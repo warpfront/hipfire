@@ -2,8 +2,8 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,8 +33,13 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let src = entry.path();
         let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if ext != "hsaco" && ext != "hash" { continue; }
-        let name = match src.file_name() { Some(n) => n, None => continue };
+        if ext != "hsaco" && ext != "hash" {
+            continue;
+        }
+        let name = match src.file_name() {
+            Some(n) => n,
+            None => continue,
+        };
         let dst = hot.join(name);
 
         // Don't clobber a JIT-validated hot pair. A .hash is only written by
@@ -79,39 +84,42 @@ pub struct KernelCompiler {
 
 impl KernelCompiler {
     pub fn new(arch: &str) -> HipResult<Self> {
-        // Cache (hot path) defaults to $CWD/.hipfire_kernels/<arch> so:
-        //   (a) parallel worktrees/agents on the same machine don't
-        //       clobber each other's JIT'd .hsaco blobs ($CWD isolation —
-        //       the original /tmp shared-state regression);
-        //   (b) two `Gpu` instances on different archs in the SAME
-        //       process (hetero PP+DFlash drafter device pinning, PRD
-        //       v1.2 PR-A) don't race on the runtime-compile output
-        //       path. Without arch suffix, drafter (gfx1010) overwrites
-        //       target's (gfx1151) `.hsaco` and the next target-side
-        //       hipModuleLoad fails with `device kernel image is invalid (200)`.
+        // Cache (hot path) defaults to $CWD/.hipfire_kernels so parallel
+        // worktrees/agents on the same machine don't clobber each other's
+        // JIT'd .hsaco blobs. /tmp was shared state: two daemons from
+        // different git states wrote the same {name}.hsaco path and
+        // thrashed each other's hash sidecars. $CWD isolation fixes that.
         // End-user / CI can pin the old location back via
-        // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters
-        // (the per-arch suffix is appended even to the override).
-        let cache_root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+        // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters.
+        let cache_dir = std::env::var_os("HIPFIRE_KERNEL_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".hipfire_kernels"));
-        let cache_dir = cache_root.join(arch);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;
 
         // Probe for pre-compiled kernels: exe-relative → CWD-relative → ~/.hipfire/bin/
-        let precompiled_dir = std::env::current_exe().ok()
+        let precompiled_dir = std::env::current_exe()
+            .ok()
             .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
             .map(|dir| dir.join("kernels").join("compiled").join(arch))
             .filter(|p| p.is_dir())
             .or_else(|| {
                 let cwd_path = PathBuf::from("kernels/compiled").join(arch);
-                if cwd_path.is_dir() { Some(cwd_path) } else { None }
+                if cwd_path.is_dir() {
+                    Some(cwd_path)
+                } else {
+                    None
+                }
             })
             .or_else(|| {
-                std::env::var("HOME").ok()
-                    .map(|h| PathBuf::from(h).join(".hipfire/bin/kernels/compiled").join(arch))
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| {
+                        PathBuf::from(h)
+                            .join(".hipfire/bin/kernels/compiled")
+                            .join(arch)
+                    })
                     .filter(|p| p.is_dir())
             });
 
@@ -122,10 +130,7 @@ impl KernelCompiler {
         // (or with stale hash) to avoid churn when both locations agree.
         // `hipfire update` wipes BOTH /tmp and the install dir, so after an
         // update + restart we get a fully-fresh re-seed.
-        //
-        // `cache_dir` already includes the arch suffix (see constructor
-        // header), so the hot path == `cache_dir` itself; no second join.
-        let hot_dir = cache_dir.clone();
+        let hot_dir = cache_dir.join(arch);
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
                 eprintln!("  hot-path seed failed ({e}) — falling back to install dir reads");
@@ -134,7 +139,14 @@ impl KernelCompiler {
         // Prefer the hot-path (tmpfs) dir when it exists and has contents.
         // This is what the `compile()` lookup uses from here on.
         let effective_precompiled = if hot_dir.is_dir()
-            && std::fs::read_dir(&hot_dir).map(|mut it| it.any(|e| e.map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false)).unwrap_or(false))).unwrap_or(false)
+            && std::fs::read_dir(&hot_dir)
+                .map(|mut it| {
+                    it.any(|e| {
+                        e.map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
         {
             Some(hot_dir.clone())
         } else {
@@ -147,7 +159,8 @@ impl KernelCompiler {
         let precompiled_dir = effective_precompiled;
 
         // Probe for hipcc once at init, not per-kernel
-        let has_hipcc = Command::new("hipcc").arg("--version")
+        let has_hipcc = Command::new("hipcc")
+            .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -213,7 +226,8 @@ impl KernelCompiler {
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
 
-        let cache_valid = obj_path.exists() && hash_path.exists()
+        let cache_valid = obj_path.exists()
+            && hash_path.exists()
             && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
 
         if !cache_valid {
@@ -265,6 +279,46 @@ impl KernelCompiler {
         out
     }
 
+    /// ROCm 7.2.x gfx1151 packages seen on Strix Halo can JIT device-only HIP
+    /// against host math declarations from /usr/include while also expecting a
+    /// global device `max` helper in clang's CUDA complex header. gfx1151 was
+    /// the early Strix target string; production Strix Halo reports gfx1201.
+    /// Prepending these OCML-backed wrappers keeps runtime JIT usable without
+    /// changing every kernel source or affecting other arches.
+    fn gfx1151_math_prelude(arch: &str) -> &'static str {
+        if !matches!(arch, "gfx1151" | "gfx1201") {
+            return "";
+        }
+        r#"
+extern "C" __attribute__((device)) float __ocml_rsqrt_f32(float);
+extern "C" __attribute__((device)) float __ocml_sqrt_f32(float);
+extern "C" __attribute__((device)) float __ocml_exp_f32(float);
+extern "C" __attribute__((device)) float __ocml_log_f32(float);
+extern "C" __attribute__((device)) float __ocml_fabs_f32(float);
+extern "C" __attribute__((device)) float __ocml_floor_f32(float);
+extern "C" __attribute__((device)) float __ocml_fmax_f32(float, float);
+extern "C" __attribute__((device)) float __ocml_fmin_f32(float, float);
+extern "C" __attribute__((device)) float __ocml_pow_f32(float, float);
+extern "C" __attribute__((device)) float __ocml_cos_f32(float);
+extern "C" __attribute__((device)) float __ocml_sin_f32(float);
+static inline __attribute__((device)) float rsqrtf(float x) { return __ocml_rsqrt_f32(x); }
+static inline __attribute__((device)) float sqrtf(float x) { return __ocml_sqrt_f32(x); }
+static inline __attribute__((device)) float expf(float x) { return __ocml_exp_f32(x); }
+static inline __attribute__((device)) float logf(float x) { return __ocml_log_f32(x); }
+static inline __attribute__((device)) float fabsf(float x) { return __ocml_fabs_f32(x); }
+static inline __attribute__((device)) float floorf(float x) { return __ocml_floor_f32(x); }
+static inline __attribute__((device)) float fmaxf(float a, float b) { return __ocml_fmax_f32(a, b); }
+static inline __attribute__((device)) float fminf(float a, float b) { return __ocml_fmin_f32(a, b); }
+static inline __attribute__((device)) float powf(float a, float b) { return __ocml_pow_f32(a, b); }
+static inline __attribute__((device)) float cosf(float x) { return __ocml_cos_f32(x); }
+static inline __attribute__((device)) float sinf(float x) { return __ocml_sin_f32(x); }
+static inline __attribute__((device)) double max(double a, double b) { return a > b ? a : b; }
+static inline __attribute__((device)) float max(float a, float b) { return a > b ? a : b; }
+static inline __attribute__((device)) int max(int a, int b) { return a > b ? a : b; }
+static inline __attribute__((device)) int min(int a, int b) { return a < b ? a : b; }
+"#
+    }
+
     /// On Windows, convert a path containing spaces to its 8.3 short-path
     /// form (e.g. `C:\Program Files\AMD\ROCm\6.4\include` to
     /// `C:\PROGRA~1\AMD\ROCm\6.4\include`) so it can be embedded as a single
@@ -273,7 +327,9 @@ impl KernelCompiler {
     /// non-Windows hosts. Reported as #82.
     #[cfg(target_os = "windows")]
     fn win_short_path_if_needed(p: &str) -> String {
-        if !p.contains(' ') { return p.to_string(); }
+        if !p.contains(' ') {
+            return p.to_string();
+        }
         // Use cmd.exe's `for %A in (LONG) do echo %~sA` to ask the OS for the
         // 8.3 alias. Subprocess approach avoids pulling in a winapi crate dep
         // for this single call site.
@@ -284,7 +340,11 @@ impl KernelCompiler {
         match out {
             Ok(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !s.is_empty() && !s.contains(' ') { s } else { p.to_string() }
+                if !s.is_empty() && !s.contains(' ') {
+                    s
+                } else {
+                    p.to_string()
+                }
             }
             _ => p.to_string(),
         }
@@ -293,10 +353,27 @@ impl KernelCompiler {
     /// No-op on non-Windows: POSIX argv handling preserves embedded spaces
     /// and ROCm's standard `/opt/rocm/include` has no spaces anyway.
     #[cfg(not(target_os = "windows"))]
-    fn win_short_path_if_needed(p: &str) -> String { p.to_string() }
+    fn win_short_path_if_needed(p: &str) -> String {
+        p.to_string()
+    }
 
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
-    fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str) -> HipResult<()> {
+    fn hipcc_compile(
+        arch: &str,
+        src_path: &Path,
+        obj_path: &Path,
+        name: &str,
+        source: &str,
+    ) -> HipResult<()> {
+        let prelude = Self::gfx1151_math_prelude(arch);
+        let source_for_compile;
+        let source = if prelude.is_empty() {
+            source
+        } else {
+            source_for_compile = format!("{prelude}\n{source}");
+            source_for_compile.as_str()
+        };
+
         std::fs::write(src_path, source).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
         })?;
@@ -311,23 +388,6 @@ impl KernelCompiler {
             "--genco".into(),
             format!("--offload-arch={arch}"),
             "-O3".into(),
-            // Force-include the HIP runtime wrapper. Workaround for ROCm
-            // 7.2.x rocm-llvm packaging on Linux (Ubuntu apt builds 22.0.0.
-            // 26014 / 26084), which fails to auto-include it in HIP mode.
-            // Without this, kernel JIT fails because:
-            //  (a) __clang_cuda_complex_builtins.h (pulled in by
-            //      hip_runtime.h) references free ::max — undefined unless
-            //      __clang_hip_math.h is in scope first; and
-            //  (b) __DEVICE__ rsqrtf / exp2f / etc. resolve to the host
-            //      stdlib versions, breaking kernels with `call to
-            //      __host__ from __global__`.
-            // The wrapper pulls in __clang_hip_math.h which fixes both —
-            // it provides max/min/rsqrtf/etc. as device overloads. On
-            // working installs (Windows, NixOS, older Linux apt), this
-            // include is auto-injected and the explicit -include is a
-            // header-guard no-op. See issue #119.
-            "-include".into(),
-            "__clang_hip_runtime_wrapper.h".into(),
         ];
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
@@ -367,9 +427,7 @@ impl KernelCompiler {
         let output = Command::new("hipcc")
             .args(&args)
             .output()
-            .map_err(|e| {
-                hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}"))
-            })?;
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -422,7 +480,8 @@ impl KernelCompiler {
             let hash_path = self.cache_dir.join(format!("{name}.hash"));
             let src_path = self.cache_dir.join(format!("{name}.hip"));
 
-            let cache_valid = obj_path.exists() && hash_path.exists()
+            let cache_valid = obj_path.exists()
+                && hash_path.exists()
                 && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
 
             if cache_valid {
@@ -444,8 +503,12 @@ impl KernelCompiler {
             }
 
             to_compile.push((
-                name.to_string(), source.to_string(), src_hash,
-                src_path, obj_path, hash_path,
+                name.to_string(),
+                source.to_string(),
+                src_hash,
+                src_path,
+                obj_path,
+                hash_path,
             ));
         }
 
@@ -464,29 +527,32 @@ impl KernelCompiler {
         let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Spawn hipcc in parallel threads
-        let results: Vec<_> = to_compile.into_iter().map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
-            let arch = arch.clone();
-            let precompiled_dir = precompiled_dir.clone();
-            let done = std::sync::Arc::clone(&done);
-            let handle = thread::spawn(move || {
-                let result = Self::hipcc_compile(&arch, &src_path, &obj_path, &name, &source);
-                if result.is_ok() {
-                    let _ = std::fs::write(&hash_path, &src_hash);
-                    // Write back to precompiled dir
-                    if let Some(ref dir) = precompiled_dir {
-                        let pre_hash = dir.join(format!("{name}.hash"));
-                        let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                        let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                        let _ = std::fs::write(&pre_hash, &src_hash);
+        let results: Vec<_> = to_compile
+            .into_iter()
+            .map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
+                let arch = arch.clone();
+                let precompiled_dir = precompiled_dir.clone();
+                let done = std::sync::Arc::clone(&done);
+                let handle = thread::spawn(move || {
+                    let result = Self::hipcc_compile(&arch, &src_path, &obj_path, &name, &source);
+                    if result.is_ok() {
+                        let _ = std::fs::write(&hash_path, &src_hash);
+                        // Write back to precompiled dir
+                        if let Some(ref dir) = precompiled_dir {
+                            let pre_hash = dir.join(format!("{name}.hash"));
+                            let pre_hsaco = dir.join(format!("{name}.hsaco"));
+                            let _ = std::fs::copy(&obj_path, &pre_hsaco);
+                            let _ = std::fs::write(&pre_hash, &src_hash);
+                        }
                     }
-                }
-                let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let marker = if result.is_ok() { "✓" } else { "✗" };
-                eprintln!("  [{i:>3}/{n}] {marker} {name}");
-                (name, obj_path, result)
-            });
-            handle
-        }).collect();
+                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let marker = if result.is_ok() { "✓" } else { "✗" };
+                    eprintln!("  [{i:>3}/{n}] {marker} {name}");
+                    (name, obj_path, result)
+                });
+                handle
+            })
+            .collect();
 
         let mut errors = Vec::new();
         for handle in results {
@@ -504,5 +570,19 @@ impl KernelCompiler {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KernelCompiler;
+
+    #[test]
+    fn math_prelude_covers_gfx1201_rocm72_header_bug() {
+        let prelude = KernelCompiler::gfx1151_math_prelude("gfx1201");
+
+        assert!(prelude.contains("float sqrtf"));
+        assert!(prelude.contains("double max"));
+        assert!(prelude.contains("float max"));
     }
 }

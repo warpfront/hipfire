@@ -149,8 +149,6 @@ pub struct HipRuntime {
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
-    fn_host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32,
-    fn_host_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
@@ -303,8 +301,6 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32),
                 fn_malloc: load_fn!(lib, "hipMalloc", unsafe extern "C" fn(*mut *mut c_void, usize) -> u32),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
-                fn_host_malloc: load_fn!(lib, "hipHostMalloc", unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32),
-                fn_host_free: load_fn!(lib, "hipHostFree", unsafe extern "C" fn(*mut c_void) -> u32),
                 fn_memcpy: load_fn!(lib, "hipMemcpy", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32),
                 fn_memcpy_async: load_fn!(lib, "hipMemcpyAsync", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32),
                 fn_memset: load_fn!(lib, "hipMemset", unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32),
@@ -458,67 +454,6 @@ impl HipRuntime {
         self.check(code, "hipMemcpyPeerAsync")
     }
 
-    /// Offset-aware sync peer copy. Used by the cross-card spec-decode
-    /// path to ship sub-slices of larger buffers (per-row hidden block,
-    /// embedding rows, ring-buffer slots) between two free-standing `Gpu`
-    /// instances without sub-slicing `DeviceBuffer`s.
-    pub fn memcpy_peer_at(
-        &self,
-        dst: &DeviceBuffer,
-        dst_offset: usize,
-        dst_device: i32,
-        src: &DeviceBuffer,
-        src_offset: usize,
-        src_device: i32,
-        size: usize,
-    ) -> HipResult<()> {
-        assert!(
-            dst_offset + size <= dst.size(),
-            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})", dst.size()
-        );
-        assert!(
-            src_offset + size <= src.size(),
-            "src_offset ({src_offset}) + size ({size}) exceeds src ({})", src.size()
-        );
-        let dst_ptr = unsafe { (dst.as_ptr() as *mut u8).add(dst_offset) as *mut c_void };
-        let src_ptr = unsafe { (src.as_ptr() as *const u8).add(src_offset) as *const c_void };
-        let code = unsafe {
-            (self.fn_memcpy_peer)(dst_ptr, dst_device, src_ptr, src_device, size)
-        };
-        self.check(code, "hipMemcpyPeer@offset")
-    }
-
-    /// Offset-aware async peer copy. Stream must belong to one of the
-    /// two devices involved.
-    pub fn memcpy_peer_at_async(
-        &self,
-        dst: &DeviceBuffer,
-        dst_offset: usize,
-        dst_device: i32,
-        src: &DeviceBuffer,
-        src_offset: usize,
-        src_device: i32,
-        size: usize,
-        stream: &Stream,
-    ) -> HipResult<()> {
-        assert!(
-            dst_offset + size <= dst.size(),
-            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})", dst.size()
-        );
-        assert!(
-            src_offset + size <= src.size(),
-            "src_offset ({src_offset}) + size ({size}) exceeds src ({})", src.size()
-        );
-        let dst_ptr = unsafe { (dst.as_ptr() as *mut u8).add(dst_offset) as *mut c_void };
-        let src_ptr = unsafe { (src.as_ptr() as *const u8).add(src_offset) as *const c_void };
-        let code = unsafe {
-            (self.fn_memcpy_peer_async)(
-                dst_ptr, dst_device, src_ptr, src_device, size, stream.0,
-            )
-        };
-        self.check(code, "hipMemcpyPeerAsync@offset")
-    }
-
     pub fn pointer_get_attributes(&self, buf: &DeviceBuffer) -> HipResult<HipPointerAttribute> {
         let mut attr = HipPointerAttribute::default();
         let code = unsafe { (self.fn_pointer_get_attributes)(&mut attr, buf.as_ptr()) };
@@ -541,39 +476,6 @@ impl HipRuntime {
         let code = unsafe { (self.fn_free)(buf.ptr) };
         std::mem::forget(buf); // prevent double-free
         self.check(code, "hipFree")
-    }
-
-    /// Allocate `size` bytes of pinned (page-locked) host memory via
-    /// `hipHostMalloc`. The returned `PinnedHostBuffer` is CPU-addressable
-    /// AND can be the source/dest of `memcpy_htod_async` /
-    /// `memcpy_dtoh_async` on any visible HIP device, going through the
-    /// driver's direct-DMA path. Used by the hetero PP+DFlash cross-card
-    /// staging path to bypass HIP's bounce-buffer fallback (the
-    /// ~64 MB/s slow path on iGPU↔eGPU pairs over Thunderbolt).
-    ///
-    /// Flags: `HIP_HOST_MALLOC_PORTABLE | HIP_HOST_MALLOC_MAPPED` so the
-    /// buffer is accessible from every visible device's address space
-    /// (portable) and has a device-side mapping (mapped) for any future
-    /// `hipHostGetDevicePointer` call. The mapped flag is harmless when
-    /// only memcpy is used; it costs nothing and unlocks direct-pointer
-    /// kernel access in a follow-up if we go that route.
-    pub fn host_malloc(&self, size: usize) -> HipResult<crate::PinnedHostBuffer> {
-        const HIP_HOST_MALLOC_PORTABLE: c_uint = 0x01;
-        const HIP_HOST_MALLOC_MAPPED: c_uint = 0x02;
-        let flags = HIP_HOST_MALLOC_PORTABLE | HIP_HOST_MALLOC_MAPPED;
-        let mut ptr: *mut c_void = ptr::null_mut();
-        let code = unsafe { (self.fn_host_malloc)(&mut ptr, size, flags) };
-        self.check(code, "hipHostMalloc")?;
-        Ok(unsafe { crate::PinnedHostBuffer::from_raw(ptr, size) })
-    }
-
-    /// Free a `PinnedHostBuffer` allocated via [`host_malloc`].
-    /// # Safety
-    /// Caller must ensure no async memcpy is in flight against the buffer.
-    pub fn host_free(&self, buf: crate::PinnedHostBuffer) -> HipResult<()> {
-        let code = unsafe { (self.fn_host_free)(buf.as_mut_ptr()) };
-        std::mem::forget(buf);
-        self.check(code, "hipHostFree")
     }
 
     /// Copy host data into GPU buffer at a byte offset.
@@ -1016,34 +918,6 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync H2D")
     }
 
-    /// Async H2D copy with a destination byte offset into `dst`. Used by
-    /// the hetero PP+DFlash pinned-host staging path to ship the whole
-    /// pinned buffer into a slice of the drafter's per-cycle scratch
-    /// (e.g. `target_hidden` at row offset `position`).
-    pub fn memcpy_htod_async_at(
-        &self,
-        dst: &DeviceBuffer,
-        dst_offset: usize,
-        src: &[u8],
-        stream: &Stream,
-    ) -> HipResult<()> {
-        assert!(
-            dst_offset + src.len() <= dst.size,
-            "memcpy_htod_async_at: offset {} + len {} exceeds dst size {}",
-            dst_offset, src.len(), dst.size,
-        );
-        let code = unsafe {
-            (self.fn_memcpy_async)(
-                (dst.ptr as *mut u8).add(dst_offset) as *mut c_void,
-                src.as_ptr() as *const c_void,
-                src.len(),
-                MemcpyKind::HostToDevice as c_uint,
-                stream.0,
-            )
-        };
-        self.check(code, "hipMemcpyAsync H2D (offset)")
-    }
-
     pub fn memcpy_dtoh_async(
         &self,
         dst: &mut [u8],
@@ -1061,33 +935,6 @@ impl HipRuntime {
             )
         };
         self.check(code, "hipMemcpyAsync D2H")
-    }
-
-    /// Async D2H copy with a source byte offset into `src`. Mirror of
-    /// [`memcpy_htod_async_at`] for the cross-card return direction
-    /// (drafter hidden rows → pinned host → target staging).
-    pub fn memcpy_dtoh_async_at(
-        &self,
-        dst: &mut [u8],
-        src: &DeviceBuffer,
-        src_offset: usize,
-        stream: &Stream,
-    ) -> HipResult<()> {
-        assert!(
-            src_offset + dst.len() <= src.size,
-            "memcpy_dtoh_async_at: offset {} + len {} exceeds src size {}",
-            src_offset, dst.len(), src.size,
-        );
-        let code = unsafe {
-            (self.fn_memcpy_async)(
-                dst.as_mut_ptr() as *mut c_void,
-                (src.ptr as *const u8).add(src_offset) as *const c_void,
-                dst.len(),
-                MemcpyKind::DeviceToHost as c_uint,
-                stream.0,
-            )
-        };
-        self.check(code, "hipMemcpyAsync D2H (offset)")
     }
 
     /// Async D→D copy with optional offsets on both sides. Ordered on

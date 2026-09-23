@@ -7,9 +7,10 @@
 //   hipfire list                      → show local + available models
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, readFileSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import { classifyNpuDiag } from "./diag_pure.ts";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -641,6 +642,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
 
 const HF_BASE = "https://huggingface.co";
 
+function hfHeaders(): Record<string, string> {
+  const h: Record<string, string> = {
+    "User-Agent": "hipfire",
+  };
+  const token = process.env.HF_TOKEN;
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
 interface ModelEntry {
   /// Empty string = local-only. `pull()` short-circuits with a clear message
   /// instead of attempting a 404'ing fetch against a HF repo that doesn't
@@ -857,6 +867,30 @@ export async function isServeUp(port: number): Promise<boolean> {
   } catch { return false; }
 }
 
+function runProgram(argv: string[]): { found: boolean; status: number | null; output: string } {
+  try {
+    const r = Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe" });
+    const stdout = r.stdout ? r.stdout.toString() : "";
+    const stderr = r.stderr ? r.stderr.toString() : "";
+    return { found: true, status: r.exitCode, output: stdout + stderr };
+  } catch (err: any) {
+    return { found: false, status: null, output: err?.message ?? String(err) };
+  }
+}
+
+function currentMemlockSoftBytes(): number | null {
+  try {
+    const text = readFileSync("/proc/self/limits", "utf8");
+    const line = text.split("\n").find((row) => row.startsWith("Max locked memory"));
+    const value = line?.match(/^Max locked memory\s+(\S+)/)?.[1];
+    if (!value || value === "unlimited") return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 // Drive `hipfire run` through an existing serve's /v1/chat/completions stream.
 // Returns false if it couldn't connect (caller falls back to local spawn).
 async function runViaHttp(
@@ -954,7 +988,9 @@ class Engine {
 
   async start() {
     const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
+      ...(envBin ? [envBin] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
@@ -1108,7 +1144,7 @@ async function pull(tag: string): Promise<string> {
   console.error(`Pulling ${resolved} (${entry.size_gb}GB)...`);
   console.error(`  ${url}`);
 
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: hfHeaders() });
   if (!res.ok) {
     console.error(`Download failed: ${res.status} ${res.statusText}`);
     console.error(`URL: ${url}`);
@@ -1156,7 +1192,7 @@ async function pull(tag: string): Promise<string> {
       const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
       console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
       try {
-        const sres = await fetch(sidecarUrl);
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
         if (!sres.ok) {
           console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
         } else {
@@ -4474,10 +4510,44 @@ switch (cmd) {
       console.log(`rocminfo:      ${sh("which rocminfo 2>/dev/null") ? "installed but no GPUs detected" : "NOT FOUND"}`);
     }
 
+    // ── 3b. XDNA / Ryzen AI NPU runtime ───────────────────
+    if (isNativeLinux) {
+      const accelPath = "/dev/accel/accel0";
+      const accelExists = existsSync(accelPath);
+      let accelIsChar = false;
+      let accelMode = "0000";
+      let accelOwner = "0:0";
+      if (accelExists) {
+        try {
+          const st = statSync(accelPath);
+          accelIsChar = st.isCharacterDevice();
+          accelMode = (st.mode & 0o7777).toString(8).padStart(4, "0");
+          accelOwner = `${st.uid}:${st.gid}`;
+        } catch {}
+      }
+      const xrtProbe = runProgram(["xrt-smi", "examine"]);
+      const npu = classifyNpuDiag({
+        accelExists,
+        accelIsChar,
+        accelMode,
+        accelOwner,
+        memlockSoftBytes: currentMemlockSoftBytes(),
+        minMemlockBytes: 128 * 1024 * 1024,
+        xrtSmiFound: xrtProbe.found,
+        xrtSmiStatus: xrtProbe.status,
+        xrtSmiOutput: xrtProbe.output,
+      });
+      console.log("");
+      for (const line of npu.lines) console.log(line);
+      for (const line of npu.advice) console.log(`  NPU advice: ${line}`);
+    }
+
     // ── 4. Daemon binary + models ──────────────────────────
     console.log("");
     const exe2 = process.platform === "win32" ? ".exe" : "";
+    const envBin2 = process.env.HIPFIRE_DAEMON_BIN;
     const daemonBins = [
+      ...(envBin2 ? [envBin2] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];

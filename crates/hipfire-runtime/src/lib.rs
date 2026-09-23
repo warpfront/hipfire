@@ -15,6 +15,8 @@ pub mod hfq;
 pub mod llama;
 pub mod loop_guard;
 pub mod multi_gpu;
+pub mod npu;
+pub mod spec_spine;
 pub mod sampler;
 #[cfg(feature = "deltanet")]
 pub mod dflash;

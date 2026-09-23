@@ -121,6 +121,49 @@ struct CaskConfig {
 /// helper below is the simpler fallback for unpaired tokens — trips on
 /// `count >= threshold` regardless of structure — kept here as
 /// reference for a future per-token attractor block.
+//
+// ─── Probe-mode `committed` event emitter ────────────────────────────────
+//
+// When `HIPFIRE_EMIT_TOKEN_IDS=1` is set, the daemon emits a
+// `{"type":"committed",...}` event for every token it commits (i.e. every
+// time a sampled token is appended to `streamed_tokens` /
+// `conversation_tokens`). This is a parallel stream alongside the
+// existing `{"type":"token","text":"..."}` events; it carries the raw
+// token ID, the per-request position, and ms-since-request-start.
+//
+// Why a parallel stream and not a `tok_id` field on the existing token
+// event: `EosFilter` can hold/merge/strip/stop bytes across multiple
+// committed tokens (many-to-one and zero-to-one relationships); a
+// `tok_id` field on a text event would lie about which token produced
+// the visible chunk. The runtime-protective synthetic emit at the
+// `</think>` force-close site is intentionally NOT paired with a
+// `committed` event, because no token was actually committed there.
+//
+// Off by default — env var read once on first call. The probe binary
+// (`examples/coherence_probe.rs`) sets the env on the daemon child it
+// spawns. Existing JSONL clients see no change.
+fn emit_committed_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    tok_id: u32,
+    pos: usize,
+    t_ms: u64,
+) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let on = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1")
+    });
+    if !on {
+        return;
+    }
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"committed","id":"{}","tok_id":{},"pos":{},"t_ms":{}}}"#,
+        id, tok_id, pos, t_ms
+    );
+}
+
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -312,16 +355,6 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
-    /// Hetero PP+DFlash (PRD v1.2): when `HIPFIRE_DFLASH_DRAFTER_DEVICE=N` is
-    /// set at load time, the drafter's weights + scratch live on this dedicated
-    /// `Gpu` instance (bound to HIP device N) instead of sharing the daemon's
-    /// main `gpu`. None means single-Gpu DFlash (drafter shares VRAM with
-    /// target). The cross-card spec-decode coordination loop in
-    /// `spec_step_dflash` (PR3 of the PRD) routes per-cycle ops between
-    /// `gpu` (target side) and this handle (drafter side); when None, both
-    /// sides resolve to the daemon's main `gpu` and behavior is byte-for-byte
-    /// identical to the prior single-Gpu path.
-    dflash_drafter_gpu: Option<rdna_compute::Gpu>,
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -621,55 +654,7 @@ fn main() {
                     }
                 }
 
-                // Hetero PP+DFlash drafter device pinning (PRD v1.2 PR2).
-                // HIPFIRE_DFLASH_DRAFTER_DEVICE=N opens a dedicated `Gpu`
-                // bound to HIP device N for the drafter's weights + scratch
-                // (sized ~877 MB for the 2B drafter targeting 27B). Only
-                // honored when a draft model is being loaded; ignored
-                // otherwise so it's harmless to leave set across non-DFlash
-                // sessions. Failure to open the requested device is a hard
-                // error — emit "error" and skip the load so the operator
-                // gets a structured signal instead of a daemon panic on
-                // first generate.
-                let drafter_gpu_owned: Option<rdna_compute::Gpu> = if draft_path.is_some() {
-                    match std::env::var("HIPFIRE_DFLASH_DRAFTER_DEVICE")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                    {
-                        Some(spec) => match spec.parse::<i32>() {
-                            Ok(id) => match rdna_compute::Gpu::init_with_device(id) {
-                                Ok(g) => {
-                                    eprintln!(
-                                        "[hipfire-daemon] DFlash drafter pinned to HIP device {} (gfx={}, dedicated Gpu instance)",
-                                        id, g.arch
-                                    );
-                                    Some(g)
-                                }
-                                Err(e) => {
-                                    let _ = writeln!(stdout,
-                                        r#"{{"type":"error","message":"HIPFIRE_DFLASH_DRAFTER_DEVICE={} failed to initialize: {} (code {})"}}"#,
-                                        id, e.message.replace('"', "'"), e.code,
-                                    );
-                                    let _ = stdout.flush();
-                                    continue;
-                                }
-                            },
-                            Err(_) => {
-                                let _ = writeln!(stdout,
-                                    r#"{{"type":"error","message":"HIPFIRE_DFLASH_DRAFTER_DEVICE='{}' is not a non-negative integer"}}"#,
-                                    spec.replace('"', "'"),
-                                );
-                                let _ = stdout.flush();
-                                continue;
-                            }
-                        },
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu, drafter_gpu_owned) {
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -824,13 +809,6 @@ fn main() {
                 // / enable_thinking knobs no-ops on the wire.
                 let max_think_tokens = msg.get("max_think_tokens")
                     .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                // raw=true bypasses ChatML wrapping (no system tag, no
-                // assistant role tag, no <think> opener). Mirrors
-                // dflash_spec_demo's --no-chatml flag. Useful for
-                // canonical benches and one-shot completion where the
-                // post-trained reasoning-mode default would tank τ.
-                // Defaults false (existing chat behavior).
-                let raw = msg.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
@@ -897,7 +875,6 @@ fn main() {
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
-                        raw,
                     );
                 }
             }
@@ -1142,28 +1119,14 @@ fn main() {
     }
 }
 
-fn load_model(
-    path: &str,
-    max_seq: usize,
-    draft_path: Option<&str>,
-    kv_mode_override: Option<&str>,
-    cask: &CaskConfig,
-    pp: usize,
-    gpu: &mut rdna_compute::Gpu,
-    // Hetero PP+DFlash drafter device pinning (PRD v1.2 PR2).
-    // `Some(g)` = drafter weights/scratch live on the dedicated `g` Gpu;
-    // None = drafter shares VRAM with target on the daemon's main `gpu`
-    // (single-Gpu, byte-for-byte identical to prior behavior). Threaded
-    // by-value so load_model can return ownership inside `LoadedModel.dflash_drafter_gpu`.
-    mut drafter_gpu_owned: Option<rdna_compute::Gpu>,
-) -> Result<LoadedModel, String> {
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
         let _ = (draft_path, cask);
-        return load_model_pp(path, max_seq, kv_mode_override, pp, gpu, drafter_gpu_owned);
+        return load_model_pp(path, max_seq, kv_mode_override, pp, gpu);
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
@@ -1440,7 +1403,7 @@ fn load_model(
             // `max_seq` so eviction's smaller buffer caps VRAM: a 128K-advertised
             // model with physical_cap=896 allocates an 896-slot ring, not 128K.
             // Without eviction, physical_cap == max_seq so the behavior matches.
-            match load_dflash_state(dp, physical_cap, &config, &dn, gpu, drafter_gpu_owned.as_mut()) {
+            match load_dflash_state(dp, physical_cap, &config, &dn, gpu) {
                 Ok(state) => {
                     eprintln!(
                         "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
@@ -1468,7 +1431,6 @@ fn load_model(
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
-            dflash_drafter_gpu: drafter_gpu_owned,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -1496,11 +1458,6 @@ fn load_model(
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
-            // Qwen3/LLaMA never carries DFlash; if the operator set
-            // HIPFIRE_DFLASH_DRAFTER_DEVICE for a model that doesn't
-            // support DFlash, we still hand the owned drafter Gpu back
-            // through `LoadedModel` so `unload_model` can drop it cleanly.
-            dflash_drafter_gpu: drafter_gpu_owned,
         })
     }
 }
@@ -1518,14 +1475,6 @@ fn load_model_pp(
     kv_mode_override: Option<&str>,
     pp: usize,
     _gpu: &mut rdna_compute::Gpu,
-    // pp>1 + drafter pinning is deferred (PRD v1.2 PR3 follow-on); the
-    // refusal at the upstream load handler still gates DFlash on pp>1
-    // unless `HIPFIRE_PP_DFLASH=1` is set, but this load path itself
-    // does not yet wire DFlash state. Threaded for parity with `load_model`
-    // so the daemon call sites are uniform; the owned Gpu (if any) is
-    // simply parked on `LoadedModel.dflash_drafter_gpu` for `unload_model`
-    // to clean up.
-    drafter_gpu_owned: Option<rdna_compute::Gpu>,
 ) -> Result<LoadedModel, String> {
     let kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
@@ -1637,7 +1586,6 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
-        dflash_drafter_gpu: drafter_gpu_owned,
     })
 }
 
@@ -1692,7 +1640,7 @@ fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute
     (n_safe, n_unsafe)
 }
 
-fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order
@@ -1720,33 +1668,9 @@ fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // leak until daemon exit if the caller cycles load/unload mid-session.
     // Acceptable for the daemon since unload is rare and the weights are the
     // bulk of the VRAM anyway.
-    //
-    // Hetero PP+DFlash (PRD v1.2): when `dflash_drafter_gpu` is set, the
-    // draft weights + scratch live on that dedicated Gpu instead of the
-    // daemon's main one — free them against `dflash_drafter_gpu` so the
-    // free_tensor calls land on the right device's pool. When None, fall
-    // through to `gpu` (single-Gpu DFlash, prior behavior).
     if let Some(df) = m.dflash {
-        let drafter_handle: &mut rdna_compute::Gpu = match m.dflash_drafter_gpu.as_mut() {
-            Some(d) => d,
-            None => &mut *gpu,
-        };
-        df.draft_weights.free_gpu(drafter_handle);
-        df.draft_scratch.free_gpu(drafter_handle);
-    }
-    // Drop the dedicated drafter Gpu (if any) AFTER its allocations have
-    // been released. Drop on `Gpu` invalidates caches + drains the pool;
-    // the borrow needed to be released first.
-    if let Some(mut drafter_gpu) = m.dflash_drafter_gpu {
-        drafter_gpu.invalidate_weight_caches();
-        drafter_gpu.invalidate_graph_state();
-        drafter_gpu.drain_pool();
-        // Owned `Gpu` drops here — its underlying HIP context is not
-        // explicitly destroyed (no dtor); HIP cleans up at process exit.
-        // Acceptable since unload is rare; future could add an explicit
-        // hipDeviceReset here if VRAM pressure becomes an issue across
-        // load/unload cycles.
-        drop(drafter_gpu);
+        df.draft_weights.free_gpu(gpu);
+        df.draft_scratch.free_gpu(gpu);
     }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
@@ -1781,34 +1705,14 @@ fn load_dflash_state(
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
-    // Target side: hidden ring buffer, DN snapshots, gdn_tape, verify_scratch,
-    // ddtree state — all live alongside the target weights/KV.
     gpu: &mut rdna_compute::Gpu,
-    // Drafter side: weights + scratch buffers. `Some(d)` pins them to a
-    // dedicated `Gpu` instance (HIPFIRE_DFLASH_DRAFTER_DEVICE=N); None
-    // routes them to `gpu` for byte-for-byte parity with the prior
-    // single-Gpu DFlash path.
-    drafter_gpu: Option<&mut rdna_compute::Gpu>,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
-    // Drafter-side allocations: weights + activation scratch. Reborrow `gpu`
-    // when no dedicated drafter Gpu — preserves byte-for-byte single-Gpu
-    // behavior when HIPFIRE_DFLASH_DRAFTER_DEVICE is unset. The drafter
-    // borrow is scoped to this block so target-side allocs below can
-    // reclaim the &mut reference cleanly.
-    let (draft_weights, draft_scratch) = {
-        let drafter_handle: &mut rdna_compute::Gpu = match drafter_gpu {
-            Some(d) => d,
-            None => &mut *gpu,
-        };
-        let dw = DflashWeights::load(drafter_handle, &hfq, &draft_config)
-            .map_err(|e| format!("load weights: {e}"))?;
-        let ds = DflashScratch::new_with_mq(
-            drafter_handle, &draft_config, draft_config.block_size, ctx_capacity, dw.has_mq,
-        ).map_err(|e| format!("draft scratch: {e}"))?;
-        (dw, ds)
-    };
+    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
+    let draft_scratch = DflashScratch::new_with_mq(
+        gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
+    ).map_err(|e| format!("draft scratch: {e}"))?;
 
     // Hidden ring: one row per target-layer selected by the draft config,
     // captured during each target forward. Sized so the whole context plus
@@ -1878,8 +1782,6 @@ fn load_dflash_state(
         target_config.dim,
         target_config.vocab_size,
         target_config.dim,
-        draft_config.num_extract(),
-        draft_config.hidden,
         target_config,
     ).map_err(|e| format!("verify_scratch: {e}"))?;
 
@@ -2016,100 +1918,23 @@ fn generate_dflash(
     max_think_tokens: usize,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
-    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
-    raw: bool,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
         ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
 
-    // Hetero PP+DFlash drafter device pinning (PRD v1.2 PR-A): when
-    // `m.dflash_drafter_gpu` is `Some`, `spec_step_dflash` runs the
-    // cross-card spec-decode loop with the drafter on the dedicated
-    // device (HIPFIRE_DFLASH_DRAFTER_DEVICE=N). Per-cycle phases 2/4/5/9
-    // stage the cross-card transfers through `verify_scratch` staging
-    // buffers + `multi_gpu::cross_card_copy_at`. Default behavior unchanged
-    // when the env is unset (drafter_gpu=None → byte-identical single-Gpu
-    // path).
-
-    // Tokenize the user prompt raw first so PFlash can score/compress it
-    // before the ChatML scaffold is wrapped around it. This matches the AR
-    // path at lines 2525-2591 — PFlash compresses the user content, then
-    // build_with_user_tokens reframes the compressed list. When PFlash is
-    // off / unavailable, q_tokens == raw_q_tokens and the result is
-    // byte-identical to the previous ChatFrame::build() path.
+    // Tokenize with ChatML wrapping (identical to the AR path). System prompt
+    // is always prepended because this fast path is single-turn.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let raw_q_tokens: Vec<u32> = tokenizer.encode(prompt);
-
-    // PFlash + DFlash composition (PRD v1.2 PR 4). Mirrors AR's
-    // RequestKind detection so tool-call prompts skip compression.
-    let request_kind = match tokenizer.special_token_id("<tool_call>") {
-        Some(tid) => {
-            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
-            let in_system = system_prompt
-                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
-                .unwrap_or(false);
-            if in_user || in_system {
-                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
-            } else {
-                hipfire_arch_qwen35::pflash::RequestKind::Text
-            }
-        }
-        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
-    };
-    let q_tokens: Vec<u32> = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
-            gpu, state, cfg, &raw_q_tokens, request_kind, &[],
-        ) {
-            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
-                let _ = writeln!(stdout,
-                    r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
-                    id, cp.source_tokens, cp.kept_tokens,
-                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                    cp.source_md5, cp.compressed_md5,
-                    cp.timings.score_ms, cp.timings.total_ms,
-                );
-                let _ = stdout.flush();
-                cp.token_ids
-            }
-            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
-                if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
-                    let _ = writeln!(stdout,
-                        r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
-                        id, reason.as_str().replace('"', "'"),
-                    );
-                    let _ = stdout.flush();
-                }
-                raw_q_tokens
-            }
-            Err(e) => {
-                let _ = writeln!(stdout,
-                    r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
-                    id, e.to_string().replace('"', "'"),
-                );
-                let _ = stdout.flush();
-                raw_q_tokens
-            }
-        }
-    } else {
-        raw_q_tokens
-    };
-
-    // Wrap with ChatML scaffold. q_tokens is either raw or PFlash-compressed
-    // user content; the scaffold + system + assistant prefix are unchanged.
-    // raw=true (per-request) bypasses the scaffold and emits q_tokens
-    // verbatim — used for canonical benches where the model's
-    // post-trained <think> default would collapse τ.
     let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
         tokenizer,
         system: system_prompt,
-        user: "", // unused: q_tokens passed via build_with_user_tokens
+        user: prompt,
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw,
+        raw: false,
     }
-    .build_with_user_tokens(&q_tokens);
+    .build();
 
     // `im_end_token` is still needed downstream for the EOS check.
     let im_end = tokenizer.encode("<|im_end|>");
@@ -2216,28 +2041,7 @@ fn generate_dflash(
     }
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
     // first spec step can skip the CPU→GPU upload of the whole context.
-    //
-    // Hetero path (drafter on a different device): scatter_hidden_block_to_
-    // interleaved would be a cross-device hipMemcpyDeviceToDevice (src on
-    // target hidden_rb, dst on drafter target_hidden), which routes through
-    // HIP's broken P2P path and crashes inside libamdhip64.so on
-    // TB5+gfx1010 (asymmetric peer access). target_hidden_host is already
-    // populated by seed_target_hidden_from_prompt; upload directly via H2D
-    // from the drafter to sidestep cross-device D2D entirely. Mirrors
-    // dflash_spec_demo's commit 9ba0b87 fix.
-    if let Some(d) = m.dflash_drafter_gpu.as_mut() {
-        if let Err(e) = d.bind_thread().and_then(|_| {
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    df.target_hidden_host.as_ptr() as *const u8,
-                    df.target_hidden_host.len() * 4,
-                )
-            };
-            d.hip.memcpy_htod(&df.draft_scratch.target_hidden.buf, bytes)
-        }) {
-            eprintln!("[dflash] hetero seed H2D failed: {e} — falling back to per-cycle upload");
-        }
-    } else if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+    if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
         gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
         0, prompt_tokens.len(), prompt_tokens.len(),
     ) {
@@ -2311,6 +2115,7 @@ fn generate_dflash(
 
     // Emit the first token immediately so TTFT is the prefill time.
     streamed_tokens.push(first_token);
+    emit_committed_event(stdout, id, first_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
     let new_bytes = &all_bytes[bytes_fed_to_filter..];
     bytes_fed_to_filter = all_bytes.len();
@@ -2322,55 +2127,6 @@ fn generate_dflash(
     generated += 1;
 
     let mut rng_state: u64 = 0x13579BDFu64;
-
-    // PLD spine + n-gram cache activation (PRD v1.2 follow-on, 2026-05-08).
-    // Both are env-gated and default-OFF — when unset, daemon decodes
-    // byte-identically to the pre-activation path. Mirrors dflash_spec_demo's
-    // wiring (lookup logic at dflash_spec_demo.rs:1170-1200, observe_many at
-    // :1329-1337). The bypass-mode path inside spec_step_dflash already
-    // handles `Some(spine)` correctly (speculative.rs:2630+).
-    //
-    // HIPFIRE_DAEMON_PLD=1 enables PldMatcher (Goose §4.3 bypass mode):
-    // suffix self-match against (prompt + emitted) → spine continuation
-    // skips the DFlash forward when consensus + chain length pass.
-    //   HIPFIRE_DAEMON_PLD_CONSENSUS  default 2 (paper)
-    //   HIPFIRE_DAEMON_PLD_CHAIN      default 5 (conservative; paper uses 8)
-    //
-    // HIPFIRE_DAEMON_NGRAM=1 enables NgramCache (rolling bigram → next):
-    // populated from prompt + each cycle's committed window; used inside
-    // spec_step_dflash as a "free second opinion" override on top of DFlash.
-    //   HIPFIRE_DAEMON_NGRAM_MIN_COUNT default 3
-    let pld_enabled = std::env::var("HIPFIRE_DAEMON_PLD").ok().as_deref() == Some("1");
-    let pld_min_consensus: usize = std::env::var("HIPFIRE_DAEMON_PLD_CONSENSUS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
-    let pld_min_chain: usize = std::env::var("HIPFIRE_DAEMON_PLD_CHAIN")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let pld_matcher = if pld_enabled {
-        let m = speculative::PldMatcher::new();
-        eprintln!(
-            "[daemon-dflash] pld: enabled (ngrams={:?}, min_extract={}, max_extract={}, consensus_gate={}, chain_gate={})",
-            m.ngram_lens, m.min_extract, m.max_extract, pld_min_consensus, pld_min_chain,
-        );
-        Some(m)
-    } else {
-        None
-    };
-    let mut pld_hits: usize = 0;
-
-    let ngram_enabled = std::env::var("HIPFIRE_DAEMON_NGRAM").ok().as_deref() == Some("1");
-    let ngram_min_count: u32 = std::env::var("HIPFIRE_DAEMON_NGRAM_MIN_COUNT")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-    let mut ngram_cache = if ngram_enabled {
-        let mut c = speculative::NgramCache::new(ngram_min_count);
-        c.observe_many(&prompt_tokens);
-        eprintln!(
-            "[daemon-dflash] ngram: enabled (min_count={}, seeded with {} prompt tokens)",
-            ngram_min_count, prompt_tokens.len(),
-        );
-        Some(c)
-    } else {
-        None
-    };
 
     // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
     // previous version re-read the env-var on every spec cycle which
@@ -2443,38 +2199,8 @@ fn generate_dflash(
                 )
             }
         } else {
-            // PLD lookup: build context = prompt ++ emitted (everything
-            // committed so far). The matcher predicts what follows the
-            // suffix, so the context must end at seed_token. At cycle
-            // K≥1, emitted's last entry is the prior bonus (== current
-            // seed_token), so we usually skip the explicit push; at cycle
-            // 0 (emitted == [first_token] == seed_token) ditto. This
-            // mirrors dflash_spec_demo.rs:1175-1188.
-            let pld_match = pld_matcher.as_ref().and_then(|matcher| {
-                let mut ctx: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + emitted.len() + 1);
-                ctx.extend_from_slice(&prompt_tokens);
-                ctx.extend_from_slice(&emitted);
-                if ctx.last() != Some(&seed_token) {
-                    ctx.push(seed_token);
-                }
-                matcher.lookup(&ctx)
-            });
-            // Goose §4.3 bypass-mode confidence gate.
-            let pld_spine: Option<&[u32]> = pld_match.as_ref().and_then(|pm| {
-                if pm.consensus >= pld_min_consensus && pm.tokens.len() >= pld_min_chain {
-                    Some(pm.tokens.as_slice())
-                } else {
-                    None
-                }
-            });
-            let used_pld = pld_spine.is_some();
-            if used_pld {
-                pld_hits += 1;
-            }
             spec_step_dflash(
-                gpu,
-                m.dflash_drafter_gpu.as_mut(),
-                &mut target, &df.draft_weights, &df.draft_config,
+                gpu, &mut target, &df.draft_weights, &df.draft_config,
                 &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
                 &mut df.target_snap, &df.verify_scratch,
                 position, seed_token,
@@ -2483,10 +2209,10 @@ fn generate_dflash(
                 0.0_f32,                   // temperature
                 &mut rng_state,
                 None,                      // block_size override
-                ngram_cache.as_ref(),      // bigram override (None when ngram disabled)
+                None,                      // ngram_cache
                 &emitted,
                 0.0_f32,                   // cactus_delta
-                pld_spine,                 // PLD bypass spine (None when disabled or below gate)
+                None,                      // pld_spine
                 1.0_f32,                   // repeat_penalty (off)
                 0,                         // repeat_window
             )
@@ -2500,19 +2226,6 @@ fn generate_dflash(
             }
         };
         stats.record(&step);
-
-        // Populate n-gram cache from newly committed tokens. step.committed
-        // is [seed, accepted draft tokens, bonus]; record consecutive triples
-        // including the join with prior context (last 2 of emitted before
-        // this cycle's commits land). Mirrors dflash_spec_demo.rs:1329-1337.
-        if let Some(ref mut ng) = ngram_cache {
-            let tail_len = emitted.len().min(2);
-            let mut window: Vec<u32> = Vec::with_capacity(tail_len + step.committed.len());
-            window.extend_from_slice(&emitted[emitted.len() - tail_len..]);
-            window.extend_from_slice(&step.committed);
-            ng.observe_many(&window);
-        }
-
         let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
 
         let mut hit_eos = false;
@@ -2521,6 +2234,7 @@ fn generate_dflash(
             if generated >= max_tokens { break; }
             emitted.push(tok);
             streamed_tokens.push(tok);
+            emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
@@ -2609,22 +2323,12 @@ fn generate_dflash(
         ),
         _ => String::new(),
     };
-    // PLD / n-gram observability fields. Empty when both are off so the
-    // baseline `done` shape is unchanged for non-opt-in clients.
-    let pld_ngram_field = if pld_enabled || ngram_enabled {
-        format!(
-            r#","pld_enabled":{},"pld_hits":{},"ngram_enabled":{}"#,
-            pld_enabled, pld_hits, ngram_enabled,
-        )
-    } else {
-        String::new()
-    };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}}}"#,
         id, generated, tok_s, prompt_tokens.len(),
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-        tau, stats.cycles, pflash_done_field, pld_ngram_field,
+        tau, stats.cycles, pflash_done_field,
     );
     let _ = stdout.flush();
 }
@@ -2656,7 +2360,6 @@ fn generate_multi(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
-    raw: bool,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -2763,7 +2466,7 @@ fn generate_multi(
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "",
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw,
+        raw: false,
     }
     .build_with_user_tokens(&q_tokens);
 
@@ -2871,6 +2574,7 @@ fn generate_multi(
         generated += 1;
         m.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[bytes_fed_to_filter..];
         bytes_fed_to_filter = all_bytes.len();
@@ -2921,6 +2625,7 @@ fn generate_multi(
                     m.seq_pos += 1;
                     m.conversation_tokens.push(t);
                     streamed_tokens.push(t);
+                    emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes = &all_bytes[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes.len();
@@ -2987,6 +2692,7 @@ fn generate_multi(
                 for &tok in &nudge_tokens[..nudge_len] {
                     m.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
+                    emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                     let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes2.len();
@@ -3057,7 +2763,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, raw: bool) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
@@ -3066,7 +2772,6 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
             budget_alert_at_tok, budget_alert_text, max_think_tokens,
-            raw,
         );
         return;
     }
@@ -3074,26 +2779,33 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
     if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
-        // PFlash + DFlash composition (PRD v1.2 PR 4): thread PflashState
-        // and PflashConfig through generate_dflash so the spec-decode
-        // path can call maybe_compress_prompt before seeding target KV.
-        // dflash_bypass_reason is surfaced in the final "done" event for
-        // observability (None when PFlash actually compressed, Some(reason)
-        // when it bypassed). dflash_alpha mirrors the AR path's behavior.
+        // PFlash + DFlash decode path is not yet wired -- the DFlash spec
+        // loop builds its own prompt token stream internally, so the
+        // generate() PFlash block below never runs. Surface this loud so
+        // an operator who set prefill_compression != off sees a clear
+        // bypass event instead of silently getting full-prefill behavior
+        // they didn't ask for. Compression-on-DFlash lands in a future
+        // phase that threads PflashState through generate_dflash().
+        let mut dflash_bypass_reason: Option<&'static str> = None;
         let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
+        if let Some(cfg) = pflash_cfg.as_ref() {
+            if cfg.mode != hipfire_arch_qwen35::pflash::PflashMode::Off {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
+                    id,
+                );
+                let _ = stdout.flush();
+                dflash_bypass_reason = Some("dflash_decode_active");
+            }
+        }
         // max_think_tokens is now enforced inside generate_dflash (it
-        // mirrors the AR path's <think>/</think> counter).
-        generate_dflash(
-            m, gpu, stdout, id, prompt, system_prompt, max_tokens,
-            max_think_tokens,
-            None,        // dflash_bypass_reason: emitted from inside generate_dflash now
-            dflash_alpha,
-            pflash_state,
-            pflash_cfg,
-            raw,
-        );
+        // mirrors the AR path's <think>/</think> counter). The "ignored
+        // on DFlash" warning that used to live here is gone -- the cap
+        // is real on both paths now.
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, dflash_bypass_reason, dflash_alpha);
         // Silence unused-variable warnings for the params we didn't need.
-        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
+        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
     }
 
@@ -3277,7 +2989,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw,
+        raw: false,
     }
     .build_with_user_tokens(&q_tokens);
 
@@ -3500,6 +3212,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             // Incremental UTF-8 + filter routing: feed only the new
             // bytes since last call, let the filter buffer any partial
             // codepoint or marker prefix until disambiguated.
@@ -3579,6 +3292,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         }
                         m.conversation_tokens.push(t);
                         streamed_tokens.push(t);
+                        emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[bytes_fed_to_filter..];
                         bytes_fed_to_filter = all_bytes.len();
@@ -3683,6 +3397,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
+                        emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         // Emit the injected token's text to stdout so the client
                         // sees it as part of the stream (will be inside <think>
                         // if that's the current state, and get stripped client-
@@ -3826,6 +3541,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
@@ -4045,6 +3761,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     for _ in 0..max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, generated - 1, t0.elapsed().as_millis() as u64);
         let text = tokenizer.decode(&[next_token]);
         let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
         let _ = stdout.flush();

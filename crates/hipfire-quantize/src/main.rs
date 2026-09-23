@@ -1312,6 +1312,101 @@ enum QuantType {
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
 }
 
+/// Per-tensor precision level assigned by the K-map pre-pass.
+/// Determines whether a tensor gets the base format, a 6-bit promotion,
+/// Q8, or F16. See docs/superpowers/specs/2026-05-08-mixed-quant-kmap-design.md.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum QuantLevel {
+    /// Store as F16 (norms, biases, 1D tensors).
+    F16,
+    /// Store as Q8_F16 (embeddings, lm_head, MoE routers).
+    Q8,
+    /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
+    Promote6,
+    /// Use the base format as-is.
+    Base,
+}
+
+/// Extract layer index from a tensor name.
+/// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
+/// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
+fn parse_layer_idx(name: &str) -> Option<usize> {
+    // Try safetensors pattern: "layers.{N}."
+    if let Some(pos) = name.find("layers.") {
+        let after = &name[pos + 7..]; // skip "layers."
+        if let Some(dot) = after.find('.') {
+            if let Ok(idx) = after[..dot].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    // Try GGUF pattern: "blk.{N}."
+    if let Some(pos) = name.find("blk.") {
+        let after = &name[pos + 4..]; // skip "blk."
+        if let Some(dot) = after.find('.') {
+            if let Ok(idx) = after[..dot].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the quantization level for a tensor based on its name, the model's
+/// layer count, and whether the model is MoE. See spec for rule ordering.
+///
+/// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
+/// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
+fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+    // Rule 1: norms, biases, 1D (GGUF path mainly)
+    if name.contains("norm") || name.contains("bias") {
+        return QuantLevel::F16;
+    }
+
+    // Rule 2: embeddings, lm_head, output projection
+    if name.contains("embed_tokens") || name.contains("token_embd")
+        || name.contains("lm_head") || name.ends_with("output.weight")
+    {
+        return QuantLevel::Q8;
+    }
+
+    // Rule 3: MoE routers
+    if is_moe
+        && (name.ends_with("mlp.gate.weight")
+            || name.contains("shared_expert_gate"))
+    {
+        return QuantLevel::Q8;
+    }
+
+    // Rule 4: MoE expert FFN weights
+    if is_moe && name.contains("mlp.experts.") {
+        return QuantLevel::Promote6;
+    }
+
+    // Rule 5: edge layers (first 2 + last 2).
+    // Dense models: FFN only — attn promotion regresses PPL (+3.1% on 27B).
+    // MoE models: attn+FFN — full promotion gives -19.8% PPL on 3.6-35B-A3B.
+    // Bench: asym4 KV, ctx=8192, wikitext-2-test. See ppl_kmap_20260508.md.
+    if n_layers > 0 {
+        if let Some(idx) = parse_layer_idx(name) {
+            if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                if is_moe {
+                    // MoE: promote all tensors in edge layers (attn + FFN)
+                    return QuantLevel::Promote6;
+                }
+                // Dense: promote FFN only — attn stays at Base
+                let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                if is_ffn {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+    }
+
+    // Rule 6: everything else
+    QuantLevel::Base
+}
+
 struct HfqTensor {
     name: String,
     quant_type: QuantType,
@@ -1865,7 +1960,7 @@ impl GgufFormat {
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io::Result<()> {
+fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
@@ -1910,6 +2005,51 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
+    // K-map setup for GGUF path
+    let is_moe = arch_id == 6;
+    let n_layers: usize = config_json
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    // Build K-map using translated (safetensors-style) names where available,
+    // falling back to raw GGUF names for untranslated tensors.
+    //
+    // K-map is gated to MoE models only. On dense models the author's own
+    // bench shows a mixed picture (PPL +1.5% to +2.5% at 2K context on 4B
+    // and 27B; PPL -4.8% on 27B at 8K context — crossover at ~3K). The
+    // ship-default is the conservative shape per maintainer directive
+    // (2026-05-08): never silently change dense quantization. Users who
+    // want K-map on dense pass `--kmap-dense` (see flag parsing below).
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+        HashMap::new()
+    } else {
+        let mut map = HashMap::new();
+        let mut counts = [0u32; 4];
+        for info in &gguf.tensors {
+            let out_name = gguf_to_safetensors_name(&info.name)
+                .unwrap_or_else(|| info.name.clone());
+            let level = kmap_resolve(&out_name, n_layers, is_moe);
+            match level {
+                QuantLevel::F16 => counts[0] += 1,
+                QuantLevel::Q8 => counts[1] += 1,
+                QuantLevel::Promote6 => counts[2] += 1,
+                QuantLevel::Base => counts[3] += 1,
+            }
+            map.insert(out_name, level);
+        }
+        if !map.is_empty() {
+            eprintln!("K-map plan ({} base, {n_layers} layers{}):",
+                format.label(),
+                if is_moe { ", MoE" } else { "" });
+            eprintln!("  F16:       {:>4} tensors", counts[0]);
+            eprintln!("  Q8:        {:>4} tensors", counts[1]);
+            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+            eprintln!("  Base:      {:>4} tensors", counts[3]);
+        }
+        map
+    };
+
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
     let mut total_params: u64 = 0;
     let mut quant_params: u64 = 0;
@@ -1936,22 +2076,39 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat) -> std::io
         let out_name = gguf_to_safetensors_name(&info.name)
             .unwrap_or_else(|| info.name.clone());
 
+        let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
+
         let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Store as F16 — convert via dequant→f32→f16 for any source dtype.
+            // Norms and 1D tensors always F16 (primary gate)
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
-        } else if is_embed {
-            // Q8 embedding (matches safetensors path's is_embed rule).
+        } else if kmap_level == QuantLevel::Q8 || is_embed {
+            // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
+            // K-map promote to 6-bit
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            quant_params += n_elements as u64;
+            match format {
+                GgufFormat::Mq4 | GgufFormat::Mq3 | GgufFormat::Mq2
+                | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq6 => {
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                }
+                GgufFormat::Hfq4 | GgufFormat::Hfq6 => {
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                }
+            }
         } else if k_dim % 256 == 0 {
-            // 256-aligned 2D weight — quantize per the chosen format.
+            // 256-aligned 2D weight — quantize per the chosen format (Base level).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             match format {
@@ -2090,12 +2247,26 @@ fn main() {
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
+    if use_mq4_mq6exp {
+        eprintln!(
+            "warning: --format mq4-mq6exp is deprecated. Use --format mq4 instead — \
+             K-map promotes expert FFNs (and edge layers) to MQ6 automatically. \
+             Proceeding as --format mq4."
+        );
+    }
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
     let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
+    let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+    // K-map gate: applies to MoE models by default. Dense models opt in
+    // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
+    // short context, win at long context — see benchmarks/results/
+    // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
+    // help ONLY (never on dense)" by default.
+    let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -2187,7 +2358,7 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -2226,6 +2397,17 @@ fn main() {
     let q8_router = is_moe || q8_router_flag;
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
+    }
+
+    // Extract layer count for K-map edge-layer promotion.
+    // Qwen3.5+ nests config under "text_config"; try both paths.
+    let n_layers: usize = config
+        .get("num_hidden_layers")
+        .or_else(|| config.get("text_config").and_then(|tc| tc.get("num_hidden_layers")))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if n_layers == 0 {
+        eprintln!("  warning: num_hidden_layers not found in config.json — edge-layer promotion disabled");
     }
 
     // Read tokenizer if present
@@ -2273,6 +2455,41 @@ fn main() {
     }
     all_tensors.sort_by_key(|(name, _)| name.to_string());
     eprintln!("Found {} tensors", all_tensors.len());
+
+    // ── K-map pre-pass ──────────────────────────────────────────────────────
+    // Build per-tensor quant level map. Gated to MoE models by default
+    // (maintainer directive 2026-05-08): K-map's dense PPL effect is mixed
+    // (+1.5% to +2.5% at 2K, -4.8% at 8K — crossover at ~3K context). To
+    // avoid silently changing dense quantization output, dense models opt
+    // out by default and require `--kmap-dense` to enable. MoE models keep
+    // the K-map default-on path because the routed-expert promotion is
+    // the headline win and the empirical regression there is tighter
+    // (+1.7% PPL at 2K, gated below the dense regression threshold).
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+        HashMap::new()
+    } else {
+        let mut map = HashMap::new();
+        let mut counts = [0u32; 4]; // F16, Q8, Promote6, Base
+        for (name, _fi) in &all_tensors {
+            let level = kmap_resolve(name, n_layers, is_moe);
+            match level {
+                QuantLevel::F16 => counts[0] += 1,
+                QuantLevel::Q8 => counts[1] += 1,
+                QuantLevel::Promote6 => counts[2] += 1,
+                QuantLevel::Base => counts[3] += 1,
+            }
+            map.insert(name.to_string(), level);
+        }
+        if !map.is_empty() {
+            eprintln!("K-map plan ({format} base, {n_layers} layers{}):",
+                if is_moe { ", MoE" } else { "" });
+            eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
+            eprintln!("  Q8:        {:>4} tensors (embed, lm_head, routers)", counts[1]);
+            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+            eprintln!("  Base:      {:>4} tensors (remaining)", counts[3]);
+        }
+        map
+    };
 
     // Quantize
     let mut hfq_tensors = Vec::new();
@@ -2347,9 +2564,14 @@ fn main() {
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
-            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp) && supports_g256;
-            let expert_hfq6 = use_hfq6 && supports_g256;
-            let expert_hfq4 = use_hfq4g256 && supports_g256;
+            // K-map: check the parent tensor name directly. The parent
+            // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
+            // so kmap_resolve rule 4 matches it. The kmap HashMap was built
+            // from all_tensors which has these parent names as keys.
+            let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
+            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
+            let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
+            let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -2453,6 +2675,54 @@ fn main() {
                     spilled_len: 0,
                 });
             } else {
+
+            // ── K-map override ──────────────────────────────────────────────
+            let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+
+            let (quantized, qt, gs, label) = if kmap_level == QuantLevel::Q8 {
+                // K-map says Q8 (embed, lm_head, router)
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if kmap_level == QuantLevel::F16 {
+                // K-map says F16 (should not normally reach here — should_quantize filters first)
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                (f16_bytes, QuantType::F16, 0u32, "F16")
+            } else if kmap_level == QuantLevel::Promote6 {
+                // K-map says promote to 6-bit
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
+                    || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
+                {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                } else if (use_hfq4g256 || use_hfq3g256 || use_hfq3g128
+                    || use_hfq2g256 || use_hfq2g128) && k_dim % 256 == 0
+                {
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                } else if use_mq6g256 && k_dim % 256 == 0 {
+                    // Already 6-bit MQ — no-op promotion
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                } else if use_hfq6 && k_dim % 256 == 0 {
+                    // Already 6-bit HFQ — no-op promotion
+                    let q = quantize_hfq6g256(&f32_data);
+                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                } else {
+                    // Non-256-aligned fallback: Q8
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                }
+            } else {
+            // QuantLevel::Base — existing format-specific logic below
+
             // Choose quant format per tensor
             let this_q8 = if use_q4k_all {
                 false // everything Q4_K
@@ -2470,7 +2740,7 @@ fn main() {
             // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
             let is_embed = name.contains("embed_tokens");
 
-            let (quantized, qt, gs, label) = if use_hfq_mixed {
+            if use_hfq_mixed {
                 // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
                 let is_ffn = name.contains("mlp.") || name.contains("ffn");
                 if !is_ffn {
@@ -2670,7 +2940,8 @@ fn main() {
             } else {
                 let q = quantize_q4f16_g64(&f32_data);
                 (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
-            };
+            }
+            }; // end K-map outer if-else
 
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
@@ -2695,7 +2966,8 @@ fn main() {
                         total_quant_error += err as f64;
                         max_quant_error = max_quant_error.max(err);
                     }
-                } else if this_q8 || this_q4as8 {
+                } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
+                    // NB: string match because this_q8/this_q4as8 are scoped inside Base block.
                     let off = b * 34;
                     let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
                     for i in 0..(end - start) {
@@ -2856,4 +3128,155 @@ fn main() {
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_layer_idx_safetensors_dense() {
+        assert_eq!(parse_layer_idx("model.layers.0.self_attn.q_proj.weight"), Some(0));
+        assert_eq!(parse_layer_idx("model.layers.63.mlp.gate_proj.weight"), Some(63));
+    }
+
+    #[test]
+    fn parse_layer_idx_safetensors_moe() {
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.5.mlp.experts.0.gate_up_proj.weight"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn parse_layer_idx_gguf() {
+        assert_eq!(parse_layer_idx("blk.0.attn_q.weight"), Some(0));
+        assert_eq!(parse_layer_idx("blk.31.ffn_gate.weight"), Some(31));
+    }
+
+    #[test]
+    fn parse_layer_idx_no_match() {
+        assert_eq!(parse_layer_idx("token_embd.weight"), None);
+        assert_eq!(parse_layer_idx("output.weight"), None);
+    }
+
+    #[test]
+    fn kmap_norms_are_f16() {
+        assert_eq!(kmap_resolve("model.layers.0.input_layernorm.weight", 64, false), QuantLevel::F16);
+        assert_eq!(kmap_resolve("model.layers.30.post_attention_layernorm.weight", 64, false), QuantLevel::F16);
+    }
+
+    #[test]
+    fn kmap_embeds_are_q8() {
+        assert_eq!(kmap_resolve("model.embed_tokens.weight", 64, false), QuantLevel::Q8);
+        assert_eq!(kmap_resolve("lm_head.weight", 64, false), QuantLevel::Q8);
+        assert_eq!(kmap_resolve("output.weight", 64, false), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn kmap_moe_router_q8() {
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.5.mlp.gate.weight", 64, true),
+            QuantLevel::Q8
+        );
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.5.mlp.shared_expert_gate.weight", 64, true),
+            QuantLevel::Q8
+        );
+    }
+
+    #[test]
+    fn kmap_moe_router_not_promoted_on_dense() {
+        // On a dense model, mlp.gate.weight is not a router — falls to edge/base
+        assert_ne!(
+            kmap_resolve("model.layers.30.mlp.gate.weight", 64, false),
+            QuantLevel::Q8
+        );
+    }
+
+    #[test]
+    fn kmap_moe_expert_ffn_promote6() {
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, true),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve("model.language_model.layers.30.mlp.experts.5.down_proj.weight", 64, true),
+            QuantLevel::Promote6
+        );
+    }
+
+    #[test]
+    fn kmap_edge_layers_dense_ffn_only() {
+        // Dense: FFN in edge layers — promoted
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        // Dense: attn in edge layers — NOT promoted
+        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.63.self_attn.v_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.0.linear_attn.in_proj_qkv.weight", 64, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_moe_attn_and_ffn() {
+        // MoE: both attn and FFN in edge layers — promoted
+        assert_eq!(kmap_resolve("model.language_model.layers.0.self_attn.q_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.mlp.gate_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.63.self_attn.v_proj.weight", 64, true), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn kmap_middle_layers_base() {
+        assert_eq!(kmap_resolve("model.layers.2.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.30.mlp.gate_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.61.mlp.down_proj.weight", 64, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_small_model_24_layers() {
+        // 24 layers: edge = 0,1 and 22,23
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 24, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("model.layers.22.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.23.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn kmap_n_layers_zero_disables_edge() {
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 0, false), QuantLevel::Base);
+    }
+
+    #[test]
+    fn kmap_edge_layers_tiny_model_3_layers() {
+        // 3 layers: first-2 = {0,1}, last-2 = {1,2}. All layers promoted.
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn kmap_expert_not_promoted_on_dense() {
+        // "mlp.experts." in name but is_moe=false — should NOT trigger rule 4
+        assert_eq!(
+            kmap_resolve("model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, false),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_gguf_names() {
+        // GGUF edge-layer FFN (dense) — promoted
+        assert_eq!(kmap_resolve("blk.0.ffn_gate.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote6);
+        // GGUF edge-layer attn (dense) — NOT promoted
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Base);
+        // GGUF edge-layer attn (MoE) — promoted
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote6);
+        // GGUF middle-layer — base
+        assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
+    }
 }

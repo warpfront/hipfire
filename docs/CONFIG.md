@@ -325,12 +325,4 @@ HIPFIRE_PREFILL_THRESHOLD=32768     # PFlash auto-mode source-token cutoff
 HIPFIRE_PREFILL_KEEP_RATIO=0.05     # PFlash kept fraction in (0, 1]
 HIPFIRE_PREFILL_DRAFTER=~/.hipfire/models/qwen3-0.6b.hf4
 HIPFIRE_PREFILL_PROFILE=1           # PFlash per-stage timing logs
-
-# DFlash hetero / spec-decode levers (daemon-only)
-HIPFIRE_DFLASH_DRAFTER_DEVICE=1     # pin DFlash drafter to HIP[N] (hetero PP+DFlash)
-HIPFIRE_DAEMON_PLD=1                # enable Goose §4.3 PLD spine (daemon DFlash path)
-HIPFIRE_DAEMON_PLD_CONSENSUS=2      # PLD bypass-mode consensus gate (default 2 = paper)
-HIPFIRE_DAEMON_PLD_CHAIN=5          # PLD bypass-mode min spine length (default 5)
-HIPFIRE_DAEMON_NGRAM=1              # enable rolling bigram cache override
-HIPFIRE_DAEMON_NGRAM_MIN_COUNT=3    # min count before bigram override fires
 ```

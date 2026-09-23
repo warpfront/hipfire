@@ -1,0 +1,87 @@
+
+extern "C" __attribute__((device)) float __ocml_rsqrt_f32(float);
+extern "C" __attribute__((device)) float __ocml_sqrt_f32(float);
+extern "C" __attribute__((device)) float __ocml_exp_f32(float);
+extern "C" __attribute__((device)) float __ocml_log_f32(float);
+extern "C" __attribute__((device)) float __ocml_fabs_f32(float);
+extern "C" __attribute__((device)) float __ocml_floor_f32(float);
+extern "C" __attribute__((device)) float __ocml_fmax_f32(float, float);
+extern "C" __attribute__((device)) float __ocml_fmin_f32(float, float);
+extern "C" __attribute__((device)) float __ocml_pow_f32(float, float);
+extern "C" __attribute__((device)) float __ocml_cos_f32(float);
+extern "C" __attribute__((device)) float __ocml_sin_f32(float);
+static inline __attribute__((device)) float rsqrtf(float x) { return __ocml_rsqrt_f32(x); }
+static inline __attribute__((device)) float sqrtf(float x) { return __ocml_sqrt_f32(x); }
+static inline __attribute__((device)) float expf(float x) { return __ocml_exp_f32(x); }
+static inline __attribute__((device)) float logf(float x) { return __ocml_log_f32(x); }
+static inline __attribute__((device)) float fabsf(float x) { return __ocml_fabs_f32(x); }
+static inline __attribute__((device)) float floorf(float x) { return __ocml_floor_f32(x); }
+static inline __attribute__((device)) float fmaxf(float a, float b) { return __ocml_fmax_f32(a, b); }
+static inline __attribute__((device)) float fminf(float a, float b) { return __ocml_fmin_f32(a, b); }
+static inline __attribute__((device)) float powf(float a, float b) { return __ocml_pow_f32(a, b); }
+static inline __attribute__((device)) float cosf(float x) { return __ocml_cos_f32(x); }
+static inline __attribute__((device)) float sinf(float x) { return __ocml_sin_f32(x); }
+static inline __attribute__((device)) double max(double a, double b) { return a > b ? a : b; }
+static inline __attribute__((device)) float max(float a, float b) { return a > b ? a : b; }
+static inline __attribute__((device)) int max(int a, int b) { return a > b ? a : b; }
+static inline __attribute__((device)) int min(int a, int b) { return a < b ? a : b; }
+
+#include <hip/hip_runtime.h>
+
+// Batched partial/interleaved RoPE. Counterpart of rope_partial_interleaved_f32
+// for prefill batching — each batch row has its own absolute position read
+// from a positions[] array.
+//
+// Grid: [ceil(n_rot/2 / block), batch_size, 1]
+// Each thread handles one (pair, batch) combination: rotates dims (2p, 2p+1)
+// of every Q and K head for batch row b, using angle = positions[b] * freq.
+//
+// Byte-exact with rope_partial_interleaved_f32 for batch_size=1 + pos=positions[0].
+// Q/K are [batch_size × n_heads × head_dim] row-major.
+
+extern "C" __global__ void rope_partial_interleaved_batched_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const int* __restrict__ positions,
+    int n_heads_q,
+    int n_heads_k,
+    int head_dim,
+    int n_rot,          // number of dims to rotate (64 for Qwen3.5)
+    float freq_base,
+    int batch_size
+) {
+    int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.y;
+    int n_pairs = n_rot / 2;
+    if (pair >= n_pairs || b >= batch_size) return;
+
+    int pos = positions[b];
+
+    // Interleaved: pair i rotates dims (2*i, 2*i+1)
+    int d0 = pair * 2;
+    int d1 = pair * 2 + 1;
+
+    float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)n_rot);
+    float angle = (float)pos * freq;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+
+    int q_stride = n_heads_q * head_dim;
+    int k_stride = n_heads_k * head_dim;
+
+    for (int h = 0; h < n_heads_q; h++) {
+        int base = b * q_stride + h * head_dim;
+        float v0 = q[base + d0];
+        float v1 = q[base + d1];
+        q[base + d0] = v0 * cos_a - v1 * sin_a;
+        q[base + d1] = v0 * sin_a + v1 * cos_a;
+    }
+
+    for (int h = 0; h < n_heads_k; h++) {
+        int base = b * k_stride + h * head_dim;
+        float v0 = k[base + d0];
+        float v1 = k[base + d1];
+        k[base + d0] = v0 * cos_a - v1 * sin_a;
+        k[base + d1] = v0 * sin_a + v1 * cos_a;
+    }
+}

@@ -15,10 +15,9 @@
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
-use hipfire_runtime::multi_gpu;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::tokenizer::Tokenizer;
-use hip_bridge::{DeviceBuffer, HipResult, PinnedHostBuffer};
+use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1065,40 +1064,6 @@ pub struct VerifyScratch {
     /// constructor — `forward_prefill_batch` then falls back to allocating
     /// its own scratch.
     pub prefill_batch: Option<qwen35::PrefillBatchScratch>,
-    /// Cross-card staging on target_gpu for hetero PP+DFlash (PRD v1.2 PR-A).
-    /// Phase 2 of `spec_step_dflash` writes B target embeddings here, then
-    /// `cross_card_copy_at`s them to `draft_scratch.x` on the drafter device.
-    /// Shape `[max_n × dim]` f32 = same footprint as `final_hidden`.
-    /// Unused (still allocated) on the homogeneous single-Gpu path.
-    pub embd_staging: GpuTensor,
-    /// Cross-card staging on target_gpu for hetero PP+DFlash (PRD v1.2 PR-A).
-    /// Phase 5 of `spec_step_dflash` ships drafter hidden rows
-    /// `draft_scratch.x[h..]` into this buffer, then runs target's lm_head
-    /// GEMM against it. Shape `[max_n × dim]` f32. Unused on the homogeneous
-    /// path; the GEMM reads `draft_scratch.x` directly there.
-    pub draft_hidden_staging: GpuTensor,
-    /// Cross-card staging on target_gpu for Phase 9's `target_hidden`
-    /// scatter (PRD v1.2 PR-A coalesced variant). Holds the interleaved
-    /// `[max_n × num_extract × hidden]` f32 block produced by the
-    /// same-device scatter from `hidden_rb.layer_bufs`, before a single
-    /// peer copy ships it to the drafter's `draft_scratch.target_hidden`.
-    /// Replaces the prior per-(row, ext) cross_card_copy_at loop (~80 calls
-    /// per cycle at 27B) with one D2D scatter + one peer copy. Unused on
-    /// the homogeneous path.
-    pub hidden_scatter_staging: GpuTensor,
-    /// Pinned-host-mapped bounce buffer for the hetero PP+DFlash
-    /// cross-card transfers (PRD v1.2 PR-A pinned-host fast path).
-    /// Replaces `hipMemcpyPeer`'s implicit unpinned-bounce-buffer route
-    /// (~64 MB/s effective on hipx iGPU↔eGPU per `peer_smoke`) with two
-    /// explicit DMA legs through this pinned buffer, each at the eGPU's
-    /// hardware-native rate (~5 GB/s TB3). Sized to the largest cross-
-    /// card payload — the Phase 9 hidden scatter at
-    /// `max_n × num_extract × draft_hidden × 4` bytes — reused for the
-    /// smaller Phase 2 / Phase 5 transfers within the cycle.
-    /// Allocated unconditionally in `VerifyScratch::new`; ~1.6 MB max
-    /// at 27B (max_n=16, ne=5, hidden=5120). Unused on the homogeneous
-    /// path.
-    pub xcard_pinned: PinnedHostBuffer,
 }
 
 impl VerifyScratch {
@@ -1108,8 +1073,6 @@ impl VerifyScratch {
         dim: usize,
         vocab: usize,
         hidden_k: usize,
-        num_extract: usize,
-        draft_hidden: usize,
     ) -> HipResult<Self> {
         Ok(Self {
             max_n,
@@ -1121,13 +1084,6 @@ impl VerifyScratch {
             rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
             prefill_batch: None,
-            embd_staging: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
-            draft_hidden_staging: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
-            hidden_scatter_staging: gpu.alloc_tensor(
-                &[max_n * num_extract * draft_hidden],
-                rdna_compute::DType::F32,
-            )?,
-            xcard_pinned: gpu.hip.host_malloc(max_n * num_extract * draft_hidden * 4)?,
         })
     }
 
@@ -1142,11 +1098,9 @@ impl VerifyScratch {
         dim: usize,
         vocab: usize,
         hidden_k: usize,
-        num_extract: usize,
-        draft_hidden: usize,
         config: &qwen35::Qwen35Config,
     ) -> HipResult<Self> {
-        let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k, num_extract, draft_hidden)?;
+        let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
         s.prefill_batch = Some(qwen35::PrefillBatchScratch::new(gpu, config, max_n)?);
         Ok(s)
     }
@@ -1156,10 +1110,6 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
         let _ = gpu.free_tensor(self.argmax);
-        let _ = gpu.free_tensor(self.embd_staging);
-        let _ = gpu.free_tensor(self.draft_hidden_staging);
-        let _ = gpu.free_tensor(self.hidden_scatter_staging);
-        let _ = gpu.hip.host_free(self.xcard_pinned);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
@@ -1379,51 +1329,6 @@ impl HiddenStateRingBuffer {
                     &self.layer_bufs[ei].buf, 0,
                     &self.staging_bufs[ei].buf, first * row_bytes,
                     (n - first) * row_bytes,
-                )?;
-            }
-        }
-        self.head = (head + n) % max_pos;
-        self.written += n;
-        Ok(())
-    }
-
-    /// Path D0a: stream-async variant of `commit_staging_to_ring`.
-    /// Same scatter geometry, but uses `memcpy_dtod_async_at` on the supplied
-    /// stream and skips the `stream_synchronize` pre-flight. The caller is
-    /// responsible for ordering writes against the consumer via HIP events
-    /// (path_d.md §D3b: pre_commit_evt records the verify forward's last
-    /// staging write before this commit runs on `verify_stream`).
-    pub fn commit_staging_to_ring_on_stream(
-        &mut self,
-        gpu: &mut Gpu,
-        n: usize,
-        stream: &hip_bridge::Stream,
-    ) -> HipResult<()> {
-        let row_bytes = self.hidden_dim * 4;
-        let head = self.head;
-        let max_pos = self.max_positions;
-
-        for ei in 0..self.layer_bufs.len() {
-            if head + n <= max_pos {
-                gpu.hip.memcpy_dtod_async_at(
-                    &self.layer_bufs[ei].buf, head * row_bytes,
-                    &self.staging_bufs[ei].buf, 0,
-                    n * row_bytes,
-                    stream,
-                )?;
-            } else {
-                let first = max_pos - head;
-                gpu.hip.memcpy_dtod_async_at(
-                    &self.layer_bufs[ei].buf, head * row_bytes,
-                    &self.staging_bufs[ei].buf, 0,
-                    first * row_bytes,
-                    stream,
-                )?;
-                gpu.hip.memcpy_dtod_async_at(
-                    &self.layer_bufs[ei].buf, 0,
-                    &self.staging_bufs[ei].buf, first * row_bytes,
-                    (n - first) * row_bytes,
-                    stream,
                 )?;
             }
         }
@@ -1912,31 +1817,7 @@ pub fn verify_dflash_block(
 ) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
-        verify_scratch, false,
-    )
-}
-
-/// Path D3a: variant of [`verify_dflash_block`] that returns BEFORE
-/// `hidden_rb.commit_staging_to_ring`. Pipelined orchestration (D3b)
-/// uses this so it can record `pre_commit_evt` between the verify
-/// forward and the commit, then run the commit on a chosen stream
-/// via `commit_staging_to_ring_on_stream`. Caller is responsible for
-/// the final commit; failing to commit leaves the staging buffer's
-/// rows un-scattered into the ring (visible as missing recent
-/// hidden states on the next draft).
-pub fn verify_dflash_block_no_commit(
-    gpu: &mut Gpu,
-    target: &mut ModelSlot,
-    draft_tokens: &[u32],
-    start_pos: usize,
-    hidden_rb: &mut HiddenStateRingBuffer,
-    gdn_tape: Option<&mut GdnTape>,
-    want_full_logits: bool,
-    verify_scratch: &VerifyScratch,
-) -> HipResult<DflashVerifyOutput> {
-    verify_dflash_block_inner(
-        gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
-        verify_scratch, true,
+        verify_scratch,
     )
 }
 
@@ -1966,7 +1847,7 @@ pub fn verify_dflash_block_tree(
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits,
         Some(tree_verify),
-        verify_scratch, false,
+        verify_scratch,
     )
 }
 
@@ -1980,7 +1861,6 @@ fn verify_dflash_block_inner(
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
     verify_scratch: &VerifyScratch,
-    skip_internal_commit: bool,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2173,11 +2053,7 @@ fn verify_dflash_block_inner(
     // those rows at the current head and advances head by b. Under the
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
-    //
-    // Path D3a: when `skip_internal_commit=true`, the pipelined orchestrator
-    // commits explicitly on its chosen stream after recording pre_commit_evt
-    // — see verify_dflash_block_no_commit + path_d.md §D3b.
-    if verify_graph_ok && batch_result.is_ok() && !skip_internal_commit {
+    if verify_graph_ok && batch_result.is_ok() {
         hidden_rb.commit_staging_to_ring(gpu, b)?;
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
@@ -2208,7 +2084,9 @@ fn verify_dflash_block_inner(
         rdna_compute::DType::Q8_0
         | rdna_compute::DType::HFQ4G256
         | rdna_compute::DType::MQ4G256
-        | rdna_compute::DType::MQ3G256 => true,
+        | rdna_compute::DType::MQ3G256
+        | rdna_compute::DType::HFQ6G256
+        | rdna_compute::DType::MQ6G256 => true,
         _ => false,
     };
 
@@ -2216,7 +2094,7 @@ fn verify_dflash_block_inner(
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
         // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=16 in the kernel, so
         // tree-verify blocks exceeding 16 (budget + 1 > 16) need chunking.
-        // MQ4/HFQ4 kernels have no such cap — they take the single-shot path.
+        // MQ4/HFQ4/HFQ6/MQ6 kernels have no such cap — they take the single-shot path.
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
                 const Q8_LM_MAX: usize = 16;
@@ -2254,6 +2132,23 @@ fn verify_dflash_block_inner(
                 let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
                 gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
+                    &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
+                )?;
+            }
+            rdna_compute::DType::HFQ6G256 => {
+                // Phase A.4: gfx906 dp4a path for HFQ6 lm_head batched.
+                gpu.gemm_hfq6g256_batched_lmhead(
+                    &w_out.buf, &final_hidden, &logits_batch, w_out.m, w_out.k, b,
+                )?;
+            }
+            rdna_compute::DType::MQ6G256 => {
+                // Phase A.4: rotate-then-batched lm_head for MQ6.
+                assert!(b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                    "verify_scratch.rot undersized for MQ6 lm_head: b*k={} > max_n*hidden_k={}",
+                    b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
+                let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+                gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
+                gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
                 )?;
             }
@@ -2367,12 +2262,6 @@ pub fn scatter_hidden_block_to_interleaved(
     block_size: usize,
     n_rows: usize,
 ) -> HipResult<()> {
-    // Hetero-PP correctness: drafter `Gpu::init_with_device(N)` leaves
-    // HIP's thread-local current_device set to the drafter. Sync
-    // `hipMemcpyDtoD` below resolves through that thread-local, not
-    // through the buffer's owning device, so we re-bind the target
-    // before issuing any same-card D2D. Solo path is a no-op.
-    gpu.bind_thread()?;
     assert!(n_rows <= block_size, "scatter: n_rows {n_rows} > block_size {block_size}");
     let num_extract = hidden_rb.extract_layers.len();
     let hidden = hidden_rb.hidden_dim;
@@ -2399,202 +2288,6 @@ pub fn scatter_hidden_block_to_interleaved(
             )?;
         }
     }
-    Ok(())
-}
-
-/// Path D0b: stream-async scatter that uses a caller-supplied
-/// `head_snapshot` instead of `hidden_rb.head`. Decouples the read
-/// from live state so the draft side can scatter from a stable
-/// position while verify advances head on a different stream
-/// (path_d.md §2.1: snap = ring head/written taken before any
-/// verify-leg work). Issues `memcpy_dtod_async_at` on the supplied
-/// stream — caller orders against verify's commit via HIP events.
-///
-/// `head_snapshot` is the captured `hidden_rb.head` at cycle entry.
-/// `block_size` and the snap-anchored `start_slot` together address
-/// the same B rows that the synchronous variant would read at the
-/// time of the snapshot. Caller must guarantee that the
-/// `block_size` rows ending at `head_snapshot` are actually present
-/// in the ring (path_d.md §2.1 covers this with `target_hidden_abs_positions`
-/// snapshot + CASK eviction deferral).
-pub fn scatter_hidden_block_to_interleaved_on_stream(
-    gpu: &Gpu,
-    hidden_rb: &HiddenStateRingBuffer,
-    dst: &GpuTensor,
-    dst_row_offset: usize,
-    block_size: usize,
-    n_rows: usize,
-    head_snapshot: usize,
-    stream: &hip_bridge::Stream,
-) -> HipResult<()> {
-    gpu.bind_thread()?;
-    assert!(n_rows <= block_size, "scatter_on_stream: n_rows {n_rows} > block_size {block_size}");
-    let num_extract = hidden_rb.extract_layers.len();
-    let hidden = hidden_rb.hidden_dim;
-    let max_pos = hidden_rb.max_positions;
-    let row_bytes = hidden * 4;
-    let start_slot = (head_snapshot + max_pos - block_size) % max_pos;
-
-    for r in 0..n_rows {
-        let slot = (start_slot + r) % max_pos;
-        let dst_row = dst_row_offset + r;
-        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
-        for ext in 0..num_extract {
-            let src_offset_bytes = slot * row_bytes;
-            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
-            gpu.hip.memcpy_dtod_async_at(
-                &dst.buf,
-                dst_offset_bytes,
-                &hidden_rb.layer_bufs[ext].buf,
-                src_offset_bytes,
-                row_bytes,
-                stream,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Path D3b: stream-async scatter that reads from `hidden_rb.staging_bufs`
-/// (contiguous, written by the verify forward) instead of `layer_bufs` (the
-/// ring, written by the subsequent commit). Lets commit-staging-to-ring
-/// run on `verify_stream` concurrent with this scatter on `draft_stream`
-/// without a data dependency between them — both READ staging while
-/// writing to disjoint destinations (ring vs draft_scratch.target_hidden).
-///
-/// `n_rows` selects the prefix of the staged block to scatter (typically
-/// `accept_len + 1` from the calling cycle). The staged rows are at
-/// `staging_bufs[ext][0..max_batch]`; the verify forward wrote rows
-/// `[0..b]` so any `n_rows ≤ b` is valid.
-pub fn scatter_hidden_block_from_staging_on_stream(
-    gpu: &Gpu,
-    hidden_rb: &HiddenStateRingBuffer,
-    dst: &GpuTensor,
-    dst_row_offset: usize,
-    n_rows: usize,
-    stream: &hip_bridge::Stream,
-) -> HipResult<()> {
-    gpu.bind_thread()?;
-    assert!(n_rows <= hidden_rb.max_batch,
-        "scatter_from_staging: n_rows {n_rows} > max_batch {}", hidden_rb.max_batch);
-    let num_extract = hidden_rb.extract_layers.len();
-    let hidden = hidden_rb.hidden_dim;
-    let row_bytes = hidden * 4;
-
-    for r in 0..n_rows {
-        let dst_row = dst_row_offset + r;
-        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
-        for ext in 0..num_extract {
-            let src_offset_bytes = r * row_bytes;
-            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
-            gpu.hip.memcpy_dtod_async_at(
-                &dst.buf,
-                dst_offset_bytes,
-                &hidden_rb.staging_bufs[ext].buf,
-                src_offset_bytes,
-                row_bytes,
-                stream,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Cross-card variant of [`scatter_hidden_block_to_interleaved`] for the
-/// hetero PP+DFlash path (PRD v1.2 PR-A): `hidden_rb` lives on
-/// `target_gpu`, `dst` lives on `drafter_gpu`.
-///
-/// Coalesced + pinned-host path: same-device D2D scatter into `staging`
-/// on `target_gpu` (cheap — same kernel, ~µs per row), then a single
-/// pinned-host-mediated cross-card copy of the whole
-/// `n_rows × num_extract × hidden × 4` byte block via
-/// [`multi_gpu::cross_card_copy_via_pinned`]. Replaces the prior
-/// per-(row, ext) cross-card loop (~80 calls per cycle at 27B) AND the
-/// `hipMemcpyPeer` bounce-buffer fallback that capped throughput at
-/// ~64 MB/s on hipx iGPU↔eGPU.
-///
-/// Per-cycle cost at typical 27B shapes (ne=5, B=16, hidden=5120,
-/// rows_to_keep=12): ~1.2 MB shipped via pinned-host DMA. The target-
-/// side `staging` GpuTensor (~1.6 MB max) is allocated once at
-/// VerifyScratch construction; the pinned host bounce buffer
-/// (`xcard_pinned`) is also a VerifyScratch field.
-pub fn scatter_hidden_block_to_interleaved_cross_card(
-    target_gpu: &Gpu,
-    drafter_gpu: &Gpu,
-    hidden_rb: &HiddenStateRingBuffer,
-    staging: &GpuTensor,
-    pinned: &PinnedHostBuffer,
-    dst: &GpuTensor,
-    dst_row_offset: usize,
-    block_size: usize,
-    n_rows: usize,
-) -> HipResult<()> {
-    assert!(n_rows <= block_size, "scatter_cross_card: n_rows {n_rows} > block_size {block_size}");
-    let num_extract = hidden_rb.extract_layers.len();
-    let hidden = hidden_rb.hidden_dim;
-    let row_bytes = hidden * 4;
-
-    // HIPFIRE_HETERO_NO_COALESCE=1 forces the per-(row, ext) fallback so we
-    // can A/B the f50121f coalesce on a given fabric. The coalesce was null
-    // on TB5 (fabric-bound); on faster fabrics with lower per-call latency
-    // floor (PCIe gen1+) the per-call HIP launch overhead may become the
-    // larger fraction and the coalesce wins. Default OFF — coalesced path
-    // is the production default.
-    if std::env::var("HIPFIRE_HETERO_NO_COALESCE").ok().as_deref() == Some("1") {
-        let max_pos = hidden_rb.max_positions;
-        let head = hidden_rb.head;
-        let written = hidden_rb.written;
-        assert!(block_size <= written,
-            "scatter_cross_card no-coalesce: block_size {block_size} > written {written}");
-        let start_slot = (head + max_pos - block_size) % max_pos;
-        for r in 0..n_rows {
-            let slot = (start_slot + r) % max_pos;
-            let dst_row = dst_row_offset + r;
-            let dst_row_base_bytes = dst_row * num_extract * row_bytes;
-            for ext in 0..num_extract {
-                let src_offset_bytes = slot * row_bytes;
-                let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
-                let evt = multi_gpu::cross_card_copy_at(
-                    target_gpu,
-                    drafter_gpu,
-                    &hidden_rb.layer_bufs[ext].buf,
-                    src_offset_bytes,
-                    &dst.buf,
-                    dst_offset_bytes,
-                    row_bytes,
-                )?;
-                multi_gpu::cross_card_wait(drafter_gpu, evt)?;
-            }
-        }
-        return Ok(());
-    }
-
-    // Step 1: same-device D2D scatter into `staging` on target_gpu.
-    // Writes contiguous rows starting at staging row 0 (independent of
-    // `dst_row_offset`, which addresses the drafter-side dst layout).
-    scatter_hidden_block_to_interleaved(
-        target_gpu,
-        hidden_rb,
-        staging,
-        /* dst_row_offset = */ 0,
-        block_size,
-        n_rows,
-    )?;
-
-    // Step 2: pinned-host-mediated cross-card copy of the staged rows.
-    let n_bytes = n_rows * num_extract * row_bytes;
-    let dst_offset_bytes = dst_row_offset * num_extract * row_bytes;
-    multi_gpu::cross_card_copy_via_pinned(
-        target_gpu,
-        drafter_gpu,
-        pinned,
-        &staging.buf,
-        0,
-        &dst.buf,
-        dst_offset_bytes,
-        n_bytes,
-    )?;
-
     Ok(())
 }
 
@@ -2709,7 +2402,6 @@ pub fn download_hidden_block(
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
-    drafter_gpu_opt: Option<&mut Gpu>,
     target: &mut ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
@@ -2732,17 +2424,6 @@ pub fn spec_step_dflash(
     repeat_penalty: f32,
     repeat_window: usize,
 ) -> HipResult<SpecStepResult> {
-    // Hetero PP+DFlash (PRD v1.2 PR-A): when `drafter_gpu_opt` is `Some`,
-    // `gpu` is the target device and `drafter_gpu_opt` holds the dedicated
-    // drafter device (HIPFIRE_DFLASH_DRAFTER_DEVICE=N at load time). All
-    // drafter-side work (DflashWeights, DflashScratch, draft_forward) runs
-    // on `drafter_gpu_opt`; everything else (target.weights, hidden_rb,
-    // target_snap, verify_scratch, gdn_tape, KV cache) stays on `gpu`.
-    // Phases 2 / 5 / 9 stage the cross-card transfers via `verify_scratch`
-    // staging buffers + `multi_gpu::cross_card_copy_at`. Single-Gpu callers
-    // pass `None` and hit the byte-identical fast paths.
-    let mut drafter_gpu_opt = drafter_gpu_opt;
-    let hetero = drafter_gpu_opt.is_some();
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
@@ -2763,62 +2444,9 @@ pub fn spec_step_dflash(
     // Ensure active_stream is set before any draft/verify work so memset_async
     // and stream-ordered launches have a non-null stream to ride on. Without
     // this, the lm_head pre-zero memsets in dispatch.rs:4475/4545 fall through
-    // to the sync hipMemset path (~46 hot calls/cycle on 27B). Mirror the
-    // initialization onto the drafter device in hetero mode so its
-    // stream-ordered draft_forward dispatches don't silently fall back.
+    // to the sync hipMemset path (~46 hot calls/cycle on 27B).
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
-    }
-    if let Some(d) = drafter_gpu_opt.as_deref_mut() {
-        if d.active_stream.is_none() {
-            // hipStreamCreate creates the stream on the current HIP device.
-            // After prefill the calling thread is still bound to `gpu`'s
-            // device, so without binding to the drafter first the stream
-            // would belong to the target — and any drafter kernel launch
-            // would fail with `hipModuleLaunchKernel: invalid resource
-            // handle (400)`. bind_thread() switches the thread to drafter
-            // before the create.
-            d.bind_thread()?;
-            d.active_stream = Some(d.hip.stream_create()?);
-        }
-    }
-
-    // Path D3b cross-cycle async: if the previous cycle ran the pipelined
-    // branch and stashed a scatter_done_evt in `gpu.pending_scatter_evt`,
-    // wait it on verify_stream NOW so the upcoming draft_forward sees a
-    // consistent draft_scratch.target_hidden. Queue-side wait — does NOT
-    // block the CPU. Replaces the prior end-of-cycle stream_synchronize
-    // (which forced CPU-side serialization). Solo-only — hetero never
-    // populates this field.
-    if let Some(evt) = gpu.pending_scatter_evt.take() {
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.stream_wait_event(stream, &evt)?;
-        }
-        gpu.hip.event_destroy(evt)?;
-    }
-
-    // Path D3b speculative prefetch: take any pending predraft from the
-    // previous cycle's tail. Hit if expected_(position, seed_token, b)
-    // match the new cycle's actuals. On hit, predraft_predictions is the
-    // (B-1)-token list to use as drafted, and the predraft_done event
-    // orders verify_stream's read of draft_scratch.x against the
-    // predraft's writes on draft_stream. On miss, discard the cache and
-    // run Phase 2-5 inline.
-    let mut predraft_hit = false;
-    let mut predraft_predictions: Vec<u32> = Vec::new();
-    if let Some(pd) = gpu.pending_predraft.take() {
-        let match_ok = pd.expected_position == position
-            && pd.expected_seed_token == seed_token
-            && pd.expected_b == b
-            && pd.predictions.len() == b - 1;
-        if match_ok {
-            if let Some(stream) = gpu.active_stream.as_ref() {
-                gpu.hip.stream_wait_event(stream, &pd.event)?;
-            }
-            predraft_predictions = pd.predictions;
-            predraft_hit = true;
-        }
-        gpu.hip.event_destroy(pd.event)?;
     }
 
     assert!(b >= 2, "dflash block size must be ≥ 2");
@@ -2872,38 +2500,6 @@ pub fn spec_step_dflash(
         && std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1");
     let host_path_active = rp_active || ngram_block_active;
 
-    // PR 5 probe-scoped event scaffolding: declared at outer scope so the
-    // assignment after Phase 4 (inside the DFlash-else branch) and the
-    // destroy at function end can both reach it. PLD bypass leaves
-    // `probe_event = None`, which is correct — no Phase 4 draft work to
-    // record an event against.
-    let pipeline_probe_on = std::env::var("HIPFIRE_DFLASH_PIPELINE")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let mut probe_event: Option<hip_bridge::Event> = None;
-
-    // Path D3b: pipeline_mode routes verify's commit_staging_to_ring onto
-    // the verify stream and Phase-9 scatter onto a dedicated draft_stream
-    // (reading from the contiguous post-forward staging instead of the
-    // ring) so the two D2D copy chains can hit different SDMA queues
-    // concurrently. Solo mode only — hetero already pays the cross-card
-    // pinned-host bounce on its own stream chain (PRD v1.2 PR-A) and
-    // doesn't benefit from same-device draft_stream reuse. PLD bypass
-    // (no Phase 4 draft) and ctx_slice CPU shadow path also skip
-    // pipelining since neither writes hidden_rb.staging through the
-    // graph-eligible verify path that this commit/scatter restructure
-    // depends on.
-    //
-    // Bypass conditions match path_d.md §D3b warnings + this codebase's
-    // realities: hetero, PLD, ctx_slice, cycle 0 (probe_event is None ⇒
-    // implicit). The flag here is computed; later branches read it.
-    let pipeline_mode =
-        pipeline_probe_on && pld_spine.is_none() && !hetero && ctx_slice.is_none();
-    if pipeline_mode {
-        gpu.init_pipeline_streams()?;
-    }
-
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
         // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
@@ -2924,89 +2520,27 @@ pub fn spec_step_dflash(
                 draft_probs_at_drafted.push(1.0);
             }
         }
-    } else if predraft_hit {
-        // Path D3b speculative prefetch hit: cycle N's tail already ran
-        // Phase 2-5 (embedding lookup → draft_forward → target lm_head →
-        // argmax download) on `draft_stream` for cycle N+1's predicted
-        // (position, seed_token, b). The predraft_done event was waited
-        // at cycle entry so draft_scratch.x is consistent on
-        // verify_stream. Skip the entire DFlash draft chain — drafted
-        // gets the cached predictions, and `block[1..b]` will be filled
-        // from drafted at the unconditional loop below the PLD-else
-        // split. No softmaxes/probs needed: predraft is greedy-only by
-        // construction (eligibility check at launch enforces temp==0
-        // && !rp_active && !ngram_block_active).
-        for &tok in &predraft_predictions {
-            drafted.push(tok);
-        }
-        eprintln!("[predraft] hit pos={} seed={} b={}", position, seed_token, b);
     } else {
     // ── 2. noise_embedding = target.embed_tokens(block) written directly
     // into draft_scratch.x on GPU (no host round-trip). Target and draft
     // share the same Gpu, so the embedding lookup can target the draft's
     // scratch buffer. Avoids 16 × D2H + one H2D per iter (~1 ms saved).
-    //
-    // Hetero (PRD v1.2 PR-A): target.weights.token_embd lives on `gpu`
-    // and `draft_scratch.x` lives on `drafter_gpu_opt`. Look up into
-    // `verify_scratch.embd_staging` on target_gpu first, then ship the
-    // B contiguous rows cross-card to `draft_scratch.x` on the drafter.
-    // ~327 KB / cycle at B=16, h=5120 — fits in the cross-card budget.
-    if hetero {
-        for (i, &tok) in block.iter().enumerate() {
-            let dst = verify_scratch.embd_staging.sub_offset(i * h, h);
-            match target.weights.embd_format {
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-                }
-                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
+    for (i, &tok) in block.iter().enumerate() {
+        let dst = draft_scratch.x.sub_offset(i * h, h);
+        match target.weights.embd_format {
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
             }
-        }
-        // Cross-card ship the B embedding rows into draft_scratch.x on
-        // the drafter. Goes through the pinned-host fast path (PRD
-        // v1.2 PR-A): D2H from `embd_staging` to verify_scratch's
-        // pinned bounce, then H2D from pinned to drafter's
-        // `draft_scratch.x`. Replaces `hipMemcpyPeer`'s ~64 MB/s
-        // bounce-buffer fallback on hipx iGPU↔eGPU with two
-        // hardware-native DMA legs.
-        let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
-        let n_bytes = b * h * 4;
-        multi_gpu::cross_card_copy_via_pinned(
-            gpu,
-            drafter,
-            &verify_scratch.xcard_pinned,
-            &verify_scratch.embd_staging.buf,
-            0,
-            &draft_scratch.x.buf,
-            0,
-            n_bytes,
-        )?;
-    } else {
-        for (i, &tok) in block.iter().enumerate() {
-            let dst = draft_scratch.x.sub_offset(i * h, h);
-            match target.weights.embd_format {
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-                }
-                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
+            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+            }
+            _ => panic!("dflash: unsupported target embedding format for noise lookup"),
         }
     }
 
@@ -3073,69 +2607,19 @@ pub fn spec_step_dflash(
 
     // ── 4. draft_forward ────────────────────────────────────────────────
     // noise_embedding = None: we wrote embeddings directly into
-    // draft_scratch.x above (D2D in homogeneous, cross-card in hetero).
-    // In hetero, this dispatches against the dedicated drafter device;
-    // draft_weights and draft_scratch already live there from load time.
-    match drafter_gpu_opt.as_deref_mut() {
-        Some(drafter) => dflash::draft_forward(
-            drafter,
-            draft_weights,
-            draft_cfg,
-            None,
-            th_arg,
-            &positions_q,
-            &positions_k,
-            b,
-            effective_ctx_len,
-            draft_scratch,
-        )?,
-        None => dflash::draft_forward(
-            gpu,
-            draft_weights,
-            draft_cfg,
-            None,
-            th_arg,
-            &positions_q,
-            &positions_k,
-            b,
-            effective_ctx_len,
-            draft_scratch,
-        )?,
-    }
-
-    // ── 4.5. PR 5 probe-scoped event scaffolding (HIPFIRE_DFLASH_PIPELINE=1) ──
-    // Per docs/plans/path_d.md PR 5: insert HIP event_record on the drafter
-    // stream after Phase 4 and stream_wait_event on the target stream before
-    // Phase 5 lm_head GEMM. In the current sequential cycle structure this is
-    // SEMANTICALLY A NO-OP: solo path the drafter and target share
-    // gpu.active_stream so the wait completes immediately; hetero path the
-    // existing `cross_card_copy_via_pinned` host-blocks on the drafter stream
-    // at the start of Phase 5 anyway. Probe purpose: measure the per-cycle
-    // cost of event_create+record+wait+destroy and validate τ-invariance —
-    // the smallest faithful test that PR 5 alone (without the D0-D3a path_d.md
-    // prereqs that restructure the cycle for actual draft↔verify overlap) can
-    // recover any tok/s. DIVERGES from continuation-prompt step 4 (speculative
-    // launch with seed_token cache): that path would race against shared
-    // draft_scratch in the absence of DflashScratchPair from D1, per
-    // path_d.md D3b explicit warning ("In the pipelined path, both legs would
-    // write the same buffers concurrently — a flat data race"). The honest
-    // probe answer is the no-op overhead measurement.
-    //
-    // `probe_event` is declared at outer scope (above the PLD-else split at
-    // ~line 2650 via a mut binding pattern below) so the event_destroy at
-    // function-end can see it. We assign here only on the DFlash draft branch
-    // because PLD bypass skips Phase 4 entirely — there's no draft work to
-    // record an event against.
-    if pipeline_probe_on {
-        // Record the event on whichever Gpu actually ran draft_forward.
-        let (gpu_for_event, stream_for_event) = match drafter_gpu_opt.as_deref() {
-            Some(drafter) => (drafter, drafter.active_stream.as_ref()),
-            None => (&*gpu, gpu.active_stream.as_ref()),
-        };
-        let evt = gpu_for_event.hip.event_create()?;
-        gpu_for_event.hip.event_record(&evt, stream_for_event)?;
-        probe_event = Some(evt);
-    }
+    // draft_scratch.x above via D2D (no host round-trip).
+    dflash::draft_forward(
+        gpu,
+        draft_weights,
+        draft_cfg,
+        None,
+        th_arg,
+        &positions_q,
+        &positions_k,
+        b,
+        effective_ctx_len,
+        draft_scratch,
+    )?;
 
     // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
     // Fast path: a single batched GEMM against target.weights.output over
@@ -3151,7 +2635,11 @@ pub fn spec_step_dflash(
     let w_out = &target.weights.output;
     let use_batched_gemm = matches!(
         w_out.gpu_dtype,
-        rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256 | rdna_compute::DType::MQ3G256,
+        rdna_compute::DType::HFQ4G256
+        | rdna_compute::DType::MQ4G256
+        | rdna_compute::DType::MQ3G256
+        | rdna_compute::DType::HFQ6G256
+        | rdna_compute::DType::MQ6G256,
     );
     let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
     if use_batched_gemm || use_q8_staged {
@@ -3162,48 +2650,10 @@ pub fn spec_step_dflash(
         // verify uses. Draft calls this BEFORE verify in the cycle, so
         // there's no aliasing. The verify call overwrites these buffers
         // afterward. Avoids 2-3 hipMalloc/Free pairs per cycle.
-        //
-        // Hetero (PRD v1.2 PR-A): draft_scratch.x lives on the drafter
-        // device but target.weights.output lives on `gpu`. Cross-card
-        // ship the (B-1) drafter hidden rows into
-        // verify_scratch.draft_hidden_staging on `gpu`, then run the
-        // lm_head GEMM against the staging buffer. ~307 KB / cycle at
-        // B=16, h=5120.
         let batch = b - 1;
         assert!(batch <= verify_scratch.max_n,
             "verify_scratch max_n {} < draft batch {}", verify_scratch.max_n, batch);
-        // PR 5 probe: target stream waits on drafter's draft_done event before
-        // consuming draft hidden state in lm_head. Solo path: same stream waits
-        // on its own event (no-op). Hetero path: cross_card_copy_via_pinned
-        // below already host-blocks on drafter, so this wait is also a no-op.
-        // The probe measures the per-cycle event API overhead, not pipelining
-        // recovery (which requires the path_d.md D0-D3a cycle restructure).
-        if let Some(evt) = probe_event.as_ref() {
-            if let Some(target_stream) = gpu.active_stream.as_ref() {
-                gpu.hip.stream_wait_event(target_stream, evt)?;
-            }
-        }
-        let hidden_rows = if hetero {
-            let drafter = drafter_gpu_opt.as_deref().expect("hetero implies Some");
-            let n_bytes = batch * h * 4;
-            // Drafter D2H into pinned bounce, then target H2D into the
-            // staging buffer the lm_head GEMM consumes. Pinned-host
-            // fast path bypasses `hipMemcpyPeer`'s bounce-buffer
-            // fallback for the iGPU↔eGPU return direction.
-            multi_gpu::cross_card_copy_via_pinned(
-                drafter,
-                gpu,
-                &verify_scratch.xcard_pinned,
-                &draft_scratch.x.buf,
-                h * 4,                                       // skip block[0] (the seed)
-                &verify_scratch.draft_hidden_staging.buf,
-                0,
-                n_bytes,
-            )?;
-            verify_scratch.draft_hidden_staging.sub_offset(0, batch * h)
-        } else {
-            draft_scratch.x.sub_offset(h, batch * h)
-        };
+        let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
 
         match w_out.gpu_dtype {
@@ -3230,6 +2680,20 @@ pub fn spec_step_dflash(
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
+                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+                )?;
+            }
+            rdna_compute::DType::HFQ6G256 => {
+                gpu.gemm_hfq6g256_batched_lmhead(
+                    &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+                )?;
+            }
+            rdna_compute::DType::MQ6G256 => {
+                assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                    "verify_scratch.rot undersized for MQ6 draft lm_head");
+                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -3285,23 +2749,7 @@ pub fn spec_step_dflash(
             }
         }
     } else {
-        // Fallback: per-row weight_gemv loop. Used only for lm_head dtypes
-        // outside the batched-gemm coverage above (HFQ4G256/MQ4G256/MQ3G256
-        // /Q8_0). In hetero mode `draft_scratch.x` lives on the drafter
-        // device while `target.weights.output` and `target.scratch.logits`
-        // live on `gpu`; dispatching the per-row GEMV against `gpu` with a
-        // drafter-side buffer would touch wrong-device memory. Refuse
-        // cleanly instead — the production target dtypes hit the batched
-        // path above.
-        if hetero {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "spec_step_dflash hetero: per-row weight_gemv fallback path is not \
-                 supported on the cross-card spec-decode loop. Production target \
-                 lm_head dtypes (HFQ4G256/MQ4G256/MQ3G256/Q8_0) hit the batched \
-                 path; this fallback fires only for unsupported dtypes.",
-            ));
-        }
+        // Fallback: per-row weight_gemv loop.
         for i in 1..b {
             let hidden_row = draft_scratch.x.sub_offset(i * h, h);
             llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
@@ -3409,51 +2857,12 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
-    // Path D3b: pipelined branch defers the internal commit so we can
-    // record post_verify_evt between the verify forward and the commit,
-    // then drive commit_staging_to_ring_on_stream + scatter_from_staging
-    // on separate streams. The scatter is rerouted in Phase 9.
-    let mut post_verify_evt: Option<hip_bridge::Event> = None;
-    let verify_out = if pipeline_mode {
-        let out = verify_dflash_block_no_commit(
-            gpu, target, &block, position, hidden_rb,
-            gdn_tape_opt.as_deref_mut(),
-            use_temp_sampling || host_path_active,
-            verify_scratch,
-        )?;
-        // gpu.active_stream is guaranteed Some at this point — the
-        // function's preflight at line ~2597 forces it before any draft
-        // or verify work. Verify_dflash_block_inner also sets it inside
-        // the graph-eligible path. Pipeline_mode without a stream is
-        // unreachable.
-        let stream = gpu.active_stream.as_ref().expect(
-            "pipeline_mode requires gpu.active_stream — preflight should have set it"
-        );
-        // Record the event on verify_stream BEFORE issuing the commit.
-        // The kernel that wrote staging is already on this stream so it
-        // is naturally ordered ahead of the commit's reads of staging.
-        let evt = gpu.hip.event_create()?;
-        gpu.hip.event_record(&evt, Some(stream))?;
-        // Drive the commit on verify_stream via the stream-async variant.
-        // Re-borrow `stream` per call since `commit_staging_to_ring_on_stream`
-        // takes &mut Gpu — Rust's borrow checker requires this dance.
-        let stream_for_commit = gpu.active_stream.as_ref().unwrap() as *const _;
-        // SAFETY: we hold &mut gpu but commit_staging_to_ring_on_stream
-        // doesn't reassign gpu.active_stream. The pointer remains valid
-        // for the call's duration. This sidesteps the simultaneous &mut
-        // gpu + & gpu.active_stream borrow conflict.
-        let stream_ref: &hip_bridge::Stream = unsafe { &*stream_for_commit };
-        hidden_rb.commit_staging_to_ring_on_stream(gpu, b, stream_ref)?;
-        post_verify_evt = Some(evt);
-        out
-    } else {
-        verify_dflash_block(
-            gpu, target, &block, position, hidden_rb,
-            gdn_tape_opt.as_deref_mut(),
-            use_temp_sampling || host_path_active,
-            verify_scratch,
-        )?
-    };
+    let verify_out = verify_dflash_block(
+        gpu, target, &block, position, hidden_rb,
+        gdn_tape_opt.as_deref_mut(),
+        use_temp_sampling || host_path_active,  // full target logits needed for rejection sampling, RP, or n-gram block
+        verify_scratch,
+    )?;
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -3685,84 +3094,14 @@ pub fn spec_step_dflash(
         // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
         // scatter function aligns to the verify-block origin, not the
         // ring tail.
-        //
-        // Hetero (PRD v1.2 PR-A): hidden_rb lives on `gpu`, but
-        // `draft_scratch.target_hidden` lives on the drafter device.
-        // Use the cross-card variant — it issues the same per-(row, ext)
-        // copies through `cross_card_copy_at` instead of in-device
-        // `memcpy_dtod_at`. Per-cycle ~820 KB at typical 27B shapes.
-        match drafter_gpu_opt.as_deref() {
-            Some(drafter) => {
-                scatter_hidden_block_to_interleaved_cross_card(
-                    gpu,
-                    drafter,
-                    hidden_rb,
-                    &verify_scratch.hidden_scatter_staging,
-                    &verify_scratch.xcard_pinned,
-                    &draft_scratch.target_hidden,
-                    position,
-                    b,
-                    rows_to_keep,
-                )?;
-            }
-            None => {
-                if pipeline_mode {
-                    // Path D3b: scatter from STAGING (contiguous, no ring
-                    // wrap) on draft_stream, waiting on post_verify_evt
-                    // so the read happens after verify's forward kernel
-                    // wrote staging but in parallel with the commit's
-                    // staging→ring writes (which target a disjoint
-                    // destination — layer_bufs vs draft_scratch.target_hidden).
-                    // SDMA on RDNA3+ schedules the two D2D chains on
-                    // separate queues when issued on separate streams.
-                    //
-                    // gpu.draft_stream is Some — pipeline_mode required
-                    // init_pipeline_streams to succeed at cycle entry,
-                    // which is gated by HIPFIRE_DFLASH_PIPELINE=1.
-                    let draft_stream_ptr = gpu.draft_stream.as_ref()
-                        .expect("pipeline_mode requires draft_stream") as *const _;
-                    // SAFETY: holding &mut gpu, but neither stream_wait_event
-                    // nor scatter mutate gpu.draft_stream. Pointer valid for
-                    // both calls' duration.
-                    let draft_stream: &hip_bridge::Stream = unsafe { &*draft_stream_ptr };
-                    if let Some(evt) = post_verify_evt.as_ref() {
-                        gpu.hip.stream_wait_event(draft_stream, evt)?;
-                    }
-                    scatter_hidden_block_from_staging_on_stream(
-                        gpu,
-                        hidden_rb,
-                        &draft_scratch.target_hidden,
-                        position,
-                        rows_to_keep,
-                        draft_stream,
-                    )?;
-                    // Path D3b cross-cycle async: record scatter_done_evt
-                    // on draft_stream and stash on gpu.pending_scatter_evt
-                    // for the next cycle's spec_step entry to wait. This
-                    // replaces the previous end-of-cycle CPU-blocking
-                    // stream_synchronize — the scatter now overlaps with
-                    // Phase 10 (DeltaNet rewind + KV update) on
-                    // verify_stream and the caller's inter-cycle CPU work.
-                    let scatter_done_evt = gpu.hip.event_create()?;
-                    gpu.hip.event_record(&scatter_done_evt, Some(draft_stream))?;
-                    // Drop any prior pending_scatter_evt (defensive — should
-                    // be None here because the cycle entry consumed it).
-                    if let Some(stale) = gpu.pending_scatter_evt.take() {
-                        let _ = gpu.hip.event_destroy(stale);
-                    }
-                    gpu.pending_scatter_evt = Some(scatter_done_evt);
-                } else {
-                    scatter_hidden_block_to_interleaved(
-                        gpu,
-                        hidden_rb,
-                        &draft_scratch.target_hidden,
-                        position,
-                        b,
-                        rows_to_keep,
-                    )?;
-                }
-            }
-        }
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            b,
+            rows_to_keep,
+        )?;
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
         // GPU already has; and so the assertion-in-draft path stays coherent.
@@ -3776,169 +3115,6 @@ pub fn spec_step_dflash(
             draft_scratch
                 .target_hidden_abs_positions
                 .push(position as i32 + p as i32 + co);
-        }
-
-        // ── Path D3b speculative prefetch: launch cycle N+1's draft on
-        // draft_stream now that target_hidden + abs_positions are up to
-        // date. Eligibility:
-        //   - pipeline_mode (solo only — already guarantees not hetero)
-        //   - greedy + no RP + no ngram_block (deterministic seed_token)
-        //   - drafter_gpu_opt is None (solo) — implied by pipeline_mode
-        //   - lm_head dtype = MQ4G256 (canonical 27B mq4) + Q8_0 embed
-        //     (broaden later — see predraft_eligible block).
-        //
-        // The predraft writes draft_scratch.x and verify_scratch.logits/argmax
-        // on draft_stream concurrently with Phase 10's target_snap.restore_to
-        // and tape_replay on verify_stream — disjoint buffers, no race.
-        // Cycle N+1's spec_step entry waits the predraft event before any
-        // verify-stream read of draft_scratch.x.
-        let predraft_eligible = pipeline_mode
-            && !use_temp_sampling
-            && !rp_active
-            && !ngram_block_active
-            && pld_spine.is_none()
-            && matches!(
-                target.weights.output.gpu_dtype,
-                rdna_compute::DType::MQ4G256 | rdna_compute::DType::HFQ4G256
-            )
-            && matches!(
-                target.weights.embd_format,
-                hipfire_runtime::llama::EmbeddingFormat::Q8_0
-                    | hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
-            );
-
-        if predraft_eligible {
-            let next_position = position + accept_len + 1;
-            let next_seed = bonus_token;
-            let next_b = b;
-            let next_batch = next_b - 1;
-
-            // Switch active_stream → draft_stream; all dispatches that
-            // follow read gpu.active_stream and route to draft_stream.
-            let (saved, swapped) = gpu.enter_draft_stream();
-            if swapped {
-                let mut next_block: Vec<u32> = vec![mask_token; next_b];
-                next_block[0] = next_seed;
-
-                // Phase 2: embedding lookup for next_block into draft_scratch.x
-                for (i, &tok) in next_block.iter().enumerate() {
-                    let dst = draft_scratch.x.sub_offset(i * h, h);
-                    match target.weights.embd_format {
-                        hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                            gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-                        }
-                        hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                            gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-                        }
-                        _ => unreachable!("predraft_eligible filters to Q8_0/HFQ4G256"),
-                    }
-                }
-
-                // Phase 3: positions for next cycle. abs_positions has just
-                // been updated to include accepted rows from cycle N, so it
-                // is the correct base for next cycle's positions_k.
-                let next_effective_ctx = draft_scratch.target_hidden_abs_positions.len();
-                let next_positions_q: Vec<i32> = ((next_position as i32 + co)
-                    ..(next_position as i32 + next_b as i32 + co))
-                    .collect();
-                let mut next_positions_k: Vec<i32> = Vec::with_capacity(next_effective_ctx + next_b);
-                next_positions_k.extend_from_slice(&draft_scratch.target_hidden_abs_positions);
-                for p in 0..next_b {
-                    next_positions_k.push(next_position as i32 + p as i32 + co);
-                }
-
-                // Phase 4: draft_forward on draft_stream (active_stream is
-                // routed there). target_hidden=None → reads GPU resident
-                // draft_scratch.target_hidden which the cycle-N scatter
-                // just populated.
-                let predraft_result = dflash::draft_forward(
-                    gpu,
-                    draft_weights,
-                    draft_cfg,
-                    None,
-                    None,
-                    &next_positions_q,
-                    &next_positions_k,
-                    next_b,
-                    next_effective_ctx,
-                    draft_scratch,
-                );
-
-                if predraft_result.is_ok() && next_batch <= verify_scratch.max_n {
-                    // Phase 5: target lm_head against the (next_b - 1)
-                    // last hidden positions. Match Phase-5 dispatch.
-                    let logits_batch = verify_scratch.logits.sub_offset(0, next_batch * vocab);
-                    let w_out = &target.weights.output;
-                    let phase5_ok = match w_out.gpu_dtype {
-                        rdna_compute::DType::MQ4G256 => {
-                            if next_batch * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k {
-                                let rot = verify_scratch.rot.sub_offset(0, next_batch * w_out.k);
-                                let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
-                                gpu.rotate_x_mq_batched(&predraft_x_tail, &rot, w_out.k, next_batch)
-                                    .and_then(|_| gpu.gemm_hfq4g256_batched_lmhead(
-                                        &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, next_batch,
-                                    ))
-                                    .is_ok()
-                            } else { false }
-                        }
-                        rdna_compute::DType::HFQ4G256 => {
-                            let predraft_x_tail = draft_scratch.x.sub_offset(h, next_batch * h);
-                            gpu.gemm_hfq4g256_batched_lmhead(
-                                &w_out.buf, &predraft_x_tail, &logits_batch, w_out.m, w_out.k, next_batch,
-                            ).is_ok()
-                        }
-                        _ => false,
-                    };
-
-                    if phase5_ok {
-                        // GPU-side batched argmax + sync download to host.
-                        // memcpy_dtoh is sync — it blocks the CPU until the
-                        // entire chain completes on draft_stream. The GPU
-                        // work overlapped with Phase 10 on verify_stream;
-                        // the CPU sync at the very end of the predraft
-                        // chain is acceptable (Phase 10 is short).
-                        let argmax_buf = verify_scratch.argmax.sub_offset(0, next_batch);
-                        let argmax_ok = gpu.argmax_f32_batched(
-                            &logits_batch, &argmax_buf, vocab, next_batch,
-                        ).is_ok();
-                        if argmax_ok {
-                            let mut host_idx = vec![0i32; next_batch];
-                            let bytes: &mut [u8] = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    host_idx.as_mut_ptr() as *mut u8, next_batch * 4)
-                            };
-                            let dl_ok = gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf).is_ok();
-                            if dl_ok {
-                                let predictions: Vec<u32> = host_idx.iter().map(|&x| x as u32).collect();
-                                // Record predraft_done_evt on draft_stream.
-                                if let Ok(evt) = gpu.hip.event_create() {
-                                    let stream_for_evt = gpu.active_stream.as_ref()
-                                        .map(|s| s as *const _);
-                                    let evt_ok = if let Some(sptr) = stream_for_evt {
-                                        let sref: &hip_bridge::Stream = unsafe { &*sptr };
-                                        gpu.hip.event_record(&evt, Some(sref)).is_ok()
-                                    } else { false };
-                                    if evt_ok {
-                                        if let Some(stale) = gpu.pending_predraft.take() {
-                                            let _ = gpu.hip.event_destroy(stale.event);
-                                        }
-                                        gpu.pending_predraft = Some(rdna_compute::PredraftedBlock {
-                                            predictions,
-                                            expected_position: next_position,
-                                            expected_seed_token: next_seed,
-                                            expected_b: next_b,
-                                            event: evt,
-                                        });
-                                    } else {
-                                        let _ = gpu.hip.event_destroy(evt);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            gpu.exit_draft_stream(saved, swapped);
         }
     }
 
@@ -4013,24 +3189,6 @@ pub fn spec_step_dflash(
     }
     let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end,
              t_accept_end, t_scatter_end, t_restore_end);
-
-    // PR 5 probe: destroy the per-cycle event on the Gpu that created it.
-    // Per-cycle create+destroy is wasteful but matches the probe's "smallest
-    // faithful" scope — the full path_d.md ladder allocates one event per
-    // pair (or session) and reuses across cycles.
-    if let Some(evt) = probe_event {
-        match drafter_gpu_opt.as_deref() {
-            Some(drafter) => drafter.hip.event_destroy(evt)?,
-            None => gpu.hip.event_destroy(evt)?,
-        }
-    }
-    // Path D3b: destroy the verify-side post-forward event allocated for
-    // the pipelined commit/scatter ordering. Solo-only — gpu owns the
-    // event. Per-cycle alloc+destroy mirrors probe_event's pattern; the
-    // full path_d.md ladder pools events across cycles.
-    if let Some(evt) = post_verify_evt {
-        gpu.hip.event_destroy(evt)?;
-    }
 
     Ok(SpecStepResult {
         accepted: accept_len,
@@ -4168,9 +3326,31 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::HFQ6G256 => {
+            // Phase A.4: HFQ6 lm_head batched via gemm_hfq6g256_batched_lmhead
+            // (which zeros Y then dispatches the dp4a residual on gfx906 or
+            // WMMA / FP16 fallbacks elsewhere).
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+            )
+        }
+        rdna_compute::DType::MQ6G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -4305,9 +3485,29 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::HFQ6G256 => {
+            // Phase A.4: HFQ6 lm_head batched.
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+            )
+        }
+        rdna_compute::DType::MQ6G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {

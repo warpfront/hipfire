@@ -28,9 +28,13 @@ fn main() {
     use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
+    use hipfire_runtime::spec_spine::{
+        CommandSpecSpineProvider, SpecSpineGate, SpecSpineMode, SpecSpineRequest,
+        SpecSpineStats,
+    };
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, EvictionResult, TriAttnCenters};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     enum CaskPolicy { Plain(EvictionCtx), Cask(CaskCtx) }
@@ -67,16 +71,6 @@ fn main() {
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
     let mut block_size_override: Option<usize> = None;
-    // --drafter-device N opts the demo into the hetero PP+DFlash path
-    // (PRD v1.2 PR-A): target on the default `Gpu::init()` device,
-    // drafter weights + scratch + draft_forward dispatched on a
-    // dedicated `Gpu::init_with_device(N)` instance. Cross-card
-    // staging at phases 2/5/9 of `spec_step_dflash` is fully internal
-    // (the body refactor in commit ad235e5). Mirrors the daemon's
-    // HIPFIRE_DFLASH_DRAFTER_DEVICE=N env var.
-    //
-    // None (default) = single-Gpu DFlash, byte-identical to master.
-    let mut drafter_device: Option<i32> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
     let mut repeat_penalty: f32 = 1.0;
@@ -124,6 +118,34 @@ fn main() {
     // diagnostics; usually a net loss on content where DFlash is strong).
     let mut pld_min_consensus: usize = 2;
     let mut pld_min_chain: usize = 5;  // conservative: below paper's 8 but still filters noise
+    // Experimental Strix/XDNA sidecar spine proposal. A sidecar command gets
+    // compact token-history JSON and may return {"tokens":[...],"confidence":0.7}.
+    // shadow = measure only; active = feed accepted proposals into the same
+    // target-verify path used by PLD. Target verify remains the correctness
+    // boundary either way.
+    let mut npu_spine_mode: SpecSpineMode = std::env::var("HIPFIRE_NPU_SPINE")
+        .ok()
+        .and_then(|s| SpecSpineMode::parse(&s))
+        .unwrap_or(SpecSpineMode::Off);
+    let mut npu_spine_cmd: Option<String> = std::env::var("HIPFIRE_NPU_SPINE_CMD")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mut npu_spine_min_len: usize = std::env::var("HIPFIRE_NPU_SPINE_MIN_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let mut npu_spine_max_len: usize = std::env::var("HIPFIRE_NPU_SPINE_MAX_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let mut npu_spine_min_confidence: f32 = std::env::var("HIPFIRE_NPU_SPINE_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.60);
+    let mut npu_spine_tail_tokens: usize = std::env::var("HIPFIRE_NPU_SPINE_TAIL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
     // DDTree (Ringel & Romano 2026): tree-structured verification built from
     // DFlash per-position draft marginals. Per-path DFS verify (no batched
     // tree attention) — slower per cycle but correct on hybrid arch. Spike
@@ -288,6 +310,33 @@ fn main() {
                 pld_min_chain = args[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--npu-spine" => {
+                npu_spine_mode = SpecSpineMode::parse(&args[i + 1]).unwrap_or_else(|| {
+                    eprintln!("--npu-spine expects off|shadow|active");
+                    std::process::exit(2);
+                });
+                i += 2;
+            }
+            "--npu-spine-cmd" => {
+                npu_spine_cmd = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--npu-spine-min-len" => {
+                npu_spine_min_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--npu-spine-max-len" => {
+                npu_spine_max_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--npu-spine-min-confidence" => {
+                npu_spine_min_confidence = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--npu-spine-tail" => {
+                npu_spine_tail_tokens = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             "--ddtree" => {
                 ddtree_enabled = true;
                 i += 1;
@@ -325,10 +374,6 @@ fn main() {
             "--no-chatml" => {
                 chatml = false;
                 i += 1;
-            }
-            "--drafter-device" => {
-                drafter_device = Some(args[i + 1].parse().expect("--drafter-device expects an integer HIP device index"));
-                i += 2;
             }
             "--ar-baseline" => {
                 ar_baseline = true;
@@ -386,7 +431,7 @@ fn main() {
 
     // ── Init GPU ──────────────────────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("gpu (target): {}", gpu.arch);
+    eprintln!("gpu: {}", gpu.arch);
     let vram_report = |hip: &hip_bridge::HipRuntime, label: &str| {
         if let Ok((free, total)) = hip.get_vram_info() {
             let used_gb = (total - free) as f64 / 1e9;
@@ -394,20 +439,7 @@ fn main() {
             eprintln!("VRAM @ {label}: used {used_gb:.2} GB, free {free_gb:.2} GB");
         }
     };
-    vram_report(&gpu.hip, "target init");
-
-    // Drafter on a dedicated device (hetero PP+DFlash, PRD v1.2 PR-A).
-    // None preserves the single-Gpu byte-identical path.
-    let mut drafter_gpu_opt: Option<rdna_compute::Gpu> = match drafter_device {
-        Some(idx) => {
-            let g = rdna_compute::Gpu::init_with_device(idx)
-                .expect("drafter Gpu::init_with_device");
-            eprintln!("drafter pinned to HIP[{idx}]: {} (dedicated Gpu instance)", g.arch);
-            vram_report(&g.hip, "drafter init");
-            Some(g)
-        }
-        None => None,
-    };
+    vram_report(&gpu.hip, "init");
 
     // ── Load draft ────────────────────────────────────────────────────
     let draft_hfq = HfqFile::open(Path::new(&draft_path)).expect("open draft");
@@ -453,19 +485,9 @@ fn main() {
     vram_report(&gpu.hip, "after target load");
 
     let t0 = Instant::now();
-    // In hetero mode, draft weights live on the drafter Gpu (matches
-    // the daemon's load_dflash_state path). Single-Gpu mode loads onto
-    // target — byte-identical to master.
-    let draft_weights = match drafter_gpu_opt.as_mut() {
-        Some(d) => DflashWeights::load(d, &draft_hfq, &draft_cfg).expect("load draft (drafter)"),
-        None => DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft"),
-    };
+    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load draft");
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
-    if let Some(ref d) = drafter_gpu_opt {
-        vram_report(&d.hip, "after draft load (drafter)");
-    } else {
-        vram_report(&gpu.hip, "after draft load");
-    }
+    vram_report(&gpu.hip, "after draft load");
 
     // Adaptive-B scratch sizing: the draft was trained at a specific
     // block_size; going past it is out-of-distribution for its positional
@@ -500,16 +522,9 @@ fn main() {
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    // Draft scratch lives on the same device as draft weights — drafter
-    // in hetero mode, target otherwise.
-    let mut draft_scratch = match drafter_gpu_opt.as_mut() {
-        Some(d) => DflashScratch::new_with_mq(
-            d, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
-        ).expect("alloc draft scratch (drafter)"),
-        None => DflashScratch::new_with_mq(
-            &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
-        ).expect("alloc draft scratch"),
-    };
+    let mut draft_scratch = DflashScratch::new_with_mq(
+        &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
+    ).expect("alloc draft scratch");
     if draft_weights.has_mq {
         eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
     }
@@ -519,32 +534,6 @@ fn main() {
         target.config.vocab_size, draft_cfg.vocab_size,
         "target vocab ({}) != draft vocab ({})",
         target.config.vocab_size, draft_cfg.vocab_size
-    );
-
-    // ── Check hidden-dim compatibility ────────────────────────────────
-    // The draft was trained against a target of a specific hidden_dim;
-    // its cross-attention weights and DflashScratch.target_hidden buffer
-    // are sized for [max_ctx_len × num_extract × draft_cfg.hidden] f32.
-    // If the runtime target has a different hidden_dim, the seed-from-
-    // prompt scatter writes target.config.dim-sized rows into a buffer
-    // expecting draft_cfg.hidden-sized rows, and the assertion in
-    // hip-bridge memcpy_dtod_at fires deep inside scatter_hidden_block_
-    // to_interleaved with a confusing message. Catch the mismatch up
-    // front so users see a clear "wrong pair" error.
-    assert_eq!(
-        target.config.dim, draft_cfg.hidden,
-        "incompatible target/draft pair: target hidden_dim ({}) != draft trained hidden ({}). \
-         The DFlash draft was trained against a target of a different size. \
-         Use a draft trained for this target (e.g. 27B target needs 27B-trained DFlash).",
-        target.config.dim, draft_cfg.hidden
-    );
-    // Same story for num_extract: hidden_rb and target_hidden are laid out
-    // [L × num_extract × hidden]; mismatched ne also rips the row stride.
-    let target_extract_layers = draft_cfg.num_extract();
-    assert!(
-        target_extract_layers <= target.config.n_layers,
-        "incompatible target/draft pair: draft expects {} extract layers but target has only {}",
-        target_extract_layers, target.config.n_layers
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
@@ -654,8 +643,6 @@ fn main() {
         target.config.dim,
         target.config.vocab_size,
         target.weights.output.k,
-        draft_cfg.num_extract(),
-        draft_cfg.hidden,
         &target.config,
     ).expect("alloc verify scratch");
     let mut target_hidden_host: Vec<f32> =
@@ -676,36 +663,15 @@ fn main() {
     // draft_scratch.target_hidden on GPU. This primes the GPU-resident
     // path in spec_step_dflash (ctx_slice=None) so it doesn't need to
     // round-trip target_hidden through the CPU shadow each cycle.
-    //
-    // Hetero path (drafter on a different device): the same-card scatter
-    // would be a cross-device hipMemcpyDeviceToDevice (src on target, dst
-    // on drafter), which routes through HIP's broken P2P path and
-    // crashes inside libamdhip64.so on TB5+gfx1010 (asymmetric peer
-    // access). target_hidden_host already holds the seeded rows from
-    // seed_target_hidden_from_prompt, so an H2D upload from the drafter
-    // sidesteps cross-device D2D entirely.
-    if let Some(d) = drafter_gpu_opt.as_mut() {
-        d.bind_thread().expect("bind drafter for seed H2D");
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                target_hidden_host.as_ptr() as *const u8,
-                target_hidden_host.len() * 4,
-            )
-        };
-        d.hip
-            .memcpy_htod(&draft_scratch.target_hidden.buf, bytes)
-            .expect("seed H2D to drafter target_hidden");
-    } else {
-        speculative::scatter_hidden_block_to_interleaved(
-            &gpu,
-            &hidden_rb,
-            &draft_scratch.target_hidden,
-            0,
-            prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
-            prompt_tokens.len(), // n_rows:     keep all of them
-        )
-        .expect("seed scatter");
-    }
+    speculative::scatter_hidden_block_to_interleaved(
+        &gpu,
+        &hidden_rb,
+        &draft_scratch.target_hidden,
+        0,
+        prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
+        prompt_tokens.len(), // n_rows:     keep all of them
+    )
+    .expect("seed scatter");
     draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     // Seed per-row absolute positions for the draft's cross-attention RoPE.
     // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
@@ -930,6 +896,67 @@ fn main() {
     // accepted_from_pld = accepted count on those cycles (for τ_pld).
     let mut pld_hits: usize = 0;
     let mut pld_accepted: usize = 0;
+    let npu_spine_gate = SpecSpineGate {
+        min_len: npu_spine_min_len,
+        max_len: npu_spine_max_len.max(npu_spine_min_len),
+        min_confidence: npu_spine_min_confidence,
+    };
+    let allow_unready_npu = std::env::var("HIPFIRE_NPU_SPINE_ALLOW_UNREADY")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut npu_spine_provider: Option<CommandSpecSpineProvider> = None;
+    let mut npu_spine_stats = SpecSpineStats::default();
+    let mut npu_spine_error_warned = false;
+    if npu_spine_mode.is_enabled() {
+        if let Some(cmd) = npu_spine_cmd.as_ref() {
+            match hipfire_runtime::npu::probe_strix_npu(
+                hipfire_runtime::npu::DEFAULT_ACCEL_PATH,
+                hipfire_runtime::npu::DEFAULT_MIN_MEMLOCK_BYTES,
+            ) {
+                Ok(report) if report.ready() => {
+                    eprintln!(
+                        "npu-spine: mode={:?} cmd={} gate=len{}..{} conf>={:.2}",
+                        npu_spine_mode,
+                        cmd,
+                        npu_spine_gate.min_len,
+                        npu_spine_gate.max_len,
+                        npu_spine_gate.min_confidence,
+                    );
+                }
+                Ok(report) if allow_unready_npu => {
+                    eprintln!(
+                        "npu-spine: WARN NPU readiness is {:?}; continuing because HIPFIRE_NPU_SPINE_ALLOW_UNREADY=1",
+                        report.readiness,
+                    );
+                }
+                Ok(report) => {
+                    eprintln!(
+                        "npu-spine: disabled because NPU readiness is {:?}; set HIPFIRE_NPU_SPINE_ALLOW_UNREADY=1 to run a command sidecar anyway",
+                        report.readiness,
+                    );
+                    npu_spine_mode = SpecSpineMode::Off;
+                }
+                Err(e) if allow_unready_npu => {
+                    eprintln!(
+                        "npu-spine: WARN probe failed ({e}); continuing because HIPFIRE_NPU_SPINE_ALLOW_UNREADY=1",
+                    );
+                }
+                Err(e) => {
+                    eprintln!("npu-spine: disabled because NPU probe failed: {e}");
+                    npu_spine_mode = SpecSpineMode::Off;
+                }
+            }
+            if npu_spine_mode.is_enabled() {
+                npu_spine_provider = Some(CommandSpecSpineProvider::new(PathBuf::from(cmd)));
+            }
+        } else {
+            eprintln!(
+                "npu-spine: disabled because no command was provided (use --npu-spine-cmd or HIPFIRE_NPU_SPINE_CMD)"
+            );
+            npu_spine_mode = SpecSpineMode::Off;
+        }
+    }
 
     if ddtree_enabled {
         if temp > 0.0 {
@@ -940,6 +967,11 @@ fn main() {
         }
         if pld_enabled {
             eprintln!("WARNING: --pld is ignored when --ddtree is enabled.");
+        }
+        if npu_spine_mode.is_enabled() {
+            eprintln!("WARNING: --npu-spine is ignored when --ddtree is enabled.");
+            npu_spine_provider = None;
+            npu_spine_mode = SpecSpineMode::Off;
         }
         if ddtree_batched {
             eprintln!(
@@ -1193,38 +1225,75 @@ fn main() {
         } else {
             None
         };
-        // PLD lookup: context = prompt ++ emitted (everything committed so
-        // far). The matcher finds a suffix self-match and extracts up to
-        // pld_max_extract continuation tokens. `pld_spine` is passed as a
-        // borrowed slice — when Some, spec_step_dflash bypasses the
-        // DFlash forward entirely for this cycle.
-        let pld_match = pld_matcher.as_ref().and_then(|m| {
-            // Build context = prompt ++ emitted ++ seed_token, making sure
-            // the context suffix ENDS at seed_token — the matcher predicts
-            // what follows the suffix, and block[1..] lives right after
-            // seed_token. At cycle K≥1, emitted[-1] is already seed_token
-            // (pushed as the prior cycle's bonus) so we skip the extra push;
-            // at cycle 0 (emitted empty) we need to append it explicitly.
-            let mut ctx = Vec::with_capacity(prompt_tokens.len() + emitted.len() + 1);
-            ctx.extend_from_slice(&prompt_tokens);
-            ctx.extend_from_slice(&emitted);
-            if ctx.last() != Some(&seed_token) {
-                ctx.push(seed_token);
-            }
-            m.lookup(&ctx)
-        });
+        // Spine proposal context = prompt ++ emitted ++ seed_token, making
+        // sure the suffix ENDS at seed_token. At cycle K≥1, emitted[-1] is
+        // already seed_token (pushed as the prior cycle's bonus), so we skip
+        // the extra push; at cycle 0 we append it explicitly.
+        let mut spine_ctx = Vec::with_capacity(prompt_tokens.len() + emitted.len() + 1);
+        spine_ctx.extend_from_slice(&prompt_tokens);
+        spine_ctx.extend_from_slice(&emitted);
+        if spine_ctx.last() != Some(&seed_token) {
+            spine_ctx.push(seed_token);
+        }
+
+        // PLD lookup: the matcher finds a suffix self-match and extracts up
+        // to pld_max_extract continuation tokens. The resulting spine can be
+        // fed straight into spec_step_dflash's verify-only bypass.
+        let pld_match = pld_matcher.as_ref().and_then(|m| m.lookup(&spine_ctx));
         // Goose §4.3 bypass-mode gate: only use PLD if both consensus AND
         // chain length clear their thresholds. Weaker matches are a net loss
         // when DFlash is strong (repetition-heavy content where literal
         // 3-gram matches predict the wrong number/variable in a list).
-        let pld_spine: Option<&[u32]> = pld_match.as_ref().and_then(|m| {
+        let pld_spine_candidate: Option<&[u32]> = pld_match.as_ref().and_then(|m| {
             if m.consensus >= pld_min_consensus && m.tokens.len() >= pld_min_chain {
                 Some(m.tokens.as_slice())
             } else {
                 None
             }
         });
-        let used_pld = pld_spine.is_some();
+        let mut npu_cycle_proposal = None;
+        let mut npu_spine_owned: Option<Vec<u32>> = None;
+        if let Some(provider) = npu_spine_provider.as_ref() {
+            let tail_start = spine_ctx.len().saturating_sub(npu_spine_tail_tokens);
+            let mut req = SpecSpineRequest::new(
+                position,
+                seed_token,
+                npu_spine_gate.max_len,
+                prompt_tokens.len(),
+                spine_ctx[tail_start..].to_vec(),
+            );
+            if let Some(m) = pld_match.as_ref() {
+                req.pld_tokens = Some(m.tokens.clone());
+                req.pld_consensus = Some(m.consensus);
+            }
+            match provider.propose(&req) {
+                Ok(proposal) => {
+                    npu_spine_stats.record_proposal(&proposal);
+                    if let Some(spine) = npu_spine_gate.accept(&proposal) {
+                        if npu_spine_mode.is_active() {
+                            npu_spine_owned = Some(spine);
+                        }
+                        npu_cycle_proposal = Some(proposal);
+                    } else {
+                        npu_spine_stats.record_gated();
+                    }
+                }
+                Err(e) => {
+                    npu_spine_stats.record_provider_error();
+                    if !npu_spine_error_warned {
+                        eprintln!("npu-spine: provider failed; falling back this run: {e}");
+                        npu_spine_error_warned = true;
+                    }
+                }
+            }
+        }
+        let used_npu_spine = npu_spine_owned.is_some();
+        let spec_spine: Option<&[u32]> = if used_npu_spine {
+            npu_spine_owned.as_deref()
+        } else {
+            pld_spine_candidate
+        };
+        let used_pld = !used_npu_spine && spec_spine.is_some();
         if used_pld {
             pld_hits += 1;
         }
@@ -1302,7 +1371,6 @@ fn main() {
         } else {
             speculative::spec_step_dflash(
                 &mut gpu,
-                drafter_gpu_opt.as_mut(),              // None=single-Gpu, Some=hetero drafter pin
                 &mut target,
                 &draft_weights,
                 &draft_cfg,
@@ -1321,7 +1389,7 @@ fn main() {
                 ngram_cache.as_ref(),
                 &emitted,
                 cactus_delta,
-                pld_spine,
+                spec_spine,
                 runtime_repeat_penalty,
                 repeat_window,
             )
@@ -1329,6 +1397,18 @@ fn main() {
         };
         if used_pld {
             pld_accepted += step.accepted;
+        }
+        if used_npu_spine {
+            npu_spine_stats.record_active(step.accepted);
+        } else if npu_spine_mode == SpecSpineMode::Shadow {
+            if let Some(proposal) = npu_cycle_proposal.as_ref() {
+                let committed_tail = if step.committed.len() > 1 {
+                    &step.committed[1..]
+                } else {
+                    &[]
+                };
+                npu_spine_stats.record_shadow(proposal, committed_tail);
+            }
         }
 
         // Per-cycle debug for the first N cycles.
@@ -1709,6 +1789,35 @@ fn main() {
             mean_launch, n_launch, mean_htod, n_htod, mean_dtoh, n_dtoh, b_dtoh / 1024,
             mean_dtod, n_dtod, mean_memset, n_memset, b_memset / (1024*1024), mean_glaunch, n_glaunch,
             mean_ssync, n_ssync, mean_esync, mean_dsync, untracked,
+        );
+    }
+    if npu_spine_mode.is_enabled()
+        || npu_spine_stats.proposed_cycles > 0
+        || npu_spine_stats.provider_errors > 0
+    {
+        let shadow_first_hit = if npu_spine_stats.shadow_cycles > 0 {
+            npu_spine_stats.shadow_first_token_hits as f32 / npu_spine_stats.shadow_cycles as f32
+        } else {
+            0.0
+        };
+        let shadow_prefix = if npu_spine_stats.shadow_cycles > 0 {
+            npu_spine_stats.shadow_prefix_tokens as f32 / npu_spine_stats.shadow_cycles as f32
+        } else {
+            0.0
+        };
+        eprintln!(
+            "npu-spine: mode={:?} proposals={} gated={} active={} shadow={} errors={} \
+             mean_len={:.2} active_tau={:.3} shadow_first_hit={:.3} shadow_prefix={:.3}",
+            npu_spine_mode,
+            npu_spine_stats.proposed_cycles,
+            npu_spine_stats.gated_cycles,
+            npu_spine_stats.active_cycles,
+            npu_spine_stats.shadow_cycles,
+            npu_spine_stats.provider_errors,
+            npu_spine_stats.mean_proposed_len(),
+            npu_spine_stats.active_tau(),
+            shadow_first_hit,
+            shadow_prefix,
         );
     }
     eprintln!("DFlash tokens: {:?}", emitted);

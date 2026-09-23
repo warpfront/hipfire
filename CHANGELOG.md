@@ -1,30 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### feat(hetero-dflash): PR 5 probe-scoped event scaffolding (env-gated, no-op in sequential)
-
-Adds `HIPFIRE_DFLASH_PIPELINE=1` env-gate to `spec_step_dflash` that wires
-`event_create + event_record` after Phase 4 (drafter forward) on the drafter
-stream and `stream_wait_event` before Phase 5 (target lm_head GEMM) on the
-target stream, with `event_destroy` at function exit. Default-OFF; OFF path
-behaviorally identical to pre-probe (single env-var read per cycle).
-
-This is the **smallest faithful answer** to "does PR 5 alone recover any
-tok/s without the path_d.md D0-D3a cycle restructure?". In the current
-sequential code structure, the wait is semantically a no-op: solo path the
-drafter and target share `gpu.active_stream` so the wait completes
-immediately; hetero path the existing `cross_card_copy_via_pinned`
-host-blocks on the drafter stream at the start of Phase 5 anyway. The
-probe measures the per-cycle event-API overhead and validates τ-invariance.
-
-**Diverges from continuation-prompt step 4** (speculative draft launch +
-seed_token cache for cycle N+1 from end of cycle N): that path would race
-against shared `draft_scratch` in the absence of `DflashScratchPair` from
-path_d.md D1, per D3b explicit warning. Honest probe = no-op overhead
-measurement, not a forced overlap that would either drift τ or appear
-correct on small prompts by accident.
-
 ## v0.1.20 — engine modularization
 
 The `crates/engine/` monolith is split into a runtime crate plus

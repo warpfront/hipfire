@@ -51,6 +51,26 @@ curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/in
 For Windows, source builds, and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
+## NixOS
+
+First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).
+
+```bash
+nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm + bun
+nix build github:Kaden-Schutt/hipfire    # build package
+```
+
+NixOS module:
+
+```nix
+{
+  inputs.hipfire.url = "github:Kaden-Schutt/hipfire";
+  # then in configuration.nix:
+  services.hipfire.enable = true;
+  services.hipfire.gpuTargets = [ "gfx1100" ];
+}
+```
+
 ## Inspiration: Lucebox
 
 hipfire's DFlash work was substantially shaped by Davide Ciffa's
@@ -100,6 +120,7 @@ the prefill MMQ redesign log is at
 | Page | Topic |
 |---|---|
 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, first run, what to read next |
+| [NIXOS.md](docs/NIXOS.md) | NixOS flake, module, dev shell |
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |

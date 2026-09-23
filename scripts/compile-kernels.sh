@@ -25,9 +25,9 @@ echo "Source: $SRC_DIR"
 echo "Architectures: ${ARCHS[*]}"
 echo "Parallel jobs: $JOBS"
 
-# Variant-tag regex: matches .gfxNNNN. (chip, e.g. .gfx1201.) and .gfxNN.
-# (family, e.g. .gfx12.). Files matching this are treated as overrides for
-# their parent name, not as independent kernels.
+# Variant-tag regex: matches .gfxNNNN.hip (chip, e.g. .gfx1201.hip) and
+# .gfxNN.hip (family, e.g. .gfx12.hip). Files matching this are treated as
+# overrides for their parent name, not as independent kernels.
 VARIANT_TAG_RE='\.gfx[0-9]+\.hip$'
 
 # ── Phase 1: enumerate jobs ──────────────────────────────────────────────
@@ -67,7 +67,7 @@ for arch in "${ARCHS[@]}"; do
         # gfx906-specific kernels (sdot4 dp4a, etc.) only build on gfx906.
         if [ "$arch" != "gfx906" ]; then
             case "$name" in
-                *_gfx906)
+                *_gfx906|*_gfx906_*|*_dp4a)
                     echo "  - $name SKIP (gfx906-only)"
                     continue
                     ;;
