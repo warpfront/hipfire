@@ -446,7 +446,13 @@ pub(crate) fn decode_raw_codec(
     k: usize,
     name: &str,
 ) -> HipResult<WeightTensor> {
-    if codec.dtype.requires_k_mod_256() && k % 256 != 0 {
+    // Low-bit layout validation — centralized before any upload/host-dequant.
+    // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
+    // Both require K%128==0 and exact packed length m*(k/128)*block_bytes.
+    // Checked arithmetic so overflow is an actionable error, not a silent wrap.
+    if let Some(block_bytes) = lowbit_block_bytes(codec.dtype) {
+        validate_lowbit_layout(codec.dtype, data.len(), m, k, name, block_bytes)?;
+    } else if codec.dtype.requires_k_mod_256() && k % 256 != 0 {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
@@ -465,6 +471,78 @@ pub(crate) fn decode_raw_codec(
         paro: None,
         awq_scale: None,
     })
+}
+
+/// Block bytes for low-bit codecs, or None for other codecs.
+fn lowbit_block_bytes(dtype: DType) -> Option<usize> {
+    match dtype {
+        DType::TQ2G128 => Some(34),
+        DType::BQ1G128 => Some(18),
+        _ => None,
+    }
+}
+
+/// Compute expected packed byte length for TQ2G128/BQ1G128 with checked arithmetic.
+/// Returns error with dtype/shape/caller context if K%128!=0 or arithmetic overflows.
+fn lowbit_expected_bytes(
+    dtype: DType,
+    m: usize,
+    k: usize,
+    name: &str,
+    block_bytes: usize,
+) -> HipResult<usize> {
+    if k % 128 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) requires K%128==0: K={k} not divisible by 128",
+                dtype
+            ),
+        ));
+    }
+    let groups = k / 128;
+    let bytes_per_row = groups.checked_mul(block_bytes).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) byte length overflow: (k/128)*{block_bytes} overflows usize (k/128={groups})",
+                dtype
+            ),
+        )
+    })?;
+    bytes_per_row.checked_mul(m).ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) byte length overflow: m*(k/128)*{block_bytes} overflows usize (bytes_per_row={bytes_per_row}, m={m})",
+                dtype
+            ),
+        )
+    })
+}
+
+/// Validate that `data_len` exactly matches the published low-bit layout.
+/// Checked arithmetic so overflow is an error; includes dtype, shape/caller,
+/// expected and actual length in the message. GPU-free, unit-testable.
+fn validate_lowbit_layout(
+    dtype: DType,
+    data_len: usize,
+    m: usize,
+    k: usize,
+    name: &str,
+    block_bytes: usize,
+) -> HipResult<()> {
+    let expected = lowbit_expected_bytes(dtype, m, k, name, block_bytes)?;
+    if data_len != expected {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{:?} tensor [m={m}, k={k}] (caller: {name}) expects {expected} bytes (m*(k/128)*{block_bytes}) but got {data_len}",
+                dtype
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Quant `data` → device `WeightTensor [m, k]`. Moved from
@@ -1505,5 +1583,230 @@ mod tests {
     fn bq1g128_quant_type_41_maps_to_bq1g128() {
         let c = raw_codec(41).expect("no RAW_CODECS row for qt=41");
         assert_eq!(c.dtype, DType::BQ1G128);
+    }
+
+    // ── Low-bit layout-validation contract (GPU-free) ─────────────────────────
+    // TQ2G128: 34 B per 128, BQ1G128: 18 B per 128, K%128==0, exact byte length
+    // m*(k/128)*block_bytes with checked arithmetic. Centralized in
+    // decode_raw_codec via validate_lowbit_layout / lowbit_expected_bytes.
+
+    #[test]
+    fn lowbit_block_bytes_mapping() {
+        assert_eq!(lowbit_block_bytes(DType::TQ2G128), Some(34));
+        assert_eq!(lowbit_block_bytes(DType::BQ1G128), Some(18));
+        assert_eq!(lowbit_block_bytes(DType::HFQ4G256), None);
+        assert_eq!(lowbit_block_bytes(DType::Q8_0), None);
+        assert_eq!(lowbit_block_bytes(DType::HFP4G32), None);
+    }
+
+    #[test]
+    fn lowbit_block_bytes_none_for_other_dtypes() {
+        for dt in [
+            DType::Q4K,
+            DType::Q8HFQ,
+            DType::MQ4G256,
+            DType::MQ2G256GL,
+            DType::F32,
+            DType::F16,
+        ] {
+            assert_eq!(lowbit_block_bytes(dt), None, "{dt:?} must not be low-bit");
+        }
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_tq2g128_valid_layouts() {
+        // Single-row, single-group: m=1,k=128 => 1*1*34 =34
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 1, 128, "test", 34).unwrap(),
+            34
+        );
+        // m=32,k=128 => 32*1*34=1088
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 32, 128, "test", 34).unwrap(),
+            32 * 34
+        );
+        // m=1,k=256 => 1*2*34=68
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 1, 256, "test", 34).unwrap(),
+            68
+        );
+        // Real Bonsai shape: m=8192,k=4096 => 8192*(4096/128)*34 =8192*32*34=8912896
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 8192, 4096, "test", 34).unwrap(),
+            8192 * 32 * 34
+        );
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 8192, 4096, "test", 34).unwrap(),
+            8912896
+        );
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_bq1g128_valid_layouts() {
+        // m=1,k=128 => 18
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 1, 128, "test", 18).unwrap(),
+            18
+        );
+        // m=32,k=128 => 576
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 32, 128, "test", 18).unwrap(),
+            576
+        );
+        // m=8192,k=4096 => 8192*32*18=4718592
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 8192, 4096, "test", 18).unwrap(),
+            4718592
+        );
+        // m=4096,k=512 => 4096*4*18=294912
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 4096, 512, "test", 18).unwrap(),
+            4096 * 4 * 18
+        );
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_rejects_k_not_divisible() {
+        for k in [1, 127, 129, 256 - 1, 255, 257, 1000] {
+            let err = lowbit_expected_bytes(DType::TQ2G128, 1, k, "caller_ctx", 34).unwrap_err();
+            assert!(
+                err.message.contains("K%128==0") || err.message.contains("requires K%128"),
+                "k={k}: expected K%128 error, got {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("TQ2G128"),
+                "must include dtype: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("caller_ctx"),
+                "must include caller: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&format!("k={k}")) || err.message.contains(&format!("K={k}")),
+                "must include shape K: {}",
+                err.message
+            );
+        }
+        // BQ1G128 same guard
+        let err = lowbit_expected_bytes(DType::BQ1G128, 4, 200, "my_layer", 18).unwrap_err();
+        assert!(err.message.contains("BQ1G128"));
+        assert!(err.message.contains("my_layer"));
+        assert!(err.message.contains("K%128"));
+    }
+
+    #[test]
+    fn validate_lowbit_layout_accepts_exact() {
+        // TQ2G128 m=2,k=128 => 68 bytes
+        validate_lowbit_layout(DType::TQ2G128, 68, 2, 128, "accept", 34).unwrap();
+        // BQ1G128 m=2,k=128 => 36 bytes
+        validate_lowbit_layout(DType::BQ1G128, 36, 2, 128, "accept", 18).unwrap();
+        // m=0 => 0 bytes expected (degenerate but valid)
+        validate_lowbit_layout(DType::TQ2G128, 0, 0, 128, "zero_m", 34).unwrap();
+        validate_lowbit_layout(DType::BQ1G128, 0, 0, 256, "zero_m", 18).unwrap();
+    }
+
+    #[test]
+    fn validate_lowbit_layout_rejects_short_and_long() {
+        // TQ2G128 m=1,k=128 expects 34, give 33 and 35
+        let exp = 34;
+        for bad in [exp - 1, exp + 1, exp + 10, 0] {
+            let err =
+                validate_lowbit_layout(DType::TQ2G128, bad, 1, 128, "my_caller", 34).unwrap_err();
+            assert!(
+                err.message.contains("TQ2G128"),
+                "dtype in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("m=1"),
+                "shape m in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("k=128"),
+                "shape k in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("my_caller"),
+                "caller in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&exp.to_string()),
+                "expected in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&bad.to_string()),
+                "actual in msg: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("expects"),
+                "expects phrase: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("but got"),
+                "but got phrase: {}",
+                err.message
+            );
+        }
+        // BQ1G128 m=4,k=256 => 4*2*18=144, test short
+        let err = validate_lowbit_layout(DType::BQ1G128, 100, 4, 256, "bq_caller", 18).unwrap_err();
+        assert!(err.message.contains("BQ1G128"));
+        assert!(err.message.contains("expects 144"));
+        assert!(err.message.contains("but got 100"));
+    }
+
+    #[test]
+    fn validate_lowbit_layout_error_contains_context() {
+        let err =
+            validate_lowbit_layout(DType::TQ2G128, 10, 8, 256, "attn.q_proj", 34).unwrap_err();
+        // 8 rows *2 groups *34 =544 expected, got 10
+        assert!(err.message.contains("TQ2G128"));
+        assert!(err.message.contains("m=8"));
+        assert!(err.message.contains("k=256"));
+        assert!(err.message.contains("attn.q_proj"));
+        assert!(err.message.contains("expects 544"));
+        assert!(err.message.contains("but got 10"));
+        assert!(err.message.contains("m*(k/128)*34"));
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_overflow() {
+        // bytes_per_row*m overflows: choose m=usize::MAX, k=128 => bytes_per_row=34 => 34*MAX overflows
+        let err =
+            lowbit_expected_bytes(DType::TQ2G128, usize::MAX, 128, "overflow_m", 34).unwrap_err();
+        assert!(err.message.contains("overflow"), "got {}", err.message);
+        assert!(err.message.contains("TQ2G128"), "dtype: {}", err.message);
+        assert!(
+            err.message.contains("overflow_m"),
+            "caller: {}",
+            err.message
+        );
+        assert!(err.message.contains("m="), "shape: {}", err.message);
+        // BQ1G128 overflow same
+        let err = lowbit_expected_bytes(DType::BQ1G128, usize::MAX, 256, "ov_bq", 18).unwrap_err();
+        assert!(err.message.contains("overflow"));
+        assert!(err.message.contains("BQ1G128"));
+        assert!(err.message.contains("ov_bq"));
+    }
+
+    #[test]
+    fn lowbit_expected_bytes_zero_m() {
+        // m=0 => 0 expected regardless of K (as long as K%128==0)
+        assert_eq!(
+            lowbit_expected_bytes(DType::TQ2G128, 0, 4096, "zero", 34).unwrap(),
+            0
+        );
+        assert_eq!(
+            lowbit_expected_bytes(DType::BQ1G128, 0, 128, "zero", 18).unwrap(),
+            0
+        );
     }
 }

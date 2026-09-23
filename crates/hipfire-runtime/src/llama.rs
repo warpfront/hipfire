@@ -1768,6 +1768,10 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             | DType::MQ6G256
             | DType::HFQ6G256
             | DType::Q8_0
+            // TQ2G128/BQ1G128 (PrismML Bonsai ternary/binary). Unrotated plain
+            // tiled prefill GEMMs; lockstep with qwen35::is_batchable_la.
+            | DType::TQ2G128
+            | DType::BQ1G128
     );
     if always_ok {
         return true;
@@ -8770,7 +8774,12 @@ impl KvCache {
             "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -8790,7 +8799,12 @@ impl KvCache {
             "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 

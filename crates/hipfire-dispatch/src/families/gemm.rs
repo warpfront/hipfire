@@ -76,6 +76,8 @@ impl GemmFamily {
                 }
             }
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
+            DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
+            DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm",

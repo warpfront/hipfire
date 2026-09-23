@@ -5402,6 +5402,10 @@ impl QuantType {
             35 => Some(Self::MFP4G32E8SOA),
             36 => Some(Self::MFP3G32E8),
             37 => Some(Self::MFP2G32E8),
+            38 => Some(Self::MQ2G256GL),
+            39 => Some(Self::MQ3G256GL),
+            40 => Some(Self::TQ2G128),
+            41 => Some(Self::BQ1G128),
             _ => None,
         }
     }
@@ -9511,6 +9515,7 @@ fn run_gguf_pipeline(
     arch_id_override: Option<u32>,
     force_arch_id: bool,
     attribution: Attribution,
+    allow_degenerate: bool,
 ) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
@@ -9678,6 +9683,7 @@ fn run_gguf_pipeline(
     let mut quant_params: u64 = 0;
     let mut total_bytes_in: u64 = 0;
     let mut total_bytes_out: u64 = 0;
+    let mut ternary_stats = Tq2PackStats::default();
 
     // qwen35 linear-attn head geometry, for the V-head un-tiling + A_log transform.
     let (qw_nk, qw_nv, qw_hv): (Option<usize>, Option<usize>, Option<usize>) =
@@ -9919,7 +9925,7 @@ fn run_gguf_pipeline(
                     // No Promote6 sibling for ternary (see default_promote_target);
                     // this arm only exists for match-exhaustiveness — Bonsai has
                     // no kmap-promoted tensors (kmap is dense-gated off by default).
-                    let q = quantize_tq2g128(&f32_data);
+                    let q = quantize_tq2g128_gptq(&f32_data, &[1.0f32; 128], 0.0);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, promote6)")
                 }
                 GgufFormat::Binary => unreachable!(
@@ -10016,7 +10022,7 @@ fn run_gguf_pipeline(
                 GgufFormat::Ternary => {
                     // K-map override target (lm_head) not expected under
                     // --format ternary; arm only for match-exhaustiveness.
-                    let q = quantize_tq2g128(&f32_data);
+                    let q = quantize_tq2g128_gptq(&f32_data, &[1.0f32; 128], 0.0);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, override)")
                 }
                 GgufFormat::Binary => unreachable!(
@@ -10040,7 +10046,7 @@ fn run_gguf_pipeline(
                     // Safety net for non-Q2_0 matmul tensors under --format
                     // ternary (real Bonsai matmuls are all Q2_0 and are
                     // caught by the passthrough arm earlier in this chain).
-                    let q = quantize_tq2g128(&f32_data);
+                    let q = quantize_tq2g128_gptq(&f32_data, &[1.0f32; 128], 0.0);
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
                 }
                 GgufFormat::Binary => unreachable!(
@@ -10137,6 +10143,9 @@ fn run_gguf_pipeline(
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
         };
 
+        if quant_type == QuantType::TQ2G128 && label.contains("requant") {
+            ternary_stats.add(tq2_pack_stats(&data));
+        }
         total_bytes_out += data.len() as u64;
         eprintln!(
             "  {label:>9}: {} → {} {:?} ({} src={:?}, {:.1} KB → {:.1} KB)",
@@ -10197,6 +10206,8 @@ fn run_gguf_pipeline(
             "conv1d kept full precision (F16)".to_string(),
         ]);
     }
+    check_ternary_pack_health(ternary_stats, allow_degenerate);
+
     let provenance = base_provenance(&input.to_string_lossy(), format.label(), &attribution);
     let metadata_json = stamp_provenance(&metadata_json, &provenance);
 
@@ -11707,6 +11718,7 @@ fn main() {
                 args.arch_id,
                 args.force_arch_id,
                 attribution_from_args(&args),
+                args.allow_degenerate_ternary,
             ) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
@@ -12365,6 +12377,7 @@ fn main() {
     let mut hfq_tensors = Vec::new();
     let mut total_params = 0u64;
     let mut quantized_params = 0u64;
+    let mut ternary_stats = Tq2PackStats::default();
     // Spill file for large models — keeps peak RSS bounded by flushing
     // completed tensor data to disk when accumulated memory exceeds 32 GB.
     // HIPFIRE_SPILL_DIR overrides the spill location (default = output dir).
@@ -14841,7 +14854,7 @@ fn main() {
                                 // match-exhaustiveness (not a real dispatch
                                 // target — lm_head override under ternary is
                                 // unused on this branch).
-                                let q = quantize_tq2g128(&f32_data);
+                                let q = quantize_tq2g128_gptq(&f32_data, &[1.0f32; 128], 0.0);
                                 (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
                             }
                             GgufFormat::Binary => unreachable!(
@@ -15691,6 +15704,9 @@ fn main() {
                     quantized.len() as f64 / 1024.0
                 );
 
+                if qt == QuantType::TQ2G128 {
+                    ternary_stats.add(tq2_pack_stats(&quantized));
+                }
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
                     quant_type: qt,
@@ -15979,6 +15995,8 @@ fn main() {
             }
         }
     }
+
+    check_ternary_pack_health(ternary_stats, args.allow_degenerate_ternary);
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
