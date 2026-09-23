@@ -1176,9 +1176,9 @@ mod tests {
         assert_eq!(fast.default_kv_mode.as_deref(), Some("q8"));
         assert_eq!(
             fast.sha256.as_deref(),
-            Some("9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7")
+            Some("80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3")
         );
-        assert_eq!(fast.size_bytes, Some(14980361216));
+        assert_eq!(fast.size_bytes, Some(14987185152));
         assert_ne!(
             fast.sha256, model.sha256,
             "the two tiers must not share a content digest"

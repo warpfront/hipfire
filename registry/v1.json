@@ -954,10 +954,10 @@
     "qwen3.8:27b-mq4-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq4-xt",
-      "size_gb": 14.98,
+      "size_gb": 14.99,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.057 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.048 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, xhigh thinking.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -988,8 +988,8 @@
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
         "size_bytes": 927611840
       },
-      "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
-      "size_bytes": 14980361216,
+      "sha256": "80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3",
+      "size_bytes": 14987185152,
       "arch_id": 5,
       "quant": "mq4"
     },
