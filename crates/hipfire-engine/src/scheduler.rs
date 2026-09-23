@@ -512,6 +512,68 @@ pub fn batch_rng_for_key(key: &AttemptKey) -> u64 {
     }
 }
 
+/// Process-global monotonic request counter. Mixed into the derived seed so
+/// two sequential requests that reuse the same wire key (clients that always
+/// send `id:"r1", attempt_id:1`) still get distinct sampler streams. The
+/// continuous-batch scheduler does not need this — its enqueue dedup already
+/// enforces key uniqueness per cohort.
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-start nonce (nanos since UNIX_EPOCH). Mixed into tier 2 so raw
+/// daemon clients that reuse identical `(id, attempt_id)` keys across daemon
+/// restarts do not replay the same unseeded draw sequences; within a process
+/// the counter already guarantees distinctness.
+static BOOT_NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+});
+
+/// Per-request sampler seed for the sequential AR route, replacing the
+/// historical fixed 0x13579BDF that made same-prompt requests byte-identical
+/// at temp>0. Entropy tiers:
+///
+/// 1. `client_seed = Some(s)` (wire `seed` field, OpenAI-compatible): splitmix
+///    over `s` ALONE. The seed must reproduce the draw sequence for every
+///    request that carries it — attempt identity is deliberately NOT mixed in,
+///    because HTTP clients get a fresh `attempt_id` per request, which would
+///    make seeded determinism unreachable over `/v1/chat/completions`.
+/// 2. `None`: `batch_rng_for_key(key)` mixed with the process-global request
+///    counter and [`BOOT_NONCE`] — every call gets a fresh stream regardless
+///    of client keying, and streams do not replay across daemon restarts.
+///
+/// The result is never 0: xorshift32 (GPU sampler kernel and
+/// `simple_rand`) treats a 0 state as stuck/degenerate, and truncating a
+/// nonzero u64 to u32 can produce 0.
+pub fn request_seed_for(key: &AttemptKey, client_seed: Option<u64>) -> u32 {
+    let h = match client_seed {
+        Some(s) => {
+            let mut z = s.wrapping_add(0x13579BDF);
+            z ^= z >> 30;
+            z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 27;
+            z = z.wrapping_mul(0xFF51AFD7ED558CCD);
+            z ^= z >> 31;
+            z
+        }
+        None => {
+            batch_rng_for_key(key)
+                ^ *BOOT_NONCE
+                ^ REQUEST_COUNTER
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_mul(0x9E3779B97F4A7C15)
+        }
+    };
+    let seed = h as u32;
+    if seed == 0 {
+        0x13579BDF
+    } else {
+        seed
+    }
+}
+
+ /// Eligibility for continuous batching. Conservative: only single-GPU
 /// Eligibility for continuous batching. Conservative: only single-GPU
 /// exact HIP Qwen 5/6 and dense LFM 11 stateless text without excluded features.
 pub fn is_batch_eligible(
