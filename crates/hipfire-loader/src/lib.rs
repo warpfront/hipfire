@@ -738,7 +738,8 @@ fn finish_qwen35_load(
                 match hipfire_runtime::hfq::HfqFile::open(&p) {
                     Ok(mut sidecar) => {
                         sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu) {
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
+                        {
                             Ok(Some((dspark_weights, assets))) => {
                                 let block = dspark_weights.cfg.block_size;
                                 // Reduced-vocab drafters (ORNITH) ship a compressed
@@ -784,7 +785,9 @@ fn finish_qwen35_load(
                                         ))
                                     }
                                     Err(e) => {
-                                        eprintln!("  qwen35: DSpark body build failed: {e} — AR/other");
+                                        eprintln!(
+                                            "  qwen35: DSpark body build failed: {e} — AR/other"
+                                        );
                                         None
                                     }
                                 }

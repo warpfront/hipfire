@@ -1,0 +1,1492 @@
+{
+  "model": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r",
+  "automatic_clocks": true,
+  "context": 128,
+  "iterations": 128,
+  "warmups": 10,
+  "runs": 30,
+  "transport": "pm4",
+  "kv_mode": "q8",
+  "hip_control": "direct",
+  "hip": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 848.44619,
+        "us_per_token": 6628.485859375,
+        "tok_s": 150.86401649113424,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 839.920492,
+        "us_per_token": 6561.87884375,
+        "tok_s": 152.39537696622838,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.8429990000001,
+        "us_per_token": 6545.6484296875005,
+        "tok_s": 152.7732524503675,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.6133110000001,
+        "us_per_token": 6543.8539921875,
+        "tok_s": 152.81514550811622,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.669337,
+        "us_per_token": 6544.2916953125,
+        "tok_s": 152.80492474323432,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.416595,
+        "us_per_token": 6542.3171484375,
+        "tok_s": 152.85104303432152,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.655165,
+        "us_per_token": 6544.1809765625,
+        "tok_s": 152.80750999726718,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.736718,
+        "us_per_token": 6544.818109375,
+        "tok_s": 152.7926343082887,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.87231,
+        "us_per_token": 6538.0649218749995,
+        "tok_s": 152.95045429331986,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.9133429999999,
+        "us_per_token": 6538.3854921875,
+        "tok_s": 152.94295528993615,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.838459,
+        "us_per_token": 6537.8004609375,
+        "tok_s": 152.95664130082721,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.873342,
+        "us_per_token": 6538.072984375,
+        "tok_s": 152.9502656807056,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.034366,
+        "us_per_token": 6539.330984375,
+        "tok_s": 152.92084196218056,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.655175,
+        "us_per_token": 6544.181054687499,
+        "tok_s": 152.80750817303792,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.209891,
+        "us_per_token": 6540.7022734375,
+        "tok_s": 152.88878138684103,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 837.166917,
+        "us_per_token": 6540.3665390625,
+        "tok_s": 152.89662957381293,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.828965,
+        "us_per_token": 6537.726289062501,
+        "tok_s": 152.95837662598115,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.459537,
+        "us_per_token": 6534.8401328125,
+        "tok_s": 153.02593172537408,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.672699,
+        "us_per_token": 6536.5054609375,
+        "tok_s": 152.98694477898817,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.722835,
+        "us_per_token": 6536.8971484375,
+        "tok_s": 152.97777788029413,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.583884,
+        "us_per_token": 6535.811593750001,
+        "tok_s": 153.00318646826813,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.307276,
+        "us_per_token": 6533.65059375,
+        "tok_s": 153.05379215665224,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.827112,
+        "us_per_token": 6537.711812500001,
+        "tok_s": 152.9587153242234,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.694432,
+        "us_per_token": 6536.67525,
+        "tok_s": 152.98297096830686,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.013281,
+        "us_per_token": 6531.353757812501,
+        "tok_s": 153.10761552363425,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.0919100000001,
+        "us_per_token": 6531.968046875,
+        "tok_s": 153.09321674934037,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.102273,
+        "us_per_token": 6524.236507812499,
+        "tok_s": 153.27463969194585,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.4448920000001,
+        "us_per_token": 6526.91321875,
+        "tok_s": 153.21178120267925,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.264088,
+        "us_per_token": 6525.5006875,
+        "tok_s": 153.24494592661094,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.535248,
+        "us_per_token": 6527.619125,
+        "tok_s": 153.19521265726422,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.3646,
+        "us_per_token": 6526.2859375,
+        "tok_s": 153.22650732386793,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.451511,
+        "us_per_token": 6526.9649296875,
+        "tok_s": 153.2105673575112,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.575869,
+        "us_per_token": 6527.9364765625005,
+        "tok_s": 153.1877651674979,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.5610770000001,
+        "us_per_token": 6527.8209140625,
+        "tok_s": 153.190477061918,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 835.9762360000001,
+        "us_per_token": 6531.06434375,
+        "tok_s": 153.11440025192294,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.1518100000001,
+        "us_per_token": 6532.436015625,
+        "tok_s": 153.0822495020372,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.2743459999999,
+        "us_per_token": 6533.393328124999,
+        "tok_s": 153.05981896041567,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.491264,
+        "us_per_token": 6535.088,
+        "tok_s": 153.02012765551132,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.212412,
+        "us_per_token": 6532.90946875,
+        "tok_s": 153.07115532267417,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 836.34979,
+        "us_per_token": 6533.982734375,
+        "tok_s": 153.04601200414004,
+        "hip_calls": {
+          "launches": 93952,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 152.80750817303792,
+      "median": 153.04990208039612,
+      "max": 153.27463969194585
+    }
+  },
+  "auto": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 682.845107,
+        "us_per_token": 5334.7273984375,
+        "tok_s": 187.45100270594747,
+        "hip_calls": {
+          "launches": 861,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 2
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 659.20264,
+        "us_per_token": 5150.020624999999,
+        "tok_s": 194.1739796430427,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 653.2395690000001,
+        "us_per_token": 5103.4341328125,
+        "tok_s": 195.9464889672046,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 650.435878,
+        "us_per_token": 5081.530296875,
+        "tok_s": 196.79111243614392,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 647.372523,
+        "us_per_token": 5057.5978359375,
+        "tok_s": 197.72232439961002,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.610217,
+        "us_per_token": 4989.1423203125,
+        "tok_s": 200.4352523536278,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.805022,
+        "us_per_token": 4990.664234375,
+        "tok_s": 200.37412918147032,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.9893679999999,
+        "us_per_token": 4984.291937499999,
+        "tok_s": 200.6303026667366,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.264914,
+        "us_per_token": 4986.444640625,
+        "tok_s": 200.54368835320315,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 636.7855569999999,
+        "us_per_token": 4974.887164062499,
+        "tok_s": 201.00958414168306,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.06556,
+        "us_per_token": 4977.0746875,
+        "tok_s": 200.9212364265932,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.098681,
+        "us_per_token": 4977.3334453125,
+        "tok_s": 200.9107910866951,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.833051,
+        "us_per_token": 4983.0707109375,
+        "tok_s": 200.67947215861665,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.71287,
+        "us_per_token": 4982.131796875,
+        "tok_s": 200.71729146692618,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.140627,
+        "us_per_token": 4985.4736484375,
+        "tok_s": 200.58274710035036,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.323203,
+        "us_per_token": 4986.9000234375,
+        "tok_s": 200.52537554396247,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.2987959999999,
+        "us_per_token": 4986.70934375,
+        "tok_s": 200.53304314865105,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.233787,
+        "us_per_token": 4986.2014609375,
+        "tok_s": 200.55346897515471,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.4466199999999,
+        "us_per_token": 4987.86421875,
+        "tok_s": 200.48661233416823,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.7440399999999,
+        "us_per_token": 4990.187812499999,
+        "tok_s": 200.39325924669293,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.277775,
+        "us_per_token": 4986.5451171875,
+        "tok_s": 200.53964749125095,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.8593609999999,
+        "us_per_token": 4983.276257812499,
+        "tok_s": 200.6711946648064,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.137692,
+        "us_per_token": 4985.45071875,
+        "tok_s": 200.58366964476375,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.194929,
+        "us_per_token": 4985.8978828125,
+        "tok_s": 200.5656801450392,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 637.759911,
+        "us_per_token": 4982.4993046875,
+        "tok_s": 200.70248661333625,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.4170449999999,
+        "us_per_token": 4987.633164062499,
+        "tok_s": 200.49589998023941,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.5295050000001,
+        "us_per_token": 4988.5117578125,
+        "tok_s": 200.46058795669902,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.588254,
+        "us_per_token": 4988.970734375,
+        "tok_s": 200.44214593399022,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.570888,
+        "us_per_token": 4988.835062499999,
+        "tok_s": 200.44759697845794,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.5606230000001,
+        "us_per_token": 4988.7548671875,
+        "tok_s": 200.45081921689368,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.150702,
+        "us_per_token": 4985.552359375,
+        "tok_s": 200.57958033868934,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.419509,
+        "us_per_token": 4987.6524140625,
+        "tok_s": 200.49512616006226,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.841086,
+        "us_per_token": 4990.945984375,
+        "tok_s": 200.36281761627336,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.820776,
+        "us_per_token": 4990.7873125,
+        "tok_s": 200.36918774225967,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.886045,
+        "us_per_token": 4991.2972265625,
+        "tok_s": 200.3487179000756,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.616497,
+        "us_per_token": 4989.1913828125,
+        "tok_s": 200.43328132188856,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 639.098846,
+        "us_per_token": 4992.959734375,
+        "tok_s": 200.28200770683287,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 639.1639140000001,
+        "us_per_token": 4993.468078125001,
+        "tok_s": 200.26161864951592,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.722418,
+        "us_per_token": 4990.018890625,
+        "tok_s": 200.40004294948673,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 638.937493,
+        "us_per_token": 4991.6991640625,
+        "tok_s": 200.33258558517554,
+        "hip_calls": {
+          "launches": 128,
+          "htod": 128,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 200.26161864951592,
+      "median": 200.49551307015082,
+      "max": 200.9212364265932
+    }
+  },
+  "speedup": 1.3100009235212176
+}

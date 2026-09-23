@@ -103,8 +103,13 @@ extern "C" __global__ void fused_qkv_hfq6g256_wave64_dp4a(
         const int xq_b = xqs[1];
 
         int sumi = 0;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        sumi = __builtin_amdgcn_sudot4(true, int_a, true, xq_a, sumi, false);
+        sumi = __builtin_amdgcn_sudot4(true, int_b, true, xq_b, sumi, false);
+#else
         sumi = __builtin_amdgcn_sdot4(int_a, xq_a, sumi, false);
         sumi = __builtin_amdgcn_sdot4(int_b, xq_b, sumi, false);
+#endif
 
         const half2 ds = xb->ds4[sub_in_block];
         const float2 dsf = __half22float2(ds);

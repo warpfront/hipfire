@@ -1,0 +1,123 @@
+{
+  "model": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4p",
+  "automatic_clocks": true,
+  "context": 128,
+  "iterations": 16,
+  "warmups": 1,
+  "runs": 1,
+  "transport": "pm4",
+  "kv_mode": "q8",
+  "hip": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 16,
+        "ms": 613.5829940000001,
+        "us_per_token": 38348.937125000004,
+        "tok_s": 26.07634200500674,
+        "hip_calls": {
+          "launches": 1480,
+          "htod": 16,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 16,
+        "ms": 631.239129,
+        "us_per_token": 39452.4455625,
+        "tok_s": 25.346971163443197,
+        "hip_calls": {
+          "launches": 16,
+          "htod": 16,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 25.346971163443197,
+      "median": 25.346971163443197,
+      "max": 25.346971163443197
+    }
+  },
+  "auto": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 16,
+        "ms": 139.44811800000002,
+        "us_per_token": 8715.507375000001,
+        "tok_s": 114.73801317275576,
+        "hip_calls": {
+          "launches": 748,
+          "htod": 16,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 2
+        }
+      }
+    ],
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 16,
+        "ms": 118.869983,
+        "us_per_token": 7429.3739375,
+        "tok_s": 134.6008436797707,
+        "hip_calls": {
+          "launches": 16,
+          "htod": 16,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 134.6008436797707,
+      "median": 134.6008436797707,
+      "max": 134.6008436797707
+    }
+  },
+  "speedup": 5.310332457942725
+}

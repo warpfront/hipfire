@@ -43,7 +43,7 @@ use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
@@ -1029,7 +1029,9 @@ fn main() {
             }
         }
         if errors > 0 {
-            eprintln!("Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use.");
+            eprintln!(
+                "Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use."
+            );
         } else {
             eprintln!("Kernel precompilation done.");
         }
@@ -1831,9 +1833,15 @@ fn main() {
                                         pf_max_kv,
                                     ) {
                                         Ok(()) => {
-                                            eprintln!("[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
-                                                pf_drafter_path, pflash_drafter_device, pflash_mode_str,
-                                                pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
+                                            eprintln!(
+                                                "[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
+                                                pf_drafter_path,
+                                                pflash_drafter_device,
+                                                pflash_mode_str,
+                                                pf_state.tokenizer_compat,
+                                                pflash_keep_ratio,
+                                                pflash_threshold
+                                            );
                                             let _ = writeln!(
                                                 stdout,
                                                 r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
@@ -1874,8 +1882,14 @@ fn main() {
                         let total_mb = vram_total / (1024 * 1024);
                         // serde-escape: raw HipError debug contains { } and "
                         // which corrupt the JSONL protocol if interpolated raw.
-                        write_error(&mut stdout, "", &format!(
-                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpu.arch));
+                        write_error(
+                            &mut stdout,
+                            "",
+                            &format!(
+                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
+                                gpu.arch
+                            ),
+                        );
                     }
                 }
                 let _ = stdout.flush();
@@ -2242,7 +2256,10 @@ fn main() {
                     // None — but clear them anyway for defense-in-depth
                     // in case a future arch adds VL support.
                     if m.seq_pos > 0 {
-                        eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
+                        eprintln!(
+                            "[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation",
+                            m.seq_pos
+                        );
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
                         free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
@@ -2465,7 +2482,10 @@ fn main() {
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
+                        eprintln!(
+                            "[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})",
+                            m.conversation_tokens.len()
+                        );
                     }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
@@ -2989,7 +3009,7 @@ fn main() {
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_ok = {
+                let prime_result = {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -3007,14 +3027,16 @@ fn main() {
                         None,
                         None,
                     )
-                    .is_ok()
                 };
                 let _ = gpu.hip.device_synchronize();
-                if !prime_ok {
+                if let Err(err) = prime_result {
                     let _ = writeln!(
                         stdout,
                         "{}",
-                        r#"{"type":"error","message":"bench_decode prefill prime failed"}"#
+                        serde_json::json!({
+                            "type": "error",
+                            "message": format!("bench_decode prefill prime failed: {err}"),
+                        })
                     );
                     let _ = stdout.flush();
                     continue;
@@ -3037,6 +3059,7 @@ fn main() {
                 }
 
                 let _ = gpu.hip.device_synchronize();
+                hip_bridge::launch_counters::reset();
                 let t0 = Instant::now();
                 let run_ok = {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
@@ -3065,6 +3088,16 @@ fn main() {
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
+                let hip_calls = serde_json::json!({
+                    "launches": hip_bridge::launch_counters::launch_kernel::count(),
+                    "htod": hip_bridge::launch_counters::memcpy_htod::count(),
+                    "dtod": hip_bridge::launch_counters::memcpy_dtod::count(),
+                    "dtoh": hip_bridge::launch_counters::memcpy_dtoh::count(),
+                    "memset": hip_bridge::launch_counters::memset::count(),
+                    "stream_sync": hip_bridge::launch_counters::stream_sync::count(),
+                    "event_sync": hip_bridge::launch_counters::event_sync::count(),
+                    "device_sync": hip_bridge::launch_counters::device_sync::count(),
+                });
                 let capture_summary = if capture {
                     match gpu.replay.finish_capture() {
                         Ok(summary) => Some(summary),
@@ -3085,6 +3118,19 @@ fn main() {
                     None
                 };
 
+                // Diagnostic only: preserve the exact output produced by the
+                // forward that populated the retained tape. This separates a
+                // capture/blob ABI drift from a replay tape that simply omits
+                // some non-kernel side effect of the ordinary forward.
+                let capture_snapshot = if capture && capture_detail && run_ok {
+                    let ModelState::Qwen35(bundle) = m.state.as_ref().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_qwen_snapshot(&gpu, bundle).ok()
+                } else {
+                    None
+                };
+
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
@@ -3098,10 +3144,14 @@ fn main() {
                         "ms": elapsed * 1000.0,
                         "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
                         "tok_s": tok_s,
+                        "hip_calls": hip_calls,
                     });
                     if let Some(summary) = capture_summary {
                         response["redline_capture"] =
                             redline_capture_json(&gpu, summary, capture_detail);
+                    }
+                    if let Some(snapshot) = capture_snapshot {
+                        response["redline_capture_snapshot"] = snapshot.json();
                     }
                     let _ = writeln!(stdout, "{response}");
                 } else {
@@ -3207,6 +3257,57 @@ fn main() {
                     }
                 };
                 let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+
+                // Run the ordinary HIP oracle first as well as last. A full
+                // retained tape mutates more state than a short prefix; this
+                // pre-arm distinguishes replay drift from an incomplete
+                // reset contaminating the historical post-replay oracle.
+                let hip_pre_result = (|| -> Result<RedlineQwenSnapshot, String> {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                    let loaded = model.as_mut().expect("eligibility checked");
+                    let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    redline_reset_qwen(&mut gpu, bundle)?;
+                    redline_prime_qwen(&mut gpu, bundle, context)?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    for i in 0..iterations {
+                        qwen35::forward_scratch(
+                            &mut gpu,
+                            &bundle.weights,
+                            &bundle.config,
+                            101 + i as u32,
+                            context + i,
+                            &mut bundle.kv_cache,
+                            &mut bundle.dn_state,
+                            &bundle.scratch,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    redline_qwen_snapshot(&gpu, bundle)
+                })();
+                let hip_pre_snapshot = match hip_pre_result {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": format!("redline pre-replay HIP oracle failed: {reason}"),
+                            })
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
 
                 let aql_result = (|| -> Result<(RedlineQwenSnapshot, f64, f64), String> {
                     let loaded = model.as_mut().expect("eligibility checked");
@@ -3349,9 +3450,26 @@ fn main() {
                 let kv_equal = aql_snapshot.kv == hip_snapshot.kv;
                 let recurrent_equal = aql_snapshot.recurrent == hip_snapshot.recurrent;
                 let bit_exact = logits_equal && kv_equal && recurrent_equal;
+                let pre_logits_equal = aql_snapshot.logits == hip_pre_snapshot.logits;
+                let pre_kv_equal = aql_snapshot.kv == hip_pre_snapshot.kv;
+                let pre_recurrent_equal = aql_snapshot.recurrent == hip_pre_snapshot.recurrent;
+                let pre_bit_exact = pre_logits_equal && pre_kv_equal && pre_recurrent_equal;
+                let hip_oracles_equal = hip_pre_snapshot.logits == hip_snapshot.logits
+                    && hip_pre_snapshot.kv == hip_snapshot.kv
+                    && hip_pre_snapshot.recurrent == hip_snapshot.recurrent;
                 let blob_bit_exact = aql_snapshot.logits == blob_snapshot.logits
                     && aql_snapshot.kv == blob_snapshot.kv
                     && aql_snapshot.recurrent == blob_snapshot.recurrent;
+                let captured_gdn_frames = gpu
+                    .replay
+                    .recorded_launches()
+                    .iter()
+                    .filter(|launch| launch.kernel.starts_with("gated_delta_net_q8"))
+                    .filter_map(|launch| {
+                        let bytes: [u8; 4] = launch.kernarg.get(76..80)?.try_into().ok()?;
+                        Some(u32::from_ne_bytes(bytes))
+                    })
+                    .collect::<Vec<_>>();
                 let _ = writeln!(
                     stdout,
                     "{}",
@@ -3365,7 +3483,15 @@ fn main() {
                         "queue_id": prepared.2,
                         "command_dwords": prepared.3,
                         "bit_exact": bit_exact,
+                        "pre_bit_exact": pre_bit_exact,
+                        "pre_logits_equal": pre_logits_equal,
+                        "pre_kv_equal": pre_kv_equal,
+                        "pre_recurrent_equal": pre_recurrent_equal,
+                        "hip_oracles_equal": hip_oracles_equal,
                         "blob_bit_exact": blob_bit_exact,
+                        "force_blob_path": gpu.flags.force_blob_path,
+                        "frame_checkpoint": frame_checkpoint,
+                        "captured_gdn_frames": captured_gdn_frames,
                         "logits_equal": logits_equal,
                         "kv_equal": kv_equal,
                         "recurrent_equal": recurrent_equal,
@@ -3374,6 +3500,7 @@ fn main() {
                         "hip_host_us": hip_host_us,
                         "aql": aql_snapshot.json(),
                         "hip": hip_snapshot.json(),
+                        "hip_pre": hip_pre_snapshot.json(),
                         "blob": blob_snapshot.json(),
                     })
                 );
@@ -3450,6 +3577,8 @@ fn main() {
                         .device_synchronize()
                         .map_err(|error| error.to_string())?;
                     let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let mut initial_x = Vec::new();
+                    redline_append_buffer(&gpu, &mut initial_x, &bundle.scratch.x.buf)?;
                     let replay_started = Instant::now();
                     if pm4 {
                         unsafe { gpu.replay.replay_pm4() }?;
@@ -3463,20 +3592,23 @@ fn main() {
                     let hashes = redline_qwen_debug_hashes(&gpu, bundle)?;
                     let mut dn_k = Vec::new();
                     redline_append_buffer(&gpu, &mut dn_k, &bundle.scratch.dn_k.buf)?;
-                    Ok((initial, hashes, dn_k, replay_host_us))
+                    let mut x = Vec::new();
+                    redline_append_buffer(&gpu, &mut x, &bundle.scratch.x.buf)?;
+                    Ok((initial, initial_x, hashes, dn_k, x, replay_host_us))
                 })();
-                let (aql_initial, aql_hashes, aql_dn_k, direct_host_us) = match aql_hashes {
-                    Ok(result) => result,
-                    Err(reason) => {
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type":"error", "message": format!("AQL prefix failed: {reason}")})
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                };
+                let (aql_initial, aql_initial_x, aql_hashes, aql_dn_k, aql_x, direct_host_us) =
+                    match aql_hashes {
+                        Ok(result) => result,
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type":"error", "message": format!("AQL prefix failed: {reason}")})
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
                 let hip_hashes = (|| -> Result<_, String> {
                     let loaded = model.as_mut().unwrap();
                     let ModelState::Qwen35(bundle) = loaded.state.as_mut().unwrap() else {
@@ -3497,6 +3629,8 @@ fn main() {
                         .device_synchronize()
                         .map_err(|error| error.to_string())?;
                     let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let mut initial_x = Vec::new();
+                    redline_append_buffer(&gpu, &mut initial_x, &bundle.scratch.x.buf)?;
                     let replay_started = Instant::now();
                     gpu.replay_recorded_hip_prefix(prefix)
                         .map_err(|error| error.to_string())?;
@@ -3507,20 +3641,23 @@ fn main() {
                     let hashes = redline_qwen_debug_hashes(&gpu, bundle)?;
                     let mut dn_k = Vec::new();
                     redline_append_buffer(&gpu, &mut dn_k, &bundle.scratch.dn_k.buf)?;
-                    Ok((initial, hashes, dn_k, replay_host_us))
+                    let mut x = Vec::new();
+                    redline_append_buffer(&gpu, &mut x, &bundle.scratch.x.buf)?;
+                    Ok((initial, initial_x, hashes, dn_k, x, replay_host_us))
                 })();
-                let (hip_initial, hip_hashes, hip_dn_k, hip_host_us) = match hip_hashes {
-                    Ok(result) => result,
-                    Err(reason) => {
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type":"error", "message": format!("HIP prefix failed: {reason}")})
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                };
+                let (hip_initial, hip_initial_x, hip_hashes, hip_dn_k, hip_x, hip_host_us) =
+                    match hip_hashes {
+                        Ok(result) => result,
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type":"error", "message": format!("HIP prefix failed: {reason}")})
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
                 let differing = aql_hashes
                     .iter()
                     .filter_map(|(name, hash)| (hip_hashes.get(name) != Some(hash)).then_some(name))
@@ -3542,6 +3679,39 @@ fn main() {
                             "hip": hip_dn_k[index],
                         })
                     });
+                let x_mismatched_f32 = aql_x
+                    .chunks_exact(4)
+                    .zip(hip_x.chunks_exact(4))
+                    .filter(|(aql, hip)| aql != hip)
+                    .count();
+                let x_first_mismatch = aql_x
+                    .chunks_exact(4)
+                    .zip(hip_x.chunks_exact(4))
+                    .position(|(aql, hip)| aql != hip)
+                    .map(|index| {
+                        let offset = index * 4;
+                        let aql = f32::from_ne_bytes(aql_x[offset..offset + 4].try_into().unwrap());
+                        let hip = f32::from_ne_bytes(hip_x[offset..offset + 4].try_into().unwrap());
+                        serde_json::json!({"index": index, "aql": aql, "hip": hip})
+                    });
+                let mut x_aql_stale_f32 = 0usize;
+                let mut x_hip_stale_f32 = 0usize;
+                let mut x_max_abs_diff = 0.0f32;
+                for index in 0..aql_x.len().min(hip_x.len()) / 4 {
+                    let offset = index * 4;
+                    let aql_bytes = &aql_x[offset..offset + 4];
+                    let hip_bytes = &hip_x[offset..offset + 4];
+                    if aql_bytes == hip_bytes {
+                        continue;
+                    }
+                    x_aql_stale_f32 +=
+                        usize::from(aql_initial_x.get(offset..offset + 4) == Some(aql_bytes));
+                    x_hip_stale_f32 +=
+                        usize::from(hip_initial_x.get(offset..offset + 4) == Some(hip_bytes));
+                    let aql = f32::from_ne_bytes(aql_bytes.try_into().unwrap());
+                    let hip = f32::from_ne_bytes(hip_bytes.try_into().unwrap());
+                    x_max_abs_diff = x_max_abs_diff.max((aql - hip).abs());
+                }
                 let pointer_debug = model.as_ref().and_then(|loaded| {
                     let ModelState::Qwen35(bundle) = loaded.state.as_ref()? else {
                         return None;
@@ -3593,6 +3763,12 @@ fn main() {
                         "hip_initial": hip_initial,
                         "dn_k_mismatched_bytes": dn_k_mismatches,
                         "dn_k_first_mismatch": dn_k_first_mismatch,
+                        "x_mismatched_f32": x_mismatched_f32,
+                        "x_first_mismatch": x_first_mismatch,
+                        "x_aql_stale_f32": x_aql_stale_f32,
+                        "x_hip_stale_f32": x_hip_stale_f32,
+                        "x_max_abs_diff": x_max_abs_diff,
+                        "initial_x_equal": aql_initial_x == hip_initial_x,
                         "pointer_debug": pointer_debug,
                         "aql": aql_hashes,
                         "hip": hip_hashes,
@@ -4680,7 +4856,12 @@ fn plan_prompt_cache(
             {
                 eprintln!(
                     "[qwen-cache resume dflash] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
-                    ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
+                    ckpt,
+                    lcp,
+                    prior_len,
+                    rendered.len(),
+                    rendered.len() - ckpt,
+                    rendered.len(),
                 );
                 return PromptCachePlan {
                     new_tokens: rendered[ckpt..].to_vec(),
@@ -5162,7 +5343,10 @@ fn generate_dflash(
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                fp, cached_seq.len(), emit_text.len(), emit_tool_calls.len(),
+                fp,
+                cached_seq.len(),
+                emit_text.len(),
+                emit_tool_calls.len(),
                 emit_text.chars().take(60).collect::<String>(),
             );
         }
@@ -6204,11 +6388,7 @@ fn generate_qwen35_mtp(
         .iter()
         .enumerate()
         .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
+            if v > bv { (i as u32, v) } else { (best, bv) }
         })
         .0;
 
@@ -7199,12 +7379,19 @@ fn generate_multi(
                 latch_gen_mark = Some(generated);
             }
             if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
-                eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
+                eprintln!(
+                    "[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS",
+                    id, total_think_tokens, max_total_think
+                );
                 break;
             }
             if let Some(mark) = latch_gen_mark {
                 if generated.saturating_sub(mark) >= post_latch_answer_budget {
-                    eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+                    eprintln!(
+                        "[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS",
+                        id,
+                        generated.saturating_sub(mark)
+                    );
                     break;
                 }
             }
@@ -7229,7 +7416,10 @@ fn generate_multi(
                         id
                     );
                 } else if force_answer_latched {
-                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
+                    eprintln!(
+                        "[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)",
+                        id
+                    );
                 }
                 let close_tokens = tokenizer.encode(&think_continuation());
                 let budget_left = max_tokens.saturating_sub(generated);
@@ -7756,19 +7946,21 @@ fn generate(
         );
         let _ = (repeat_penalty, repeat_window);
         let _ = stop; // hunt3 M-F: not wired for arch_id=9 (deepseek4 bring-up)
-                      // Route the MTP spec-decode path (greedy, speculator present) through the
-                      // unified `generate_spec`; the AR sampler path (temp>0) and the
-                      // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
-                      // deletes the latter's now-redundant spec loop).
-                      // Route to the DSpark/MTP spec loop for greedy OR — now un-gated — for
-                      // temp>0 when the loaded speculator can sample its verify. DSpark
-                      // signals this via `requires_greedy()==false` (its sampled verify is the
-                      // "chain" kind, NOT the ddtree-SWOR flavour that `supports_temp_verify()`
-                      // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
-                      // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
-                      // was hardcoded greedy-only (temp>0 → AR).
-        let spec_temp_ok =
-            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        // Route the MTP spec-decode path (greedy, speculator present) through the
+        // unified `generate_spec`; the AR sampler path (temp>0) and the
+        // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
+        // deletes the latter's now-redundant spec loop).
+        // Route to the DSpark/MTP spec loop for greedy OR — now un-gated — for
+        // temp>0 when the loaded speculator can sample its verify. DSpark
+        // signals this via `requires_greedy()==false` (its sampled verify is the
+        // "chain" kind, NOT the ddtree-SWOR flavour that `supports_temp_verify()`
+        // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
+        // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
+        // was hardcoded greedy-only (temp>0 → AR).
+        let spec_temp_ok = temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(
@@ -8214,10 +8406,7 @@ fn generate(
             "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
         );
     }
-    if m.speculator.is_some()
-        && !force_ar_chat
-        && (qwen_dflash_route || llama_dflash_route)
-    {
+    if m.speculator.is_some() && !force_ar_chat && (qwen_dflash_route || llama_dflash_route) {
         // One-time visibility: temp + top_p + top_k ARE now honored on the
         // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
         // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains
@@ -8709,8 +8898,13 @@ fn generate(
     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
-            cache_eligible, cache_kill_switch, messages_history.is_some(),
-            m.eviction.is_none(), !pflash_active, jinja_active, m.conversation_tokens.len(),
+            cache_eligible,
+            cache_kill_switch,
+            messages_history.is_some(),
+            m.eviction.is_none(),
+            !pflash_active,
+            jinja_active,
+            m.conversation_tokens.len(),
         );
     }
     let mut cached_tokens_count: usize = 0;
@@ -8767,7 +8961,12 @@ fn generate(
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
+                            fp,
+                            msg.role,
+                            msg.content.len(),
+                            normalized.len(),
+                            primer.len(),
+                            hit.is_some(),
                         );
                     }
                     hit
@@ -8810,8 +9009,12 @@ fn generate(
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} tool_calls={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(),
-                            msg.tool_calls.len(), hit.is_some(),
+                            fp,
+                            msg.role,
+                            msg.content.len(),
+                            normalized.len(),
+                            msg.tool_calls.len(),
+                            hit.is_some(),
                         );
                     }
                     hit
@@ -9016,7 +9219,12 @@ fn generate(
                     cached_tokens_count = rpos;
                     eprintln!(
                         "[qwen-cache resume] rewound to checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
-                        rpos, lcp, prior_len, rendered.len(), rendered.len() - rpos, rendered.len(),
+                        rpos,
+                        lcp,
+                        prior_len,
+                        rendered.len(),
+                        rendered.len() - rpos,
+                        rendered.len(),
                     );
                     Some(rendered[rpos..].to_vec())
                 } else {
@@ -9314,7 +9522,10 @@ fn generate(
                             }
                         }
                         Err(e) => {
-                            eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — skipping", m.seq_pos, e);
+                            eprintln!(
+                                "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — skipping",
+                                m.seq_pos, e
+                            );
                         }
                     }
                 }
@@ -9384,7 +9595,10 @@ fn generate(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — skipping", m.seq_pos, e);
+                    eprintln!(
+                        "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — skipping",
+                        m.seq_pos, e
+                    );
                 }
             }
         }
@@ -9753,7 +9967,10 @@ fn generate(
                         }
                     }
                     Err(e) => {
-                        eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — skipping", m.seq_pos, e);
+                        eprintln!(
+                            "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — skipping",
+                            m.seq_pos, e
+                        );
                     }
                 }
             }
@@ -9825,12 +10042,19 @@ fn generate(
                     latch_gen_mark = Some(generated);
                 }
                 if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
-                    eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
+                    eprintln!(
+                        "[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS",
+                        id, total_think_tokens, max_total_think
+                    );
                     break;
                 }
                 if let Some(mark) = latch_gen_mark {
                     if generated.saturating_sub(mark) >= post_latch_answer_budget {
-                        eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+                        eprintln!(
+                            "[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS",
+                            id,
+                            generated.saturating_sub(mark)
+                        );
                         break;
                     }
                 }
@@ -9850,9 +10074,15 @@ fn generate(
 
                 if in_think && (budget_hit || force_answer_now || force_answer_latched) {
                     if force_answer_now {
-                        eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                        eprintln!(
+                            "[force-answer] id={} — closing <think> mid-turn to commit to the answer",
+                            id
+                        );
                     } else if force_answer_latched {
-                        eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
+                        eprintln!(
+                            "[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)",
+                            id
+                        );
                     }
                     // Force-close. Encode the continuation and run each token
                     // through the KV write + emit path the same way a normally-
@@ -10573,11 +10803,7 @@ fn build_deepseek4_dsml_prompt(
     // emits a single non-thinking turn per /generate call.
     let lookup = |s: &str| -> Option<u32> {
         let ids = tokenizer.encode(s);
-        if ids.len() == 1 {
-            Some(ids[0])
-        } else {
-            None
-        }
+        if ids.len() == 1 { Some(ids[0]) } else { None }
     };
     let bos_tok = lookup("<｜begin▁of▁sentence｜>");
     let user_tok = lookup("<｜User｜>");
@@ -10585,8 +10811,7 @@ fn build_deepseek4_dsml_prompt(
 
     // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
     // Quoted from the model card's encoding/README.md.
-    const MAX_THINK_PREAMBLE: &str =
-        "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
+    const MAX_THINK_PREAMBLE: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
 You MUST be very thorough in your thinking and comprehensively decompose the problem.";
 
     // Build the effective system message: optional user-supplied system
@@ -10729,7 +10954,9 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     {
                         eprintln!(
                             "[asst-cache lookup] fp={:#018x} content.len={}/stripped.len={} tool_calls={} hit={}",
-                            fp, msg.content.len(), normalized.len(),
+                            fp,
+                            msg.content.len(),
+                            normalized.len(),
                             msg.tool_calls.len(),
                             asst_turn_cache.contains_key(&fp),
                         );
@@ -11592,9 +11819,9 @@ fn generate_deepseek4(
         // pushes EOS, but a future model that emits EOS mid-stream
         // shouldn't end up with EOS landing in the cached tokens).
         drop(absorb_event); // release the &mut emit_*_buf borrow
-                            // Now that the closure is dropped, we can read the buffers
-                            // immutably. Snapshot the tool_calls count so the `done`
-                            // envelope below can carry `finish_reason: "tool_calls"`.
+        // Now that the closure is dropped, we can read the buffers
+        // immutably. Snapshot the tool_calls count so the `done`
+        // envelope below can carry `finish_reason: "tool_calls"`.
         tool_calls_parsed_count = emit_tool_calls_buf.len();
         // Skip caching when the turn produced no replay-able payload —
         // empty trimmed content AND no tool_calls. The fingerprint for
@@ -11790,7 +12017,9 @@ fn generate_lfm2moe(
             match render_result {
                 Ok(rendered) => tokenizer.encode(&rendered),
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
+                    eprintln!(
+                        "[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain"
+                    );
                     hipfire_runtime::prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -12104,7 +12333,9 @@ fn generate_minimax(
                     tokenizer.encode(&rendered)
                 }
                 Err(e) => {
-                    eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
+                    eprintln!(
+                        "[daemon] jinja render failed in minimax path ({e}) — falling back to Plain"
+                    );
                     hipfire_runtime::prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
@@ -12193,47 +12424,50 @@ fn generate_minimax(
     // tail is never attended. The reused prefix GROWS with the conversation
     // (all older turns, reasoning already stripped, stay matched), so
     // steady-state per-turn prefill is just {last visible answer} + {new user}.
-    let prefill_ids: Vec<u32> =
-        {
-            let prior_len = m.conversation_tokens.len();
-            let max_match = prior_len.min(prompt_ids.len());
-            let mut lcp = 0usize;
-            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-                lcp += 1;
-            }
-            // A usable common prefix that leaves at least one fresh token to prefill
-            // (the render always appends a new `]~b]ai\n<think>\n` primer, so
-            // lcp == rendered_len cannot occur on a normal turn). `partial` is the
-            // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
-            // the degenerate pure-extension case (rewind is then a no-op).
-            let cache_hit = lcp > 0 && lcp < prompt_ids.len();
-            let partial = lcp < prior_len;
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                eprintln!(
+    let prefill_ids: Vec<u32> = {
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_ids.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        // A usable common prefix that leaves at least one fresh token to prefill
+        // (the render always appends a new `]~b]ai\n<think>\n` primer, so
+        // lcp == rendered_len cannot occur on a normal turn). `partial` is the
+        // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
+        // the degenerate pure-extension case (rewind is then a no-op).
+        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+        let partial = lcp < prior_len;
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                prior_len,
+                prompt_ids.len(),
+                lcp,
+                cache_hit,
+                cache_hit && partial,
                 m.minimax().unwrap().state.n_tokens,
             );
+        }
+        if cache_hit {
+            // Rewind KV + token history to the common prefix. When lcp ==
+            // prior_len this is a no-op; when lcp < prior_len it discards the
+            // stale reasoning+answer tail. The prefill loop below reads
+            // `state.n_tokens` as its base position, so n_tokens is the only
+            // KV state the rewind must touch (plus the mirror token history).
+            m.minimax_mut().unwrap().state.n_tokens = lcp;
+            m.conversation_tokens.truncate(lcp);
+            m.seq_pos = lcp;
+            prompt_ids[lcp..].to_vec()
+        } else {
+            if prior_len > 0 {
+                m.minimax_mut().unwrap().state.reset();
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
             }
-            if cache_hit {
-                // Rewind KV + token history to the common prefix. When lcp ==
-                // prior_len this is a no-op; when lcp < prior_len it discards the
-                // stale reasoning+answer tail. The prefill loop below reads
-                // `state.n_tokens` as its base position, so n_tokens is the only
-                // KV state the rewind must touch (plus the mirror token history).
-                m.minimax_mut().unwrap().state.n_tokens = lcp;
-                m.conversation_tokens.truncate(lcp);
-                m.seq_pos = lcp;
-                prompt_ids[lcp..].to_vec()
-            } else {
-                if prior_len > 0 {
-                    m.minimax_mut().unwrap().state.reset();
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
-                }
-                prompt_ids.clone()
-            }
-        };
+            prompt_ids.clone()
+        }
+    };
 
     let t0 = Instant::now();
 
@@ -12499,7 +12733,8 @@ fn generate_cohere2moe(
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
                             "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
-                            rendered.len(), ids.len(),
+                            rendered.len(),
+                            ids.len(),
                             &rendered[..rendered.len().min(400)],
                             &rendered[rendered.len().saturating_sub(800)..],
                         );
@@ -12528,7 +12763,9 @@ fn generate_cohere2moe(
             } else {
                 "model .hfq carries no chat_template"
             };
-            eprintln!("[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback");
+            eprintln!(
+                "[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback"
+            );
             emit_error_with_id(
                 stdout,
                 id,
@@ -12606,7 +12843,11 @@ fn generate_cohere2moe(
         if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
+                prior_len,
+                prompt_ids.len(),
+                lcp,
+                cache_hit,
+                cache_hit && partial,
                 m.cohere2moe().unwrap().state.n_tokens,
             );
         }
@@ -13472,11 +13713,22 @@ fn generate_vl(
             > m.max_seq
     };
     if over_budget {
-        write_error(stdout, id, &format!(
-            "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
-            m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
-            if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
-        ));
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
+                m.seq_pos,
+                prompt_tokens.len(),
+                max_tokens,
+                trailer,
+                if m.eviction.is_none() {
+                    m.physical_cap
+                } else {
+                    m.max_seq
+                },
+            ),
+        );
         return;
     }
 
@@ -13753,9 +14005,9 @@ fn generate_vl(
                     }
                     think_count = 0;
                     think_depth = 0; // Must reset — the close tokens
-                                     // above bypass the incremental tracker, so depth
-                                     // is still > 0 here. Without this, any subsequent
-                                     // non-open/close token would re-trigger the cap.
+                    // above bypass the incremental tracker, so depth
+                    // is still > 0 here. Without this, any subsequent
+                    // non-open/close token would re-trigger the cap.
                     if generated >= max_tokens {
                         break;
                     }
@@ -13921,9 +14173,16 @@ fn generate_vl_dots_ocr(
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
     if prompt_ids.len().saturating_add(max_tokens) > max_seq {
-        write_error(stdout, id, &format!(
-            "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
-            prompt_ids.len(), max_tokens, max_seq));
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+                prompt_ids.len(),
+                max_tokens,
+                max_seq
+            ),
+        );
         return;
     }
 
@@ -13976,8 +14235,12 @@ fn generate_vl_dots_ocr(
             stdout,
             id,
             &format!(
-            "dots.ocr: merger produced {} values but prompt has {} <|imgpad|> slots × {} dims = {}",
-            merged.len(), n_visual, dim, n_visual * dim),
+                "dots.ocr: merger produced {} values but prompt has {} <|imgpad|> slots × {} dims = {}",
+                merged.len(),
+                n_visual,
+                dim,
+                n_visual * dim
+            ),
         );
         return;
     }

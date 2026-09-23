@@ -157,6 +157,41 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 // ── ScratchState helpers ────────────────────────────────────────────────
 
 impl ScratchState {
+    /// Ensure the shared FP16 activation scratch is large enough without
+    /// launching a conversion kernel. Fused producers write it directly.
+    pub fn ensure_fp16_x_buffer(
+        &mut self,
+        hip: &HipRuntime,
+        n_elems: usize,
+    ) -> HipResult<*mut c_void> {
+        let needed = n_elems * 2;
+        if self.fp16_x_scratch_bytes < needed {
+            self.fp16_x_scratch = Some(hip.malloc(needed)?);
+            self.fp16_x_scratch_bytes = needed;
+        }
+        self.fp16_x_source_ptr = std::ptr::null_mut();
+        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the shared DS4 Q8_1 activation buffer is large enough without
+    /// launching the standalone quantizer.  Fused producers (for example
+    /// RMSNorm+Q8_1 on gfx12 decode) populate this allocation directly and
+    /// then pass the returned pointer to a pre-quantized consumer.
+    pub fn ensure_q8_1_mmq_buffer(
+        &mut self,
+        hip: &HipRuntime,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let blocks_k = k.div_ceil(128);
+        let needed = blocks_k * batch_size * 144;
+        if self.q8_1_mmq_x_scratch_bytes < needed {
+            self.q8_1_mmq_x_scratch = Some(hip.malloc(needed)?);
+            self.q8_1_mmq_x_scratch_bytes = needed;
+        }
+        Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
     /// Ensure the ksplit_det partials scratch is at least `n_bytes`, growing
     /// (never shrinking). Returns the device pointer. No init needed: every
     /// valid output cell is written exactly once per K-split before finalize.
@@ -568,18 +603,11 @@ impl ScratchState {
             "quantize_q8_1_mmq_ds4",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
-        if self.q8_1_mmq_x_scratch_bytes < needed {
-            self.q8_1_mmq_x_scratch = Some(hip.malloc(needed)?);
-            self.q8_1_mmq_x_scratch_bytes = needed;
-        }
+        let out_ptr = self.ensure_q8_1_mmq_buffer(hip, batch_size, k)?;
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
         if must_convert {
-            let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
             let mut xp = src_ptr;
             let mut yp = out_ptr;
             let mut k_val = k as i32;

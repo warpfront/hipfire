@@ -33,6 +33,7 @@ class Daemon:
         log_path: Path,
         timeout: float,
         kv_mode: str,
+        graph_enabled: bool,
     ):
         self.timeout = timeout
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,8 +44,8 @@ class Daemon:
             HIPFIRE_REPLAY_TRANSPORT=transport,
             HIPFIRE_KV_MODE=kv_mode,
             HIPFIRE_CASK_OFF="1",
-            HIPFIRE_AR_GRAPH="1",
-            HIPFIRE_GRAPH="1",
+            HIPFIRE_AR_GRAPH="1" if graph_enabled else "0",
+            HIPFIRE_GRAPH="1" if graph_enabled else "0",
         )
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
@@ -87,7 +88,7 @@ class Daemon:
         self.log.close()
 
 
-def run_arm(args, backend):
+def run_arm(args, backend, graph_enabled=True):
     daemon = Daemon(
         Path(args.daemon).resolve(),
         backend,
@@ -95,6 +96,7 @@ def run_arm(args, backend):
         Path(args.work_dir) / f"product-{backend}.log",
         args.timeout,
         args.kv_mode,
+        graph_enabled,
     )
     try:
         loaded = daemon.request(
@@ -149,6 +151,12 @@ def main():
     )
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument(
+        "--hip-control",
+        choices=("graph", "direct"),
+        default="graph",
+        help="measure the HIP control through HipGraph or ordinary direct launches",
+    )
     parser.add_argument("--work-dir", default=str(REPO / ".redline-work"))
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
@@ -162,7 +170,8 @@ def main():
         "runs": args.runs,
         "transport": args.transport,
         "kv_mode": args.kv_mode,
-        "hip": run_arm(args, "hip"),
+        "hip_control": args.hip_control,
+        "hip": run_arm(args, "hip", args.hip_control == "graph"),
         "auto": run_arm(args, "auto"),
     }
     hip = report["hip"]["tok_s"]["median"]

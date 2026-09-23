@@ -1420,6 +1420,24 @@ pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// `MOE_DOWN_COMBINE_K8_BATCHED_SRC` (dtype-independent f32 combine).
 pub const GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded.hip");
+pub const GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_WAVE64_GFX12_SRC: &str = concat!(
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_ATOMIC_WAVE64_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded.hip"),
+    "\n#define HIPFIRE_MIXED_DOWN_ATOMIC_COMBINE 1\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_BLOCK_COMBINE_WAVE64_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_MIXED_DOWN_BLOCK_COMBINE 1\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64.gfx12.hip"
+    )
+);
 
 /// HFQ5G256 counterpart to the atomic-free expanded batched MoE down kernel.
 /// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
@@ -1439,6 +1457,51 @@ pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 /// + the gate/up split write (M = 2*MI). x indexed [bid*K] (per-token).
 pub const GEMV_MIXED_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip");
+
+/// gfx12 MQ4P gate+up pair fusion. The base source supplies the established
+/// mixed dequant kernel; the suffix adds a gate/up-paired SwiGLU entry point.
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_INDEXED_BATCHED_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip"),
+    "\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_DP4A_GFX12_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a.gfx12.hip"
+);
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_SHAREX_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip"),
+    "\n#define HIPFIRE_MIXED_GATEUP_SHARE_X 1\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_WAVE_BARRIER_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip"),
+    "\n#define HIPFIRE_MIXED_GATEUP_WAVE_BARRIER 1\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_SPATIAL_LPG8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_MIXED_GATEUP_LPG 8\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_SPATIAL_LPG16_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_MIXED_GATEUP_LPG 16\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_wave64.gfx12.hip"
+    )
+);
+pub const GEMV_MIXED_MOE_GATE_UP_SWIGLU_SPATIAL_LPG32_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_MIXED_GATEUP_LPG 32\n",
+    include_str!(
+        "../../../kernels/src/gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_wave64.gfx12.hip"
+    )
+);
 
 /// HFQ5G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
 /// gate/up output split as the HFQ6 batched gate_up kernel; only the
@@ -2489,6 +2552,18 @@ pub const FUSED_GATE_UP_Q4K_SRC: &str = include_str!("../../../kernels/src/fused
 pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0_wide.hip");
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
+pub const GEMV_Q8_0_WAVE64_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_wave64.gfx12.hip");
+pub const GEMV_Q8_0_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_residual.hip");
+pub const GEMV_Q8_0_RESIDUAL_WAVE64_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_residual_wave64.gfx12.hip");
+pub const GEMV_HFQ6G256_WAVE64_DP4A_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_wave64_dp4a.gfx12.hip");
+pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_DP4A_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_HFQ6_DP4A_RESIDUAL 1\n",
+    include_str!("../../../kernels/src/gemv_hfq6g256_wave64_dp4a.gfx12.hip")
+);
 
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
@@ -2527,6 +2602,33 @@ pub const GEMM_QKV_Q8_0_WMMA_GFX12_SRC: &str =
 /// pattern as the QKV gfx12 sibling.
 pub const GEMM_QKVZA_Q8_0_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.gfx12.hip");
+/// gfx12 decode QKVZA: Q8_0 weights x fused-producer Q8_1 activation.
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma.gfx12.hip");
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_WAVE64_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma_wave64.gfx12.hip");
+pub const REPACK_Q8_0_WMMA16X32_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/repack_q8_0_wmma16x32.gfx12.hip");
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_TILED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma_tiled.gfx12.hip");
+pub const REPACK_Q8_0_TO_HFQ6G256_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/repack_q8_0_to_hfq6g256.gfx12.hip");
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_U2_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_I8_WMMA_UNROLL 2\n",
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma.gfx12.hip")
+);
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_U4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_I8_WMMA_UNROLL 4\n",
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma.gfx12.hip")
+);
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_U8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_I8_WMMA_UNROLL 8\n",
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma.gfx12.hip")
+);
+pub const GEMM_QKVZA_Q8_0_Q8_1_WMMA_U16_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_I8_WMMA_UNROLL 16\n",
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_q8_1_wmma.gfx12.hip")
+);
 
 /// gfx12 sister of GEMM_GATE_UP_Q8_0_WMMA_SRC. Same lane-grp + half8_t
 /// pattern as the QKV gfx12 sibling.
@@ -2545,6 +2647,12 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
+/// gfx12 decode producer: identical F32 RMSNorm output plus DS4 Q8_1 sidecar.
+pub const RMSNORM_EMIT_Q8_1_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_emit_q8_1.gfx12.hip");
+/// gfx12 decode producer: identical F32 RMSNorm output plus FP16 sidecar.
+pub const RMSNORM_EMIT_F16_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_emit_f16.gfx12.hip");
 
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
@@ -2630,6 +2738,52 @@ pub const FUSED_GATE_UP_Q8_0_SRC: &str =
 /// fused_qkvza_hfq4g256 but with Q8_0 dequant. Grid=[total_m], block=[32].
 /// Bit-exact with four sequential gemv_q8_0 calls.
 pub const FUSED_QKVZA_Q8_0_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_q8_0.hip");
+pub const FUSED_QKVZA_Q8_0_WAVE64_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_wave64.gfx12.hip");
+pub const FUSED_QKVZA_Q8_0_DUALROW_W32_U1_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_CHUNK 1\n",
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_NAME fused_qkvza_q8_0_dualrow_w32_u1_gfx12\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_dualrow_w32.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_DUALROW_W32_U2_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_CHUNK 2\n",
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_NAME fused_qkvza_q8_0_dualrow_w32_u2_gfx12\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_dualrow_w32.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_DUALROW_W32_U4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_CHUNK 4\n",
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_NAME fused_qkvza_q8_0_dualrow_w32_u4_gfx12\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_dualrow_w32.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_DUALROW_W32_U8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_CHUNK 8\n",
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_NAME fused_qkvza_q8_0_dualrow_w32_u8_gfx12\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_dualrow_w32.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_DUALROW_W32_U16_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_CHUNK 16\n",
+    "#define HIPFIRE_QKVZA_Q8_DUALROW_NAME fused_qkvza_q8_0_dualrow_w32_u16_gfx12\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_dualrow_w32.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_WAVE64_ROWS2_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_ROWS_PER_WAVE 2\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_wave64_rows.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_WAVE64_ROWS4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_ROWS_PER_WAVE 4\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_wave64_rows.gfx12.hip")
+);
+pub const FUSED_QKVZA_Q8_0_WAVE64_ROWS8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_Q8_ROWS_PER_WAVE 8\n",
+    include_str!("../../../kernels/src/fused_qkvza_q8_0_wave64_rows.gfx12.hip")
+);
+/// gfx12 true-wave64 spatial-K DP4A QKVZA consuming a pre-emitted DS4 Q8_1 x.
+pub const FUSED_QKVZA_Q8_0_Q8_1_DP4A_WAVE64_GFX12_SRC: &str = include_str!(
+    "../../../kernels/src/fused_qkvza_q8_0_q8_1_dp4a_wave64.gfx12.hip"
+);
+pub const FUSED_QKVZA_Q8_0_Q8_1_DP4A_WAVE64_HALVES_GFX12_SRC: &str = include_str!(
+    "../../../kernels/src/fused_qkvza_q8_0_q8_1_dp4a_wave64_halves.gfx12.hip"
+);
 
 /// 3-way fused QKV for Q8_0 weights (DECODE, n=1). Mirrors
 /// fused_qkv_hfq4g256 but with Q8_0 dequant. Grid=[q_m+k_m+v_m], block=[32].
@@ -3666,6 +3820,10 @@ pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
 /// reads x_rot).
 pub const FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_plain.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_PLAIN_Q8_1_SRC: &str = concat!(
+    "#define HIPFIRE_EMIT_ROTATED_Q8_1 1\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_plain.hip")
+);
 
 /// DeepSeek V4-asymmetric-clamped variant of `fused_silu_mul_mq_rotate`. Replaces
 /// the DeepSeek V4 decode pair `deepseek4_silu_mul_clamp_f32` + `rotate_x_mq` with one

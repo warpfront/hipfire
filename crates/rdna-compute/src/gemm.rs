@@ -18161,7 +18161,11 @@ impl Gpu {
             kernels::GEMM_QKVZA_Q8_0_WMMA_GFX12_SRC,
             "gemm_qkvza_q8_0_wmma_gfx12",
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_f16_ptr = if x.dtype == DType::F16 {
+            x.buf.as_ptr()
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
 
         let mut a_qkv_p = a_qkv.buf.as_ptr();
         let mut a_z_p = a_z.buf.as_ptr();
@@ -18586,11 +18590,99 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "fused_qkvza_q8_0",
-            kernels::FUSED_QKVZA_Q8_0_SRC,
-            "fused_qkvza_q8_0",
-        )?;
+        let wave64 = self.arch_caps.is_rdna4()
+            && self.flags.gfx12_qkvza_q8_wave64.unwrap_or(true);
+        let rows_override = self.flags.gfx12_qkvza_q8_rows_per_wave;
+        let dualrow_chunk = if self.arch_caps.is_rdna4() {
+            self.flags.gfx12_qkvza_q8_dualrow_chunk
+        } else {
+            None
+        };
+        let (module, source, name, block, rows_per_wave) = if let Some(chunk) = dualrow_chunk {
+            match chunk {
+                1 => (
+                    "fused_qkvza_q8_0_dualrow_w32_u1_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_DUALROW_W32_U1_GFX12_SRC,
+                    "fused_qkvza_q8_0_dualrow_w32_u1_gfx12",
+                    32u32,
+                    2u32,
+                ),
+                2 => (
+                    "fused_qkvza_q8_0_dualrow_w32_u2_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_DUALROW_W32_U2_GFX12_SRC,
+                    "fused_qkvza_q8_0_dualrow_w32_u2_gfx12",
+                    32u32,
+                    2u32,
+                ),
+                4 => (
+                    "fused_qkvza_q8_0_dualrow_w32_u4_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_DUALROW_W32_U4_GFX12_SRC,
+                    "fused_qkvza_q8_0_dualrow_w32_u4_gfx12",
+                    32u32,
+                    2u32,
+                ),
+                8 => (
+                    "fused_qkvza_q8_0_dualrow_w32_u8_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_DUALROW_W32_U8_GFX12_SRC,
+                    "fused_qkvza_q8_0_dualrow_w32_u8_gfx12",
+                    32u32,
+                    2u32,
+                ),
+                16 => (
+                    "fused_qkvza_q8_0_dualrow_w32_u16_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_DUALROW_W32_U16_GFX12_SRC,
+                    "fused_qkvza_q8_0_dualrow_w32_u16_gfx12",
+                    32u32,
+                    2u32,
+                ),
+                _ => {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "unsupported QKVZA dual-row chunk",
+                    ));
+                }
+            }
+        } else if wave64 {
+            match rows_override {
+                Some(2) => (
+                    "fused_qkvza_q8_0_wave64_rows2_multiacc_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_WAVE64_ROWS2_GFX12_SRC,
+                    "fused_qkvza_q8_0_wave64_rows2_multiacc_gfx12",
+                    64u32,
+                    2u32,
+                ),
+                Some(4) => (
+                    "fused_qkvza_q8_0_wave64_rows4_multiacc_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_WAVE64_ROWS4_GFX12_SRC,
+                    "fused_qkvza_q8_0_wave64_rows4_multiacc_gfx12",
+                    64u32,
+                    4u32,
+                ),
+                Some(8) => (
+                    "fused_qkvza_q8_0_wave64_rows8_multiacc_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_WAVE64_ROWS8_GFX12_SRC,
+                    "fused_qkvza_q8_0_wave64_rows8_multiacc_gfx12",
+                    64u32,
+                    8u32,
+                ),
+                _ => (
+                    "fused_qkvza_q8_0_wave64_gfx12",
+                    kernels::FUSED_QKVZA_Q8_0_WAVE64_GFX12_SRC,
+                    "fused_qkvza_q8_0_wave64_gfx12",
+                    64u32,
+                    2u32,
+                ),
+            }
+        } else {
+            (
+                "fused_qkvza_q8_0",
+                kernels::FUSED_QKVZA_Q8_0_SRC,
+                "fused_qkvza_q8_0",
+                32u32,
+                1u32,
+            )
+        };
+        self.ensure_kernel(module, source, name)?;
 
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -18626,9 +18718,9 @@ impl Gpu {
         ];
 
         self.launch_maybe_blob(
-            "fused_qkvza_q8_0",
-            [total, 1, 1],
-            [32, 1, 1],
+            name,
+            [total.div_ceil(rows_per_wave), 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -18647,6 +18739,639 @@ impl Gpu {
                 b.push_i32(b_m_i);
                 b.push_i32(a_m_i);
                 b.push_i32(k_i);
+                b
+            },
+        )
+    }
+
+    /// gfx12 decode QKVZA using a caller-produced DS4 Q8_1 activation.
+    /// Compiled in a dedicated wave64 TU; no standalone quantization launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_q8_0_q8_1_dp4a_prequant(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let halves = std::env::var("HIPFIRE_GFX12_QKVZA_Q8_DP4A_VARIANT")
+            .map(|v| v.eq_ignore_ascii_case("halves"))
+            .unwrap_or(false);
+        let (name, source) = if halves {
+            (
+                "fused_qkvza_q8_0_q8_1_dp4a_wave64_halves_gfx12",
+                kernels::FUSED_QKVZA_Q8_0_Q8_1_DP4A_WAVE64_HALVES_GFX12_SRC,
+            )
+        } else {
+            (
+                "fused_qkvza_q8_0_q8_1_dp4a_wave64_gfx12",
+                kernels::FUSED_QKVZA_Q8_0_Q8_1_DP4A_WAVE64_GFX12_SRC,
+            )
+        };
+        self.ensure_kernel(name, source, name)?;
+
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void,
+            &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [total.div_ceil(2), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m_i);
+                b.push_i32(z_m_i);
+                b.push_i32(b_m_i);
+                b.push_i32(a_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        )
+    }
+
+    /// gfx12 single-token QKVZA using a caller-produced DS4 Q8_1 activation
+    /// and the native signed-int8 WMMA path. One wave32 computes 16 rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_q8_0_q8_1_wmma_prequant(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let tiled = std::env::var("HIPFIRE_GFX12_QKVZA_Q8_I8_WMMA_TILED")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"));
+        if tiled {
+            return self.gemm_qkvza_q8_0_q8_1_wmma_tiled_prequant(
+                a_qkv, a_z, a_beta, a_alpha, xq_ptr, y_qkv, y_z, y_beta, y_alpha, qkv_m,
+                z_m, beta_m, alpha_m, k,
+            );
+        }
+        let wave64 = std::env::var("HIPFIRE_GFX12_QKVZA_Q8_I8_WMMA_WAVE64")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"));
+        let name = if wave64 {
+            "gemm_qkvza_q8_0_q8_1_wmma_wave64_gfx12"
+        } else {
+            "gemm_qkvza_q8_0_q8_1_wmma_gfx12"
+        };
+        let unroll = std::env::var("HIPFIRE_GFX12_QKVZA_Q8_I8_WMMA_UNROLL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let source = if wave64 {
+            kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_WAVE64_GFX12_SRC
+        } else { match unroll {
+            2 => kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_U2_GFX12_SRC,
+            4 => kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_U4_GFX12_SRC,
+            8 => kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_U8_GFX12_SRC,
+            16 => kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_U16_GFX12_SRC,
+            _ => kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_GFX12_SRC,
+        }};
+        // Keep the module/artifact key equal to the recorded function name;
+        // the source hash invalidates the JIT cache between sweep arms.
+        self.ensure_kernel(name, source, name)?;
+
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void,
+            &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [total.div_ceil(16), 1, 1],
+            [if wave64 { 64 } else { 32 }, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m_i);
+                b.push_i32(z_m_i);
+                b.push_i32(b_m_i);
+                b.push_i32(a_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        )
+    }
+
+    fn ensure_q8_0_wmma16x32_tiled(
+        &mut self,
+        src: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let key = src.buf.as_ptr() as usize;
+        if let Some(t) = self.q8_0_wmma_tile_cache.get(&key) {
+            return Ok(t.buf.as_ptr());
+        }
+
+        let nblocks = k / 32;
+        let mtiles = m.div_ceil(16);
+        let packed = self.alloc_tensor(&[mtiles * nblocks * 544], DType::Raw)?;
+        let name = "repack_q8_0_wmma16x32_gfx12";
+        self.ensure_kernel(name, kernels::REPACK_Q8_0_WMMA16X32_GFX12_SRC, name)?;
+        let func = &self.functions[name];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = packed.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [mtiles as u32, nblocks as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        let ptr = packed.buf.as_ptr();
+        self.q8_0_wmma_tile_cache.insert(key, packed);
+        Ok(ptr)
+    }
+
+    pub(crate) fn ensure_q8_0_hfq6g256(
+        &mut self,
+        src: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let key = src.buf.as_ptr() as usize;
+        if let Some(t) = self.q8_0_hfq6_cache.get(&key) {
+            return Ok(t.buf.as_ptr());
+        }
+        let groups = k / 256;
+        let packed = self.alloc_tensor(&[m * groups * 200], DType::Raw)?;
+        let name = "repack_q8_0_to_hfq6g256_gfx12";
+        self.ensure_kernel(name, kernels::REPACK_Q8_0_TO_HFQ6G256_GFX12_SRC, name)?;
+        let func = &self.functions[name];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = packed.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(groups * m) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        let ptr = packed.buf.as_ptr();
+        self.q8_0_hfq6_cache.insert(key, packed);
+        Ok(ptr)
+    }
+
+    fn gemv_q8_0_to_hfq6_dp4a_impl(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let a6 = self.ensure_q8_0_hfq6g256(a, m, k)?;
+        let xq = self.ensure_q8_1_mmq_x(x, 1, k)?;
+        // ensure_q8_1_mmq_x owns its scratch allocation and performs the HIP
+        // conversion, but its scratch-layer launch is not visible to the
+        // retained-PM4 recorder. Re-emit the conversion through Gpu's launch
+        // wrapper so the tape refreshes Xq every token instead of replaying
+        // stale activation bytes. (The first launch can be removed once the
+        // scratch API exposes allocation-without-conversion.)
+        let xp = x.buf.as_ptr();
+        let kq = k as i32;
+        let nq = 1i32;
+        let mut qparams: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xq as *const _ as *mut c_void,
+            &kq as *const _ as *mut c_void,
+            &nq as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "quantize_q8_1_mmq_ds4",
+            [k.div_ceil(1024) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut qparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xq);
+                b.push_i32(kq);
+                b.push_i32(nq);
+                b
+            },
+        )?;
+        let (name, source) = if residual {
+            (
+                "gemv_hfq6g256_residual_wave64_dp4a_gfx12",
+                kernels::GEMV_HFQ6G256_RESIDUAL_WAVE64_DP4A_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemv_hfq6g256_wave64_dp4a_gfx12",
+                kernels::GEMV_HFQ6G256_WAVE64_DP4A_GFX12_SRC,
+            )
+        };
+        self.ensure_kernel(name, source, name)?;
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a6 as *const _ as *mut c_void,
+            &xq as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [m.div_ceil(2) as u32, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a6);
+                b.push_ptr(xq);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b
+            },
+        )
+    }
+
+    pub fn gemv_q8_0_to_hfq6_dp4a(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_q8_0_to_hfq6_dp4a_impl(a, x, y, m, k, false)
+    }
+
+    pub fn gemv_q8_0_to_hfq6_residual_dp4a(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_q8_0_to_hfq6_dp4a_impl(a, x, y, m, k, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_q8_0_to_hfq6_dp4a_prequant(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let mut aq = self.ensure_q8_0_hfq6g256(a_q, q_m, k)?;
+        let mut ak = self.ensure_q8_0_hfq6g256(a_k, k_m, k)?;
+        let mut av = self.ensure_q8_0_hfq6g256(a_v, v_m, k)?;
+        let name = "fused_qkv_hfq6g256_wave64_dp4a";
+        self.ensure_kernel(name, kernels::FUSED_QKV_HFQ6G256_WAVE64_DP4A_SRC, name)?;
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let qmi = q_m as i32;
+        let kmi = k_m as i32;
+        let vmi = v_m as i32;
+        let ki = k as i32;
+        let total = (q_m + k_m + v_m) as u32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &qmi as *const _ as *mut c_void,
+            &kmi as *const _ as *mut c_void,
+            &vmi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [total.div_ceil(2), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(qmi);
+                b.push_i32(kmi);
+                b.push_i32(vmi);
+                b.push_i32(ki);
+                b
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_q8_0_to_hfq6_dp4a_prequant(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let mut aq = self.ensure_q8_0_hfq6g256(a_qkv, qkv_m, k)?;
+        let mut az = self.ensure_q8_0_hfq6g256(a_z, z_m, k)?;
+        let mut ab = self.ensure_q8_0_hfq6g256(a_beta, beta_m, k)?;
+        let mut aa = self.ensure_q8_0_hfq6g256(a_alpha, alpha_m, k)?;
+        let name = "fused_qkvza_hfq6g256_wave64_dp4a";
+        self.ensure_kernel(
+            name,
+            kernels::FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC,
+            name,
+        )?;
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let qmi = qkv_m as i32;
+        let zmi = z_m as i32;
+        let bmi = beta_m as i32;
+        let ami = alpha_m as i32;
+        let ki = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &qmi as *const _ as *mut c_void,
+            &zmi as *const _ as *mut c_void,
+            &bmi as *const _ as *mut c_void,
+            &ami as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [total.div_ceil(2), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(qmi);
+                b.push_i32(zmi);
+                b.push_i32(bmi);
+                b.push_i32(ami);
+                b.push_i32(ki);
+                b
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_qkvza_q8_0_q8_1_wmma_tiled_prequant(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        if [qkv_m, z_m, beta_m, alpha_m].iter().any(|m| m % 16 != 0) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gfx12 tiled QKVZA requires every projection row count to be divisible by 16",
+            ));
+        }
+        let mut aq = self.ensure_q8_0_wmma16x32_tiled(a_qkv, qkv_m, k)?;
+        let mut az = self.ensure_q8_0_wmma16x32_tiled(a_z, z_m, k)?;
+        let mut ab = self.ensure_q8_0_wmma16x32_tiled(a_beta, beta_m, k)?;
+        let mut aa = self.ensure_q8_0_wmma16x32_tiled(a_alpha, alpha_m, k)?;
+        let name = "gemm_qkvza_q8_0_q8_1_wmma_tiled_gfx12";
+        self.ensure_kernel(
+            name,
+            kernels::GEMM_QKVZA_Q8_0_Q8_1_WMMA_TILED_GFX12_SRC,
+            name,
+        )?;
+
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let qmi = qkv_m as i32;
+        let zmi = z_m as i32;
+        let bmi = beta_m as i32;
+        let ami = alpha_m as i32;
+        let ki = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &qmi as *const _ as *mut c_void,
+            &zmi as *const _ as *mut c_void,
+            &bmi as *const _ as *mut c_void,
+            &ami as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [total.div_ceil(16), 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(qmi);
+                b.push_i32(zmi);
+                b.push_i32(bmi);
+                b.push_i32(ami);
+                b.push_i32(ki);
                 b
             },
         )

@@ -1,0 +1,85 @@
+{
+  "model": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4p",
+  "automatic_clocks": true,
+  "context": 128,
+  "iterations": 1,
+  "warmups": 0,
+  "runs": 1,
+  "transport": "pm4",
+  "kv_mode": "q8",
+  "hip": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [],
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 1,
+        "ms": 13.764078000000001,
+        "us_per_token": 13764.078000000001,
+        "tok_s": 72.65288673894466,
+        "hip_calls": {
+          "launches": 733,
+          "htod": 1,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 1
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 72.65288673894466,
+      "median": 72.65288673894466,
+      "max": 72.65288673894466
+    }
+  },
+  "auto": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [],
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 1,
+        "ms": 26.264596,
+        "us_per_token": 26264.596,
+        "tok_s": 38.07406746328784,
+        "hip_calls": {
+          "launches": 733,
+          "htod": 1,
+          "dtod": 0,
+          "dtoh": 0,
+          "memset": 0,
+          "stream_sync": 0,
+          "event_sync": 0,
+          "device_sync": 2
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 38.07406746328784,
+      "median": 38.07406746328784,
+      "max": 38.07406746328784
+    }
+  },
+  "speedup": 0.524054434341956
+}

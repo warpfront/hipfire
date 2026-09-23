@@ -6367,16 +6367,24 @@ fn main() {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(d)
         };
-        let block_size = config.get("block_size").and_then(|v| v.as_u64()).unwrap_or(7) as usize;
+        let block_size = config
+            .get("block_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7) as usize;
         let target_layer_ids: Vec<u64> = config
             .get("target_layer_ids")
             .or_else(|| config.get("aux_hidden_state_layer_ids"))
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
-        let markov_rank = config.get("markov_rank").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
-        let noise_token_id =
-            config.get("mask_token_id").and_then(|v| v.as_u64()).unwrap_or(151669) as u32;
+        let markov_rank = config
+            .get("markov_rank")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256) as usize;
+        let noise_token_id = config
+            .get("mask_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(151669) as u32;
         let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
         let confidence_with_markov = config
             .get("confidence_head_with_markov")
@@ -6507,7 +6515,10 @@ fn main() {
                         .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
                         .collect()
                 } else if meta.dtype == "BOOL" || meta.dtype == "U8" {
-                    raw_data.iter().map(|&b| if b != 0 { 1.0 } else { 0.0 }).collect()
+                    raw_data
+                        .iter()
+                        .map(|&b| if b != 0 { 1.0 } else { 0.0 })
+                        .collect()
                 } else {
                     to_f32(raw_data, &meta.dtype)
                 };
@@ -8161,8 +8172,7 @@ fn main() {
                 n_elements *= 2; // fused tensor carries gate + up params
                 meta = &_fused_meta;
                 raw_data = &_fused_bytes;
-                expert_fuse_rename
-                    .insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
+                expert_fuse_rename.insert(name.to_string(), format!("{stem}.gate_up_proj.weight"));
                 st_files[up_fi].drop_tensor_pages(&up_name);
                 eprintln!(
                     "  {:>8}: {name} + up_proj → {stem}.gate_up_proj.weight {:?}",

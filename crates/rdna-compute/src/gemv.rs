@@ -5,6 +5,32 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+fn gfx1201_q8_lmhead_to_hfq6_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_Q8_LMHEAD_TO_HFQ6")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn gfx1201_q8_residual_to_hfq6_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_Q8_RESIDUAL_TO_HFQ6")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// DIAGNOSTIC: when HIPFIRE_E8_STRIP=1, gemv_mfp4g32_e8 (gfx1151) launches the
 /// compute-stripped kernel instead of the real decode kernel — for measuring
 /// the memory-vs-compute bound (output is garbage). Cached once.
@@ -2849,22 +2875,44 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        // bind_thread: skip — delegated to scratch.rs
+        self.bind_thread()?;
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
-        self.scratch.rotate_x_mq_batched(
-            &self.hip,
-            &self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
-            &mut self.pool,
-            self.device_id,
-            x,
-            x_rot,
-            k,
-            batch_size,
-        )
+        self.ensure_mq_signs()?;
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "mq_rotate_x",
+            [(k / 256) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
     }
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
@@ -5522,11 +5570,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let name = "moe_router_softmax_topk_k8_wave64";
-        self.ensure_kernel(
-            name,
-            kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC,
-            name,
-        )?;
+        self.ensure_kernel(name, kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC, name)?;
         let lp = logits.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
@@ -5539,22 +5583,15 @@ impl Gpu {
             &n as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            name,
-            [1, 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
-        )
+        self.launch_maybe_blob(name, [1, 1, 1], [64, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_i32(n);
+            b.push_i32(nr);
+            b
+        })
     }
 
     /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
@@ -6549,7 +6586,8 @@ impl Gpu {
         ];
         // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
         // is the routed-expert weight reads plus the per-token residual write.
-        let bytes = batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let bytes =
+            batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
@@ -6583,7 +6621,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
@@ -7029,6 +7066,197 @@ impl Gpu {
         }
         result
     }
+    /// gfx1201 MQ4P mixed gate+up/SwiGLU fusion. A wave64 splits into two
+    /// wave32 halves for matching gate/up rows and broadcasts x across the
+    /// halves with v_permlane64. The output is an unrotated [N,K_TOP,MI]
+    /// SwiGLU buffer; call `rotate_x_mq_batched` before mixed down.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_gfx12(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_hidden: &GpuTensor,
+        mi: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if self.flags.gfx12_mixed_gateup_dp4a == Some(true) {
+            return self
+                .gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a_gfx12(
+                    expert_ptrs,
+                    dtype_tags,
+                    topk_indices,
+                    x,
+                    y_hidden,
+                    mi,
+                    k,
+                    k_top,
+                    batch_size,
+                );
+        }
+        self.bind_thread()?;
+        let (name, source, rows_per_wave) = match self.flags.gfx12_mixed_gateup_spatial_lpg {
+            Some(8) => (
+                "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg8_gfx12",
+                kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_SPATIAL_LPG8_GFX12_SRC,
+                4usize,
+            ),
+            Some(16) => (
+                "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg16_gfx12",
+                kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_SPATIAL_LPG16_GFX12_SRC,
+                2usize,
+            ),
+            Some(32) => (
+                "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg32_gfx12",
+                kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_SPATIAL_LPG32_GFX12_SRC,
+                1usize,
+            ),
+            _ => (
+                if self.flags.gfx12_mixed_gateup_wave_barrier == Some(true) {
+                    "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_wavebarrier_gfx12"
+                } else if self.flags.gfx12_mixed_gateup_sharex == Some(true) {
+                    "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_sharex_gfx12"
+                } else {
+                    "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_gfx12"
+                },
+                if self.flags.gfx12_mixed_gateup_wave_barrier == Some(true) {
+                    kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_WAVE_BARRIER_GFX12_SRC
+                } else if self.flags.gfx12_mixed_gateup_sharex == Some(true) {
+                    kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_SHAREX_GFX12_SRC
+                } else {
+                    kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_INDEXED_BATCHED_GFX12_SRC
+                },
+                1usize,
+            ),
+        };
+        self.ensure_kernel(name, source, name)?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y_hidden.buf.as_ptr();
+        let mi_val = mi as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(2 * mi, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + mi * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [mi.div_ceil(rows_per_wave) as u32, k_top as u32, batch_size as u32],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a_gfx12(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_hidden: &GpuTensor,
+        mi: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const NAME: &str =
+            "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a_gfx12";
+        self.ensure_kernel(
+            NAME,
+            kernels::GEMV_MIXED_MOE_GATE_UP_SWIGLU_DP4A_GFX12_SRC,
+            NAME,
+        )?;
+        // The preceding MQ4P RMSNorm+FWHT producer emits this Q8_1 sidecar
+        // while the rotated values are still resident.  Reuse it here without
+        // a conversion dispatch or a second read of x.
+        let xq = self
+            .scratch
+            .q8_1_mmq_x_scratch
+            .as_ref()
+            .expect("mixed gate/up DP4A requires fused rotated-Q8 producer")
+            .as_ptr();
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y_hidden.buf.as_ptr();
+        let mi_val = mi as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut xq_arg = xq;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &mut xq_arg as *mut _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(2 * mi, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + mi * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", NAME, bytes);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [mi as u32, k_top as u32, batch_size as u32],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(xq);
+                b.push_ptr(yp);
+                b.push_i32(mi_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// HFQ5G256 batched gate_up MoE GEMV. Same kernarg signature + grid
     /// (M, K_TOP, N) + gate/up output split as the HFQ6 sibling; only the
     /// per-group dequant differs (168 B/group, 5-bit). Wave32 (RDNA) only.
@@ -7247,6 +7475,220 @@ impl Gpu {
         }
         result
     }
+    /// gfx1201 wave64 mixed down: two adjacent output rows per wave, while
+    /// retaining expert rank in grid.y and the expanded-output contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64_gfx12(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64_gfx12";
+        self.ensure_kernel(
+            "gemv_mixed_moe_down_indexed_batched_expanded_wave64_gfx12",
+            kernels::GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_WAVE64_GFX12_SRC,
+            name,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(2) as u32, k_top as u32, batch_size as u32],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// gfx1201 mixed down with parallel expert waves and an in-kernel weighted
+    /// residual atomic. Preserves the expanded kernel's eight-way expert MLP
+    /// while removing the expanded buffer and follow-up combine dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_moe_down_k8_indexed_batched_atomic_combine_wave64_gfx12(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "gemv_mixed_moe_down_k8_indexed_batched_atomic_combine_wave64_gfx12";
+        self.ensure_kernel(
+            "gemv_mixed_moe_down_indexed_batched_atomic_combine_wave64_gfx12",
+            kernels::GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_ATOMIC_WAVE64_GFX12_SRC,
+            name,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(2) as u32, k_top as u32, batch_size as u32],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Deterministic gfx1201 mixed-down fusion. One block owns all eight
+    /// routed experts for two output rows; eight wave64s compute the expert
+    /// dots in parallel, then one lane performs the established rank-ordered
+    /// weighted combine from LDS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_moe_down_k8_indexed_batched_block_combine_wave64_gfx12(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        dtype_tags: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const NAME: &str =
+            "gemv_mixed_moe_down_k8_indexed_batched_block_combine_wave64_gfx12";
+        self.ensure_kernel(
+            NAME,
+            kernels::GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_BLOCK_COMBINE_WAVE64_GFX12_SRC,
+            NAME,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = dtype_tags.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", NAME, bytes);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [m.div_ceil(2) as u32, 1, batch_size as u32],
+            [64, k_top as u32, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// HFQ5G256 counterpart to `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
     /// Atomic-free expand-then-combine for the MoE down step. Pairs with
     /// `moe_down_combine_k8_batched` (dtype-independent). Wave32 (RDNA) only.
@@ -7326,6 +7768,12 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch_caps.is_rdna4()
+            && m >= 65_536
+            && gfx1201_q8_lmhead_to_hfq6_enabled()
+        {
+            return self.gemv_q8_0_to_hfq6_dp4a(a_raw, x, y, m, k);
+        }
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -7370,16 +7818,93 @@ impl Gpu {
             );
         }
 
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
-        let block_size = 32u32;
+        let wave64 = self.arch_caps.is_rdna4()
+            && self.flags.gfx12_q8_lmhead_wave64.unwrap_or(false);
+        let (module, source, name, grid, block_size) = if wave64 {
+            (
+                "gemv_q8_0_wave64_gfx12",
+                kernels::GEMV_Q8_0_WAVE64_GFX12_SRC,
+                "gemv_q8_0_wave64_gfx12",
+                ((m + 1) / 2) as u32,
+                64u32,
+            )
+        } else {
+            (
+                "gemv_q8_0",
+                kernels::GEMV_Q8_0_SRC,
+                "gemv_q8_0",
+                m as u32,
+                32u32,
+            )
+        };
+        self.ensure_kernel(module, source, name)?;
         self.launch_maybe_blob(
-            "gemv_q8_0",
-            [m as u32, 1, 1],
+            name,
+            [grid, 1, 1],
             [block_size, 1, 1],
             0,
             &mut params,
             blob_builder,
         )
+    }
+
+    /// y += A_q8_0 * x. The kernel preserves gemv_q8_0's dot/reduction order
+    /// and folds the following add_inplace launch into its terminal store.
+    pub fn gemv_q8_0_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch_caps.is_rdna4() && gfx1201_q8_residual_to_hfq6_enabled() {
+            return self.gemv_q8_0_to_hfq6_residual_dp4a(a_raw, x, y, m, k);
+        }
+        let wave64 =
+            self.arch_caps.is_rdna4() && self.flags.gfx12_q8_residual_wave64.unwrap_or(true);
+        let (module, source, name, grid, block) = if wave64 {
+            (
+                "gemv_q8_0_residual_wave64_gfx12",
+                kernels::GEMV_Q8_0_RESIDUAL_WAVE64_GFX12_SRC,
+                "gemv_q8_0_residual_wave64_gfx12",
+                ((m + 1) / 2) as u32,
+                64u32,
+            )
+        } else {
+            (
+                "gemv_q8_0_residual",
+                kernels::GEMV_Q8_0_RESIDUAL_SRC,
+                "gemv_q8_0_residual",
+                m as u32,
+                32u32,
+            )
+        };
+        self.ensure_kernel(module, source, name)?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(name, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
     }
 
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
@@ -8293,7 +8818,7 @@ impl Gpu {
                 return Err(hip_bridge::HipError::new(
                     1,
                     "wo_per_group_batched_q8_0_multirow: rows_per_block must be 2 or 4",
-                ))
+                ));
             }
         };
         self.ensure_kernel(name, kernels::WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC, name)?;

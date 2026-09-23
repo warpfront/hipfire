@@ -29,6 +29,15 @@ pub struct FeatureFlags {
     pub gfx942_lds_gemv_default_on: bool,
     pub gemv_rows_default: u32,
     pub gemv_dp4a: Option<bool>,
+    pub gfx12_qkvza_q8_wave64: Option<bool>,
+    pub gfx12_qkvza_q8_rows_per_wave: Option<u32>,
+    pub gfx12_qkvza_q8_dualrow_chunk: Option<u32>,
+    pub gfx12_q8_lmhead_wave64: Option<bool>,
+    pub gfx12_q8_residual_wave64: Option<bool>,
+    pub gfx12_mixed_gateup_spatial_lpg: Option<u32>,
+    pub gfx12_mixed_gateup_dp4a: Option<bool>,
+    pub gfx12_mixed_gateup_sharex: Option<bool>,
+    pub gfx12_mixed_gateup_wave_barrier: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -216,6 +225,32 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            gfx12_qkvza_q8_wave64: parse_bool("HIPFIRE_GFX12_QKVZA_Q8_WAVE64"),
+            gfx12_qkvza_q8_rows_per_wave: std::env::var(
+                "HIPFIRE_GFX12_QKVZA_Q8_ROWS_PER_WAVE",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| matches!(v, 2 | 4 | 8)),
+            gfx12_qkvza_q8_dualrow_chunk: std::env::var(
+                "HIPFIRE_GFX12_QKVZA_Q8_DUALROW_CHUNK",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| matches!(v, 1 | 2 | 4 | 8 | 16)),
+            gfx12_q8_lmhead_wave64: parse_bool("HIPFIRE_GFX12_Q8_LMHEAD_WAVE64"),
+            gfx12_q8_residual_wave64: parse_bool("HIPFIRE_GFX12_Q8_RESIDUAL_WAVE64"),
+            gfx12_mixed_gateup_spatial_lpg: std::env::var(
+                "HIPFIRE_GFX12_MIXED_GATEUP_SPATIAL_LPG",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| matches!(v, 8 | 16 | 32)),
+            gfx12_mixed_gateup_dp4a: parse_bool("HIPFIRE_GFX12_MIXED_GATEUP_DP4A"),
+            gfx12_mixed_gateup_sharex: parse_bool("HIPFIRE_GFX12_MIXED_GATEUP_SHAREX"),
+            gfx12_mixed_gateup_wave_barrier: parse_bool(
+                "HIPFIRE_GFX12_MIXED_GATEUP_WAVE_BARRIER",
+            ),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -437,6 +472,15 @@ impl FeatureFlags {
             gemv_rows: None,
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
+            gfx12_qkvza_q8_wave64: None,
+            gfx12_qkvza_q8_rows_per_wave: None,
+            gfx12_qkvza_q8_dualrow_chunk: None,
+            gfx12_q8_lmhead_wave64: None,
+            gfx12_q8_residual_wave64: None,
+            gfx12_mixed_gateup_spatial_lpg: None,
+            gfx12_mixed_gateup_dp4a: None,
+            gfx12_mixed_gateup_sharex: None,
+            gfx12_mixed_gateup_wave_barrier: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

@@ -233,7 +233,9 @@ fn probe_gpu() -> (Probe, Probe) {
         RocmSmiRun::Output(text) => parse_rocm_product_name(&text),
         RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocm-smi not installed".into()),
         RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocm-smi timed out".into()),
-        RocmSmiRun::SpawnError(e) => Probe::Unavailable(format!("unavailable: rocm-smi error: {e}")),
+        RocmSmiRun::SpawnError(e) => {
+            Probe::Unavailable(format!("unavailable: rocm-smi error: {e}"))
+        }
     };
 
     let cmd = Command::new("rocminfo");
@@ -241,7 +243,9 @@ fn probe_gpu() -> (Probe, Probe) {
         RocmSmiRun::Output(text) => parse_rocminfo_arch(&text),
         RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocminfo not installed".into()),
         RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocminfo timed out".into()),
-        RocmSmiRun::SpawnError(e) => Probe::Unavailable(format!("unavailable: rocminfo error: {e}")),
+        RocmSmiRun::SpawnError(e) => {
+            Probe::Unavailable(format!("unavailable: rocminfo error: {e}"))
+        }
     };
     (name, arch)
 }
@@ -746,7 +750,7 @@ pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> RocmSmiRun {
     };
 
     match outcome {
-        Some(run) => run,        // TimedOut / SpawnError — discard partial output
+        Some(run) => run, // TimedOut / SpawnError — discard partial output
         None => RocmSmiRun::Output(captured),
     }
 }
@@ -1142,9 +1146,11 @@ mod tests {
     #[test]
     fn stats_rejects_nonfinite_tok_s() {
         // serde won't parse NaN, but a zero/negative must be dropped.
-        let b = r#"{"model":"m","uptime_s":1,"queue_depth":0,"requests_served":1,"recent_tok_s":0}"#;
+        let b =
+            r#"{"model":"m","uptime_s":1,"queue_depth":0,"requests_served":1,"recent_tok_s":0}"#;
         assert_eq!(parse_stats(b).unwrap().recent_tok_s, None);
-        let b2 = r#"{"model":"m","uptime_s":1,"queue_depth":0,"requests_served":1,"recent_tok_s":-3}"#;
+        let b2 =
+            r#"{"model":"m","uptime_s":1,"queue_depth":0,"requests_served":1,"recent_tok_s":-3}"#;
         assert_eq!(parse_stats(b2).unwrap().recent_tok_s, None);
     }
 
@@ -1234,7 +1240,10 @@ mod tests {
                     "must capture the full 1 MiB without deadlocking the pipe"
                 );
             }
-            other => panic!("expected Output (not a false timeout), got {:?}", run_kind(&other)),
+            other => panic!(
+                "expected Output (not a false timeout), got {:?}",
+                run_kind(&other)
+            ),
         }
     }
 

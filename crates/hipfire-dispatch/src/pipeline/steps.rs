@@ -141,6 +141,75 @@ fn dp4a_eligible(ctx: &DispatchCtx) -> bool {
     !ctx.flags.force_unfused && ctx.arch.gemv_dp4a_enabled()
 }
 
+/// Experimental gfx1201 decode path: fuse Q8_1 emission into the QKVZA
+/// RMSNorm producer and consume it with a true-wave64 DP4A kernel.  Opt-in
+/// while the model-level drift and product-speed ratchets are evaluated.
+fn gfx1201_qkvza_q8_dp4a_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_QKVZA_Q8_DP4A")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Experimental gfx1201 decode path: use the existing Q8_0 x FP16 WMMA
+/// prefill kernel for the single-token QKVZA projection. The wrapper performs
+/// an uncached F32 -> FP16 conversion while this flag is set because decode
+/// reuses the activation allocation with new contents at every layer.
+fn gfx1201_qkvza_q8_f16_wmma_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_QKVZA_Q8_F16_WMMA")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Experimental gfx1201 decode path: fuse Q8_1 emission into RMSNorm and
+/// consume it with signed-int8 WMMA (one wave32 per 16 output rows).
+fn gfx1201_qkvza_q8_i8_wmma_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_QKVZA_Q8_I8_WMMA")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn gfx1201_qkvza_q8_to_hfq6_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_QKVZA_Q8_TO_HFQ6")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn gfx1201_qkv_q8_to_hfq6_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX12_QKV_Q8_TO_HFQ6")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
 // ── QKV 3-way guards ──
 
 pub(crate) fn guard_qkv_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -685,6 +754,11 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             // &s.x), a fresh temp is allocated instead. See the aliasing guard below.
             // Nothing reads `out` after this step in any model decode path.
             let gemv = GEMV.get_or_init(GemvFamily::new);
+            if ctx.arch.is_gfx1201() && w.dtype == DType::Q8_0 {
+                return gpu
+                    .gemv_q8_0_residual(w.buf, x, residual, w.m, w.k)
+                    .map_err(|e| DispatchError::Hip(e.to_string()));
+            }
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
             // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
             // the `out` scratch + `residual += out` — reuses the pre-allocated `out`
@@ -857,6 +931,209 @@ fn launch_fused(
     key: KernelKey,
     steps: &[Step],
 ) -> Result<(), DispatchError> {
+    if key == KernelKey::FusedQkvQ8_0
+        && ctx.arch.is_gfx1201()
+        && gfx1201_qkv_q8_to_hfq6_enabled()
+    {
+        let (x, norm_weight, activated, eps) = match &steps[0] {
+            Step::RmsnormAutomatic {
+                x,
+                norm_weight,
+                out,
+                eps,
+                rotation,
+                ..
+            } if *rotation == RotationPlan::None => (*x, *norm_weight, *out, *eps),
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "pipeline",
+                    variant: "gfx1201_qkv_q8_to_hfq6_requires_plain_rmsnorm",
+                    arch: "gfx1201",
+                    quant: "q8_0",
+                })
+            }
+        };
+        let (wq, q) = gemv_weight_out(&steps[1]);
+        let (wk, k) = gemv_weight_out(&steps[2]);
+        let (wv, v) = gemv_weight_out(&steps[3]);
+        let xq = gpu
+            .rmsnorm_f32_emit_q8_1(x, norm_weight, activated, eps)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        return gpu
+            .fused_qkv_q8_0_to_hfq6_dp4a_prequant(
+                wq.buf, wk.buf, wv.buf, xq, q, k, v, wq.m, wk.m, wv.m, wq.k,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()));
+    }
+
+    if key == KernelKey::FusedQkvzaQ8_0
+        && ctx.arch.is_gfx1201()
+        && gfx1201_qkvza_q8_to_hfq6_enabled()
+    {
+        let (x, norm_weight, activated, eps) = match &steps[0] {
+            Step::RmsnormAutomatic {
+                x,
+                norm_weight,
+                out,
+                eps,
+                rotation,
+                ..
+            } if *rotation == RotationPlan::None => (*x, *norm_weight, *out, *eps),
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "pipeline",
+                    variant: "gfx1201_qkvza_q8_to_hfq6_requires_plain_rmsnorm",
+                    arch: "gfx1201",
+                    quant: "q8_0",
+                })
+            }
+        };
+        let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+        let (wz, z) = gemv_weight_out(&steps[2]);
+        let (wb, beta) = gemv_weight_out(&steps[3]);
+        let (wa, alpha) = gemv_weight_out(&steps[4]);
+        let xq = gpu
+            .rmsnorm_f32_emit_q8_1(x, norm_weight, activated, eps)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        return gpu
+            .fused_qkvza_q8_0_to_hfq6_dp4a_prequant(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, xq, qkv, z, beta, alpha, wqkv.m, wz.m,
+                wb.m, wa.m, wqkv.k,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()));
+    }
+
+    // The ordinary lowering launches RMSNorm and then a raw-F32 Q8 GEMV.  For
+    // the gfx1201 QKVZA hotspot, produce the normalized F32 tensor and its
+    // Q8_1 sidecar in one launch, then feed the sidecar to DP4A.  This special
+    // case must precede the generic launch_op below or we would pay both norms.
+    if key == KernelKey::FusedQkvzaQ8_0
+        && ctx.arch.is_gfx1201()
+        && gfx1201_qkvza_q8_dp4a_enabled()
+    {
+        let (x, norm_weight, activated, eps) = match &steps[0] {
+            Step::RmsnormAutomatic {
+                x,
+                norm_weight,
+                out,
+                eps,
+                rotation,
+                ..
+            } if *rotation == RotationPlan::None => (*x, *norm_weight, *out, *eps),
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "pipeline",
+                    variant: "gfx1201_qkvza_q8_dp4a_requires_plain_rmsnorm",
+                    arch: "gfx1201",
+                    quant: "q8_0",
+                })
+            }
+        };
+        let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+        let (wz, z) = gemv_weight_out(&steps[2]);
+        let (wb, beta) = gemv_weight_out(&steps[3]);
+        let (wa, alpha) = gemv_weight_out(&steps[4]);
+        let xq = gpu
+            .rmsnorm_f32_emit_q8_1(x, norm_weight, activated, eps)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        return gpu
+            .fused_qkvza_q8_0_q8_1_dp4a_prequant(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, xq, qkv, z, beta, alpha, wqkv.m, wz.m, wb.m,
+                wa.m, wqkv.k,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()));
+    }
+
+    if key == KernelKey::FusedQkvzaQ8_0
+        && ctx.arch.is_gfx1201()
+        && gfx1201_qkvza_q8_i8_wmma_enabled()
+    {
+        let (x, norm_weight, activated, eps) = match &steps[0] {
+            Step::RmsnormAutomatic {
+                x,
+                norm_weight,
+                out,
+                eps,
+                rotation,
+                ..
+            } if *rotation == RotationPlan::None => (*x, *norm_weight, *out, *eps),
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "pipeline",
+                    variant: "gfx1201_qkvza_q8_i8_wmma_requires_plain_rmsnorm",
+                    arch: "gfx1201",
+                    quant: "q8_0",
+                })
+            }
+        };
+        let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+        let (wz, z) = gemv_weight_out(&steps[2]);
+        let (wb, beta) = gemv_weight_out(&steps[3]);
+        let (wa, alpha) = gemv_weight_out(&steps[4]);
+        let xq = gpu
+            .rmsnorm_f32_emit_q8_1(x, norm_weight, activated, eps)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        return gpu
+            .gemm_qkvza_q8_0_q8_1_wmma_prequant(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, xq, qkv, z, beta, alpha, wqkv.m, wz.m, wb.m,
+                wa.m, wqkv.k,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()));
+    }
+
+    // Keep decode at two launches per LA layer: RMSNorm writes both the
+    // ordinary F32 activation and an FP16 WMMA sidecar, then QKVZA consumes
+    // the sidecar without a standalone conversion dispatch.
+    if key == KernelKey::FusedQkvzaQ8_0
+        && ctx.arch.is_gfx1201()
+        && gfx1201_qkvza_q8_f16_wmma_enabled()
+    {
+        let (x, norm_weight, activated, eps) = match &steps[0] {
+            Step::RmsnormAutomatic {
+                x,
+                norm_weight,
+                out,
+                eps,
+                rotation,
+                ..
+            } if *rotation == RotationPlan::None => (*x, *norm_weight, *out, *eps),
+            _ => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "pipeline",
+                    variant: "gfx1201_qkvza_q8_f16_wmma_requires_plain_rmsnorm",
+                    arch: "gfx1201",
+                    quant: "q8_0",
+                })
+            }
+        };
+        let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+        let (wz, z) = gemv_weight_out(&steps[2]);
+        let (wb, beta) = gemv_weight_out(&steps[3]);
+        let (wa, alpha) = gemv_weight_out(&steps[4]);
+        let activated_f16 = gpu
+            .rmsnorm_f32_emit_f16(x, norm_weight, activated, eps)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        return gpu
+            .gemm_qkvza_q8_0_wmma_gfx12(
+                wqkv.buf,
+                wz.buf,
+                wb.buf,
+                wa.buf,
+                &activated_f16,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                wb.m,
+                wa.m,
+                wqkv.k,
+                1,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()));
+    }
+
     // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;
     let activated = rmsnorm_out(&steps[0]);

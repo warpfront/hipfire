@@ -428,6 +428,15 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// Model-scoped lane-major Q8_0 copies for the experimental gfx12
+    /// single-token integer-WMMA path. Keyed by the immutable source weight
+    /// pointer and released with the other weight-pointer caches.
+    pub(crate) q8_0_wmma_tile_cache: HashMap<usize, GpuTensor>,
+
+    /// Model-scoped lossy Q8_0 -> HFQ6-G256 copies used only by explicit
+    /// drift-gated gfx12 experiments.
+    pub(crate) q8_0_hfq6_cache: HashMap<usize, GpuTensor>,
+
     /// Native GPTQ-on-E8 Hessian collection. `None` in production (zero
     /// overhead -- a single `is_some()` branch in the MoE CPU-top-K fallback
     /// per routed expert). The `collect_e8_hessian_native` example sets this to
@@ -873,6 +882,8 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            q8_0_wmma_tile_cache: HashMap::new(),
+            q8_0_hfq6_cache: HashMap::new(),
             hessian_capture: None,
         }).map(|mut gpu| {
             if gpu.flags.force_blob_path {
@@ -1192,17 +1203,31 @@ impl Gpu {
                         "deinterleave_f32_batched" => {
                             self.compiler.compiled_kernels().get("deinterleave_batched")
                         }
-                        name
-                            if name.starts_with(
-                                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-                            ) => self
+                        "quantize_q8_1_mmq_ds4" => self
                             .compiler
                             .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_scaled"),
+                            .get("gemm_hfq4g256_residual_mmq"),
+                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                            self.compiler
+                                .compiled_kernels()
+                                .get("gemv_hfq4g256_residual_scaled")
+                        }
                         "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
                             .compiler
                             .compiled_kernels()
                             .get("gemv_hfq4g256_moe_gate_up_indexed"),
+                        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_gfx12" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_mixed_moe_gate_up_swiglu_indexed_batched_wave64_gfx12"),
+                        "gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64_gfx12" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_mixed_moe_down_indexed_batched_expanded_wave64_gfx12"),
+                        "gemv_mixed_moe_down_k8_indexed_batched_atomic_combine_wave64_gfx12" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_mixed_moe_down_indexed_batched_atomic_combine_wave64_gfx12"),
                         name if name.starts_with("gemv_hfq4g256_multirow_r") => self
                             .compiler
                             .compiled_kernels()
@@ -1799,11 +1824,21 @@ impl Gpu {
     ///   * fp16_shadow_cache: lazily-built FP16 dequant of HFQ4 weights for
     ///     the rocBLAS prefill path (CDNA3-only). Owns GpuTensors, so the
     ///     entries are released back to the pool here.
+    ///   * q8_0_wmma_tile_cache: lane-major gfx12 decode copies.
+    ///   * q8_0_hfq6_cache: drift-gated 6-bit decode copies.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {
+            let _ = self.free_tensor(t);
+        }
+        let tiled: Vec<GpuTensor> = self.q8_0_wmma_tile_cache.drain().map(|(_, t)| t).collect();
+        for t in tiled {
+            let _ = self.free_tensor(t);
+        }
+        let q6: Vec<GpuTensor> = self.q8_0_hfq6_cache.drain().map(|(_, t)| t).collect();
+        for t in q6 {
             let _ = self.free_tensor(t);
         }
     }

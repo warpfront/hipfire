@@ -88,6 +88,126 @@ pub fn gdn_chunk_size() -> usize {
 }
 
 impl Gpu {
+    /// Decode-only gfx12 RMSNorm producer with an FP16 sidecar for WMMA.
+    /// The returned tensor is a non-owning alias of Gpu-owned scratch.
+    pub fn rmsnorm_f32_emit_f16(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        eps: f32,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_f32_emit_f16",
+            kernels::RMSNORM_EMIT_F16_GFX12_SRC,
+            "rmsnorm_f32_emit_f16",
+        )?;
+
+        let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
+        let n = x.shape.last().copied().unwrap();
+        let f16_ptr = self
+            .scratch
+            .ensure_fp16_x_buffer(&self.hip, batch * n)?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let eps_val = eps;
+        let mut f16_arg = f16_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &mut f16_arg as *mut _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+        let block_size = 256u32.min(n as u32);
+        let shared_mem = block_size * 4;
+        self.launch_maybe_blob(
+            "rmsnorm_f32_emit_f16",
+            [batch as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(w_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(f16_ptr);
+                b.push_i32(n_val);
+                b.push_f32(eps_val);
+                b
+            },
+        )?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(f16_ptr, batch * n * 2) },
+            shape: x.shape.clone(),
+            dtype: DType::F16,
+        })
+    }
+
+    /// Decode-only gfx12 RMSNorm producer with a DS4 Q8_1 sidecar.  The F32
+    /// output is expression-for-expression identical to `rmsnorm_f32`; the
+    /// returned pointer aliases Gpu-owned scratch and remains valid until the
+    /// next Q8_1 producer on this device.
+    pub fn rmsnorm_f32_emit_q8_1(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        eps: f32,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_f32_emit_q8_1",
+            kernels::RMSNORM_EMIT_Q8_1_GFX12_SRC,
+            "rmsnorm_f32_emit_q8_1",
+        )?;
+
+        let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
+        let n = x.shape.last().copied().unwrap();
+        let q8_ptr = self
+            .scratch
+            .ensure_q8_1_mmq_buffer(&self.hip, batch, n)?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let eps_val = eps;
+        let mut q8_arg = q8_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &mut q8_arg as *mut _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+        let block_size = 256u32.min(n as u32);
+        let shared_mem = block_size * 4;
+        self.launch_maybe_blob(
+            "rmsnorm_f32_emit_q8_1",
+            [batch as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(w_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(q8_ptr);
+                b.push_i32(n_val);
+                b.push_f32(eps_val);
+                b
+            },
+        )?;
+        Ok(q8_ptr)
+    }
+
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
         &mut self,
@@ -3893,11 +4013,19 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_rmsnorm_mq_rotate_plain",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC,
-            "fused_rmsnorm_mq_rotate_plain",
-        )?;
+        let emit_q8 = self.flags.gfx12_mixed_gateup_dp4a == Some(true);
+        let (name, source) = if emit_q8 {
+            (
+                "fused_rmsnorm_mq_rotate_plain_q8_1",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_Q8_1_SRC,
+            )
+        } else {
+            (
+                "fused_rmsnorm_mq_rotate_plain",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC,
+            )
+        };
+        self.ensure_kernel(name, source, name)?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -3916,17 +4044,25 @@ impl Gpu {
             &s2 as *const _ as *mut c_void,
             &xrp as *const _ as *mut c_void,
             &xpp as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-            &eps_v as *const _ as *mut c_void,
         ];
+        let mut q8_ptr = if emit_q8 {
+            self.scratch.ensure_q8_1_mmq_buffer(&self.hip, 1, k)?
+        } else {
+            std::ptr::null_mut()
+        };
+        if emit_q8 {
+            params.push(&mut q8_ptr as *mut _ as *mut c_void);
+        }
+        params.push(&kv as *const _ as *mut c_void);
+        params.push(&eps_v as *const _ as *mut c_void);
 
         let block_size = 256u32;
         let shared_mem = ((k + 256) * 4) as u32;
         let bytes = k * 4 * 4 + 2 * 256 * 4; // +1 K*4 for x_plain write
         let timer =
-            crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate_plain", bytes);
+            crate::profile::begin_timer(&self.hip, "fused", name, bytes);
         let result = self.launch_maybe_blob(
-            "fused_rmsnorm_mq_rotate_plain",
+            name,
             [1, 1, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -3939,6 +4075,9 @@ impl Gpu {
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
                 b.push_ptr(xpp);
+                if emit_q8 {
+                    b.push_ptr(q8_ptr);
+                }
                 b.push_i32(kv);
                 b.push_f32(eps_v);
                 b

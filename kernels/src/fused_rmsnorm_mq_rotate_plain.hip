@@ -3,6 +3,22 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+#ifdef HIPFIRE_EMIT_ROTATED_Q8_1
+struct block_q8_1_mmq {
+    half2 ds4[4];
+    int8_t qs[128];
+};
+static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
+#define HIPFIRE_RMS_ROTATE_PLAIN_NAME fused_rmsnorm_mq_rotate_plain_q8_1
+#define HIPFIRE_RMS_ROTATE_Q8_ARG \
+    , block_q8_1_mmq* __restrict__ x_rot_q8
+#else
+#define HIPFIRE_RMS_ROTATE_PLAIN_NAME fused_rmsnorm_mq_rotate_plain
+#define HIPFIRE_RMS_ROTATE_Q8_ARG
+#endif
 
 // Fused RMSNorm + (FWHT rotation AND plain RMSNorm output).
 //
@@ -31,13 +47,14 @@
 //     stride-1-to-16 cross-wave hops, 1/16 scale, sign-flip with signs2.
 
 __launch_bounds__(256, 1)
-extern "C" __global__ void fused_rmsnorm_mq_rotate_plain(
+extern "C" __global__ void HIPFIRE_RMS_ROTATE_PLAIN_NAME(
     const float* __restrict__ x,
     const float* __restrict__ weight,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,    // [N, K] FWHT-rotated
-    float* __restrict__ x_plain,  // [N, K] plain RMSNormed
+    float* __restrict__ x_plain  // [N, K] plain RMSNormed
+    HIPFIRE_RMS_ROTATE_Q8_ARG,
     int K,
     float eps
 ) {
@@ -140,13 +157,59 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_plain(
         #undef HBFLY
 
         const float s = 0.0625f;
-        x_rot_b[base]     = v0 * s * signs2[d0];
-        x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
-        x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
-        x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
-        x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
-        x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
-        x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
-        x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
+        const float o0 = v0 * s * signs2[d0];
+        const float o1 = v1 * s * signs2[d0 + 1];
+        const float o2 = v2 * s * signs2[d0 + 2];
+        const float o3 = v3 * s * signs2[d0 + 3];
+        const float o4 = v4 * s * signs2[d0 + 4];
+        const float o5 = v5 * s * signs2[d0 + 5];
+        const float o6 = v6 * s * signs2[d0 + 6];
+        const float o7 = v7 * s * signs2[d0 + 7];
+        x_rot_b[base]     = o0;
+        x_rot_b[base + 1] = o1;
+        x_rot_b[base + 2] = o2;
+        x_rot_b[base + 3] = o3;
+        x_rot_b[base + 4] = o4;
+        x_rot_b[base + 5] = o5;
+        x_rot_b[base + 6] = o6;
+        x_rot_b[base + 7] = o7;
+
+#ifdef HIPFIRE_EMIT_ROTATED_Q8_1
+        // Four adjacent lanes own one contiguous Q8_1 sub-block (32 values).
+        // Quantize while all eight rotated values are still resident so the
+        // DP4A consumer needs neither another x read nor another dispatch.
+        float amax = fmaxf(fmaxf(fabsf(o0), fabsf(o1)), fmaxf(fabsf(o2), fabsf(o3)));
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(o4), fabsf(o5)), fmaxf(fabsf(o6), fabsf(o7))));
+        float sum = ((o0 + o1) + (o2 + o3)) + ((o4 + o5) + (o6 + o7));
+        amax = fmaxf(amax, __shfl_xor(amax, 1, 4));
+        amax = fmaxf(amax, __shfl_xor(amax, 2, 4));
+        sum += __shfl_xor(sum, 1, 4);
+        sum += __shfl_xor(sum, 2, 4);
+        const float qd = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+        const float qid = qd > 0.0f ? 1.0f / qd : 0.0f;
+#define HIPFIRE_Q8(v) ((int)lrintf(fmaxf(-127.0f, fminf(127.0f, (v) * qid))))
+        const unsigned long long packed =
+            ((unsigned long long)(HIPFIRE_Q8(o0) & 0xff))
+            | ((unsigned long long)(HIPFIRE_Q8(o1) & 0xff) << 8)
+            | ((unsigned long long)(HIPFIRE_Q8(o2) & 0xff) << 16)
+            | ((unsigned long long)(HIPFIRE_Q8(o3) & 0xff) << 24)
+            | ((unsigned long long)(HIPFIRE_Q8(o4) & 0xff) << 32)
+            | ((unsigned long long)(HIPFIRE_Q8(o5) & 0xff) << 40)
+            | ((unsigned long long)(HIPFIRE_Q8(o6) & 0xff) << 48)
+            | ((unsigned long long)(HIPFIRE_Q8(o7) & 0xff) << 56);
+#undef HIPFIRE_Q8
+        const int subblock = lane_id >> 2;
+        const int block_in_group = subblock >> 2;
+        const int sub_in_block = subblock & 3;
+        block_q8_1_mmq* qb = x_rot_q8
+            + (long long)(group * 2 + block_in_group) * gridDim.x + blockIdx.x;
+        *reinterpret_cast<unsigned long long*>(
+            qb->qs + sub_in_block * 32 + (lane_id & 3) * 8) = packed;
+        if ((lane_id & 3) == 0)
+            qb->ds4[sub_in_block] = make_half2((_Float16)qd, (_Float16)sum);
+#endif
     }
 }
+
+#undef HIPFIRE_RMS_ROTATE_PLAIN_NAME
+#undef HIPFIRE_RMS_ROTATE_Q8_ARG

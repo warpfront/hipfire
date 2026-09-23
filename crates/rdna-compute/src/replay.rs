@@ -124,6 +124,23 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        "fused_rmsnorm_mq_rotate_plain" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+        ]),
+        "fused_rmsnorm_mq_rotate_plain_q8_1" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ]),
         "fused_qkvza_hfq4g256" => Some(vec![
             read(0),
             read(8),
@@ -164,6 +181,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
         | "gemv_hfq4g256_multirow_r8" => Some(vec![read(0), read(8), write(16)]),
+        "gemv_q8_0"
+        | "gemv_q8_0_wave64_gfx12"
+        | "gemv_q8_0_residual_wave64_gfx12"
+        | "gemv_hfq6g256"
+        | "gemv_hfq6g256_residual"
+        | "gemv_hfq6g256_wave64_dp4a_gfx12"
+        | "gemv_hfq6g256_residual_wave64_dp4a_gfx12" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
@@ -173,8 +199,28 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
             Some(vec![read(0), read(8), read(16), write(24), write(32)])
         }
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_sharex_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_wavebarrier_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg8_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg16_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg32_gfx12" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
+        }
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a_gfx12" => {
+            Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
+        }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded" => {
             Some(vec![read(0), read(8), read(16), write(24)])
+        }
+        "gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64_gfx12" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
+        }
+        "gemv_mixed_moe_down_k8_indexed_batched_atomic_combine_wave64_gfx12" => {
+            Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
+        }
+        "gemv_mixed_moe_down_k8_indexed_batched_block_combine_wave64_gfx12" => {
+            Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)])
         }
         "moe_down_combine_k8_batched" => Some(vec![read(0), read(8), write(16)]),
         "fused_qkv_hfq4g256" => Some(vec![
@@ -186,8 +232,77 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
             write(48),
         ]),
+        "fused_qkv_q8_0" | "fused_qkv_hfq6g256_wave64_dp4a" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ]),
+        "fused_qkvza_q8_0"
+        | "fused_qkvza_q8_0_wave64_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u1_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u2_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u4_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u8_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u16_gfx12" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]),
+        "fused_qkvza_q8_0_wave64_rows2_multiacc_gfx12"
+        | "fused_qkvza_q8_0_wave64_rows4_multiacc_gfx12"
+        | "fused_qkvza_q8_0_wave64_rows8_multiacc_gfx12" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]),
+        "fused_qkvza_q8_0_q8_1_dp4a_wave64_gfx12"
+        | "fused_qkvza_q8_0_q8_1_dp4a_wave64_halves_gfx12" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]),
+        "gemm_qkvza_q8_0_wmma_gfx12"
+        | "gemm_qkvza_q8_0_q8_1_wmma_gfx12"
+        | "gemm_qkvza_q8_0_q8_1_wmma_wave64_gfx12"
+        | "gemm_qkvza_q8_0_q8_1_wmma_tiled_gfx12"
+        | "fused_qkvza_hfq6g256_wave64_dp4a" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(64),
+        ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
         "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
+        "rmsnorm_f32_emit_f16" => Some(vec![read(0), read(8), write(16), write(24)]),
+        "rmsnorm_f32_emit_q8_1" => Some(vec![read(0), read(8), write(16), write(24)]),
+        "quantize_q8_1_mmq_ds4" => Some(vec![read(0), write(8)]),
         "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
@@ -202,7 +317,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        "attention_flash_q8_0_tile" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "attention_flash_q8_0_reduce" => Some(vec![read(0), write(8), read(24)]),
+        "fused_gate_up_hfq4g256" | "fused_gate_up_q8_0" => {
+            Some(vec![read(0), read(8), read(16), write(24), write(32)])
+        }
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         _ => None,
     }
@@ -226,6 +345,14 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
         | "gemv_hfq4g256_multirow_r8"
+        | "gemv_q8_0"
+        | "gemv_q8_0_wave64_gfx12"
+        | "gemv_q8_0_residual_wave64_gfx12"
+        | "gemv_hfq6g256"
+        | "gemv_hfq6g256_residual"
+        | "gemv_hfq6g256_wave64_dp4a_gfx12"
+        | "gemv_hfq6g256_residual_wave64_dp4a_gfx12"
+        | "quantize_q8_1_mmq_ds4"
         | "deinterleave_f32"
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
@@ -243,12 +370,48 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_asym_k_fwht3"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
+        | "rmsnorm_f32_emit_f16"
+        | "rmsnorm_f32_emit_q8_1"
         | "rope_partial_halfsplit_f32" => Some(48),
-        "conv1d_silu_split_f32" => Some(64),
-        "fused_qkv_hfq4g256" => Some(80),
-        "attention_flash_fwht3_tile" | "fused_qkvza_hfq4g256" | "gated_delta_net_q8_fast" => {
-            Some(96)
-        }
+        "conv1d_silu_split_f32"
+        | "fused_gate_up_hfq4g256"
+        | "fused_gate_up_q8_0"
+        | "fused_rmsnorm_mq_rotate_plain"
+        | "fused_rmsnorm_mq_rotate_plain_q8_1"
+        | "gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64_gfx12"
+        | "gemv_mixed_moe_down_k8_indexed_batched_atomic_combine_wave64_gfx12"
+        | "gemv_mixed_moe_down_k8_indexed_batched_block_combine_wave64_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_sharex_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_wavebarrier_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg8_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg16_gfx12"
+        | "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg32_gfx12" => Some(64),
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a_gfx12" => Some(80),
+        "attention_flash_q8_0_tile"
+        | "fused_qkv_hfq4g256"
+        | "fused_qkv_q8_0"
+        | "fused_qkv_hfq6g256_wave64_dp4a" => Some(80),
+        "attention_flash_fwht3_tile"
+        | "fused_qkvza_hfq4g256"
+        | "fused_qkvza_q8_0"
+        | "fused_qkvza_q8_0_wave64_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u1_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u2_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u4_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u8_gfx12"
+        | "fused_qkvza_q8_0_dualrow_w32_u16_gfx12"
+        | "fused_qkvza_q8_0_wave64_rows2_multiacc_gfx12"
+        | "fused_qkvza_q8_0_wave64_rows4_multiacc_gfx12"
+        | "fused_qkvza_q8_0_wave64_rows8_multiacc_gfx12"
+        | "fused_qkvza_q8_0_q8_1_dp4a_wave64_gfx12"
+        | "fused_qkvza_q8_0_q8_1_dp4a_wave64_halves_gfx12"
+        | "gemm_qkvza_q8_0_wmma_gfx12"
+        | "gemm_qkvza_q8_0_q8_1_wmma_gfx12"
+        | "gemm_qkvza_q8_0_q8_1_wmma_wave64_gfx12"
+        | "gemm_qkvza_q8_0_q8_1_wmma_tiled_gfx12"
+        | "fused_qkvza_hfq6g256_wave64_dp4a"
+        | "gated_delta_net_q8_fast" => Some(96),
         _ => None,
     }
 }
@@ -374,6 +537,8 @@ impl ReplayTransport {
 /// dependency waits and the terminal idle remain unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Pm4MidAcquirePolicy {
+    EveryBoundary,
+    DependentBoundary,
     Conservative,
     EntryOnly,
     RequiredOnly,
@@ -385,6 +550,7 @@ enum Pm4MidAcquirePolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Pm4WaitPolicy {
+    Serialized,
     Allowlist,
     ResourceAudit,
     Resource,
@@ -423,6 +589,7 @@ impl Pm4RegisterPolicy {
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "serialized" | "serial" | "all" => Some(Self::Serialized),
             "" | "allowlist" | "conservative" => Some(Self::Allowlist),
             "resource-audit" | "resource_audit" | "audit" => Some(Self::ResourceAudit),
             "resource" | "resources" => Some(Self::Resource),
@@ -452,6 +619,7 @@ struct Pm4WaitAudit {
     allowlist_only: BTreeMap<(String, String), usize>,
     resource_only: BTreeMap<(String, String), usize>,
     suballocation_candidates: BTreeMap<(String, String), usize>,
+    uncovered_kernels: BTreeMap<String, usize>,
 }
 
 impl Pm4WaitAudit {
@@ -465,6 +633,18 @@ impl Pm4WaitAudit {
         resource_covered: bool,
     ) {
         self.boundaries += 1;
+        if previous.accesses.is_none() {
+            *self
+                .uncovered_kernels
+                .entry(previous.kernel.clone())
+                .or_default() += 1;
+        }
+        if current.accesses.is_none() {
+            *self
+                .uncovered_kernels
+                .entry(current.kernel.clone())
+                .or_default() += 1;
+        }
         if resource_covered {
             self.covered += 1;
         }
@@ -494,13 +674,21 @@ impl Pm4WaitAudit {
             self.resource_only,
             self.suballocation_candidates,
         );
+        if !self.uncovered_kernels.is_empty() {
+            eprintln!(
+                "[redline] PM4 wait audit uncovered_kernels={:?}",
+                self.uncovered_kernels
+            );
+        }
     }
 }
 
 impl Pm4MidAcquirePolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
-            "" | "conservative" | "all" => Some(Self::Conservative),
+            "all" | "every" | "every-boundary" | "every_boundary" => Some(Self::EveryBoundary),
+            "dependent" | "dependency" | "hazard" | "waited" => Some(Self::DependentBoundary),
+            "" | "conservative" => Some(Self::Conservative),
             "entry-only" | "entry_only" | "none" => Some(Self::EntryOnly),
             "required-only" | "required_only" => Some(Self::RequiredOnly),
             "without-repeat-interleave" => Some(Self::WithoutRepeatInterleave),
@@ -513,7 +701,7 @@ impl Pm4MidAcquirePolicy {
 
     fn from_env() -> Self {
         let value = std::env::var("HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY")
-            .unwrap_or_else(|_| "required-only".to_owned());
+            .unwrap_or_else(|_| "dependent".to_owned());
         Self::from_value(&value).unwrap_or_else(|| {
             eprintln!(
                 "WARNING: unknown HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY={value:?}; \
@@ -523,8 +711,10 @@ impl Pm4MidAcquirePolicy {
         })
     }
 
-    fn acquire_between(self, previous: &str, current: &str) -> bool {
+    fn acquire_between(self, previous: &str, current: &str, waited: bool) -> bool {
         match self {
+            Self::EveryBoundary => true,
+            Self::DependentBoundary => waited,
             Self::Conservative => conservative_mid_acquire_except(previous, current, None),
             Self::EntryOnly => false,
             Self::RequiredOnly => required_mid_acquire(previous, current),
@@ -1266,6 +1456,7 @@ impl ReplayController {
                     resource_covered,
                 );
                 let independent = match self.pm4_wait_policy {
+                    Pm4WaitPolicy::Serialized => false,
                     Pm4WaitPolicy::Allowlist | Pm4WaitPolicy::ResourceAudit => {
                         allowlist_independent
                     }
@@ -1277,7 +1468,7 @@ impl ReplayController {
                 resource_frontier.advance(current_launch, resources_independent);
                 if self
                     .pm4_mid_acquire_policy
-                    .acquire_between(previous, current)
+                    .acquire_between(previous, current, !independent)
                 {
                     if gfx12_gcr_trim {
                         commands.acquire_inter_node_gfx12();
@@ -1298,7 +1489,10 @@ impl ReplayController {
                 .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
         }
         commands.wait_compute_idle();
-        if self.pm4_wait_policy != Pm4WaitPolicy::Allowlist {
+        if !matches!(
+            self.pm4_wait_policy,
+            Pm4WaitPolicy::Serialized | Pm4WaitPolicy::Allowlist
+        ) {
             wait_audit.report(self.pm4_wait_policy);
         }
         let command_dwords = commands.len_dwords();
@@ -1624,6 +1818,8 @@ mod tests {
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
+        "fused_rmsnorm_mq_rotate_plain",
+        "fused_rmsnorm_mq_rotate_plain_q8_1",
         "fused_qkvza_hfq4g256",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
@@ -1633,6 +1829,13 @@ mod tests {
         "gated_norm_f32",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
+        "gemv_q8_0",
+        "gemv_q8_0_wave64_gfx12",
+        "gemv_q8_0_residual_wave64_gfx12",
+        "gemv_hfq6g256",
+        "gemv_hfq6g256_residual",
+        "gemv_hfq6g256_wave64_dp4a_gfx12",
+        "gemv_hfq6g256_residual_wave64_dp4a_gfx12",
         "gemv_hfq4g256_wide",
         "softmax_f32",
         "moe_topk_renorm_k8",
@@ -1640,20 +1843,55 @@ mod tests {
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_gfx12",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_sharex_gfx12",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_wavebarrier_gfx12",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg8_gfx12",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg16_gfx12",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_spatial_lpg32_gfx12",
+        "gemv_mixed_moe_gate_up_swiglu_k8_indexed_batched_wave64_dp4a_gfx12",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+        "gemv_mixed_moe_down_k8_indexed_batched_expanded_wave64_gfx12",
+        "gemv_mixed_moe_down_k8_indexed_batched_atomic_combine_wave64_gfx12",
+        "gemv_mixed_moe_down_k8_indexed_batched_block_combine_wave64_gfx12",
         "moe_down_combine_k8_batched",
         "fused_qkv_hfq4g256",
+        "fused_qkv_q8_0",
+        "fused_qkv_hfq6g256_wave64_dp4a",
+        "fused_qkvza_q8_0",
+        "fused_qkvza_q8_0_wave64_gfx12",
+        "fused_qkvza_q8_0_dualrow_w32_u1_gfx12",
+        "fused_qkvza_q8_0_dualrow_w32_u2_gfx12",
+        "fused_qkvza_q8_0_dualrow_w32_u4_gfx12",
+        "fused_qkvza_q8_0_dualrow_w32_u8_gfx12",
+        "fused_qkvza_q8_0_dualrow_w32_u16_gfx12",
+        "fused_qkvza_q8_0_wave64_rows2_multiacc_gfx12",
+        "fused_qkvza_q8_0_wave64_rows4_multiacc_gfx12",
+        "fused_qkvza_q8_0_wave64_rows8_multiacc_gfx12",
+        "fused_qkvza_q8_0_q8_1_dp4a_wave64_gfx12",
+        "fused_qkvza_q8_0_q8_1_dp4a_wave64_halves_gfx12",
+        "gemm_qkvza_q8_0_wmma_gfx12",
+        "gemm_qkvza_q8_0_q8_1_wmma_gfx12",
+        "gemm_qkvza_q8_0_q8_1_wmma_wave64_gfx12",
+        "gemm_qkvza_q8_0_q8_1_wmma_tiled_gfx12",
+        "fused_qkvza_hfq6g256_wave64_dp4a",
         "deinterleave_f32",
         "rmsnorm_f32",
+        "rmsnorm_f32_emit_f16",
+        "rmsnorm_f32_emit_q8_1",
+        "quantize_q8_1_mmq_ds4",
         "rope_partial_halfsplit_f32",
         "kv_cache_write_asym_k_fwht3",
         "kv_cache_write_q8_0",
         "attention_flash_fwht3_tile",
+        "attention_flash_q8_0_tile",
         "attention_flash_q8_0_reduce",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
         "gemv_hfq4g256_multirow_r4",
         "gemv_hfq4g256_multirow_r8",
+        "fused_gate_up_hfq4g256",
+        "fused_gate_up_q8_0",
     ];
 
     fn passing(speedup: f64) -> ShadowValidation {
@@ -1694,31 +1932,44 @@ mod tests {
             Pm4MidAcquirePolicy::from_value("required-only"),
             Some(Pm4MidAcquirePolicy::RequiredOnly)
         );
-        assert!(Pm4MidAcquirePolicy::Conservative
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(!Pm4MidAcquirePolicy::EntryOnly
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
-        assert!(!Pm4MidAcquirePolicy::WithoutRope
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(Pm4MidAcquirePolicy::WithoutRope
-            .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32"));
-        assert!(
-            !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
+        assert_eq!(
+            Pm4MidAcquirePolicy::from_value("dependent"),
+            Some(Pm4MidAcquirePolicy::DependentBoundary)
         );
+        assert!(Pm4MidAcquirePolicy::DependentBoundary
+            .acquire_between("sigmoid_mul_f32", "gemv_q8_0", true));
+        assert!(!Pm4MidAcquirePolicy::DependentBoundary
+            .acquire_between("sigmoid_mul_f32", "gemv_q8_0", false));
+        assert!(Pm4MidAcquirePolicy::Conservative
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32", true));
+        assert!(!Pm4MidAcquirePolicy::EntryOnly
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32", true));
+        assert!(!Pm4MidAcquirePolicy::Conservative
+            .acquire_between("rmsnorm_f32", "gemv_hfq4g256", true));
+        assert!(!Pm4MidAcquirePolicy::WithoutRope
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32", true));
+        assert!(Pm4MidAcquirePolicy::WithoutRope
+            .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32", true));
+        assert!(!Pm4MidAcquirePolicy::WithoutMqRotate
+            .acquire_between("mq_rotate_x", "gemv_hfq4g256", true));
         assert!(Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32", true));
         assert!(!Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
+            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256", true));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
-            "gated_delta_net_q8_compact2_b2"
+            "gated_delta_net_q8_compact2_b2",
+            true,
         ));
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
 
     #[test]
     fn resource_wait_policy_and_a3b_pointer_catalog_fail_closed() {
+        assert_eq!(
+            Pm4WaitPolicy::from_value("serialized"),
+            Some(Pm4WaitPolicy::Serialized)
+        );
         assert_eq!(
             Pm4WaitPolicy::from_value("resource-audit"),
             Some(Pm4WaitPolicy::ResourceAudit)

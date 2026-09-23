@@ -1,0 +1,5 @@
+loaded arch=qwen3_5_moe dim=2048 layers=40 vocab=248320
+decode: stable=True launches=692 kernels=24 hash=6db9a7c47363707c median=117.3 tok/s
+aql-contracts: kernels=24
+shadow: backend=pm4_ib exact=False aql=104646.2us hip=127972.3us
+report=.redline-work/mq4p-pm4-resource-coverage-shadow15.json pass=False

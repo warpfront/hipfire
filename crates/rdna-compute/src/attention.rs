@@ -4,10 +4,10 @@
 
 //! Attention, KV cache, DFlash, pflash, triattn, kv_compact, and vision attention dispatch.
 
+use crate::kernels;
 use crate::DType;
 use crate::Gpu;
 use crate::GpuTensor;
-use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 
