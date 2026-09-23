@@ -58,7 +58,8 @@ const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
 const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
 const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
-const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
+const MODELS_CATALOG_PATH =
+  process.env.HIPFIRE_MODELS_CATALOG_PATH ?? join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 // Named thinking budgets → per-turn <think> token cap. uncapped=0 means unlimited.
@@ -671,7 +672,7 @@ export function resolveServeThinkCap(
   return cap;
 }
 
-function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
+export function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
   if (!tag) { resolveThinkingBudget(base); return base as ResolvedConfig; }
   const all = loadPerModelConfigs();
@@ -764,6 +765,8 @@ export function resolveSamplingForSend(
     top_p?: number;
     repeat_penalty?: number;
     presence_penalty?: number;
+    top_k?: number;
+    min_p?: number;
   },
 ): SamplingForSend {
   const out: SamplingForSend = {};
@@ -803,9 +806,17 @@ export function resolveSamplingForSend(
     out.presence_penalty = card.presence_penalty;
   }
 
-  // top_k / min_p: card-only today (no flag/per-model surface). Carried-but-inert.
-  if (card && typeof card.top_k === "number") out.top_k = card.top_k;
-  if (card && typeof card.min_p === "number") out.min_p = card.min_p;
+  // top_k / min_p: explicit request > card. min_p remains carried-but-inert.
+  if (flags && typeof flags.top_k === "number") {
+    out.top_k = flags.top_k;
+  } else if (card && typeof card.top_k === "number") {
+    out.top_k = card.top_k;
+  }
+  if (flags && typeof flags.min_p === "number") {
+    out.min_p = flags.min_p;
+  } else if (card && typeof card.min_p === "number") {
+    out.min_p = card.min_p;
+  }
   if (card && typeof card.system_prompt === "string") out.system_prompt = card.system_prompt;
   return out;
 }
@@ -3772,7 +3783,7 @@ async function serve(port: number, host: string) {
         //   >  OMIT (let the daemon's .hfq generation_config → arch ladder resolve).
         // A bare global CONFIG_DEFAULTS value is NOT sent, so the daemon's own
         // card/arch resolution is no longer masked by the CLI's temp=0.3.
-        const sendView = resolveSamplingForSend(body.model);
+        const sendView = resolveSamplingForSend(body.model, body);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           max_tokens: requestMaxTokens,
@@ -6631,7 +6642,60 @@ async function bench(
 
 // ─── Profile ────────────────────────────────────────────
 
-async function profile(modelTag: string | undefined, jsonOutput: boolean, kernelFilter: string | undefined) {
+// Synthetic pp/tg workload probes for `hipfire profile <model> --pp ... --tg ...`.
+// Routes through the daemon's bench_prefill / bench_decode handlers (the same
+// probes `hipfire bench --matrix` uses), so arch support is defined by the
+// daemon: Qwen3.5/3.6 (5/6) and LFM2.5 (11) today.
+interface ProfileWorkload {
+  pp: number[];
+  tg: number[];
+  ctx: number;
+  runs: number;
+}
+
+interface WorkloadRow {
+  tokens: number;
+  context?: number;
+  samples: number[];
+  tok_s_mean: number;
+  tok_s_min: number;
+  tok_s_max: number;
+}
+
+async function runProfileWorkload(e: Engine, w: ProfileWorkload) {
+  const statsOf = (xs: number[]) => {
+    if (!xs.length) return { mean: 0, min: 0, max: 0 };
+    const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+    return { mean, min: Math.min(...xs), max: Math.max(...xs) };
+  };
+  const pp: WorkloadRow[] = [];
+  for (const size of w.pp) {
+    await benchPrefill(e, size, 600_000); // per-shape JIT warmup, discarded
+    const samples: number[] = [];
+    for (let r = 0; r < w.runs; r++) {
+      const res = await benchPrefill(e, size, 600_000);
+      if (res) samples.push(res.tokS);
+    }
+    const s = statsOf(samples);
+    process.stderr.write(`  pp${size}: ${samples.length ? `${s.mean.toFixed(1)} tok/s` : "FAIL"}\n`);
+    pp.push({ tokens: size, samples, tok_s_mean: s.mean, tok_s_min: s.min, tok_s_max: s.max });
+  }
+  const tg: WorkloadRow[] = [];
+  if (w.tg.length) await benchDecode(e, w.ctx, 32); // one discarded decode warmup row
+  for (const n of w.tg) {
+    const samples: number[] = [];
+    for (let r = 0; r < w.runs; r++) {
+      const res = await benchDecode(e, w.ctx, n);
+      if (res) samples.push(res.tokS);
+    }
+    const s = statsOf(samples);
+    process.stderr.write(`  tg${n}@${w.ctx}: ${samples.length ? `${s.mean.toFixed(1)} tok/s` : "FAIL"}\n`);
+    tg.push({ tokens: n, context: w.ctx, samples, tok_s_mean: s.mean, tok_s_min: s.min, tok_s_max: s.max });
+  }
+  return { ctx: w.ctx, runs: w.runs, pp, tg };
+}
+
+async function profile(modelTag: string | undefined, jsonOutput: boolean, kernelFilter: string | undefined, workload?: ProfileWorkload) {
   // Start daemon — we need kernels compiled to profile them
   const e = new Engine();
   e.oneShot = true; // hunt3 H-B: one-shot profile — exit on daemon EOF is correct
@@ -6650,7 +6714,16 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
     }
     if (modelPath) {
       applyConfigEnv(cfg, modelTag);
-      await e.send(buildLoadMessage(modelPath, modelTag));
+      const loadMsg = buildLoadMessage(modelPath, modelTag);
+      if (workload) {
+        // Reserve KV/scratch span for the longest probe (same +32 slot rule
+        // as the bench matrix) so large --pp/--tg points don't hit the
+        // daemon's physical_cap refusal.
+        const ppMax = workload.pp.length ? Math.max(...workload.pp) : 0;
+        const tgMax = workload.tg.length ? Math.max(...workload.tg) : 0;
+        loadMsg.params.max_seq = Math.max(loadMsg.params.max_seq, ppMax + 32, workload.ctx + tgMax + 32);
+      }
+      await e.send(loadMsg);
       const loaded = await e.recv();
       if (loaded.type === "error") {
         console.error(`Load failed: ${loaded.message}`);
@@ -6663,6 +6736,9 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
   // Request profile data
   await e.send({ type: "profile" });
   const data = await e.recv();
+
+  // Workload probes run against the loaded model (needs the engine alive).
+  const workloadResult = workload ? await runProfileWorkload(e, workload) : null;
   await e.stop();
 
   if (data.type !== "profile") {
@@ -6679,6 +6755,7 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
     : kernels;
 
   if (jsonOutput) {
+    if (workloadResult) data.workload = workloadResult;
     console.log(JSON.stringify(data, null, 2));
     return;
   }
@@ -6726,6 +6803,16 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
   // Occupancy summary
   const fullOcc = filtered.filter((k: any) => k.occupancy.limiter === "wave limit").length;
   console.log(`\n${fullOcc}/${filtered.length} kernels at max occupancy`);
+
+  if (workloadResult) {
+    console.log(`\nWorkload Profile (synthetic, ctx=${workloadResult.ctx}, runs=${workloadResult.runs}):`);
+    const fmtRow = (label: string, row: WorkloadRow) =>
+      `  ${label.padEnd(14)} ${row.samples.length
+        ? `${row.tok_s_mean.toFixed(1).padStart(8)} tok/s   (min ${row.tok_s_min.toFixed(1)} / max ${row.tok_s_max.toFixed(1)}, n=${row.samples.length})`
+        : "FAIL"}`;
+    for (const row of workloadResult.pp) console.log(fmtRow(`pp${row.tokens}`, row));
+    for (const row of workloadResult.tg) console.log(fmtRow(`tg${row.tokens}`, row));
+  }
 }
 
 // ─── Config TUI ─────────────────────────────────────────
@@ -8443,6 +8530,7 @@ Examples:
   case "profile": {
     if (rest.includes("-h") || rest.includes("--help")) {
       console.error(`Usage: hipfire profile [model] [--kernel <substr>] [--json]
+       hipfire profile <model> --pp CSV --tg CSV [--ctx N] [--runs N] [--json]
 
   Roofline + compiled-kernel report for the detected GPU. Pass a [model] to
   load it first (forces its kernels to JIT-compile so they show up).
@@ -8451,18 +8539,55 @@ Flags:
   --kernel <substr>   Only report kernels whose name contains <substr>
   -j, --json          Emit the full machine-readable hardware + kernel report
 
+Workload probes (synthetic, via the daemon bench_prefill/bench_decode
+handlers; requires a model whose arch the daemon probe supports):
+  --pp CSV            Prefill lengths to measure, e.g. 128,512,2048
+  --tg CSV            Decode lengths to measure, e.g. 128,256,512,2048
+  --ctx N             Decode starting context (default: 128)
+  --runs N            Measured runs per point (default: 3)
+
 Examples:
   hipfire profile
   hipfire profile qwen3.5:9b
-  hipfire profile qwen3.5:9b --kernel gemm --json`);
+  hipfire profile qwen3.5:9b --kernel gemm --json
+  hipfire profile lfm2.5:8b-a1b --pp 128,512,2048 --tg 128,256,512,2048`);
       process.exit(0);
     }
     // takeFlag/takeFlagValue splice their tokens out of `rest`, so whatever
     // survives is purely positional (the optional model). Supports -j alias.
     const jsonFlag = takeFlag(rest, "-j", "--json");
     const kernelFilter = takeFlagValue(rest, "--kernel") ?? undefined;
+    const ppRaw = takeFlagValue(rest, "--pp");
+    const tgRaw = takeFlagValue(rest, "--tg");
+    const ctxRaw = takeFlagValue(rest, "--ctx");
+    const runsRaw = takeFlagValue(rest, "--runs");
+    const parseCsvPos = (raw: string, flag: string): number[] => {
+      const parts = raw.split(",").map(v => v.trim());
+      if (!parts.length || parts.some(v => !/^\d+$/.test(v) || parseInt(v, 10) < 1)) {
+        console.error(`Error: ${flag} must be a comma-separated list of positive integers`);
+        process.exit(1);
+      }
+      return [...new Set(parts.map(v => parseInt(v, 10)))];
+    };
+    const parsePosInt = (raw: string, flag: string): number => {
+      if (!/^\d+$/.test(raw) || parseInt(raw, 10) < 1) {
+        console.error(`Error: ${flag} must be a positive integer`);
+        process.exit(1);
+      }
+      return parseInt(raw, 10);
+    };
+    const profileWorkload: ProfileWorkload | undefined = (ppRaw !== null || tgRaw !== null) ? {
+      pp: ppRaw !== null ? parseCsvPos(ppRaw, "--pp") : [],
+      tg: tgRaw !== null ? parseCsvPos(tgRaw, "--tg") : [],
+      ctx: ctxRaw !== null ? parsePosInt(ctxRaw, "--ctx") : 128,
+      runs: runsRaw !== null ? parsePosInt(runsRaw, "--runs") : 3,
+    } : undefined;
     const profileModel = rest[0]; // optional: model to load (triggers kernel compile)
-    await profile(profileModel, jsonFlag, kernelFilter);
+    if (profileWorkload && !profileModel) {
+      console.error("Error: --pp/--tg workload profiling requires a model to load");
+      process.exit(1);
+    }
+    await profile(profileModel, jsonFlag, kernelFilter, profileWorkload);
     break;
   }
   case "update": {

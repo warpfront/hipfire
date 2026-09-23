@@ -82,6 +82,9 @@ def resolve_sampling(spec, tag, registry_path):
         for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty"]:
             if k in rec:
                 vals[k] = rec[k]; source[k] = f"registry({tag})"
+        if rec.get("thinking") == "off":
+            vals["reasoning_effort"] = "none"
+            source["reasoning_effort"] = f"registry({tag})"
         if not vals:
             sys.exit(f"  registry has no recommended_settings for tag {tag!r} — refusing to fall back to a "
                      f"naive default. Pass --tag <registry-tag> or --sampling recipe:coding explicitly.")

@@ -72,6 +72,7 @@ export interface RegistryRecommendedSettings {
   min_p?: number;
   presence_penalty?: number;
   repeat_penalty?: number;
+  thinking?: "on" | "off";
   system_prompt?: string;
 }
 
@@ -198,6 +199,13 @@ function validRecommendedSettings(v: unknown): boolean {
   if (
     v.repeat_penalty !== undefined &&
     !numInRange(v.repeat_penalty, 0.5, 2)
+  ) {
+    return false;
+  }
+  if (
+    v.thinking !== undefined &&
+    v.thinking !== "on" &&
+    v.thinking !== "off"
   ) {
     return false;
   }

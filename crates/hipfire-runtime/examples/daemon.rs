@@ -3010,11 +3010,14 @@ fn main() {
                         continue;
                     }
                 };
-                if m.pp > 1 || m.ep.is_some() || (m.arch_id != 5 && m.arch_id != 6) {
+                if m.pp > 1
+                    || m.ep.is_some()
+                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 11)
+                {
                     let _ = writeln!(
                         stdout,
                         "{}",
-                        r#"{"type":"error","message":"bench_decode currently requires a single-GPU Qwen3.5 model"}"#
+                        r#"{"type":"error","message":"bench_decode currently requires a single-GPU Qwen3.5 or LFM2.5 model"}"#
                     );
                     let _ = stdout.flush();
                     continue;
@@ -3061,8 +3064,36 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
+                if m.arch_id == 11 {
+                    // LFM2.5 carries its own KV + conv-state cursors; reset
+                    // them so the prime writes from slot 0 (mirrors the
+                    // bench_prefill arch-11 arm and the chat reset handler).
+                    if let Some(b) = m.lfm2moe_mut() {
+                        let _ = b.state.reset(&mut gpu);
+                    }
+                }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_ok = {
+                let prime_ok = if m.arch_id == 11 {
+                    // LFM2.5 has no batched prefill kernel — the production
+                    // prefill shape IS the eager per-token decode_step (see
+                    // the bench_prefill arch-11 arm), so prime with it.
+                    let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if lfm2moe::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -3111,7 +3142,30 @@ fn main() {
 
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
-                let run_ok = {
+                let run_ok = if m.arch_id == 11 {
+                    let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
+                    let config = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    let mut ok = true;
+                    for i in 0..iterations {
+                        let token = 101 + (i as u32 % 1000);
+                        if lfm2moe::forward::decode_step(
+                            config,
+                            weights,
+                            state,
+                            &mut gpu,
+                            token,
+                            (context + i) as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -3161,6 +3215,9 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 reset_qwen35_recurrent(m, &mut gpu);
+                if let Some(b) = m.lfm2moe_mut() {
+                    let _ = b.state.reset(&mut gpu);
+                }
 
                 if run_ok {
                     let tok_s = iterations as f64 / elapsed.max(f64::MIN_POSITIVE);
@@ -8110,11 +8167,9 @@ fn generate(
         return;
     }
     if m.arch_id == 11 {
-        // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
-        // the deepseek4 short-circuit above. PFlash / DFlash / VL / multi-GPU
-        // / sampler-budget scaffolding all bypass. We honour `system_prompt`,
-        // `temp`, `top_p`, `tools`, and `messages_history`; everything else
-        // routes through future follow-ups.
+        // arch_id=11 (LFM2.5). Standalone AR path; sampling must preserve the
+        // model-card contract because this branch bypasses the generic sampler.
+        // Prompt framing stays on the model's embedded Jinja template.
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -8123,7 +8178,7 @@ fn generate(
             pflash_cfg,
             think_mode,
         );
-        let _ = (repeat_penalty, repeat_window);
+        let top_k = top_k.map(|k| k as usize).unwrap_or(0);
         generate_lfm2moe(
             m,
             gpu,
@@ -8133,6 +8188,8 @@ fn generate(
             system_prompt,
             temp,
             top_p,
+            top_k,
+            repeat_penalty,
             max_tokens,
             max_think_tokens,
             tools,
@@ -12025,6 +12082,38 @@ fn generate_deepseek4(
     eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
 }
 
+fn apply_hf_repetition_penalty(
+    logits: &mut [f32],
+    seen_tokens: &std::collections::HashSet<u32>,
+    penalty: f32,
+) {
+    if penalty == 1.0 {
+        return;
+    }
+    for &token in seen_tokens {
+        if let Some(logit) = logits.get_mut(token as usize) {
+            if *logit > 0.0 {
+                *logit /= penalty;
+            } else {
+                *logit *= penalty;
+            }
+        }
+    }
+}
+
+fn sample_lfm_token(
+    logits: &mut [f32],
+    seen_tokens: &std::collections::HashSet<u32>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    repeat_penalty: f32,
+    rng: &mut deepseek4::sampling::Xorshift,
+) -> u32 {
+    apply_hf_repetition_penalty(logits, seen_tokens, repeat_penalty);
+    deepseek4::sampling::sample_token(logits, temp, top_k, top_p, rng)
+}
+
 fn generate_lfm2moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -12034,6 +12123,8 @@ fn generate_lfm2moe(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: usize,
+    repeat_penalty: f32,
     max_tokens: usize,
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
@@ -12234,6 +12325,8 @@ fn generate_lfm2moe(
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
     }
+    let mut seen_tokens: std::collections::HashSet<u32> =
+        m.conversation_tokens.iter().copied().collect();
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
@@ -12249,7 +12342,15 @@ fn generate_lfm2moe(
         if generated_count >= max_tokens {
             break;
         }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        let next_tok = sample_lfm_token(
+            &mut last_logits,
+            &seen_tokens,
+            temp,
+            top_p,
+            top_k,
+            repeat_penalty,
+            &mut rng,
+        );
         if stop_toks.contains(&next_tok) {
             break;
         }
@@ -12275,6 +12376,7 @@ fn generate_lfm2moe(
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
+        seen_tokens.insert(next_tok);
         generated_count += 1;
 
         let step = {
@@ -15086,5 +15188,30 @@ mod tool_call_parser_tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+}
+
+#[cfg(test)]
+mod lfm_sampling_tests {
+    use super::{apply_hf_repetition_penalty, sample_lfm_token};
+    use hipfire_arch_deepseek4::sampling::Xorshift;
+
+    #[test]
+    fn card_repetition_penalty_precedes_top_k() {
+        let mut logits = [9.8_f32, 10.0, 1.0];
+        let seen = [1_u32].into_iter().collect();
+        let mut rng = Xorshift::new(7);
+        let token =
+            sample_lfm_token(&mut logits, &seen, 0.2, 1.0, 1, 1.05, &mut rng);
+        assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn hf_repetition_penalty_is_once_per_unique_token() {
+        let mut logits = [10.0_f32, -10.0];
+        let seen = [0_u32, 0, 0, 1].into_iter().collect();
+        apply_hf_repetition_penalty(&mut logits, &seen, 1.05);
+        assert!((logits[0] - (10.0 / 1.05)).abs() < 1e-6);
+        assert!((logits[1] - (-10.0 * 1.05)).abs() < 1e-6);
     }
 }
