@@ -1,0 +1,184 @@
+{
+  "schema": "lane4-verify/1",
+  "cpu_only": true,
+  "baseline": {
+    "commit": "77cd6ce7d08d7b5d078902ebd211a4f9baf9e9be",
+    "eos_source": "crates/hipfire-runtime/src/eos_filter.rs",
+    "eos_source_len": 35370,
+    "eos_source_sha256": "fe75a63946ea5b3a5fa36150989d634068401d6164201b2597cbf3c35c0796a3",
+    "eos_source_fnv1a64": "b6e11a19d28b1a20",
+    "emit_source": "crates/hipfire-engine/src/emit.rs",
+    "emit_source_len": 8920,
+    "emit_source_sha256": "d56da7e4b2b4e6cb0e3dac60b262a19215e849518457f9240ec0d8ab859779ea",
+    "emit_source_fnv1a64": "28658d68bfdb3f06",
+    "vendored_byte_identical": true,
+    "emit_oracle": "verbatim recreation of ORIGINAL emit_visible_token + emit_reasoning_token bodies (json! Value + writeln! + flush); full baseline emit.rs not vendored due to crate coupling"
+  },
+  "candidate": {
+    "eos_source": "crates/hipfire-runtime/src/eos_filter.rs",
+    "eos_source_len": 35571,
+    "eos_source_fnv1a64": "9e54f7258985b42b",
+    "emit_source": "crates/hipfire-engine/src/emit.rs",
+    "emit_source_len": 14509,
+    "emit_source_fnv1a64": "a156f3c881311d8b"
+  },
+  "eos_parity": {
+    "pass": true,
+    "comparison": "per-observe action sequence + concatenated emitted bytes + flush bytes vs baseline oracle; reset path included",
+    "configs": 8,
+    "streams": 32,
+    "drives": 6056,
+    "reset_drives": 96,
+    "mismatches": 0,
+    "mismatch_cases": []
+  },
+  "emit_parity": {
+    "pass": true,
+    "comparison": "exact original bytes on Vec<u8> sinks for visible + reasoning events across ids/texts/attempt_ids; error/flush-failure paths covered by parent existing tests",
+    "events": 576,
+    "mismatches": 0,
+    "mismatch_cases": []
+  },
+  "alloc": {
+    "method": "global counting allocator; alloc windows separate from timing windows; identical loop code for both sides (relative comparison, not an absolute perf claim)",
+    "reps_per_side": 2000,
+    "warmup_reps": 50,
+    "eos_candidate": {
+      "allocs_per_op": 20.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 66.0,
+      "ns_per_op": 666.4869,
+      "ns_per_op_rounds": [
+        669.56,
+        662.919,
+        667.877,
+        661.6025,
+        670.476
+      ]
+    },
+    "eos_baseline": {
+      "allocs_per_op": 31.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 770.0,
+      "ns_per_op": 743.5436,
+      "ns_per_op_rounds": [
+        739.741,
+        740.7225,
+        747.893,
+        741.5485,
+        747.813
+      ]
+    },
+    "emit_visible_candidate": {
+      "allocs_per_op": 1.0,
+      "reallocs_per_op": 4.0,
+      "alloc_bytes_per_op": 8.0,
+      "ns_per_op": 120.50550000000001,
+      "ns_per_op_rounds": [
+        120.222,
+        118.6695,
+        118.5795,
+        117.9035,
+        127.153
+      ]
+    },
+    "emit_visible_baseline": {
+      "allocs_per_op": 11.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 531.0,
+      "ns_per_op": 431.1965,
+      "ns_per_op_rounds": [
+        435.7705,
+        431.554,
+        427.3725,
+        429.0905,
+        432.195
+      ]
+    },
+    "emit_reasoning_candidate": {
+      "allocs_per_op": 1.0,
+      "reallocs_per_op": 4.0,
+      "alloc_bytes_per_op": 8.0,
+      "ns_per_op": 128.56670000000003,
+      "ns_per_op_rounds": [
+        128.795,
+        128.89,
+        128.71,
+        128.3195,
+        128.119
+      ]
+    },
+    "emit_reasoning_baseline": {
+      "allocs_per_op": 11.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 535.0,
+      "ns_per_op": 442.9552,
+      "ns_per_op_rounds": [
+        444.5435,
+        441.7045,
+        444.258,
+        441.4135,
+        442.8565
+      ]
+    }
+  },
+  "timing": {
+    "method": "counting disabled; repeated warmups then repeated rounds; ns per drive (EOS) / per event (emit); no perf claim",
+    "warmup_reps": 500,
+    "rounds": 5,
+    "reps_per_round": 2000,
+    "eos_candidate_ns": {
+      "allocs_per_op": 20.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 66.0,
+      "ns_per_op": 666.4869,
+      "ns_per_op_rounds": [
+        669.56,
+        662.919,
+        667.877,
+        661.6025,
+        670.476
+      ]
+    },
+    "eos_baseline_ns": {
+      "allocs_per_op": 31.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 770.0,
+      "ns_per_op": 743.5436,
+      "ns_per_op_rounds": [
+        739.741,
+        740.7225,
+        747.893,
+        741.5485,
+        747.813
+      ]
+    },
+    "emit_visible_candidate_ns": {
+      "allocs_per_op": 1.0,
+      "reallocs_per_op": 4.0,
+      "alloc_bytes_per_op": 8.0,
+      "ns_per_op": 120.50550000000001,
+      "ns_per_op_rounds": [
+        120.222,
+        118.6695,
+        118.5795,
+        117.9035,
+        127.153
+      ]
+    },
+    "emit_visible_baseline_ns": {
+      "allocs_per_op": 11.0,
+      "reallocs_per_op": 5.0,
+      "alloc_bytes_per_op": 531.0,
+      "ns_per_op": 431.1965,
+      "ns_per_op_rounds": [
+        435.7705,
+        431.554,
+        427.3725,
+        429.0905,
+        432.195
+      ]
+    }
+  },
+  "pass": true
+}
