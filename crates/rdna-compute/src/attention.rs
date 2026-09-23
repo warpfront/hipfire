@@ -5738,9 +5738,14 @@ impl Gpu {
         // symbol both resolve out of this module's source.
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx11";
         if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
+            // Warp-specialized K/V fill: bit-exact, screened +30% FA2 on
+            // gfx1100 and gfx1151 (the Q16 cards). `HIPFIRE_FA2_FILL=0`
+            // restores the all-wave fill.
+            let fill = q16_tile && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n{}",
+                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}",
                 u8::from(q16_tile),
+                u8::from(fill),
                 kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;

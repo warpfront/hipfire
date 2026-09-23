@@ -98,6 +98,14 @@
 #error "HIPFIRE_FA2_KT must be 32 or 64"
 #endif
 
+// Warp-specialized K/V fill (Q8, Q16, KT32 only; see the FA2_FILL helpers
+// below). The launcher selects it (HIPFIRE_FA2_FILL=0 opts out); the file
+// default keeps the incumbent fill for every other build.
+#ifndef HIPFIRE_FA2_FILL
+#define HIPFIRE_FA2_FILL 0
+#endif
+#define FA2_FILL (HIPFIRE_FA2_FILL && FA2_Q16 && HIPFIRE_FA2_KT == 32)
+
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -115,6 +123,285 @@ __device__ __forceinline__ int fa2_swiz(int c)
                 | ((c & 4) >> 1) | ((c & 8) >> 3);
     return 2 * r;
 }
+
+#if FA2_FILL
+// ---- Warp-specialized fill (FA2_FILL) ----
+// Waves 0..5 compute, waves 6..7 own every K/V fill after tile 0. Per tile
+// t, phase A: compute runs QK(t) from the K plane while the helpers
+// dequantize V(t) into the V plane; barrier; phase B: compute runs
+// softmax/PV(t) from the V plane while the helpers dequantize K(t+1) into
+// the K plane; barrier. Each plane is written only in the phase that does
+// not read it, so one 32 KiB LDS double-buffers without growing. Raw
+// global bytes are register-pipelined one phase ahead in the helpers only
+// (wave-uniform role split: compute waves carry no fill registers).
+//
+// Plane contents are identical to the incumbent fill: the packed dequant
+// biases codes into f16 1024+(c^0x80) with v_perm, removes the 1152 bias
+// exactly, and v_pk_mul_f16 rounds s*c once (RNE) -- the value of the
+// incumbent's exact f32 product cast to f16. QK/softmax/PV op order is
+// the incumbent's verbatim, so outputs are bit-identical.
+typedef _Float16 __attribute__((ext_vector_type(2))) half2_t;
+
+typedef union {
+    uint32_t u;
+    half2_t h2;
+} fa2_pk_t;
+
+constexpr int FA2_FILL_HT = 64;               // helper threads (2 waves)
+constexpr int FA2_FILL_HK = 32 * 8 / 64;      // K slots per helper lane
+constexpr int FA2_FILL_HV = 32 * 16 / 64;     // V slots per helper lane
+constexpr int FA2_ROW_B = 4 * (256 / 32) * 34;
+
+// Two biased codes (bytes picked by `sel` from tb, interleaved with 0x64)
+// times the f16 scale pair s2: RNE(s*c) per half.
+__device__ __forceinline__ uint32_t fa2_pk_deq2(uint32_t tb, uint32_t sel, uint32_t s2)
+{
+    fa2_pk_t a, s;
+    a.u = __builtin_amdgcn_perm(0x64646464u, tb, sel);
+    s.u = s2;
+    const half2_t bias = {(_Float16)1152.0f, (_Float16)1152.0f};
+    a.h2 = (a.h2 - bias) * s.h2;
+    return a.u;
+}
+
+// K slot idx = k*8+b: scale (low 16 bits) + the block's 8 code dwords.
+// Out-of-range keys read the (valid) last row and stage zeros, exactly
+// the incumbent's null-pointer zero fill.
+__device__ __forceinline__ void fa2_fill_k_load(
+    const unsigned char* k_cache, int ktile, int seq_len, int kv_blk, int idx,
+    uint32_t& su, uint32_t* uc)
+{
+    const int gk = ktile + (idx >> 3);
+    const bool ok = gk < seq_len;
+    const unsigned char* blk = k_cache
+        + (unsigned long long)min(gk, seq_len - 1) * (unsigned long long)FA2_ROW_B
+        + (unsigned long long)(kv_blk + (idx & 7)) * 34ULL;
+    const uint32_t s = (uint32_t)blk[0] | ((uint32_t)blk[1] << 8);
+    su = ok ? s : 0u;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        uint32_t u;
+        __builtin_memcpy(&u, blk + 2 + w * 4, 4);
+        uc[w] = ok ? u : 0u;
+    }
+}
+
+// K pair p of key k lands at K[k][(p + S(k&15)) & 127]; pairs start even,
+// so each code dword's two plane dwords are one aligned b64.
+__device__ __forceinline__ void fa2_fill_k_store(uint32_t* Kdw, int idx, uint32_t su,
+                                                 const uint32_t* uc)
+{
+    const int k = idx >> 3;
+    const int rot = fa2_swiz(k & 15);
+    const int base = k * 128;
+    const int pb = (idx & 7) * 16;
+    const uint32_t s2 = su | (su << 16);
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const uint32_t tb = uc[w] ^ 0x80808080u;
+        int32x2_t v;
+        v[0] = (int32_t)fa2_pk_deq2(tb, 0x04010400u, s2);
+        v[1] = (int32_t)fa2_pk_deq2(tb, 0x04030402u, s2);
+        *(int32x2_t*)(Kdw + base + ((pb + w * 2 + rot) & 127)) = v;
+    }
+}
+
+// V slot = ((m*8+b)<<2) | wq: key pair m, block b, code dwords 2wq, 2wq+1
+// of both keys. Raw = packed scales (s0 | s1<<16), u[0..1] (key 2m),
+// u[2..3] (key 2m+1).
+__device__ __forceinline__ void fa2_fill_v_load(
+    const unsigned char* v_cache, int ktile, int seq_len, int kv_blk, int slot,
+    uint32_t& s01, uint32_t* u)
+{
+    const int pair = slot >> 2;
+    const int w_base = (slot & 3) * 2;
+    const int k0 = ktile + 2 * (pair >> 3);
+    const unsigned long long boff = (unsigned long long)(kv_blk + (pair & 7)) * 34ULL;
+    const bool ok0 = k0 < seq_len;
+    const bool ok1 = k0 + 1 < seq_len;
+    const unsigned char* blk0 = v_cache
+        + (unsigned long long)min(k0, seq_len - 1) * (unsigned long long)FA2_ROW_B + boff;
+    const unsigned char* blk1 = v_cache
+        + (unsigned long long)min(k0 + 1, seq_len - 1) * (unsigned long long)FA2_ROW_B + boff;
+    const uint32_t s0 = ok0 ? ((uint32_t)blk0[0] | ((uint32_t)blk0[1] << 8)) : 0u;
+    const uint32_t s1 = ok1 ? ((uint32_t)blk1[0] | ((uint32_t)blk1[1] << 8)) : 0u;
+    s01 = s0 | (s1 << 16);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        uint32_t u0, u1;
+        __builtin_memcpy(&u0, blk0 + 2 + (w_base + i) * 4, 4);
+        __builtin_memcpy(&u1, blk1 + 2 + (w_base + i) * 4, 4);
+        u[i] = ok0 ? u0 : 0u;
+        u[2 + i] = ok1 ? u1 : 0u;
+    }
+}
+
+// Key pair m for dim d lands at V_T[d][(m + S(d&15)) & 15]; each dword
+// holds (s0*code of key 2m, s1*code of key 2m+1) for one dim.
+__device__ __forceinline__ void fa2_fill_v_store(uint32_t* Vdw, int slot, uint32_t s01,
+                                                 const uint32_t* u)
+{
+    const int pair = slot >> 2;
+    const int w_base = (slot & 3) * 2;
+    const int m = pair >> 3;
+    const int b = pair & 7;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int w = w_base + i;
+        const uint32_t xl =
+            __builtin_amdgcn_perm(u[2 + i], u[i], 0x05010400u) ^ 0x80808080u;
+        const uint32_t xh =
+            __builtin_amdgcn_perm(u[2 + i], u[i], 0x07030602u) ^ 0x80808080u;
+        uint32_t dw[4];
+        dw[0] = fa2_pk_deq2(xl, 0x04010400u, s01);
+        dw[1] = fa2_pk_deq2(xl, 0x04030402u, s01);
+        dw[2] = fa2_pk_deq2(xh, 0x04010400u, s01);
+        dw[3] = fa2_pk_deq2(xh, 0x04030402u, s01);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int d = b * 32 + w * 4 + c;
+            Vdw[d * 16 + ((m + fa2_swiz(d & 15)) & 15)] = dw[c];
+        }
+    }
+}
+
+// K fragment for WMMA A: key row `key`, dim chunk dc (four aligned b64s).
+__device__ __forceinline__ half16_t fa2_fill_kfrag(const uint32_t* Kdw, int key, int dc)
+{
+    const int rot = fa2_swiz(key & 15);
+    const int base = key * 128;
+    half16_t kf;
+#pragma unroll
+    for (int i = 0; i < 8; i += 2) {
+        const int off = base + ((dc * 8 + i + rot) & 127);
+        const int32x2_t pair = *(const int32x2_t*)(Kdw + off);
+        fa2_dw_t d0, d1;
+        d0.u = (uint32_t)pair[0];
+        d1.u = (uint32_t)pair[1];
+        kf[2 * i] = d0.h[0];
+        kf[2 * i + 1] = d0.h[1];
+        kf[2 * i + 2] = d1.h[0];
+        kf[2 * i + 3] = d1.h[1];
+    }
+    return kf;
+}
+
+// Compute-wave QK(t) for both KT32 subtiles (qshare2) and softmax/PV(t),
+// split at the phase barrier. Bodies are the incumbent KT32 path verbatim
+// (the incumbent keeps its inline copy: hoisting it into these helpers
+// perturbs its register allocation).
+__device__ __forceinline__ void fa2_fill_qk(
+    const _Float16* __restrict__ q16, const uint32_t* Kdw, unsigned qq_base,
+    bool qok_ml, int ml, bool do0, bool do1, float8_t& sacc0, float8_t& sacc1)
+{
+    sacc0 = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    sacc1 = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int dc = 0; dc < 16; ++dc) {
+        half16_t qf;
+        {
+            const half8_t* qd =
+                (const half8_t*)(q16 + qq_base + (unsigned)(dc * 16));
+            half8_t lo = {0, 0, 0, 0, 0, 0, 0, 0};
+            half8_t hi = {0, 0, 0, 0, 0, 0, 0, 0};
+            if (qok_ml) {
+                lo = qd[0];
+                hi = qd[1];
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                qf[e] = lo[e];
+                qf[8 + e] = hi[e];
+            }
+        }
+        if (do0)
+            sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                fa2_fill_kfrag(Kdw, ml, dc), qf, sacc0);
+        if (do1)
+            sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                fa2_fill_kfrag(Kdw, 16 + ml, dc), qf, sacc1);
+        // Bound K/Q-load hoisting to this chunk.
+        asm volatile("" ::: "memory");
+    }
+}
+
+__device__ __forceinline__ void fa2_fill_softmax_pv(
+    const uint32_t* Vdw, const int* __restrict__ positions, float scale_attn,
+    int ktile, int gmin, bool do0, bool do1, float8_t sacc0, float8_t sacc1,
+    bool qok_ml, int qr_ml, int ml, int half, float& m_old, float& l_val,
+    float8_t* Ofr)
+{
+#pragma unroll 1
+    for (int sub = 0; sub < 2; ++sub) {
+        const bool dos = (sub == 0) ? do0 : do1;
+        if (!dos)
+            continue;
+        float8_t sacc = (sub == 0) ? sacc0 : sacc1;
+        const int kt_sub = ktile + sub * 16;
+        const bool full = (kt_sub + 15) <= gmin;
+        const int pos_ml = (!full && qok_ml) ? positions[qr_ml] : 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int key_g = kt_sub + 2 * j + half;
+            const bool ok = qok_ml && (full || key_g <= pos_ml);
+            sacc[j] = ok ? sacc[j] * scale_attn : -INFINITY;
+        }
+        float mx = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            mx = fmaxf(mx, sacc[j]);
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        const float m_new = fmaxf(m_old, mx);
+        const float alpha =
+            (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+        m_old = m_new;
+        float earr[8];
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float e = (m_new == -INFINITY) ? 0.0f : __expf(sacc[j] - m_new);
+            earr[j] = e;
+            sum += e;
+        }
+        sum += __shfl_xor(sum, 16, 32);
+        l_val = l_val * alpha + sum;
+        half16_t prow;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float peer = __shfl_xor(earr[j], 16, 32);
+            const float e0 = (half == 0) ? earr[j] : peer;
+            const float e1 = (half == 0) ? peer : earr[j];
+            prow[2 * j] = (_Float16)e0;
+            prow[2 * j + 1] = (_Float16)e1;
+        }
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc)
+            Ofr[dc] *= alpha;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc) {
+            const int d = dc * 16 + ml;
+            const int rot = fa2_swiz(d & 15);
+            const int vbase = d * 16;
+            const int ps = sub * 8;
+            half16_t vf;
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                const int off = vbase + ((ps + i + rot) & 15);
+                const int32x2_t pair = *(const int32x2_t*)(Vdw + off);
+                fa2_dw_t d0, d1;
+                d0.u = (uint32_t)pair[0];
+                d1.u = (uint32_t)pair[1];
+                vf[2 * i] = d0.h[0];
+                vf[2 * i + 1] = d0.h[1];
+                vf[2 * i + 2] = d1.h[0];
+                vf[2 * i + 3] = d1.h[1];
+            }
+            Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf, prow, Ofr[dc]);
+            // Bound V-load hoisting to this chunk.
+            asm volatile("" ::: "memory");
+        }
+    }
+}
+#endif
 
 // Shared workgroup body (direct only: writes normalized O to `out`).
 // `kv_h` selects the KV head (blockIdx.y); `q_base` the 16-position tile
@@ -215,6 +502,76 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[LDS_DWORDS - 1]);
     const int seq_len = gmax + 1;
 
+#if FA2_FILL
+    // ---- Transitions 2-3: warp-specialized fill (see FA2_FILL helpers) ----
+    // Role split on the scalar wave index: both loops below run the same
+    // tile count and two barriers per tile, so the barriers pair up.
+    const bool fill_compute = __builtin_amdgcn_readfirstlane(wave) < 6;
+    const int hl = tid - 6 * 32;
+    uint32_t rv_s[FA2_FILL_HV];
+    uint32_t rv_u[FA2_FILL_HV * 4];
+    if (!fill_compute) {
+#pragma unroll
+        for (int s = 0; s < FA2_FILL_HV; ++s)
+            fa2_fill_v_load(v_cache, 0, seq_len, kv_blk, hl + s * FA2_FILL_HT,
+                            rv_s[s], rv_u + s * 4);
+    }
+    // Tile 0 K: one slot per thread (all eight waves).
+    {
+        uint32_t su;
+        uint32_t uc[8];
+        fa2_fill_k_load(k_cache, 0, seq_len, kv_blk, tid, su, uc);
+        fa2_fill_k_store(Kdw, tid, su, uc);
+    }
+    __syncthreads();
+    if (fill_compute) {
+        for (int tile = 0; ; ++tile) {
+            const int ktile = tile * KT;
+            if (ktile >= seq_len)
+                break;
+            const bool do0 = ktile <= gmax;
+            const bool do1 = ktile + 16 <= gmax;
+            float8_t sacc0, sacc1;
+            if (do0 || do1)
+                fa2_fill_qk(q16, Kdw, qq_base, qok_ml, ml, do0, do1, sacc0, sacc1);
+            __syncthreads();  // B1: V(t) in plane; K(t) consumed
+            if (do0 || do1)
+                fa2_fill_softmax_pv(Vdw, positions, scale_attn, ktile, gmin, do0, do1,
+                                    sacc0, sacc1, qok_ml, qr_ml, ml, half, m_old,
+                                    l_val, Ofr);
+            __syncthreads();  // B2: K(t+1) in plane; V(t) consumed
+        }
+    } else {
+        uint32_t rk_s[FA2_FILL_HK];
+        uint32_t rk_u[FA2_FILL_HK * 8];
+        for (int tile = 0; ; ++tile) {
+            const int ktile = tile * KT;
+            if (ktile >= seq_len)
+                break;
+            const bool next = ktile + KT < seq_len;
+            if (next) {
+#pragma unroll
+                for (int t = 0; t < FA2_FILL_HK; ++t)
+                    fa2_fill_k_load(k_cache, ktile + KT, seq_len, kv_blk,
+                                    hl + t * FA2_FILL_HT, rk_s[t], rk_u + t * 8);
+            }
+#pragma unroll
+            for (int s = 0; s < FA2_FILL_HV; ++s)
+                fa2_fill_v_store(Vdw, hl + s * FA2_FILL_HT, rv_s[s], rv_u + s * 4);
+            __syncthreads();  // B1
+            if (next) {
+#pragma unroll
+                for (int s = 0; s < FA2_FILL_HV; ++s)
+                    fa2_fill_v_load(v_cache, ktile + KT, seq_len, kv_blk,
+                                    hl + s * FA2_FILL_HT, rv_s[s], rv_u + s * 4);
+#pragma unroll
+                for (int t = 0; t < FA2_FILL_HK; ++t)
+                    fa2_fill_k_store(Kdw, hl + t * FA2_FILL_HT, rk_s[t], rk_u + t * 8);
+            }
+            __syncthreads();  // B2
+        }
+    }
+#else
 #if HIPFIRE_FA2_KT == 32
     // ---- Software prefetch of the next tile's raw K bytes ----
     // Q8 KT32/block256 assigns one 34-B K block per lane; fwht3 retains
@@ -866,6 +1223,7 @@ __device__ __forceinline__ void fa2_gqa_body(
         // has finished.
         __syncthreads();
     }
+#endif
 
     // ---- Transition 4: completion (direct epilogue) ----
     // Ofr[dc][j] at lane (ml,half) = O[query=ml][dim=dc*16+2*j+half]:
