@@ -4825,7 +4825,7 @@ impl Gpu {
             self.ensure_kernel(
                 "gdn_chunk_prep_c32_gfx1151",
                 kernels::GDN_CHUNK_PREP_C32_GFX1151_SRC,
-                "gdn_chunk_prep_gfx11",
+                "gdn_chunk_prep_c32_gfx1151",
             )?;
         } else if self.gdn_chunk_prep_gfx11() {
             self.ensure_kernel(
@@ -5028,7 +5028,7 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            kkt_module,
+            kkt_symbol,
             [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
             [kkt_block, 1, 1],
             0,
@@ -5069,7 +5069,7 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            scan_module,
+            scan_symbol,
             [if c32 { 2 } else { 1 }, 48, 1],
             [if c32 { 256 } else { 512 }, 1, 1],
             0,

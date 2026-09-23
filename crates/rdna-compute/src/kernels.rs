@@ -7043,7 +7043,7 @@ pub const GDN_CHUNK_PREP_GFX11_SRC: &str =
 /// gfx1151 C32 prep resets the G prefix at each 32-row boundary.
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_PREP_C32_GFX1151_SRC: &str = concat!(
-    "#define GDN_PREP_C32 1\n",
+    "#define GDN_PREP_C32 1\n#define gdn_chunk_prep_gfx11 gdn_chunk_prep_c32_gfx1151\n",
     include_str!("../../../kernels/src/gdn_chunk_prep.gfx11.hip")
 );
 
