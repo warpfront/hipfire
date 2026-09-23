@@ -1,0 +1,162 @@
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 16840,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "redline_pm4": false,
+  "kv_mode": "fp8",
+  "runs": 3,
+  "prefill": [
+    {
+      "tokens": 277,
+      "stats": {
+        "median": 1374.3,
+        "mean": 1374.2666666666667,
+        "min": 1372.0,
+        "max": 1376.5,
+        "stdev": 1.837268503936089
+      },
+      "samples": [
+        1372.0,
+        1374.3,
+        1376.5
+      ]
+    },
+    {
+      "tokens": 512,
+      "stats": {
+        "median": 2361.2,
+        "mean": 2354.2,
+        "min": 2334.7,
+        "max": 2366.7,
+        "stdev": 13.970206393130585
+      },
+      "samples": [
+        2366.7,
+        2361.2,
+        2334.7
+      ]
+    },
+    {
+      "tokens": 1024,
+      "stats": {
+        "median": 2427.4,
+        "mean": 2422.8,
+        "min": 2411.2,
+        "max": 2429.8,
+        "stdev": 8.260750571225508
+      },
+      "samples": [
+        2411.2,
+        2427.4,
+        2429.8
+      ]
+    },
+    {
+      "tokens": 1813,
+      "stats": {
+        "median": 1185.4,
+        "mean": 1185.8999999999999,
+        "min": 1183.8,
+        "max": 1188.5,
+        "stdev": 1.9510680835549283
+      },
+      "samples": [
+        1183.8,
+        1185.4,
+        1188.5
+      ]
+    },
+    {
+      "tokens": 4096,
+      "stats": {
+        "median": 2422.4,
+        "mean": 2418.6333333333337,
+        "min": 2409.2,
+        "max": 2424.3,
+        "stdev": 6.715322446134483
+      },
+      "samples": [
+        2409.2,
+        2424.3,
+        2422.4
+      ]
+    },
+    {
+      "tokens": 5909,
+      "stats": {
+        "median": 1744.8,
+        "mean": 1743.5333333333335,
+        "min": 1739.7,
+        "max": 1746.1,
+        "stdev": 2.7620443314488234
+      },
+      "samples": [
+        1739.7,
+        1744.8,
+        1746.1
+      ]
+    },
+    {
+      "tokens": 8192,
+      "stats": {
+        "median": 2358.9,
+        "mean": 2356.133333333333,
+        "min": 2347.9,
+        "max": 2361.6,
+        "stdev": 5.925275427259751
+      },
+      "samples": [
+        2347.9,
+        2358.9,
+        2361.6
+      ]
+    }
+  ],
+  "decode": [
+    {
+      "context": 128,
+      "tokens": 64,
+      "stats": {
+        "median": 36.50917217137228,
+        "mean": 36.509180243280476,
+        "min": 36.50571186506617,
+        "max": 36.51265669340298,
+        "stdev": 0.002835220041281614
+      },
+      "samples": [
+        36.51265669340298,
+        36.50571186506617,
+        36.50917217137228
+      ]
+    }
+  ],
+  "sustained": []
+}
