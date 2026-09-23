@@ -1,0 +1,9 @@
+GATE 3: profiler CSV before/after (pp8192, chunk 4096, 2 passes, full stack iu4+fp8v2+GDNpre+fp8KV, kv q8)
+OFF: scratch-2026-09-17/silu-quant-fused/prof-off/hiptrx/2626306_kernel_stats.csv
+ON : scratch-2026-09-17/silu-quant-fused/prof-on/hiptrx/2626747_kernel_stats.csv
+total kernel: OFF 7877.4 ms -> ON 7706.1 ms, saved 171.4 ms = 10.5 us/token
+quantize_int4_mmq_ds128: OFF 1024 calls / 776.05 ms -> ON 768 calls / 379.14 ms
+  down-proj quantiser calls gone: -256 (exactly the silu-following launches); other callers keep standalone path
+fused_silu_mul_mq_rotate_awq: OFF 256 / 361.06 ms (avg 1410.4 us)
+fused_silu_mul_mq_rotate_awq_i4_gfx12: ON 256 / 506.47 ms (avg 1978.4 us)
+down-proj pair: OFF 46.3 us/token (silu+down-quant) -> ON 30.9 us/token, saved 15.4 us/token

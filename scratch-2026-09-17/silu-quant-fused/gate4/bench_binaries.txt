@@ -1,0 +1,2 @@
+b2439a2f8fa9f4ae91c612a381ed2a95  target/release/daemon
+2929a2b714c82924c23767594237c598  target/release/hipfire

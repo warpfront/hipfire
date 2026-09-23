@@ -1,0 +1,4 @@
+5a5d6a780cbfa7b2248e43c2c29901e8613c1f10
+cfefe79f4a150e6b14a490f207957218  target/release/examples/eval_hipfire
+8a21364051d844b97c122e2c895f56d8  /home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin
+1a48b45ebf5f3ef852efcf8ee5d8084b  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt

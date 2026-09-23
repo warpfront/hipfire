@@ -1,0 +1,10 @@
+GATE 6: default-ON flip for exact gfx1201 on the iu4 route + oracle env centralisation
+Code: feature_flags.rs gfx12_silu_quant_fused = parse_bool(...).unwrap_or(arch=="gfx1201") (=0 opts out; enabled() still requires arch gfx1201 + iu4 + eager + N/K constraints)
+  hipfire-config kernel.gfx12_silu_quant_fused default false->true, experimental true->false, help updated
+  docs: field/dispatch/gemv/kernels/prefill comments flipped to default-on; env-vars.md table row already lists sources (no prose change); check-env-docs passes
+  tests: new gfx12_silu_quant_fused_default_on_gfx1201_with_opt_out (11/11 feature_flags tests pass)
+  oracle: no HIPFIRE_SILU_ORACLE_MODEL read remains (fixture via bootstrap-exempt HIPFIRE_MODELS_DIR since 5a5d6a780)
+Binaries: eval_hipfire 174a37edd34cd85cf81290f61001e2ce hipfire 0d5d6b6673dd3da04d55167e117f6bfd daemon 35c57cc4473a2e7e8a764e15ad3a9944
+Pins, flag UNSET (default ON): c1 032ebad84f2c1dd5e2980fa805215ac0; c2 dc7e53181662271780374f0a85fd7732; c24 KLD 0.063410 (bin 0821993b identical to OFF)
+Opt-out HIPFIRE_GFX12_SILU_QUANT_FUSED=0 c1: 032ebad84f2c1dd5e2980fa805215ac0 (same bytes)
+Logs: c1_defaulton.log c2_defaulton.log c24_defaulton.log c1_optout.log

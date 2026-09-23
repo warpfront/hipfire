@@ -1,0 +1,11 @@
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark: Function Name: fused_silu_mul_mq_rotate_awq_i4_gfx12 [-Rpass-analysis=kernel-resource-usage]
+  201 | ) {
+      | ^
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     TotalSGPRs: 18 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     VGPRs: 55 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/silu-quant-fused/silu_quant_fused_awq_gfx12.hip:201:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

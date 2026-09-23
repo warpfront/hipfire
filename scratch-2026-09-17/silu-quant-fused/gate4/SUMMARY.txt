@@ -1,0 +1,11 @@
+GATE 4: iu4 pins bit-for-bit, flag OFF then ON (eval_hipfire 6cc24bc4... rebuilt cfefe79f for HEAD 5a5d6a780)
+Env: HOME=ab2 ROCR_VISIBLE_DEVICES=2 GRAPH=0 NORMALIZE_PROMPT=0 LLOYD_GFX12=1 IU4_PREFILL=1
+  --model ~/.hipfire/models/qwen3.8-27b.mq4-xt --ref /home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin
+  --kv-mode q8 --kv-v q8 --scoring-mode prefill --max-chunks {1,2,24}
+Ref md5 8a21364051d844b97c122e2c895f56d8; model md5 1a48b45ebf5f3ef852efcf8ee5d8084b
+OFF (no SILU flag): c1 032ebad84f2c1dd5e2980fa805215ac0 (KLD 0.041329)
+  c2 dc7e53181662271780374f0a85fd7732 (KLD 0.048091)
+  c24 KLD 0.063410 (bin 0821993b56021caf4505c1dc4a6b9990) — all match route pins
+ON (HIPFIRE_GFX12_SILU_QUANT_FUSED=1): c1 032ebad84f2c1dd5e2980fa805215ac0
+  c2 dc7e53181662271780374f0a85fd7732 c24 KLD 0.063410 (bin 0821993b identical)
+Logs: c1_off.log c2_off.log c24_off.log c1_on.log c2_on.log c24_on.log

@@ -1,0 +1,3 @@
+174a37edd34cd85cf81290f61001e2ce  target/release/examples/eval_hipfire
+0d5d6b6673dd3da04d55167e117f6bfd  target/release/hipfire
+35c57cc4473a2e7e8a764e15ad3a9944  target/release/daemon

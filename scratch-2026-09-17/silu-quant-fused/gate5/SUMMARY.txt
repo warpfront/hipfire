@@ -1,0 +1,13 @@
+GATE 5: interleaved bench OFF/ON/OFF/ON, iu4 route chunk 4096, kv fp8
+Env: HOME=ab2 ROCR_VISIBLE_DEVICES=2 GRAPH=1 LLOYD_GFX12=1 IU4_PREFILL=1 PREFILL_MAX_BATCH=4096
+  MQ4V2_FP8_V2=1 GEOM=128x128 SLABS=2 GDN_PRE_FUSED=1 FA2_PREFILL=1 FA2_FP8=1 [+SILU_QUANT_FUSED=1 ON arms]
+Cmd: hipfire bench qwen3.8:27b-mq4-xt --matrix --pp 512,2048,8192,32768 --ctx 128 --tg 64 --spec off --runs 3 --warmups 1 --kv-mode fp8 --json
+Binaries: hipfire 2929a2b714c82924c23767594237c598, daemon b2439a2f8fa9f4ae91c612a381ed2a95
+Medians (pp512/pp2048/pp8192/pp32768/decode):
+  OFF1 2205.4/2235.6/2059.6/1526.3/d36.50 (samples in bench_off1.json)
+  ON1  2283.2/2309.6/2097.8/1510.1/d28.87 (29-state; not paired with 36.5 arms)
+  OFF2 2195.7/2235.9/2059.5/1525.1/d36.53
+  ON2  2279.6/2309.0/2118.3/1555.9/d36.52
+Paired (36.5-state) ON2 vs OFF1/OFF2 medians: +3.4/+3.8% pp512, +3.3% pp2048, +2.9% pp8192, +2.0% pp32768; decode 36.52 vs 36.50/36.53 (no regression). All prefill deltas >1.5% => real.
+Decode-only (flag ON, noslots/stateless/runs5/max-tokens128): median 36.5, samples [33.7,36.1,36.5,36.7,36.7] >= 36.4 floor. See decode_on.json.
+Serve (flag ON, daemon b2439a2f, --thinking off): battery 5/5 finish=stop runaway=0 empty=0 coherent; chain 5/5 stop, prefix cache cached=387/595/790/1139, coherent. See serve_battery_on.txt serve_chain_on.txt.
