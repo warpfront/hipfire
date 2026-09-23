@@ -1,0 +1,33 @@
+on: request wall 3075.58 ms, summed GPU 3013.55 ms, GPU span 3061.90 ms, dispatches 3980
+off: request wall 3148.02 ms, summed GPU 3076.55 ms, GPU span 3135.03 ms, dispatches 3980
+delta summed GPU -63.00 ms (-2.05%), wall -72.44 ms
+kernel                                                        n_off     ms_off   n_on      ms_on     delta vgpr_off/on
+attention_q8_0_fa2_gqa_gfx11                                     32     347.37     32     268.69    -78.67 ['224']/['192']
+gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11                       128    1087.67    128    1098.49    +10.82 ['184']/['184']
+gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11                 256     744.28    256     748.27     +3.99 ['184']/['184']
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11                       288     507.56    288     508.46     +0.91 ['184']/['184']
+split_mq4v2_z_betaalpha                                          96      22.97     96      22.45     -0.52 ['16']/['16']
+fused_silu_mul_mq_rotate_awq_i4_hin                             128      66.62    128      67.04     +0.42 ['80']/['80']
+gdn_chunk_scan                                                  768      79.44    768      79.26     -0.18 ['216']/['216']
+deinterleave_q_rmsnorm_f32_batched                               32      16.21     32      16.04     -0.16 ['24']/['24']
+attention_fa2_q_preconvert_gfx11                                 32       7.55     32       7.45     -0.10 ['16']/['16']
+sigmoid_mul_rotate_x_mq_awq_i4_gfx11                             32       9.37     32       9.45     +0.08 ['88']/['88']
+gdn_chunk_prep_gfx11                                             96      37.18     96      37.26     +0.07 ['72']/['72']
+gated_norm_mq_rotate_awq_i4_gfx11                                96      44.63     96      44.70     +0.07 ['48']/['48']
+
+on: request wall 7500.83 ms, summed GPU 7451.85 ms, GPU span 7486.67 ms, dispatches 4593
+off: request wall 7687.96 ms, summed GPU 7639.43 ms, GPU span 7674.21 ms, dispatches 4593
+delta summed GPU -187.59 ms (-2.46%), wall -187.13 ms
+kernel                                                        n_off     ms_off   n_on      ms_on     delta vgpr_off/on
+attention_q8_0_fa2_gqa_gfx11                                    256     830.55    256     616.97   -213.58 ['224']/['192']
+gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11                        64    2553.80     64    2569.82    +16.01 ['248']/['248']
+gemm_mq4g256v2_residual_iu4_v2b_set_gfx11                       208    1628.65    208    1638.80    +10.16 ['248']/['248']
+fused_rmsnorm_mq_rotate_awq_i4_fold                              64     179.07     64     173.60     -5.47 ['104']/['104']
+gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11                  64    1328.74     64    1333.31     +4.57 ['256']/['256']
+fused_silu_mul_mq_rotate_awq_i4_hin                              64     189.57     64     190.86     +1.29 ['80']/['80']
+gdn_chunk_prep_gfx11                                             48     133.76     48     133.13     -0.62 ['72']/['72']
+fused_rmsnorm_mq_rotate_awq_i4                                   64      75.49     64      76.08     +0.59 ['96']/['96']
+deinterleave_q_rmsnorm_f32_batched                               16      56.50     16      57.04     +0.54 ['24']/['24']
+gdn_chunk_scan                                                  768     240.76    768     240.27     -0.49 ['216']/['216']
+gdn_chunk_kkt_solve                                             768      36.22    768      35.79     -0.43 ['120']/['120']
+gated_norm_mq_rotate_awq_i4_gfx11                                48     115.18     48     114.84     -0.34 ['48']/['48']

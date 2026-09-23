@@ -1,0 +1,30 @@
+== gfx1100
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+eval_hipfire: slice-mean KLD = 0.077271  mean NLL = 1.881043  PPL = 6.5603 arch_id=5
+fbbaa065f792681ec41499c5b8fdebab77f1062b308713240c4e39ae1ec62143  gfx1100/wt2/candidate.kldseq
+fbbaa065f792681ec41499c5b8fdebab77f1062b308713240c4e39ae1ec62143  /home/kaden/hipfire-stack1/scratch-stackwave/gate-first/gfx1100/wt2/candidate.kldseq
+== gfx1151
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.15)
+eval_hipfire: slice-mean KLD = 0.075973  mean NLL = 1.884529  PPL = 6.5833 arch_id=5
+79bbff9ef0d2b6df0f03bd50f163710c51e6d182a8f5b51d15629f0cb7b67774  gfx1151/wt2/candidate.kldseq
+79bbff9ef0d2b6df0f03bd50f163710c51e6d182a8f5b51d15629f0cb7b67774  /home/kaden/hipfire-stack1/scratch-stackwave/gate-first/gfx1151/wt2/candidate.kldseq
+== ../trace/gfx1100-8192
+../trace/gfx1100-8192/gpu-pre.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+../trace/gfx1100-8192/gpu-post.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+parent pid=2240421 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-fa2fill4/scratch-fa2fill4/trace/gfx1100-8192/home
+daemon pid=2240423 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0
+== ../trace/gfx1100-8192-off
+../trace/gfx1100-8192-off/gpu-pre.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+../trace/gfx1100-8192-off/gpu-post.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+parent pid=2237018 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-fa2fill4/scratch-fa2fill4/trace/gfx1100-8192-off/home
+daemon pid=2237020 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0
+== ../trace/gfx1151-8192
+../trace/gfx1151-8192/gpu-pre.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+../trace/gfx1151-8192/gpu-post.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+parent pid=2249534 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-fa2fill4/scratch-fa2fill4/trace/gfx1151-8192/home
+daemon pid=2249536 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0
+== ../trace/gfx1151-8192-off
+../trace/gfx1151-8192-off/gpu-pre.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+../trace/gfx1151-8192-off/gpu-post.txt:2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+parent pid=2245578 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-fa2fill4/scratch-fa2fill4/trace/gfx1151-8192-off/home
+daemon pid=2245580 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0
