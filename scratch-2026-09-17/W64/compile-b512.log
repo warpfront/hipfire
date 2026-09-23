@@ -1,0 +1,33 @@
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark: Function Name: quantize_int4_mmq_ds128 [-Rpass-analysis=kernel-resource-usage]
+  135 | ) {
+      | ^
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     TotalSGPRs: 17 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     VGPRs: 36 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:135:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_w64b_full_add [-Rpass-analysis=kernel-resource-usage]
+  446 |                           int M, int K, int N, int) { w64b_body<true>(A, Xq, Y, M, K, N); }
+      | ^
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     TotalSGPRs: 51 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     VGPRs: 198 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     Occupancy [waves/SIMD]: 3 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:446:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_w64b_full_set [-Rpass-analysis=kernel-resource-usage]
+  449 |                           int M, int K, int N, int) { w64b_body<false>(A, Xq, Y, M, K, N); }
+      | ^
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     TotalSGPRs: 51 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     VGPRs: 198 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     Occupancy [waves/SIMD]: 3 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/W64/iu4_w64_b512_combined.hip:449:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

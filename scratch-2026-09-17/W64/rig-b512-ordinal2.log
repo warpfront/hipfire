@@ -1,0 +1,20 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab2/.hipfire_kernels/gfx1201
+RESOURCE_OCC,gemm_mq4g256v2_residual_mmq_iu4_full_set,blocks_per_cu=3
+RESOURCE_OCC,gemm_mq4g256v2_residual_mmq_iu4_full_add,blocks_per_cu=3
+  kx3_iu4_w64a_mod: per-kernel flags: -mwavefrontsize64 -mwavefrontsize64
+RESOURCE_OCC,kx3_iu4_w64a_set,blocks_per_cu=3
+RESOURCE_OCC,kx3_iu4_w64a_add,blocks_per_cu=3
+  kx3_iu4_w64b512_mod: per-kernel flags: -mwavefrontsize64 -mwavefrontsize64
+RESOURCE_OCC,kx3_iu4_w64b_set,blocks_per_cu=1
+RESOURCE_OCC,kx3_iu4_w64b_add,blocks_per_cu=1
+RESOURCE_OCC,kx3_compare_u32,blocks_per_cu=3
+EXACT,kx3_iu4_w64a_set,gate_up_M4096_N34816_K5120,PASS,bytes=570425344,u32_mismatches=0,first_u32=none
+EXACT,kx3_iu4_w64a_add,residual_M4096_N5120_K17408,PASS,bytes=83886080,u32_mismatches=0,first_u32=none
+ABA,kx3_iu4_w64a_set,gate_up_M4096_N34816_K5120,A1_us=7206.151,B_us=10123.246,A2_us=7742.277,delta_pct=35.442
+ABA,kx3_iu4_w64a_add,residual_M4096_N5120_K17408,A1_us=3621.266,B_us=4557.877,A2_us=3610.645,delta_pct=26.049
+OVERRIDE_B,w64a_at_least_5pct_slower_on_both_shapes,parent_requested_4x4_receipt
+EXACT,kx3_iu4_w64b_set,gate_up_M4096_N34816_K5120,PASS,bytes=570425344,u32_mismatches=0,first_u32=none
+ABA,kx3_iu4_w64b_set,gate_up_M4096_N34816_K5120,A1_us=7760.937,B_us=9701.781,A2_us=7770.877,delta_pct=24.928
+EXACT,kx3_iu4_w64b_add,residual_M4096_N5120_K17408,PASS,bytes=83886080,u32_mismatches=0,first_u32=none
+ABA,kx3_iu4_w64b_add,residual_M4096_N5120_K17408,A1_us=3615.226,B_us=4646.318,A2_us=3649.365,delta_pct=27.917
