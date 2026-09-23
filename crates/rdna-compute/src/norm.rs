@@ -343,12 +343,20 @@ impl Gpu {
 
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
+        self.add_inplace_f32_raw(a.buf.as_ptr(), b.buf.as_ptr(), a.numel())
+    }
+
+    /// `a[0..n] += b[0..n]` over raw device pointers.
+    pub(crate) fn add_inplace_f32_raw(
+        &mut self,
+        a_ptr: *mut c_void,
+        b_ptr: *mut c_void,
+        n: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
 
-        let n = a.numel() as i32;
-        let a_ptr = a.buf.as_ptr();
-        let b_ptr = b.buf.as_ptr();
+        let n = n as i32;
         let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![

@@ -1107,6 +1107,28 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// ADD-epilogue fold (gfx1151 V2B): the IU4 producers above with a `delta`
+/// input after `x` — the preceding residual GEMM's SET output. The kernel
+/// adds it into `x` (RN(x + delta), written back) before the identical norm,
+/// so the GEMM skips its residual read-modify-write. See
+/// `Gpu::arm_residual_fold`.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_FOLD 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_fold\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_FOLD 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_fold\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 slices-2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128`
 /// emit under distinct entry symbols so gfx1151 HSACO caches and profiler
 /// rows cannot alias the gfx1201 fusion. Same shared quant recipe as the C2

@@ -19783,6 +19783,9 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
+        // An owed residual add must land before any further GEMM (defensive:
+        // callers consume it in the RMSNorm right after the folded GEMM).
+        self.flush_residual_fold()?;
         if self.arch.as_str() == "gfx1201" {
             // gfx12 K32 v2 staged tile: 128-row x 128-col workgroups
             // (8 waves; each wave covers 2 16-row groups x 4 16-col blocks).
@@ -19952,10 +19955,24 @@ impl Gpu {
             return result;
         }
         if v2_tile == Some(Iu4V2Tile::V2b) {
-            let kernel_name = if add {
-                "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11"
+            // ADD epilogue (`HIPFIRE_V2B_ADDEPI=0` restores the plain ADD):
+            // with a caller-armed delta buffer, write SET into it and leave
+            // the residual add to the next IU4 RMSNorm (`residual_fold_pending`);
+            // otherwise touch the residual ahead of the epilogue
+            // (`_add_touch`). Both are byte-identical to `_add`.
+            let addepi =
+                add && hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0");
+            let fold = if addepi {
+                self.residual_fold_arm
+                    .take()
+                    .filter(|a| a.len >= m * batch_size && a.delta != y.buf.as_ptr())
             } else {
-                "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11"
+                None
+            };
+            let kernel_name = match (add, addepi, fold.is_some()) {
+                (true, true, true) | (false, _, _) => "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11",
+                (true, true, false) => "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11",
+                (true, false, _) => "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11",
             };
             self.ensure_kernel(
                 "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
@@ -19964,7 +19981,7 @@ impl Gpu {
             )?;
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
-            let mut y_ptr = y.buf.as_ptr();
+            let mut y_ptr = fold.map_or(y.buf.as_ptr(), |a| a.delta);
             let mut m_val = m as i32;
             let mut k_val = k as i32;
             let mut n_val = batch_size as i32;
@@ -19999,6 +20016,15 @@ impl Gpu {
             );
             if let Some(t) = timer {
                 t.finish(&self.hip);
+            }
+            if let (Ok(()), Some(arm)) = (&result, fold) {
+                self.invalidate_x_caches_for(arm.delta);
+                self.residual_fold_pending = Some(crate::dispatch::ResidualFold {
+                    y: y.buf.as_ptr(),
+                    delta: arm.delta,
+                    m,
+                    n: batch_size,
+                });
             }
             return result;
         }
@@ -20235,6 +20261,42 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
+    }
+
+    /// ADD-epilogue fold, caller side. Offers `delta` (f32, >= n*m elements,
+    /// otherwise dead until the next RMSNorm) to the next residual GEMM. When
+    /// that GEMM takes the gfx1151 V2B route it writes its sum into `delta`
+    /// (SET) instead of adding it into the residual, and the owed add is
+    /// performed by the next [`Self::fused_rmsnorm_rotate_mq_i4_batched`]
+    /// over that residual (bit-identical: RN(y + sum) either way). Callers
+    /// arm only right before a residual GEMM whose next residual reader is
+    /// that norm, and call [`Self::disarm_residual_fold`] right after it.
+    pub fn arm_residual_fold(&mut self, delta: &GpuTensor) -> HipResult<()> {
+        self.flush_residual_fold()?;
+        self.residual_fold_arm = Some(crate::dispatch::ResidualFoldArm {
+            delta: delta.buf.as_ptr(),
+            len: delta.numel(),
+        });
+        Ok(())
+    }
+
+    /// Drops an arm the residual GEMM did not take (non-V2B route).
+    pub fn disarm_residual_fold(&mut self) {
+        self.residual_fold_arm = None;
+    }
+
+    /// Performs an owed residual add now (`y += delta`, same rounding as the
+    /// GEMM ADD epilogue). No-op when nothing is pending. Every residual
+    /// reader other than the folding RMSNorm must run after this.
+    pub fn flush_residual_fold(&mut self) -> HipResult<()> {
+        match self.residual_fold_pending.take() {
+            Some(f) => {
+                self.add_inplace_f32_raw(f.y, f.delta, f.m * f.n)?;
+                self.invalidate_x_caches_for(f.y);
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
 
@@ -31700,6 +31762,9 @@ impl Gpu {
             return Ok(false);
         };
         self.bind_thread()?;
+        // `h` may be the ADD-epilogue fold's delta buffer: land any owed
+        // residual add before overwriting it (see `arm_residual_fold`).
+        self.flush_residual_fold()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
         let (module, source, kernel_name) = match tile {
             Iu4V2Tile::V2c => (

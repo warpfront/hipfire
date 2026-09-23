@@ -3168,6 +3168,17 @@ impl Gpu {
                 "fused_rmsnorm_rotate_mq_i4_batched: reservation (k,n) mismatch",
             ));
         }
+        // ADD-epilogue fold: the residual GEMM before this norm may have left
+        // its add owed to `x` (see `arm_residual_fold`); perform it here.
+        if let Some(f) = self.residual_fold_pending {
+            if f.y == x.buf.as_ptr() && f.m == k && f.n == batch_size {
+                self.residual_fold_pending = None;
+                return self.fused_rmsnorm_rotate_mq_i4_fold_batched(
+                    x, f.delta, weight, awq, x_rot, reservation, k, eps, batch_size,
+                );
+            }
+            self.flush_residual_fold()?;
+        }
         self.ensure_mq_signs()?;
         let (module, source, kernel) = match awq {
             Some(_) => (
@@ -3269,6 +3280,107 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
+
+    /// [`Self::fused_rmsnorm_rotate_mq_i4_batched`] fused with the residual
+    /// add a V2B GEMM deferred: `x += delta` (written back, RN like the GEMM's
+    /// ADD epilogue), then the identical norm/FWHT/`block_i4_128` producer.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_rmsnorm_rotate_mq_i4_fold_batched(
+        &mut self,
+        x: &GpuTensor,
+        delta: *mut c_void,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.ensure_mq_signs()?;
+        let (source, kernel) = match awq {
+            Some(_) => (
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_fold",
+            ),
+            None => (
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_SRC,
+                "fused_rmsnorm_mq_rotate_i4_fold",
+            ),
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut dp = delta;
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+        ];
+        if awq.is_some() {
+            params.push(&mut awp as *mut _ as *mut c_void);
+        }
+        params.extend_from_slice(&[
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ]);
+        // Same LDS contract as the unfolded launch.
+        let shared_mem = if x_rot.is_some() {
+            ((k + 256) * std::mem::size_of::<f32>()) as u32
+        } else {
+            (256 * std::mem::size_of::<f32>()) as u32
+        };
+        let bytes = (k * 4 * 5 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(dp);
+                b.push_ptr(wp);
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xp);
         if !xrp.is_null() {
             self.invalidate_x_caches_for(xrp);
         }

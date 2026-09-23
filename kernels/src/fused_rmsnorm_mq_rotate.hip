@@ -22,6 +22,13 @@
 // identical: still ((x*w)*rms)*s1 then FWHT then *s2/16. Only load
 // issue time moves earlier.
 
+// -DHIPFIRE_RMSNORM_FOLD=1 (IU4 sidecar builds only) adds a `delta` input
+// after `x`: the preceding residual GEMM wrote its sum there (SET) instead of
+// adding it into `x`, and this kernel performs that add, RN(x + delta), in
+// both phases, writes the sum back to `x`, and normalizes it. Bit-identical
+// to the GEMM's ADD epilogue followed by the plain kernel; turns the GEMM's
+// residual read-modify-write into streams this kernel already pays for.
+//
 // -DHIPFIRE_RMSNORM_AWQ=1 builds the AWQ twin `fused_rmsnorm_mq_rotate_awq`:
 // one extra `awq_scale[K]` argument, divided in AFTER the rms multiply and
 // BEFORE the sign/FWHT (`(((x*w)*rms)/s)*sign`), completing `(W·s)·(x/s)`.
@@ -43,10 +50,18 @@
 #else
 #define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate
 #endif
+#if defined(HIPFIRE_RMSNORM_FOLD) && !defined(HIPFIRE_IU4_SIDECAR)
+#error "HIPFIRE_RMSNORM_FOLD is an IU4-sidecar producer variant"
+#endif
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
+#ifdef HIPFIRE_RMSNORM_FOLD
+    float* __restrict__ x,              // residual, updated in place: x += delta
+    const float* __restrict__ delta,    // deferred residual-GEMM sum [N, K]
+#else
     const float* __restrict__ x,
+#endif
     const float* __restrict__ weight,
 #ifdef HIPFIRE_RMSNORM_AWQ
     const float* __restrict__ awq_scale,
@@ -83,7 +98,12 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     const int num_warps = block_size >> 5;
 
     const long long batch_off = (long long)blockIdx.x * K;
+#ifdef HIPFIRE_RMSNORM_FOLD
+    float* x_b           = x     + batch_off;
+    const float* d_b     = delta + batch_off;
+#else
     const float* x_b     = x     + batch_off;
+#endif
 #ifdef HIPFIRE_IU4_SIDECAR
           float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
 #else
@@ -93,7 +113,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     // Phase 1a: accumulate sum-of-squares (same stride/order as baseline).
     float local_sum = 0.0f;
     for (int i = tid; i < K; i += block_size) {
+#ifdef HIPFIRE_RMSNORM_FOLD
+        float v = __fadd_rn(x_b[i], d_b[i]);
+#else
         float v = x_b[i];
+#endif
         local_sum += v * v;
     }
 
@@ -116,6 +140,16 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         const int base = pref_group * 256 + d0;
         pref_x0 = *reinterpret_cast<const float4*>(x_b + base);
         pref_x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
+#ifdef HIPFIRE_RMSNORM_FOLD
+        {
+            const float4 q0 = *reinterpret_cast<const float4*>(d_b + base);
+            const float4 q1 = *reinterpret_cast<const float4*>(d_b + base + 4);
+            pref_x0.x = __fadd_rn(pref_x0.x, q0.x); pref_x0.y = __fadd_rn(pref_x0.y, q0.y);
+            pref_x0.z = __fadd_rn(pref_x0.z, q0.z); pref_x0.w = __fadd_rn(pref_x0.w, q0.w);
+            pref_x1.x = __fadd_rn(pref_x1.x, q1.x); pref_x1.y = __fadd_rn(pref_x1.y, q1.y);
+            pref_x1.z = __fadd_rn(pref_x1.z, q1.z); pref_x1.w = __fadd_rn(pref_x1.w, q1.w);
+        }
+#endif
         pref_w0 = *reinterpret_cast<const float4*>(weight + base);
         pref_w1 = *reinterpret_cast<const float4*>(weight + base + 4);
 #ifdef HIPFIRE_RMSNORM_AWQ
@@ -173,6 +207,16 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         } else {
             x0 = *reinterpret_cast<const float4*>(x_b + base);
             x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
+#ifdef HIPFIRE_RMSNORM_FOLD
+            {
+                const float4 q0 = *reinterpret_cast<const float4*>(d_b + base);
+                const float4 q1 = *reinterpret_cast<const float4*>(d_b + base + 4);
+                x0.x = __fadd_rn(x0.x, q0.x); x0.y = __fadd_rn(x0.y, q0.y);
+                x0.z = __fadd_rn(x0.z, q0.z); x0.w = __fadd_rn(x0.w, q0.w);
+                x1.x = __fadd_rn(x1.x, q1.x); x1.y = __fadd_rn(x1.y, q1.y);
+                x1.z = __fadd_rn(x1.z, q1.z); x1.w = __fadd_rn(x1.w, q1.w);
+            }
+#endif
             w0 = *reinterpret_cast<const float4*>(weight + base);
             w1 = *reinterpret_cast<const float4*>(weight + base + 4);
 #ifdef HIPFIRE_RMSNORM_AWQ
@@ -180,6 +224,13 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
             a1 = *reinterpret_cast<const float4*>(awq_scale + base + 4);
 #endif
         }
+#ifdef HIPFIRE_RMSNORM_FOLD
+        // Write the updated residual back: every element of the row is owned
+        // by exactly one lane here, and all Phase-1a reads of x retired at the
+        // reduction barrier.
+        *reinterpret_cast<float4*>(x_b + base) = x0;
+        *reinterpret_cast<float4*>(x_b + base + 4) = x1;
+#endif
 
 #ifdef HIPFIRE_RMSNORM_AWQ
         // Exact order of the retired LDS-staged AWQ kernel:
