@@ -1,0 +1,97 @@
+{
+  "schema": "g45-fail-closed-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "notes": "G4.5 terminal-safe parser finalization: user-visible malformed / open-think / length-cap smoke on qwen3.8-27b. Plain Qwen3.5/3.8 cards take the XML-native <tool_call> path with constrained grammar OFF by default (qwen35_grammar_on; HIPFIRE_QWEN35_GRAMMAR=0 forces it). Each step is one independent single-turn request against the same serve: no history is carried, so a fail-closed turn can neither poison nor require follow-up context. Truncation is forced mechanically with small per-step max_tokens (not by hoping the model misbehaves): the malformed step opens a long tool-call body the cap cannot close; the open-think step ends generation while the model is still reasoning; the length-cap step ends a long answer early. Every fail-closed step must show exactly one terminal, zero tool_calls, a non-storing finish (error/length), and zero payload bytes after the terminal; with HIPFIRE_QWEN_CACHE_TRACE=1 its serve-log slice must add zero [qwen-cache store] lines. Sampling: run greedy with a fixed --seed for determinism.",
+  "steps": [
+    {
+      "name": "seed",
+      "kind": "positive",
+      "content": "What is the capital of France, and which river runs through it? Answer in one sentence.",
+      "expect_finish": [
+        "stop"
+      ]
+    },
+    {
+      "name": "malformed_tool",
+      "kind": "fail_closed",
+      "content": "Call the read tool for /tmp/fibonacci.c NOW. Reply with ONLY the <tool_call> XML element and no prose before or after it. In the arguments, include the full absolute path plus a verbatim expected-content hint of at least 200 characters describing what you believe the file contains.",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read the contents of a file from disk",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute path to the file"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "description": "Execute a shell command",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "description": "The command to run"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        }
+      ],
+      "max_tokens": 14,
+      "max_think_tokens": 1,
+      "expect_finish": [
+        "error",
+        "length"
+      ],
+      "why": "max_think_tokens=1 disables thinking; max_tokens=14 truncates inside the tool-call JSON body (gfx1201: call opens ~tok 8-10, closes at 28 with think off; 48 completed the call). A completed call fails the step as 'call completed; lower max_tokens'."
+    },
+    {
+      "name": "open_think",
+      "kind": "fail_closed",
+      "content": "Think step by step through every implication, exploring each alternative at length before committing: should a city airport prioritize expanding cargo terminals or passenger concourses over the next decade? Reason exhaustively first, then give the final recommendation only at the very end.",
+      "max_think_tokens": 0,
+      "max_tokens": 48,
+      "expect_finish": [
+        "error",
+        "length"
+      ]
+    },
+    {
+      "name": "length_cap",
+      "kind": "fail_closed",
+      "content": "Write a 500-word essay on the history of bridge building, from Roman arches to modern suspension spans.",
+      "max_tokens": 32,
+      "expect_finish": [
+        "length"
+      ],
+      "max_think_tokens": 1,
+      "why": " Thinking disabled so the 32-token cap lands in the visible answer (finish=length), not inside an open think span."
+    },
+    {
+      "name": "reuse_probe",
+      "kind": "positive",
+      "content": "Answer with exactly this word and nothing else: READY",
+      "expect_finish": [
+        "stop"
+      ]
+    }
+  ]
+}
