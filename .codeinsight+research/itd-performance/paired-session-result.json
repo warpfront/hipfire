@@ -1,0 +1,64 @@
+{
+  "experiment": "ITD full session_coding paired observation",
+  "before_commit": "7b16762b0ed9d4d8eac4d5ed0b70a2f1acef0988",
+  "after_commit": "77cd6ce7d08d7b5d078902ebd211a4f9baf9e9be",
+  "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+  "model_md5": "e45d15bfe0c9a87132697101d17cbed6",
+  "session_md5": "c0d470288bde3f1e54e4bba04da8f8a2",
+  "binary_md5": {
+    "before_cli": "51b4412663b07f70348de4c2d03421fe",
+    "before_daemon": "1cd12bab79290d8bfd2a21d102f22b47",
+    "after_cli": "58eb03de74f9ce64761be57c1f15e314",
+    "after_daemon": "fd6c70c88bc4a4c6936b001f1c3d5f38"
+  },
+  "settings": {
+    "gpu": 3,
+    "arch": "gfx1201",
+    "hip": "7.15",
+    "kv": "q8",
+    "kv_backend": "vmm",
+    "max_seq": 32768,
+    "max_tokens": 4096,
+    "temperature": 0,
+    "seed": 42,
+    "reasoning_effort": "low",
+    "reasoning_budget": "uncapped",
+    "speculation": "off",
+    "kernel_cache": "/home/kaden/.hipfire_kernels"
+  },
+  "fresh_sessions_per_variant": 1,
+  "completed_turns_per_session": 8,
+  "reported_decode_tok_s_by_turn": {
+    "before": [
+      36.3,
+      35.8,
+      35,
+      34.6,
+      34,
+      null,
+      34.4,
+      34.1
+    ],
+    "after": [
+      36.3,
+      35.8,
+      35,
+      34.6,
+      34,
+      null,
+      34.4,
+      34.1
+    ]
+  },
+  "reported_average_decode_tok_s": {
+    "before": 34.9,
+    "after": 34.9
+  },
+  "disposition": "No measurable decode-speed improvement in this single paired observation; not a statistical no-effect claim and not a clean correctness pass.",
+  "limitations": [
+    "Before first turn still paid residual kernel cache preparation (604.1ms versus133.8ms); do not credit prefill average difference to ITD.",
+    "Both harness runs completed all8 turns then exited1 for the same empty/attractor-classified turn6.",
+    "Both had capped turn3 and two substring recall misses.",
+    "Harness aborts before --out JSON write on attractor; full generated-text byte parity and per-turn HTTP wall time are unavailable. Console previews, token counts, context/cached counts, finish classifications and reported decode rates agree."
+  ]
+}

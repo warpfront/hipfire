@@ -1,0 +1,36 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+  registry tag  : qwen3.8:27b-mq4-xt
+  kv_mode       : q8 [explicit(--kv)]   kv_backend: vmm [explicit(--kv-backend)]   mtp_mode: off   mode: session
+  max_seq       : 32768 [explicit(--max-seq)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : off   <-- OVERRIDES dflash/mtp
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : 3
+  expert parallel: tp=1
+  seed          : 42   prompt_source: (built-in battery)
+  thinking_cap  : uncapped [named-budget(uncapped)]
+  reasoning_effort: low  (parent prompt semantics; independent of cap)
+  max_tokens     : 4096 [explicit(--max-tokens)]  (uncapped think budget)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+      reasoning_effort  = low      [explicit(--thinking-effort)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty
+  env HIPFIRE_DFLASH_DRAFT='' (pass-through)
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.8-27b.mq4-xt|off|session  kv=q8 sampling={'temperature': 0.0, 'reasoning_effort': 'low'} seed=42 ###
+  t1  finish=stop   ctx=79     cached=0      gen=3295 (think 416/ans 1252w) prefill=133.8ms/590.5tok/s decode=36.3tok/s tau=None | '# Architecture: `dedup` — Content-Hash Deduplication CLI\n\n## Module Tree\n\n```\nsrc/\n├── mai'
+  t2  finish=stop   ctx=3427   cached=0      gen=3392 (think 601/ans 1013w) prefill=4040.0ms/848.3tok/s decode=35.8tok/s tau=None | '```rust\n// src/dedup.rs\n\nuse std::collections::HashMap;\nuse std::fs::File;\nuse std::io::{s'
+  t3  finish=length ctx=6864   cached=2688   gen=4096 (think 1067/ans 968w) prefill=5536.3ms/754.3tok/s decode=35.0tok/s tau=None !RUNAWAY | '## Allocation Inventory\n\nEvery heap allocation in the pipeline, with per-item cost:\n\n| Sit'
+  t4  finish=stop   ctx=8875   cached=4992   gen=3810 (think 677/ans 1074w) prefill=5592.0ms/694.4tok/s decode=34.6tok/s tau=None | '```rust\n// src/dedup.rs\n\nuse std::collections::HashMap;\nuse std::fs::File;\nuse std::io::{s'
+  t5  finish=stop   ctx=12730  cached=7296   gen=3653 (think 1188/ans 1039w) prefill=8635.2ms/629.3tok/s decode=34.0tok/s tau=None | '## The Core Difference in One Sentence\n\nFixed-size chunking makes boundaries depend on **p'
+  t6  finish=None   ctx=0      cached=0      gen=0    (think 2019/ans 0w) prefill=Nonems/n/atok/s decode=Nonetok/s tau=None !EMPTY,ATTRACTOR | '<<no visible content>>'
+  t7  finish=stop   ctx=11709  cached=0      gen=1457 (think 598/ans 230w) prefill=16119.7ms/726.4tok/s decode=34.4tok/s tau=None recall=2/3 | 'The first function you asked me to write was `hash_file_full` — the streaming hasher from '
+  t8  finish=stop   ctx=13203  cached=9600   gen=1141 (think 84/ans 591w) prefill=6040.7ms/596.5tok/s decode=34.1tok/s tau=None recall=2/3 | '## Session Summary\n\n### What We Built\n\nA content-hash deduplication CLI in Rust, designed '
+[qwen3.8-27b.mq4-xt|off|session DONE] turns=8 runaway=1 empty=1 attractor=1 retrieval_miss=2 avg_prefill=691.4tok/s avg_decode=34.9tok/s
+serve_harness: qwen3.8-27b.mq4-xt|off|session produced a token attractor across 8 turn(s): attractor=1 (runaway=1, empty=1 — reported, not fatal). Read the decoded text above. Set HIPFIRE_SERVE_ALLOW_INCOHERENT=1 to characterise a known-bad model on purpose.
+[itd-warm-session-after-1: failed; cursor=3686]
