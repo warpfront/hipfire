@@ -1,0 +1,26 @@
+[rocprof-wrap] output dir: scratch-2026-09-17/Raster3/rocprofFA-g0
+[rocprof-wrap] stats CSV:  scratch-2026-09-17/Raster3/rocprofFA-g0/trace_kernel_stats.csv
+[rocprof-wrap] command:    env HIPFIRE_FA_GRID_ORDER=0 ./target/release/examples/tmp_fa_grid_order_probe
+W0919 21:09:22.073534 3915786 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000418 sec
+W0919 21:09:22.073674 3915786 simple_timer.cpp:55] [rocprofv3] 'env HIPFIRE_FA_GRID_ORDER=0 ./target/release/examples/tmp_fa_grid_order_probe' ::     0.000000 sec
+W0919 21:09:22.105909 3915786 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000330 sec
+W0919 21:09:22.106034 3915786 simple_timer.cpp:55] [rocprofv3] './target/release/examples/tmp_fa_grid_order_probe' ::     0.000000 sec
+W0919 21:09:22.134012 3915786 tool.cpp:3348] HSA version 1.21.0 initialized (instance=0)
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab4/.hipfire_kernels/gfx1201
+RESULT,fa_packet_prefill8192,13393.146
+W0919 21:09:23.163119 3915786 simple_timer.cpp:55] [rocprofv3] './target/release/examples/tmp_fa_grid_order_probe' ::     1.057084 sec
+E0919 21:09:23.175775 3915786 output_stream.cpp:110] Opened result file: scratch-2026-09-17/Raster3/rocprofFA-g0/trace_kernel_stats.csv
+E0919 21:09:23.175874 3915786 output_stream.cpp:110] Opened result file: scratch-2026-09-17/Raster3/rocprofFA-g0/trace_kernel_trace.csv
+E0919 21:09:23.178678 3915786 output_stream.cpp:110] Opened result file: scratch-2026-09-17/Raster3/rocprofFA-g0/trace_agent_info.csv
+E0919 21:09:23.178749 3915786 output_stream.cpp:110] Opened result file: scratch-2026-09-17/Raster3/rocprofFA-g0/trace_domain_stats.csv
+
+    ROCPROFV3 SUMMARY:
+
+    |                   NAME                    |     DOMAIN      |      CALLS      | DURATION (nsec) | AVERAGE (nsec)  | PERCENT (INC) |   MIN (nsec)    |   MAX (nsec)    |     STDDEV      |
+    |-------------------------------------------|-----------------|-----------------|-----------------|-----------------|---------------|-----------------|-----------------|-----------------|
+    | attention_fp8_e4m3_fa2_gqa_packet_gfx1201 | KERNEL_DISPATCH |              25 |       352673989 |       1.411e+07 |     99.911720 |        10177062 |        17886921 |       2.559e+06 |
+    | __amd_rocclr_fillBufferUnAligned          | KERNEL_DISPATCH |               1 |          311616 |       3.116e+05 |      0.088280 |          311616 |          311616 |       0.000e+00 |
+
+W0919 21:09:23.179910 3915786 simple_timer.cpp:55] [rocprofv3] output generation ::     0.014801 sec
+W0919 21:09:23.179937 3915786 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.014852 sec

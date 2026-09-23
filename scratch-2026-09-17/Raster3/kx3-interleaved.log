@@ -1,0 +1,24 @@
+== round 1 base:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6591.685,221.535
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,2988.217,244.341
+== round 1 wsingle:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6781.075,215.348
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,3071.084,237.748
+== round 2 base:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6601.900,221.192
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,2979.945,245.019
+== round 2 wsingle:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6792.748,214.978
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,3079.918,237.066
+== round 3 base:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6612.889,220.825
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,2989.830,244.209
+== round 3 wsingle:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6800.678,214.727
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,3080.452,237.025
+== round 4 base:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6620.438,220.573
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,2994.527,243.826
+== round 4 wsingle:
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6804.400,214.610
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,3088.429,236.413

@@ -1,0 +1,12 @@
+=== profile_prefill_qwen35 ===
+Model: /home/kaden/.hipfire/models/qwen35-27b-dflash-mq4.hfq
+Prefill: 8192  Warmup iters: 1  KV mode: fp8
+Config: dim=5120 layers=5 heads=32 kv_heads=8
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab4/.hipfire_kernels/gfx1201
+GPU: gfx1201
+  loading token_embd...
+
+thread 'main' (3893094) panicked at crates/saddle-lab/examples/profile_prefill_qwen35.rs:93:6:
+load weights: HipError { code: 0, message: "embed_tokens not found (hipError=0)", context: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,3 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage","MinNs","MaxNs","StdDev"
+"attention_fp8_e4m3_fa2_gqa_packet_gfx1201",25,282110318,11284412.720000,99.72,10388275,11793328,381230.064013
+"__amd_rocclr_fillBufferUnAligned",1,796501,796501.000000,0.2815,796501,796501,0.00000000e+00
