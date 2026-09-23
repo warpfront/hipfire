@@ -1,0 +1,8 @@
+{
+  "status": 200,
+  "elapsed_s": 21.792166,
+  "prompt_tokens": 57030,
+  "completion_tokens": 1,
+  "cached_tokens": 0,
+  "response_file": "fresh2-response.json"
+}

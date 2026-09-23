@@ -1,0 +1,17 @@
+{
+  "elapsed_s": 21.94005400899914,
+  "status": 200,
+  "usage": {
+    "prompt_tokens": 57030,
+    "completion_tokens": 1,
+    "total_tokens": 57031,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "message": {
+    "role": "assistant",
+    "content": "The"
+  },
+  "bytes": 301833
+}
