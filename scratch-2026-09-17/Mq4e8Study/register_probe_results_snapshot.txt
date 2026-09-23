@@ -1,0 +1,49 @@
+# WMMA / VALU co-execution probe (2026-09-18)
+Probe: coexec_probe.hip (gfx1201, iu4 K32) / coexec_probe_gfx11.hip (gfx1100, iu4 K16). VOPS=1, ITERS=2048, block 256.
+W = WMMA-only loop (4 independent chains), V = fold-like VALU loop (cvt/mul/fma/add, independent),
+WV = both in one loop body (no data dependence), MIX = even waves W / odd waves V.
+
+gfx1201 (ordinal 0):
+blocks  W       V       WV       sum      MIX     serial-est
+64      141.5   160.9   319.9    302.4    149.4   151.2
+256     530.5   523.9   1190.3   1054.5   575.8   527.2
+1024    1970.5  2278.8  4939.4   4249.3   2167.3  2124.6
+-> no co-execution at any occupancy; WV >= W+V; MIX == serial.
+
+gfx1100 (hipx XTX, ROCR 0):
+blocks  W       V       WV       sum      MIX     serial-est
+96      542.4   244.3   467.4    786.6    310.7   393.3   <- latency-bound K16 WMMA chain: VALU fills bubbles
+384     953.1   681.4   1955.6   1634.6   1100.5  817.3
+1536    3854.3  2673.5  7126.9   6527.9   3822.0  3263.9
+-> same as gfx1201 once the WMMA stream is issue-bound. gfx11's "overlap" is bubble-filling on a latency-bound chain, not a separate pipe.
+Conclusion: on both RDNA3 and RDNA4 the WMMA occupies the VALU issue slot; fold cost = issue packets. Exact levers: fewer packets (VOPD) or fewer folds (format).
+
+# fold_probe (2026-09-18, gfx1201 ordinal 1, equal MACs, register-resident unless noted)
+| variant | TOPS |
+|---|---|
+| A iu4 K32 + exact IU4_FOLD_RN per 128 K | 338-348 |
+| B fp8 (int-valued e4m3 operands) + f32 fold | 230-255 |
+| C iu4, one fold per 256 K (hypothetical format) | 431-450 |
+| D fp8 shipped route, weight-only fold | 264 |
+| E iu4 + fold, A/W fragments read from LDS with the kernels' row/stride layout (stride 40) | 57 |
+| F/G = E with 1-ahead / batched fragment loads | 57 (unchanged -> not latency) |
+| H LDS loads only, E's address pattern | same time as E: 1.85 TB/s aggregate |
+| J LDS loads only, contiguous lane*8 pattern | 35.5 TB/s (19x H) |
+| K iu4 + fold, A/W planes in WMMA fragment order (lane*8 contiguous) | 266-285 |
+Conclusions: the fold is not iu4's limiter (A > D); the kernels' LDS fragment layout is a ~19x bank-conflict penalty on reads; fragment-order planes recover 4.7x on the fed loop. Exact change (byte placement only). Applies to fp8 v2 (stride-72) identically.
+
+# bf8_probe (gfx1201, register-resident, 4 chains, warm): fp8xfp8 346-362 TF, bf8xbf8 330-368, fp8xbf8 340-352, bf8xfp8 349-352 -> identical issue rate for all e4m3/e5m2 mixes (first cold pass ordered 254/275/297/317 = warm-up artifact). Choice is numerical only: e4m3 for K/V/P (3 mantissa bits); e5m2 (P) is a range fallback if scaled-e4m3 P fails its KLD gate; mixed bf8xfp8 PV is free.
+
+# pure_probe (2026-09-18, gfx1201 ordinal 0, register-resident, NO fold; blocks 256/512/1024)
+| variant | rate |
+|---|---|
+| P pure wmma_i32_16x16x32_iu4, 4 chains | 677-735 TOPS |
+| R same, 8 chains | 675-701 TOPS |
+| Q pure wmma_f32_16x16x16_fp8_fp8, 4 chains | 330-365 TF |
+Conclusion: iu4 instruction issues at 2x fp8 (AMD 779 pattern is real, ~730 achievable). Ladder: 730 (pure) -> 345 (exact fold per 128 K, probe A) -> 440 (fold per 256, probe C) -> ~190 (shipped kernel, staging). 500-700 TOPS requires a column-constant scale across the K-tile (int32 accumulate, epilogue scale) = format change; within MQ4V2 the fold-bound cap is ~345.
+Integer-domain fold variants (same probe, per-128-K fold kept, int32 accumulate across the tile, one f32 scale at the end):
+| S iu4 + v_mad_i32_i24 fold (half-scale = group x small int m) | 426-449 TOPS |
+| U iu4 + v_lshl_add_u32 fold (half-scale = group x 2^e)        | 473-501 TOPS |
+(vs A exact f32 fold 338-348, pure 677-735). Header width is irrelevant; header *constraint* (int ratio / power-of-two ratio between half and group scale) is what lets the fold shrink from 12 to 2 packets per WMMA. Requires requantizing codes to constrained scales -> KLD study before any kernel.
+| V C4 full-affine: shift fold + per-128 zero-point f32 FMA per component | 435-455 TOPS (one 343 outlier at 1024 blocks, 3 reruns 452-455) |
+-> honest C4 kernel class with free f16 zeros = ~450 (probe C class), not U's 500; fully-integer zeros (z_h = s_h * int) would recover U.

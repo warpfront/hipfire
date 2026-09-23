@@ -1,0 +1,925 @@
+{
+  "lm_head": {
+    "tensors": 1,
+    "groups": 4966400,
+    "coefficients": 1271398400,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 13.554504667785697,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 2073.0033320724915,
+        "maxcoef_rel_worst": 0.0019142801689702056,
+        "tail_mse": 1.066108761994905e-06,
+        "maxcoef_rel_mean": 0.0004174056322633077
+      },
+      "C0": {
+        "tail_sse": 15.833794957266303,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 49821.9466065569,
+        "maxcoef_rel_worst": 0.062348244783735955,
+        "tail_mse": 1.2453828415944618e-06,
+        "maxcoef_rel_mean": 0.010031803037724892
+      },
+      "C1": {
+        "tail_sse": 39.85226279412889,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 56781.96395348606,
+        "maxcoef_rel_worst": 0.06624177590550082,
+        "tail_mse": 3.1345185671831073e-06,
+        "maxcoef_rel_mean": 0.011433224056355924
+      },
+      "C2": {
+        "tail_sse": 18.808068330181733,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 63701.71827034905,
+        "maxcoef_rel_worst": 0.09827689964456926,
+        "tail_mse": 1.479319749002771e-06,
+        "maxcoef_rel_mean": 0.012826537989358297
+      },
+      "C3": {
+        "tail_sse": 19.96670301872581,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 56781.96395348606,
+        "maxcoef_rel_worst": 0.06624177590550082,
+        "tail_mse": 1.5704503822264098e-06,
+        "maxcoef_rel_mean": 0.011433224056355924
+      },
+      "C4": {
+        "tail_sse": 408.2013652849551,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 419280.8735352616,
+        "maxcoef_rel_worst": 0.5777868937595276,
+        "tail_mse": 3.210645190324516e-05,
+        "maxcoef_rel_mean": 0.08442350063129463
+      },
+      "C4z": {
+        "tail_sse": 507.55038576128146,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 403728.1119382862,
+        "maxcoef_rel_worst": 0.66630854850125,
+        "tail_mse": 3.992059663382686e-05,
+        "maxcoef_rel_mean": 0.0812919039824191
+      },
+      "C4s": {
+        "tail_sse": 523.5860081348776,
+        "tail_n": 12713998,
+        "maxcoef_rel_sum": 597089.2366421514,
+        "maxcoef_rel_worst": 0.5660302510620296,
+        "tail_mse": 4.11818539011e-05,
+        "maxcoef_rel_mean": 0.12022576446563937
+      }
+    }
+  },
+  "linear_attn.in_proj_a": {
+    "tensors": 48,
+    "groups": 46080,
+    "coefficients": 11796480,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 0.9576643664247686,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 18.093942861622253,
+        "maxcoef_rel_worst": 0.0018171240987389758,
+        "tail_mse": 8.116900312116632e-06,
+        "maxcoef_rel_mean": 0.0003926636905733996
+      },
+      "C0": {
+        "tail_sse": 0.9519660607829052,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 463.3439568185366,
+        "maxcoef_rel_worst": 0.0520683603194067,
+        "tail_mse": 8.068603037555136e-06,
+        "maxcoef_rel_mean": 0.010055207396235603
+      },
+      "C1": {
+        "tail_sse": 1.3113673359629194,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 527.147880858613,
+        "maxcoef_rel_worst": 0.06515763129604765,
+        "tail_mse": 1.1114789598275355e-05,
+        "maxcoef_rel_mean": 0.011439841164466428
+      },
+      "C2": {
+        "tail_sse": 0.9978519835945072,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 585.9927815868417,
+        "maxcoef_rel_worst": 0.0778887851138843,
+        "tail_mse": 8.457519524634757e-06,
+        "maxcoef_rel_mean": 0.012716857239297781
+      },
+      "C3": {
+        "tail_sse": 1.0839953087376242,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 527.147880858613,
+        "maxcoef_rel_worst": 0.06515763129604765,
+        "tail_mse": 9.187646704109237e-06,
+        "maxcoef_rel_mean": 0.011439841164466428
+      },
+      "C4": {
+        "tail_sse": 10.404852887788657,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 5617.519270135883,
+        "maxcoef_rel_worst": 0.5797285515241044,
+        "tail_mse": 8.818867717477503e-05,
+        "maxcoef_rel_mean": 0.12190797027204607
+      },
+      "C4z": {
+        "tail_sse": 14.53832866618336,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 5769.63649207749,
+        "maxcoef_rel_worst": 0.6642812601414851,
+        "tail_mse": 0.00012322288332471657,
+        "maxcoef_rel_mean": 0.12520912526209832
+      },
+      "C4s": {
+        "tail_sse": 12.388673028889668,
+        "tail_n": 117984,
+        "maxcoef_rel_sum": 8247.613396070245,
+        "maxcoef_rel_worst": 0.5694769603943974,
+        "tail_mse": 0.0001050029921759702,
+        "maxcoef_rel_mean": 0.17898466571332997
+      }
+    }
+  },
+  "linear_attn.in_proj_b": {
+    "tensors": 48,
+    "groups": 46080,
+    "coefficients": 11796480,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 1.2716547728995655,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 18.35909635094285,
+        "maxcoef_rel_worst": 0.0018028424528238798,
+        "tail_mse": 1.0778105461707552e-05,
+        "maxcoef_rel_mean": 0.0003984178895603917
+      },
+      "C0": {
+        "tail_sse": 1.2260195612708173,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 464.29868750492636,
+        "maxcoef_rel_worst": 0.05310200148967138,
+        "tail_mse": 1.0391317212110162e-05,
+        "maxcoef_rel_mean": 0.010075926378145103
+      },
+      "C1": {
+        "tail_sse": 1.4159976332535895,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 525.6517481769653,
+        "maxcoef_rel_worst": 0.06467816657059607,
+        "tail_mse": 1.2001505557940327e-05,
+        "maxcoef_rel_mean": 0.011407373007312614
+      },
+      "C2": {
+        "tail_sse": 1.2413258111774381,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 581.7820374584708,
+        "maxcoef_rel_worst": 0.07821427206807406,
+        "tail_mse": 1.0521047685531535e-05,
+        "maxcoef_rel_mean": 0.012625478243456396
+      },
+      "C3": {
+        "tail_sse": 1.3381167603694846,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 525.6517481769653,
+        "maxcoef_rel_worst": 0.06467816657059607,
+        "tail_mse": 1.1341414250705467e-05,
+        "maxcoef_rel_mean": 0.011407373007312614
+      },
+      "C4": {
+        "tail_sse": 4.47270845988948,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 5504.68772992847,
+        "maxcoef_rel_worst": 0.5841512156534249,
+        "tail_mse": 3.790912793905564e-05,
+        "maxcoef_rel_mean": 0.1194593691390727
+      },
+      "C4z": {
+        "tail_sse": 6.027676636539546,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 5628.315336524407,
+        "maxcoef_rel_worst": 0.6648960636856835,
+        "tail_mse": 5.1088499695211644e-05,
+        "maxcoef_rel_mean": 0.1221422599072137
+      },
+      "C4s": {
+        "tail_sse": 5.381551608742993,
+        "tail_n": 117985,
+        "maxcoef_rel_sum": 8103.632955088054,
+        "maxcoef_rel_worst": 0.5503357756606865,
+        "tail_mse": 4.561216772253247e-05,
+        "maxcoef_rel_mean": 0.17586009017118173
+      }
+    }
+  },
+  "linear_attn.in_proj_qkv": {
+    "tensors": 48,
+    "groups": 9830400,
+    "coefficients": 2516582400,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 64.10778949693857,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 3577.115028141226,
+        "maxcoef_rel_worst": 0.05612984455640778,
+        "tail_mse": 2.5474093152779284e-06,
+        "maxcoef_rel_mean": 0.00036388295777803814
+      },
+      "C0": {
+        "tail_sse": 68.97114294467755,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 98710.99457185697,
+        "maxcoef_rel_worst": 0.06532483481344409,
+        "tail_mse": 2.7406612113965887e-06,
+        "maxcoef_rel_mean": 0.01004140162881032
+      },
+      "C1": {
+        "tail_sse": 127.83070148309977,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 112723.14059738409,
+        "maxcoef_rel_worst": 0.3830351083408468,
+        "tail_mse": 5.079525004556756e-06,
+        "maxcoef_rel_mean": 0.011466790832253427
+      },
+      "C2": {
+        "tail_sse": 76.50569582906638,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 123475.86513897573,
+        "maxcoef_rel_worst": 0.617903934526963,
+        "tail_mse": 3.0400568130038297e-06,
+        "maxcoef_rel_mean": 0.012560614536435519
+      },
+      "C3": {
+        "tail_sse": 82.16318582150228,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 112721.60764655139,
+        "maxcoef_rel_worst": 0.06639037370193326,
+        "tail_mse": 3.2648647937642816e-06,
+        "maxcoef_rel_mean": 0.011466634892430765
+      },
+      "C4": {
+        "tail_sse": 1188.5960270578155,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 998649.1272146722,
+        "maxcoef_rel_worst": 0.6025152577821072,
+        "tail_mse": 4.723046318067181e-05,
+        "maxcoef_rel_mean": 0.10158784253078941
+      },
+      "C4z": {
+        "tail_sse": 1555.8547240424136,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 972800.8645574192,
+        "maxcoef_rel_worst": 0.6663312526556181,
+        "tail_mse": 6.18239818958987e-05,
+        "maxcoef_rel_mean": 0.09895842128066194
+      },
+      "C4s": {
+        "tail_sse": 1507.7229837458626,
+        "tail_n": 25165877,
+        "maxcoef_rel_sum": 1387405.4007002842,
+        "maxcoef_rel_worst": 0.5746236661182791,
+        "tail_mse": 5.991140240198514e-05,
+        "maxcoef_rel_mean": 0.14113417568972617
+      }
+    }
+  },
+  "linear_attn.in_proj_z": {
+    "tensors": 48,
+    "groups": 5898240,
+    "coefficients": 1509949440,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 47.04716729270174,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 2221.3306864578612,
+        "maxcoef_rel_worst": 0.001904689172914727,
+        "tail_mse": 3.1158048696440102e-06,
+        "maxcoef_rel_mean": 0.0003766090709190981
+      },
+      "C0": {
+        "tail_sse": 48.94797716481355,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 59188.44286018951,
+        "maxcoef_rel_worst": 0.06146859390270498,
+        "tail_mse": 3.2416902947737853e-06,
+        "maxcoef_rel_mean": 0.010034932939349622
+      },
+      "C1": {
+        "tail_sse": 78.77763202037838,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 67644.26136219766,
+        "maxcoef_rel_worst": 0.31160612367972523,
+        "tail_mse": 5.217226532280415e-06,
+        "maxcoef_rel_mean": 0.011468550171271035
+      },
+      "C2": {
+        "tail_sse": 52.94476797403603,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 74528.81976598741,
+        "maxcoef_rel_worst": 0.22398263021982023,
+        "tail_mse": 3.506386789439377e-06,
+        "maxcoef_rel_mean": 0.012635772665403139
+      },
+      "C3": {
+        "tail_sse": 56.49274352356027,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 67643.68984407789,
+        "maxcoef_rel_worst": 0.06630523127109587,
+        "tail_mse": 3.7413594802670435e-06,
+        "maxcoef_rel_mean": 0.011468453274888423
+      },
+      "C4": {
+        "tail_sse": 692.2912914976331,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 658317.2351483863,
+        "maxcoef_rel_worst": 0.6007689301648289,
+        "tail_mse": 4.5848553725679484e-05,
+        "maxcoef_rel_mean": 0.11161248697041598
+      },
+      "C4z": {
+        "tail_sse": 882.3909201106912,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 640789.7654434427,
+        "maxcoef_rel_worst": 0.6663807166440492,
+        "tail_mse": 5.843833080758189e-05,
+        "maxcoef_rel_mean": 0.10864084293678161
+      },
+      "C4s": {
+        "tail_sse": 886.5277348509442,
+        "tail_n": 15099523,
+        "maxcoef_rel_sum": 910333.3148943972,
+        "maxcoef_rel_worst": 0.5818554583647257,
+        "tail_mse": 5.8712300703203944e-05,
+        "maxcoef_rel_mean": 0.1543398225393333
+      }
+    }
+  },
+  "linear_attn.out_proj": {
+    "tensors": 48,
+    "groups": 5898240,
+    "coefficients": 1509949440,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 56.63348128206896,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 2173.292626934239,
+        "maxcoef_rel_worst": 0.001901571150620866,
+        "tail_mse": 3.7506809012517594e-06,
+        "maxcoef_rel_mean": 0.0003684645973941784
+      },
+      "C0": {
+        "tail_sse": 58.98426183045998,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 59189.29073187803,
+        "maxcoef_rel_worst": 0.05820342939702946,
+        "tail_mse": 3.906366681222978e-06,
+        "maxcoef_rel_mean": 0.010035076689296811
+      },
+      "C1": {
+        "tail_sse": 102.3580965033017,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 67605.52551691714,
+        "maxcoef_rel_worst": 0.42005438650276195,
+        "tail_mse": 6.778897375764375e-06,
+        "maxcoef_rel_mean": 0.01146198281469
+      },
+      "C2": {
+        "tail_sse": 64.06913327058237,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 74187.28981608005,
+        "maxcoef_rel_worst": 0.09716901248586549,
+        "tail_mse": 4.243123839074512e-06,
+        "maxcoef_rel_mean": 0.012577868960245778
+      },
+      "C3": {
+        "tail_sse": 69.35409111247318,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 67604.86173775217,
+        "maxcoef_rel_worst": 0.0663867749291523,
+        "tail_mse": 4.5931321732394925e-06,
+        "maxcoef_rel_mean": 0.011461870276175973
+      },
+      "C4": {
+        "tail_sse": 979.7723150416448,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 760282.846553477,
+        "maxcoef_rel_worst": 0.594718445861209,
+        "tail_mse": 6.488764643125376e-05,
+        "maxcoef_rel_mean": 0.12889995092662845
+      },
+      "C4z": {
+        "tail_sse": 1255.6479020633349,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 740308.9479895817,
+        "maxcoef_rel_worst": 0.66641303407258,
+        "tail_mse": 8.31581336402306e-05,
+        "maxcoef_rel_mean": 0.1255135342050479
+      },
+      "C4s": {
+        "tail_sse": 1238.3695276526093,
+        "tail_n": 15099520,
+        "maxcoef_rel_sum": 1038987.5870289857,
+        "maxcoef_rel_worst": 0.5700397165778242,
+        "tail_mse": 8.201383405913628e-05,
+        "maxcoef_rel_mean": 0.17615213810034616
+      }
+    }
+  },
+  "mlp.down_proj": {
+    "tensors": 64,
+    "groups": 22282240,
+    "coefficients": 5704253440,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 46.025462067708226,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 9831.53781872765,
+        "maxcoef_rel_worst": 0.0019261412784620756,
+        "tail_mse": 8.068610968987801e-07,
+        "maxcoef_rel_mean": 0.0004412275345175193
+      },
+      "C0": {
+        "tail_sse": 53.51105813215115,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 223914.8657582154,
+        "maxcoef_rel_worst": 0.06091481572268909,
+        "tail_mse": 9.380892471477093e-07,
+        "maxcoef_rel_mean": 0.010049028542831214
+      },
+      "C1": {
+        "tail_sse": 114.99782321072163,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 255476.58810338017,
+        "maxcoef_rel_worst": 0.4294640612152254,
+        "tail_mse": 2.0159986583138514e-06,
+        "maxcoef_rel_mean": 0.011465480494931396
+      },
+      "C2": {
+        "tail_sse": 63.59888768185981,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 290060.7926372863,
+        "maxcoef_rel_worst": 0.10462982347892114,
+        "tail_mse": 1.1149365149455175e-06,
+        "maxcoef_rel_mean": 0.013017577794570308
+      },
+      "C3": {
+        "tail_sse": 66.71358202071764,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 255474.27715941428,
+        "maxcoef_rel_worst": 0.06633082066193766,
+        "tail_mse": 1.1695394581393996e-06,
+        "maxcoef_rel_mean": 0.011465376782559307
+      },
+      "C4": {
+        "tail_sse": 2133.4548561614774,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 2955709.270353937,
+        "maxcoef_rel_worst": 0.6098417501827814,
+        "tail_mse": 3.740107427697561e-05,
+        "maxcoef_rel_mean": 0.1326486596659015
+      },
+      "C4z": {
+        "tail_sse": 2500.814334565519,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 2690827.4343540333,
+        "maxcoef_rel_worst": 0.6664872240627443,
+        "tail_mse": 4.384116327087211e-05,
+        "maxcoef_rel_mean": 0.12076108301293018
+      },
+      "C4s": {
+        "tail_sse": 2672.214657411114,
+        "tail_n": 57042609,
+        "maxcoef_rel_sum": 3820290.768545737,
+        "maxcoef_rel_worst": 0.582454709617289,
+        "tail_mse": 4.684594032876571e-05,
+        "maxcoef_rel_mean": 0.1714500323372218
+      }
+    }
+  },
+  "mlp.gate_proj": {
+    "tensors": 64,
+    "groups": 22282240,
+    "coefficients": 5704253440,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 45.23298866170651,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 9581.323946472265,
+        "maxcoef_rel_worst": 0.0019265398101754943,
+        "tail_mse": 7.929686622364188e-07,
+        "maxcoef_rel_mean": 0.0004299982383491186
+      },
+      "C0": {
+        "tail_sse": 52.50610250580726,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 223911.02580121296,
+        "maxcoef_rel_worst": 0.06024320827662243,
+        "tail_mse": 9.204718745132653e-07,
+        "maxcoef_rel_mean": 0.01004885621020207
+      },
+      "C1": {
+        "tail_sse": 118.55597386434873,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 255617.7003821887,
+        "maxcoef_rel_worst": 0.45111323223407696,
+        "tail_mse": 2.0783763084603945e-06,
+        "maxcoef_rel_mean": 0.01147181344345042
+      },
+      "C2": {
+        "tail_sse": 62.220587063355325,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 288823.4206516668,
+        "maxcoef_rel_worst": 0.1058284141974984,
+        "tail_mse": 1.090774170510715e-06,
+        "maxcoef_rel_mean": 0.012962046035392619
+      },
+      "C3": {
+        "tail_sse": 65.52859112654544,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 255613.54436691586,
+        "maxcoef_rel_worst": 0.06651152983143836,
+        "tail_mse": 1.148765995377269e-06,
+        "maxcoef_rel_mean": 0.0114716269265081
+      },
+      "C4": {
+        "tail_sse": 1326.7239466175652,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 2140845.537445735,
+        "maxcoef_rel_worst": 0.6081073372282866,
+        "tail_mse": 2.3258478916229584e-05,
+        "maxcoef_rel_mean": 0.09607856020964388
+      },
+      "C4z": {
+        "tail_sse": 1587.7703729969471,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 2012535.488965367,
+        "maxcoef_rel_worst": 0.6664738166150999,
+        "tail_mse": 2.7834821130886303e-05,
+        "maxcoef_rel_mean": 0.09032016031446422
+      },
+      "C4s": {
+        "tail_sse": 1719.1518612731388,
+        "tail_n": 57042593,
+        "maxcoef_rel_sum": 2975920.6805004003,
+        "maxcoef_rel_worst": 0.5878586506680985,
+        "tail_mse": 3.0138038452654823e-05,
+        "maxcoef_rel_mean": 0.13355572332496196
+      }
+    }
+  },
+  "mlp.up_proj": {
+    "tensors": 64,
+    "groups": 22282240,
+    "coefficients": 5704253440,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 29.177056499702555,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 9753.702819042759,
+        "maxcoef_rel_worst": 0.0019324147687105988,
+        "tail_mse": 5.114959621174057e-07,
+        "maxcoef_rel_mean": 0.00043773439380613257
+      },
+      "C0": {
+        "tail_sse": 37.27253243177593,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 223814.80505703267,
+        "maxcoef_rel_worst": 0.06201803145377955,
+        "tail_mse": 6.534158041931952e-07,
+        "maxcoef_rel_mean": 0.01004453793949947
+      },
+      "C1": {
+        "tail_sse": 93.11515525547252,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 255343.4908733048,
+        "maxcoef_rel_worst": 0.449261080412171,
+        "tail_mse": 1.6323793980244397e-06,
+        "maxcoef_rel_mean": 0.011459507252112212
+      },
+      "C2": {
+        "tail_sse": 46.90725417408724,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 289633.2371510067,
+        "maxcoef_rel_worst": 0.10312789783296625,
+        "tail_mse": 8.223197944695019e-07,
+        "maxcoef_rel_mean": 0.012998389621106617
+      },
+      "C3": {
+        "tail_sse": 48.3800177147164,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 255338.43486528334,
+        "maxcoef_rel_worst": 0.06627854471804899,
+        "tail_mse": 8.481384579866127e-07,
+        "maxcoef_rel_mean": 0.0114592803445831
+      },
+      "C4": {
+        "tail_sse": 1089.768432768138,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 1913820.7394865016,
+        "maxcoef_rel_worst": 0.5989411401975581,
+        "tail_mse": 1.9104468369165292e-05,
+        "maxcoef_rel_mean": 0.0858899616684185
+      },
+      "C4z": {
+        "tail_sse": 1188.242126423057,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 1807252.0695842037,
+        "maxcoef_rel_worst": 0.6664562007400217,
+        "tail_mse": 2.083078701545475e-05,
+        "maxcoef_rel_mean": 0.08110728856632922
+      },
+      "C4s": {
+        "tail_sse": 1496.4114875439288,
+        "tail_n": 57042594,
+        "maxcoef_rel_sum": 2718818.8769453196,
+        "maxcoef_rel_worst": 0.577653455306514,
+        "tail_mse": 2.6233229988522768e-05,
+        "maxcoef_rel_mean": 0.12201730512485816
+      }
+    }
+  },
+  "self_attn.k_proj": {
+    "tensors": 16,
+    "groups": 327680,
+    "coefficients": 83886080,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 3.2874680487493744,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 124.57660048657073,
+        "maxcoef_rel_worst": 0.0018602844227376362,
+        "tail_mse": 3.918947683774355e-06,
+        "maxcoef_rel_mean": 0.0003801776137895835
+      },
+      "C0": {
+        "tail_sse": 3.3756889544957325,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 3305.2603517758803,
+        "maxcoef_rel_worst": 0.05873664992489598,
+        "tail_mse": 4.02411467220081e-06,
+        "maxcoef_rel_mean": 0.010086854100878541
+      },
+      "C1": {
+        "tail_sse": 5.651244696935818,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 3776.643730494393,
+        "maxcoef_rel_worst": 0.06581054306866474,
+        "tail_mse": 6.73677492437498e-06,
+        "maxcoef_rel_mean": 0.011525402009565408
+      },
+      "C2": {
+        "tail_sse": 3.63634300892517,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 4160.103862439346,
+        "maxcoef_rel_worst": 0.09417016317449381,
+        "tail_mse": 4.334836962950141e-06,
+        "maxcoef_rel_mean": 0.0126956294630107
+      },
+      "C3": {
+        "tail_sse": 3.927056921352441,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 3776.643730494393,
+        "maxcoef_rel_worst": 0.06581054306866474,
+        "tail_mse": 4.681393217445526e-06,
+        "maxcoef_rel_mean": 0.011525402009565408
+      },
+      "C4": {
+        "tail_sse": 49.44738804510442,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 38879.63131632647,
+        "maxcoef_rel_worst": 0.5843374426789424,
+        "tail_mse": 5.894558486181259e-05,
+        "maxcoef_rel_mean": 0.11865121861671897
+      },
+      "C4z": {
+        "tail_sse": 70.77797082748707,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 37945.96448693646,
+        "maxcoef_rel_worst": 0.6661136489597893,
+        "tail_mse": 8.437349374152821e-05,
+        "maxcoef_rel_mean": 0.11580189357585588
+      },
+      "C4s": {
+        "tail_sse": 58.10781158890964,
+        "tail_n": 838865,
+        "maxcoef_rel_sum": 53792.16617783742,
+        "maxcoef_rel_worst": 0.5551801986606917,
+        "tail_mse": 6.926956255048148e-05,
+        "maxcoef_rel_mean": 0.1641606633845136
+      }
+    }
+  },
+  "self_attn.o_proj": {
+    "tensors": 16,
+    "groups": 1966080,
+    "coefficients": 503316480,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 38.33520749678046,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 746.1639222947719,
+        "maxcoef_rel_worst": 0.0018755468059675968,
+        "tail_mse": 7.6165090086870575e-06,
+        "maxcoef_rel_mean": 0.0003795185965447855
+      },
+      "C0": {
+        "tail_sse": 38.1645870398666,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 19718.280343635073,
+        "maxcoef_rel_worst": 0.0591414640877473,
+        "tail_mse": 7.582609824829507e-06,
+        "maxcoef_rel_mean": 0.010029236014625586
+      },
+      "C1": {
+        "tail_sse": 59.69949154187621,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 22522.91817186571,
+        "maxcoef_rel_worst": 0.44002525659280833,
+        "tail_mse": 1.1861203964552025e-05,
+        "maxcoef_rel_mean": 0.011455748581881565
+      },
+      "C2": {
+        "tail_sse": 39.97635378024302,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 24829.774703284136,
+        "maxcoef_rel_worst": 0.09949813475198271,
+        "tail_mse": 7.942574948296635e-06,
+        "maxcoef_rel_mean": 0.012629076488893705
+      },
+      "C3": {
+        "tail_sse": 43.815850506546774,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 22522.492298216785,
+        "maxcoef_rel_worst": 0.0662704364721463,
+        "tail_mse": 8.70541316711084e-06,
+        "maxcoef_rel_mean": 0.011455531971342359
+      },
+      "C4": {
+        "tail_sse": 401.0414109102041,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 257003.88000531128,
+        "maxcoef_rel_worst": 0.6127804355487252,
+        "tail_mse": 7.967963964485308e-05,
+        "maxcoef_rel_mean": 0.1307189331081702
+      },
+      "C4z": {
+        "tail_sse": 549.1597477001786,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 257506.9228210399,
+        "maxcoef_rel_worst": 0.6662713437521692,
+        "tail_mse": 0.00010910806119721667,
+        "maxcoef_rel_mean": 0.13097479391532382
+      },
+      "C4s": {
+        "tail_sse": 490.2865874347882,
+        "tail_n": 5033173,
+        "maxcoef_rel_sum": 368422.5872076696,
+        "maxcoef_rel_worst": 0.5794086631165076,
+        "tail_mse": 9.741103423919428e-05,
+        "maxcoef_rel_mean": 0.18738941813541138
+      }
+    }
+  },
+  "self_attn.q_proj": {
+    "tensors": 16,
+    "groups": 3932160,
+    "coefficients": 1006632960,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 57.93368856605679,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 1523.3998941893017,
+        "maxcoef_rel_worst": 0.0018712906816086077,
+        "tail_mse": 5.755187789770781e-06,
+        "maxcoef_rel_mean": 0.0003874206273878229
+      },
+      "C0": {
+        "tail_sse": 57.46622546004163,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 39482.81780303853,
+        "maxcoef_rel_worst": 0.0620969308971521,
+        "tail_mse": 5.708749559675365e-06,
+        "maxcoef_rel_mean": 0.010040999807494743
+      },
+      "C1": {
+        "tail_sse": 79.68826580490479,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 45118.76429085002,
+        "maxcoef_rel_worst": 0.4296760782858765,
+        "tail_mse": 7.916308208573164e-06,
+        "maxcoef_rel_mean": 0.011474295117912297
+      },
+      "C2": {
+        "tail_sse": 59.88540240206238,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 49934.14381400564,
+        "maxcoef_rel_worst": 0.18394479468545033,
+        "tail_mse": 5.949072900767963e-06,
+        "maxcoef_rel_mean": 0.012698909457907522
+      },
+      "C3": {
+        "tail_sse": 64.81341273145893,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 45118.07089808644,
+        "maxcoef_rel_worst": 0.06640812151286532,
+        "tail_mse": 6.4386261396104885e-06,
+        "maxcoef_rel_mean": 0.011474118779013682
+      },
+      "C4": {
+        "tail_sse": 490.1473863354091,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 436941.2576239442,
+        "maxcoef_rel_worst": 0.600221628912318,
+        "tail_mse": 4.869170810363975e-05,
+        "maxcoef_rel_mean": 0.11111990804645391
+      },
+      "C4z": {
+        "tail_sse": 673.7093157549306,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 426332.4231160955,
+        "maxcoef_rel_worst": 0.6663579273762376,
+        "tail_mse": 6.692692496985802e-05,
+        "maxcoef_rel_mean": 0.10842194191388334
+      },
+      "C4s": {
+        "tail_sse": 595.4009020092503,
+        "tail_n": 10066342,
+        "maxcoef_rel_sum": 610536.3280045112,
+        "maxcoef_rel_worst": 0.5680626694787586,
+        "tail_mse": 5.914769257881864e-05,
+        "maxcoef_rel_mean": 0.1552674174002358
+      }
+    }
+  },
+  "self_attn.v_proj": {
+    "tensors": 16,
+    "groups": 327680,
+    "coefficients": 83886080,
+    "metrics": {
+      "fixture": {
+        "tail_sse": 2.84950197095396,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 123.74976206315097,
+        "maxcoef_rel_worst": 0.0019029403013376045,
+        "tail_mse": 3.396849998633822e-06,
+        "maxcoef_rel_mean": 0.0003776543031712371
+      },
+      "C0": {
+        "tail_sse": 3.1187311258083756,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 3290.5664881992,
+        "maxcoef_rel_worst": 0.056531792414009956,
+        "tail_mse": 3.7177941719039463e-06,
+        "maxcoef_rel_mean": 0.010042011987912599
+      },
+      "C1": {
+        "tail_sse": 6.4563537153048856,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 3761.255598877479,
+        "maxcoef_rel_worst": 0.2893019018566234,
+        "tail_mse": 7.69652568503776e-06,
+        "maxcoef_rel_mean": 0.011478441158683713
+      },
+      "C2": {
+        "tail_sse": 3.530802508530625,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 4146.968850641615,
+        "maxcoef_rel_worst": 0.08799475041541571,
+        "tail_mse": 4.209018494647089e-06,
+        "maxcoef_rel_mean": 0.012655544588139694
+      },
+      "C3": {
+        "tail_sse": 3.776649744329772,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 3760.9665123567534,
+        "maxcoef_rel_worst": 0.06531531617765018,
+        "tail_mse": 4.502089421111086e-06,
+        "maxcoef_rel_mean": 0.0114775589366356
+      },
+      "C4": {
+        "tail_sse": 65.31580187691475,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 37214.94813925408,
+        "maxcoef_rel_worst": 0.5762040864160591,
+        "tail_mse": 7.786202072430489e-05,
+        "maxcoef_rel_mean": 0.11357100872575096
+      },
+      "C4z": {
+        "tail_sse": 86.19930414933276,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 36551.59106641725,
+        "maxcoef_rel_worst": 0.6660551954669601,
+        "tail_mse": 0.00010275694109587558,
+        "maxcoef_rel_mean": 0.11154660359624405
+      },
+      "C4s": {
+        "tail_sse": 82.63432522153516,
+        "tail_n": 838866,
+        "maxcoef_rel_sum": 51430.65204952248,
+        "maxcoef_rel_worst": 0.556725979831276,
+        "tail_mse": 9.850718138717645e-05,
+        "maxcoef_rel_mean": 0.15695389419409939
+      }
+    }
+  }
+}

@@ -1,0 +1,50 @@
+## 10. Implemented study flags and artifact receipts
+
+`--format mq4e8-c0`, `mq4e8-c1`, `mq4e8-c2`, `mq4e8-c3`, `mq4e8-c4`, `mq4e8-c4z`, `mq4e8-c4s` are opt-in study formats. Original `mq4v2` and production routing defaults remain unchanged. The pipeline admits only dense Qwen model `arch_id=5` and K divisible by256, rejects unknown suffixes, and has no fallback to an unconstrained recipe. This is a **model-architecture** restriction, not a GPU ISA check. GGUF input does not acquire these flags. CPU quantization is ISA-independent; no non-gfx1201 model-quality claim follows.
+
+Implementation anchors (owner receipt): `/home/kaden/ClaudeCode/warpfront/wt-mq4e8/crates/hipfire-quantize/src/quant_mq4e8.rs:24` `Mq4HeaderConstraint`; `:63` `Mq4e8Stats`; `:648` `quantize_mq4g256v2_constrained(w,m,k,signs1,signs2,constraint) -> Result<(Vec<u8>,Mq4e8Stats),String>`. Helpers are `base_half_steps:134`, `c1_scales:159`, `c2_scales:197`, `lloyd_free_zeros:239`, `lloyd_int_zero:301`, `assign_fixed_kminus8:375`, `choose_row_exp:470`, `row_master_b:491`. `pipeline.rs:325–334` parses the flags; `MainQuantFlags::mq4e8` owns the choice; the dense dispatch at approximately`:5886` calls the constrained encoder before the ordinary MQ4V2 branch. Existing embedding handling stays Q8. Metadata records `hipfire_base_format=mq4e8-cN` and `hipfire_mq4e8_study`. Measurement commits reported by owner: `2fd1416bb`, `200af2e48`, `6344f3a94`. [Full implementation receipt](@@E@@/quant-a/IMPLEMENTATION_RECEIPT.md).
+
+Every artifact below is **14,987,185,152 B**, with **497 qt44 /801 f16 /49 Q8 tensors**. Independent consumer-side verification checked all **200,171,520 half scales**, finite headers, C4z/C4s zero constraints, and the complete L0 in_proj_a oracle bytes. All **850 non-qt44 payloads (1,361,091,584 B)** remain byte-identical, including all496 AWQ sidecars. Seven constraint artifacts all passed. [Artifact manifest and proof links](@@E@@/artifact_manifest.json); [exhaustive verifier source](@@E@@/verify_artifact.py). These checks do not claim exhaustive code-byte parity for every emitted coefficient; the independent seven-arm full-tensor oracle covers L0 in_proj_a, while full model evaluation covers the selected quality arms.
+
+@@ARTIFACT_TABLE@@
+
+Requant recipe: original parent, `--format mq4e8-cN --imatrix /home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf --awq-alpha 0.55 --tier xt`, no vision inclusion. Exact runnable invocations are the adjacent `requant_cN.cmd` files. Clamp/floor report: C2 multiplier high-cap769 groups, low-cap0, base-floor226; C4/C4s master-floor3 rows; C4z master-floor28 rows; zero-master rows0. [Independent encoder oracle](@@E@@/quant-a/gate1_oracle.log) recorded Rust7/7 and Python7/7 exact matches. Owner ran only scoped quantizer/pipeline gates, not project-wide validation. Study-only oracle/dump harnesses and their measurements belong in untracked evidence, not permanent machine-local test dependencies; final code integration/cleanup and review are Main's responsibility.
+
+## 11. Tree-built model-quality measurements
+
+### Weight-only evaluation provenance
+
+All weight rows use the immutable tree-built evaluator `/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/eval_hipfire.weight`, **md5 `8b2d99f611fd201dda6c0199f3ae3eba`**. Build command: `cargo build --release -p hipfire-runtime --example eval_hipfire --features deltanet`, from this worktree before activation changes. The first build's stdout was not duplicated into evidence; the successful owner build receipt is retained in [weight_eval_build.txt](@@E@@/weight_eval_build.txt). Actual executable hash is checked by the launcher on every run. This is not a prebaked baseline evaluator.
+
+References: WT2 `/home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin`, md5 `8a21364051d844b97c122e2c895f56d8`; AG `/home/kaden/kldrefs/qwen3.8-27b.ref_ag.bin`, md5 `b63d3bc13e3ea294e6c938050a07d36f`.
+
+All runs pin `HOME=/home/kaden/.hipfire-homes/ab0 ROCR_VISIBLE_DEVICES=0 HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models HIPFIRE_KERNEL_CACHE=/home/kaden/.hipfire-homes/ab0/.hipfire_kernels HIPFIRE_IU4_PREFILL=0 HIPFIRE_IU4_XMASTER=0 HIPFIRE_GRAPH=0`, after clearing inherited `HIPFIRE_*` variables. Scoring is `--kv-mode q8 --kv-v q8 --scoring-mode prefill --max-chunks N`. Thus weights alone change; current fp8-prefill/GEMV consume their exact lowered reconstruction. Every log contains the full command, model/reference/binary hashes, environment, KLD and exit0. [Launcher](@@E@@/run_weight_eval.py); [raw row manifest](@@E@@/weight_eval_results.jsonl); [independent log/output-hash verification of all18 rows](@@E@@/weight_eval_verified.json).
+
+@@WEIGHT_TABLE@@
+
+The fresh fixture WT2_24 **0.048659** exactly reproduces the supplied fp8 baseline. C3 was run at24 chunks directly under Main's final narrowed gate. **C1/C4z/C4s model evaluations were explicitly canceled by Main after the coefficient screen; none is represented as a measured KLD failure.** Their artifacts, all-layer coefficient metrics and algebra remain complete. C4's already-started full ladder and AG result are retained, not discarded.
+
+### Weight quality decision
+
+@@COMPARISON_TABLE@@
+
+C2 is the strongest constrained weight recipe here: WT2 improves **0.003030**, AG improves **0.003677**; it passes the default-quality threshold by **0.003530**. C3 exceeds the threshold by **0.000554** and worsens AG. C4's row-master cost is large on both corpora. C0 illustrates why the zero-refit control matters: WT2 improves but AG worsens **0.013774**. Tail/max-coef are screens, not a substitute for matched model evaluation or proof that family-MSE ranking monotonically predicts KLD. No overall-MSE/Frobenius ranking was used.
+
+### Separate activation-only gate
+
+All following rows use **unchanged fixture md5 `1a48b45ebf5f3ef852efcf8ee5d8084b`**, iu4 prefill, and activation-arm tree evaluator **md5 `a92a527fa9c1f1509aedba26a330cbbf`**. The activation build log is [build-eval-xm.log](@@E@@/slice-b/build-eval-xm.log). Owner pins `HIPFIRE_GRAPH=0 HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_LLOYD_GFX12=1 HIPFIRE_IU4_PREFILL=1`, adding `HIPFIRE_IU4_XMASTER=1` only for the constrained rows; q8/q8 prefill scoring and references are unchanged. [Full activation receipt](@@E@@/slice-b/RESULTS-slice-b.md); [independently verified logs and output hashes](@@E@@/activation_eval_verified.json).
+
+@@ACTIVATION_TABLE@@
+
+The **0.063410 iu4 WT2_24 baseline is the supplied contract**, not a newly run baseline row in this study; no corresponding fresh log is invented. The new activation-only WT2_24 result **0.070464** costs **+0.007054** against that contract, exceeding its0.063910 default gate by **0.006554**. Fresh matched AG rows worsen from **0.181992** to **0.203572**, **+0.021580**. Flag-off WT2_1/2 output hashes exactly reproduce the prior pins. The device oracle checks decoded d, exponent selection, all q and exact integer sums: e histogram27/1/36, zero mismatches ([oracle](@@E@@/slice-b/verify2.stderr)). This does not bound joint weight+activation KLD.
+
+Activation preparation timing is measured overhead, not a GEMM speedup: N512, K5120 **88.9→143.5us**; K17408 **215.4→376.3us**, sync-delimited wall medians over20 calls. rocprof attribution atK5120: pass1 **65.7us**, reduce **26.5us**, fixup **24.2us**. These are owner measurements in the linked receipt; no full-model latency result is claimed.
+
+## 12. Recommendation and closure
+
+1. **Keep current default format/routes. Retain C2 as an opt-in weight recipe and a quality-passing control for any later group-fold study.** It passes the stated weight gate on this fixture and improves both corpora. This is a quality result, not a throughput result or a general claim across model families/GPUs.
+2. **Do not adopt the frozen whole-K row-master path.** C4 weights and the independent compatible activation arm each fail their required default-quality gates. C4z/C4s were screened out without KLD under Main's explicit decision. C4s is the only proposed arm with the no-zero U-style algebra, and its all-family tail/max-coef screen is poor. No joint route or native compact-header GEMM was built or benchmarked.
+3. **C3 is not a default candidate under the stated contract.** Its +0.001054 WT2 cost is above +0.0005, with corroborating AG degradation. A quality/speed opt-in beyond the contract is Kaden's call, but this study has no data-fed speed result to justify that trade.
+4. **Do not mistake C2's pass for an integer-fold implementation.** Current activation half scales remain independent; group bases also vary across K. C2 alone therefore buys neither the proposed whole-K integer epilogue nor a proven group-fold speedup. A future compatible group-level activation constraint is a distinct, unmeasured hypothesis; the failed row-master arm does not validate or disprove it.
+
+The completed deliverable is the coefficient/header census, exact study encoders and seven artifacts, scoped runtime state recipe, overflow/epilogue proof,18 weight-quality rows,7 activation-quality rows, and this recommendation. No production-default change is made. Performance exploration must stop at the claim-scoped quality and data-fed benchmark gates in section9; favorable register ceilings alone do not justify implementation. Reviewer retains the final veto on source integration, architecture admission and cleanup.

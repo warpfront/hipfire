@@ -1,0 +1,4 @@
+Command: bash /home/kaden/ClaudeCode/warpfront/wt-mq4e8/scripts/check_fixture.sh --sha /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.ctrl.hfq
+OK: /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.ctrl.hfq -> /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.ctrl.hfq (14987185152 B, sha256 verified)
+sha256=80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3
+Tool result bg_2 exit0, 27.76s.

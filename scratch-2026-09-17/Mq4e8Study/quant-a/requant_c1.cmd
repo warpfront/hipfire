@@ -1,0 +1,1 @@
+/home/kaden/ClaudeCode/warpfront/wt-mq4e8/target/release/hipfire-quantize --input /home/kaden/qcal/parents/qwen3.8-27b/ --output /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c1.hfq --format mq4e8-c1 --imatrix /home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf --awq-alpha 0.55 --tier xt

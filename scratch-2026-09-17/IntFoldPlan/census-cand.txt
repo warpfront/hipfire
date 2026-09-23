@@ -1,0 +1,16 @@
+== gemm_mq4g256v2_residual_mmq_iu4_full_add ==
+  instr lines       = 2667
+  any v_dual_ lines = 176
+  fold dual halves  = 204 {'mul_f32': 122, 'fmac_f32': 39, 'add_f32': 43}
+  fold singletons   = 248 {'cvt_f32_i32': 68, 'mul_f32': 70, 'fmac_f32': 25, 'add_f32': 85}
+  FOLD packets      = 350   (singleton lines + lines w/ fold half)
+  FOLD scalar ops   = 452   (singletons + fold halves)
+  wmma instr        = 32
+== gemm_mq4g256v2_residual_mmq_iu4_full_set ==
+  instr lines       = 2571
+  any v_dual_ lines = 176
+  fold dual halves  = 204 {'mul_f32': 122, 'fmac_f32': 39, 'add_f32': 43}
+  fold singletons   = 184 {'cvt_f32_i32': 68, 'mul_f32': 70, 'fmac_f32': 25, 'add_f32': 21}
+  FOLD packets      = 286   (singleton lines + lines w/ fold half)
+  FOLD scalar ops   = 388   (singletons + fold halves)
+  wmma instr        = 32

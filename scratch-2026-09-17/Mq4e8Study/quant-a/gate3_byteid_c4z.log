@@ -1,0 +1,12 @@
+fixture: /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.ctrl.hfq
+  arch=5 tensors=1347
+artifact: /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c4z.hfq
+  arch=5 tensors=1347
+tensor names identical (1347)
+qt44 tensors: 497
+AWQ sidecars: 496, mismatched: 0
+other non-qt44: 354, mismatched: 0
+qt44 groups: 100085760; headers: scales-identical 3970419 (3.97%), zeros-identical 59030237 (58.98%), payload-bytes-identical 955738562 (7.46%)
+metadata fixture: {'hipfire_base_format': 'mq4v2', 'hipfire_product_tier': 'xt'}
+metadata artifact: {'hipfire_base_format': 'mq4e8-c4z', 'hipfire_product_tier': 'xt', 'hipfire_mq4e8_study': 'constrained-header quality study; standard qt44 lowering'}
+RESULT: PASS

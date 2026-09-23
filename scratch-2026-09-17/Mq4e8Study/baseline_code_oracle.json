@@ -1,0 +1,30 @@
+[
+  {
+    "tensor": "lm_head.weight",
+    "rows": 32,
+    "groups": 640,
+    "nibble_bytes_compared": 81920,
+    "mismatched_bytes": 0
+  },
+  {
+    "tensor": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+    "rows": 32,
+    "groups": 640,
+    "nibble_bytes_compared": 81920,
+    "mismatched_bytes": 0
+  },
+  {
+    "tensor": "model.language_model.layers.31.self_attn.q_proj.weight",
+    "rows": 32,
+    "groups": 640,
+    "nibble_bytes_compared": 81920,
+    "mismatched_bytes": 0
+  },
+  {
+    "tensor": "model.language_model.layers.63.mlp.down_proj.weight",
+    "rows": 32,
+    "groups": 2176,
+    "nibble_bytes_compared": 278528,
+    "mismatched_bytes": 0
+  }
+]

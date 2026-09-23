@@ -1,0 +1,11 @@
+# gfx1201 (Navi 48: RX 9070 XT / R9700) matrix roofs — from AMD product spec (via Kaden, 2026-09-18)
+- 64 CUs (2 AI accelerators/CU); HIP reports multiProcessorCount=32 (WGPs). fp32 vector 48.7 TF (dual-issue).
+- fp16 matrix DENSE: 194.8 TF (= 4x fp32 vector). fp16 vector = 48.7.
+- fp8 matrix DENSE (E4M3/E5M2): 389 TF; int8 matrix dense: 389 TOPS; sparse 2x = 779.
+- int4 (halving-bitwidth-doubles): 779 dense (inferred from the pattern; AMD publishes int8/fp8 only).
+- No FP4 matrix format on RDNA4 (confirmed negative).
+- Memory: 256-bit x 20 Gbps = 640 GB/s + 64 MB Infinity Cache. R9700 clocks slightly lower than 9070 XT.
+
+Probe cross-check (wmma_probe, register-resident): fp8 330 TF = 85% of 389; f16 182 = 93% of 194.8; iu4-K32 540 = 69% of 779.
+CORRECTION: docs/plans/2026-09-14-mq4e8-format.md states "fp8 dense roof ~191 TFLOPS (341 is sparse)" — that is the fp16-matrix figure; the fp8 kernel there ran at ~24% of the real fp8 roof, not 49%.
+Kernel positions vs the real roof (N=512): incumbent fp8 s2bt8 ~93 TF = 24%; fp8 v2+staging ~124 TF = 32%; iu4 v2 ~180 TOPS = 23% of 779; competitor fp8 GEMM 190-220 = ~55%; f16 FA2 is capped at 194.8 (fp8 operands double it).

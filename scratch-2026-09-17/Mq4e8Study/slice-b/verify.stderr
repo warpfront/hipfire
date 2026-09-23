@@ -1,0 +1,4 @@
+verify: n=8 k=1024 nb=8
+e histogram: e0=27 e1=1 e2=36
+d_fail=0 q_fail=0 s_fail=0 e_fail=0
+ORACLE PASS

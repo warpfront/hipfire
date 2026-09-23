@@ -1,0 +1,78 @@
+{
+  "signed_i32_max": 2147483647,
+  "raw_half_dot_bounds": [
+    -15360,
+    13440
+  ],
+  "half_activation_sum_bounds": [
+    -1024,
+    896
+  ],
+  "group_bounds": {
+    "C1_tight": 261120,
+    "C1_generic": 491520,
+    "C2": 491520,
+    "C3": 30720
+  },
+  "rows": [
+    {
+      "constraint": "C1",
+      "max_integer_factor": 16,
+      "max_abs_product": 120,
+      "K5120_abs_bound": 9830400,
+      "K17408_abs_bound": 33423360,
+      "wholeK_common_master_required": false
+    },
+    {
+      "constraint": "C2",
+      "max_integer_factor": 16,
+      "max_abs_product": 120,
+      "K5120_abs_bound": 9830400,
+      "K17408_abs_bound": 33423360,
+      "wholeK_common_master_required": false
+    },
+    {
+      "constraint": "C3",
+      "max_integer_factor": 1,
+      "max_abs_product": 120,
+      "K5120_abs_bound": 614400,
+      "K17408_abs_bound": 2088960,
+      "wholeK_common_master_required": false
+    },
+    {
+      "constraint": "C4 weight-only common-X-scale",
+      "max_integer_factor": 256,
+      "max_abs_product": 120,
+      "K5120_abs_bound": 157286400,
+      "K17408_abs_bound": 534773760,
+      "wholeK_common_master_required": true
+    },
+    {
+      "constraint": "C4 paired / C4z paired",
+      "max_integer_factor": 1024,
+      "max_abs_product": 120,
+      "K5120_abs_bound": 629145600,
+      "K17408_abs_bound": 2139095040,
+      "wholeK_common_master_required": true
+    },
+    {
+      "constraint": "C4s paired",
+      "max_integer_factor": 1024,
+      "max_abs_product": 64,
+      "K5120_abs_bound": 335544320,
+      "K17408_abs_bound": 1140850688,
+      "wholeK_common_master_required": true
+    }
+  ],
+  "unsafe_cases": {
+    "C4paired_exponents8plus8_abs_bound_K17408": 136902082560,
+    "C4z_unrestricted_positive_zero_multiplier_abs_bound_K17408": 4278190080
+  },
+  "epilogue": {
+    "general": "sum_h s[r,h]*d[t,h]*A[r,t,h] + z[r,h]*d[t,h]*S[t,h]",
+    "C4paired": "B[r]*D[t]*sum_h(2^(ew+ex)*A) + D[t]*sum_h(z[r,h]*2^ex*S)",
+    "C4zpaired": "B[r]*D[t]*sum_h(2^(ew+ex)*(A+k*S))",
+    "C4spaired": "B[r]*D[t]*sum_h(2^(ew+ex)*sum_i((qW_i-8)*qX_i))"
+  },
+  "scope": "Bounds are algebraic exhaustive worst-case bounds, not measured quality/performance. C1/C2/C3 whole-K numeric boxes do NOT license accumulating unrelated group bases; current independent activation scales also prevent group integer folds."
+}

@@ -1,0 +1,1438 @@
+0000f014 v_mul_u32_u24_e32 v1, 0x500, v177
+0000f01c v_lshlrev_b32_e32 v2, 2, v176
+0000f020 v_lshrrev_b32_e32 v0, 4, v0
+0000f024 v_mul_u32_u24_e32 v5, 0x50, v176
+0000f02c s_delay_alu instid0(VALU_DEP_3) | instskip(NEXT) | instid1(VALU_DEP_3)
+0000f030 v_add3_u32 v3, 0, v1, v2
+0000f038 v_and_b32_e32 v2, 15, v0
+0000f03c v_or_b32_e32 v0, s20, v176
+0000f040 s_delay_alu instid0(VALU_DEP_3) | instskip(NEXT) | instid1(VALU_DEP_3)
+0000f044 v_mad_u32_u24 v1, 0x280, v167, v3
+0000f050 v_or_b32_e32 v4, s21, v2
+0000f054 v_lshlrev_b32_e32 v2, 2, v2
+0000f058 s_delay_alu instid0(VALU_DEP_4)
+0000f05c v_cmp_gt_i32_e64 s7, s12, v0
+0000f064 ds_store_2addr_b32 v1, v178, v185 offset1:20
+0000f06c ds_store_2addr_b32 v1, v183, v184 offset0:40 offset1:60
+0000f074 ds_store_2addr_b32 v1, v181, v182 offset0:80 offset1:100
+0000f07c ds_store_2addr_b32 v1, v179, v180 offset0:120 offset1:140
+0000f084 s_wait_loadcnt_dscnt 0x0
+0000f088 s_barrier_signal -1
+0000f08c v_cmp_gt_i32_e32 vcc_lo, s14, v4
+0000f090 v_ashrrev_i32_e32 v1, 31, v0
+0000f094 v_add3_u32 v2, 0, v5, v2
+0000f09c s_and_b32 s0, s7, vcc_lo
+0000f0a0 s_barrier_wait 0xffff
+0000f0a4 global_inv scope:SCOPE_SE
+0000f0b0 s_wait_alu depctr_sa_sdst(0)
+0000f0b4 s_and_saveexec_b32 s1, s0
+0000f0b8 s_cbranch_execz 22
+0000f0bc v_mad_co_i64_i32 v[5:6], null, s12, v4, 0
+0000f0c4 ds_load_b32 v9, v2
+0000f0cc v_lshlrev_b64_e32 v[7:8], 2, v[0:1]
+0000f0d0 v_lshlrev_b64_e32 v[5:6], 2, v[5:6]
+0000f0d4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f0d8 v_add_co_u32 v5, s0, s16, v5
+0000f0e0 s_wait_alu depctr_va_sdst(0)
+0000f0e4 v_add_co_ci_u32_e64 v6, null, s17, v6, s0
+0000f0ec s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f0f0 v_add_co_u32 v5, s0, v5, v7
+0000f0f8 s_wait_alu depctr_va_sdst(0)
+0000f0fc v_add_co_ci_u32_e64 v6, null, v6, v8, s0
+0000f104 s_wait_dscnt 0x0
+0000f108 global_store_b32 v[5:6], v9, off
+0000f114 s_wait_alu depctr_sa_sdst(0)
+0000f118 s_or_b32 exec_lo, exec_lo, s1
+0000f11c v_or_b32_e32 v5, 64, v4
+0000f120 s_delay_alu instid0(VALU_DEP_1)
+0000f124 v_cmp_gt_i32_e64 s0, s14, v5
+0000f12c s_and_b32 s1, s7, s0
+0000f130 s_wait_alu depctr_sa_sdst(0)
+0000f134 s_and_saveexec_b32 s2, s1
+0000f138 s_cbranch_execz 22
+0000f13c v_mad_co_i64_i32 v[6:7], null, s12, v5, 0
+0000f144 ds_load_b32 v10, v2 offset:1280
+0000f14c v_lshlrev_b64_e32 v[8:9], 2, v[0:1]
+0000f150 v_lshlrev_b64_e32 v[6:7], 2, v[6:7]
+0000f154 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f158 v_add_co_u32 v6, s1, s16, v6
+0000f160 s_wait_alu depctr_va_sdst(0)
+0000f164 v_add_co_ci_u32_e64 v7, null, s17, v7, s1
+0000f16c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f170 v_add_co_u32 v6, s1, v6, v8
+0000f178 s_wait_alu depctr_va_sdst(0)
+0000f17c v_add_co_ci_u32_e64 v7, null, v7, v9, s1
+0000f184 s_wait_dscnt 0x0
+0000f188 global_store_b32 v[6:7], v10, off
+0000f194 s_wait_alu depctr_sa_sdst(0)
+0000f198 s_or_b32 exec_lo, exec_lo, s2
+0000f19c v_or_b32_e32 v6, 32, v0
+0000f1a0 s_delay_alu instid0(VALU_DEP_1)
+0000f1a4 v_cmp_gt_i32_e64 s8, s12, v6
+0000f1ac s_and_b32 s1, s8, vcc_lo
+0000f1b0 s_wait_alu depctr_sa_sdst(0)
+0000f1b4 s_and_saveexec_b32 s2, s1
+0000f1b8 s_cbranch_execz 22
+0000f1bc v_mad_co_i64_i32 v[6:7], null, s12, v4, 0
+0000f1c4 ds_load_b32 v10, v2 offset:2560
+0000f1cc v_lshlrev_b64_e32 v[8:9], 2, v[0:1]
+0000f1d0 v_lshlrev_b64_e32 v[6:7], 2, v[6:7]
+0000f1d4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f1d8 v_add_co_u32 v6, s1, s16, v6
+0000f1e0 s_wait_alu depctr_va_sdst(0)
+0000f1e4 v_add_co_ci_u32_e64 v7, null, s17, v7, s1
+0000f1ec s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f1f0 v_add_co_u32 v6, s1, v6, v8
+0000f1f8 s_wait_alu depctr_va_sdst(0)
+0000f1fc v_add_co_ci_u32_e64 v7, null, v7, v9, s1
+0000f204 s_wait_dscnt 0x0
+0000f208 global_store_b32 v[6:7], v10, off offset:128
+0000f214 s_wait_alu depctr_sa_sdst(0)
+0000f218 s_or_b32 exec_lo, exec_lo, s2
+0000f21c s_and_b32 s1, s8, s0
+0000f220 s_wait_alu depctr_sa_sdst(0)
+0000f224 s_and_saveexec_b32 s2, s1
+0000f228 s_cbranch_execz 22
+0000f22c v_mad_co_i64_i32 v[6:7], null, s12, v5, 0
+0000f234 ds_load_b32 v10, v2 offset:3840
+0000f23c v_lshlrev_b64_e32 v[8:9], 2, v[0:1]
+0000f240 v_lshlrev_b64_e32 v[6:7], 2, v[6:7]
+0000f244 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f248 v_add_co_u32 v6, s1, s16, v6
+0000f250 s_wait_alu depctr_va_sdst(0)
+0000f254 v_add_co_ci_u32_e64 v7, null, s17, v7, s1
+0000f25c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f260 v_add_co_u32 v6, s1, v6, v8
+0000f268 s_wait_alu depctr_va_sdst(0)
+0000f26c v_add_co_ci_u32_e64 v7, null, v7, v9, s1
+0000f274 s_wait_dscnt 0x0
+0000f278 global_store_b32 v[6:7], v10, off offset:128
+0000f284 s_wait_alu depctr_sa_sdst(0)
+0000f288 s_or_b32 exec_lo, exec_lo, s2
+0000f28c v_or_b32_e32 v6, 64, v0
+0000f290 s_delay_alu instid0(VALU_DEP_1)
+0000f294 v_cmp_gt_i32_e64 s9, s12, v6
+0000f29c s_and_b32 s1, s9, vcc_lo
+0000f2a0 s_wait_alu depctr_sa_sdst(0)
+0000f2a4 s_and_saveexec_b32 s2, s1
+0000f2a8 s_cbranch_execz 22
+0000f2ac v_mad_co_i64_i32 v[6:7], null, s12, v4, 0
+0000f2b4 ds_load_b32 v10, v2 offset:5120
+0000f2bc v_lshlrev_b64_e32 v[8:9], 2, v[0:1]
+0000f2c0 v_lshlrev_b64_e32 v[6:7], 2, v[6:7]
+0000f2c4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f2c8 v_add_co_u32 v6, s1, s16, v6
+0000f2d0 s_wait_alu depctr_va_sdst(0)
+0000f2d4 v_add_co_ci_u32_e64 v7, null, s17, v7, s1
+0000f2dc s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f2e0 v_add_co_u32 v6, s1, v6, v8
+0000f2e8 s_wait_alu depctr_va_sdst(0)
+0000f2ec v_add_co_ci_u32_e64 v7, null, v7, v9, s1
+0000f2f4 s_wait_dscnt 0x0
+0000f2f8 global_store_b32 v[6:7], v10, off offset:256
+0000f304 s_wait_alu depctr_sa_sdst(0)
+0000f308 s_or_b32 exec_lo, exec_lo, s2
+0000f30c s_and_b32 s1, s9, s0
+0000f310 s_wait_alu depctr_sa_sdst(0)
+0000f314 s_and_saveexec_b32 s2, s1
+0000f318 s_cbranch_execz 22
+0000f31c v_mad_co_i64_i32 v[6:7], null, s12, v5, 0
+0000f324 ds_load_b32 v10, v2 offset:6400
+0000f32c v_lshlrev_b64_e32 v[8:9], 2, v[0:1]
+0000f330 v_lshlrev_b64_e32 v[6:7], 2, v[6:7]
+0000f334 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f338 v_add_co_u32 v6, s1, s16, v6
+0000f340 s_wait_alu depctr_va_sdst(0)
+0000f344 v_add_co_ci_u32_e64 v7, null, s17, v7, s1
+0000f34c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f350 v_add_co_u32 v6, s1, v6, v8
+0000f358 s_wait_alu depctr_va_sdst(0)
+0000f35c v_add_co_ci_u32_e64 v7, null, v7, v9, s1
+0000f364 s_wait_dscnt 0x0
+0000f368 global_store_b32 v[6:7], v10, off offset:256
+0000f374 s_wait_alu depctr_sa_sdst(0)
+0000f378 s_or_b32 exec_lo, exec_lo, s2
+0000f37c v_or_b32_e32 v6, 0x60, v0
+0000f384 s_delay_alu instid0(VALU_DEP_1)
+0000f388 v_cmp_gt_i32_e64 s10, s12, v6
+0000f390 s_and_b32 s1, s10, vcc_lo
+0000f394 s_wait_alu depctr_sa_sdst(0)
+0000f398 s_and_saveexec_b32 s2, s1
+0000f39c s_cbranch_execz 22
+0000f3a0 v_mad_co_i64_i32 v[6:7], null, s12, v4, 0
+0000f3a8 ds_load_b32 v10, v2 offset:7680
+0000f3b0 v_lshlrev_b64_e32 v[8:9], 2, v[0:1]
+0000f3b4 v_lshlrev_b64_e32 v[6:7], 2, v[6:7]
+0000f3b8 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f3bc v_add_co_u32 v6, s1, s16, v6
+0000f3c4 s_wait_alu depctr_va_sdst(0)
+0000f3c8 v_add_co_ci_u32_e64 v7, null, s17, v7, s1
+0000f3d0 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f3d4 v_add_co_u32 v6, s1, v6, v8
+0000f3dc s_wait_alu depctr_va_sdst(0)
+0000f3e0 v_add_co_ci_u32_e64 v7, null, v7, v9, s1
+0000f3e8 s_wait_dscnt 0x0
+0000f3ec global_store_b32 v[6:7], v10, off offset:384
+0000f3f8 s_wait_alu depctr_sa_sdst(0)
+0000f3fc s_or_b32 exec_lo, exec_lo, s2
+0000f400 v_mul_u32_u24_e32 v6, 0x280, v167
+0000f408 s_and_b32 s1, s10, s0
+0000f40c s_wait_alu depctr_sa_sdst(0)
+0000f410 s_and_saveexec_b32 s2, s1
+0000f414 s_cbranch_execz 22
+0000f418 v_mad_co_i64_i32 v[7:8], null, s12, v5, 0
+0000f420 ds_load_b32 v11, v2 offset:8960
+0000f428 v_lshlrev_b64_e32 v[9:10], 2, v[0:1]
+0000f42c v_lshlrev_b64_e32 v[7:8], 2, v[7:8]
+0000f430 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f434 v_add_co_u32 v7, s1, s16, v7
+0000f43c s_wait_alu depctr_va_sdst(0)
+0000f440 v_add_co_ci_u32_e64 v8, null, s17, v8, s1
+0000f448 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f44c v_add_co_u32 v7, s1, v7, v9
+0000f454 s_wait_alu depctr_va_sdst(0)
+0000f458 v_add_co_ci_u32_e64 v8, null, v8, v10, s1
+0000f460 s_wait_dscnt 0x0
+0000f464 global_store_b32 v[7:8], v11, off offset:384
+0000f470 s_wait_alu depctr_sa_sdst(0)
+0000f474 s_or_b32 exec_lo, exec_lo, s2
+0000f478 s_wait_loadcnt 0x0
+0000f47c s_wait_storecnt 0x0
+0000f480 s_barrier_signal -1
+0000f484 v_add_nc_u32_e32 v3, v3, v6
+0000f488 v_or_b32_e32 v6, 16, v4
+0000f48c s_delay_alu instid0(VALU_DEP_1)
+0000f490 v_cmp_gt_i32_e64 s1, s14, v6
+0000f498 s_and_b32 s2, s7, s1
+0000f49c s_barrier_wait 0xffff
+0000f4a0 global_inv scope:SCOPE_SE
+0000f4ac ds_store_2addr_b32 v3, v175, v174 offset1:20
+0000f4b4 ds_store_2addr_b32 v3, v172, v173 offset0:40 offset1:60
+0000f4bc ds_store_2addr_b32 v3, v171, v170 offset0:80 offset1:100
+0000f4c4 ds_store_2addr_b32 v3, v169, v168 offset0:120 offset1:140
+0000f4cc s_wait_loadcnt_dscnt 0x0
+0000f4d0 s_barrier_signal -1
+0000f4d4 s_barrier_wait 0xffff
+0000f4d8 global_inv scope:SCOPE_SE
+0000f4e4 s_wait_alu depctr_sa_sdst(0)
+0000f4e8 s_and_saveexec_b32 s3, s2
+0000f4ec s_cbranch_execz 22
+0000f4f0 v_mad_co_i64_i32 v[7:8], null, s12, v6, 0
+0000f4f8 ds_load_b32 v11, v2
+0000f500 v_lshlrev_b64_e32 v[9:10], 2, v[0:1]
+0000f504 v_lshlrev_b64_e32 v[7:8], 2, v[7:8]
+0000f508 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f50c v_add_co_u32 v7, s2, s16, v7
+0000f514 s_wait_alu depctr_va_sdst(0)
+0000f518 v_add_co_ci_u32_e64 v8, null, s17, v8, s2
+0000f520 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f524 v_add_co_u32 v7, s2, v7, v9
+0000f52c s_wait_alu depctr_va_sdst(0)
+0000f530 v_add_co_ci_u32_e64 v8, null, v8, v10, s2
+0000f538 s_wait_dscnt 0x0
+0000f53c global_store_b32 v[7:8], v11, off
+0000f548 s_wait_alu depctr_sa_sdst(0)
+0000f54c s_or_b32 exec_lo, exec_lo, s3
+0000f550 v_or_b32_e32 v7, 0x50, v4
+0000f558 s_delay_alu instid0(VALU_DEP_1)
+0000f55c v_cmp_gt_i32_e64 s2, s14, v7
+0000f564 s_and_b32 s3, s7, s2
+0000f568 s_wait_alu depctr_sa_sdst(0)
+0000f56c s_and_saveexec_b32 s4, s3
+0000f570 s_cbranch_execnz 840
+00010294 v_mad_co_i64_i32 v[8:9], null, s12, v7, 0
+0001029c ds_load_b32 v12, v2 offset:1280
+000102a4 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+000102a8 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+000102ac s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000102b0 v_add_co_u32 v8, s3, s16, v8
+000102b8 s_wait_alu depctr_va_sdst(0)
+000102bc v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+000102c4 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000102c8 v_add_co_u32 v8, s3, v8, v10
+000102d0 s_wait_alu depctr_va_sdst(0)
+000102d4 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+000102dc s_wait_dscnt 0x0
+000102e0 global_store_b32 v[8:9], v12, off
+000102ec s_wait_alu depctr_sa_sdst(0)
+000102f0 s_or_b32 exec_lo, exec_lo, s4
+000102f4 s_and_b32 s3, s8, s1
+000102f8 s_wait_alu depctr_sa_sdst(0)
+000102fc s_and_saveexec_b32 s4, s3
+00010300 s_cbranch_execz 64674
+00010304 v_mad_co_i64_i32 v[8:9], null, s12, v6, 0
+0001030c ds_load_b32 v12, v2 offset:2560
+00010314 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+00010318 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+0001031c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010320 v_add_co_u32 v8, s3, s16, v8
+00010328 s_wait_alu depctr_va_sdst(0)
+0001032c v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+00010334 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010338 v_add_co_u32 v8, s3, v8, v10
+00010340 s_wait_alu depctr_va_sdst(0)
+00010344 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+0001034c s_wait_dscnt 0x0
+00010350 global_store_b32 v[8:9], v12, off offset:128
+0001035c s_wait_alu depctr_sa_sdst(0)
+00010360 s_or_b32 exec_lo, exec_lo, s4
+00010364 s_and_b32 s3, s8, s2
+00010368 s_wait_alu depctr_sa_sdst(0)
+0001036c s_and_saveexec_b32 s4, s3
+00010370 s_cbranch_execz 64652
+00010374 v_mad_co_i64_i32 v[8:9], null, s12, v7, 0
+0001037c ds_load_b32 v12, v2 offset:3840
+00010384 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+00010388 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+0001038c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010390 v_add_co_u32 v8, s3, s16, v8
+00010398 s_wait_alu depctr_va_sdst(0)
+0001039c v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+000103a4 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000103a8 v_add_co_u32 v8, s3, v8, v10
+000103b0 s_wait_alu depctr_va_sdst(0)
+000103b4 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+000103bc s_wait_dscnt 0x0
+000103c0 global_store_b32 v[8:9], v12, off offset:128
+000103cc s_wait_alu depctr_sa_sdst(0)
+000103d0 s_or_b32 exec_lo, exec_lo, s4
+000103d4 s_and_b32 s3, s9, s1
+000103d8 s_wait_alu depctr_sa_sdst(0)
+000103dc s_and_saveexec_b32 s4, s3
+000103e0 s_cbranch_execz 64630
+000103e4 v_mad_co_i64_i32 v[8:9], null, s12, v6, 0
+000103ec ds_load_b32 v12, v2 offset:5120
+000103f4 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+000103f8 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+000103fc s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010400 v_add_co_u32 v8, s3, s16, v8
+00010408 s_wait_alu depctr_va_sdst(0)
+0001040c v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+00010414 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010418 v_add_co_u32 v8, s3, v8, v10
+00010420 s_wait_alu depctr_va_sdst(0)
+00010424 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+0001042c s_wait_dscnt 0x0
+00010430 global_store_b32 v[8:9], v12, off offset:256
+0001043c s_wait_alu depctr_sa_sdst(0)
+00010440 s_or_b32 exec_lo, exec_lo, s4
+00010444 s_and_b32 s3, s9, s2
+00010448 s_wait_alu depctr_sa_sdst(0)
+0001044c s_and_saveexec_b32 s4, s3
+00010450 s_cbranch_execz 64608
+00010454 v_mad_co_i64_i32 v[8:9], null, s12, v7, 0
+0001045c ds_load_b32 v12, v2 offset:6400
+00010464 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+00010468 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+0001046c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010470 v_add_co_u32 v8, s3, s16, v8
+00010478 s_wait_alu depctr_va_sdst(0)
+0001047c v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+00010484 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010488 v_add_co_u32 v8, s3, v8, v10
+00010490 s_wait_alu depctr_va_sdst(0)
+00010494 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+0001049c s_wait_dscnt 0x0
+000104a0 global_store_b32 v[8:9], v12, off offset:256
+000104ac s_wait_alu depctr_sa_sdst(0)
+000104b0 s_or_b32 exec_lo, exec_lo, s4
+000104b4 s_and_b32 s3, s10, s1
+000104b8 s_wait_alu depctr_sa_sdst(0)
+000104bc s_and_saveexec_b32 s4, s3
+000104c0 s_cbranch_execz 64586
+000104c4 v_mad_co_i64_i32 v[8:9], null, s12, v6, 0
+000104cc ds_load_b32 v12, v2 offset:7680
+000104d4 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+000104d8 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+000104dc s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000104e0 v_add_co_u32 v8, s3, s16, v8
+000104e8 s_wait_alu depctr_va_sdst(0)
+000104ec v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+000104f4 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000104f8 v_add_co_u32 v8, s3, v8, v10
+00010500 s_wait_alu depctr_va_sdst(0)
+00010504 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+0001050c s_wait_dscnt 0x0
+00010510 global_store_b32 v[8:9], v12, off offset:384
+0001051c s_wait_alu depctr_sa_sdst(0)
+00010520 s_or_b32 exec_lo, exec_lo, s4
+00010524 s_and_b32 s3, s10, s2
+00010528 s_wait_alu depctr_sa_sdst(0)
+0001052c s_and_saveexec_b32 s4, s3
+00010530 s_cbranch_execnz 64564
+0000f604 v_mad_co_i64_i32 v[8:9], null, s12, v7, 0
+0000f60c ds_load_b32 v12, v2 offset:8960
+0000f614 v_lshlrev_b64_e32 v[10:11], 2, v[0:1]
+0000f618 v_lshlrev_b64_e32 v[8:9], 2, v[8:9]
+0000f61c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f620 v_add_co_u32 v8, s3, s16, v8
+0000f628 s_wait_alu depctr_va_sdst(0)
+0000f62c v_add_co_ci_u32_e64 v9, null, s17, v9, s3
+0000f634 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f638 v_add_co_u32 v8, s3, v8, v10
+0000f640 s_wait_alu depctr_va_sdst(0)
+0000f644 v_add_co_ci_u32_e64 v9, null, v9, v11, s3
+0000f64c s_wait_dscnt 0x0
+0000f650 global_store_b32 v[8:9], v12, off offset:384
+0000f65c s_wait_alu depctr_sa_sdst(0)
+0000f660 s_or_b32 exec_lo, exec_lo, s4
+0000f664 s_wait_loadcnt 0x0
+0000f668 s_wait_storecnt 0x0
+0000f66c s_barrier_signal -1
+0000f670 v_or_b32_e32 v8, 32, v4
+0000f674 s_delay_alu instid0(VALU_DEP_1)
+0000f678 v_cmp_gt_i32_e64 s3, s14, v8
+0000f680 s_and_b32 s4, s7, s3
+0000f684 s_barrier_wait 0xffff
+0000f688 global_inv scope:SCOPE_SE
+0000f694 ds_store_2addr_b32 v3, v165, v166 offset1:20
+0000f69c ds_store_2addr_b32 v3, v163, v164 offset0:40 offset1:60
+0000f6a4 ds_store_2addr_b32 v3, v161, v162 offset0:80 offset1:100
+0000f6ac ds_store_2addr_b32 v3, v159, v160 offset0:120 offset1:140
+0000f6b4 s_wait_loadcnt_dscnt 0x0
+0000f6b8 s_barrier_signal -1
+0000f6bc s_barrier_wait 0xffff
+0000f6c0 global_inv scope:SCOPE_SE
+0000f6cc s_wait_alu depctr_sa_sdst(0)
+0000f6d0 s_and_saveexec_b32 s5, s4
+0000f6d4 s_cbranch_execz 22
+0000f6d8 v_mad_co_i64_i32 v[9:10], null, s12, v8, 0
+0000f6e0 ds_load_b32 v13, v2
+0000f6e8 v_lshlrev_b64_e32 v[11:12], 2, v[0:1]
+0000f6ec v_lshlrev_b64_e32 v[9:10], 2, v[9:10]
+0000f6f0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f6f4 v_add_co_u32 v9, s4, s16, v9
+0000f6fc s_wait_alu depctr_va_sdst(0)
+0000f700 v_add_co_ci_u32_e64 v10, null, s17, v10, s4
+0000f708 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f70c v_add_co_u32 v9, s4, v9, v11
+0000f714 s_wait_alu depctr_va_sdst(0)
+0000f718 v_add_co_ci_u32_e64 v10, null, v10, v12, s4
+0000f720 s_wait_dscnt 0x0
+0000f724 global_store_b32 v[9:10], v13, off
+0000f730 s_wait_alu depctr_sa_sdst(0)
+0000f734 s_or_b32 exec_lo, exec_lo, s5
+0000f738 v_or_b32_e32 v9, 0x60, v4
+0000f740 s_delay_alu instid0(VALU_DEP_1)
+0000f744 v_cmp_gt_i32_e64 s4, s14, v9
+0000f74c s_and_b32 s5, s7, s4
+0000f750 s_wait_alu depctr_sa_sdst(0)
+0000f754 s_and_saveexec_b32 s6, s5
+0000f758 s_cbranch_execnz 887
+00010538 v_mad_co_i64_i32 v[10:11], null, s12, v9, 0
+00010540 ds_load_b32 v14, v2 offset:1280
+00010548 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0001054c v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+00010550 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010554 v_add_co_u32 v10, s5, s16, v10
+0001055c s_wait_alu depctr_va_sdst(0)
+00010560 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+00010568 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001056c v_add_co_u32 v10, s5, v10, v12
+00010574 s_wait_alu depctr_va_sdst(0)
+00010578 v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+00010580 s_wait_dscnt 0x0
+00010584 global_store_b32 v[10:11], v14, off
+00010590 s_wait_alu depctr_sa_sdst(0)
+00010594 s_or_b32 exec_lo, exec_lo, s6
+00010598 s_and_b32 s5, s8, s3
+0001059c s_wait_alu depctr_sa_sdst(0)
+000105a0 s_and_saveexec_b32 s6, s5
+000105a4 s_cbranch_execz 64627
+000105a8 v_mad_co_i64_i32 v[10:11], null, s12, v8, 0
+000105b0 ds_load_b32 v14, v2 offset:2560
+000105b8 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+000105bc v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+000105c0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000105c4 v_add_co_u32 v10, s5, s16, v10
+000105cc s_wait_alu depctr_va_sdst(0)
+000105d0 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+000105d8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000105dc v_add_co_u32 v10, s5, v10, v12
+000105e4 s_wait_alu depctr_va_sdst(0)
+000105e8 v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+000105f0 s_wait_dscnt 0x0
+000105f4 global_store_b32 v[10:11], v14, off offset:128
+00010600 s_wait_alu depctr_sa_sdst(0)
+00010604 s_or_b32 exec_lo, exec_lo, s6
+00010608 s_and_b32 s5, s8, s4
+0001060c s_wait_alu depctr_sa_sdst(0)
+00010610 s_and_saveexec_b32 s6, s5
+00010614 s_cbranch_execz 64605
+00010618 v_mad_co_i64_i32 v[10:11], null, s12, v9, 0
+00010620 ds_load_b32 v14, v2 offset:3840
+00010628 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0001062c v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+00010630 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010634 v_add_co_u32 v10, s5, s16, v10
+0001063c s_wait_alu depctr_va_sdst(0)
+00010640 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+00010648 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001064c v_add_co_u32 v10, s5, v10, v12
+00010654 s_wait_alu depctr_va_sdst(0)
+00010658 v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+00010660 s_wait_dscnt 0x0
+00010664 global_store_b32 v[10:11], v14, off offset:128
+00010670 s_wait_alu depctr_sa_sdst(0)
+00010674 s_or_b32 exec_lo, exec_lo, s6
+00010678 s_and_b32 s5, s9, s3
+0001067c s_wait_alu depctr_sa_sdst(0)
+00010680 s_and_saveexec_b32 s6, s5
+00010684 s_cbranch_execz 64583
+00010688 v_mad_co_i64_i32 v[10:11], null, s12, v8, 0
+00010690 ds_load_b32 v14, v2 offset:5120
+00010698 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0001069c v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+000106a0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000106a4 v_add_co_u32 v10, s5, s16, v10
+000106ac s_wait_alu depctr_va_sdst(0)
+000106b0 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+000106b8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000106bc v_add_co_u32 v10, s5, v10, v12
+000106c4 s_wait_alu depctr_va_sdst(0)
+000106c8 v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+000106d0 s_wait_dscnt 0x0
+000106d4 global_store_b32 v[10:11], v14, off offset:256
+000106e0 s_wait_alu depctr_sa_sdst(0)
+000106e4 s_or_b32 exec_lo, exec_lo, s6
+000106e8 s_and_b32 s5, s9, s4
+000106ec s_wait_alu depctr_sa_sdst(0)
+000106f0 s_and_saveexec_b32 s6, s5
+000106f4 s_cbranch_execz 64561
+000106f8 v_mad_co_i64_i32 v[10:11], null, s12, v9, 0
+00010700 ds_load_b32 v14, v2 offset:6400
+00010708 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0001070c v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+00010710 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010714 v_add_co_u32 v10, s5, s16, v10
+0001071c s_wait_alu depctr_va_sdst(0)
+00010720 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+00010728 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001072c v_add_co_u32 v10, s5, v10, v12
+00010734 s_wait_alu depctr_va_sdst(0)
+00010738 v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+00010740 s_wait_dscnt 0x0
+00010744 global_store_b32 v[10:11], v14, off offset:256
+00010750 s_wait_alu depctr_sa_sdst(0)
+00010754 s_or_b32 exec_lo, exec_lo, s6
+00010758 s_and_b32 s5, s10, s3
+0001075c s_wait_alu depctr_sa_sdst(0)
+00010760 s_and_saveexec_b32 s6, s5
+00010764 s_cbranch_execz 64539
+00010768 v_mad_co_i64_i32 v[10:11], null, s12, v8, 0
+00010770 ds_load_b32 v14, v2 offset:7680
+00010778 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0001077c v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+00010780 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010784 v_add_co_u32 v10, s5, s16, v10
+0001078c s_wait_alu depctr_va_sdst(0)
+00010790 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+00010798 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001079c v_add_co_u32 v10, s5, v10, v12
+000107a4 s_wait_alu depctr_va_sdst(0)
+000107a8 v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+000107b0 s_wait_dscnt 0x0
+000107b4 global_store_b32 v[10:11], v14, off offset:384
+000107c0 s_wait_alu depctr_sa_sdst(0)
+000107c4 s_or_b32 exec_lo, exec_lo, s6
+000107c8 s_and_b32 s5, s10, s4
+000107cc s_wait_alu depctr_sa_sdst(0)
+000107d0 s_and_saveexec_b32 s6, s5
+000107d4 s_cbranch_execnz 64517
+0000f7ec v_mad_co_i64_i32 v[10:11], null, s12, v9, 0
+0000f7f4 ds_load_b32 v14, v2 offset:8960
+0000f7fc v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0000f800 v_lshlrev_b64_e32 v[10:11], 2, v[10:11]
+0000f804 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f808 v_add_co_u32 v10, s5, s16, v10
+0000f810 s_wait_alu depctr_va_sdst(0)
+0000f814 v_add_co_ci_u32_e64 v11, null, s17, v11, s5
+0000f81c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f820 v_add_co_u32 v10, s5, v10, v12
+0000f828 s_wait_alu depctr_va_sdst(0)
+0000f82c v_add_co_ci_u32_e64 v11, null, v11, v13, s5
+0000f834 s_wait_dscnt 0x0
+0000f838 global_store_b32 v[10:11], v14, off offset:384
+0000f844 s_wait_alu depctr_sa_sdst(0)
+0000f848 s_or_b32 exec_lo, exec_lo, s6
+0000f84c s_wait_loadcnt 0x0
+0000f850 s_wait_storecnt 0x0
+0000f854 s_barrier_signal -1
+0000f858 v_or_b32_e32 v10, 48, v4
+0000f85c s_delay_alu instid0(VALU_DEP_1)
+0000f860 v_cmp_gt_i32_e64 s5, s14, v10
+0000f868 s_and_b32 s6, s7, s5
+0000f86c s_barrier_wait 0xffff
+0000f870 global_inv scope:SCOPE_SE
+0000f87c ds_store_2addr_b32 v3, v157, v158 offset1:20
+0000f884 ds_store_2addr_b32 v3, v155, v156 offset0:40 offset1:60
+0000f88c ds_store_2addr_b32 v3, v153, v154 offset0:80 offset1:100
+0000f894 ds_store_2addr_b32 v3, v151, v152 offset0:120 offset1:140
+0000f89c s_wait_loadcnt_dscnt 0x0
+0000f8a0 s_barrier_signal -1
+0000f8a4 s_barrier_wait 0xffff
+0000f8a8 global_inv scope:SCOPE_SE
+0000f8b4 s_wait_alu depctr_sa_sdst(0)
+0000f8b8 s_and_saveexec_b32 s11, s6
+0000f8bc s_cbranch_execz 22
+0000f8c0 v_mad_co_i64_i32 v[11:12], null, s12, v10, 0
+0000f8c8 ds_load_b32 v15, v2
+0000f8d0 v_lshlrev_b64_e32 v[13:14], 2, v[0:1]
+0000f8d4 v_lshlrev_b64_e32 v[11:12], 2, v[11:12]
+0000f8d8 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f8dc v_add_co_u32 v11, s6, s16, v11
+0000f8e4 s_wait_alu depctr_va_sdst(0)
+0000f8e8 v_add_co_ci_u32_e64 v12, null, s17, v12, s6
+0000f8f0 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f8f4 v_add_co_u32 v11, s6, v11, v13
+0000f8fc s_wait_alu depctr_va_sdst(0)
+0000f900 v_add_co_ci_u32_e64 v12, null, v12, v14, s6
+0000f908 s_wait_dscnt 0x0
+0000f90c global_store_b32 v[11:12], v15, off
+0000f918 s_or_b32 exec_lo, exec_lo, s11
+0000f91c v_or_b32_e32 v11, 0x70, v4
+0000f924 s_delay_alu instid0(VALU_DEP_1)
+0000f928 v_cmp_gt_i32_e64 s6, s14, v11
+0000f930 s_and_b32 s7, s7, s6
+0000f934 s_wait_alu depctr_sa_sdst(0)
+0000f938 s_and_saveexec_b32 s11, s7
+0000f93c s_cbranch_execnz 935
+000107dc v_mad_co_i64_i32 v[12:13], null, s12, v11, 0
+000107e4 ds_load_b32 v16, v2 offset:1280
+000107ec v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+000107f0 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+000107f4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000107f8 v_add_co_u32 v12, s7, s16, v12
+00010800 s_wait_alu depctr_va_sdst(0)
+00010804 v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+0001080c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010810 v_add_co_u32 v12, s7, v12, v14
+00010818 s_wait_alu depctr_va_sdst(0)
+0001081c v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+00010824 s_wait_dscnt 0x0
+00010828 global_store_b32 v[12:13], v16, off
+00010834 s_or_b32 exec_lo, exec_lo, s11
+00010838 s_and_b32 s7, s8, s5
+0001083c s_wait_alu depctr_sa_sdst(0)
+00010840 s_and_saveexec_b32 s11, s7
+00010844 s_cbranch_execz 64579
+00010848 v_mad_co_i64_i32 v[12:13], null, s12, v10, 0
+00010850 ds_load_b32 v16, v2 offset:2560
+00010858 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0001085c v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+00010860 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010864 v_add_co_u32 v12, s7, s16, v12
+0001086c s_wait_alu depctr_va_sdst(0)
+00010870 v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+00010878 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001087c v_add_co_u32 v12, s7, v12, v14
+00010884 s_wait_alu depctr_va_sdst(0)
+00010888 v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+00010890 s_wait_dscnt 0x0
+00010894 global_store_b32 v[12:13], v16, off offset:128
+000108a0 s_or_b32 exec_lo, exec_lo, s11
+000108a4 s_and_b32 s7, s8, s6
+000108a8 s_wait_alu depctr_sa_sdst(0)
+000108ac s_and_saveexec_b32 s8, s7
+000108b0 s_cbranch_execz 64557
+000108b4 v_mad_co_i64_i32 v[12:13], null, s12, v11, 0
+000108bc ds_load_b32 v16, v2 offset:3840
+000108c4 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+000108c8 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+000108cc s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000108d0 v_add_co_u32 v12, s7, s16, v12
+000108d8 s_wait_alu depctr_va_sdst(0)
+000108dc v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+000108e4 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000108e8 v_add_co_u32 v12, s7, v12, v14
+000108f0 s_wait_alu depctr_va_sdst(0)
+000108f4 v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+000108fc s_wait_dscnt 0x0
+00010900 global_store_b32 v[12:13], v16, off offset:128
+0001090c s_wait_alu depctr_sa_sdst(0)
+00010910 s_or_b32 exec_lo, exec_lo, s8
+00010914 s_and_b32 s7, s9, s5
+00010918 s_wait_alu depctr_sa_sdst(0)
+0001091c s_and_saveexec_b32 s8, s7
+00010920 s_cbranch_execz 64535
+00010924 v_mad_co_i64_i32 v[12:13], null, s12, v10, 0
+0001092c ds_load_b32 v16, v2 offset:5120
+00010934 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+00010938 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0001093c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010940 v_add_co_u32 v12, s7, s16, v12
+00010948 s_wait_alu depctr_va_sdst(0)
+0001094c v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+00010954 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010958 v_add_co_u32 v12, s7, v12, v14
+00010960 s_wait_alu depctr_va_sdst(0)
+00010964 v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+0001096c s_wait_dscnt 0x0
+00010970 global_store_b32 v[12:13], v16, off offset:256
+0001097c s_wait_alu depctr_sa_sdst(0)
+00010980 s_or_b32 exec_lo, exec_lo, s8
+00010984 s_and_b32 s7, s9, s6
+00010988 s_wait_alu depctr_sa_sdst(0)
+0001098c s_and_saveexec_b32 s8, s7
+00010990 s_cbranch_execz 64513
+00010994 v_mad_co_i64_i32 v[12:13], null, s12, v11, 0
+0001099c ds_load_b32 v16, v2 offset:6400
+000109a4 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+000109a8 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+000109ac s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000109b0 v_add_co_u32 v12, s7, s16, v12
+000109b8 s_wait_alu depctr_va_sdst(0)
+000109bc v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+000109c4 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000109c8 v_add_co_u32 v12, s7, v12, v14
+000109d0 s_wait_alu depctr_va_sdst(0)
+000109d4 v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+000109dc s_wait_dscnt 0x0
+000109e0 global_store_b32 v[12:13], v16, off offset:256
+000109ec s_wait_alu depctr_sa_sdst(0)
+000109f0 s_or_b32 exec_lo, exec_lo, s8
+000109f4 s_and_b32 s7, s10, s5
+000109f8 s_wait_alu depctr_sa_sdst(0)
+000109fc s_and_saveexec_b32 s8, s7
+00010a00 s_cbranch_execz 64491
+00010a04 v_mad_co_i64_i32 v[12:13], null, s12, v10, 0
+00010a0c ds_load_b32 v16, v2 offset:7680
+00010a14 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+00010a18 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+00010a1c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010a20 v_add_co_u32 v12, s7, s16, v12
+00010a28 s_wait_alu depctr_va_sdst(0)
+00010a2c v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+00010a34 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010a38 v_add_co_u32 v12, s7, v12, v14
+00010a40 s_wait_alu depctr_va_sdst(0)
+00010a44 v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+00010a4c s_wait_dscnt 0x0
+00010a50 global_store_b32 v[12:13], v16, off offset:384
+00010a5c s_wait_alu depctr_sa_sdst(0)
+00010a60 s_or_b32 exec_lo, exec_lo, s8
+00010a64 s_and_b32 s7, s10, s6
+00010a68 s_wait_alu depctr_sa_sdst(0)
+00010a6c s_and_saveexec_b32 s8, s7
+00010a70 s_cbranch_execnz 64469
+0000f9c8 v_mad_co_i64_i32 v[12:13], null, s12, v11, 0
+0000f9d0 ds_load_b32 v16, v2 offset:8960
+0000f9d8 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000f9dc v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000f9e0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f9e4 v_add_co_u32 v12, s7, s16, v12
+0000f9ec s_wait_alu depctr_va_sdst(0)
+0000f9f0 v_add_co_ci_u32_e64 v13, null, s17, v13, s7
+0000f9f8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000f9fc v_add_co_u32 v12, s7, v12, v14
+0000fa04 s_wait_alu depctr_va_sdst(0)
+0000fa08 v_add_co_ci_u32_e64 v13, null, v13, v15, s7
+0000fa10 s_wait_dscnt 0x0
+0000fa14 global_store_b32 v[12:13], v16, off offset:384
+0000fa20 s_wait_alu depctr_sa_sdst(0)
+0000fa24 s_or_b32 exec_lo, exec_lo, s8
+0000fa28 s_wait_loadcnt 0x0
+0000fa2c s_wait_storecnt 0x0
+0000fa30 s_barrier_signal -1
+0000fa34 v_or_b32_e32 v12, 16, v0
+0000fa38 s_delay_alu instid0(VALU_DEP_1)
+0000fa3c v_cmp_gt_i32_e64 s7, s12, v12
+0000fa44 s_and_b32 s8, s7, vcc_lo
+0000fa48 s_barrier_wait 0xffff
+0000fa4c global_inv scope:SCOPE_SE
+0000fa58 ds_store_2addr_b32 v3, v149, v150 offset1:20
+0000fa60 ds_store_2addr_b32 v3, v147, v148 offset0:40 offset1:60
+0000fa68 ds_store_2addr_b32 v3, v146, v145 offset0:80 offset1:100
+0000fa70 ds_store_2addr_b32 v3, v143, v144 offset0:120 offset1:140
+0000fa78 s_wait_loadcnt_dscnt 0x0
+0000fa7c s_barrier_signal -1
+0000fa80 s_barrier_wait 0xffff
+0000fa84 global_inv scope:SCOPE_SE
+0000fa90 s_wait_alu depctr_sa_sdst(0)
+0000fa94 s_and_saveexec_b32 s9, s8
+0000fa98 s_cbranch_execz 22
+0000fa9c v_mad_co_i64_i32 v[12:13], null, s12, v4, 0
+0000faa4 ds_load_b32 v16, v2
+0000faac v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fab0 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fab4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fab8 v_add_co_u32 v12, s8, s16, v12
+0000fac0 s_wait_alu depctr_va_sdst(0)
+0000fac4 v_add_co_ci_u32_e64 v13, null, s17, v13, s8
+0000facc s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fad0 v_add_co_u32 v12, s8, v12, v14
+0000fad8 s_wait_alu depctr_va_sdst(0)
+0000fadc v_add_co_ci_u32_e64 v13, null, v13, v15, s8
+0000fae4 s_wait_dscnt 0x0
+0000fae8 global_store_b32 v[12:13], v16, off offset:64
+0000faf4 s_wait_alu depctr_sa_sdst(0)
+0000faf8 s_or_b32 exec_lo, exec_lo, s9
+0000fafc s_and_b32 s8, s7, s0
+0000fb00 s_wait_alu depctr_sa_sdst(0)
+0000fb04 s_and_saveexec_b32 s9, s8
+0000fb08 s_cbranch_execz 22
+0000fb0c v_mad_co_i64_i32 v[12:13], null, s12, v5, 0
+0000fb14 ds_load_b32 v16, v2 offset:1280
+0000fb1c v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fb20 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fb24 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fb28 v_add_co_u32 v12, s8, s16, v12
+0000fb30 s_wait_alu depctr_va_sdst(0)
+0000fb34 v_add_co_ci_u32_e64 v13, null, s17, v13, s8
+0000fb3c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fb40 v_add_co_u32 v12, s8, v12, v14
+0000fb48 s_wait_alu depctr_va_sdst(0)
+0000fb4c v_add_co_ci_u32_e64 v13, null, v13, v15, s8
+0000fb54 s_wait_dscnt 0x0
+0000fb58 global_store_b32 v[12:13], v16, off offset:64
+0000fb64 s_wait_alu depctr_sa_sdst(0)
+0000fb68 s_or_b32 exec_lo, exec_lo, s9
+0000fb6c v_or_b32_e32 v12, 48, v0
+0000fb70 s_delay_alu instid0(VALU_DEP_1)
+0000fb74 v_cmp_gt_i32_e64 s8, s12, v12
+0000fb7c s_and_b32 s9, s8, vcc_lo
+0000fb80 s_wait_alu depctr_sa_sdst(0)
+0000fb84 s_and_saveexec_b32 s10, s9
+0000fb88 s_cbranch_execz 22
+0000fb8c v_mad_co_i64_i32 v[12:13], null, s12, v4, 0
+0000fb94 ds_load_b32 v16, v2 offset:2560
+0000fb9c v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fba0 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fba4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fba8 v_add_co_u32 v12, s9, s16, v12
+0000fbb0 s_wait_alu depctr_va_sdst(0)
+0000fbb4 v_add_co_ci_u32_e64 v13, null, s17, v13, s9
+0000fbbc s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fbc0 v_add_co_u32 v12, s9, v12, v14
+0000fbc8 s_wait_alu depctr_va_sdst(0)
+0000fbcc v_add_co_ci_u32_e64 v13, null, v13, v15, s9
+0000fbd4 s_wait_dscnt 0x0
+0000fbd8 global_store_b32 v[12:13], v16, off offset:192
+0000fbe4 s_or_b32 exec_lo, exec_lo, s10
+0000fbe8 s_and_b32 s9, s8, s0
+0000fbec s_wait_alu depctr_sa_sdst(0)
+0000fbf0 s_and_saveexec_b32 s10, s9
+0000fbf4 s_cbranch_execz 22
+0000fbf8 v_mad_co_i64_i32 v[12:13], null, s12, v5, 0
+0000fc00 ds_load_b32 v16, v2 offset:3840
+0000fc08 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fc0c v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fc10 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fc14 v_add_co_u32 v12, s9, s16, v12
+0000fc1c s_wait_alu depctr_va_sdst(0)
+0000fc20 v_add_co_ci_u32_e64 v13, null, s17, v13, s9
+0000fc28 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fc2c v_add_co_u32 v12, s9, v12, v14
+0000fc34 s_wait_alu depctr_va_sdst(0)
+0000fc38 v_add_co_ci_u32_e64 v13, null, v13, v15, s9
+0000fc40 s_wait_dscnt 0x0
+0000fc44 global_store_b32 v[12:13], v16, off offset:192
+0000fc50 s_or_b32 exec_lo, exec_lo, s10
+0000fc54 v_or_b32_e32 v12, 0x50, v0
+0000fc5c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(SALU_CYCLE_1)
+0000fc60 v_cmp_gt_i32_e64 s9, s12, v12
+0000fc68 s_and_b32 s10, s9, vcc_lo
+0000fc6c s_and_saveexec_b32 s11, s10
+0000fc70 s_cbranch_execz 21
+0000fc74 v_mad_co_i64_i32 v[12:13], null, s12, v4, 0
+0000fc7c ds_load_b32 v16, v2 offset:5120
+0000fc84 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fc88 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fc8c s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+0000fc90 v_add_co_u32 v12, s10, s16, v12
+0000fc98 v_add_co_ci_u32_e64 v13, null, s17, v13, s10
+0000fca0 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fca4 v_add_co_u32 v12, s10, v12, v14
+0000fcac s_wait_alu depctr_va_sdst(0)
+0000fcb0 v_add_co_ci_u32_e64 v13, null, v13, v15, s10
+0000fcb8 s_wait_dscnt 0x0
+0000fcbc global_store_b32 v[12:13], v16, off offset:320
+0000fcc8 s_or_b32 exec_lo, exec_lo, s11
+0000fccc s_and_b32 s10, s9, s0
+0000fcd0 s_wait_alu depctr_sa_sdst(0)
+0000fcd4 s_and_saveexec_b32 s11, s10
+0000fcd8 s_cbranch_execz 22
+0000fcdc v_mad_co_i64_i32 v[12:13], null, s12, v5, 0
+0000fce4 ds_load_b32 v16, v2 offset:6400
+0000fcec v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fcf0 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fcf4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fcf8 v_add_co_u32 v12, s10, s16, v12
+0000fd00 s_wait_alu depctr_va_sdst(0)
+0000fd04 v_add_co_ci_u32_e64 v13, null, s17, v13, s10
+0000fd0c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fd10 v_add_co_u32 v12, s10, v12, v14
+0000fd18 s_wait_alu depctr_va_sdst(0)
+0000fd1c v_add_co_ci_u32_e64 v13, null, v13, v15, s10
+0000fd24 s_wait_dscnt 0x0
+0000fd28 global_store_b32 v[12:13], v16, off offset:320
+0000fd34 s_wait_alu depctr_sa_sdst(0)
+0000fd38 s_or_b32 exec_lo, exec_lo, s11
+0000fd3c v_or_b32_e32 v12, 0x70, v0
+0000fd44 s_delay_alu instid0(VALU_DEP_1)
+0000fd48 v_cmp_gt_i32_e64 s10, s12, v12
+0000fd50 s_and_b32 s13, s10, vcc_lo
+0000fd54 s_wait_alu depctr_sa_sdst(0)
+0000fd58 s_and_saveexec_b32 s11, s13
+0000fd5c s_cbranch_execz 22
+0000fd60 v_mad_co_i64_i32 v[12:13], null, s12, v4, 0
+0000fd68 ds_load_b32 v4, v2 offset:7680
+0000fd70 v_lshlrev_b64_e32 v[14:15], 2, v[0:1]
+0000fd74 v_lshlrev_b64_e32 v[12:13], 2, v[12:13]
+0000fd78 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fd7c v_add_co_u32 v12, vcc_lo, s16, v12
+0000fd84 s_wait_alu depctr_va_vcc(0)
+0000fd88 v_add_co_ci_u32_e64 v13, null, s17, v13, vcc_lo
+0000fd90 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fd94 v_add_co_u32 v12, vcc_lo, v12, v14
+0000fd9c s_wait_alu depctr_va_vcc(0)
+0000fda0 v_add_co_ci_u32_e64 v13, null, v13, v15, vcc_lo
+0000fda8 s_wait_dscnt 0x0
+0000fdac global_store_b32 v[12:13], v4, off offset:448
+0000fdb8 s_wait_alu depctr_sa_sdst(0)
+0000fdbc s_or_b32 exec_lo, exec_lo, s11
+0000fdc0 s_and_b32 s11, s10, s0
+0000fdc4 s_wait_alu depctr_sa_sdst(0)
+0000fdc8 s_and_saveexec_b32 s0, s11
+0000fdcc s_cbranch_execz 22
+0000fdd0 v_mad_co_i64_i32 v[4:5], null, s12, v5, 0
+0000fdd8 ds_load_b32 v14, v2 offset:8960
+0000fde0 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+0000fde4 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+0000fde8 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fdec v_add_co_u32 v4, vcc_lo, s16, v4
+0000fdf4 s_wait_alu depctr_va_vcc(0)
+0000fdf8 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+0000fe00 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000fe04 v_add_co_u32 v4, vcc_lo, v4, v12
+0000fe0c s_wait_alu depctr_va_vcc(0)
+0000fe10 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+0000fe18 s_wait_dscnt 0x0
+0000fe1c global_store_b32 v[4:5], v14, off offset:448
+0000fe28 s_wait_alu depctr_sa_sdst(0)
+0000fe2c s_or_b32 exec_lo, exec_lo, s0
+0000fe30 s_wait_loadcnt 0x0
+0000fe34 s_wait_storecnt 0x0
+0000fe38 s_barrier_signal -1
+0000fe3c s_and_b32 s11, s7, s1
+0000fe40 s_barrier_wait 0xffff
+0000fe44 global_inv scope:SCOPE_SE
+0000fe50 ds_store_2addr_b32 v3, v141, v142 offset1:20
+0000fe58 ds_store_2addr_b32 v3, v140, v139 offset0:40 offset1:60
+0000fe60 ds_store_2addr_b32 v3, v137, v138 offset0:80 offset1:100
+0000fe68 ds_store_2addr_b32 v3, v135, v136 offset0:120 offset1:140
+0000fe70 s_wait_loadcnt_dscnt 0x0
+0000fe74 s_barrier_signal -1
+0000fe78 s_barrier_wait 0xffff
+0000fe7c global_inv scope:SCOPE_SE
+0000fe88 s_wait_alu depctr_sa_sdst(0)
+0000fe8c s_and_saveexec_b32 s0, s11
+0000fe90 s_cbranch_execnz 761
+00010a78 v_mad_co_i64_i32 v[4:5], null, s12, v6, 0
+00010a80 ds_load_b32 v14, v2
+00010a88 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010a8c v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010a90 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010a94 v_add_co_u32 v4, vcc_lo, s16, v4
+00010a9c s_wait_alu depctr_va_vcc(0)
+00010aa0 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010aa8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010aac v_add_co_u32 v4, vcc_lo, v4, v12
+00010ab4 s_wait_alu depctr_va_vcc(0)
+00010ab8 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010ac0 s_wait_dscnt 0x0
+00010ac4 global_store_b32 v[4:5], v14, off offset:64
+00010ad0 s_wait_alu depctr_sa_sdst(0)
+00010ad4 s_or_b32 exec_lo, exec_lo, s0
+00010ad8 s_and_b32 s11, s7, s2
+00010adc s_wait_alu depctr_sa_sdst(0)
+00010ae0 s_and_saveexec_b32 s0, s11
+00010ae4 s_cbranch_execz 64753
+00010ae8 v_mad_co_i64_i32 v[4:5], null, s12, v7, 0
+00010af0 ds_load_b32 v14, v2 offset:1280
+00010af8 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010afc v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010b00 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010b04 v_add_co_u32 v4, vcc_lo, s16, v4
+00010b0c s_wait_alu depctr_va_vcc(0)
+00010b10 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010b18 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010b1c v_add_co_u32 v4, vcc_lo, v4, v12
+00010b24 s_wait_alu depctr_va_vcc(0)
+00010b28 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010b30 s_wait_dscnt 0x0
+00010b34 global_store_b32 v[4:5], v14, off offset:64
+00010b40 s_wait_alu depctr_sa_sdst(0)
+00010b44 s_or_b32 exec_lo, exec_lo, s0
+00010b48 s_and_b32 s11, s8, s1
+00010b4c s_wait_alu depctr_sa_sdst(0)
+00010b50 s_and_saveexec_b32 s0, s11
+00010b54 s_cbranch_execz 64731
+00010b58 v_mad_co_i64_i32 v[4:5], null, s12, v6, 0
+00010b60 ds_load_b32 v14, v2 offset:2560
+00010b68 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010b6c v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010b70 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010b74 v_add_co_u32 v4, vcc_lo, s16, v4
+00010b7c s_wait_alu depctr_va_vcc(0)
+00010b80 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010b88 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010b8c v_add_co_u32 v4, vcc_lo, v4, v12
+00010b94 s_wait_alu depctr_va_vcc(0)
+00010b98 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010ba0 s_wait_dscnt 0x0
+00010ba4 global_store_b32 v[4:5], v14, off offset:192
+00010bb0 s_wait_alu depctr_sa_sdst(0)
+00010bb4 s_or_b32 exec_lo, exec_lo, s0
+00010bb8 s_and_b32 s11, s8, s2
+00010bbc s_wait_alu depctr_sa_sdst(0)
+00010bc0 s_and_saveexec_b32 s0, s11
+00010bc4 s_cbranch_execz 64709
+00010bc8 v_mad_co_i64_i32 v[4:5], null, s12, v7, 0
+00010bd0 ds_load_b32 v14, v2 offset:3840
+00010bd8 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010bdc v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010be0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010be4 v_add_co_u32 v4, vcc_lo, s16, v4
+00010bec s_wait_alu depctr_va_vcc(0)
+00010bf0 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010bf8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010bfc v_add_co_u32 v4, vcc_lo, v4, v12
+00010c04 s_wait_alu depctr_va_vcc(0)
+00010c08 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010c10 s_wait_dscnt 0x0
+00010c14 global_store_b32 v[4:5], v14, off offset:192
+00010c20 s_wait_alu depctr_sa_sdst(0)
+00010c24 s_or_b32 exec_lo, exec_lo, s0
+00010c28 s_and_b32 s11, s9, s1
+00010c2c s_wait_alu depctr_sa_sdst(0)
+00010c30 s_and_saveexec_b32 s0, s11
+00010c34 s_cbranch_execz 64687
+00010c38 v_mad_co_i64_i32 v[4:5], null, s12, v6, 0
+00010c40 ds_load_b32 v14, v2 offset:5120
+00010c48 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010c4c v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010c50 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010c54 v_add_co_u32 v4, vcc_lo, s16, v4
+00010c5c s_wait_alu depctr_va_vcc(0)
+00010c60 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010c68 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010c6c v_add_co_u32 v4, vcc_lo, v4, v12
+00010c74 s_wait_alu depctr_va_vcc(0)
+00010c78 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010c80 s_wait_dscnt 0x0
+00010c84 global_store_b32 v[4:5], v14, off offset:320
+00010c90 s_wait_alu depctr_sa_sdst(0)
+00010c94 s_or_b32 exec_lo, exec_lo, s0
+00010c98 s_and_b32 s11, s9, s2
+00010c9c s_wait_alu depctr_sa_sdst(0)
+00010ca0 s_and_saveexec_b32 s0, s11
+00010ca4 s_cbranch_execz 64665
+00010ca8 v_mad_co_i64_i32 v[4:5], null, s12, v7, 0
+00010cb0 ds_load_b32 v14, v2 offset:6400
+00010cb8 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010cbc v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010cc0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010cc4 v_add_co_u32 v4, vcc_lo, s16, v4
+00010ccc s_wait_alu depctr_va_vcc(0)
+00010cd0 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010cd8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010cdc v_add_co_u32 v4, vcc_lo, v4, v12
+00010ce4 s_wait_alu depctr_va_vcc(0)
+00010ce8 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010cf0 s_wait_dscnt 0x0
+00010cf4 global_store_b32 v[4:5], v14, off offset:320
+00010d00 s_wait_alu depctr_sa_sdst(0)
+00010d04 s_or_b32 exec_lo, exec_lo, s0
+00010d08 s_and_b32 s1, s10, s1
+00010d0c s_wait_alu depctr_sa_sdst(0)
+00010d10 s_and_saveexec_b32 s0, s1
+00010d14 s_cbranch_execz 64643
+00010d18 v_mad_co_i64_i32 v[4:5], null, s12, v6, 0
+00010d20 ds_load_b32 v6, v2 offset:7680
+00010d28 v_lshlrev_b64_e32 v[12:13], 2, v[0:1]
+00010d2c v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010d30 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010d34 v_add_co_u32 v4, vcc_lo, s16, v4
+00010d3c s_wait_alu depctr_va_vcc(0)
+00010d40 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010d48 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010d4c v_add_co_u32 v4, vcc_lo, v4, v12
+00010d54 s_wait_alu depctr_va_vcc(0)
+00010d58 v_add_co_ci_u32_e64 v5, null, v5, v13, vcc_lo
+00010d60 s_wait_dscnt 0x0
+00010d64 global_store_b32 v[4:5], v6, off offset:448
+00010d70 s_wait_alu depctr_sa_sdst(0)
+00010d74 s_or_b32 exec_lo, exec_lo, s0
+00010d78 s_and_b32 s1, s10, s2
+00010d7c s_wait_alu depctr_sa_sdst(0)
+00010d80 s_and_saveexec_b32 s0, s1
+00010d84 s_cbranch_execnz 64621
+0000ff3c v_mad_co_i64_i32 v[4:5], null, s12, v7, 0
+0000ff44 ds_load_b32 v12, v2 offset:8960
+0000ff4c v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+0000ff50 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+0000ff54 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000ff58 v_add_co_u32 v4, vcc_lo, s16, v4
+0000ff60 s_wait_alu depctr_va_vcc(0)
+0000ff64 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+0000ff6c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0000ff70 v_add_co_u32 v4, vcc_lo, v4, v6
+0000ff78 s_wait_alu depctr_va_vcc(0)
+0000ff7c v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+0000ff84 s_wait_dscnt 0x0
+0000ff88 global_store_b32 v[4:5], v12, off offset:448
+0000ff94 s_wait_alu depctr_sa_sdst(0)
+0000ff98 s_or_b32 exec_lo, exec_lo, s0
+0000ff9c s_wait_loadcnt 0x0
+0000ffa0 s_wait_storecnt 0x0
+0000ffa4 s_barrier_signal -1
+0000ffa8 s_and_b32 s1, s7, s3
+0000ffac s_barrier_wait 0xffff
+0000ffb0 global_inv scope:SCOPE_SE
+0000ffbc ds_store_2addr_b32 v3, v133, v134 offset1:20
+0000ffc4 ds_store_2addr_b32 v3, v131, v132 offset0:40 offset1:60
+0000ffcc ds_store_2addr_b32 v3, v129, v130 offset0:80 offset1:100
+0000ffd4 ds_store_2addr_b32 v3, v127, v128 offset0:120 offset1:140
+0000ffdc s_wait_loadcnt_dscnt 0x0
+0000ffe0 s_barrier_signal -1
+0000ffe4 s_barrier_wait 0xffff
+0000ffe8 global_inv scope:SCOPE_SE
+0000fff4 s_wait_alu depctr_sa_sdst(0)
+0000fff8 s_and_saveexec_b32 s0, s1
+0000fffc s_cbranch_execnz 867
+00010d8c v_mad_co_i64_i32 v[4:5], null, s12, v8, 0
+00010d94 ds_load_b32 v12, v2
+00010d9c v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00010da0 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010da4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010da8 v_add_co_u32 v4, vcc_lo, s16, v4
+00010db0 s_wait_alu depctr_va_vcc(0)
+00010db4 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010dbc s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010dc0 v_add_co_u32 v4, vcc_lo, v4, v6
+00010dc8 s_wait_alu depctr_va_vcc(0)
+00010dcc v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00010dd4 s_wait_dscnt 0x0
+00010dd8 global_store_b32 v[4:5], v12, off offset:64
+00010de4 s_wait_alu depctr_sa_sdst(0)
+00010de8 s_or_b32 exec_lo, exec_lo, s0
+00010dec s_and_b32 s1, s7, s4
+00010df0 s_wait_alu depctr_sa_sdst(0)
+00010df4 s_and_saveexec_b32 s0, s1
+00010df8 s_cbranch_execz 64647
+00010dfc v_mad_co_i64_i32 v[4:5], null, s12, v9, 0
+00010e04 ds_load_b32 v12, v2 offset:1280
+00010e0c v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00010e10 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010e14 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010e18 v_add_co_u32 v4, vcc_lo, s16, v4
+00010e20 s_wait_alu depctr_va_vcc(0)
+00010e24 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010e2c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010e30 v_add_co_u32 v4, vcc_lo, v4, v6
+00010e38 s_wait_alu depctr_va_vcc(0)
+00010e3c v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00010e44 s_wait_dscnt 0x0
+00010e48 global_store_b32 v[4:5], v12, off offset:64
+00010e54 s_wait_alu depctr_sa_sdst(0)
+00010e58 s_or_b32 exec_lo, exec_lo, s0
+00010e5c s_and_b32 s1, s8, s3
+00010e60 s_wait_alu depctr_sa_sdst(0)
+00010e64 s_and_saveexec_b32 s0, s1
+00010e68 s_cbranch_execz 64625
+00010e6c v_mad_co_i64_i32 v[4:5], null, s12, v8, 0
+00010e74 ds_load_b32 v12, v2 offset:2560
+00010e7c v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00010e80 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010e84 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010e88 v_add_co_u32 v4, vcc_lo, s16, v4
+00010e90 s_wait_alu depctr_va_vcc(0)
+00010e94 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010e9c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010ea0 v_add_co_u32 v4, vcc_lo, v4, v6
+00010ea8 s_wait_alu depctr_va_vcc(0)
+00010eac v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00010eb4 s_wait_dscnt 0x0
+00010eb8 global_store_b32 v[4:5], v12, off offset:192
+00010ec4 s_wait_alu depctr_sa_sdst(0)
+00010ec8 s_or_b32 exec_lo, exec_lo, s0
+00010ecc s_and_b32 s1, s8, s4
+00010ed0 s_wait_alu depctr_sa_sdst(0)
+00010ed4 s_and_saveexec_b32 s0, s1
+00010ed8 s_cbranch_execz 64603
+00010edc v_mad_co_i64_i32 v[4:5], null, s12, v9, 0
+00010ee4 ds_load_b32 v12, v2 offset:3840
+00010eec v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00010ef0 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010ef4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010ef8 v_add_co_u32 v4, vcc_lo, s16, v4
+00010f00 s_wait_alu depctr_va_vcc(0)
+00010f04 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010f0c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010f10 v_add_co_u32 v4, vcc_lo, v4, v6
+00010f18 s_wait_alu depctr_va_vcc(0)
+00010f1c v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00010f24 s_wait_dscnt 0x0
+00010f28 global_store_b32 v[4:5], v12, off offset:192
+00010f34 s_wait_alu depctr_sa_sdst(0)
+00010f38 s_or_b32 exec_lo, exec_lo, s0
+00010f3c s_and_b32 s1, s9, s3
+00010f40 s_wait_alu depctr_sa_sdst(0)
+00010f44 s_and_saveexec_b32 s0, s1
+00010f48 s_cbranch_execz 64581
+00010f4c v_mad_co_i64_i32 v[4:5], null, s12, v8, 0
+00010f54 ds_load_b32 v12, v2 offset:5120
+00010f5c v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00010f60 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010f64 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010f68 v_add_co_u32 v4, vcc_lo, s16, v4
+00010f70 s_wait_alu depctr_va_vcc(0)
+00010f74 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010f7c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010f80 v_add_co_u32 v4, vcc_lo, v4, v6
+00010f88 s_wait_alu depctr_va_vcc(0)
+00010f8c v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00010f94 s_wait_dscnt 0x0
+00010f98 global_store_b32 v[4:5], v12, off offset:320
+00010fa4 s_wait_alu depctr_sa_sdst(0)
+00010fa8 s_or_b32 exec_lo, exec_lo, s0
+00010fac s_and_b32 s1, s9, s4
+00010fb0 s_wait_alu depctr_sa_sdst(0)
+00010fb4 s_and_saveexec_b32 s0, s1
+00010fb8 s_cbranch_execz 64559
+00010fbc v_mad_co_i64_i32 v[4:5], null, s12, v9, 0
+00010fc4 ds_load_b32 v12, v2 offset:6400
+00010fcc v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00010fd0 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00010fd4 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010fd8 v_add_co_u32 v4, vcc_lo, s16, v4
+00010fe0 s_wait_alu depctr_va_vcc(0)
+00010fe4 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+00010fec s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010ff0 v_add_co_u32 v4, vcc_lo, v4, v6
+00010ff8 s_wait_alu depctr_va_vcc(0)
+00010ffc v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00011004 s_wait_dscnt 0x0
+00011008 global_store_b32 v[4:5], v12, off offset:320
+00011014 s_wait_alu depctr_sa_sdst(0)
+00011018 s_or_b32 exec_lo, exec_lo, s0
+0001101c s_and_b32 s1, s10, s3
+00011020 s_wait_alu depctr_sa_sdst(0)
+00011024 s_and_saveexec_b32 s0, s1
+00011028 s_cbranch_execz 64537
+0001102c v_mad_co_i64_i32 v[4:5], null, s12, v8, 0
+00011034 ds_load_b32 v8, v2 offset:7680
+0001103c v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+00011040 v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+00011044 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011048 v_add_co_u32 v4, vcc_lo, s16, v4
+00011050 s_wait_alu depctr_va_vcc(0)
+00011054 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+0001105c s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011060 v_add_co_u32 v4, vcc_lo, v4, v6
+00011068 s_wait_alu depctr_va_vcc(0)
+0001106c v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+00011074 s_wait_dscnt 0x0
+00011078 global_store_b32 v[4:5], v8, off offset:448
+00011084 s_wait_alu depctr_sa_sdst(0)
+00011088 s_or_b32 exec_lo, exec_lo, s0
+0001108c s_and_b32 s1, s10, s4
+00011090 s_wait_alu depctr_sa_sdst(0)
+00011094 s_and_saveexec_b32 s0, s1
+00011098 s_cbranch_execnz 64515
+000100a8 v_mad_co_i64_i32 v[4:5], null, s12, v9, 0
+000100b0 ds_load_b32 v8, v2 offset:8960
+000100b8 v_lshlrev_b64_e32 v[6:7], 2, v[0:1]
+000100bc v_lshlrev_b64_e32 v[4:5], 2, v[4:5]
+000100c0 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000100c4 v_add_co_u32 v4, vcc_lo, s16, v4
+000100cc s_wait_alu depctr_va_vcc(0)
+000100d0 v_add_co_ci_u32_e64 v5, null, s17, v5, vcc_lo
+000100d8 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000100dc v_add_co_u32 v4, vcc_lo, v4, v6
+000100e4 s_wait_alu depctr_va_vcc(0)
+000100e8 v_add_co_ci_u32_e64 v5, null, v5, v7, vcc_lo
+000100f0 s_wait_dscnt 0x0
+000100f4 global_store_b32 v[4:5], v8, off offset:448
+00010100 s_wait_alu depctr_sa_sdst(0)
+00010104 s_or_b32 exec_lo, exec_lo, s0
+00010108 s_wait_loadcnt 0x0
+0001010c s_wait_storecnt 0x0
+00010110 s_barrier_signal -1
+00010114 s_and_b32 s1, s7, s5
+00010118 s_barrier_wait 0xffff
+0001011c global_inv scope:SCOPE_SE
+00010128 ds_store_2addr_b32 v3, v125, v126 offset1:20
+00010130 ds_store_2addr_b32 v3, v123, v124 offset0:40 offset1:60
+00010138 ds_store_2addr_b32 v3, v121, v122 offset0:80 offset1:100
+00010140 ds_store_2addr_b32 v3, v120, v67 offset0:120 offset1:140
+00010148 s_wait_loadcnt_dscnt 0x0
+0001014c s_barrier_signal -1
+00010150 s_barrier_wait 0xffff
+00010154 global_inv scope:SCOPE_SE
+00010160 s_wait_alu depctr_sa_sdst(0)
+00010164 s_and_saveexec_b32 s0, s1
+00010168 s_cbranch_execnz 973
+000110a0 v_mad_co_i64_i32 v[3:4], null, s12, v10, 0
+000110a8 ds_load_b32 v7, v2
+000110b0 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+000110b4 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+000110b8 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000110bc v_add_co_u32 v3, vcc_lo, s16, v3
+000110c4 s_wait_alu depctr_va_vcc(0)
+000110c8 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+000110d0 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000110d4 v_add_co_u32 v3, vcc_lo, v3, v5
+000110dc s_wait_alu depctr_va_vcc(0)
+000110e0 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+000110e8 s_wait_dscnt 0x0
+000110ec global_store_b32 v[3:4], v7, off offset:64
+000110f8 s_wait_alu depctr_sa_sdst(0)
+000110fc s_or_b32 exec_lo, exec_lo, s0
+00011100 s_and_b32 s1, s7, s6
+00011104 s_wait_alu depctr_sa_sdst(0)
+00011108 s_and_saveexec_b32 s0, s1
+0001110c s_cbranch_execz 64541
+00011110 v_mad_co_i64_i32 v[3:4], null, s12, v11, 0
+00011118 ds_load_b32 v7, v2 offset:1280
+00011120 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+00011124 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+00011128 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001112c v_add_co_u32 v3, vcc_lo, s16, v3
+00011134 s_wait_alu depctr_va_vcc(0)
+00011138 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+00011140 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011144 v_add_co_u32 v3, vcc_lo, v3, v5
+0001114c s_wait_alu depctr_va_vcc(0)
+00011150 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+00011158 s_wait_dscnt 0x0
+0001115c global_store_b32 v[3:4], v7, off offset:64
+00011168 s_wait_alu depctr_sa_sdst(0)
+0001116c s_or_b32 exec_lo, exec_lo, s0
+00011170 s_and_b32 s1, s8, s5
+00011174 s_wait_alu depctr_sa_sdst(0)
+00011178 s_and_saveexec_b32 s0, s1
+0001117c s_cbranch_execz 64519
+00011180 v_mad_co_i64_i32 v[3:4], null, s12, v10, 0
+00011188 ds_load_b32 v7, v2 offset:2560
+00011190 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+00011194 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+00011198 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001119c v_add_co_u32 v3, vcc_lo, s16, v3
+000111a4 s_wait_alu depctr_va_vcc(0)
+000111a8 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+000111b0 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000111b4 v_add_co_u32 v3, vcc_lo, v3, v5
+000111bc s_wait_alu depctr_va_vcc(0)
+000111c0 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+000111c8 s_wait_dscnt 0x0
+000111cc global_store_b32 v[3:4], v7, off offset:192
+000111d8 s_wait_alu depctr_sa_sdst(0)
+000111dc s_or_b32 exec_lo, exec_lo, s0
+000111e0 s_and_b32 s1, s8, s6
+000111e4 s_wait_alu depctr_sa_sdst(0)
+000111e8 s_and_saveexec_b32 s0, s1
+000111ec s_cbranch_execz 64497
+000111f0 v_mad_co_i64_i32 v[3:4], null, s12, v11, 0
+000111f8 ds_load_b32 v7, v2 offset:3840
+00011200 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+00011204 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+00011208 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001120c v_add_co_u32 v3, vcc_lo, s16, v3
+00011214 s_wait_alu depctr_va_vcc(0)
+00011218 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+00011220 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011224 v_add_co_u32 v3, vcc_lo, v3, v5
+0001122c s_wait_alu depctr_va_vcc(0)
+00011230 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+00011238 s_wait_dscnt 0x0
+0001123c global_store_b32 v[3:4], v7, off offset:192
+00011248 s_wait_alu depctr_sa_sdst(0)
+0001124c s_or_b32 exec_lo, exec_lo, s0
+00011250 s_and_b32 s1, s9, s5
+00011254 s_wait_alu depctr_sa_sdst(0)
+00011258 s_and_saveexec_b32 s0, s1
+0001125c s_cbranch_execz 64475
+00011260 v_mad_co_i64_i32 v[3:4], null, s12, v10, 0
+00011268 ds_load_b32 v7, v2 offset:5120
+00011270 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+00011274 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+00011278 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001127c v_add_co_u32 v3, vcc_lo, s16, v3
+00011284 s_wait_alu depctr_va_vcc(0)
+00011288 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+00011290 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011294 v_add_co_u32 v3, vcc_lo, v3, v5
+0001129c s_wait_alu depctr_va_vcc(0)
+000112a0 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+000112a8 s_wait_dscnt 0x0
+000112ac global_store_b32 v[3:4], v7, off offset:320
+000112b8 s_wait_alu depctr_sa_sdst(0)
+000112bc s_or_b32 exec_lo, exec_lo, s0
+000112c0 s_and_b32 s1, s9, s6
+000112c4 s_wait_alu depctr_sa_sdst(0)
+000112c8 s_and_saveexec_b32 s0, s1
+000112cc s_cbranch_execz 64453
+000112d0 v_mad_co_i64_i32 v[3:4], null, s12, v11, 0
+000112d8 ds_load_b32 v7, v2 offset:6400
+000112e0 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+000112e4 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+000112e8 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+000112ec v_add_co_u32 v3, vcc_lo, s16, v3
+000112f4 s_wait_alu depctr_va_vcc(0)
+000112f8 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+00011300 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011304 v_add_co_u32 v3, vcc_lo, v3, v5
+0001130c s_wait_alu depctr_va_vcc(0)
+00011310 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+00011318 s_wait_dscnt 0x0
+0001131c global_store_b32 v[3:4], v7, off offset:320
+00011328 s_wait_alu depctr_sa_sdst(0)
+0001132c s_or_b32 exec_lo, exec_lo, s0
+00011330 s_and_b32 s1, s10, s5
+00011334 s_wait_alu depctr_sa_sdst(0)
+00011338 s_and_saveexec_b32 s0, s1
+0001133c s_cbranch_execz 64431
+00011340 v_mad_co_i64_i32 v[3:4], null, s12, v10, 0
+00011348 ds_load_b32 v7, v2 offset:7680
+00011350 v_lshlrev_b64_e32 v[5:6], 2, v[0:1]
+00011354 v_lshlrev_b64_e32 v[3:4], 2, v[3:4]
+00011358 s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+0001135c v_add_co_u32 v3, vcc_lo, s16, v3
+00011364 s_wait_alu depctr_va_vcc(0)
+00011368 v_add_co_ci_u32_e64 v4, null, s17, v4, vcc_lo
+00011370 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00011374 v_add_co_u32 v3, vcc_lo, v3, v5
+0001137c s_wait_alu depctr_va_vcc(0)
+00011380 v_add_co_ci_u32_e64 v4, null, v4, v6, vcc_lo
+00011388 s_wait_dscnt 0x0
+0001138c global_store_b32 v[3:4], v7, off offset:448
+00011398 s_wait_alu depctr_sa_sdst(0)
+0001139c s_or_b32 exec_lo, exec_lo, s0
+000113a0 s_and_b32 s1, s10, s6
+000113a4 s_wait_alu depctr_sa_sdst(0)
+000113a8 s_and_saveexec_b32 s0, s1
+000113ac s_cbranch_execnz 64409
+00010214 v_mad_co_i64_i32 v[3:4], null, s12, v11, 0
+0001021c ds_load_b32 v5, v2 offset:8960
+00010224 v_lshlrev_b64_e32 v[0:1], 2, v[0:1]
+00010228 v_lshlrev_b64_e32 v[2:3], 2, v[3:4]
+0001022c s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010230 v_add_co_u32 v2, vcc_lo, s16, v2
+00010238 s_wait_alu depctr_va_vcc(0)
+0001023c v_add_co_ci_u32_e64 v3, null, s17, v3, vcc_lo
+00010244 s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+00010248 v_add_co_u32 v0, vcc_lo, v2, v0
+00010250 s_wait_alu depctr_va_vcc(0)
+00010254 v_add_co_ci_u32_e64 v1, null, v3, v1, vcc_lo
+0001025c s_wait_dscnt 0x0
+00010260 global_store_b32 v[0:1], v5, off offset:448
+0001026c s_wait_alu depctr_sa_sdst(0)
+00010270 s_or_b32 exec_lo, exec_lo, s0
+00010274 s_wait_loadcnt 0x0
+00010278 s_wait_storecnt 0x0
+0001027c s_barrier_signal -1
+00010280 s_barrier_wait 0xffff
+00010284 global_inv scope:SCOPE_SE
+00010290 s_endpgm

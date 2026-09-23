@@ -1,0 +1,7 @@
+=== GATE 2 default-path byte identity (one tensor, default path before/after) ===
+method: fixed synthetic tensor (m=4,k=512,xorshift seed) encoded with quantize_mq4g256v2
+pre:  pristine tree (only additive mod-line + new-file diff); post: with constrained encoder landed
+85f5fa20dd45afa9754bfeb8e78b29a4  /home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/quant-a/byteid_pre.bin
+85f5fa20dd45afa9754bfeb8e78b29a4  /home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/quant-a/byteid_post.bin
+RESULT: BYTE-IDENTICAL
+in-tree tripwire: quant_mq4e8::tests::default_path_bytes_stable (fnv1a64 pinned)

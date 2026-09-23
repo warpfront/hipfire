@@ -1,0 +1,40 @@
+{
+  "tensor": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+  "shape": [
+    48,
+    5120
+  ],
+  "input": "AWQ already applied, before FWHT",
+  "input_path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_awq_f32.bin",
+  "input_md5": "a82c17203f692582c32e5e8e846639c2",
+  "outputs": {
+    "C0": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C0.qt44",
+      "md5": "e378fb99622b73a2df7aa3c7151d70b0"
+    },
+    "C1": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C1.qt44",
+      "md5": "1acaf896c36ea807f46cbb7c939c9e8a"
+    },
+    "C2": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C2.qt44",
+      "md5": "f7a32f31f781049e267059e38b8ac88f"
+    },
+    "C3": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C3.qt44",
+      "md5": "969b8cdc8977ce461690a7434d15381e"
+    },
+    "C4": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C4.qt44",
+      "md5": "652a5a6db99fe4657e212717e1629a9f"
+    },
+    "C4z": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C4z.qt44",
+      "md5": "acae106271dc3543a0319e3f83b0bc2f"
+    },
+    "C4s": {
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/oracle_L0_in_proj_a_C4s.qt44",
+      "md5": "0bf1f256e88cb2b073dbdb54979f5d5a"
+    }
+  }
+}

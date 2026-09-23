@@ -1,0 +1,11 @@
+{
+  "artifact": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c3.hfq",
+  "arm": "C3",
+  "tensors_checked": 497,
+  "groups_checked": 100085760,
+  "half_scales_checked": 200171520,
+  "scale_mismatches": 0,
+  "nonfinite_headers": 0,
+  "integer_zero_constraints_checked": 0,
+  "wall_seconds": 6.650204420089722
+}

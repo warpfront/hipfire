@@ -1,0 +1,12 @@
+{
+  "arm": "C1",
+  "artifact": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c1.hfq",
+  "tensor_count": 1347,
+  "qt44_tensors": 497,
+  "unchanged_non_qt44_tensors": 850,
+  "unchanged_non_qt44_bytes": 1361091584,
+  "oracle_tensor": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+  "oracle_bytes": 130560,
+  "oracle_mismatched_bytes": 0,
+  "first_oracle_mismatch_offsets": []
+}

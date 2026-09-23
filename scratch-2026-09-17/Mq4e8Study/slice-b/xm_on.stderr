@@ -1,0 +1,4 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201
+arch gfx1201 flags: iu4_prefill=true iu4_xmaster=true
+dump scratch-2026-09-17/Mq4e8Study/slice-b/xm_on: n=8 k=1024 nb=8 y=4608B xmaster=true

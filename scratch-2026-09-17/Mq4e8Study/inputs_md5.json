@@ -1,0 +1,27 @@
+[
+  {
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.ctrl.hfq",
+    "size": 14987185152,
+    "md5": "1a48b45ebf5f3ef852efcf8ee5d8084b"
+  },
+  {
+    "path": "/home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin",
+    "size": 50675552,
+    "md5": "8a21364051d844b97c122e2c895f56d8"
+  },
+  {
+    "path": "/home/kaden/kldrefs/qwen3.8-27b.ref_ag.bin",
+    "size": 50675552,
+    "md5": "b63d3bc13e3ea294e6c938050a07d36f"
+  },
+  {
+    "path": "/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf",
+    "size": 13642688,
+    "md5": "10f0d067a9cf8d989120a04dfc3d0c90"
+  },
+  {
+    "path": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/eval_hipfire.weight",
+    "size": 22015280,
+    "md5": "8b2d99f611fd201dda6c0199f3ae3eba"
+  }
+]

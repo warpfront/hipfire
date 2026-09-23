@@ -1,0 +1,58 @@
+[
+  {
+    "arm": "C0",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c0.hfq",
+    "md5": "ccf14c7cbfe2e7602f22e56a2463f170",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C0_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C0_header_verification.json"
+  },
+  {
+    "arm": "C1",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c1.hfq",
+    "md5": "3676676ea4e6f135926675a93e267075",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C1_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C1_header_verification.json"
+  },
+  {
+    "arm": "C2",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c2.hfq",
+    "md5": "6582bc9b0d8cb4915c877711bc2a1d02",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C2_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C2_header_verification.json"
+  },
+  {
+    "arm": "C3",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c3.hfq",
+    "md5": "fac22847faa912ea1cd9c150ea9e91dd",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C3_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C3_header_verification.json"
+  },
+  {
+    "arm": "C4",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c4.hfq",
+    "md5": "e5a522a0a27a779c3db15949010e0178",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C4_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C4_header_verification.json"
+  },
+  {
+    "arm": "C4z",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c4z.hfq",
+    "md5": "0c0278958f144bd4af5e9a5354e5679c",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C4z_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C4z_header_verification.json"
+  },
+  {
+    "arm": "C4s",
+    "path": "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4e8-c4s.hfq",
+    "md5": "48e3d81b49e1723b57de1b1f6471b1c5",
+    "size": 14987185152,
+    "verification_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C4s_verification.json",
+    "header_receipt": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/artifact_C4s_header_verification.json"
+  }
+]

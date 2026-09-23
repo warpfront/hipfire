@@ -1,0 +1,1 @@
+Full sweep stopped after layer14.linear_attn.in_proj_b: C4 next tensor had nonzero rows with maxhalfstep/256 underflowing f16. C4 master now floors at smallest positive f16 (2^-24); exponent span stays0..8. Full tool output artifact://14922. No final aggregate uses incomplete v2.

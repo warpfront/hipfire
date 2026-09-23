@@ -1,0 +1,14 @@
+{
+  "completed_tensors": 497,
+  "total_groups": 100085760,
+  "total_coefficients": 25621954560,
+  "sum_tensor_wall_seconds": 353.21290922164917,
+  "boundary_counts": {
+    "c1_nonrepresentable_candidates": 11,
+    "c2_base_clamps": 226,
+    "c4_master_clamps": 3,
+    "c4z_master_clamps": 28
+  },
+  "parent_minmax_scale_and_zero_matches_fixture": "all200171520 halfheaders exact",
+  "group_f16_scale_roundtrip": "allconstraints allgroups exact"
+}

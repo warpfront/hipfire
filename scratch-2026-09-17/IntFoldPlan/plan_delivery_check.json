@@ -1,0 +1,9 @@
+{
+  "plan": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/docs/plans/2026-09-18-gfx1201-iu4-intfold.md",
+  "absolute_local_links_checked": 16,
+  "missing_links": [],
+  "balanced_code_fences": true,
+  "cpu_proof_output": "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/IntFoldPlan/plan_checks.json",
+  "plan_sha256": "c64d05dde78edb129981934b8202f61466d6e9bd044f40f0913fe89e24e1fd61",
+  "scope": "Document links and executed CPU-only proof; no GPU claim"
+}

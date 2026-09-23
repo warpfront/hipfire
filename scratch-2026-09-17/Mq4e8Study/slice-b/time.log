@@ -1,0 +1,12 @@
+== K=5120 flag OFF ==
+arch gfx1201 flags: iu4_prefill=true iu4_xmaster=false
+TIME ensure_int4_mmq_x n=512 k=5120 xmaster=false med=84.1us mean=83.4us min=78.0 max=84.5 (sync-delimited, 20 calls)
+== K=5120 flag ON ==
+arch gfx1201 flags: iu4_prefill=true iu4_xmaster=true
+TIME ensure_int4_mmq_x n=512 k=5120 xmaster=true med=508.8us mean=505.9us min=480.0 max=520.3 (sync-delimited, 20 calls)
+== K=17408 flag OFF ==
+arch gfx1201 flags: iu4_prefill=true iu4_xmaster=false
+TIME ensure_int4_mmq_x n=512 k=17408 xmaster=false med=215.5us mean=215.0us min=212.0 max=220.6 (sync-delimited, 20 calls)
+== K=17408 flag ON ==
+arch gfx1201 flags: iu4_prefill=true iu4_xmaster=true
+TIME ensure_int4_mmq_x n=512 k=17408 xmaster=true med=1584.8us mean=1636.4us min=1482.3 max=2467.5 (sync-delimited, 20 calls)

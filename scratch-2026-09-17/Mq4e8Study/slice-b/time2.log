@@ -1,0 +1,8 @@
+== K=5120 XMASTER=0 ==
+TIME ensure_int4_mmq_x n=512 k=5120 xmaster=false med=88.9us mean=101.2us min=81.7 max=347.4 (sync-delimited, 20 calls)
+== K=5120 XMASTER=1 ==
+TIME ensure_int4_mmq_x n=512 k=5120 xmaster=true med=143.5us mean=180.2us min=135.0 max=420.7 (sync-delimited, 20 calls)
+== K=17408 XMASTER=0 ==
+TIME ensure_int4_mmq_x n=512 k=17408 xmaster=false med=215.4us mean=215.6us min=212.6 max=221.0 (sync-delimited, 20 calls)
+== K=17408 XMASTER=1 ==
+TIME ensure_int4_mmq_x n=512 k=17408 xmaster=true med=376.3us mean=388.5us min=370.4 max=599.0 (sync-delimited, 20 calls)

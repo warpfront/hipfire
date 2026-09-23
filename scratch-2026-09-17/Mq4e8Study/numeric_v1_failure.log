@@ -1,0 +1,1 @@
+Initial full sweep stopped after layer10.linear_attn.in_proj_b: C1 next tensor had 1 selected half step 1.4007092e-6 not representable in f16 (G/2). C1 representable-set choice now excludes non-f16 steps. No published all-layer aggregate uses the incomplete v1 run. Full tool output artifact://14900.

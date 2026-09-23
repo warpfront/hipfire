@@ -1,0 +1,7 @@
+{
+  "paired_affine_max_K": 17476,
+  "paired_affine_max_K_multiple256": 17408,
+  "paired_affine_K17664_bound": 2170552320,
+  "paired_symmetric_max_K": 32767,
+  "paired_symmetric_max_K_multiple256": 32512
+}
