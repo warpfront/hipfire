@@ -1,0 +1,24 @@
+{
+  "gdn_normalized_to_14pct_of534": {
+    "scan": 48.912603967037185,
+    "preamble": 20.441515906477576,
+    "gated_norm": 5.405880126485243
+  },
+  "FA_13pct": 69.42,
+  "glue_7pct": 37.38,
+  "unclassified_to190": 8.43999999999999,
+  "preamble_measured_isolated_off_us_per_token": 20.96405029296875,
+  "on": 15.76827392578125,
+  "saved": 5.1957763671875,
+  "reduction_pct": 24.784220103355416,
+  "scan_derived_range_us_per_token": [
+    17.8125,
+    38.4375
+  ],
+  "scan_derived_saving_vs_allocated": [
+    10.475103967037185,
+    31.100103967037185
+  ],
+  "pack_fp8_isolated_us_per_token": 20.81,
+  "fp8_pack_rocprof_scaled_us_per_token": 16.95
+}

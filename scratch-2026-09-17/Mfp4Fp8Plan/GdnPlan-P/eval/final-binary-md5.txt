@@ -1,0 +1,2 @@
+b780f39017ae7a04d4702cd24acbd161  target/release/examples/eval_hipfire
+b1f3760da37ed68d6634afeb355a4e88  target/release/examples/profile_prefill_qwen35

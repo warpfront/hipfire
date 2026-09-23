@@ -1,0 +1,86 @@
+{
+  "exact_code_shift_cases": 240,
+  "normal_only_cases": 192,
+  "edges": {
+    "positive_6_shift_6": "384",
+    "positive_half_shift_minus8": "1/512",
+    "shift_minus9_half_exact": "1/1024",
+    "shift_7_six": "768"
+  },
+  "model_equivalent_GFLOP_per_token": 43.0,
+  "rates": [
+    {
+      "TF": 125,
+      "gemm_us": 344.0,
+      "total_us_with_190": 534.0,
+      "tok_s": 1872.6591760299625,
+      "non_gemm_max_for_333": -11.0,
+      "non_gemm_reduction_us": 201.0
+    },
+    {
+      "TF": 145,
+      "gemm_us": 296.55172413793105,
+      "total_us_with_190": 486.55172413793105,
+      "tok_s": 2055.279943302622,
+      "non_gemm_max_for_333": 36.448275862068954,
+      "non_gemm_reduction_us": 153.55172413793105
+    },
+    {
+      "TF": 180,
+      "gemm_us": 238.88888888888889,
+      "total_us_with_190": 428.8888888888889,
+      "tok_s": 2331.60621761658,
+      "non_gemm_max_for_333": 94.11111111111111,
+      "non_gemm_reduction_us": 95.88888888888889
+    },
+    {
+      "TF": 200,
+      "gemm_us": 215.0,
+      "total_us_with_190": 405.0,
+      "tok_s": 2469.135802469136,
+      "non_gemm_max_for_333": 118.0,
+      "non_gemm_reduction_us": 72.0
+    },
+    {
+      "TF": 220,
+      "gemm_us": 195.45454545454547,
+      "total_us_with_190": 385.4545454545455,
+      "tok_s": 2594.3396226415093,
+      "non_gemm_max_for_333": 137.54545454545453,
+      "non_gemm_reduction_us": 52.45454545454547
+    },
+    {
+      "TF": 250,
+      "gemm_us": 172.0,
+      "total_us_with_190": 362.0,
+      "tok_s": 2762.4309392265195,
+      "non_gemm_max_for_333": 161.0,
+      "non_gemm_reduction_us": 29.0
+    },
+    {
+      "TF": 280,
+      "gemm_us": 153.57142857142858,
+      "total_us_with_190": 343.57142857142856,
+      "tok_s": 2910.602910602911,
+      "non_gemm_max_for_333": 179.42857142857142,
+      "non_gemm_reduction_us": 10.571428571428584
+    },
+    {
+      "TF": 300,
+      "gemm_us": 143.33333333333334,
+      "total_us_with_190": 333.33333333333337,
+      "tok_s": 2999.9999999999995,
+      "non_gemm_max_for_333": 189.66666666666666,
+      "non_gemm_reduction_us": 0.3333333333333428
+    },
+    {
+      "TF": 389,
+      "gemm_us": 110.53984575835476,
+      "total_us_with_190": 300.5398457583548,
+      "tok_s": 3327.3458215721494,
+      "non_gemm_max_for_333": 222.46015424164523,
+      "non_gemm_reduction_us": 0
+    }
+  ],
+  "required_TF_if_nonGemm190": 300.6993006993007
+}

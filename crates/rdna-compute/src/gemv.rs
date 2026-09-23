@@ -3996,6 +3996,62 @@ impl Gpu {
         )
     }
 
+    /// AWQ pre-divide WITHOUT rotation, for rotation-free quantized dtypes
+    /// (HFP4G32 + AWQ sidecar): y[r*K+i] = x[r*K+i] / s[i].
+    /// Alias-safe (pure elementwise): y may alias x, so prefill callers can
+    /// divide a freshly-normalized buffer in place. MUST be used instead of
+    /// the `*_mq_rotate_awq` producers, which FWHT-rotate (HFP4 weights are
+    /// encoded unrotated — rotating here is silent garbage, not an error).
+    pub fn awq_divide_x(
+        &mut self,
+        x: &GpuTensor,
+        awq_scale: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("awq_divide_x", kernels::AWQ_DIVIDE_X_SRC, "awq_divide_x")?;
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let sp = awq_scale.buf.as_ptr();
+        let mut rows_val = rows as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let n = rows * k;
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "awq_divide_x", bytes);
+        let result = self.launch_maybe_blob(
+            "awq_divide_x",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(xp);
+                bb.push_ptr(yp);
+                bb.push_ptr(sp);
+                bb.push_i32(rows_val);
+                bb.push_i32(k_val);
+                bb
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+
     /// MagnumQuant MQ4: rotate x once, then GEMV against rotated x.
     /// MQ4 weights are stored in HFQ4-G256 format with FWHT pre-applied, so the GEMV
     /// inner loop is identical to standard HFQ4 — we reuse the arch-tuned HFQ4 kernel.

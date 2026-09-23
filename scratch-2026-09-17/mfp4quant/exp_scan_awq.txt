@@ -1,0 +1,5 @@
+tensors_qt24=497 blocks=800686080 nz_blocks=800686080
+exp_min=119 exp_max=128 (bias127: [-8,1])
+max_per_row_span=8
+e0_with_nonzero_nibble=0
+fold_q=e_max-127-6 normal_span_ok_11=-5

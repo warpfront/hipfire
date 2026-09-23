@@ -1,0 +1,28 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : qwen3.8-27b.mq4-xt
+  registry tag  : qwen3.8:27b
+  kv_mode       : q8 [registry(qwen3.8:27b)]   kv_backend: vmm [tag-policy(qwen3.8:27b)]   mtp_mode: off   mode: battery
+  max_seq       : 262144 [tag-policy(qwen3.8:27b)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : uncapped [named-budget(uncapped)]
+  reasoning_effort: xhigh  (parent prompt semantics; independent of cap)
+  max_tokens     : 81920 [tag-policy(qwen3.8:27b)]  (uncapped think budget)
+  sampling (what IS set):
+      temperature       = 1.0      [registry(qwen3.8:27b)]
+      top_p             = 0.95     [registry(qwen3.8:27b)]
+      top_k             = 20       [registry(qwen3.8:27b)]
+      min_p             = 0.0      [registry(qwen3.8:27b)]
+      presence_penalty  = 0.0      [registry(qwen3.8:27b)]
+      repeat_penalty    = 1.0      [registry(qwen3.8:27b)]
+      reasoning_effort  = xhigh    [registry(qwen3.8:27b)]
+  sampling (NOT set, serve/daemon default applies): (none)
+=======================================================================================
+  [serve spawn attempt 1 failed]

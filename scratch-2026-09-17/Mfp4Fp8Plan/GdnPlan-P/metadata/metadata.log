@@ -1,0 +1,8 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+caps: cu=64 arch=gfx1201
+kernel=conv1d_silu_split_f32 vgpr=24 sgpr=8 lds=0 scratch=0 kernarg=320 occ_waves=16/16 limiter=wave limit occ_pct=100.0
+kernel=fused_qk_l2_norm_scale_interleave_f32_batched vgpr=16 sgpr=8 lds=0 scratch=0 kernarg=52 occ_waves=16/16 limiter=wave limit occ_pct=100.0
+kernel=fused_sigmoid_alpha_gate vgpr=16 sgpr=8 lds=0 scratch=0 kernarg=296 occ_waves=16/16 limiter=wave limit occ_pct=100.0
+kernel=fused_sigmoid_alpha_gate_f32 vgpr=16 sgpr=8 lds=0 scratch=0 kernarg=296 occ_waves=16/16 limiter=wave limit occ_pct=100.0
+kernel=gdn_pre_batched_gfx1201 vgpr=224 sgpr=8 lds=33024 scratch=0 kernarg=132 occ_waves=0/16 limiter=LDS occ_pct=0.0
+occupancy_probe: gdn_pre_batched_gfx1201 max_active_blocks=1

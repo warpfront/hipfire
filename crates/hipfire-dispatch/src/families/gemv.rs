@@ -252,10 +252,39 @@ impl GemvFamily {
             RotInput::Raw(x) => {
                 let plan = crate::types::dtype_rotation_plan(w.dtype);
                 if plan == RotationPlan::None {
-                    GpuTensor {
-                        buf: unsafe { x.buf.alias() },
-                        shape: x.shape.clone(),
-                        dtype: x.dtype,
+                    if let Some(awq) = w.awq_scale {
+                        // Rotation-free AWQ (HFP4G32 + sidecar): the weights
+                        // carry quant-time pre-scale s, so divide x by s here
+                        // so (W·s)·(x/s). No FWHT — MUST NOT route through
+                        // the *_mq_rotate_awq producers (they rotate, which
+                        // corrupts unrotated weights). Fails loud if the
+                        // shared FWHT scratch cannot hold one row.
+                        gpu.ensure_mq_signs()
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                        let cap =
+                            unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4 };
+                        if w.k > cap {
+                            return Err(DispatchError::Hip(format!(
+                                "gemv family (awq-divide): K={} exceeds divide scratch {cap}",
+                                w.k
+                            )));
+                        }
+                        let div = GpuTensor {
+                            buf: unsafe {
+                                gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias()
+                            },
+                            shape: vec![w.k],
+                            dtype: x.dtype,
+                        };
+                        gpu.awq_divide_x(x, awq, &div, 1, w.k)
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                        div
+                    } else {
+                        GpuTensor {
+                            buf: unsafe { x.buf.alias() },
+                            shape: x.shape.clone(),
+                            dtype: x.dtype,
+                        }
                     }
                 } else {
                     let h = self.rotate(ctx, gpu, w, x, &RotateInputs::default())?;

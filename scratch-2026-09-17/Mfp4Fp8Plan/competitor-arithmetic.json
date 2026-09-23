@@ -1,0 +1,48 @@
+{
+  "target_us": 282.80542986425337,
+  "required_TF_with_nonGemm190": 463.33495855680167,
+  "scenarios": [
+    {
+      "TF": 180,
+      "gemm_us": 238.88888888888889,
+      "allowed_nonGemm_us": 43.916540975364484,
+      "reduction_from190_us": 146.08345902463552
+    },
+    {
+      "TF": 200,
+      "gemm_us": 215.0,
+      "allowed_nonGemm_us": 67.80542986425337,
+      "reduction_from190_us": 122.19457013574663
+    },
+    {
+      "TF": 220,
+      "gemm_us": 195.45454545454547,
+      "allowed_nonGemm_us": 87.3508844097079,
+      "reduction_from190_us": 102.6491155902921
+    },
+    {
+      "TF": 250,
+      "gemm_us": 172.0,
+      "allowed_nonGemm_us": 110.80542986425337,
+      "reduction_from190_us": 79.19457013574663
+    },
+    {
+      "TF": 280,
+      "gemm_us": 153.57142857142858,
+      "allowed_nonGemm_us": 129.2340012928248,
+      "reduction_from190_us": 60.765998707175214
+    },
+    {
+      "TF": 300,
+      "gemm_us": 143.33333333333334,
+      "allowed_nonGemm_us": 139.47209653092003,
+      "reduction_from190_us": 50.52790346907997
+    },
+    {
+      "TF": 389,
+      "gemm_us": 110.53984575835476,
+      "allowed_nonGemm_us": 172.2655841058986,
+      "reduction_from190_us": 17.734415894101403
+    }
+  ]
+}

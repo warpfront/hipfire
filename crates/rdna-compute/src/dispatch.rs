@@ -545,6 +545,17 @@ impl DType {
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
                 | DType::MQ2G256Lloyd
+                // MFP4G32 shares MQ4's FWHT input contract (rotation + x/s
+                // divide in the rotate step); the quantizer emits sidecars
+                // for it under --awq exactly like MQ4V2. Omitting it would
+                // silently drop the sidecar → (W·s)·x scale error.
+                | DType::MFP4G32
+                // HFP4G32 is rotation-free, so its x/s divide has NO rotate
+                // step: the runtime divides via awq_divide_x (decode, in
+                // GemvFamily::run_input) and the rmsnorm_div_awq prefill
+                // hooks. MUST NOT route through the *_mq_rotate_awq
+                // producers — they FWHT-rotate, corrupting unrotated HFP4.
+                | DType::HFP4G32
         )
     }
 

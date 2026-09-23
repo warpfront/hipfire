@@ -1007,6 +1007,51 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
         gpu.fused_rmsnorm_rotate_mq_batched(x, norm_weight, x_rot, k, eps, batch_size)
     }
 }
+/// RMSNorm + AWQ pre-divide for rotation-free AWQ dtypes (HFP4G32) in batched
+/// prefill. Mirrors `fused_rmsnorm_rotate_mq_batched_for` MINUS the FWHT:
+/// rmsnorm into `x_out`, then `x_out /= s` in place when `next_linear`
+/// carries an AWQ sidecar, so `(W·s)·(x/s)`. With no sidecar attached this is
+/// exactly `rmsnorm_batched` (one extra branch, zero behavior change).
+/// MUST NOT route through the `*_mq_rotate_awq` producers — they FWHT-rotate,
+/// corrupting unrotated HFP4 weights.
+pub fn rmsnorm_div_awq_batched_for(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    next_linear: &WeightTensor,
+    x_out: &GpuTensor,
+    k: usize,
+    eps: f32,
+    batch_size: usize,
+) -> HipResult<()> {
+    gpu.rmsnorm_batched(x, norm_weight, x_out, batch_size, k, eps)?;
+    if let Some(awq) = next_linear.awq_scale.as_ref() {
+        gpu.awq_divide_x(x_out, awq, x_out, batch_size, k)?;
+    }
+    Ok(())
+}
+
+/// AWQ pre-divide for an already-normalized (or already-reduced) batched
+/// activation buffer, rotation-free (HFP4G32): `dst = src/s` when `linear`
+/// carries a sidecar, else a no-op returning false (caller keeps using
+/// `src`). `dst` may alias `src` (the kernel is elementwise) for buffers
+/// the caller owns (e.g. per-layer silu output); it MUST NOT alias a live
+/// pipeline buffer. Same no-rotate contract as above.
+pub fn div_awq_batched_for(
+    gpu: &mut Gpu,
+    src: &GpuTensor,
+    dst: &GpuTensor,
+    linear: &WeightTensor,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<bool> {
+    if let Some(awq) = linear.awq_scale.as_ref() {
+        gpu.awq_divide_x(src, awq, dst, batch_size, k)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
 
 pub fn fused_rmsnorm_rotate_for_mq<'a>(
     gpu: &mut Gpu,

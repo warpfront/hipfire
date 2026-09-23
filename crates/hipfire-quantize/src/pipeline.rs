@@ -5989,7 +5989,28 @@ fn handle_main_quant(
                     };
                     if k_dim % 32 == 0 && meta.shape.len() == 2 {
                         let m = meta.shape[0];
-                        let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                        // AWQ pre-scaling (mirrors the MFP4 dense arm): W' = W·s
+                        // before quant, sidecar emitted after the tensor push.
+                        // Runtime divides x by s WITHOUT rotation ((W·s)·(x/s))
+                        // via awq_divide_x / the rmsnorm_div_awq prefill hooks.
+                        // HFP4G32 is in DType::supports_awq_sidecar so the
+                        // loader attaches the sidecar; without --awq/--imatrix
+                        // this arm is byte-identical to plain HFP4.
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m, k_dim, &scales);
+                                quantize_hfp4g32_2d(&scaled, m, k_dim)
+                            } else {
+                                quantize_hfp4g32_2d(&f32_data, m, k_dim)
+                            }
+                        } else {
+                            quantize_hfp4g32_2d(&f32_data, m, k_dim)
+                        };
                         (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                     } else {
                         // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
@@ -6016,7 +6037,27 @@ fn handle_main_quant(
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
                         let m = meta.shape[0];
-                        let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                        // AWQ pre-scaling (mirrors the MQ4V2 dense arm): W' = W·s
+                        // before FWHT+quant, sidecar emitted after the tensor push.
+                        // Runtime divides x by s in the rotate step ((W·s)·(x/s)).
+                        // MFP4G32 is in DType::supports_awq_sidecar so the loader
+                        // attaches the sidecar; without --awq/--imatrix this arm
+                        // is byte-identical to the pre-AWQ plain MFP4 quant.
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m, k_dim, &scales);
+                                quantize_mfp4g32_2d(&scaled, m, k_dim, &signs1, &signs2)
+                            } else {
+                                quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                            }
+                        } else {
+                            quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2)
+                        };
                         (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                     } else {
                         // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation

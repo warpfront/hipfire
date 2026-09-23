@@ -1,0 +1,34 @@
+{
+  "source": "/home/kaden/ClaudeCode/warpfront/wt-lloyd/.codeinsight+research/scratch-2026-09-17/Fp8Phase1/attrib/savetemps/agu_full.s",
+  "fed_intervals": [
+    [
+      437,
+      437
+    ],
+    [
+      458,
+      512
+    ]
+  ],
+  "fed": {
+    "wmma": 32,
+    "ds": 12,
+    "VALU_packets": 0,
+    "wait_ds": 8,
+    "instructions": 52
+  },
+  "fold_interval": [
+    677,
+    849
+  ],
+  "fold": {
+    "wmma": 0,
+    "ds": 18,
+    "VALU_packets": 132,
+    "wait_ds": 17,
+    "instructions": 173
+  },
+  "fold_FMA_ops_including_VOPD": 128,
+  "fold_WMMAs_amortization_K128": 64,
+  "fold_VALU_packets_per_WMMA": 2.0625
+}

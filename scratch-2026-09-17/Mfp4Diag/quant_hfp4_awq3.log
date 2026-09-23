@@ -1,0 +1,310 @@
+Rayon: 51 worker threads (64 cores available, default 80% = 51)
+Loading imatrix: /home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf
+  imatrix: 496 in_sum2 + 496 counts tensors
+imatrix: loaded 496 entries from /home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf (0 MoE multi-matrix entries skipped — Step 5a is dense-only)
+imatrix loaded from /home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf
+AWQ pre-scaling: ENABLED (alpha=0.55, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)
+Architecture: qwen3_5 (id=5)
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00001-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00002-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00003-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00004-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00005-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00006-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00007-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00008-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00009-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00010-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00011-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00012-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00013-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00014-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00015-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00016-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00017-of-00018.safetensors
+Loading: /home/kaden/qcal/parents/qwen3.8-27b/model-00018-of-00018.safetensors
+Found 1199 tensors (0 FP8 scale siblings indexed)
+   HFP4G32: lm_head.weight [248320, 5120] (1271398400 elements, 2483200.0 KB → 663480.0 KB)
+    Q8_F16: model.language_model.embed_tokens.weight [248320, 5120] (1271398400 elements, 2483200.0 KB → 1319200.0 KB)
+       F16: model.language_model.layers.0.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.0.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.0.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.0.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.0.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.0.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.0.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.0.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.0.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.0.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.0.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.0.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.0.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.0.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.0.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.0.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.0.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.0.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.0.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.0.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.0.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.0.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.1.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.1.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.1.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.1.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.1.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.1.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.1.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.1.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.1.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.1.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.1.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.1.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.1.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.1.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.1.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.1.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.1.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.1.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.1.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.1.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.1.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.1.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.10.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.10.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.10.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.10.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.10.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.10.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.10.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.10.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.10.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.10.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.10.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.10.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.10.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.10.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.10.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.10.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.10.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.10.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.10.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.10.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.10.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.10.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.11.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.11.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.11.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.11.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.11.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.11.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.11.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.11.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.11.self_attn.k_norm.weight [256] (256 elements, 0.5 KB → 0.5 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.11.self_attn.k_proj.weight [1024, 5120] (5242880 elements, 10240.0 KB → 2736.0 KB)
+    AWQ:    model.language_model.layers.11.self_attn.k_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.11.self_attn.o_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.11.self_attn.o_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+       F16: model.language_model.layers.11.self_attn.q_norm.weight [256] (256 elements, 0.5 KB → 0.5 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.11.self_attn.q_proj.weight [12288, 5120] (62914560 elements, 122880.0 KB → 32832.0 KB)
+    AWQ:    model.language_model.layers.11.self_attn.q_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.11.self_attn.v_proj.weight [1024, 5120] (5242880 elements, 10240.0 KB → 2736.0 KB)
+    AWQ:    model.language_model.layers.11.self_attn.v_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.12.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.12.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.12.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.12.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.12.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.12.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.12.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.12.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.12.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.12.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.12.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.12.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.12.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.12.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.12.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.12.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.12.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.12.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.12.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.12.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.12.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.12.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.13.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.13.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.13.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.13.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.13.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.13.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.13.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.13.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.13.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.13.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.13.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.13.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.13.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.13.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.13.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.13.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.13.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.13.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.13.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.13.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.13.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.13.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.14.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.14.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.14.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.14.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.14.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.14.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.14.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.14.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.14.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.14.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.14.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.14.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.14.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.14.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.14.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.14.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.14.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.14.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.14.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.14.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.14.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.14.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.15.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.15.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.15.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.15.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.15.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.15.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.15.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.15.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.15.self_attn.k_norm.weight [256] (256 elements, 0.5 KB → 0.5 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.15.self_attn.k_proj.weight [1024, 5120] (5242880 elements, 10240.0 KB → 2736.0 KB)
+    AWQ:    model.language_model.layers.15.self_attn.k_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.15.self_attn.o_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.15.self_attn.o_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+       F16: model.language_model.layers.15.self_attn.q_norm.weight [256] (256 elements, 0.5 KB → 0.5 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.15.self_attn.q_proj.weight [12288, 5120] (62914560 elements, 122880.0 KB → 32832.0 KB)
+    AWQ:    model.language_model.layers.15.self_attn.q_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.15.self_attn.v_proj.weight [1024, 5120] (5242880 elements, 10240.0 KB → 2736.0 KB)
+    AWQ:    model.language_model.layers.15.self_attn.v_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.16.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.16.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.16.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.16.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.16.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.16.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.16.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.16.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.16.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.16.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.16.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.16.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.16.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.16.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.16.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.16.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.16.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.16.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.16.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.16.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.16.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.16.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.17.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.17.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.17.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.17.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.17.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.17.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.17.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.17.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.17.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.17.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.17.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.17.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.17.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.17.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.17.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.17.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.17.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.17.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.17.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.17.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.17.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.17.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.18.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.18.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.18.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.18.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.18.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.18.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.18.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.18.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.18.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.18.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.18.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.18.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.18.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.18.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.18.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.18.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.18.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.18.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.18.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.18.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.18.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.18.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.19.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.19.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.19.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.19.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.19.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.19.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.19.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.19.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.19.self_attn.k_norm.weight [256] (256 elements, 0.5 KB → 0.5 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.19.self_attn.k_proj.weight [1024, 5120] (5242880 elements, 10240.0 KB → 2736.0 KB)
+    AWQ:    model.language_model.layers.19.self_attn.k_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.19.self_attn.o_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.19.self_attn.o_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+       F16: model.language_model.layers.19.self_attn.q_norm.weight [256] (256 elements, 0.5 KB → 0.5 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.19.self_attn.q_proj.weight [12288, 5120] (62914560 elements, 122880.0 KB → 32832.0 KB)
+    AWQ:    model.language_model.layers.19.self_attn.q_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.19.self_attn.v_proj.weight [1024, 5120] (5242880 elements, 10240.0 KB → 2736.0 KB)
+    AWQ:    model.language_model.layers.19.self_attn.v_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.2.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.2.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.2.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.2.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.2.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.2.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.2.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.2.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.2.linear_attn.in_proj_qkv.weight [10240, 5120] (52428800 elements, 102400.0 KB → 27360.0 KB)
+    AWQ:    model.language_model.layers.2.linear_attn.in_proj_qkv.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.2.linear_attn.in_proj_z.weight [6144, 5120] (31457280 elements, 61440.0 KB → 16416.0 KB)
+    AWQ:    model.language_model.layers.2.linear_attn.in_proj_z.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.2.linear_attn.norm.weight [128] (128 elements, 0.2 KB → 0.2 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.2.linear_attn.out_proj.weight [5120, 6144] (31457280 elements, 61440.0 KB → 16400.0 KB)
+    AWQ:    model.language_model.layers.2.linear_attn.out_proj.awq_scale.weight [6144] (1D F16, 12288 B)
+   HFP4G32: model.language_model.layers.2.mlp.down_proj.weight [5120, 17408] (89128960 elements, 174080.0 KB → 46320.0 KB)
+    AWQ:    model.language_model.layers.2.mlp.down_proj.awq_scale.weight [17408] (1D F16, 34816 B)
+   HFP4G32: model.language_model.layers.2.mlp.gate_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.2.mlp.gate_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.2.mlp.up_proj.weight [17408, 5120] (89128960 elements, 174080.0 KB → 46512.0 KB)
+    AWQ:    model.language_model.layers.2.mlp.up_proj.awq_scale.weight [5120] (1D F16, 10240 B)
+       F16: model.language_model.layers.2.post_attention_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.20.input_layernorm.weight [5120] (5120 elements, 10.0 KB → 10.0 KB) [F16 fallback]
+       F16: model.language_model.layers.20.linear_attn.A_log [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+    Q8_F16: model.language_model.layers.20.linear_attn.conv1d.weight [10240, 1, 4] (40960 elements, 80.0 KB → 42.5 KB)
+       F16: model.language_model.layers.20.linear_attn.dt_bias [48] (48 elements, 0.1 KB → 0.1 KB) [F16 fallback]
+   HFP4G32: model.language_model.layers.20.linear_attn.in_proj_a.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.20.linear_attn.in_proj_a.awq_scale.weight [5120] (1D F16, 10240 B)
+   HFP4G32: model.language_model.layers.20.linear_attn.in_proj_b.weight [48, 5120] (245760 elements, 480.0 KB → 128.2 KB)
+    AWQ:    model.language_model.layers.20.linear_attn.in_proj_b.awq_scale.weight [5120] (1D F16, 10240 B)

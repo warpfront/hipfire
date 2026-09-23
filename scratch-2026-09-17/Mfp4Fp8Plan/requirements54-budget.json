@@ -1,0 +1,49 @@
+{
+  "work_gflop_per_token": 54,
+  "target_tok_s": 4000,
+  "target_us": 250,
+  "requirements": [
+    {
+      "aggregate_tf": 250,
+      "gemm_us": 216.0,
+      "non_gemm_budget_us": 34.0,
+      "saving_from_today_190_us": 156.0,
+      "unexplained_saving_after_conditional_P_scan_us": [
+        119.7041196657753,
+        140.3291196657753
+      ]
+    },
+    {
+      "aggregate_tf": 300,
+      "gemm_us": 180.0,
+      "non_gemm_budget_us": 70.0,
+      "saving_from_today_190_us": 120.0,
+      "unexplained_saving_after_conditional_P_scan_us": [
+        83.7041196657753,
+        104.3291196657753
+      ]
+    },
+    {
+      "aggregate_tf": 350,
+      "gemm_us": 154.28571428571428,
+      "non_gemm_budget_us": 95.71428571428572,
+      "saving_from_today_190_us": 94.28571428571428,
+      "unexplained_saving_after_conditional_P_scan_us": [
+        57.98983395148957,
+        78.61483395148957
+      ]
+    }
+  ],
+  "same_card_3536_roof_non_gemm_upper_bound_us": 143.98794914445904,
+  "observed_arm_us": 534,
+  "observed_gap_us": 284,
+  "observed_gap_pp8192_s": 2.326528,
+  "B3_pp8192_best_tok_s": 1873.1,
+  "B3_pp8192_fp8_pair_mean": 1870.75,
+  "B3_pp8192_q8_pair_mean": 1823.65,
+  "B3_paired_time_saved_us": 13.805866268662953,
+  "conditional_non_gemm_remaining_after_P_and_derived_scan_us": [
+    153.7041196657753,
+    174.3291196657753
+  ]
+}

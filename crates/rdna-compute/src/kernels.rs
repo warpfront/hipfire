@@ -1206,6 +1206,11 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC: &str = concat!(
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
 /// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
 pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// AWQ pre-divide WITHOUT rotation, for rotation-free quantized dtypes
+/// (HFP4G32 + AWQ sidecar): y[r*K+i] = x[r*K+i] / s[i]. Alias-safe. The
+/// FWHT-fused `*_mq_rotate_awq` producers must not be used here — they
+/// rotate, and HFP4 weights are encoded unrotated.
+pub const AWQ_DIVIDE_X_SRC: &str = include_str!("../../../kernels/src/awq_divide_x.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
 /// for the down_proj / w_down input stage. Dispatched when down_proj
 /// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE

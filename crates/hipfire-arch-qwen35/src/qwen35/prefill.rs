@@ -5137,13 +5137,17 @@ fn batch_chunk_delta_net_input_projection(
             )?;
         }
     } else {
-        gpu.rmsnorm_batched(
+        // Rotation-free AWQ (HFP4G32 + sidecar): rmsnorm, then x/s divide
+        // with NO FWHT — no-op vs rmsnorm_batched when no sidecar attached.
+        llama::rmsnorm_div_awq_batched_for(
+            gpu,
             &pbs.x_batch,
             &layer.attn_norm,
+            &layer.wqkv,
             &pbs.x_rot_batch,
-            n,
             dim,
             config.norm_eps,
+            n,
         )?;
     }
 
@@ -5835,6 +5839,18 @@ fn batch_chunk_delta_net_output_projection(
             n,
         )?;
         &pbs.dn_normed_rot_batch
+    } else if llama::div_awq_batched_for(
+        gpu,
+        &pbs.dn_normed_batch,
+        &pbs.dn_normed_rot_batch,
+        &layer.wo,
+        layer.wo.k,
+        n,
+    )? {
+        // Rotation-free AWQ (HFP4G32 + sidecar): x/s divided with NO FWHT
+        // into the MQ twin's rot scratch. dn_normed_batch is a live
+        // pipeline buffer — never divide it in place.
+        &pbs.dn_normed_rot_batch
     } else {
         &pbs.dn_normed_batch
     };
@@ -6243,13 +6259,17 @@ fn batch_chunk_delta_net_ffn_gate_up(
             )?;
         }
     } else {
-        gpu.rmsnorm_batched(
+        // Rotation-free AWQ (HFP4G32 + sidecar): rmsnorm, then x/s divide
+        // with NO FWHT — no-op vs rmsnorm_batched when no sidecar attached.
+        llama::rmsnorm_div_awq_batched_for(
+            gpu,
             &pbs.x_batch,
             &layer.ffn_norm,
+            &layer.w_gate,
             &pbs.x_rot_batch,
-            n,
             dim,
             config.norm_eps,
+            n,
         )?;
     }
 
@@ -6523,6 +6543,16 @@ fn batch_chunk_delta_net_ffn_down(
         }
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        // Rotation-free AWQ (HFP4G32 + sidecar): x/s divide with NO FWHT,
+        // in place over the per-layer silu scratch. No-op without sidecar.
+        llama::div_awq_batched_for(
+            gpu,
+            &pbs.ffn_hidden_batch,
+            &pbs.ffn_hidden_batch,
+            &layer.w_down,
+            layer.w_down.k,
+            n,
+        )?;
     }
     // Batched w_down + residual/partial.
     if let Some(prep) = &iu4_prep {
@@ -6701,13 +6731,17 @@ fn batch_chunk_full_attn_input_projection(
             )?;
         }
     } else {
-        gpu.rmsnorm_batched(
+        // Rotation-free AWQ (HFP4G32 + sidecar): rmsnorm, then x/s divide
+        // with NO FWHT — no-op vs rmsnorm_batched when no sidecar attached.
+        llama::rmsnorm_div_awq_batched_for(
+            gpu,
             &pbs.x_batch,
             &layer.attn_norm,
+            &layer.wq,
             &pbs.x_rot_batch,
-            n,
             dim,
             config.norm_eps,
+            n,
         )?;
     }
 
@@ -7203,6 +7237,18 @@ fn batch_chunk_full_attn_output_projection(
             n,
         )?;
         &pbs.fa_attn_out_rot_batch
+    } else if llama::div_awq_batched_for(
+        gpu,
+        &pbs.fa_attn_out_batch,
+        &pbs.fa_attn_out_rot_batch,
+        &layer.wo,
+        layer.wo.k,
+        n,
+    )? {
+        // Rotation-free AWQ (HFP4G32 + sidecar): x/s divided with NO FWHT
+        // into the MQ twin's rot scratch. fa_attn_out_batch is a live
+        // pipeline buffer — never divide it in place.
+        &pbs.fa_attn_out_rot_batch
     } else {
         &pbs.fa_attn_out_batch
     };
@@ -7670,13 +7716,17 @@ fn batch_chunk_full_attn_ffn_gate_up(
             )?;
         }
     } else {
-        gpu.rmsnorm_batched(
+        // Rotation-free AWQ (HFP4G32 + sidecar): rmsnorm, then x/s divide
+        // with NO FWHT — no-op vs rmsnorm_batched when no sidecar attached.
+        llama::rmsnorm_div_awq_batched_for(
+            gpu,
             &pbs.x_batch,
             &layer.ffn_norm,
+            &layer.w_gate,
             &pbs.x_rot_batch,
-            n,
             dim,
             config.norm_eps,
+            n,
         )?;
     }
     // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
@@ -7937,6 +7987,16 @@ fn batch_chunk_full_attn_ffn_down(
         }
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        // Rotation-free AWQ (HFP4G32 + sidecar): x/s divide with NO FWHT,
+        // in place over the per-layer silu scratch. No-op without sidecar.
+        llama::div_awq_batched_for(
+            gpu,
+            &pbs.ffn_hidden_batch,
+            &pbs.ffn_hidden_batch,
+            &layer.w_down,
+            layer.w_down.k,
+            n,
+        )?;
     }
     if let Some(prep) = &iu4_prep {
         gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
