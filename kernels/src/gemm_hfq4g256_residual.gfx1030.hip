@@ -7,8 +7,30 @@
 // residual stream). 136 B/group stride, 4-bit nibble unpack. See
 // gemm_gate_up_hfq4g256.gfx1030.hip for the template comments.
 // fdot2 inner product for 2× FP16 FMA throughput on gfx1030+.
+// Double-buffered LDS pipelines dequant of K-tile N+1 with the dot
+// product of K-tile N (1 __syncthreads per iter).
 
 typedef _Float16 __attribute__((ext_vector_type(2))) half2_t;
+
+// Helper: dequantize one HFQ4 K-tile (16 FP16 weights from 8 bytes) into
+// lds_buf[my_lds_row][0..16]. Called by lanes 0..15 only. `tile_ptr`
+// points at the 8 packed bytes for this K-tile (i.e. gp + 8 + kt * 8).
+__device__ static inline void dq_hfq4_ktile(
+    _Float16 (&lds_buf)[16][16],
+    int my_lds_row,
+    const char* __restrict__ tile_ptr,
+    _Float16 sc_h,
+    _Float16 zp_h
+) {
+    unsigned int pk0 = *(const unsigned int*)(tile_ptr);
+    unsigned int pk1 = *(const unsigned int*)(tile_ptr + 4);
+    #define DQ(i, pk, sh) lds_buf[my_lds_row][i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
+    DQ(0,  pk0,  0); DQ(1,  pk0,  4); DQ(2,  pk0,  8); DQ(3,  pk0, 12);
+    DQ(4,  pk0, 16); DQ(5,  pk0, 20); DQ(6,  pk0, 24); DQ(7,  pk0, 28);
+    DQ(8,  pk1,  0); DQ(9,  pk1,  4); DQ(10, pk1,  8); DQ(11, pk1, 12);
+    DQ(12, pk1, 16); DQ(13, pk1, 20); DQ(14, pk1, 24); DQ(15, pk1, 28);
+    #undef DQ
+}
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemm_hfq4g256_residual_gfx1030(
@@ -35,7 +57,8 @@ extern "C" __global__ void gemm_hfq4g256_residual_gfx1030(
     const char* row_base = A + safe_row * row_stride;
     const _Float16* x_base = X + (long long)safe_col * K;
 
-    __shared__ _Float16 lds_a[16][16];
+    // Double-buffered LDS: 2× 16×16 FP16 = 1024 bytes.
+    __shared__ _Float16 lds_a[2][16][16];
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int g = 0; g < groups_per_row; g++) {
@@ -43,37 +66,46 @@ extern "C" __global__ void gemm_hfq4g256_residual_gfx1030(
         _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
         _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         const _Float16* xg = x_base + g * 256;
+        const char* dp = gp + 8;
+
+        // Prefetch K-tile 0 into lds_a[0] before entering the pipelined loop.
+        if ((tid >> 4) == 0) {
+            dq_hfq4_ktile(lds_a[0], my_lds_row, dp, sc_h, zp_h);
+        }
+        __syncthreads();
 
         for (int kt = 0; kt < 16; kt++) {
+            const int cur_buf = kt & 1;
+            const int next_kt = kt + 1;
+            const int next_buf = next_kt & 1;
             const int k_off = kt * 16;
 
-            if ((tid >> 4) == 0) {
-                unsigned int pk0 = *(const unsigned int*)(gp + 8 + k_off / 2);
-                unsigned int pk1 = *(const unsigned int*)(gp + 8 + k_off / 2 + 4);
-                #define DQ(i, pk, sh) lds_a[my_lds_row][i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
-                DQ(0,  pk0,  0); DQ(1,  pk0,  4); DQ(2,  pk0,  8); DQ(3,  pk0, 12);
-                DQ(4,  pk0, 16); DQ(5,  pk0, 20); DQ(6,  pk0, 24); DQ(7,  pk0, 28);
-                DQ(8,  pk1,  0); DQ(9,  pk1,  4); DQ(10, pk1,  8); DQ(11, pk1, 12);
-                DQ(12, pk1, 16); DQ(13, pk1, 20); DQ(14, pk1, 24); DQ(15, pk1, 28);
-                #undef DQ
-            }
-            __syncthreads();
-
+            // Load X for current K-tile.
             half2_t x_pairs[8];
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 x_pairs[p] = *(const half2_t*)(xg + k_off + p * 2);
             }
+
+            // Prefetch K-tile kt+1 into lds_a[next_buf] (skip on last K-tile).
+            // Runs concurrently with the dot product on lds_a[cur_buf].
+            if (next_kt < 16 && (tid >> 4) == 0) {
+                dq_hfq4_ktile(lds_a[next_buf], my_lds_row, dp + next_kt * 8, sc_h, zp_h);
+            }
+
+            // Compute using cur_buf (already populated by previous iter's
+            // prefetch or the per-group K-tile 0 prefetch above).
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 int out_row_in_tile = 2 * j + (tid >> 4);
-                const _Float16* a_row = &lds_a[out_row_in_tile][0];
+                const _Float16* a_row = &lds_a[cur_buf][out_row_in_tile][0];
                 #pragma unroll
                 for (int p = 0; p < 8; p++) {
                     half2_t a_pair = *(const half2_t*)(a_row + p * 2);
                     acc[j] = __builtin_amdgcn_fdot2(a_pair, x_pairs[p], acc[j], false);
                 }
             }
+
             __syncthreads();
         }
     }
