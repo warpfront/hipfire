@@ -1,0 +1,62 @@
+{
+  "id": "chatcmpl-1991097-11",
+  "object": "chat.completion",
+  "created": 1790149772,
+  "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "It looks like your message got cut off at the end with just \"a\".\n\nHowever, I can see you've included a Python function `merge_sorted` that merges two sorted lists. The function appears to be correct for merging two sorted lists into a single sorted list.\n\nIs there something specific you'd like help with? For example:\n- Do you want me to explain how the merge function works?\n- Do you have a question about the kernel dispatch table context?\n- Did you want to test the function with specific inputs?\n- Is there a bug you're trying to identify?\n\nLet me know how I can help!"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 511,
+    "completion_tokens": 132,
+    "total_tokens": 643,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "ttft_ms": 8069.3,
+    "prefill_ms": 8069.3,
+    "prefill_tok_s": 63.3,
+    "decode_tok_s": 14.7,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "mtp_window_timings": null
+  },
+  "hipfire": {
+    "tok_s": 7.8,
+    "prefill_tok_s": 63.3,
+    "decode_tok_s": 14.7,
+    "execution_mode": null,
+    "continuous_batch": null,
+    "reasoning": {
+      "contract": "qwen_jinja",
+      "mode": "disabled",
+      "effort": null,
+      "max_think_tokens": null,
+      "cap_source": "none"
+    },
+    "config_warnings": [
+      "reasoning_effort 'none' dropped: thinking disabled",
+      "max_think_tokens/budget dropped: thinking disabled"
+    ]
+  }
+}

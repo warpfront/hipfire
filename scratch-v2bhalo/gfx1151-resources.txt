@@ -1,0 +1,12 @@
+trace/gfx1151-8192/home/.hipfire_kernels/gfx1151/gemm_mq4g256v2_residual_iu4_v2b_gfx11.2d3e1a3c10c6bf7b.hsaco
+4d361efdab6d275047eb8cf7aa046a2daeb057ffc6c01557e6286018849d9c68  trace/gfx1151-8192/home/.hipfire_kernels/gfx1151/gemm_mq4g256v2_residual_iu4_v2b_gfx11.2d3e1a3c10c6bf7b.hsaco
+GPU dev 0: gfx1151
+gemm_mq4g256v2_residual_iu4_v2b_set_gfx11: 246 VGPR, 0 private bytes, 0 static LDS, dynamic LDS 65536, 1 blocks/MP (16 waves)
+gemm_mq4g256v2_residual_iu4_v2b_add_gfx11: 246 VGPR, 0 private bytes, 0 static LDS, dynamic LDS 65536, 1 blocks/MP (16 waves)
+rc=0
+host-x86_64-unknown-linux-gnu-
+hipv4-amdgcn-amd-amdhsa--gfx1151
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2b_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2b_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0		
+kernel-cache .hash: 2d3e1a3c10c6bf7b
+X5 objects in the trace run's kernel cache: 0 (every SET/ADD dispatched V2B)
