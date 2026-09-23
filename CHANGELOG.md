@@ -6,6 +6,7 @@
 
 **Breaking migration** (not yet tagged or released).
 
+- gfx11 symmetric MQ4V2 full-tile IU4 prefill now stages X5 activation packets ahead of each WMMA half on exact gfx1100/gfx1151 for eager M128×N128, K-multiple-of-256 SET/ADD; partial tiles, other architectures, and non-eager paths retain the incumbent. `HIPFIRE_IU4_X5=0` opts out. On the prior X5 branch, Q8/VMM two-cycle fresh-process ABBA improved pp8192 +9.13% on Halo and +4.74% on gfx1100, with tg128 within 1% and byte-identical q8/q8 WT2 c24 outputs. The composite `mq4-lloyd` gate and absolute throughput are recorded in `scratch-land042/REPORT.md`.
 - VMM is the default KV backend. The former `contiguous` backend spelling is renamed `legacy`; the old name is rejected with a migration message (`use --kv-backend legacy` / `memory.kv_backend = "legacy"`).
 - Legacy loads emit one stable warning carrying the `HIPFIRE_KV_BACKEND=legacy` token (automatic fallback or explicit operator choice). Loaded JSON, bench `--json`, and harness output expose `kv_backend*` fields (`kv_backend`, `kv_backend_request`, `kv_backend_reason`, `kv_backend_legacy`, `kv_backend_warning`).
 - New public `--kv-k` / `--kv-v` flags and typed `memory.kv_k` / `memory.kv_v` (Qwen family) override K and V independently of the whole-cache `--kv-mode` / `memory.kv_cache` preset.

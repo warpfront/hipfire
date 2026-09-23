@@ -1,0 +1,35 @@
+# land-042: X5 on the measured gfx11 production stack
+
+## Integration
+
+`land-042` was created as a separate hipx worktree at `/home/kaden/hipfire-land042` from `mq4-lloyd` `0a6f3e2b6deebc69b198c28e78c0e80f4bf39713`; X5 `gfx11-x5` `54ba7ed42a01bb524766f4fa4468cc35790ffbed` was merged with a two-parent merge (`776358d6de3a7ce808516fd0d4c13e12215f85bc`). Git's ort merge had **zero textual conflicts**. The earlier stack's gfx11 FA2 Q16, batched fast RoPE, and tiny-Qwen Q8 reducer bound remain in place. X5 adds separate SET/ADD packet-prefetch kernels only for exact gfx1100/gfx1151 symmetric full M128×N128 eager-column IU4 shapes; mixed partial tiles, capture, other architectures, and opt-out `HIPFIRE_IU4_X5=0` retain the incumbent. `CHANGELOG.md` has an Unreleased X5 entry; version remains 0.4.0. The patch-history forbidden-token scan found zero matches. The user's local `wt-lloyd` worktree and its uncommitted edits were not touched.
+
+Native hipx `cargo build --release --manifest-path /home/kaden/hipfire-land042/Cargo.toml` and `cargo build --release --manifest-path /home/kaden/hipfire-land042/Cargo.toml -p hipfire-runtime --example eval_hipfire` both succeeded. No build used the sshfs mount. No formatter, linter, or workspace test suite ran. The build occurred only in the compile-only handoff between GemmCalib and BetaAlpha, with no hipx GPU timing active.
+
+## Full-stack Q8/VMM paired matrix — PASS
+
+Per card, `scratch-land042/run_abba.py` ran **A B B A A B B A**, eight separate `hipfire bench <model> --matrix --pp 512,8192 --ctx 128 --tg 128 --spec off --runs 3 --warmups 1 --kv-mode q8 --kv-backend vmm --json` processes, each with its own HOME. A is the exact `0a6f3e2b6` native binary in `/home/kaden/hipfire-land041`; B is this merged tree's native binary. No tuning knobs. Every arm attested `/proc` `ROCR_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES=0`, the `GPU dev 0: <arch>` log line, `KV cache: Q8 vmm (`, and the effective JSON architecture/KV mode/backend. Halo used ROCR=1/HIP=0; gfx1100 used ROCR=0/HIP=0. HIP 3 and local card-D were not used. Each reported value below is the mean of four independent process medians, not an estimate.
+
+| Card / row | A tok/s | B tok/s | B/A | Two ABBA-cycle ratios | Original X5 delta (threshold: no more than 1 percentage point below) |
+|---|---:|---:|---:|---:|---:|
+| Halo gfx1151 pp512 | 806.150 | **948.925** | **+17.711%** | 1.17439, 1.17985 | +18.514% (floor +17.514%) |
+| Halo gfx1151 pp8192 | 754.300 | **827.225** | **+9.668%** | 1.09141, 1.10199 | +9.131% (floor +8.131%) |
+| Halo gfx1151 tg128 @ ctx128 | 14.78975 | **14.83306** | +0.293% | 1.00060, 1.00526 | within 1% |
+| gfx1100 pp512 | 2133.025 | **2263.375** | **+6.111%** | 1.05840, 1.06384 | +5.908% (floor +4.908%) |
+| gfx1100 pp8192 | 2225.900 | **2332.575** | **+4.792%** | 1.04718, 1.04867 | +4.744% (floor +3.744%) |
+| gfx1100 tg128 @ ctx128 | 49.02643 | **49.00453** | −0.045% | 0.99886, 1.00025 | within 1% |
+
+The first measured landed-stack pp8192 replaces the approximate **833 Halo / 2,330 gfx1100** figures: actual **827.225 Halo / 2332.575 gfx1100 tok/s**. Both cards pass every prefill row and decode gate. Per-process JSON, command, `/proc` environment, and combined logs are under `scratch-land042/{gfx1151,gfx1100}/abba/`; the pooled `summary.json` in each directory is the arithmetic receipt.
+
+## Correctness and guard — PASS
+
+- Paired WT2 c24 prefill scoring (`scratch-land042/run_wt2.py`, explicit `--kv-mode q8 --kv-v q8`, model/reference below): gfx1151 A/B slice-mean KLD **0.076901 / 0.076901**, byte-identical output SHA256 `eefd7d257d736b9bdaddf1246e93217c710eb4291dfec3cafd7f62c863aaeb25`; gfx1100 **0.076879 / 0.076879**, byte-identical output SHA256 `8f2b94bb904603bc53d17f7877c306ee4aacd0afc7c71acbf80a60bea0b1e2b2`. Each evaluated 24 chunks with the same reference `/home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin`; `A.kldseq` and `B.kldseq` were compared byte-for-byte per card. Raw logs, sequences, and process environments live in `scratch-land042/<arch>/wt2/`.
+- Manual per-card server loaded the B model with effective `KV cache: Q8 vmm (` and attested the exact arch plus both daemon `/proc` visibility variables. `scripts/serve_harness.py --no-spawn --mode battery --kv q8 --kv-backend vmm --max-think-tokens 1 --max-tokens 512` returned **5/5** nonempty, coherent `finish=stop` turns on each card, with zero runaway/attractor/retrieval miss. Receipts: `scratch-land042/{gfx1100,gfx1151}/battery.json`. `scratch-land042/odd_fill.py` sent the 511-token prompt from `benchmarks/prompts/ttft_511.txt`: both responses had exactly 511 prompt tokens, coherent answers recognizing the truncated merge-function question, and `finish=stop`; receipts `scratch-land042/<arch>/ttft511.json`.
+- Local card-B `GPU-e475645fe0200397` gfx1201 guard ran the **copied landed hipx B binaries**, not the parent stack, using `scripts/guard_gfx1201_baseline.py` from the matching stack in an isolated local workspace. After a discarded fresh-process warmup, independent pp8192 medians were **3662.4 / 3634.8 / 3635.9 tok/s** (all ≥3620); decode medians **36.50971 / 36.49712 / 36.48929 tok/s** (all within 1% of 36.5); automatic native-FP8 VMM was asserted in every log. The separate A control medians were 3640.5 / 3631.3 / 3631.1, with 36.48923 / 36.50624 / 36.51109 decode. Candidate evidence: `/home/kaden/ClaudeCode/warpfront/land042-guard/guard-evidence/summary.json`; no card-D `GPU-6109a4cb5f833235` use.
+
+## Provenance and lease discipline
+
+- hipx model: `/home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq`. Its pinned hipx MD5 in the immediately preceding land-041 gate is `2cfe88923b3671ca16a8de6ec1122fde`. The local card-B fixture was re-hashed this run: MD5 **`2cfe88923b3671ca16a8de6ec1122fde`**, SHA256 **`de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5`**. The SHA256 is for the local same-MD5 fixture; it was not independently recomputed on hipx during another agent's GPU timing.
+- hipx A binaries SHA256: `hipfire` `92ba8888082f52feebbbe9881f5075fa198605964fdc9f9ca1cb2a9869b41c30`; `daemon` `ad804bc8bfe6926e72340e1abc055f2ba80c521f5b1ccfa59b78619220219559`.
+- hipx B binaries SHA256: `hipfire` **`f1ae6d2e7f45e9331377efb66d6358868169efc6437e1273c285b5006e53be86`**; `daemon` **`a4f83b5ca854563fe0144a76d83af3caeb20dd14dda6f5a97c6125517beeda62`**; `eval_hipfire` **`98abe134ec3a6bad6e806e64f3a131e76bab1195beb63ca4b21b65e3ad71dda4`**. The local guard's copied B CLI/daemon SHA256 matched those hipx values exactly.
+- GPU leases and compile gap were announced through hub. Before gfx1100 gating its card was 0% busy/VRAM with only persistent `gpusentry` PID 2970; after server shutdown it was again 0% busy/VRAM and no land-042 KFD process remained. Halo precheck was 0% busy/VRAM; after `hipfire stop`, Halo was 0% busy/VRAM with no land-042 process. Other agents' independent process on the *other* card remained outside the leased card. Neither card was compiled against during anyone's timing. No gate was skipped.
