@@ -720,18 +720,48 @@ function gfxTargetVersionToArch(ver: number): string {
   return `gfx${major}${minor}${step}`;
 }
 
-function detectGpuArch(): string {
-  // Read KFD sysfs for GPU arch (same as install command)
-  for (const node of ["1", "0"]) {
-    try {
-      const props = require("fs").readFileSync(`/sys/class/kfd/kfd/topology/nodes/${node}/properties`, "utf8");
-      const m = props.match(/gfx_target_version\s+(\d+)/);
-      if (m) {
-        return gfxTargetVersionToArch(parseInt(m[1]));
-      }
-    } catch {}
+function kfdGpuNodes(): Array<{ node: number; arch: string }> {
+  const fs = require("fs");
+  const root = "/sys/class/kfd/kfd/topology/nodes";
+  try {
+    return fs.readdirSync(root)
+      .map((name: string) => parseInt(name, 10))
+      .filter((node: number) => Number.isFinite(node))
+      .sort((a: number, b: number) => a - b)
+      .flatMap((node: number) => {
+        try {
+          const props = fs.readFileSync(`${root}/${node}/properties`, "utf8");
+          const m = props.match(/gfx_target_version\s+(\d+)/);
+          if (!m) return [];
+          const arch = gfxTargetVersionToArch(parseInt(m[1], 10));
+          return arch === "unknown" ? [] : [{ node, arch }];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return [];
   }
-  return "unknown";
+}
+
+function selectedGpuOrdinal(): number | null {
+  const raw = process.env.ROCR_VISIBLE_DEVICES || process.env.HIP_VISIBLE_DEVICES || "";
+  const first = raw.split(",")[0]?.trim();
+  if (!first || !/^\d+$/.test(first)) return null;
+  return parseInt(first, 10);
+}
+
+function detectGpuArch(): string {
+  const explicit = process.env.HIPFIRE_GPU_ARCH || process.env.HIPFIRE_DETECTED_ARCH;
+  if (explicit && /^gfx\d+/.test(explicit)) return explicit;
+
+  const nodes = kfdGpuNodes();
+  const ordinal = selectedGpuOrdinal();
+  if (ordinal !== null && ordinal >= 0 && ordinal < nodes.length) {
+    const selected = nodes[ordinal];
+    if (selected) return selected.arch;
+  }
+  return nodes[0]?.arch ?? "unknown";
 }
 
 interface ArchDefaults {
@@ -751,7 +781,9 @@ function archDefaults(arch: string): ArchDefaults {
     case "gfx1100": return { kv_cache: "asym3", vram_gb: 24 };  // 7900 XTX
     case "gfx1101": return { kv_cache: "asym3", vram_gb: 16 };  // 7900 XT
     case "gfx1102": return { kv_cache: "asym3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "asym2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
+    // Strix Halo exposes a large coherent memory pool; q8 avoids the K-quant
+    // decode overhead that regressed qwen3.5-0.8b on the 8060S.
+    case "gfx1151": return { kv_cache: "q8", vram_gb: 96 };      // Ryzen AI Max+ 395 / Radeon 8060S
     // RDNA4
     case "gfx1200": case "gfx1201":
       return { kv_cache: "asym3", vram_gb: 16 };                // 9070 XT
@@ -4356,16 +4388,7 @@ switch (cmd) {
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
-    // Detect GPU arch from sysfs (cross-platform, no external commands)
-    let archOut = "";
-    try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/1/properties").text(); } catch {}
-    if (!archOut) try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/0/properties").text(); } catch {}
-    const verMatch = archOut.match(/gfx_target_version\s+(\d+)/);
-    let gpuArch = "unknown";
-    if (verMatch) {
-      // Derive gfx arch from version number: e.g. 100100→gfx1010, 110501→gfx1151.
-      gpuArch = gfxTargetVersionToArch(parseInt(verMatch[1]));
-    }
+    const gpuArch = detectGpuArch();
     if (gpuArch !== "unknown") {
       const kernelSrc = join(repoDir, "kernels/compiled", gpuArch);
       const kernelDst = join(binDir, "kernels/compiled", gpuArch);

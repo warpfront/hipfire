@@ -9551,10 +9551,9 @@ impl Gpu {
         //   ksplit — K-split + atomicAdd (non-deterministic accum order)
         //   k2     — 2× K-tile pipeline (byte-exact accum order)
         //   k2x32  — 32-row block with shared X fragment per K-tile. Slower
-        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo for
-        //            small-M residual projections at prefill-sized batches.
-        //            DFlash verify/lm_head runs at B<=16 and large-M draft
-        //            FFN/lm_head also prefer k2.
+        //            than k2 on gfx1100. Kept as an override, but not the
+        //            gfx1151 default: Ryzen AI Max+ 395 measured faster with
+        //            k2 on qwen3.5-0.8b MQ4 prefill.
         //   k4     — 4× K-tile pipeline. Fixed 2026-05-01 (commit pending):
         //            output mapping was swapped relative to K2's canonical
         //            wave32 WMMA C-mapping. Channel-test passes at K∈{256,512,4096}
@@ -9584,10 +9583,8 @@ impl Gpu {
         });
         let auto_variant = if force_det {
             "k2"
-        } else if is_gfx115x && batch_size <= 16 {
+        } else if is_gfx115x {
             "k2"
-        } else if is_gfx115x && m < 8192 {
-            "k2x32"
         } else if m >= 8192 {
             "k2"
         } else {

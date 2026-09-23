@@ -1259,6 +1259,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    let kv_mode = default_kv_mode_for_arch(kv_mode, &gpu.arch);
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
@@ -1589,6 +1590,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     }
 }
 
+fn default_kv_mode_for_arch(kv_mode: String, arch: &str) -> String {
+    match kv_mode.as_str() {
+        "" | "auto" if arch == "gfx1151" => "q8".to_string(),
+        _ => kv_mode,
+    }
+}
+
 /// Multi-GPU pipeline-parallel load path (Stage 7 of #58). Refuses VL,
 /// non-Qwen3.5 architectures and (transitively, via the upstream "load"
 /// handler) DFlash, CASK and PFlash. Returns a `LoadedModel` with `pp_gpus`,
@@ -1601,12 +1609,13 @@ fn load_model_pp(
     max_seq: usize,
     kv_mode_override: Option<&str>,
     pp: usize,
-    _gpu: &mut rdna_compute::Gpu,
+    gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    let kv_mode = default_kv_mode_for_arch(kv_mode, &gpu.arch);
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
