@@ -1,0 +1,107 @@
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 17516,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "redline_pm4": false,
+  "kv_mode": "fp8",
+  "runs": 1,
+  "prefill": [
+    {
+      "tokens": 512,
+      "stats": {
+        "median": 2334.0,
+        "mean": 2334.0,
+        "min": 2334.0,
+        "max": 2334.0,
+        "stdev": 0.0
+      },
+      "samples": [
+        2334.0
+      ]
+    },
+    {
+      "tokens": 2048,
+      "stats": {
+        "median": 2420.9,
+        "mean": 2420.9,
+        "min": 2420.9,
+        "max": 2420.9,
+        "stdev": 0.0
+      },
+      "samples": [
+        2420.9
+      ]
+    },
+    {
+      "tokens": 8192,
+      "stats": {
+        "median": 2329.5,
+        "mean": 2329.5,
+        "min": 2329.5,
+        "max": 2329.5,
+        "stdev": 0.0
+      },
+      "samples": [
+        2329.5
+      ]
+    },
+    {
+      "tokens": 32768,
+      "stats": {
+        "median": 1941.8,
+        "mean": 1941.8,
+        "min": 1941.8,
+        "max": 1941.8,
+        "stdev": 0.0
+      },
+      "samples": [
+        1941.8
+      ]
+    }
+  ],
+  "decode": [
+    {
+      "context": 128,
+      "tokens": 64,
+      "stats": {
+        "median": 28.813889333399413,
+        "mean": 28.813889333399413,
+        "min": 28.813889333399413,
+        "max": 28.813889333399413,
+        "stdev": 0.0
+      },
+      "samples": [
+        28.813889333399413
+      ]
+    }
+  ],
+  "sustained": []
+}
