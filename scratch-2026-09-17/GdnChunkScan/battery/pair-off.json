@@ -1,0 +1,3 @@
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire_kernels/gfx1100
+hipfire: daemon error: [gpu retryable=false rolled_back=false attempt=0] load failed: kv_mode Fp8 requires exact gfx1201 (got gfx1100). GPU: gfx1100 (24522 MB free / 24560 MB total)
