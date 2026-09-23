@@ -1,0 +1,14 @@
+{
+  "fa2_symbol": "attention_q8_0_fa2_gqa_gfx11",
+  "calls": 256,
+  "fa2_ms": 829.973074,
+  "grid_workitems_x_y_block_x": [
+    [
+      "8192",
+      "4",
+      "256"
+    ]
+  ],
+  "kernel_window_count": 4849,
+  "trace_wall_ms": 10739.681464
+}
