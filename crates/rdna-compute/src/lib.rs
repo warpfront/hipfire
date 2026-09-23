@@ -7,11 +7,12 @@
 mod compiler;
 mod dispatch;
 mod kernels;
+pub mod arch_caps;
 pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;
-pub use dispatch::{gemv_dp4a_enabled, has_wmma_f16, DType, Gpu, GpuTensor};
+pub use dispatch::{gen_fwht_signs, gemv_dp4a_enabled, has_wmma_f16, DType, Gpu, GpuTensor};
 pub use kernels::GEMV_SRC;

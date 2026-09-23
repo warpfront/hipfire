@@ -602,6 +602,15 @@ impl LlamaWeights {
 
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
+fn paro_small_direct_limit() -> Option<usize> {
+    let raw = std::env::var_os("HIPFIRE_PARO_SMALL_DIRECT")?;
+    let text = raw.to_string_lossy();
+    if text.is_empty() || text == "1" {
+        return Some(64);
+    }
+    text.parse::<usize>().ok()
+}
+
 pub fn weight_gemv(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -610,13 +619,47 @@ pub fn weight_gemv(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
-        DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1),
+        DType::F16 => {
+            // gfx12 fast-path: 256-thread block F16-W × F32-X GEMV. Halves
+            // BW vs F32 storage. Specifically targets lm_head decode where
+            // the existing gemm_f16_batched_lmhead falls through to
+            // gemm_f16_tiled (32-thread WG, BW-starved at M=248k).
+            // Opt-in via HIPFIRE_LM_HEAD_F16_X32_GFX12=1.
+            let arch_gfx12 = gpu.arch.starts_with("gfx1200") || gpu.arch.starts_with("gfx1201");
+            if arch_gfx12 && std::env::var("HIPFIRE_LM_HEAD_F16_X32_GFX12").as_deref() == Ok("1") {
+                gpu.gemv_f16_x32_lmhead_gfx12(&w.buf, x, y, w.m, w.k)
+            } else {
+                gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1)
+            }
+        }
         DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
         DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
         DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
+        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_paro4g128_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
+        DType::PARO4G128 => gpu.gemv_paro4g128(&w.buf, x, y, w.m, w.k),
+        DType::PARO4G128T => {
+            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
+                return gpu.gemv_paro4g128t_direct(&w.buf, x, y, w.m, w.k);
+            }
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_paro4g128t_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
         DType::HFP4G32 => gpu.gemv_hfp4g32(&w.buf, x, y, w.m, w.k),
         // ── MQ-family GEMVs ─────────────────────────────────────────
         // F2 fix (2026-05-14): the `_with_rotate` variants below all
@@ -664,6 +707,16 @@ pub fn weight_gemv(
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq4g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
+        DType::MQ4G128 => {
+            gpu.ensure_mq_signs_128()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            rotate_x_mq_128_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq4g128_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ6G256 => {
             gpu.ensure_mq_signs()?;
@@ -727,23 +780,26 @@ pub fn weight_gemv(
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         DType::ParoQ4G128 => {
-            // ParoQuant: copy x → scratch, Givens-rotate scratch, GEMV from scratch.
-            // Must NOT rotate x in-place: the same x_norm is shared across multiple
-            // weight_gemv calls in a layer (wqkv, wz, w_alpha, w_beta, etc.),
-            // each with different rotation metadata.
+            // ParoQuant: fused copy+rotate via givens_rotate_to (1 launch),
+            // then GEMV from scratch. Out-of-place rotation kernel — must
+            // NOT rotate x in-place: same x_norm shared across multiple
+            // weight_gemv calls per layer (wqkv, wz, w_alpha, w_beta), each
+            // with different rotation metadata.
+            //
+            // Switched 2026-05-22 from `copy_d2d + givens_rotate` (2 launches)
+            // to `givens_rotate_to` (1 launch). Saves 1 dispatch per PARO
+            // weight call × ~131 PARO calls/token = 1.3 ms/token wall savings
+            // (~+8 percent at decode).
             let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
-            // Lazily allocate the scratch buffer on first use
             gpu.ensure_paro_scratch(w.k)?;
-            // Alias the scratch buffer to avoid borrow conflicts with gpu methods
             let scratch_alias = GpuTensor {
                 buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
                 shape: vec![w.k],
                 dtype: DType::F32,
             };
-            // Copy x → scratch, rotate scratch, GEMV from scratch
-            gpu.copy_d2d(x, &scratch_alias, w.k * 4)?;
-            gpu.givens_rotate(
-                &scratch_alias, &paro.pairs, &paro.theta, &paro.channel_scales,
+            gpu.givens_rotate_to(
+                x, &scratch_alias,
+                &paro.pairs, &paro.theta, &paro.channel_scales,
                 1, w.k, paro.krot as usize,
             )?;
             gpu.gemv_hfq4g128(&w.buf, &scratch_alias, y, w.m, w.k)
@@ -796,6 +852,74 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
         gpu.fused_rmsnorm_rotate_mq_awq_batched(x, norm_weight, awq, x_rot, k, eps, batch_size)
     } else {
         gpu.fused_rmsnorm_rotate_mq_batched(x, norm_weight, x_rot, k, eps, batch_size)
+    }
+}
+
+/// Lever 1 — Fused RMSNorm + PARO4G128T per-group Givens rotation.
+///
+/// When `next_linear` is PARO4G128T and `HIPFIRE_PARO_FUSE_RMSNORM` is enabled
+/// (default: on, opt-out with `=0`), runs a single fused kernel that produces
+/// BOTH x_rot (for the immediate prerotated GEMV on next_linear) AND
+/// post-rmsnorm x_norm (written into `tmp` for subsequent linears in the
+/// same residual block). Saves 1 launch vs the separated rmsnorm_f32 +
+/// paro4g128t_rotate path.
+///
+/// Returns `Some(x_rot_scratch)` if fused — caller should run
+/// `gemv_paro4g128t_prerotated` for `next_linear`, then standard
+/// `weight_gemv` for subsequent paro linears (they consume `tmp`).
+///
+/// Returns `None` if fusion was skipped (non-PARO dtype or env opt-out) —
+/// in that case `tmp` contains plain rmsnorm output and caller should use
+/// `weight_gemv` as usual.
+pub fn fused_rmsnorm_rotate_for_paro<'a>(
+    gpu: &mut Gpu,
+    next_linear: &WeightTensor,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    tmp: &GpuTensor,
+    x_rot_scratch: &'a GpuTensor,
+    eps: f32,
+) -> HipResult<Option<&'a GpuTensor>> {
+    // IMPORTANT: callers chain this AFTER `fused_rmsnorm_rotate_for_mq`,
+    // which already runs rmsnorm_f32 in its non-MQ fallthrough. So when we
+    // return None (opt-out or wrong dtype), `tmp` already contains the
+    // rmsnorm output from the prior call — DO NOT run rmsnorm_f32 again.
+    //
+    // STATUS: Lever 1 falsified at -2.4% on 0.8B PARO4G128T (gfx1201, 2026-05-22).
+    // The single-workgroup fused kernel runs ~K-rotation serially within one block,
+    // losing the M/8 cross-CU parallelism that the split rotate kernel (grid=[K/128])
+    // gets for free. Saves ~10µs launch overhead but adds ~30-70µs serial rotate
+    // time per call. Net loss on every site. Default OFF; explicit opt-in for
+    // research / future-redesign comparison.
+    let opt_in = std::env::var("HIPFIRE_PARO_FUSE_RMSNORM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !opt_in {
+        return Ok(None);
+    }
+    match next_linear.gpu_dtype {
+        DType::PARO4G128T => {
+            // Fast path: fused kernel emits x_rot (for next_linear's
+            // prerotated GEMV) + tmp (post-rmsnorm x for subsequent linears).
+            // Math identity: the kernel computes the same rmsnorm into tmp
+            // that fused_rmsnorm_rotate_for_mq's fallthrough would have, so
+            // overwriting tmp here is fine.
+            gpu.fused_rmsnorm_paro4g128t_rotate(
+                &next_linear.buf,
+                x,
+                norm_weight,
+                x_rot_scratch,
+                Some(tmp),
+                next_linear.m,
+                next_linear.k,
+                eps,
+            )?;
+            Ok(Some(x_rot_scratch))
+        }
+        _ => {
+            // Non-PARO dtype: tmp already has rmsnorm output from prior call.
+            Ok(None)
+        }
     }
 }
 
@@ -901,6 +1025,22 @@ pub fn rotate_x_mq_for(
     } else {
         gpu.rotate_x_mq(x, x_rot, k)
     }
+}
+
+/// MQ4G128 activation rotate helper. Always takes the non-AWQ path —
+/// no AWQ sidecar is supported for G128 weights in this PR.
+/// The `_next_linear` argument is reserved for a future AWQ branch;
+/// pass the upcoming weight tensor but its `awq_scale` is ignored here.
+pub fn rotate_x_mq_128_for(
+    gpu: &mut Gpu,
+    _next_linear: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    // NOTE: no AWQ branch for G128. If AWQ support for MQ4G128 is added
+    // in a follow-up, mirror the AWQ branch from `rotate_x_mq_for` here.
+    gpu.rotate_x_mq_128(x, x_rot, k)
 }
 
 /// ParoQuant single-token rotation: read x, write Givens-rotated
@@ -1071,6 +1211,28 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_paro4g128_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
+        DType::PARO4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
+        DType::PARO4G128T => {
+            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
+                return gpu.gemv_paro4g128t_direct_residual(&w.buf, x, y, w.m, w.k);
+            }
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_paro4g128t_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
         DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ6G256 => gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k),
         DType::MQ6G256 => {
@@ -1231,6 +1393,43 @@ pub fn weight_gemv_swiglu_residual(
             // `w_down` IS the downstream weight; route through _for helper.
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_paro4g128_swiglu_residual_with_prerotate(
+                &w_down.buf,
+                gate,
+                up,
+                x,
+                &x_rot_alias,
+                w_down.m,
+                w_down.k,
+            )
+        }
+        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_SWIGLU_FUSED").is_some() => {
+            gpu.gemv_paro4g128_swiglu_residual(&w_down.buf, gate, up, x, w_down.m, w_down.k)
+        }
+        DType::PARO4G128T => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_paro4g128t_swiglu_residual_with_prerotate(
+                &w_down.buf,
+                gate,
+                up,
+                x,
+                &x_rot_alias,
+                w_down.m,
+                w_down.k,
+            )
         }
         _ => {
             // Non-MQ fallback: plain two-step.

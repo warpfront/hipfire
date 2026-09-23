@@ -8,6 +8,14 @@
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");
 
+/// gfx12 (RDNA4) wave32-optimized multirow GEMV: 8 rows per WG with
+/// LDS-cached X. Replaces gemv_f32 for the per-token decode call sites
+/// where M is a multiple of 8 (router, shared_expert F32 paths).
+/// Targets the 45.8% gemv_f32 attribution on z-lab A3B-PARO decode.
+/// Dynamic LDS: K × 4 bytes. Routes via HIPFIRE_GEMV_F32_MULTIROW_GFX12=1.
+pub const GEMV_F32_MULTIROW_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f32_multirow.gfx12.hip");
+
 
 /// GEMV Q4_K: matrix-vector multiply with on-the-fly Q4_K dequantization.
 /// A is stored as Q4_K blocks (144 bytes per 256 elements).
@@ -31,11 +39,90 @@ pub const GEMV_Q4K_SRC: &str = include_str!("../../../kernels/src/gemv_q4k.hip")
 /// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
 pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128.hip");
 
+/// gfx12 (RDNA4) 4-way unrolled GEMV for HFQ4-G128. Mirrors the proven
+/// gfx1100 pattern (acc0..acc3 = 4× ILP vs baseline's single accumulator).
+/// Targets the 16.0% gemv_hfq4g128 attribution on z-lab A3B-PARO decode
+/// (decode-perfmaxx-2026-05-22.md). Routes via HIPFIRE_GEMV_HFQ4G128_GFX12=1.
+pub const GEMV_HFQ4G128_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128.gfx12.hip");
+
+/// gfx12 (RDNA4) 4-way fused F32 GEMV — mirror of MQ4's fused_qkvza_hfq4g256
+/// for the PARO mixed-dtype gate-side. One launch instead of 4 = saves 3
+/// launches per layer × 40 layers = 120 launches/token of dispatch overhead.
+/// Routes via HIPFIRE_FUSED_4WAY_F32_GEMV_GFX12=1 (opt-in).
+pub const FUSED_4WAY_F32_GEMV_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_4way_f32_gemv.gfx12.hip");
+
+/// gfx12 (RDNA4) F32 fused shared_expert.down step for PARO decode.
+/// Combines silu_mul + gemv_f32 + sigmoid + scaled_add into one launch
+/// (4 → 1 = saves 3 launches per MoE layer). Mirrors MQ4's
+/// gemv_hfq4g256_residual_sigmoid_scaled_gpu pattern.
+pub const GEMV_F32_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f32_silu_mul_residual_sigmoid_scaled.gfx12.hip");
+
+/// gfx12 (RDNA4) 2-way fused F32 GEMV for small-M cases (alpha + beta in
+/// LA layers). Uses 256-thread blocks for BW saturation. 2 → 1 launch
+/// saves 32/token of dispatch overhead on z-lab A3B-PARO.
+pub const FUSED_2WAY_F32_GEMV_SMALLM_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_2way_f32_gemv_smallm.gfx12.hip");
+
+/// gfx12 (RDNA4) F16 weight × F32 X GEMV with 256-thread block — drop-in
+/// for gemv_f32 when weight storage is F16. Halves BW vs F32. Specifically
+/// targets the lm_head decode hot path (M=vocab, K=dim, batch=1) which
+/// rocprof shows as 28.4 percent of decode GPU time.
+pub const GEMV_F16_X32_LMHEAD_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f16_x32_lmhead.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ4-G128 multirow GEMV: 4 rows per WG with LDS-cached X.
+/// Cuts WG count 4× to amortize dispatch overhead. Targets the 20-percent
+/// gemv_hfq4g128 attribution on z-lab A3B-PARO decode (PARO LA wqkv/wz/etc).
+pub const GEMV_HFQ4G128_MULTIROW_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_multirow.gfx12.hip");
+
+/// gfx12 (RDNA4) Q8_0-weighted 4-way fused GEMV. Mirror of fused_4way_f32
+/// but reads Q8_0 quantized router/seg/gate/up weights (4× less BW).
+pub const FUSED_4WAY_Q8_0_GEMV_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_4way_q8_0_gemv.gfx12.hip");
+
+/// gfx12 (RDNA4) Q8_0 fused shared_expert.down step. Mirror of the F32 sister
+/// but reads Q8_0 weight. Recovers the F32 down fusion win at Q8 storage.
+pub const GEMV_Q8_0_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_silu_mul_residual_sigmoid_scaled.gfx12.hip");
+
+/// gfx12 (RDNA4) Q8_0 2-way fused GEMV for small-M (LA alpha+beta with Q8 storage).
+pub const FUSED_2WAY_Q8_0_GEMV_SMALLM_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_2way_q8_0_gemv_smallm.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ4G256-weighted 4-way fused GEMV. 4-bit (2× less BW vs Q8).
+pub const FUSED_4WAY_HFQ4G256_GEMV_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/fused_4way_hfq4g256_gemv.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ4G256 fused shared_expert.down step. 4-bit weight (2× less BW vs Q8).
+pub const GEMV_HFQ4G256_SILU_MUL_RESIDUAL_SIGMOID_SCALED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_silu_mul_residual_sigmoid_scaled.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ4-G128 GEMV using __builtin_amdgcn_fdot2 (FP16x2 paired
+/// multiply). Mirror of the gfx11 dot2 family, ported to HFQ4G128 group
+/// format that PARO LA decode uses. Targets the 25 percent gemv_hfq4g128 slot.
+pub const GEMV_HFQ4G128_DOT2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_dot2.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ4-G128 GEMV using __builtin_amdgcn_sdot4 (i8x4 → i32).
+/// Requires Q8_1 mmq pre-quantized X (144 B per 128-K block) via
+/// ensure_q8_1_mmq_x. 4 MACs per VALU vs dot2's 2.
+pub const GEMV_HFQ4G128_DP4A_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_dp4a.gfx12.hip");
+
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
 /// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
 /// under HIPFIRE_PARO_BATCHED=1).
 pub const GEMV_HFQ4G128_RESIDUAL_SIGMOID_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128_residual_sigmoid_scaled.hip");
+
+/// PARO4-G128: ParoQuant-compatible rotated activation + W4 GEMV.
+/// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights,
+/// followed by shared pair-rotation metadata and channel scales.
+pub const GEMV_PARO4G128_SRC: &str = include_str!("../../../kernels/src/gemv_paro4g128.hip");
 
 
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
@@ -346,11 +433,15 @@ pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
+/// Lever 1 — RMSNorm + PARO4G128T per-group Givens rotation, fused into a single launch.
+/// Replaces the `rmsnorm_f32` + `paro4g128t_rotate` pair. Numerically equivalent within FP16.
+pub const FUSED_RMSNORM_PARO4G128T_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_paro4g128t_rotate.hip");
 pub const RMSNORM_REDUCE_GFX942_SRC: &str = include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
 pub const ROTATE_WITH_RMS_GFX942_SRC: &str = include_str!("../../../kernels/src/rotate_with_rms.gfx942.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip");
@@ -491,6 +582,14 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_PARO_Q4G128_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_indexed.hip");
 
+/// gfx12 (RDNA4) G128-native m4 (4 output rows per WG) MoE gate_up GEMV with
+/// LDS-cached X. Reduces X-load BW per layer 4× vs the cross-arch
+/// single-row-per-WG sibling (~96 MB → 24 MB per layer at K=2048).
+/// Routes via HIPFIRE_MOE_PARO_GEMV_M4_GFX12=1 (opt-in pending bench validation).
+/// Dynamic LDS: K × 4 bytes.
+pub const GEMV_PARO_Q4G128_MOE_GATE_UP_M4_INDEXED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_m4_indexed.gfx12.hip");
+
 /// N-batched indexed MoE gate_up GEMV for HFQ4G128 (ParoQuant routed
 /// experts). Sister of `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC` with
 /// 72 B/group stride. Used by Path 1 fallback in
@@ -605,6 +704,52 @@ pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX12_SRC: &str =
 /// Routes via HIPFIRE_MOE_PARO_I8_K4_GFX12=1 (opt-in).
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_k4.gfx12.hip");
+
+/// gfx12 (RDNA4) G128-native m2 i8 WMMA MMQ port of HFQ4G128 ParoQuant MoE
+/// grouped-GEMM. 2×1 M-direction reg-blocked: each WG owns a 32-row × 16-slot
+/// output tile. Halves B-gather (X-tile) BW per output FLOP. Grid uses
+/// `ceil(M/32)` row tiles (vs k2's `ceil(M/16)`).
+/// Routes via HIPFIRE_MOE_PARO_I8_M2_GFX12=1 (opt-in pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_M2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_m2.gfx12.hip");
+
+/// gfx12 (RDNA4) k2-baseline structure with vectorized nibble unpack via
+/// `__builtin_amdgcn_perm` (v_perm_b32). Same grid + kernarg layout as the
+/// k2 sibling; only the inner-loop dequant pattern differs (4 instructions
+/// per pk32 vs 16 scalar shifts in k2). Disasm of k2 baseline shows 54
+/// v_lshrrev_b32 + 0 v_perm_b32 — the compiler did NOT auto-vectorize.
+/// Routes via HIPFIRE_MOE_PARO_I8_PERM_GFX12=1 (opt-in pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_PERM_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_perm.gfx12.hip");
+
+/// gfx12 (RDNA4) FP16 WMMA port of HFQ4G128 (ParoQuant) MoE grouped-GEMM —
+/// the missing gfx12 sister of the cross-arch
+/// `gemm_paro_q4g128_moe_grouped_wmma_k2`. Mirrors the MQ4 G256 gfx12 FP16
+/// WMMA path (`gemm_hfq4g256_moe_grouped_wmma_gfx12`) on the G128 layout.
+/// This is the correct lever for PARO G128 on gfx12: MQ4's i8 MMQ variant
+/// on the same hardware measured -11.6% vs its FP16 WMMA sister
+/// (dispatch.rs:12538-12550), so the FP16 path should be the default for
+/// PARO too. Routes via HIPFIRE_MOE_PARO_FP16_GFX12=1 initially (opt-in
+/// pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma.gfx12.hip");
+
+/// gfx12 (RDNA4) 2x1 M-direction reg-blocked sister of the FP16 WMMA G128
+/// kernel above. Halves B-gather (X-tile) BW per output FLOP by sharing the
+/// loaded X tile across two M-blocks per WG. Mirror of the MQ4 G256 m2
+/// kernel (`gemm_hfq4g256_moe_grouped_wmma_m2_gfx12`). Grid uses
+/// `ceil(M/32)` row tiles (vs k2's `ceil(M/16)`).
+/// Routes via HIPFIRE_MOE_PARO_FP16_M2_GFX12=1 (opt-in).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_m2.gfx12.hip");
+
+/// gfx12 (RDNA4) FP16 WMMA non-grouped port of `gemm_hfq4g128.hip`. The
+/// missing gfx12 sister of `gemm_hfq4g128_mmq.gfx1151.hip` — covers the
+/// LA wqkv/wz, FullAttn QKV/wo, and shared-expert gate/up/down dispatch
+/// sites which account for 70% of PARO prefill GPU time per rocprof
+/// (2026-05-22). Routes via `dispatch::gemm_hfq4g128` when arch is gfx12.
+pub const GEMM_HFQ4G128_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g128_wmma.gfx12.hip");
 
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
@@ -1709,6 +1854,30 @@ pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str = include_str!("../../../kernels/sr
 /// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
 pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
 
+/// Y[i,j] += sigmoid(scalar[i]) * temp[i,j]. Completes the F32 shared_expert
+/// down step (`gemm_f32_batched` writes `temp`; this applies sigmoid scaling
+/// and accumulates into x_batch). Mirrors the residual-sigmoid-scaled fused
+/// kernels for HFQ4-quantized shared_expert, but for FP16-dense z-lab-style
+/// shared_expert weights.
+pub const SIGMOID_SCALED_ADD_INPLACE_F32_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_scaled_add_inplace_f32.hip");
+
+/// gfx12 (RDNA4) FP16 WMMA replacement for `gemm_f32_batched`. Same call
+/// contract (A/B/Y are F32); downcasts to F16 in-kernel per WMMA tile.
+/// Routes via HIPFIRE_GEMM_F32_WMMA_GFX12=1 (opt-in pending bench). For
+/// z-lab F32 shared_expert dispatch this addresses the 58.7% GPU time
+/// `gemm_f32_batched` consumes post-admit-fix.
+pub const GEMM_F32_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_wmma.gfx12.hip");
+
+/// gfx12 (RDNA4) BF16 WMMA replacement for `gemm_f32_batched`. Same call
+/// contract as the FP16 sister, but downcasts to BF16 instead — preserves
+/// F32's 8-bit exponent range, only sacrificing mantissa precision.
+/// Suitable for precision-sensitive call sites (e.g. router) where FP16's
+/// clamped dynamic range broke top-K routing decisions.
+pub const GEMM_F32_WMMA_BF16_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_wmma_bf16.gfx12.hip");
+
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB
 /// logits array. See kernel header for bit-exactness reasoning.
@@ -1770,6 +1939,16 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 /// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8.hip");
+
+/// gfx12 (RDNA4) register-array variant of gated_delta_net_q8.
+/// S_local[128] held in VGPRs across the entire recurrence; LDS only
+/// used for k/q tile broadcast. F32 accumulated throughout, requanted
+/// once at end (numerically different from baseline's per-token requant).
+/// Routes via HIPFIRE_GDN_Q8_GFX12_REGISTER=1. rocprof attribution on
+/// post-WMMA z-lab pp256 shows the baseline kernel at 11.9% of GPU time.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_q8.gfx1200.hip");
 
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
@@ -1937,6 +2116,12 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 
 /// GPU argmax: find index of maximum value.
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
+
+/// gfx12 (RDNA4) multi-WG argmax_f32: pass-1 chunks vocab across many WGs;
+/// pass-2 reduces partials. 30-100× faster than single-WG baseline on
+/// 248k-vocab Qwen3.6 (~232 µs → ~5-10 µs expected).
+pub const ARGMAX_F32_MULTIWG_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/argmax_f32_multiwg.gfx12.hip");
 
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
