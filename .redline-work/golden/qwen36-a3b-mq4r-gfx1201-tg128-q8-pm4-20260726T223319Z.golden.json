@@ -1,0 +1,76 @@
+{
+  "schema": "hipfire.redline.golden-reproduction.v1",
+  "created_at_utc": "2026-07-26T22:34:46.959292+00:00",
+  "fixture_registry": "/home/kaden/hipfire-golden/registry/redline-golden-v1.json",
+  "fixture_registry_sha256": "3c8531c8075cf19c37484de0c13890aa636d75bbcc06ea5871b6fcf8838950d0",
+  "fixture": {
+    "id": "qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4",
+    "architecture": "gfx1201",
+    "reference": {
+      "created_at_utc": "2026-07-23",
+      "source_commit": "319905cb4dec72330623e5e3a9fae50362cbde1d",
+      "daemon_sha256": "1dee4a5d7d0db3d5484268cab6e688fbf4a0a739a3eded9729b322c1287b704a",
+      "report_sha256": "177c2705b1a1fa905611dcc1e20969fe03a4c225ddce1b5cda32448a42f57170",
+      "hip_median_tok_s": 174.6696293080805,
+      "pm4_min_tok_s": 202.3745360051897,
+      "pm4_median_tok_s": 202.46022224831836,
+      "pm4_max_tok_s": 202.58638556497297,
+      "speedup": 1.159103749463057,
+      "historical_headline": {
+        "route_proof_status": "earlier campaign measurement",
+        "min_tok_s": 203.42,
+        "median_tok_s": 203.93,
+        "max_tok_s": 204.04
+      }
+    },
+    "acceptance": {
+      "minimum_pm4_tok_s": 197.0,
+      "minimum_speedup": 1.1
+    },
+    "benchmark": {
+      "context": 128,
+      "iterations": 128,
+      "warmups": 10,
+      "warmup_iterations": 32,
+      "runs": 10,
+      "transport": "pm4",
+      "kv_mode": "q8",
+      "max_seq": 2048,
+      "settle_window": 10,
+      "settle_min_runs": 10,
+      "settle_confirmation_runs": 10,
+      "settle_max_runs": 120,
+      "settle_max_slope_pct": 0.05,
+      "settle_max_spread_pct": 1.0,
+      "settle_max_median_drift_pct": 0.5
+    },
+    "route": {
+      "dispatches": 733,
+      "packets": 1,
+      "phases": 2,
+      "command_dwords": 20502,
+      "unique_kernels": 23,
+      "sequence_hash": "3318ffca3daf2338",
+      "observed_positions": [
+        128,
+        255
+      ]
+    }
+  },
+  "product_report": "/home/kaden/hipfire-golden/.redline-work/golden/qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4-20260726T223319Z.json",
+  "product_report_sha256": "e2adbe465605ecd60630fe1598422366b2e7f17af0dc73dd46696bd5a41fd4cf",
+  "validation": {
+    "valid": true,
+    "classification": "route-compatible-reproduction",
+    "fixture_id": "qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4",
+    "architecture": "gfx1201",
+    "hip_median_tok_s": 174.2125019248445,
+    "pm4_median_tok_s": 197.45340863653874,
+    "speedup": 1.1334055045126463,
+    "errors": [],
+    "warnings": [
+      "source commit 12ddbc834d084b61e214273b3f8a8531cd6b64b1 differs from reference 319905cb4dec72330623e5e3a9fae50362cbde1d",
+      "daemon sha256 f5d7a7bd4d839ff106a54cadb6d8398ecd147e3e0d9e8c004d63f74d758aea30 differs from reference 1dee4a5d7d0db3d5484268cab6e688fbf4a0a739a3eded9729b322c1287b704a"
+    ]
+  }
+}
