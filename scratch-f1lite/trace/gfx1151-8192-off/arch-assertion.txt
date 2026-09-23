@@ -1,0 +1,1 @@
+HIP_VISIBLE_DEVICES=0 HIP device=0 gcnArchName=gfx1151 name=AMD Radeon 8060S Graphics
