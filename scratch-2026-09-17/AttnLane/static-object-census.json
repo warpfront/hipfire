@@ -1,0 +1,387 @@
+{
+  "schema": "attn-lane-static-object-census-v1",
+  "objects": {
+    "baseline": {
+      "path": "/home/kaden/.hipfire-homes/ab4/.hipfire_kernels/gfx1201/attention_fp8_e4m3_fa2_gqa_packet_gfx1201.fcab03e8e867d730.hsaco",
+      "sha256": "0ed79d32134add3e2217a472e2c2a69b4303d3f3450dac4e715c462ab6d8812c",
+      "assembly": "/home/kaden/ClaudeCode/warpfront/wt-attnlane/scratch-2026-09-17/AttnLane/baseline-packet.s",
+      "symbols": {
+        "attention_fp8_e4m3_fa2_gqa_packet_gfx1201": {
+          "instruction_count": 1906,
+          "code_asm_lines": 3027,
+          "wmma": 20,
+          "lds_issue": 147,
+          "global_issue": 94,
+          "wait": 294,
+          "barrier": 6,
+          "branch": 39,
+          "top_opcodes": [
+            [
+              "s_delay_alu",
+              137
+            ],
+            [
+              "v_dual_mul_f32",
+              125
+            ],
+            [
+              "s_wait_alu",
+              117
+            ],
+            [
+              "s_wait_dscnt",
+              115
+            ],
+            [
+              "v_dual_mov_b32",
+              90
+            ],
+            [
+              "ds_bpermute_b32",
+              74
+            ],
+            [
+              "v_max3_num_f32",
+              73
+            ],
+            [
+              "v_perm_b32",
+              64
+            ],
+            [
+              "v_fma_f32",
+              60
+            ],
+            [
+              "s_wait_loadcnt",
+              53
+            ],
+            [
+              "v_or_b32_e32",
+              47
+            ],
+            [
+              "v_mul_f32_e32",
+              45
+            ],
+            [
+              "v_div_scale_f32",
+              40
+            ],
+            [
+              "s_or_b32",
+              36
+            ],
+            [
+              "s_mov_b32",
+              34
+            ],
+            [
+              "global_load_b128",
+              34
+            ],
+            [
+              "v_lshl_add_u32",
+              32
+            ],
+            [
+              "global_store_b128",
+              32
+            ],
+            [
+              "v_mov_b32_e32",
+              29
+            ],
+            [
+              "v_xor_b32_e32",
+              29
+            ]
+          ]
+        },
+        "attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201": {
+          "instruction_count": 1574,
+          "code_asm_lines": 2472,
+          "wmma": 20,
+          "lds_issue": 147,
+          "global_issue": 61,
+          "wait": 251,
+          "barrier": 6,
+          "branch": 39,
+          "top_opcodes": [
+            [
+              "v_dual_mul_f32",
+              120
+            ],
+            [
+              "s_wait_dscnt",
+              115
+            ],
+            [
+              "s_wait_alu",
+              109
+            ],
+            [
+              "v_dual_mov_b32",
+              98
+            ],
+            [
+              "ds_bpermute_b32",
+              74
+            ],
+            [
+              "s_delay_alu",
+              66
+            ],
+            [
+              "v_perm_b32",
+              64
+            ],
+            [
+              "v_or_b32_e32",
+              45
+            ],
+            [
+              "v_mul_f32_e32",
+              44
+            ],
+            [
+              "s_or_b32",
+              37
+            ],
+            [
+              "global_store_b128",
+              32
+            ],
+            [
+              "v_lshl_add_u32",
+              31
+            ],
+            [
+              "v_fma_f32",
+              30
+            ],
+            [
+              "v_xor_b32_e32",
+              29
+            ],
+            [
+              "s_mov_b32",
+              26
+            ],
+            [
+              "ds_load_b32",
+              24
+            ],
+            [
+              "s_cbranch_execz",
+              23
+            ],
+            [
+              "v_mov_b32_e32",
+              21
+            ],
+            [
+              "s_wait_loadcnt",
+              20
+            ],
+            [
+              "global_load_b64",
+              20
+            ]
+          ]
+        }
+      }
+    },
+    "candidate": {
+      "path": "/home/kaden/.hipfire-homes/ab4/.hipfire_kernels/gfx1201/attention_fp8_e4m3_fa2_gqa_packet_gfx1201.5d531b291a941cd7.hsaco",
+      "sha256": "41ce65ab8770b15bd90362d525a786403dffa09a9485985e068e77f0b651cd87",
+      "assembly": "/home/kaden/ClaudeCode/warpfront/wt-attnlane/scratch-2026-09-17/AttnLane/q384-packet.s",
+      "symbols": {
+        "attention_fp8_e4m3_fa2_gqa_packet_gfx1201": {
+          "instruction_count": 1924,
+          "code_asm_lines": 2910,
+          "wmma": 20,
+          "lds_issue": 142,
+          "global_issue": 89,
+          "wait": 271,
+          "barrier": 6,
+          "branch": 35,
+          "top_opcodes": [
+            [
+              "s_delay_alu",
+              172
+            ],
+            [
+              "v_dual_mov_b32",
+              150
+            ],
+            [
+              "v_dual_mul_f32",
+              132
+            ],
+            [
+              "s_wait_dscnt",
+              113
+            ],
+            [
+              "s_wait_alu",
+              98
+            ],
+            [
+              "ds_bpermute_b32",
+              74
+            ],
+            [
+              "v_max3_num_f32",
+              73
+            ],
+            [
+              "v_perm_b32",
+              64
+            ],
+            [
+              "v_fma_f32",
+              60
+            ],
+            [
+              "s_wait_loadcnt",
+              49
+            ],
+            [
+              "v_or_b32_e32",
+              42
+            ],
+            [
+              "v_div_scale_f32",
+              40
+            ],
+            [
+              "global_load_b128",
+              34
+            ],
+            [
+              "v_lshl_add_u32",
+              33
+            ],
+            [
+              "v_mul_f32_e32",
+              32
+            ],
+            [
+              "global_store_b128",
+              32
+            ],
+            [
+              "s_or_b32",
+              31
+            ],
+            [
+              "v_xor_b32_e32",
+              29
+            ],
+            [
+              "v_mov_b32_e32",
+              27
+            ],
+            [
+              "s_mov_b32",
+              26
+            ]
+          ]
+        },
+        "attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201": {
+          "instruction_count": 1610,
+          "code_asm_lines": 2484,
+          "wmma": 20,
+          "lds_issue": 142,
+          "global_issue": 56,
+          "wait": 237,
+          "barrier": 6,
+          "branch": 35,
+          "top_opcodes": [
+            [
+              "v_dual_mov_b32",
+              145
+            ],
+            [
+              "v_dual_mul_f32",
+              128
+            ],
+            [
+              "s_wait_dscnt",
+              114
+            ],
+            [
+              "s_wait_alu",
+              97
+            ],
+            [
+              "s_delay_alu",
+              84
+            ],
+            [
+              "ds_bpermute_b32",
+              74
+            ],
+            [
+              "v_perm_b32",
+              64
+            ],
+            [
+              "v_or_b32_e32",
+              41
+            ],
+            [
+              "v_mov_b32_e32",
+              40
+            ],
+            [
+              "s_or_b32",
+              34
+            ],
+            [
+              "global_store_b128",
+              32
+            ],
+            [
+              "v_lshl_add_u32",
+              31
+            ],
+            [
+              "v_fma_f32",
+              30
+            ],
+            [
+              "v_mul_f32_e32",
+              29
+            ],
+            [
+              "v_xor_b32_e32",
+              29
+            ],
+            [
+              "s_mov_b32",
+              25
+            ],
+            [
+              "ds_load_b32",
+              24
+            ],
+            [
+              "s_cbranch_execz",
+              21
+            ],
+            [
+              "v_div_scale_f32",
+              20
+            ],
+            [
+              "v_wmma_f32_16x16x16_fp8_fp8",
+              20
+            ]
+          ]
+        }
+      }
+    }
+  }
+}

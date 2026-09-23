@@ -1,0 +1,267 @@
+W0919 22:38:26.577206 4052766 agent.cpp:157] Attempt to enable hip visibility for agent-1 which is not visible to HSA (ROCR)
+W0919 22:38:28.160943 4052766 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000320 sec
+W0919 22:38:28.161103 4052766 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-attnlane/scratch-2026-09-17/AttnLane/bin/daemon-base' ::     0.000000 sec
+W0919 22:38:28.189442 4052766 tool.cpp:3348] HSA version 1.21.0 initialized (instance=0)
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab4/.hipfire_kernels/gfx1201
+[hipfire-daemon] vision_mode=off — skipping tower sidecar load (/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq)
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+  loading output_norm...
+  loading output (separate lm_head)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/64 (LinearAttention)...
+  loading layer 1/64 (LinearAttention)...
+  loading layer 2/64 (LinearAttention)...
+  loading layer 3/64 (FullAttention)...
+  loading layer 4/64 (LinearAttention)...
+  loading layer 5/64 (LinearAttention)...
+  loading layer 6/64 (LinearAttention)...
+  loading layer 7/64 (FullAttention)...
+  loading layer 8/64 (LinearAttention)...
+  loading layer 9/64 (LinearAttention)...
+  loading layer 10/64 (LinearAttention)...
+  loading layer 11/64 (FullAttention)...
+  loading layer 12/64 (LinearAttention)...
+  loading layer 13/64 (LinearAttention)...
+  loading layer 14/64 (LinearAttention)...
+  loading layer 15/64 (FullAttention)...
+  loading layer 16/64 (LinearAttention)...
+  loading layer 17/64 (LinearAttention)...
+  loading layer 18/64 (LinearAttention)...
+  loading layer 19/64 (FullAttention)...
+  loading layer 20/64 (LinearAttention)...
+  loading layer 21/64 (LinearAttention)...
+  loading layer 22/64 (LinearAttention)...
+  loading layer 23/64 (FullAttention)...
+  loading layer 24/64 (LinearAttention)...
+  loading layer 25/64 (LinearAttention)...
+  loading layer 26/64 (LinearAttention)...
+  loading layer 27/64 (FullAttention)...
+  loading layer 28/64 (LinearAttention)...
+  loading layer 29/64 (LinearAttention)...
+  loading layer 30/64 (LinearAttention)...
+  loading layer 31/64 (FullAttention)...
+  loading layer 32/64 (LinearAttention)...
+  loading layer 33/64 (LinearAttention)...
+  loading layer 34/64 (LinearAttention)...
+  loading layer 35/64 (FullAttention)...
+  loading layer 36/64 (LinearAttention)...
+  loading layer 37/64 (LinearAttention)...
+  loading layer 38/64 (LinearAttention)...
+  loading layer 39/64 (FullAttention)...
+  loading layer 40/64 (LinearAttention)...
+  loading layer 41/64 (LinearAttention)...
+  loading layer 42/64 (LinearAttention)...
+  loading layer 43/64 (FullAttention)...
+  loading layer 44/64 (LinearAttention)...
+  loading layer 45/64 (LinearAttention)...
+  loading layer 46/64 (LinearAttention)...
+  loading layer 47/64 (FullAttention)...
+  loading layer 48/64 (LinearAttention)...
+  loading layer 49/64 (LinearAttention)...
+  loading layer 50/64 (LinearAttention)...
+  loading layer 51/64 (FullAttention)...
+  loading layer 52/64 (LinearAttention)...
+  loading layer 53/64 (LinearAttention)...
+  loading layer 54/64 (LinearAttention)...
+  loading layer 55/64 (FullAttention)...
+  loading layer 56/64 (LinearAttention)...
+  loading layer 57/64 (LinearAttention)...
+  loading layer 58/64 (LinearAttention)...
+  loading layer 59/64 (FullAttention)...
+  loading layer 60/64 (LinearAttention)...
+  loading layer 61/64 (LinearAttention)...
+  loading layer 62/64 (LinearAttention)...
+  loading layer 63/64 (FullAttention)...
+  weight sweep: 10905 ms (packed-expert host-read 0 ms, H2D 0 ms)
+E0919 22:38:39.748378 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421312885150 > 1275421312823653) :: difference=61497. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.748865 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421312386922 > 1275421312332807) :: difference=54115. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.749228 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421312225971 > 1275421312172256) :: difference=53715. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.749721 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421312652370 > 1275421312595978) :: difference=56392. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.750109 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421312565947 > 1275421312512643) :: difference=53304. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.750468 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421312402464 > 1275421312348397) :: difference=54067. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+KV cache: Fp8 vmm (16/64 layers carry KV; K/V 1032B/row; mapped_prefix=2032 / physical_cap=262144 / max_seq=262144)
+E0919 22:38:39.751447 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421317049239 > 1275421317021211) :: difference=28028. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.751756 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421317449407 > 1275421317387976) :: difference=61431. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.752093 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421317553696 > 1275421317523682) :: difference=30014. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.752544 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421318126577 > 1275421318122700) :: difference=3877. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.752872 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421318219072 > 1275421318197975) :: difference=21097. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.753432 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421319473241 > 1275421319441528) :: difference=31713. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.753564 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421318967440 > 1275421318936593) :: difference=30847. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.753805 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421319428108 > 1275421319427118) :: difference=990. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.753945 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421319736494 > 1275421319705439) :: difference=31055. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.754555 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421319722660 > 1275421319692347) :: difference=30313. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.755279 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421321251909 > 1275421321235246) :: difference=16663. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.755411 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421320897118 > 1275421320843318) :: difference=53800. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.755570 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421321253064 > 1275421321225756) :: difference=27308. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.756444 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421322005927 > 1275421321975775) :: difference=30152. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.756580 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421322499917 > 1275421322468520) :: difference=31397. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.757555 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421323203464 > 1275421323187421) :: difference=16043. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.757732 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421323443632 > 1275421323346689) :: difference=96943. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.758106 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421323511234 > 1275421323478943) :: difference=32291. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.758426 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421324405899 > 1275421324354136) :: difference=51763. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.758601 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421324635013 > 1275421324602223) :: difference=32790. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.759100 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421324025082 > 1275421323992978) :: difference=32104. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.759754 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421325797400 > 1275421325764296) :: difference=33104. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+hipfire bench
+  model:  qwen3.8:27b-mq4-xt
+  arch:   qwen3_5
+  gpu:    gfx1201
+  runs:   1
+  max_tokens: 128
+  prompt_md5: d94d3115a3001f08a654d91461d6bdc4
+  prompt_chars: 57
+E0919 22:38:39.914415 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421474796644 > 1275421474477160) :: difference=319484. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.915214 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421474313182 > 1275421474175744) :: difference=137438. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.916098 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473704995 > 1275421473567907) :: difference=137088. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.916983 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473489629 > 1275421473354234) :: difference=135395. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.917880 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421474058804 > 1275421473924599) :: difference=134205. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.918757 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473003600 > 1275421472869665) :: difference=133935. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.919637 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473861802 > 1275421473719337) :: difference=142465. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.920551 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473446923 > 1275421473311606) :: difference=135317. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.920635 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473518056 > 1275421473511086) :: difference=6970. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+prefill_chunk: requested=8192 admitted=8192 commit_stride=512
+E0919 22:38:39.935273 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421475403773 > 1275421472830535) :: difference=2573238. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.935505 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473412116 > 1275421473225649) :: difference=186467. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.935718 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421472302287 > 1275421472132659) :: difference=169628. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.936697 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473860271 > 1275421472922738) :: difference=937533. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.948065 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421474551433 > 1275421471998964) :: difference=2552469. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.980844 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473069468 > 1275421472949186) :: difference=120282. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.981410 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421473152315 > 1275421472628962) :: difference=523353. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.987021 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421472560093 > 1275421471523770) :: difference=1036323. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:39.993275 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275421472130265 > 1275421472091865) :: difference=38400. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:43.414056 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275424967989046 > 1275424967866340) :: difference=122706. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:43.421670 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275424967849993 > 1275424967809289) :: difference=40704. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:43.422896 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275424967495147 > 1275424967480654) :: difference=14493. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+  pp8192: 2392.90 tok/s median
+E0919 22:38:46.976547 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428433236645 > 1275428432701328) :: difference=535317. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:46.980338 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428498597787 > 1275428498561044) :: difference=36743. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:46.982566 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428548702644 > 1275428548698802) :: difference=3842. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:46.983505 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428548098028 > 1275428548093444) :: difference=4584. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:46.984171 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428550156220 > 1275428550137271) :: difference=18949. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:47.233105 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428649771777 > 1275428649771041) :: difference=736. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:47.572103 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428989461267 > 1275428989460872) :: difference=395. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:47.617099 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275428922030147 > 1275428922027953) :: difference=2194. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:47.866110 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275429427305117 > 1275429427303828) :: difference=1289. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:47.897117 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275429376703058 > 1275429376688085) :: difference=14973. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:48.268102 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275429657692192 > 1275429657691109) :: difference=1083. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:48.302102 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275429602452906 > 1275429602450962) :: difference=1944. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:48.332116 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275429669056859 > 1275429669042556) :: difference=14303. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:48.354115 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275429920258051 > 1275429920255386) :: difference=2665. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:48.951129 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275430335239137 > 1275430335223825) :: difference=15312. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:48.978118 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275430295022178 > 1275430295005893) :: difference=16285. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:49.607106 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275431066227447 > 1275431066226978) :: difference=469. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:50.432112 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275431996666299 > 1275431996659457) :: difference=6842. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:50.603108 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432130422027 > 1275432130421461) :: difference=566. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.231098 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432793827083 > 1275432793826812) :: difference=271. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.263004 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432754165169 > 1275432754047158) :: difference=118011. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.395101 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432955874138 > 1275432955873900) :: difference=238. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.401705 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432954658342 > 1275432954654703) :: difference=3639. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.419131 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432926984908 > 1275432926969177) :: difference=15731. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.489238 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275432920245944 > 1275432920244722) :: difference=1222. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.574107 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275433139470275 > 1275433139467819) :: difference=2456. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:51.694098 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275433254746093 > 1275433254745163) :: difference=930. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.069127 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275433533637798 > 1275433533622016) :: difference=15782. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.069687 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275433531765797 > 1275433531764019) :: difference=1778. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.126119 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275433452671599 > 1275433452656054) :: difference=15545. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.425102 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275433860330525 > 1275433860325957) :: difference=4568. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.721119 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434280563693 > 1275434280560734) :: difference=2959. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.848113 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434184772951 > 1275434184769261) :: difference=3690. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:52.850104 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434196759111 > 1275434196758312) :: difference=799. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.079114 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434600554180 > 1275434600550504) :: difference=3676. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.129115 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434513842310 > 1275434513832242) :: difference=10068. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.130386 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434517502386 > 1275434517496275) :: difference=6111. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.159102 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434474485032 > 1275434474484984) :: difference=48. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.443101 4052852 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434908422360 > 1275434907430394) :: difference=991966. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.475107 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434862463639 > 1275434862462658) :: difference=981. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.513123 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275434789467808 > 1275434789466671) :: difference=1137. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.767108 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275435298940740 > 1275435298933086) :: difference=7654. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.773117 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275435286006293 > 1275435286005274) :: difference=1019. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.817116 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275435215928818 > 1275435215923490) :: difference=5328. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:53.989098 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275435551318813 > 1275435551317739) :: difference=1074. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:54.524125 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275435910678664 > 1275435910659660) :: difference=19004. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:54.590106 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275435981401625 > 1275435981400024) :: difference=1601. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:54.856109 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275436259723288 > 1275436259710717) :: difference=12571. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.141129 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275436699102819 > 1275436699084308) :: difference=18511. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.167106 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275436655465836 > 1275436655465078) :: difference=758. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.195116 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275436608919200 > 1275436608910948) :: difference=8252. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.496098 4052855 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275437014938331 > 1275437014938121) :: difference=210. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+  tg64@128: 14.58 tok/s median
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 16838,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "redline_pm4": false,
+  "kv_mode": "fp8",
+  "runs": 1,
+  "prefill": [
+    {
+      "tokens": 8192,
+      "stats": {
+        "median": 2392.9,
+        "mean": 2392.9,
+        "min": 2392.9,
+        "max": 2392.9,
+        "stdev": 0.0
+      },
+      "samples": [
+        2392.9
+      ]
+    }
+  ],
+  "decode": [
+    {
+      "context": 128,
+      "tokens": 64,
+      "stats": {
+        "median": 14.58391846701234,
+        "mean": 14.58391846701234,
+        "min": 14.58391846701234,
+        "max": 14.58391846701234,
+        "stdev": 0.0
+      },
+      "samples": [
+        14.58391846701234
+      ]
+    }
+  ],
+  "sustained": []
+}
+W0919 22:38:55.765144 4052766 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-attnlane/scratch-2026-09-17/AttnLane/bin/daemon-base' ::    27.604037 sec
+E0919 22:38:55.766114 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275437283531765 > 1275437282551966) :: difference=979799. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.775107 4052853 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275437267596602 > 1275437267594299) :: difference=2303. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.826096 4052854 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (1275437228442177 > 1275437228441326) :: difference=851. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0919 22:38:55.844657 4052766 output_stream.cpp:110] Opened result file: /home/kaden/ClaudeCode/warpfront/wt-attnlane/scratch-2026-09-17/AttnLane/rocprof-pinned-base/trace-pinned-base_kernel_trace.csv
+E0919 22:38:55.953106 4052766 output_stream.cpp:110] Opened result file: /home/kaden/ClaudeCode/warpfront/wt-attnlane/scratch-2026-09-17/AttnLane/rocprof-pinned-base/trace-pinned-base_agent_info.csv
+W0919 22:38:55.955257 4052766 simple_timer.cpp:55] [rocprofv3] output generation ::     0.112777 sec
+W0919 22:38:55.955320 4052766 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.112850 sec

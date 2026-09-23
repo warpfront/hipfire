@@ -1,0 +1,379 @@
+diff --git a/crates/rdna-compute/src/attention.rs b/crates/rdna-compute/src/attention.rs
+index 3e64f307f..de7c1446d 100644
+--- a/crates/rdna-compute/src/attention.rs
++++ b/crates/rdna-compute/src/attention.rs
+@@ -4634,16 +4634,17 @@ impl Gpu {
+         }
+         result
+     }
+-    /// Packet-minimal Q128 twin of
++    /// Packet-minimal Q384 twin of
+     /// [`Self::attention_fp8_e4m3_fa2_gqa_fp8_gfx1201`] (exact stage-b
+-    /// arithmetic; fused Q-preconvert + multi-run launch). Dense ownership: one workgroup owns 128
+-    /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
+-    /// `head = 6*kv_h + row%6`) over eight compute waves and KT64 tiles.
++    /// arithmetic; fused Q-preconvert + multi-run launch). Dense ownership:
++    /// one workgroup owns 384 query-head rows
++    /// (`row = 384*bx + 16*wave + ml`, `query = row/6`,
++    /// `head = 6*kv_h + row%6`) over 24 compute waves and KT48 tiles.
+     /// Q f32->E4M3 conversion is fused into each owned row with the same
+     /// amax, scale and `cvt_pk_fp8_f32` grouping as the removed pre-convert,
+-    /// writing the existing Q scratch once before the KT64 loop consumes it.
++    /// writing the existing Q scratch once before the tile loop consumes it.
+     /// Widened batches use a 3-D grid: z enumerates equal-length 512-row
+-    /// runs and x restarts inside each run. Block 256, 49408 B dynamic LDS.
++    /// runs and x restarts inside each run. Block 768, 37120 B dynamic LDS.
+     /// Default route on exact gfx1201; `kernel.gfx12_fa_packet=false` opts out.
+     #[allow(clippy::too_many_arguments)]
+     pub fn attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+@@ -4729,7 +4730,7 @@ impl Gpu {
+             .scratch
+             .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+         let run_rows = batch_size.min(512);
+-        let grid_x = (run_rows * 6).div_ceil(128) as u32;
++        let grid_x = (run_rows * 6).div_ceil(384) as u32;
+         let grid_z = batch_size.div_ceil(512) as u32;
+         let scale = 1.0f32 / (head_dim as f32).sqrt();
+         let mut q_arg = q.buf.as_ptr();
+@@ -4765,13 +4766,13 @@ impl Gpu {
+             SYMBOL,
+             bytes,
+         );
+-        // Packet arms use exactly 49408 B dynamic LDS (paired planes +
+-        // transpose scratch + shared scale headers); block 256.
++        // Packet arms use exactly 37120 B dynamic LDS (paired planes +
++        // six-wave transpose scratch + shared scale headers); block 768.
+         let result = self.launch_maybe_blob(
+             SYMBOL,
+             [grid_x, 4, grid_z],
+-            [256, 1, 1],
+-            49408,
++            [768, 1, 1],
++            37120,
+             &mut params,
+             || {
+                 let mut b = hip_bridge::KernargBlob::new();
+@@ -4827,8 +4828,8 @@ impl Gpu {
+     /// Benchmark/oracle-only split-KV packet path (S partitions + stable
+     /// merge). Same contract as
+     /// [`Self::attention_fp8_e4m3_fa2_gqa_stageb_split_gfx1201_bench`] with
+-    /// packet geometry: partial grid `[(batch*6).div_ceil(128), 4,
+-    /// n_splits]` (block 256, LDS 49408). Exists for the packet oracle.
++    /// packet geometry: partial grid `[(batch*6).div_ceil(384), 4,
++    /// n_splits]` (block 768, LDS 37120). Exists for the packet oracle.
+     #[doc(hidden)]
+     #[allow(clippy::too_many_arguments)]
+     pub fn attention_fp8_e4m3_fa2_gqa_packet_split_gfx1201_bench(
+@@ -4952,11 +4953,11 @@ impl Gpu {
+             .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+         let sq_ptr = unsafe { (q8_ptr as *mut u8).add(sq_off) as *mut c_void };
+         let grid_x = if packet {
+-            (batch_size * 6).div_ceil(128) as u32
++            (batch_size * 6).div_ceil(384) as u32
+         } else {
+             batch_size.div_ceil(8) as u32
+         };
+-        let (block, lds) = if packet { (256, 49408) } else { (128, 32768) };
++        let (block, lds) = if packet { (768, 37120) } else { (128, 32768) };
+         let scale = 1.0f32 / (head_dim as f32).sqrt();
+         let mut q8_arg = q8_ptr;
+         let mut k_ptr = k_cache.buf.as_ptr();
+diff --git a/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip b/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip
+index 1affc8864..401a7121c 100644
+--- a/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip
++++ b/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip
+@@ -1723,16 +1723,16 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
+     }
+ }
+ #endif
+-// ---- Packet-minimal Q128 body (FaPacket K1, exact) ----
++// ---- Packet-minimal Q384 body (exact stage-b recurrence) ----
+ // Gated by HIPFIRE_FA2_PACKET (default route via kernel.gfx12_fa_packet): all
+ // other translation units preprocess this region away, so K0/K3/K8 objects stay
+-// byte-identical. Geometry: 256 threads / eight wave32s, ALL computing, 128
+-// densely enumerated query-head rows per KV head, KT64, 49408 B dynamic LDS.
+-// Fill is the T-verified paired mechanism (b128 K/V pairs, wave-private 2
+-// KiB transpose scratch, shared native-scale headers). Arithmetic graph is
+-// the stage-b recurrence unchanged (true divisions, serial sum, rho fold);
+-// reductions use the fixed permlanex16 partner idiom. Q fragments reload in
+-// four-fragment groups during QK so the exact transpose remains spill-free.
++// byte-identical. Geometry: 768 threads / 24 wave32s, ALL computing, 384
++// densely enumerated query-head rows per KV head, KT48, 37120 B dynamic LDS.
++// Six loader waves fill three KT16 K/V subtiles with the verified paired
++// mechanism (b128 K/V pairs, wave-private 2 KiB transpose scratch, shared
++// native-scale headers). Arithmetic is the stage-b recurrence unchanged (true
++// divisions, serial sum, rho fold); reductions use the fixed permlanex16
++// partner idiom. Q fragments reload in four-fragment groups during QK.
+ #if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_PACKET)
+ static __device__ __forceinline__ float fa2_pkt_xor16(float v)
+ {
+@@ -1758,8 +1758,8 @@ __device__ void fa2_stageb_packet_body(
+     float scale_attn,
+     int kv_h,
+     int row_base,
+-    int tile0,
+-    int tile1,
++    int key_begin,
++    int key_end,
+     int split,
+     int n_splits)
+ {
+@@ -1770,10 +1770,10 @@ __device__ void fa2_stageb_packet_body(
+     const int kg = lane >> 4;
+     extern __shared__ uint32_t LDS[];
+     unsigned char* K8 = (unsigned char*)LDS;
+-    unsigned char* V8 = (unsigned char*)LDS + 16384;
+-    uint32_t* SCR = LDS + 8192 + (unsigned)wave * 512u;
+-    const uint16_t* SK = (const uint16_t*)((const unsigned char*)LDS + 49152);
+-    const uint16_t* SV = (const uint16_t*)((const unsigned char*)LDS + 49280);
++    unsigned char* V8 = (unsigned char*)LDS + 12288;
++    uint32_t* SCR = LDS + 6144 + (unsigned)wave * 512u;
++    const uint16_t* SK = (const uint16_t*)((const unsigned char*)LDS + 36864);
++    const uint16_t* SV = (const uint16_t*)((const unsigned char*)LDS + 36960);
+     // Dense ownership: each (query, head_local) has exactly one owner.
+     const int row = row_base + 16 * wave + ml;
+     const int query_local = row / 6;
+@@ -1840,17 +1840,21 @@ __device__ void fa2_stageb_packet_body(
+             q8_codes + (unsigned)batch_size * 24u * 256u);
+         q_row_scale = q_scales[qrow];
+     }
+-    // WG bounds: lanes 0..21 load the same guarded prefix (<=22 positions)
+-    // and reduce with the identical integer graph on every wave.
++    // WG bounds: two guarded reads per lane cover the same 64-query span on
++    // every wave, followed by the identical integer reduction graph.
+     int wmx = -1;
+     int wmn = 0x7fffffff;
+-    if (lane < 22) {
+-        const int qr = query_offset + row_base / 6 + lane;
+-        if (qr < query_offset + batch_size) {
+-            const int p = positions[qr];
+-            wmx = p;
+-            wmn = p;
+-        }
++    const int qr0 = query_offset + row_base / 6 + lane;
++    const int qr1 = qr0 + 32;
++    if (qr0 < query_offset + batch_size) {
++        const int p = positions[qr0];
++        wmx = p;
++        wmn = p;
++    }
++    if (qr1 < query_offset + batch_size) {
++        const int p = positions[qr1];
++        wmx = max(wmx, p);
++        wmn = min(wmn, p);
+     }
+     wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+     wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+@@ -1865,23 +1869,22 @@ __device__ void fa2_stageb_packet_body(
+     const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+     const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+     const int seq_len = gmax + 1;
+-    const bool qok_all = (row_base + 127 < 6 * batch_size);
+-    for (int tile = tile0; tile < tile1; ++tile) {
+-        const int ktile = tile * 64;
+-        if (ktile >= seq_len)
+-            break;
++    const bool qok_all = (row_base + 383 < 6 * batch_size);
++    const int key_limit = min(seq_len, key_end);
++    for (int ktile = key_begin; ktile < key_limit; ktile += 48) {
+         // Hoisted full-tile predicate: every K/V/header key valid and every
+         // score unmasked. Edge path keeps guarded semantics below.
+-        const bool full = qok_all && (ktile + 63 <= gmin);
+-        // ---- Paired K fill (T-verified; 8-byte-aligned u64, no b128 cast)
+-        for (int t = 0; t < 4; ++t) {
+-            const int idx = tid + t * 256;
++        const bool full =
++            qok_all && (ktile + 47 < key_limit) && (ktile + 47 <= gmin);
++        // ---- Paired K fill (8-byte-aligned u64, no b128 cast)
++        {
++            const int idx = tid;
+             const int ln = idx & 31;
+-            const int sub = (idx >> 5) & 3;
+-            const int p = idx >> 7;
++            const int sub = (idx >> 5) % 3;
++            const int p = idx / 96;
+             const int gk = ktile + sub * 16 + (ln & 15);
+             uint4 pair = {0u, 0u, 0u, 0u};
+-            if (gk < seq_len) {
++            if (gk < key_limit) {
+                 const unsigned char* rrow = k_cache +
+                     (unsigned long long)gk * 1032ULL +
+                     (unsigned long long)kv_h * 256ULL;
+@@ -1896,27 +1899,29 @@ __device__ void fa2_stageb_packet_body(
+                 pair.z = (uint32_t)(b & 0xffffffffULL);
+                 pair.w = (uint32_t)(b >> 32);
+             }
+-            *(uint4*)(K8 + (unsigned)(((p * 4 + sub) * 32 + ln) * 16)) = pair;
++            *(uint4*)(K8 + (unsigned)(((p * 3 + sub) * 32 + ln) * 16)) = pair;
+         }
+-        // ---- V raw staging: wave w owns keys ktile+8w..+7 ----
+-        for (int r = 0; r < 8; ++r) {
+-            const int gkey = ktile + wave * 8 + r;
+-            const bool ok = gkey < seq_len;
+-            unsigned long long v = 0ULL;
+-            if (ok) {
+-                const unsigned char* rrow = v_cache +
+-                    (unsigned long long)gkey * 1032ULL +
+-                    (unsigned long long)kv_h * 256ULL;
+-                v = *(const unsigned long long*)(rrow + (unsigned)lane * 8u);
++        // ---- V raw staging: loader wave w owns keys ktile+8w..+7 ----
++        if (wave < 6) {
++            for (int r = 0; r < 8; ++r) {
++                const int gkey = ktile + wave * 8 + r;
++                const bool ok = gkey < key_limit;
++                unsigned long long v = 0ULL;
++                if (ok) {
++                    const unsigned char* rrow = v_cache +
++                        (unsigned long long)gkey * 1032ULL +
++                        (unsigned long long)kv_h * 256ULL;
++                    v = *(const unsigned long long*)(rrow + (unsigned)lane * 8u);
++                }
++                SCR[(((r * 64 + lane * 2) ^ ((r & 3) * 8)))] =
++                    (uint32_t)(v & 0xffffffffULL);
++                SCR[(((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8)))] =
++                    (uint32_t)(v >> 32);
+             }
+-            SCR[(((r * 64 + lane * 2) ^ ((r & 3) * 8)))] =
+-                (uint32_t)(v & 0xffffffffULL);
+-            SCR[(((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8)))] =
+-                (uint32_t)(v >> 32);
+         }
+         __syncthreads();
+         // ---- Transpose + paired V stores (sub=w>>1, key-half=w&1) ----
+-        {
++        if (wave < 6) {
+             const int sub = wave >> 1;
+             const int r = ml & 3;
+             const int dq = ml >> 2;
+@@ -1952,11 +1957,11 @@ __device__ void fa2_stageb_packet_body(
+                 }
+             }
+         }
+-        // ---- Shared scale headers: threads 0..63 copy both halves ----
+-        if (tid < 64) {
++        // ---- Shared scale headers: threads 0..47 copy all three subtiles ----
++        if (tid < 48) {
+             const int gk = ktile + tid;
+             uint16_t skv = 0, svv = 0;
+-            if (gk < seq_len) {
++            if (gk < key_limit) {
+                 const unsigned char* kr =
+                     k_cache + (unsigned long long)gk * 1032ULL;
+                 const unsigned char* vr =
+@@ -1966,16 +1971,15 @@ __device__ void fa2_stageb_packet_body(
+                 svv = (uint16_t)vr[1024 + kv_h * 2] |
+                     ((uint16_t)vr[1024 + kv_h * 2 + 1] << 8);
+             }
+-            ((uint16_t*)((unsigned char*)LDS + 49152))[tid] = skv;
+-            ((uint16_t*)((unsigned char*)LDS + 49280))[tid] = svv;
++            ((uint16_t*)((unsigned char*)LDS + 36864))[tid] = skv;
++            ((uint16_t*)((unsigned char*)LDS + 36960))[tid] = svv;
+         }
+         __syncthreads();
+-        // ---- Compute: four KT16 recurrences, exact stage-b graph ----
++        // ---- Compute: three KT16 recurrences, exact stage-b graph ----
+         {
+-            const bool do0 = ktile <= gmax;
+-            const bool do1 = ktile + 16 <= gmax;
+-            const bool do2 = ktile + 32 <= gmax;
+-            const bool do3 = ktile + 48 <= gmax;
++            const bool do0 = ktile < key_limit && ktile <= gmax;
++            const bool do1 = ktile + 16 < key_limit && ktile + 16 <= gmax;
++            const bool do2 = ktile + 32 < key_limit && ktile + 32 <= gmax;
+             const float qs_tile = q_row_scale * scale_attn;
+             const int pos = (!full && qok) ? positions[query] : 0;
+             const v2i_t* Kf = (const v2i_t*)K8;
+@@ -1983,9 +1987,8 @@ __device__ void fa2_stageb_packet_body(
+             const unsigned kbn = (unsigned)lane;
+             const unsigned vbn = (unsigned)lane;
+ #pragma unroll 1
+-            for (int sub = 0; sub < 4; ++sub) {
+-                const bool dos = (sub == 0) ? do0
+-                    : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
++            for (int sub = 0; sub < 3; ++sub) {
++                const bool dos = (sub == 0) ? do0 : (sub == 1) ? do1 : do2;
+                 if (!dos)
+                     continue;
+                 float8_t sacc =
+@@ -2001,7 +2004,7 @@ __device__ void fa2_stageb_packet_body(
+                         const int p = 2 * dg + u;
+                         const uint4* kp =
+                             (const uint4*)(K8 +
+-                                (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
++                                (unsigned)(((p * 3 + sub) * 32 + lane) * 16));
+                         const uint4 kv = *kp;
+                         const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                         const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+@@ -2023,7 +2026,8 @@ __device__ void fa2_stageb_packet_body(
+                 }
+                 (void)kbn;
+                 const int kt_sub = ktile + sub * 16;
+-                const bool sub_full = full || ((kt_sub + 15) <= gmin);
++                const bool sub_full =
++                    full || ((kt_sub + 15 < key_limit) && (kt_sub + 15 <= gmin));
+                 float sc[8];
+ #pragma unroll
+                 for (int j = 0; j < 8; ++j)
+@@ -2149,13 +2153,13 @@ __device__ void fa2_stageb_packet_body(
+         }
+     }
+ }
+-// Packet direct entry: native-fp8 fill, fused f32->E4M3 Q, dense Q128
++// Packet direct entry: native-fp8 fill, fused f32->E4M3 Q, dense Q384
+ // ownership. For widened prefill, z enumerates equal-length 512-row runs;
+ // x restarts within each run so the row grouping and causal bounds are
+ // identical to the former per-step launches.
+-// Grid [ceil(min(batch,512)*6/128), 4, ceil(batch/512)], block 256,
+-// 49408 B dynamic LDS.
+-extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
++// Grid [ceil(min(batch,512)/64), 4, ceil(batch/512)], block 768,
++// 37120 B dynamic LDS.
++extern "C" __global__ __launch_bounds__(768, 1) void attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+     const float* __restrict__ q,
+     unsigned char* __restrict__ q8_codes,
+     const unsigned char* __restrict__ k_cache,
+@@ -2177,15 +2181,16 @@ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_
+     if (query_offset >= batch_size)
+         return;
+     const int run_rows = min(512, batch_size - query_offset);
+-    const int row_base = 128 * (int)blockIdx.x;
++    const int row_base = 384 * (int)blockIdx.x;
+     if (row_base >= 6 * run_rows)
+         return;
+     fa2_stageb_packet_body<false, true>(
+         q, q8_codes, k_cache, v_cache, out, positions, run_rows, query_offset,
+-        scale_attn, kv_h, row_base, 0, 0x3fffffff, 0, 1);
++        scale_attn, kv_h, row_base, 0, 0x7fffffff, 0, 1);
+ }
+-// Packet partial twin: same KT64 tile partition as the stage-b partial.
+-extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201(
++// Packet partial twin: preserves the external KT64 partition while clamping
++// each internal KT48 tile to the split's absolute key interval.
++extern "C" __global__ __launch_bounds__(768, 1) void attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201(
+     const unsigned char* __restrict__ q8_codes,
+     const unsigned char* __restrict__ k_cache,
+     const unsigned char* __restrict__ v_cache,
+@@ -2205,18 +2210,19 @@ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_
+     const int kv_h = blockIdx.y;
+     if (kv_h >= 4)
+         return;
+-    const int row_base = 128 * (int)blockIdx.x;
++    const int row_base = 384 * (int)blockIdx.x;
+     if (row_base >= 6 * batch_size)
+         return;
+     const int split = blockIdx.z;
+     if (split >= n_splits)
+         return;
+     const int per = (512 + n_splits - 1) / n_splits;
+-    const int t0 = split * per;
+-    const int t1 = t0 + per;
++    const int key_begin = split * per * 64;
++    const int key_end = (split * per + per) * 64;
+     fa2_stageb_packet_body<true, false>(
+         nullptr, (unsigned char*)q8_codes, k_cache, v_cache, out, positions,
+-        batch_size, 0, scale_attn, kv_h, row_base, t0, t1, split, n_splits);
++        batch_size, 0, scale_attn, kv_h, row_base, key_begin, key_end, split,
++        n_splits);
+ }
+ // Packet merge: scale-free 258-float records, same body as stage-b merge
+ // under its own symbol (duplicated so the route-N object stays identical).

@@ -1,0 +1,6 @@
+hsaco=/home/kaden/.hipfire-homes/ab4/.hipfire_kernels/gfx1201/attention_fp8_e4m3_fa2_gqa_packet_gfx1201.5d531b291a941cd7.hsaco
+symbol=attention_fp8_e4m3_fa2_gqa_packet_gfx1201
+block=768 lds=37120
+max_blocks_per_cu=1
+resident_waves_per_cu=24
+average_waves_per_simd=6
