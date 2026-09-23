@@ -1,0 +1,10 @@
+IU4 + FP8 KV, WT2, qwen3.8-27b.mq4-xt
+Environment: HIPFIRE_GRAPH=0 HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_LLOYD_GFX12=1 HIPFIRE_IU4_PREFILL=1 HIPFIRE_GFX12_FA2_FP8=1
+KV: --kv-mode fp8 --kv-v q8; scoring: prefill
+
+chunks  KLD       iu4-q8-pin  delta      md5
+1       0.043126  0.041329    +0.001797  5c49765c97632d8fdfdee16a7115da53
+2       0.049313  0.048091    +0.001222  3a3b524171a970226e32f966f6c6001b
+24      0.063890  0.063410    +0.000480  f9b2021b984ff24bdbe6f40332f8cca1
+
+24-chunk inexact gate: 0.063890 <= 0.063410 + 0.000500 = 0.063910 (PASS by 0.000020).

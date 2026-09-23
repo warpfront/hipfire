@@ -1,0 +1,5 @@
+ROCR_VISIBLE_DEVICES ordinal 0
+rocminfo UUID: GPU-9eb7aeda51c88ffd (Node 1, BDFID 768 = 0000:03:00.0)
+amd-smi index: 0
+amd-smi UUID: 9e007551-0000-1000-80b7-aeda51c88ffd
+amd-smi BDF: 0000:03:00.0
