@@ -3702,6 +3702,9 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_X5_SYMFOLD_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+/// Kernel-agnostic Z output scatter after a widened ordinary IU4 SET.
+pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
+    include_str!("../../../kernels/src/split_mq4v2_z_betaalpha.hip");
 /// gfx11 GEMM v2 "V2C" symmetric IU4 prefill tile (M128xN128, 8 waves, two
 /// K128 LDS slots, 2 CTAs/WGP). Reads the production MQ4V2 weights and
 /// `block_i4_128` activations and permutes them at the LDS store; SET/ADD are
