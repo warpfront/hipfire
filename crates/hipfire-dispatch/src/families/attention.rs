@@ -2368,18 +2368,35 @@ fn dispatch_attend(
                     && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
-                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
+                    // v2 is the bit-exact reschedule of the same body;
+                    // `kernel.attn_qresident_v2=false` restores v1.
+                    if gpu.flags.attn_qresident_v2 {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    } else {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    }
                     return Ok(());
                 }
                 if gpu.flags.gfx12_fa_packet

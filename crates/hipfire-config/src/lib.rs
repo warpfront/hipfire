@@ -2298,6 +2298,15 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_ATTN_QRESIDENT",
         "Enable the gfx1201 register-resident-Q wide-workgroup FA2 prefill route (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT=0 to opt out; exact H24/KV4/D256 native-fp8-KV shapes only)."
     ),
+    process_bool_field!(
+        "kernel.attn_qresident_v2",
+        "attn_qresident_v2",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_ATTN_QRESIDENT_V2",
+        "Use the bit-exact v2 schedule of the gfx1201 Q-resident FA2 prefill kernel (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT_V2=0 to restore the v1 Q-resident kernel; only applies where kernel.attn_qresident selects the Q-resident route)."
+    ),
     process_auto_bool_field!(
         "kernel.gfx11_q8_fa2_wide",
         "gfx11_q8_fa2_wide",

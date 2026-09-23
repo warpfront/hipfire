@@ -6297,6 +6297,18 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Exact reschedule of [`ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC`]
+/// (`attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201`): same geometry and
+/// per-row arithmetic, bit-identical output, with prefetched K/V tiles,
+/// transposed V loads, branch-free masking, bracketed fp8 code conversion
+/// in place of per-element IEEE division, and heaviest-first workgroups.
+/// Default on exact gfx1201 behind `kernel.attn_qresident_v2`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_QRESIDENT_V2 1\n",
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 
 
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
