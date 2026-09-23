@@ -1,0 +1,4250 @@
+GPU     :	0
+Name    :	gfx1201
+configs :
+   Type                :	SAMPLE_INTERVAL_SCLK_CYCLES
+   Minimum_Interval    :	32
+   Maximum_Interval    :	65504
+
+
+
+
+GPU     :	1
+Name    :	gfx1201
+configs :
+   Type                :	SAMPLE_INTERVAL_SCLK_CYCLES
+   Minimum_Interval    :	32
+   Maximum_Interval    :	65504
+
+
+
+
+GPU     :	2
+Name    :	gfx1201
+configs :
+   Type                :	SAMPLE_INTERVAL_SCLK_CYCLES
+   Minimum_Interval    :	32
+   Maximum_Interval    :	65504
+
+
+
+
+GPU     :	3
+Name    :	gfx1201
+configs :
+   Type                :	SAMPLE_INTERVAL_SCLK_CYCLES
+   Minimum_Interval    :	32
+   Maximum_Interval    :	65504
+
+
+
+
+GPU     :	4
+Name    :	gfx1201
+configs :
+   Type                :	SAMPLE_INTERVAL_SCLK_CYCLES
+   Minimum_Interval    :	32
+   Maximum_Interval    :	65504
+
+
+
+
+GPU:0
+Name:gfx1201
+Counter_Name        :	processor_id_low
+Description         :	Constant value processor_id_low from agent properties
+
+
+Counter_Name        :	capability
+Description         :	Constant value capability from agent properties
+
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+
+
+Counter_Name        :	size
+Description         :	Constant value size from agent properties
+
+
+Counter_Name        :	unique_id
+Description         :	Constant value unique_id from agent properties
+
+
+Counter_Name        :	min_latency
+Description         :	Constant value min_latency from agent properties
+
+
+Counter_Name        :	weight
+Description         :	Constant value weight from agent properties
+
+
+Counter_Name        :	node_from
+Description         :	Constant value node_from from agent properties
+
+
+Counter_Name        :	version_major
+Description         :	Constant value version_major from agent properties
+
+
+Counter_Name        :	version_minor
+Description         :	Constant value version_minor from agent properties
+
+
+Counter_Name        :	mem_clk_max
+Description         :	Constant value mem_clk_max from agent properties
+
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+
+Counter_Name        :	width
+Description         :	Constant value width from agent properties
+
+
+Counter_Name        :	flags
+Description         :	Constant value flags from agent properties
+
+
+Counter_Name        :	size_in_bytes
+Description         :	Constant value size_in_bytes from agent properties
+
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+
+Counter_Name        :	sdma_fw_version
+Description         :	Constant value sdma_fw_version from agent properties
+
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+
+Counter_Name        :	max_bandwidth
+Description         :	Constant value max_bandwidth from agent properties
+
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+
+Counter_Name        :	cache_line_size
+Description         :	Constant value cache_line_size from agent properties
+
+
+Counter_Name        :	level
+Description         :	Constant value level from agent properties
+
+
+Counter_Name        :	min_bandwidth
+Description         :	Constant value min_bandwidth from agent properties
+
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+
+Counter_Name        :	fw_version
+Description         :	Constant value fw_version from agent properties
+
+
+Counter_Name        :	recommended_transfer_size
+Description         :	Constant value recommended_transfer_size from agent properties
+
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+
+Counter_Name        :	association
+Description         :	Constant value association from agent properties
+
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+
+Counter_Name        :	latency
+Description         :	Constant value latency from agent properties
+
+
+Counter_Name        :	max_latency
+Description         :	Constant value max_latency from agent properties
+
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+
+Counter_Name        :	cache_lines_per_tag
+Description         :	Constant value cache_lines_per_tag from agent properties
+
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+
+Counter_Name        :	type
+Description         :	Constant value type from agent properties
+
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+
+Counter_Name        :	heap_type
+Description         :	Constant value heap_type from agent properties
+
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+
+Counter_Name        :	node_to
+Description         :	Constant value node_to from agent properties
+
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+
+Counter_Name        :	CU_NUM
+Description         :	CU_NUM
+Expression          :	simd_count/simd_per_cu
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SIMD_NUM
+Description         :	SIMD Number
+Expression          :	simd_count
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FETCH_SIZE
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FetchSize
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	FETCH_SIZE
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte) for all clients.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_sum
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte). Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B
+Description         :	Number of 128-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B_sum
+Description         :	Number of 128-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_128B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B
+Description         :	Number of 256-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B_sum
+Description         :	Number of 256-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_256B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B
+Description         :	Number of 32-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B_sum
+Description         :	Number of 32-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_32B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B
+Description         :	Number of 64-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B_sum
+Description         :	Number of 64-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ
+Description         :	Number of transactions (all sizes) going over the GL2C_EA_WRREQ interface for all clients. This does not include probe commands.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_sum
+Description         :	Number of transactions (either 32-byte or 64-byte) going over the GL2C_EA_WRREQ interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the TC_EA_wrreq interface.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B_sum
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the GL2C_EA_wrreq interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_HIT
+Description         :	Number of cache hits
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_HIT_sum
+Description         :	Number of cache hits. Sum over GL2C instances.
+Expression          :	reduce(GL2C_HIT,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_MC_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS
+Description         :	Number of cache misses.  UC reads count as misses.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS_sum
+Description         :	Number of cache misses. Sum over GL2C instances.
+Expression          :	reduce(GL2C_MISS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_MC_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPUBusy
+Description         :	The percentage of time GPU was busy.
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPU_UTIL
+Description         :	Percentage of the time that GUI is active
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_GUI_ACTIVE
+Description         :	The GUI is Active
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L2CacheHit
+Description         :	The percentage of fetch, write, atomic, and other instructions that hit the data in L2 cache. Value range: 0% (no hit) to 100% (optimal).
+Expression          :	100*reduce(GL2C_HIT,sum)/(reduce(GL2C_HIT,sum)+reduce(GL2C_MISS,sum))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LDSBankConflict
+Description         :	The percentage of GPUTime LDS is stalled by bank conflicts. Value range: 0% (optimal) to 100% (bad).
+Expression          :	100*reduce(SQC_LDS_BANK_CONFLICT,sum)/reduce(SQC_LDS_IDX_ACTIVE,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LdsUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQC_LDS_IDX_ACTIVE,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerActiveCU
+Description         :	Mean occupancy per active compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(SQ_BUSY_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerCU
+Description         :	Mean occupancy per compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	OccupancyPercent
+Description         :	GPU Occupancy as % of maximum.
+Expression          :	100*reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM/32
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MemUnitBusy
+Description         :	The percentage of GPUTime the memory unit is active. The result includes the stall time (MemUnitStalled). This is measured with all extra fetches and writes and any cache or memory effects taken into account. Value range: 0% to 100% (fetch-bound).
+Expression          :	100*reduce(TA_TA_BUSY,max)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SALUInsts
+Description         :	The average number of scalar ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SE_NUM
+Description         :	SE_NUM
+Expression          :	array_count/simd_arrays_per_engine
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SFetchInsts
+Description         :	The average number of scalar fetch instructions from the video memory executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SMEM,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQC_ICACHE_HITS
+Description         :	Number of cache hits. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES
+Description         :	Number of cache misses, includes uncached requests. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_REQ
+Description         :	Number of requests. (per-SQ, per-Bank)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_BANK_CONFLICT
+Description         :	Number of cycles LDS is stalled by bank conflicts. (emulated, C1)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_IDX_ACTIVE
+Description         :	Number of cycles LDS is used for indexed (non-direct,non-interpolation) operations. {per-simd, emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_ACCUM_PREV
+Description         :	This is a hardware register that can be used for accumulating values for other counters. This is useful in expressions where you want to integrate over time. Only accumulates once every 4 cycles. This counter is primarily for use with derived counters supplied by rocprof.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_BUSY_CYCLES
+Description         :	Number of clock cycles there are active waves in a shader engine (as reported by the distributed sequencer). This value does not denote the number of active waves, only the clock cycle in which any wave is present in a SE. This value is returned on a per-shader engine basis in clock cycles.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_LOAD
+Description         :	The number of buffer load, image load, sample, or atomic (with return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_LOAD instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_STORE
+Description         :	The number of buffer store, image store, or atomic (without return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_STORE instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32
+Description         :	Number of wave32 instructions issued, for flat, lds, valu, tex. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_LDS
+Description         :	Number of wave32 LDS indexed instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_VALU
+Description         :	Number of wave32 valu instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VMEM
+Description         :	The number of cycles needed to send addr and data for VMEM (lds, buffer, image, flat, scratch, global) instructions, windowed by perf_en. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis with units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_LEVEL_LDS
+Description         :	Number of in-flight LDS instructions. This value represents the number of instructions each wave spends executing instructions accessing the local data store (data shared between SIMDs on the same CU). Set next counter to ACCUM_PREV and divide by INSTS_LDS for average latency. Includes FLAT instructions. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_ANY
+Description         :	Number of wave-cycles spent waiting for anything (per-simd, nondeterministic). Units in quad-cycles(4 cycles)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_INST_ANY
+Description         :	Number of wave-cycles spent waiting for any instruction issue. Units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQ_WAVE_CYCLES
+Description         :	The cycles spent executing waves in the CUs. This value is reported per-SE (aggregates of SIMD values) and is nondeterministic. Units are in quad-cycles (4 cycles). Useful for determining how much time is spent executing wave code vs overhead/waiting. Low cycle count relative to actual number of cycles processed by the CU can indicate that the CU is stalling or is overloaded.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VALU
+Description         :	Number of cycles needed to execute VALU operations (SIMD cycles), where there is overlapping V_OP32_1 and V_OP32_T instruction, count them separately.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VEC32_LEVEL_LDS
+Description         :	Number of in-flight wave32 LDS (indexed, flat) instructions issued.{level, nondeterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS
+Description         :	Number of buffer load vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS_sum
+Description         :	Number of buffer load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_LOAD_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS
+Description         :	Number of buffer store vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS_sum
+Description         :	Number of buffer store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_STORE_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_avr
+Description         :	TA block is busy. Average over TA instances.
+Expression          :	reduce(TA_TA_BUSY,avr)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_max
+Description         :	TA block is busy. Max over TA instances.
+Expression          :	reduce(TA_TA_BUSY,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_min
+Description         :	TA block is busy. Min over TA instances.
+Expression          :	reduce(TA_TA_BUSY,min)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_TA_BUSY
+Description         :	TA block is busy. Perf_Windowing not supported for this counter.
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ
+Description         :	Total cache line accesses
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ_MISS
+Description         :	Total cache requests that missed
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	VALUBusy
+Description         :	The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal).
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(SIMD_NUM/4)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	VALUInsts
+Description         :	The average number of vector ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_VALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	ValuPipeIssueUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_DEP_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for anything.
+Expression          :	100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_ISSUE_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for any instruction issue.
+Expression          :	100*reduce(SQ_WAIT_INST_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	Wavefronts
+Description         :	Total wavefronts.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WriteUnitStalled
+Description         :	The percentage of GPUTime the Write unit is stalled. Value range: 0% to 100% (bad).
+Expression          :	100*GL2C_WRREQ_STALL_max/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L0CacheHit
+Description         :	The percentage of read requests that hit the data in the L0 cache. The L0 cache contains vector data, which is data that may vary in each thread across the wavefront. Value range 0% (no hit) to 100% (optimal).
+Expression          :	(1-(reduce(TCP_REQ_MISS,sum)/reduce(TCP_REQ,sum)))*100
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+GPU:1
+Name:gfx1201
+Counter_Name        :	processor_id_low
+Description         :	Constant value processor_id_low from agent properties
+
+
+Counter_Name        :	capability
+Description         :	Constant value capability from agent properties
+
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+
+
+Counter_Name        :	size
+Description         :	Constant value size from agent properties
+
+
+Counter_Name        :	unique_id
+Description         :	Constant value unique_id from agent properties
+
+
+Counter_Name        :	min_latency
+Description         :	Constant value min_latency from agent properties
+
+
+Counter_Name        :	weight
+Description         :	Constant value weight from agent properties
+
+
+Counter_Name        :	node_from
+Description         :	Constant value node_from from agent properties
+
+
+Counter_Name        :	version_major
+Description         :	Constant value version_major from agent properties
+
+
+Counter_Name        :	version_minor
+Description         :	Constant value version_minor from agent properties
+
+
+Counter_Name        :	mem_clk_max
+Description         :	Constant value mem_clk_max from agent properties
+
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+
+Counter_Name        :	width
+Description         :	Constant value width from agent properties
+
+
+Counter_Name        :	flags
+Description         :	Constant value flags from agent properties
+
+
+Counter_Name        :	size_in_bytes
+Description         :	Constant value size_in_bytes from agent properties
+
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+
+Counter_Name        :	sdma_fw_version
+Description         :	Constant value sdma_fw_version from agent properties
+
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+
+Counter_Name        :	max_bandwidth
+Description         :	Constant value max_bandwidth from agent properties
+
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+
+Counter_Name        :	cache_line_size
+Description         :	Constant value cache_line_size from agent properties
+
+
+Counter_Name        :	level
+Description         :	Constant value level from agent properties
+
+
+Counter_Name        :	min_bandwidth
+Description         :	Constant value min_bandwidth from agent properties
+
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+
+Counter_Name        :	fw_version
+Description         :	Constant value fw_version from agent properties
+
+
+Counter_Name        :	recommended_transfer_size
+Description         :	Constant value recommended_transfer_size from agent properties
+
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+
+Counter_Name        :	association
+Description         :	Constant value association from agent properties
+
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+
+Counter_Name        :	latency
+Description         :	Constant value latency from agent properties
+
+
+Counter_Name        :	max_latency
+Description         :	Constant value max_latency from agent properties
+
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+
+Counter_Name        :	cache_lines_per_tag
+Description         :	Constant value cache_lines_per_tag from agent properties
+
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+
+Counter_Name        :	type
+Description         :	Constant value type from agent properties
+
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+
+Counter_Name        :	heap_type
+Description         :	Constant value heap_type from agent properties
+
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+
+Counter_Name        :	node_to
+Description         :	Constant value node_to from agent properties
+
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+
+Counter_Name        :	CU_NUM
+Description         :	CU_NUM
+Expression          :	simd_count/simd_per_cu
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SIMD_NUM
+Description         :	SIMD Number
+Expression          :	simd_count
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FETCH_SIZE
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FetchSize
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	FETCH_SIZE
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte) for all clients.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_sum
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte). Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B
+Description         :	Number of 128-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B_sum
+Description         :	Number of 128-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_128B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B
+Description         :	Number of 256-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B_sum
+Description         :	Number of 256-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_256B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B
+Description         :	Number of 32-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B_sum
+Description         :	Number of 32-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_32B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B
+Description         :	Number of 64-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B_sum
+Description         :	Number of 64-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ
+Description         :	Number of transactions (all sizes) going over the GL2C_EA_WRREQ interface for all clients. This does not include probe commands.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_sum
+Description         :	Number of transactions (either 32-byte or 64-byte) going over the GL2C_EA_WRREQ interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the TC_EA_wrreq interface.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B_sum
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the GL2C_EA_wrreq interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_HIT
+Description         :	Number of cache hits
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_HIT_sum
+Description         :	Number of cache hits. Sum over GL2C instances.
+Expression          :	reduce(GL2C_HIT,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_MC_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS
+Description         :	Number of cache misses.  UC reads count as misses.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS_sum
+Description         :	Number of cache misses. Sum over GL2C instances.
+Expression          :	reduce(GL2C_MISS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_MC_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPUBusy
+Description         :	The percentage of time GPU was busy.
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPU_UTIL
+Description         :	Percentage of the time that GUI is active
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_GUI_ACTIVE
+Description         :	The GUI is Active
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L2CacheHit
+Description         :	The percentage of fetch, write, atomic, and other instructions that hit the data in L2 cache. Value range: 0% (no hit) to 100% (optimal).
+Expression          :	100*reduce(GL2C_HIT,sum)/(reduce(GL2C_HIT,sum)+reduce(GL2C_MISS,sum))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LDSBankConflict
+Description         :	The percentage of GPUTime LDS is stalled by bank conflicts. Value range: 0% (optimal) to 100% (bad).
+Expression          :	100*reduce(SQC_LDS_BANK_CONFLICT,sum)/reduce(SQC_LDS_IDX_ACTIVE,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LdsUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQC_LDS_IDX_ACTIVE,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerActiveCU
+Description         :	Mean occupancy per active compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(SQ_BUSY_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerCU
+Description         :	Mean occupancy per compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	OccupancyPercent
+Description         :	GPU Occupancy as % of maximum.
+Expression          :	100*reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM/32
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MemUnitBusy
+Description         :	The percentage of GPUTime the memory unit is active. The result includes the stall time (MemUnitStalled). This is measured with all extra fetches and writes and any cache or memory effects taken into account. Value range: 0% to 100% (fetch-bound).
+Expression          :	100*reduce(TA_TA_BUSY,max)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SALUInsts
+Description         :	The average number of scalar ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SE_NUM
+Description         :	SE_NUM
+Expression          :	array_count/simd_arrays_per_engine
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SFetchInsts
+Description         :	The average number of scalar fetch instructions from the video memory executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SMEM,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQC_ICACHE_HITS
+Description         :	Number of cache hits. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES
+Description         :	Number of cache misses, includes uncached requests. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_REQ
+Description         :	Number of requests. (per-SQ, per-Bank)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_BANK_CONFLICT
+Description         :	Number of cycles LDS is stalled by bank conflicts. (emulated, C1)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_IDX_ACTIVE
+Description         :	Number of cycles LDS is used for indexed (non-direct,non-interpolation) operations. {per-simd, emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_ACCUM_PREV
+Description         :	This is a hardware register that can be used for accumulating values for other counters. This is useful in expressions where you want to integrate over time. Only accumulates once every 4 cycles. This counter is primarily for use with derived counters supplied by rocprof.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_BUSY_CYCLES
+Description         :	Number of clock cycles there are active waves in a shader engine (as reported by the distributed sequencer). This value does not denote the number of active waves, only the clock cycle in which any wave is present in a SE. This value is returned on a per-shader engine basis in clock cycles.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_LOAD
+Description         :	The number of buffer load, image load, sample, or atomic (with return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_LOAD instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_STORE
+Description         :	The number of buffer store, image store, or atomic (without return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_STORE instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32
+Description         :	Number of wave32 instructions issued, for flat, lds, valu, tex. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_LDS
+Description         :	Number of wave32 LDS indexed instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_VALU
+Description         :	Number of wave32 valu instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VMEM
+Description         :	The number of cycles needed to send addr and data for VMEM (lds, buffer, image, flat, scratch, global) instructions, windowed by perf_en. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis with units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_LEVEL_LDS
+Description         :	Number of in-flight LDS instructions. This value represents the number of instructions each wave spends executing instructions accessing the local data store (data shared between SIMDs on the same CU). Set next counter to ACCUM_PREV and divide by INSTS_LDS for average latency. Includes FLAT instructions. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_ANY
+Description         :	Number of wave-cycles spent waiting for anything (per-simd, nondeterministic). Units in quad-cycles(4 cycles)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_INST_ANY
+Description         :	Number of wave-cycles spent waiting for any instruction issue. Units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQ_WAVE_CYCLES
+Description         :	The cycles spent executing waves in the CUs. This value is reported per-SE (aggregates of SIMD values) and is nondeterministic. Units are in quad-cycles (4 cycles). Useful for determining how much time is spent executing wave code vs overhead/waiting. Low cycle count relative to actual number of cycles processed by the CU can indicate that the CU is stalling or is overloaded.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VALU
+Description         :	Number of cycles needed to execute VALU operations (SIMD cycles), where there is overlapping V_OP32_1 and V_OP32_T instruction, count them separately.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VEC32_LEVEL_LDS
+Description         :	Number of in-flight wave32 LDS (indexed, flat) instructions issued.{level, nondeterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS
+Description         :	Number of buffer load vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS_sum
+Description         :	Number of buffer load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_LOAD_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS
+Description         :	Number of buffer store vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS_sum
+Description         :	Number of buffer store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_STORE_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_avr
+Description         :	TA block is busy. Average over TA instances.
+Expression          :	reduce(TA_TA_BUSY,avr)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_max
+Description         :	TA block is busy. Max over TA instances.
+Expression          :	reduce(TA_TA_BUSY,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_min
+Description         :	TA block is busy. Min over TA instances.
+Expression          :	reduce(TA_TA_BUSY,min)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_TA_BUSY
+Description         :	TA block is busy. Perf_Windowing not supported for this counter.
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ
+Description         :	Total cache line accesses
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ_MISS
+Description         :	Total cache requests that missed
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	VALUBusy
+Description         :	The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal).
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(SIMD_NUM/4)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	VALUInsts
+Description         :	The average number of vector ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_VALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	ValuPipeIssueUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_DEP_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for anything.
+Expression          :	100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_ISSUE_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for any instruction issue.
+Expression          :	100*reduce(SQ_WAIT_INST_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	Wavefronts
+Description         :	Total wavefronts.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WriteUnitStalled
+Description         :	The percentage of GPUTime the Write unit is stalled. Value range: 0% to 100% (bad).
+Expression          :	100*GL2C_WRREQ_STALL_max/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L0CacheHit
+Description         :	The percentage of read requests that hit the data in the L0 cache. The L0 cache contains vector data, which is data that may vary in each thread across the wavefront. Value range 0% (no hit) to 100% (optimal).
+Expression          :	(1-(reduce(TCP_REQ_MISS,sum)/reduce(TCP_REQ,sum)))*100
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+GPU:2
+Name:gfx1201
+Counter_Name        :	processor_id_low
+Description         :	Constant value processor_id_low from agent properties
+
+
+Counter_Name        :	capability
+Description         :	Constant value capability from agent properties
+
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+
+
+Counter_Name        :	size
+Description         :	Constant value size from agent properties
+
+
+Counter_Name        :	unique_id
+Description         :	Constant value unique_id from agent properties
+
+
+Counter_Name        :	min_latency
+Description         :	Constant value min_latency from agent properties
+
+
+Counter_Name        :	weight
+Description         :	Constant value weight from agent properties
+
+
+Counter_Name        :	node_from
+Description         :	Constant value node_from from agent properties
+
+
+Counter_Name        :	version_major
+Description         :	Constant value version_major from agent properties
+
+
+Counter_Name        :	version_minor
+Description         :	Constant value version_minor from agent properties
+
+
+Counter_Name        :	mem_clk_max
+Description         :	Constant value mem_clk_max from agent properties
+
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+
+Counter_Name        :	width
+Description         :	Constant value width from agent properties
+
+
+Counter_Name        :	flags
+Description         :	Constant value flags from agent properties
+
+
+Counter_Name        :	size_in_bytes
+Description         :	Constant value size_in_bytes from agent properties
+
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+
+Counter_Name        :	sdma_fw_version
+Description         :	Constant value sdma_fw_version from agent properties
+
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+
+Counter_Name        :	max_bandwidth
+Description         :	Constant value max_bandwidth from agent properties
+
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+
+Counter_Name        :	cache_line_size
+Description         :	Constant value cache_line_size from agent properties
+
+
+Counter_Name        :	level
+Description         :	Constant value level from agent properties
+
+
+Counter_Name        :	min_bandwidth
+Description         :	Constant value min_bandwidth from agent properties
+
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+
+Counter_Name        :	fw_version
+Description         :	Constant value fw_version from agent properties
+
+
+Counter_Name        :	recommended_transfer_size
+Description         :	Constant value recommended_transfer_size from agent properties
+
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+
+Counter_Name        :	association
+Description         :	Constant value association from agent properties
+
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+
+Counter_Name        :	latency
+Description         :	Constant value latency from agent properties
+
+
+Counter_Name        :	max_latency
+Description         :	Constant value max_latency from agent properties
+
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+
+Counter_Name        :	cache_lines_per_tag
+Description         :	Constant value cache_lines_per_tag from agent properties
+
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+
+Counter_Name        :	type
+Description         :	Constant value type from agent properties
+
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+
+Counter_Name        :	heap_type
+Description         :	Constant value heap_type from agent properties
+
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+
+Counter_Name        :	node_to
+Description         :	Constant value node_to from agent properties
+
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+
+Counter_Name        :	CU_NUM
+Description         :	CU_NUM
+Expression          :	simd_count/simd_per_cu
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SIMD_NUM
+Description         :	SIMD Number
+Expression          :	simd_count
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FETCH_SIZE
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FetchSize
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	FETCH_SIZE
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte) for all clients.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_sum
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte). Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B
+Description         :	Number of 128-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B_sum
+Description         :	Number of 128-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_128B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B
+Description         :	Number of 256-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B_sum
+Description         :	Number of 256-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_256B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B
+Description         :	Number of 32-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B_sum
+Description         :	Number of 32-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_32B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B
+Description         :	Number of 64-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B_sum
+Description         :	Number of 64-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ
+Description         :	Number of transactions (all sizes) going over the GL2C_EA_WRREQ interface for all clients. This does not include probe commands.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_sum
+Description         :	Number of transactions (either 32-byte or 64-byte) going over the GL2C_EA_WRREQ interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the TC_EA_wrreq interface.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B_sum
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the GL2C_EA_wrreq interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_HIT
+Description         :	Number of cache hits
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_HIT_sum
+Description         :	Number of cache hits. Sum over GL2C instances.
+Expression          :	reduce(GL2C_HIT,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_MC_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS
+Description         :	Number of cache misses.  UC reads count as misses.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS_sum
+Description         :	Number of cache misses. Sum over GL2C instances.
+Expression          :	reduce(GL2C_MISS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_MC_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPUBusy
+Description         :	The percentage of time GPU was busy.
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPU_UTIL
+Description         :	Percentage of the time that GUI is active
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_GUI_ACTIVE
+Description         :	The GUI is Active
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L2CacheHit
+Description         :	The percentage of fetch, write, atomic, and other instructions that hit the data in L2 cache. Value range: 0% (no hit) to 100% (optimal).
+Expression          :	100*reduce(GL2C_HIT,sum)/(reduce(GL2C_HIT,sum)+reduce(GL2C_MISS,sum))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LDSBankConflict
+Description         :	The percentage of GPUTime LDS is stalled by bank conflicts. Value range: 0% (optimal) to 100% (bad).
+Expression          :	100*reduce(SQC_LDS_BANK_CONFLICT,sum)/reduce(SQC_LDS_IDX_ACTIVE,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LdsUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQC_LDS_IDX_ACTIVE,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerActiveCU
+Description         :	Mean occupancy per active compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(SQ_BUSY_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerCU
+Description         :	Mean occupancy per compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	OccupancyPercent
+Description         :	GPU Occupancy as % of maximum.
+Expression          :	100*reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM/32
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MemUnitBusy
+Description         :	The percentage of GPUTime the memory unit is active. The result includes the stall time (MemUnitStalled). This is measured with all extra fetches and writes and any cache or memory effects taken into account. Value range: 0% to 100% (fetch-bound).
+Expression          :	100*reduce(TA_TA_BUSY,max)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SALUInsts
+Description         :	The average number of scalar ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SE_NUM
+Description         :	SE_NUM
+Expression          :	array_count/simd_arrays_per_engine
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SFetchInsts
+Description         :	The average number of scalar fetch instructions from the video memory executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SMEM,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQC_ICACHE_HITS
+Description         :	Number of cache hits. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES
+Description         :	Number of cache misses, includes uncached requests. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_REQ
+Description         :	Number of requests. (per-SQ, per-Bank)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_BANK_CONFLICT
+Description         :	Number of cycles LDS is stalled by bank conflicts. (emulated, C1)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_IDX_ACTIVE
+Description         :	Number of cycles LDS is used for indexed (non-direct,non-interpolation) operations. {per-simd, emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_ACCUM_PREV
+Description         :	This is a hardware register that can be used for accumulating values for other counters. This is useful in expressions where you want to integrate over time. Only accumulates once every 4 cycles. This counter is primarily for use with derived counters supplied by rocprof.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_BUSY_CYCLES
+Description         :	Number of clock cycles there are active waves in a shader engine (as reported by the distributed sequencer). This value does not denote the number of active waves, only the clock cycle in which any wave is present in a SE. This value is returned on a per-shader engine basis in clock cycles.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_LOAD
+Description         :	The number of buffer load, image load, sample, or atomic (with return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_LOAD instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_STORE
+Description         :	The number of buffer store, image store, or atomic (without return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_STORE instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32
+Description         :	Number of wave32 instructions issued, for flat, lds, valu, tex. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_LDS
+Description         :	Number of wave32 LDS indexed instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_VALU
+Description         :	Number of wave32 valu instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VMEM
+Description         :	The number of cycles needed to send addr and data for VMEM (lds, buffer, image, flat, scratch, global) instructions, windowed by perf_en. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis with units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_LEVEL_LDS
+Description         :	Number of in-flight LDS instructions. This value represents the number of instructions each wave spends executing instructions accessing the local data store (data shared between SIMDs on the same CU). Set next counter to ACCUM_PREV and divide by INSTS_LDS for average latency. Includes FLAT instructions. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_ANY
+Description         :	Number of wave-cycles spent waiting for anything (per-simd, nondeterministic). Units in quad-cycles(4 cycles)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_INST_ANY
+Description         :	Number of wave-cycles spent waiting for any instruction issue. Units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQ_WAVE_CYCLES
+Description         :	The cycles spent executing waves in the CUs. This value is reported per-SE (aggregates of SIMD values) and is nondeterministic. Units are in quad-cycles (4 cycles). Useful for determining how much time is spent executing wave code vs overhead/waiting. Low cycle count relative to actual number of cycles processed by the CU can indicate that the CU is stalling or is overloaded.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VALU
+Description         :	Number of cycles needed to execute VALU operations (SIMD cycles), where there is overlapping V_OP32_1 and V_OP32_T instruction, count them separately.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VEC32_LEVEL_LDS
+Description         :	Number of in-flight wave32 LDS (indexed, flat) instructions issued.{level, nondeterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS
+Description         :	Number of buffer load vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS_sum
+Description         :	Number of buffer load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_LOAD_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS
+Description         :	Number of buffer store vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS_sum
+Description         :	Number of buffer store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_STORE_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_avr
+Description         :	TA block is busy. Average over TA instances.
+Expression          :	reduce(TA_TA_BUSY,avr)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_max
+Description         :	TA block is busy. Max over TA instances.
+Expression          :	reduce(TA_TA_BUSY,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_min
+Description         :	TA block is busy. Min over TA instances.
+Expression          :	reduce(TA_TA_BUSY,min)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_TA_BUSY
+Description         :	TA block is busy. Perf_Windowing not supported for this counter.
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ
+Description         :	Total cache line accesses
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ_MISS
+Description         :	Total cache requests that missed
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	VALUBusy
+Description         :	The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal).
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(SIMD_NUM/4)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	VALUInsts
+Description         :	The average number of vector ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_VALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	ValuPipeIssueUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_DEP_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for anything.
+Expression          :	100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_ISSUE_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for any instruction issue.
+Expression          :	100*reduce(SQ_WAIT_INST_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	Wavefronts
+Description         :	Total wavefronts.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WriteUnitStalled
+Description         :	The percentage of GPUTime the Write unit is stalled. Value range: 0% to 100% (bad).
+Expression          :	100*GL2C_WRREQ_STALL_max/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L0CacheHit
+Description         :	The percentage of read requests that hit the data in the L0 cache. The L0 cache contains vector data, which is data that may vary in each thread across the wavefront. Value range 0% (no hit) to 100% (optimal).
+Expression          :	(1-(reduce(TCP_REQ_MISS,sum)/reduce(TCP_REQ,sum)))*100
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+GPU:3
+Name:gfx1201
+Counter_Name        :	processor_id_low
+Description         :	Constant value processor_id_low from agent properties
+
+
+Counter_Name        :	capability
+Description         :	Constant value capability from agent properties
+
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+
+
+Counter_Name        :	size
+Description         :	Constant value size from agent properties
+
+
+Counter_Name        :	unique_id
+Description         :	Constant value unique_id from agent properties
+
+
+Counter_Name        :	min_latency
+Description         :	Constant value min_latency from agent properties
+
+
+Counter_Name        :	weight
+Description         :	Constant value weight from agent properties
+
+
+Counter_Name        :	node_from
+Description         :	Constant value node_from from agent properties
+
+
+Counter_Name        :	version_major
+Description         :	Constant value version_major from agent properties
+
+
+Counter_Name        :	version_minor
+Description         :	Constant value version_minor from agent properties
+
+
+Counter_Name        :	mem_clk_max
+Description         :	Constant value mem_clk_max from agent properties
+
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+
+Counter_Name        :	width
+Description         :	Constant value width from agent properties
+
+
+Counter_Name        :	flags
+Description         :	Constant value flags from agent properties
+
+
+Counter_Name        :	size_in_bytes
+Description         :	Constant value size_in_bytes from agent properties
+
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+
+Counter_Name        :	sdma_fw_version
+Description         :	Constant value sdma_fw_version from agent properties
+
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+
+Counter_Name        :	max_bandwidth
+Description         :	Constant value max_bandwidth from agent properties
+
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+
+Counter_Name        :	cache_line_size
+Description         :	Constant value cache_line_size from agent properties
+
+
+Counter_Name        :	level
+Description         :	Constant value level from agent properties
+
+
+Counter_Name        :	min_bandwidth
+Description         :	Constant value min_bandwidth from agent properties
+
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+
+Counter_Name        :	fw_version
+Description         :	Constant value fw_version from agent properties
+
+
+Counter_Name        :	recommended_transfer_size
+Description         :	Constant value recommended_transfer_size from agent properties
+
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+
+Counter_Name        :	association
+Description         :	Constant value association from agent properties
+
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+
+Counter_Name        :	latency
+Description         :	Constant value latency from agent properties
+
+
+Counter_Name        :	max_latency
+Description         :	Constant value max_latency from agent properties
+
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+
+Counter_Name        :	cache_lines_per_tag
+Description         :	Constant value cache_lines_per_tag from agent properties
+
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+
+Counter_Name        :	type
+Description         :	Constant value type from agent properties
+
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+
+Counter_Name        :	heap_type
+Description         :	Constant value heap_type from agent properties
+
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+
+Counter_Name        :	node_to
+Description         :	Constant value node_to from agent properties
+
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+
+Counter_Name        :	CU_NUM
+Description         :	CU_NUM
+Expression          :	simd_count/simd_per_cu
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SIMD_NUM
+Description         :	SIMD Number
+Expression          :	simd_count
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FETCH_SIZE
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FetchSize
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	FETCH_SIZE
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte) for all clients.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_sum
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte). Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B
+Description         :	Number of 128-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B_sum
+Description         :	Number of 128-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_128B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B
+Description         :	Number of 256-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B_sum
+Description         :	Number of 256-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_256B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B
+Description         :	Number of 32-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B_sum
+Description         :	Number of 32-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_32B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B
+Description         :	Number of 64-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B_sum
+Description         :	Number of 64-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ
+Description         :	Number of transactions (all sizes) going over the GL2C_EA_WRREQ interface for all clients. This does not include probe commands.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_sum
+Description         :	Number of transactions (either 32-byte or 64-byte) going over the GL2C_EA_WRREQ interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the TC_EA_wrreq interface.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B_sum
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the GL2C_EA_wrreq interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_HIT
+Description         :	Number of cache hits
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_HIT_sum
+Description         :	Number of cache hits. Sum over GL2C instances.
+Expression          :	reduce(GL2C_HIT,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_MC_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS
+Description         :	Number of cache misses.  UC reads count as misses.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS_sum
+Description         :	Number of cache misses. Sum over GL2C instances.
+Expression          :	reduce(GL2C_MISS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_MC_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPUBusy
+Description         :	The percentage of time GPU was busy.
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPU_UTIL
+Description         :	Percentage of the time that GUI is active
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_GUI_ACTIVE
+Description         :	The GUI is Active
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L2CacheHit
+Description         :	The percentage of fetch, write, atomic, and other instructions that hit the data in L2 cache. Value range: 0% (no hit) to 100% (optimal).
+Expression          :	100*reduce(GL2C_HIT,sum)/(reduce(GL2C_HIT,sum)+reduce(GL2C_MISS,sum))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LDSBankConflict
+Description         :	The percentage of GPUTime LDS is stalled by bank conflicts. Value range: 0% (optimal) to 100% (bad).
+Expression          :	100*reduce(SQC_LDS_BANK_CONFLICT,sum)/reduce(SQC_LDS_IDX_ACTIVE,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LdsUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQC_LDS_IDX_ACTIVE,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerActiveCU
+Description         :	Mean occupancy per active compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(SQ_BUSY_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerCU
+Description         :	Mean occupancy per compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	OccupancyPercent
+Description         :	GPU Occupancy as % of maximum.
+Expression          :	100*reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM/32
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MemUnitBusy
+Description         :	The percentage of GPUTime the memory unit is active. The result includes the stall time (MemUnitStalled). This is measured with all extra fetches and writes and any cache or memory effects taken into account. Value range: 0% to 100% (fetch-bound).
+Expression          :	100*reduce(TA_TA_BUSY,max)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SALUInsts
+Description         :	The average number of scalar ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SE_NUM
+Description         :	SE_NUM
+Expression          :	array_count/simd_arrays_per_engine
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SFetchInsts
+Description         :	The average number of scalar fetch instructions from the video memory executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SMEM,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQC_ICACHE_HITS
+Description         :	Number of cache hits. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES
+Description         :	Number of cache misses, includes uncached requests. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_REQ
+Description         :	Number of requests. (per-SQ, per-Bank)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_BANK_CONFLICT
+Description         :	Number of cycles LDS is stalled by bank conflicts. (emulated, C1)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_IDX_ACTIVE
+Description         :	Number of cycles LDS is used for indexed (non-direct,non-interpolation) operations. {per-simd, emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_ACCUM_PREV
+Description         :	This is a hardware register that can be used for accumulating values for other counters. This is useful in expressions where you want to integrate over time. Only accumulates once every 4 cycles. This counter is primarily for use with derived counters supplied by rocprof.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_BUSY_CYCLES
+Description         :	Number of clock cycles there are active waves in a shader engine (as reported by the distributed sequencer). This value does not denote the number of active waves, only the clock cycle in which any wave is present in a SE. This value is returned on a per-shader engine basis in clock cycles.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_LOAD
+Description         :	The number of buffer load, image load, sample, or atomic (with return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_LOAD instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_STORE
+Description         :	The number of buffer store, image store, or atomic (without return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_STORE instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32
+Description         :	Number of wave32 instructions issued, for flat, lds, valu, tex. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_LDS
+Description         :	Number of wave32 LDS indexed instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_VALU
+Description         :	Number of wave32 valu instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VMEM
+Description         :	The number of cycles needed to send addr and data for VMEM (lds, buffer, image, flat, scratch, global) instructions, windowed by perf_en. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis with units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_LEVEL_LDS
+Description         :	Number of in-flight LDS instructions. This value represents the number of instructions each wave spends executing instructions accessing the local data store (data shared between SIMDs on the same CU). Set next counter to ACCUM_PREV and divide by INSTS_LDS for average latency. Includes FLAT instructions. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_ANY
+Description         :	Number of wave-cycles spent waiting for anything (per-simd, nondeterministic). Units in quad-cycles(4 cycles)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_INST_ANY
+Description         :	Number of wave-cycles spent waiting for any instruction issue. Units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQ_WAVE_CYCLES
+Description         :	The cycles spent executing waves in the CUs. This value is reported per-SE (aggregates of SIMD values) and is nondeterministic. Units are in quad-cycles (4 cycles). Useful for determining how much time is spent executing wave code vs overhead/waiting. Low cycle count relative to actual number of cycles processed by the CU can indicate that the CU is stalling or is overloaded.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VALU
+Description         :	Number of cycles needed to execute VALU operations (SIMD cycles), where there is overlapping V_OP32_1 and V_OP32_T instruction, count them separately.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VEC32_LEVEL_LDS
+Description         :	Number of in-flight wave32 LDS (indexed, flat) instructions issued.{level, nondeterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS
+Description         :	Number of buffer load vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS_sum
+Description         :	Number of buffer load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_LOAD_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS
+Description         :	Number of buffer store vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS_sum
+Description         :	Number of buffer store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_STORE_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_avr
+Description         :	TA block is busy. Average over TA instances.
+Expression          :	reduce(TA_TA_BUSY,avr)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_max
+Description         :	TA block is busy. Max over TA instances.
+Expression          :	reduce(TA_TA_BUSY,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_min
+Description         :	TA block is busy. Min over TA instances.
+Expression          :	reduce(TA_TA_BUSY,min)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_TA_BUSY
+Description         :	TA block is busy. Perf_Windowing not supported for this counter.
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ
+Description         :	Total cache line accesses
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ_MISS
+Description         :	Total cache requests that missed
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	VALUBusy
+Description         :	The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal).
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(SIMD_NUM/4)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	VALUInsts
+Description         :	The average number of vector ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_VALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	ValuPipeIssueUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_DEP_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for anything.
+Expression          :	100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_ISSUE_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for any instruction issue.
+Expression          :	100*reduce(SQ_WAIT_INST_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	Wavefronts
+Description         :	Total wavefronts.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WriteUnitStalled
+Description         :	The percentage of GPUTime the Write unit is stalled. Value range: 0% to 100% (bad).
+Expression          :	100*GL2C_WRREQ_STALL_max/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L0CacheHit
+Description         :	The percentage of read requests that hit the data in the L0 cache. The L0 cache contains vector data, which is data that may vary in each thread across the wavefront. Value range 0% (no hit) to 100% (optimal).
+Expression          :	(1-(reduce(TCP_REQ_MISS,sum)/reduce(TCP_REQ,sum)))*100
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+GPU:4
+Name:gfx1201
+Counter_Name        :	processor_id_low
+Description         :	Constant value processor_id_low from agent properties
+
+
+Counter_Name        :	capability
+Description         :	Constant value capability from agent properties
+
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+
+
+Counter_Name        :	size
+Description         :	Constant value size from agent properties
+
+
+Counter_Name        :	unique_id
+Description         :	Constant value unique_id from agent properties
+
+
+Counter_Name        :	min_latency
+Description         :	Constant value min_latency from agent properties
+
+
+Counter_Name        :	weight
+Description         :	Constant value weight from agent properties
+
+
+Counter_Name        :	node_from
+Description         :	Constant value node_from from agent properties
+
+
+Counter_Name        :	version_major
+Description         :	Constant value version_major from agent properties
+
+
+Counter_Name        :	version_minor
+Description         :	Constant value version_minor from agent properties
+
+
+Counter_Name        :	mem_clk_max
+Description         :	Constant value mem_clk_max from agent properties
+
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+
+Counter_Name        :	width
+Description         :	Constant value width from agent properties
+
+
+Counter_Name        :	flags
+Description         :	Constant value flags from agent properties
+
+
+Counter_Name        :	size_in_bytes
+Description         :	Constant value size_in_bytes from agent properties
+
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+
+Counter_Name        :	sdma_fw_version
+Description         :	Constant value sdma_fw_version from agent properties
+
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+
+Counter_Name        :	max_bandwidth
+Description         :	Constant value max_bandwidth from agent properties
+
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+
+Counter_Name        :	cache_line_size
+Description         :	Constant value cache_line_size from agent properties
+
+
+Counter_Name        :	level
+Description         :	Constant value level from agent properties
+
+
+Counter_Name        :	min_bandwidth
+Description         :	Constant value min_bandwidth from agent properties
+
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+
+Counter_Name        :	fw_version
+Description         :	Constant value fw_version from agent properties
+
+
+Counter_Name        :	recommended_transfer_size
+Description         :	Constant value recommended_transfer_size from agent properties
+
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+
+Counter_Name        :	association
+Description         :	Constant value association from agent properties
+
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+
+Counter_Name        :	latency
+Description         :	Constant value latency from agent properties
+
+
+Counter_Name        :	max_latency
+Description         :	Constant value max_latency from agent properties
+
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+
+Counter_Name        :	cache_lines_per_tag
+Description         :	Constant value cache_lines_per_tag from agent properties
+
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+
+Counter_Name        :	type
+Description         :	Constant value type from agent properties
+
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+
+Counter_Name        :	heap_type
+Description         :	Constant value heap_type from agent properties
+
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+
+Counter_Name        :	node_to
+Description         :	Constant value node_to from agent properties
+
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+
+Counter_Name        :	CU_NUM
+Description         :	CU_NUM
+Expression          :	simd_count/simd_per_cu
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SIMD_NUM
+Description         :	SIMD Number
+Expression          :	simd_count
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FETCH_SIZE
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	(GL2C_EA_RDREQ_32B_sum*32+GL2C_EA_RDREQ_64B_sum*64+GL2C_EA_RDREQ_128B_sum*128+GL2C_EA_RDREQ_256B_sum*256)/1024
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	FetchSize
+Description         :	The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.
+Expression          :	FETCH_SIZE
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte) for all clients.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_sum
+Description         :	Number of GL2C/EA read requests (either 32-byte or 64-byte or 128-byte). Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B
+Description         :	Number of 128-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_128B_sum
+Description         :	Number of 128-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_128B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B
+Description         :	Number of 256-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_256B_sum
+Description         :	Number of 256-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_256B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B
+Description         :	Number of 32-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_32B_sum
+Description         :	Number of 32-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_32B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B
+Description         :	Number of 64-byte GL2C/EA read requests
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_RDREQ_64B_sum
+Description         :	Number of 64-byte GL2C/EA read requests. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_RDREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ
+Description         :	Number of transactions (all sizes) going over the GL2C_EA_WRREQ interface for all clients. This does not include probe commands.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_sum
+Description         :	Number of transactions (either 32-byte or 64-byte) going over the GL2C_EA_WRREQ interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the TC_EA_wrreq interface.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_EA_WRREQ_64B_sum
+Description         :	Number of 64-byte transactions going (64-byte write or CMPSWAP) over the GL2C_EA_wrreq interface. Sum over GL2C instances.
+Expression          :	reduce(GL2C_EA_WRREQ_64B,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_HIT
+Description         :	Number of cache hits
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_HIT_sum
+Description         :	Number of cache hits. Sum over GL2C instances.
+Expression          :	reduce(GL2C_HIT,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_MC_WRREQ_STALL
+Description         :	Number of cycles a write request was stalled.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS
+Description         :	Number of cache misses.  UC reads count as misses.
+Block               :	GL2C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:31]
+
+
+Counter_Name        :	GL2C_MISS_sum
+Description         :	Number of cache misses. Sum over GL2C instances.
+Expression          :	reduce(GL2C_MISS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GL2C_WRREQ_STALL_max
+Description         :	Number of cycles a write request was stalled. Max over GL2C instances.
+Expression          :	reduce(GL2C_MC_WRREQ_STALL,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPUBusy
+Description         :	The percentage of time GPU was busy.
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GPU_UTIL
+Description         :	Percentage of the time that GUI is active
+Expression          :	100*reduce(GRBM_GUI_ACTIVE,max)/reduce(GRBM_COUNT,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	GRBM_GUI_ACTIVE
+Description         :	The GUI is Active
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L2CacheHit
+Description         :	The percentage of fetch, write, atomic, and other instructions that hit the data in L2 cache. Value range: 0% (no hit) to 100% (optimal).
+Expression          :	100*reduce(GL2C_HIT,sum)/(reduce(GL2C_HIT,sum)+reduce(GL2C_MISS,sum))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LDSBankConflict
+Description         :	The percentage of GPUTime LDS is stalled by bank conflicts. Value range: 0% (optimal) to 100% (bad).
+Expression          :	100*reduce(SQC_LDS_BANK_CONFLICT,sum)/reduce(SQC_LDS_IDX_ACTIVE,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	LdsUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQC_LDS_IDX_ACTIVE,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerActiveCU
+Description         :	Mean occupancy per active compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(SQ_BUSY_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MeanOccupancyPerCU
+Description         :	Mean occupancy per compute unit.
+Expression          :	reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	OccupancyPercent
+Description         :	GPU Occupancy as % of maximum.
+Expression          :	100*reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM/32
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	MemUnitBusy
+Description         :	The percentage of GPUTime the memory unit is active. The result includes the stall time (MemUnitStalled). This is measured with all extra fetches and writes and any cache or memory effects taken into account. Value range: 0% to 100% (fetch-bound).
+Expression          :	100*reduce(TA_TA_BUSY,max)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SALUInsts
+Description         :	The average number of scalar ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SE_NUM
+Description         :	SE_NUM
+Expression          :	array_count/simd_arrays_per_engine
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SFetchInsts
+Description         :	The average number of scalar fetch instructions from the video memory executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_SMEM,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQC_ICACHE_HITS
+Description         :	Number of cache hits. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES
+Description         :	Number of cache misses, includes uncached requests. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_ICACHE_REQ
+Description         :	Number of requests. (per-SQ, per-Bank)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_BANK_CONFLICT
+Description         :	Number of cycles LDS is stalled by bank conflicts. (emulated, C1)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQC_LDS_IDX_ACTIVE
+Description         :	Number of cycles LDS is used for indexed (non-direct,non-interpolation) operations. {per-simd, emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_ACCUM_PREV
+Description         :	This is a hardware register that can be used for accumulating values for other counters. This is useful in expressions where you want to integrate over time. Only accumulates once every 4 cycles. This counter is primarily for use with derived counters supplied by rocprof.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_BUSY_CYCLES
+Description         :	Number of clock cycles there are active waves in a shader engine (as reported by the distributed sequencer). This value does not denote the number of active waves, only the clock cycle in which any wave is present in a SE. This value is returned on a per-shader engine basis in clock cycles.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_LOAD
+Description         :	The number of buffer load, image load, sample, or atomic (with return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_LOAD instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_TEX_STORE
+Description         :	The number of buffer store, image store, or atomic (without return) texture instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on TEX_STORE instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32
+Description         :	Number of wave32 instructions issued, for flat, lds, valu, tex. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_LDS
+Description         :	Number of wave32 LDS indexed instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_WAVE32_VALU
+Description         :	Number of wave32 valu instructions issued. Wave64 may count 1 or 2, depending on what gets issued. {emulated, C1}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VMEM
+Description         :	The number of cycles needed to send addr and data for VMEM (lds, buffer, image, flat, scratch, global) instructions, windowed by perf_en. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis with units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_LEVEL_LDS
+Description         :	Number of in-flight LDS instructions. This value represents the number of instructions each wave spends executing instructions accessing the local data store (data shared between SIMDs on the same CU). Set next counter to ACCUM_PREV and divide by INSTS_LDS for average latency. Includes FLAT instructions. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_ANY
+Description         :	Number of wave-cycles spent waiting for anything (per-simd, nondeterministic). Units in quad-cycles(4 cycles)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAIT_INST_ANY
+Description         :	Number of wave-cycles spent waiting for any instruction issue. Units in quad-cycles(4 cycles).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	SQ_WAVE_CYCLES
+Description         :	The cycles spent executing waves in the CUs. This value is reported per-SE (aggregates of SIMD values) and is nondeterministic. Units are in quad-cycles (4 cycles). Useful for determining how much time is spent executing wave code vs overhead/waiting. Low cycle count relative to actual number of cycles processed by the CU can indicate that the CU is stalling or is overloaded.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VALU
+Description         :	Number of cycles needed to execute VALU operations (SIMD cycles), where there is overlapping V_OP32_1 and V_OP32_T instruction, count them separately.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	SQ_INSTS_VEC32_LEVEL_LDS
+Description         :	Number of in-flight wave32 LDS (indexed, flat) instructions issued.{level, nondeterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS
+Description         :	Number of buffer load vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_LOAD_WAVEFRONTS_sum
+Description         :	Number of buffer load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_LOAD_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS
+Description         :	Number of buffer store vec32 packets processed by TA
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TA_BUFFER_STORE_WAVEFRONTS_sum
+Description         :	Number of buffer store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_BUFFER_STORE_WAVEFRONTS,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_avr
+Description         :	TA block is busy. Average over TA instances.
+Expression          :	reduce(TA_TA_BUSY,avr)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_max
+Description         :	TA block is busy. Max over TA instances.
+Expression          :	reduce(TA_TA_BUSY,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_BUSY_min
+Description         :	TA block is busy. Min over TA instances.
+Expression          :	reduce(TA_TA_BUSY,min)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	TA_TA_BUSY
+Description         :	TA block is busy. Perf_Windowing not supported for this counter.
+Block               :	TA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ
+Description         :	Total cache line accesses
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	TCP_REQ_MISS
+Description         :	Total cache requests that missed
+Block               :	TCP
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_WGP[0:3] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:3]
+
+
+Counter_Name        :	VALUBusy
+Description         :	The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal).
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(SIMD_NUM/4)/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	VALUInsts
+Description         :	The average number of vector ALU instructions executed per work-item (affected by flow control).
+Expression          :	reduce(SQ_INSTS_VALU,sum)/reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	ValuPipeIssueUtil
+Description         :	Unit: percent
+Expression          :	100*reduce(SQ_INST_CYCLES_VALU,sum)/(reduce(GRBM_GUI_ACTIVE,max)*(SIMD_NUM/4))
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_DEP_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for anything.
+Expression          :	100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WAVE_ISSUE_WAIT
+Description         :	Percentage of the SQ_WAVE_CYCLE time spent waiting for any instruction issue.
+Expression          :	100*reduce(SQ_WAIT_INST_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	Wavefronts
+Description         :	Total wavefronts.
+Expression          :	reduce(SQ_WAVES,sum)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	WriteUnitStalled
+Description         :	The percentage of GPUTime the Write unit is stalled. Value range: 0% to 100% (bad).
+Expression          :	100*GL2C_WRREQ_STALL_max/reduce(GRBM_GUI_ACTIVE,max)
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
+Counter_Name        :	L0CacheHit
+Description         :	The percentage of read requests that hit the data in the L0 cache. The L0 cache contains vector data, which is data that may vary in each thread across the wavefront. Value range 0% (no hit) to 100% (optimal).
+Expression          :	(1-(reduce(TCP_REQ_MISS,sum)/reduce(TCP_REQ,sum)))*100
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0]
+
+
