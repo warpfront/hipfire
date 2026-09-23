@@ -1,0 +1,1761 @@
+[redline] DRM version 3.64
+[redline] GPU: gfx1201 (asic 0x7551) — 64 CUs, 4 SEs, 34.1 GB VRAM
+[redline] Compute context created
+gfx_arch=gfx1201 gran=512 layout_b=soa soa_b=true ws_mib=1 ro=0 reverse=0 iters=20 seed=1 route=pm4-prod-barrier
+elf_a=/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/aos-gfx1201.hsaco hash=f36ba84dc5639b4a sym=gemv_mq4g256v2 block=32 grid_div=1
+elf_b=/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/soa-gfx1201.hsaco hash=9017c48398c1fe56 sym=gemv_mq4g256v2_soa block=32 grid_div=1
+M=33 K=256 gpr=1 weight_bytes=4488 slots=234 working_set_bytes=1050192 seed=1
+  slot=0 seed=1 aos_hash=bd45aed04ec23bac b_hash=7db234d60501df3c x_hash=80f3e9c561de555d
+  slot=1 seed=2 aos_hash=e9ac373dba952091 b_hash=0bacc08c878ebf6d x_hash=80f3e9c561de555d
+  slot=2 seed=3 aos_hash=66829581b25fe417 b_hash=ca20fcf2845940db x_hash=80f3e9c561de555d
+  slot=3 seed=4 aos_hash=13c1a8f5bf11bc5f b_hash=56e5009a195ae1f7 x_hash=80f3e9c561de555d
+  slot=4 seed=5 aos_hash=460f2152c9a3b173 b_hash=15290eaca129cb1f x_hash=80f3e9c561de555d
+  slot=5 seed=6 aos_hash=fd5bebdb279a4f91 b_hash=32c9fec4604fd36d x_hash=80f3e9c561de555d
+  slot=6 seed=7 aos_hash=1d1e2b94523a0086 b_hash=3f2276c40220979e x_hash=80f3e9c561de555d
+  slot=7 seed=8 aos_hash=8709571f6fcaeab4 b_hash=0b12ee5e156aa030 x_hash=80f3e9c561de555d
+  slot=8 seed=9 aos_hash=d49b608b60081913 b_hash=fc084433e2a4bb6f x_hash=80f3e9c561de555d
+  slot=9 seed=10 aos_hash=44ecb5855302215b b_hash=08d4f42a01708b47 x_hash=80f3e9c561de555d
+  slot=10 seed=11 aos_hash=1b395af5ecabe0fe b_hash=7789ff64f009d706 x_hash=80f3e9c561de555d
+  slot=11 seed=12 aos_hash=ffc601f4962dda95 b_hash=ab5a72dd58bbdd29 x_hash=80f3e9c561de555d
+  slot=12 seed=13 aos_hash=42e9a173a40f161e b_hash=a5ef94cfcb673e72 x_hash=80f3e9c561de555d
+  slot=13 seed=14 aos_hash=880059f02f613d66 b_hash=4dc64ad919828e2a x_hash=80f3e9c561de555d
+  slot=14 seed=15 aos_hash=a89f11a7bf006be6 b_hash=7ada9e3d45c7e15e x_hash=80f3e9c561de555d
+  slot=15 seed=16 aos_hash=5018171434d6c00e b_hash=9cb95f79756441f2 x_hash=80f3e9c561de555d
+  slot=16 seed=17 aos_hash=74ce8ee7d80234c8 b_hash=08515d7693d54e40 x_hash=80f3e9c561de555d
+  slot=17 seed=18 aos_hash=90998bd0cb2b598d b_hash=be4d5e070e3c3a4d x_hash=80f3e9c561de555d
+  slot=18 seed=19 aos_hash=1608522bece0ecee b_hash=267b727c3c438c4a x_hash=80f3e9c561de555d
+  slot=19 seed=20 aos_hash=3132a8fe2ad39b9a b_hash=10991a24c32cc52a x_hash=80f3e9c561de555d
+  slot=20 seed=21 aos_hash=1ee071442d31183a b_hash=e0ec5c13f327c572 x_hash=80f3e9c561de555d
+  slot=21 seed=22 aos_hash=d11d5e528a2a2c27 b_hash=3a15eb306a5a4cc3 x_hash=80f3e9c561de555d
+  slot=22 seed=23 aos_hash=0e806a7c2bc3c23d b_hash=0cb49d267a2581b1 x_hash=80f3e9c561de555d
+  slot=23 seed=24 aos_hash=2d71061c10b7e0c6 b_hash=67fd0591187de2da x_hash=80f3e9c561de555d
+  slot=24 seed=25 aos_hash=33a5909e796e5ae7 b_hash=c0512d5fe3c7132f x_hash=80f3e9c561de555d
+  slot=25 seed=26 aos_hash=758da6e61f4f3ac7 b_hash=4f9f5c00a0546c3f x_hash=80f3e9c561de555d
+  slot=26 seed=27 aos_hash=0f6f312e5bf1e1fb b_hash=732b06a4411460d7 x_hash=80f3e9c561de555d
+  slot=27 seed=28 aos_hash=4b31912350f794fb b_hash=47850cbd1d14cd53 x_hash=80f3e9c561de555d
+  slot=28 seed=29 aos_hash=588dfbcfd212bc6c b_hash=01bb6bbf34401e70 x_hash=80f3e9c561de555d
+  slot=29 seed=30 aos_hash=74dee6f2fe3501b6 b_hash=0712ba7f49204b5a x_hash=80f3e9c561de555d
+  slot=30 seed=31 aos_hash=1bf936a905ad6c9b b_hash=2dfe3eaa96070833 x_hash=80f3e9c561de555d
+  slot=31 seed=32 aos_hash=72386742fd00dcf1 b_hash=663e9f173603c0c1 x_hash=80f3e9c561de555d
+  slot=32 seed=33 aos_hash=b702d5e7ac705b9e b_hash=6bff895e3f367bca x_hash=80f3e9c561de555d
+  slot=33 seed=34 aos_hash=c7d5329a70f39931 b_hash=5d80d78439582f19 x_hash=80f3e9c561de555d
+  slot=34 seed=35 aos_hash=2255a68e6afd6c30 b_hash=cb75b9cedefe23e8 x_hash=80f3e9c561de555d
+  slot=35 seed=36 aos_hash=ea0aab55cf6c2cab b_hash=72dc169c75ab3f13 x_hash=80f3e9c561de555d
+  slot=36 seed=37 aos_hash=95edf6ca8b8d7efa b_hash=15f101085dfa04e2 x_hash=80f3e9c561de555d
+  slot=37 seed=38 aos_hash=e5c380fc1477c8ef b_hash=17c04e32aec145cb x_hash=80f3e9c561de555d
+  slot=38 seed=39 aos_hash=fc25906b84cbe376 b_hash=fd202d69f1fa6f12 x_hash=80f3e9c561de555d
+  slot=39 seed=40 aos_hash=1f25fdd049f9057b b_hash=2d57d665ab197d07 x_hash=80f3e9c561de555d
+  slot=40 seed=41 aos_hash=2bf0742c5ff0d26d b_hash=a052996a311b5a75 x_hash=80f3e9c561de555d
+  slot=41 seed=42 aos_hash=5912f58de4a365e5 b_hash=ea6c184e1d380269 x_hash=80f3e9c561de555d
+  slot=42 seed=43 aos_hash=cb69bf5686a89224 b_hash=41cbb5d95c262f8c x_hash=80f3e9c561de555d
+  slot=43 seed=44 aos_hash=865d0b7905020156 b_hash=daccafed3820eaf2 x_hash=80f3e9c561de555d
+  slot=44 seed=45 aos_hash=2b0076a915325346 b_hash=bbbb50c4b355f176 x_hash=80f3e9c561de555d
+  slot=45 seed=46 aos_hash=1fdac443648cea74 b_hash=4db1cfb8f3639784 x_hash=80f3e9c561de555d
+  slot=46 seed=47 aos_hash=842db0a56b65c99e b_hash=4a3a6d59d94cf026 x_hash=80f3e9c561de555d
+  slot=47 seed=48 aos_hash=fbac066b6ef3ade0 b_hash=dd96f97a22f1e28c x_hash=80f3e9c561de555d
+  slot=48 seed=49 aos_hash=d4e52ae22abbaa4b b_hash=6ec1cfe7c5829657 x_hash=80f3e9c561de555d
+  slot=49 seed=50 aos_hash=54d73913a9bd5a90 b_hash=d35670bbe09060f4 x_hash=80f3e9c561de555d
+  slot=50 seed=51 aos_hash=8a85470d8d34900c b_hash=717fd8f0211e17c8 x_hash=80f3e9c561de555d
+  slot=51 seed=52 aos_hash=f536e0fe06e6afad b_hash=294918f5a0c0cf1d x_hash=80f3e9c561de555d
+  slot=52 seed=53 aos_hash=395c090167eec92f b_hash=15ab566426c0b0b7 x_hash=80f3e9c561de555d
+  slot=53 seed=54 aos_hash=9bd29e5285ff86cf b_hash=460febc2f7077fa7 x_hash=80f3e9c561de555d
+  slot=54 seed=55 aos_hash=db30ac8fea4fd4b3 b_hash=ad6c0ae1f55da9ab x_hash=80f3e9c561de555d
+  slot=55 seed=56 aos_hash=458675f5b1bcc432 b_hash=e02f4384cd709256 x_hash=80f3e9c561de555d
+  slot=56 seed=57 aos_hash=ea3a7d1962673b1d b_hash=76f09ee1e6a76115 x_hash=80f3e9c561de555d
+  slot=57 seed=58 aos_hash=5b4c56aba2d1d9e2 b_hash=6fb19c6bd004970a x_hash=80f3e9c561de555d
+  slot=58 seed=59 aos_hash=24a918a16f990c0c b_hash=a94ea55d8510cf60 x_hash=80f3e9c561de555d
+  slot=59 seed=60 aos_hash=a3c18fdefc0f1100 b_hash=704175250c8098e8 x_hash=80f3e9c561de555d
+  slot=60 seed=61 aos_hash=4b5f3d7152d2ed9a b_hash=788032254d3c0de2 x_hash=80f3e9c561de555d
+  slot=61 seed=62 aos_hash=36a17026c7505846 b_hash=a7735aef99d7cf42 x_hash=80f3e9c561de555d
+  slot=62 seed=63 aos_hash=844d66aa556c49e3 b_hash=1e80d1c772eb7b07 x_hash=80f3e9c561de555d
+  slot=63 seed=64 aos_hash=f1fc87cc2b677df2 b_hash=890c126f8cb1057e x_hash=80f3e9c561de555d
+  slot=64 seed=65 aos_hash=75531cd03a49a8bf b_hash=6bf3deebc09b4e17 x_hash=80f3e9c561de555d
+  slot=65 seed=66 aos_hash=80cca5fa2ed205f6 b_hash=c0d996ae05cb9dca x_hash=80f3e9c561de555d
+  slot=66 seed=67 aos_hash=30fae1ce4c0c6125 b_hash=e5c9f9256a9142cd x_hash=80f3e9c561de555d
+  slot=67 seed=68 aos_hash=07aeeea24e1ed17b b_hash=6dfa2618a645e71b x_hash=80f3e9c561de555d
+  slot=68 seed=69 aos_hash=2b05c58782938c96 b_hash=01c188e57c8bb382 x_hash=80f3e9c561de555d
+  slot=69 seed=70 aos_hash=6eb95b38c65ce7c9 b_hash=751ae4cd285cd52d x_hash=80f3e9c561de555d
+  slot=70 seed=71 aos_hash=9fa4230c4b72bea9 b_hash=d0172b8010bb3dc1 x_hash=80f3e9c561de555d
+  slot=71 seed=72 aos_hash=9a8789a21ace6afa b_hash=ca37eb146307c7fa x_hash=80f3e9c561de555d
+  slot=72 seed=73 aos_hash=9ed2159f4ce243f3 b_hash=82c30f2d79757a43 x_hash=80f3e9c561de555d
+  slot=73 seed=74 aos_hash=8d7802a9bfe9b1a0 b_hash=2e90837a66690798 x_hash=80f3e9c561de555d
+  slot=74 seed=75 aos_hash=988f1bc58dd324fe b_hash=e9cdc5cef9254b4a x_hash=80f3e9c561de555d
+  slot=75 seed=76 aos_hash=98ab106a6f16eeb3 b_hash=99568687e50aeb3b x_hash=80f3e9c561de555d
+  slot=76 seed=77 aos_hash=28670ff2eb708f25 b_hash=e4180943c81df261 x_hash=80f3e9c561de555d
+  slot=77 seed=78 aos_hash=5f03dd3ef65af930 b_hash=603d5bdff5d4c5f4 x_hash=80f3e9c561de555d
+  slot=78 seed=79 aos_hash=201f0dd1a2347e80 b_hash=9a2049a124bf50b8 x_hash=80f3e9c561de555d
+  slot=79 seed=80 aos_hash=4b82ab4d2e322a05 b_hash=b59d2ae3d4b4fa99 x_hash=80f3e9c561de555d
+  slot=80 seed=81 aos_hash=31edbfaa5bb3a4a1 b_hash=4b0f72ca79372b7d x_hash=80f3e9c561de555d
+  slot=81 seed=82 aos_hash=561108d6105855c8 b_hash=449c656d56fa7f40 x_hash=80f3e9c561de555d
+  slot=82 seed=83 aos_hash=7b77d6f50d63c2d2 b_hash=ba4eef33842cc20e x_hash=80f3e9c561de555d
+  slot=83 seed=84 aos_hash=301858988c5bf2f5 b_hash=a89fb16cc0ac83dd x_hash=80f3e9c561de555d
+  slot=84 seed=85 aos_hash=1c6a20dbf6e48ad4 b_hash=974d42fb457b42b0 x_hash=80f3e9c561de555d
+  slot=85 seed=86 aos_hash=8861001278c1f3d8 b_hash=4b0615770e929938 x_hash=80f3e9c561de555d
+  slot=86 seed=87 aos_hash=025280198eec0014 b_hash=ea8a481741fbe5cc x_hash=80f3e9c561de555d
+  slot=87 seed=88 aos_hash=9c756ba84668a92e b_hash=5f583a7c50b571b2 x_hash=80f3e9c561de555d
+  slot=88 seed=89 aos_hash=d6a6a99bc8dd54d7 b_hash=7c506166a2179c67 x_hash=80f3e9c561de555d
+  slot=89 seed=90 aos_hash=8f48499507c44fb4 b_hash=4a5321a494083ffc x_hash=80f3e9c561de555d
+  slot=90 seed=91 aos_hash=62406f69706db436 b_hash=97f24d1f6ee93476 x_hash=80f3e9c561de555d
+  slot=91 seed=92 aos_hash=2e0e9deeed5d0d18 b_hash=4256024aa973fb84 x_hash=80f3e9c561de555d
+  slot=92 seed=93 aos_hash=27451f468f3ea71f b_hash=14a2abaad4783eb3 x_hash=80f3e9c561de555d
+  slot=93 seed=94 aos_hash=0a752a1db9f00308 b_hash=8ad88ff60c77df44 x_hash=80f3e9c561de555d
+  slot=94 seed=95 aos_hash=a8b1ef46925e66f9 b_hash=957b28811f56b40d x_hash=80f3e9c561de555d
+  slot=95 seed=96 aos_hash=b359b71f67bb4481 b_hash=eb0512a8fc45c915 x_hash=80f3e9c561de555d
+  slot=96 seed=97 aos_hash=7369d194deb24bad b_hash=d8550629eb6c5d0d x_hash=80f3e9c561de555d
+  slot=97 seed=98 aos_hash=05d119e766a865c7 b_hash=55bf4117f9f1c537 x_hash=80f3e9c561de555d
+  slot=98 seed=99 aos_hash=826e92b44515cfd7 b_hash=93bf97bb963511ff x_hash=80f3e9c561de555d
+  slot=99 seed=100 aos_hash=396af78dbadc1d7d b_hash=f55114debbedf62d x_hash=80f3e9c561de555d
+  slot=100 seed=101 aos_hash=148b100b8e3b12d4 b_hash=8d64c13a7964eabc x_hash=80f3e9c561de555d
+  slot=101 seed=102 aos_hash=06b7df70288fbbbf b_hash=79d1e3dfca1b020b x_hash=80f3e9c561de555d
+  slot=102 seed=103 aos_hash=bc752356771ec96b b_hash=fca1d97adbdce55f x_hash=80f3e9c561de555d
+  slot=103 seed=104 aos_hash=66e9b4023d52ef56 b_hash=76ca13b8753b39b2 x_hash=80f3e9c561de555d
+  slot=104 seed=105 aos_hash=76cfc20a7b85e2ee b_hash=b50eb4228cc39df2 x_hash=80f3e9c561de555d
+  slot=105 seed=106 aos_hash=e4fac5a50c2a3d1d b_hash=ec90b3a3dc053ee5 x_hash=80f3e9c561de555d
+  slot=106 seed=107 aos_hash=430d32436f77c9af b_hash=4c4e76e508fadfb7 x_hash=80f3e9c561de555d
+  slot=107 seed=108 aos_hash=457d5ae61e6e9985 b_hash=d8961aaa49e6063d x_hash=80f3e9c561de555d
+  slot=108 seed=109 aos_hash=d8ba176ced9ffbd2 b_hash=b92ab90e5fdb4c9a x_hash=80f3e9c561de555d
+  slot=109 seed=110 aos_hash=e30a6bc700ee07ba b_hash=6ea51a03981ce112 x_hash=80f3e9c561de555d
+  slot=110 seed=111 aos_hash=51046458908c1c37 b_hash=4efb57bae46b789b x_hash=80f3e9c561de555d
+  slot=111 seed=112 aos_hash=b4bedec2c5e12ce4 b_hash=bd7f97e0a9c82444 x_hash=80f3e9c561de555d
+  slot=112 seed=113 aos_hash=44fd1defb30b0142 b_hash=c94093fbf30e33fa x_hash=80f3e9c561de555d
+  slot=113 seed=114 aos_hash=fa9b3eab598c2734 b_hash=d636bb401ed360ec x_hash=80f3e9c561de555d
+  slot=114 seed=115 aos_hash=c96dc3bf51400687 b_hash=f29211899085b327 x_hash=80f3e9c561de555d
+  slot=115 seed=116 aos_hash=0ab150c6265948db b_hash=3d37c0923ee507c7 x_hash=80f3e9c561de555d
+  slot=116 seed=117 aos_hash=74f71f34399d572e b_hash=d74ef7a50dcd5202 x_hash=80f3e9c561de555d
+  slot=117 seed=118 aos_hash=ee9154979b7444f8 b_hash=4c0982cd5e89e52c x_hash=80f3e9c561de555d
+  slot=118 seed=119 aos_hash=5d01bc8784ddbb2c b_hash=e924830f0763cd8c x_hash=80f3e9c561de555d
+  slot=119 seed=120 aos_hash=6afb3b526c4be8dc b_hash=8ebf4f5cf99edaf0 x_hash=80f3e9c561de555d
+  slot=120 seed=121 aos_hash=d5380d86bec27f03 b_hash=540c5889eb43015b x_hash=80f3e9c561de555d
+  slot=121 seed=122 aos_hash=114eb8aaf961a340 b_hash=5ac4134d26888944 x_hash=80f3e9c561de555d
+  slot=122 seed=123 aos_hash=c885cb12fcb19789 b_hash=070b51c421990921 x_hash=80f3e9c561de555d
+  slot=123 seed=124 aos_hash=d489c82bc8382aa0 b_hash=cb553da3f2a8eeec x_hash=80f3e9c561de555d
+  slot=124 seed=125 aos_hash=8efb1dae95cc892e b_hash=a01c0202018e8302 x_hash=80f3e9c561de555d
+  slot=125 seed=126 aos_hash=15c4e532e8790d00 b_hash=7d0b8a4a6867ba34 x_hash=80f3e9c561de555d
+  slot=126 seed=127 aos_hash=83ac8258411b73ad b_hash=2247f8ed81a06d31 x_hash=80f3e9c561de555d
+  slot=127 seed=128 aos_hash=c0bee0bea8c1c9ee b_hash=cd56a39748b441da x_hash=80f3e9c561de555d
+  slot=128 seed=129 aos_hash=b82de659bd87802f b_hash=c08b9a02cc84a903 x_hash=80f3e9c561de555d
+  slot=129 seed=130 aos_hash=55d116912a745daa b_hash=ae112d3a8364afa2 x_hash=80f3e9c561de555d
+  slot=130 seed=131 aos_hash=0ddd5b721bde2ab0 b_hash=5cc1d5a8f1198410 x_hash=80f3e9c561de555d
+  slot=131 seed=132 aos_hash=6a02a1275f5a2ee9 b_hash=bf12677918d7d055 x_hash=80f3e9c561de555d
+  slot=132 seed=133 aos_hash=e198093fb65d930b b_hash=c291fb9324f57aef x_hash=80f3e9c561de555d
+  slot=133 seed=134 aos_hash=0f9533a906d6c2da b_hash=a83393ec715e9742 x_hash=80f3e9c561de555d
+  slot=134 seed=135 aos_hash=148adef7672deed3 b_hash=c5572b7621d3b50b x_hash=80f3e9c561de555d
+  slot=135 seed=136 aos_hash=f882f8aaf57d9e6a b_hash=685878309d5fc00e x_hash=80f3e9c561de555d
+  slot=136 seed=137 aos_hash=ec49d071d2d33917 b_hash=4794f7013696e463 x_hash=80f3e9c561de555d
+  slot=137 seed=138 aos_hash=fc792d4b2a6f679c b_hash=83101713d208ec88 x_hash=80f3e9c561de555d
+  slot=138 seed=139 aos_hash=4a4c35794d6113a1 b_hash=5ae0a4bf503491c1 x_hash=80f3e9c561de555d
+  slot=139 seed=140 aos_hash=82b81c40eca4f2ba b_hash=fd0f9c359eb88a9e x_hash=80f3e9c561de555d
+  slot=140 seed=141 aos_hash=48584eff7d183e7c b_hash=35772676dfd05390 x_hash=80f3e9c561de555d
+  slot=141 seed=142 aos_hash=215f040f817a8a6f b_hash=3dd28775e7d182b3 x_hash=80f3e9c561de555d
+  slot=142 seed=143 aos_hash=9e77afd450962aa8 b_hash=5acd26f8f83d82bc x_hash=80f3e9c561de555d
+  slot=143 seed=144 aos_hash=130d2588eedbc5e1 b_hash=3a3c827be364b241 x_hash=80f3e9c561de555d
+  slot=144 seed=145 aos_hash=ea4063ae1358d2cd b_hash=1ec533400835d6ed x_hash=80f3e9c561de555d
+  slot=145 seed=146 aos_hash=a85a08b179d8b17c b_hash=84b676285ef736a0 x_hash=80f3e9c561de555d
+  slot=146 seed=147 aos_hash=2949a28b5881ffd6 b_hash=9e47f7301b5b83de x_hash=80f3e9c561de555d
+  slot=147 seed=148 aos_hash=6329847c8f312139 b_hash=182935b436bfba9d x_hash=80f3e9c561de555d
+  slot=148 seed=149 aos_hash=e766018f97d718ab b_hash=af12fc8d94985c97 x_hash=80f3e9c561de555d
+  slot=149 seed=150 aos_hash=88b3c6f2016db397 b_hash=94a2fcbbd66b30b7 x_hash=80f3e9c561de555d
+  slot=150 seed=151 aos_hash=b4b6d1cfa1da36a7 b_hash=5fb7515b589ac253 x_hash=80f3e9c561de555d
+  slot=151 seed=152 aos_hash=9dda66ebfa36dc6d b_hash=10a895d104a5c46d x_hash=80f3e9c561de555d
+  slot=152 seed=153 aos_hash=aa087e6fcdcf682b b_hash=addab28f46c8bcf3 x_hash=80f3e9c561de555d
+  slot=153 seed=154 aos_hash=43c4b35931c5d177 b_hash=915247db485572fb x_hash=80f3e9c561de555d
+  slot=154 seed=155 aos_hash=eab35e95fb703c64 b_hash=86c58da4353d96b4 x_hash=80f3e9c561de555d
+  slot=155 seed=156 aos_hash=eecdb4fb610657ce b_hash=12d0b1ac8b06c262 x_hash=80f3e9c561de555d
+  slot=156 seed=157 aos_hash=ed10bfbf4ab09946 b_hash=443d1cd4b786a2d6 x_hash=80f3e9c561de555d
+  slot=157 seed=158 aos_hash=669d497508422fdd b_hash=18f9383b0b5e4dfd x_hash=80f3e9c561de555d
+  slot=158 seed=159 aos_hash=85604924fc2b793f b_hash=7aaeb5c653a04cdf x_hash=80f3e9c561de555d
+  slot=159 seed=160 aos_hash=114e80d00b9b8c93 b_hash=7dba9fd347a6722f x_hash=80f3e9c561de555d
+  slot=160 seed=161 aos_hash=45b57b5834f85c13 b_hash=e75396d1c123308f x_hash=80f3e9c561de555d
+  slot=161 seed=162 aos_hash=08deb8203cced6ee b_hash=d6f5b4a90dbb096e x_hash=80f3e9c561de555d
+  slot=162 seed=163 aos_hash=3da6fe808976a677 b_hash=f649185a936267cf x_hash=80f3e9c561de555d
+  slot=163 seed=164 aos_hash=3ab3e2e45791ea61 b_hash=3dd4c82dbf611ba9 x_hash=80f3e9c561de555d
+  slot=164 seed=165 aos_hash=ee8801e5d7b4e042 b_hash=fdfcdbe874d3369e x_hash=80f3e9c561de555d
+  slot=165 seed=166 aos_hash=0416575953f73f64 b_hash=c222167b715ccfa0 x_hash=80f3e9c561de555d
+  slot=166 seed=167 aos_hash=838d0e61f1801546 b_hash=49dace888716f94a x_hash=80f3e9c561de555d
+  slot=167 seed=168 aos_hash=7a66e7130c86a5c3 b_hash=4a11b1a21c27bad7 x_hash=80f3e9c561de555d
+  slot=168 seed=169 aos_hash=1d0e8655c9e13e26 b_hash=184f188e53da3aba x_hash=80f3e9c561de555d
+  slot=169 seed=170 aos_hash=f7a311fbda5821b7 b_hash=168bfa50e5b99e43 x_hash=80f3e9c561de555d
+  slot=170 seed=171 aos_hash=000f632a9cd0b37a b_hash=47488c0f8217eb9e x_hash=80f3e9c561de555d
+  slot=171 seed=172 aos_hash=7be7008245b2e2bf b_hash=2f70bbce4a809f3f x_hash=80f3e9c561de555d
+  slot=172 seed=173 aos_hash=d9da6d83eac0e028 b_hash=318b576fb1eb7dd4 x_hash=80f3e9c561de555d
+  slot=173 seed=174 aos_hash=f21222634bb3a623 b_hash=06ebd4f9ed89ce63 x_hash=80f3e9c561de555d
+  slot=174 seed=175 aos_hash=ec38af216fc19bdd b_hash=8ec3c1c9e50d0ded x_hash=80f3e9c561de555d
+  slot=175 seed=176 aos_hash=eb322740c4a450a0 b_hash=6e4592a78cba54f0 x_hash=80f3e9c561de555d
+  slot=176 seed=177 aos_hash=9a9ce7e029a8585f b_hash=e8b9d79466b5b027 x_hash=80f3e9c561de555d
+  slot=177 seed=178 aos_hash=f86590b833b28ee2 b_hash=686b7856f274ab7a x_hash=80f3e9c561de555d
+  slot=178 seed=179 aos_hash=3ee2ca8e952299f7 b_hash=5e4b085878c4d0d3 x_hash=80f3e9c561de555d
+  slot=179 seed=180 aos_hash=b3d06e38efda3e9f b_hash=72b7d13e6f6b675b x_hash=80f3e9c561de555d
+  slot=180 seed=181 aos_hash=e735fde956e006dd b_hash=f388ffd0316c4971 x_hash=80f3e9c561de555d
+  slot=181 seed=182 aos_hash=d564509f72768d25 b_hash=5737c85c1bd530f9 x_hash=80f3e9c561de555d
+  slot=182 seed=183 aos_hash=1dfa9d61b89270e4 b_hash=7807762055d3fe98 x_hash=80f3e9c561de555d
+  slot=183 seed=184 aos_hash=6e50deaaf41b7c16 b_hash=9699681dd9c47eea x_hash=80f3e9c561de555d
+  slot=184 seed=185 aos_hash=80dcda637e1fca50 b_hash=77e4d6c9e5480a4c x_hash=80f3e9c561de555d
+  slot=185 seed=186 aos_hash=0ebd2995cb296461 b_hash=a430ea323cdd82fd x_hash=80f3e9c561de555d
+  slot=186 seed=187 aos_hash=333d9a01ea6255e6 b_hash=d7b489aafafbbb32 x_hash=80f3e9c561de555d
+  slot=187 seed=188 aos_hash=2954110970924213 b_hash=f22f06c85b318a0b x_hash=80f3e9c561de555d
+  slot=188 seed=189 aos_hash=e828580691e32841 b_hash=5c546bc5bba2894d x_hash=80f3e9c561de555d
+  slot=189 seed=190 aos_hash=63fd19baddfd0596 b_hash=b5ff872699404cce x_hash=80f3e9c561de555d
+  slot=190 seed=191 aos_hash=3f6f27d60bd9fd37 b_hash=07e148adda38233b x_hash=80f3e9c561de555d
+  slot=191 seed=192 aos_hash=c3f1ee21d95150f7 b_hash=ca683635339a4947 x_hash=80f3e9c561de555d
+  slot=192 seed=193 aos_hash=4581702ea9bf71e6 b_hash=045686af358d4a6a x_hash=80f3e9c561de555d
+  slot=193 seed=194 aos_hash=84cf6a327e86a648 b_hash=933e1f05af45aebc x_hash=80f3e9c561de555d
+  slot=194 seed=195 aos_hash=4c6be4bf3c22f650 b_hash=24087063885abf1c x_hash=80f3e9c561de555d
+  slot=195 seed=196 aos_hash=e4551a369b9b101e b_hash=e78c7cbca1cd2d0a x_hash=80f3e9c561de555d
+  slot=196 seed=197 aos_hash=4b1a287c28df94f1 b_hash=d55fff9d4669b881 x_hash=80f3e9c561de555d
+  slot=197 seed=198 aos_hash=221e038ca00fc613 b_hash=814e3c6c9a4ef2c3 x_hash=80f3e9c561de555d
+  slot=198 seed=199 aos_hash=a13e89e4424d52ca b_hash=e24653142bb79f5a x_hash=80f3e9c561de555d
+  slot=199 seed=200 aos_hash=fdce82febe2162ca b_hash=2ef84f6b3f3d83de x_hash=80f3e9c561de555d
+  slot=200 seed=201 aos_hash=9d313755d9bb8277 b_hash=0acaae112d7e340f x_hash=80f3e9c561de555d
+  slot=201 seed=202 aos_hash=8fc7487ca7c9d8f2 b_hash=c961ab2b0f0cc2a6 x_hash=80f3e9c561de555d
+  slot=202 seed=203 aos_hash=33d15627a6ecde6a b_hash=060b3cf40421ee7a x_hash=80f3e9c561de555d
+  slot=203 seed=204 aos_hash=e4966d0b75e405cd b_hash=ddf54bc05b9c78ad x_hash=80f3e9c561de555d
+  slot=204 seed=205 aos_hash=692e1d4428625c1b b_hash=bbfde98956a49de7 x_hash=80f3e9c561de555d
+  slot=205 seed=206 aos_hash=68a25b1f27b8b52d b_hash=f8eeaa7a270a449d x_hash=80f3e9c561de555d
+  slot=206 seed=207 aos_hash=5fdb591c5d2787cb b_hash=9504ca91197fccf3 x_hash=80f3e9c561de555d
+  slot=207 seed=208 aos_hash=c3a987f895b8f5fa b_hash=95affa10fc9fc8e6 x_hash=80f3e9c561de555d
+  slot=208 seed=209 aos_hash=305309de042ec21d b_hash=88e106849dc1b54d x_hash=80f3e9c561de555d
+  slot=209 seed=210 aos_hash=26790f1407aa507c b_hash=900f8005cd9b1d94 x_hash=80f3e9c561de555d
+  slot=210 seed=211 aos_hash=dc011fef55dfed09 b_hash=d2ef2de8c9619ccd x_hash=80f3e9c561de555d
+  slot=211 seed=212 aos_hash=a54ef47f4568b998 b_hash=36d72ecde5b789ec x_hash=80f3e9c561de555d
+  slot=212 seed=213 aos_hash=b65645f1e17dbfc0 b_hash=431fda77de4d9c48 x_hash=80f3e9c561de555d
+  slot=213 seed=214 aos_hash=401fe9bf575090a4 b_hash=f8b2e321c7fffa80 x_hash=80f3e9c561de555d
+  slot=214 seed=215 aos_hash=f35990f4afd44306 b_hash=eb8c2d7d33d8c09e x_hash=80f3e9c561de555d
+  slot=215 seed=216 aos_hash=1c0c4b09e94f7715 b_hash=f884e9ab117383f5 x_hash=80f3e9c561de555d
+  slot=216 seed=217 aos_hash=0155985551687ffe b_hash=005a05fcdd9ff94a x_hash=80f3e9c561de555d
+  slot=217 seed=218 aos_hash=479289b282c0d1ae b_hash=e081726287ca0476 x_hash=80f3e9c561de555d
+  slot=218 seed=219 aos_hash=715cdb0e7e9563fd b_hash=731d30bd510d61dd x_hash=80f3e9c561de555d
+  slot=219 seed=220 aos_hash=362c7a7f14f478af b_hash=648b93b0c6f7fd27 x_hash=80f3e9c561de555d
+  slot=220 seed=221 aos_hash=86da9defa43a1d90 b_hash=00d435d8b0aafd3c x_hash=80f3e9c561de555d
+  slot=221 seed=222 aos_hash=e3f97264336617ce b_hash=2a1c56b155c1192a x_hash=80f3e9c561de555d
+  slot=222 seed=223 aos_hash=9c36439cb9ea5c48 b_hash=16a4668f949aee54 x_hash=80f3e9c561de555d
+  slot=223 seed=224 aos_hash=0ca0310b80d580cd b_hash=9a568d9eb87b7bc5 x_hash=80f3e9c561de555d
+  slot=224 seed=225 aos_hash=bd480bb63913393b b_hash=09ba78908f3b0e73 x_hash=80f3e9c561de555d
+  slot=225 seed=226 aos_hash=497e1d639d6570bb b_hash=c6645a7b7d1bf7c3 x_hash=80f3e9c561de555d
+  slot=226 seed=227 aos_hash=c559d522a495f696 b_hash=7486b852722ba96e x_hash=80f3e9c561de555d
+  slot=227 seed=228 aos_hash=5d2b468834f061ab b_hash=1cdc3405d8e91fa7 x_hash=80f3e9c561de555d
+  slot=228 seed=229 aos_hash=68448d78fd1fa58d b_hash=8382544ca82b7921 x_hash=80f3e9c561de555d
+  slot=229 seed=230 aos_hash=c3176168eb8ece14 b_hash=0b0f05dcc8008e40 x_hash=80f3e9c561de555d
+  slot=230 seed=231 aos_hash=d13fea4756f757f4 b_hash=a38b2eeaaff3a070 x_hash=80f3e9c561de555d
+  slot=231 seed=232 aos_hash=42f0bf98f5489f82 b_hash=78a07e3b4a320356 x_hash=80f3e9c561de555d
+  slot=232 seed=233 aos_hash=0c0817f4ae3cd2a9 b_hash=3d0745b17b534de5 x_hash=80f3e9c561de555d
+  slot=233 seed=234 aos_hash=584b5553ec502685 b_hash=e9d0ce1e22169e99 x_hash=80f3e9c561de555d
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=20 A/B all-row y-bit-diff=0
+  slot=20 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=21 A/B all-row y-bit-diff=0
+  slot=21 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=22 A/B all-row y-bit-diff=0
+  slot=22 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=23 A/B all-row y-bit-diff=0
+  slot=23 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=24 A/B all-row y-bit-diff=0
+  slot=24 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=25 A/B all-row y-bit-diff=0
+  slot=25 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=26 A/B all-row y-bit-diff=0
+  slot=26 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=27 A/B all-row y-bit-diff=0
+  slot=27 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=28 A/B all-row y-bit-diff=0
+  slot=28 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=29 A/B all-row y-bit-diff=0
+  slot=29 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=30 A/B all-row y-bit-diff=0
+  slot=30 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=31 A/B all-row y-bit-diff=0
+  slot=31 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=32 A/B all-row y-bit-diff=0
+  slot=32 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=33 A/B all-row y-bit-diff=0
+  slot=33 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=34 A/B all-row y-bit-diff=0
+  slot=34 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=35 A/B all-row y-bit-diff=0
+  slot=35 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=36 A/B all-row y-bit-diff=0
+  slot=36 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=37 A/B all-row y-bit-diff=0
+  slot=37 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=38 A/B all-row y-bit-diff=0
+  slot=38 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=39 A/B all-row y-bit-diff=0
+  slot=39 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=40 A/B all-row y-bit-diff=0
+  slot=40 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=41 A/B all-row y-bit-diff=0
+  slot=41 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=42 A/B all-row y-bit-diff=0
+  slot=42 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=43 A/B all-row y-bit-diff=0
+  slot=43 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=44 A/B all-row y-bit-diff=0
+  slot=44 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=45 A/B all-row y-bit-diff=0
+  slot=45 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=46 A/B all-row y-bit-diff=0
+  slot=46 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=47 A/B all-row y-bit-diff=0
+  slot=47 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=48 A/B all-row y-bit-diff=0
+  slot=48 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=49 A/B all-row y-bit-diff=0
+  slot=49 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=50 A/B all-row y-bit-diff=0
+  slot=50 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=51 A/B all-row y-bit-diff=0
+  slot=51 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=52 A/B all-row y-bit-diff=0
+  slot=52 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=53 A/B all-row y-bit-diff=0
+  slot=53 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=54 A/B all-row y-bit-diff=0
+  slot=54 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=55 A/B all-row y-bit-diff=0
+  slot=55 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=56 A/B all-row y-bit-diff=0
+  slot=56 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=57 A/B all-row y-bit-diff=0
+  slot=57 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=58 A/B all-row y-bit-diff=0
+  slot=58 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=59 A/B all-row y-bit-diff=0
+  slot=59 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=60 A/B all-row y-bit-diff=0
+  slot=60 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=61 A/B all-row y-bit-diff=0
+  slot=61 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=62 A/B all-row y-bit-diff=0
+  slot=62 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=63 A/B all-row y-bit-diff=0
+  slot=63 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=64 A/B all-row y-bit-diff=0
+  slot=64 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=65 A/B all-row y-bit-diff=0
+  slot=65 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=66 A/B all-row y-bit-diff=0
+  slot=66 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=67 A/B all-row y-bit-diff=0
+  slot=67 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=68 A/B all-row y-bit-diff=0
+  slot=68 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=69 A/B all-row y-bit-diff=0
+  slot=69 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=70 A/B all-row y-bit-diff=0
+  slot=70 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=71 A/B all-row y-bit-diff=0
+  slot=71 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=72 A/B all-row y-bit-diff=0
+  slot=72 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=73 A/B all-row y-bit-diff=0
+  slot=73 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=74 A/B all-row y-bit-diff=0
+  slot=74 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=75 A/B all-row y-bit-diff=0
+  slot=75 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=76 A/B all-row y-bit-diff=0
+  slot=76 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=77 A/B all-row y-bit-diff=0
+  slot=77 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=78 A/B all-row y-bit-diff=0
+  slot=78 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=79 A/B all-row y-bit-diff=0
+  slot=79 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=80 A/B all-row y-bit-diff=0
+  slot=80 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=81 A/B all-row y-bit-diff=0
+  slot=81 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=82 A/B all-row y-bit-diff=0
+  slot=82 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=83 A/B all-row y-bit-diff=0
+  slot=83 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=84 A/B all-row y-bit-diff=0
+  slot=84 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=85 A/B all-row y-bit-diff=0
+  slot=85 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=86 A/B all-row y-bit-diff=0
+  slot=86 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=87 A/B all-row y-bit-diff=0
+  slot=87 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=88 A/B all-row y-bit-diff=0
+  slot=88 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=89 A/B all-row y-bit-diff=0
+  slot=89 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=90 A/B all-row y-bit-diff=0
+  slot=90 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=91 A/B all-row y-bit-diff=0
+  slot=91 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=92 A/B all-row y-bit-diff=0
+  slot=92 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=93 A/B all-row y-bit-diff=0
+  slot=93 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=94 A/B all-row y-bit-diff=0
+  slot=94 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=95 A/B all-row y-bit-diff=0
+  slot=95 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=96 A/B all-row y-bit-diff=0
+  slot=96 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=97 A/B all-row y-bit-diff=0
+  slot=97 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=98 A/B all-row y-bit-diff=0
+  slot=98 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=99 A/B all-row y-bit-diff=0
+  slot=99 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=100 A/B all-row y-bit-diff=0
+  slot=100 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=101 A/B all-row y-bit-diff=0
+  slot=101 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=102 A/B all-row y-bit-diff=0
+  slot=102 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=103 A/B all-row y-bit-diff=0
+  slot=103 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=104 A/B all-row y-bit-diff=0
+  slot=104 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=105 A/B all-row y-bit-diff=0
+  slot=105 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=106 A/B all-row y-bit-diff=0
+  slot=106 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=107 A/B all-row y-bit-diff=0
+  slot=107 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=108 A/B all-row y-bit-diff=0
+  slot=108 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=109 A/B all-row y-bit-diff=0
+  slot=109 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=110 A/B all-row y-bit-diff=0
+  slot=110 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=111 A/B all-row y-bit-diff=0
+  slot=111 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=112 A/B all-row y-bit-diff=0
+  slot=112 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=113 A/B all-row y-bit-diff=0
+  slot=113 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=114 A/B all-row y-bit-diff=0
+  slot=114 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=115 A/B all-row y-bit-diff=0
+  slot=115 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=116 A/B all-row y-bit-diff=0
+  slot=116 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=117 A/B all-row y-bit-diff=0
+  slot=117 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=118 A/B all-row y-bit-diff=0
+  slot=118 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=119 A/B all-row y-bit-diff=0
+  slot=119 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=120 A/B all-row y-bit-diff=0
+  slot=120 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=121 A/B all-row y-bit-diff=0
+  slot=121 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=122 A/B all-row y-bit-diff=0
+  slot=122 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=123 A/B all-row y-bit-diff=0
+  slot=123 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=124 A/B all-row y-bit-diff=0
+  slot=124 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=125 A/B all-row y-bit-diff=0
+  slot=125 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=126 A/B all-row y-bit-diff=0
+  slot=126 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=127 A/B all-row y-bit-diff=0
+  slot=127 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=128 A/B all-row y-bit-diff=0
+  slot=128 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=129 A/B all-row y-bit-diff=0
+  slot=129 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=130 A/B all-row y-bit-diff=0
+  slot=130 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=131 A/B all-row y-bit-diff=0
+  slot=131 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=132 A/B all-row y-bit-diff=0
+  slot=132 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=133 A/B all-row y-bit-diff=0
+  slot=133 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=134 A/B all-row y-bit-diff=0
+  slot=134 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=135 A/B all-row y-bit-diff=0
+  slot=135 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=136 A/B all-row y-bit-diff=0
+  slot=136 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=137 A/B all-row y-bit-diff=0
+  slot=137 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=138 A/B all-row y-bit-diff=0
+  slot=138 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=139 A/B all-row y-bit-diff=0
+  slot=139 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=140 A/B all-row y-bit-diff=0
+  slot=140 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=141 A/B all-row y-bit-diff=0
+  slot=141 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=142 A/B all-row y-bit-diff=0
+  slot=142 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=143 A/B all-row y-bit-diff=0
+  slot=143 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=144 A/B all-row y-bit-diff=0
+  slot=144 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=145 A/B all-row y-bit-diff=0
+  slot=145 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=146 A/B all-row y-bit-diff=0
+  slot=146 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=147 A/B all-row y-bit-diff=0
+  slot=147 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=148 A/B all-row y-bit-diff=0
+  slot=148 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=149 A/B all-row y-bit-diff=0
+  slot=149 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=150 A/B all-row y-bit-diff=0
+  slot=150 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=151 A/B all-row y-bit-diff=0
+  slot=151 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=152 A/B all-row y-bit-diff=0
+  slot=152 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=153 A/B all-row y-bit-diff=0
+  slot=153 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=154 A/B all-row y-bit-diff=0
+  slot=154 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=155 A/B all-row y-bit-diff=0
+  slot=155 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=156 A/B all-row y-bit-diff=0
+  slot=156 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=157 A/B all-row y-bit-diff=0
+  slot=157 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=158 A/B all-row y-bit-diff=0
+  slot=158 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=159 A/B all-row y-bit-diff=0
+  slot=159 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=160 A/B all-row y-bit-diff=0
+  slot=160 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=161 A/B all-row y-bit-diff=0
+  slot=161 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=162 A/B all-row y-bit-diff=0
+  slot=162 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=163 A/B all-row y-bit-diff=0
+  slot=163 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=164 A/B all-row y-bit-diff=0
+  slot=164 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=165 A/B all-row y-bit-diff=0
+  slot=165 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=166 A/B all-row y-bit-diff=0
+  slot=166 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=167 A/B all-row y-bit-diff=0
+  slot=167 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=168 A/B all-row y-bit-diff=0
+  slot=168 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=169 A/B all-row y-bit-diff=0
+  slot=169 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=170 A/B all-row y-bit-diff=0
+  slot=170 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=171 A/B all-row y-bit-diff=0
+  slot=171 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=172 A/B all-row y-bit-diff=0
+  slot=172 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=173 A/B all-row y-bit-diff=0
+  slot=173 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=174 A/B all-row y-bit-diff=0
+  slot=174 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=175 A/B all-row y-bit-diff=0
+  slot=175 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=176 A/B all-row y-bit-diff=0
+  slot=176 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=177 A/B all-row y-bit-diff=0
+  slot=177 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=178 A/B all-row y-bit-diff=0
+  slot=178 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=179 A/B all-row y-bit-diff=0
+  slot=179 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=180 A/B all-row y-bit-diff=0
+  slot=180 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=181 A/B all-row y-bit-diff=0
+  slot=181 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=182 A/B all-row y-bit-diff=0
+  slot=182 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=183 A/B all-row y-bit-diff=0
+  slot=183 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=184 A/B all-row y-bit-diff=0
+  slot=184 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=185 A/B all-row y-bit-diff=0
+  slot=185 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=186 A/B all-row y-bit-diff=0
+  slot=186 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=187 A/B all-row y-bit-diff=0
+  slot=187 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=188 A/B all-row y-bit-diff=0
+  slot=188 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=189 A/B all-row y-bit-diff=0
+  slot=189 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=190 A/B all-row y-bit-diff=0
+  slot=190 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=191 A/B all-row y-bit-diff=0
+  slot=191 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=192 A/B all-row y-bit-diff=0
+  slot=192 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=193 A/B all-row y-bit-diff=0
+  slot=193 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=194 A/B all-row y-bit-diff=0
+  slot=194 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=195 A/B all-row y-bit-diff=0
+  slot=195 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=196 A/B all-row y-bit-diff=0
+  slot=196 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=197 A/B all-row y-bit-diff=0
+  slot=197 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=198 A/B all-row y-bit-diff=0
+  slot=198 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=199 A/B all-row y-bit-diff=0
+  slot=199 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=200 A/B all-row y-bit-diff=0
+  slot=200 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=201 A/B all-row y-bit-diff=0
+  slot=201 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=202 A/B all-row y-bit-diff=0
+  slot=202 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=203 A/B all-row y-bit-diff=0
+  slot=203 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=204 A/B all-row y-bit-diff=0
+  slot=204 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=205 A/B all-row y-bit-diff=0
+  slot=205 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=206 A/B all-row y-bit-diff=0
+  slot=206 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=207 A/B all-row y-bit-diff=0
+  slot=207 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=208 A/B all-row y-bit-diff=0
+  slot=208 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=209 A/B all-row y-bit-diff=0
+  slot=209 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=210 A/B all-row y-bit-diff=0
+  slot=210 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=211 A/B all-row y-bit-diff=0
+  slot=211 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=212 A/B all-row y-bit-diff=0
+  slot=212 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=213 A/B all-row y-bit-diff=0
+  slot=213 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=214 A/B all-row y-bit-diff=0
+  slot=214 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=215 A/B all-row y-bit-diff=0
+  slot=215 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=216 A/B all-row y-bit-diff=0
+  slot=216 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=217 A/B all-row y-bit-diff=0
+  slot=217 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=218 A/B all-row y-bit-diff=0
+  slot=218 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=219 A/B all-row y-bit-diff=0
+  slot=219 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=220 A/B all-row y-bit-diff=0
+  slot=220 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=221 A/B all-row y-bit-diff=0
+  slot=221 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=222 A/B all-row y-bit-diff=0
+  slot=222 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=223 A/B all-row y-bit-diff=0
+  slot=223 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=224 A/B all-row y-bit-diff=0
+  slot=224 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=225 A/B all-row y-bit-diff=0
+  slot=225 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=226 A/B all-row y-bit-diff=0
+  slot=226 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=227 A/B all-row y-bit-diff=0
+  slot=227 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=228 A/B all-row y-bit-diff=0
+  slot=228 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=229 A/B all-row y-bit-diff=0
+  slot=229 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=230 A/B all-row y-bit-diff=0
+  slot=230 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=231 A/B all-row y-bit-diff=0
+  slot=231 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=232 A/B all-row y-bit-diff=0
+  slot=232 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=233 A/B all-row y-bit-diff=0
+  slot=233 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=33 K=256 arm0/A aos-gfx1201.hsaco: 1.16 us/dispatch  logical 5 GB/s  (median t1=220us tN=491us iters=234 slots=234)
+  raw t1_us=[219.983,221.786,219.101] tN_us=[491.244,475.169,491.043] marginal_us=[1.164,1.087,1.167] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1050192
+M=33 K=256 arm1/B soa-gfx1201.hsaco: 1.57 us/dispatch  logical 4 GB/s  (median t1=227us tN=593us iters=234 slots=234)
+  raw t1_us=[226.523,298.993,222.407] tN_us=[613.730,593.298,499.677] marginal_us=[1.662,1.263,1.190] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1050192
+M=33 K=256 ratio b/a=1.353 (parity gated pre-timing; timed order=A,B)
+M=33 K=512 gpr=2 weight_bytes=8976 slots=117 working_set_bytes=1050192 seed=1
+  slot=0 seed=1 aos_hash=5207db305d17a051 b_hash=a1bb521b4c160425 x_hash=c268fbff5344edea
+  slot=1 seed=2 aos_hash=2ea6c0a5d33d0aca b_hash=b508e3f262a5f1d2 x_hash=c268fbff5344edea
+  slot=2 seed=3 aos_hash=564709d0f2970cb5 b_hash=05c014863fa17439 x_hash=c268fbff5344edea
+  slot=3 seed=4 aos_hash=9a87269f1ca649ee b_hash=c4fa989629c7dd9a x_hash=c268fbff5344edea
+  slot=4 seed=5 aos_hash=918b8787babc2a81 b_hash=a229d5c2ae9844ad x_hash=c268fbff5344edea
+  slot=5 seed=6 aos_hash=ab21eff4e0310c72 b_hash=475e0164550f1e86 x_hash=c268fbff5344edea
+  slot=6 seed=7 aos_hash=e8ab74c213fe3bf7 b_hash=628c7786c109ab23 x_hash=c268fbff5344edea
+  slot=7 seed=8 aos_hash=b7efa0a230dd75f3 b_hash=857e740d9a3b4a3f x_hash=c268fbff5344edea
+  slot=8 seed=9 aos_hash=8ceccb7157e8712c b_hash=63e5ccbd41ffb210 x_hash=c268fbff5344edea
+  slot=9 seed=10 aos_hash=06ad204c9e77e122 b_hash=9373a7d4a2752152 x_hash=c268fbff5344edea
+  slot=10 seed=11 aos_hash=35a4f7d906650fc4 b_hash=6a08e5bb9210d9a8 x_hash=c268fbff5344edea
+  slot=11 seed=12 aos_hash=7df20f4210cb7625 b_hash=f93edd18d89e8a29 x_hash=c268fbff5344edea
+  slot=12 seed=13 aos_hash=2cbbb71669375bf2 b_hash=766f6f91beba0c5a x_hash=c268fbff5344edea
+  slot=13 seed=14 aos_hash=4b5aec140b142d8f b_hash=f5c15e9c68b5c987 x_hash=c268fbff5344edea
+  slot=14 seed=15 aos_hash=cca3fd843d74e6c7 b_hash=f0382761645aa967 x_hash=c268fbff5344edea
+  slot=15 seed=16 aos_hash=53f6c5dc09818bee b_hash=f8f33b8e23705ef6 x_hash=c268fbff5344edea
+  slot=16 seed=17 aos_hash=5823a2acf9ca28bd b_hash=ae8bc177a24e4df1 x_hash=c268fbff5344edea
+  slot=17 seed=18 aos_hash=8d382be1427885e9 b_hash=ee30331e161cba89 x_hash=c268fbff5344edea
+  slot=18 seed=19 aos_hash=c6418c570dc4a7f9 b_hash=7469ba4188ba5299 x_hash=c268fbff5344edea
+  slot=19 seed=20 aos_hash=a079079089b9ce66 b_hash=84cc885d41665ffe x_hash=c268fbff5344edea
+  slot=20 seed=21 aos_hash=48161e068bf2e51d b_hash=833c4934dd6219d1 x_hash=c268fbff5344edea
+  slot=21 seed=22 aos_hash=ed3596d6a0424797 b_hash=8acd98c7e33dbd57 x_hash=c268fbff5344edea
+  slot=22 seed=23 aos_hash=0b368f8437fda3aa b_hash=9800512a8ad77c8e x_hash=c268fbff5344edea
+  slot=23 seed=24 aos_hash=1322e3df2f192bb8 b_hash=a39b1cbba7218360 x_hash=c268fbff5344edea
+  slot=24 seed=25 aos_hash=936b58adc2ae3548 b_hash=9a1daea55f75ad94 x_hash=c268fbff5344edea
+  slot=25 seed=26 aos_hash=822f0f54ba085eb7 b_hash=175a2130d0db954f x_hash=c268fbff5344edea
+  slot=26 seed=27 aos_hash=8ad343a2b37fb9a2 b_hash=aba1f7c6491bd0d2 x_hash=c268fbff5344edea
+  slot=27 seed=28 aos_hash=2fee3259f163d554 b_hash=5a6dee8d88b4e64c x_hash=c268fbff5344edea
+  slot=28 seed=29 aos_hash=876d68a506ed2667 b_hash=ef18573ba27d8b6f x_hash=c268fbff5344edea
+  slot=29 seed=30 aos_hash=73168d5629dc9e82 b_hash=afa96cd726e0c73e x_hash=c268fbff5344edea
+  slot=30 seed=31 aos_hash=400fdc4a4d22aff7 b_hash=cdccc342c2521e3f x_hash=c268fbff5344edea
+  slot=31 seed=32 aos_hash=99e8fa84cd6ae05c b_hash=5c857ea54f3ed980 x_hash=c268fbff5344edea
+  slot=32 seed=33 aos_hash=0bdb87c47dd90a01 b_hash=c5b9cc1acf18de2d x_hash=c268fbff5344edea
+  slot=33 seed=34 aos_hash=00bbaba5561e2eea b_hash=3cd82aa7daa39dce x_hash=c268fbff5344edea
+  slot=34 seed=35 aos_hash=a6980d4aa4d5e52f b_hash=99779ed7f5f2394f x_hash=c268fbff5344edea
+  slot=35 seed=36 aos_hash=a9677ee299a7d044 b_hash=bd7c430fb67e817c x_hash=c268fbff5344edea
+  slot=36 seed=37 aos_hash=d9140e09ab16a29b b_hash=e3abaa59a2622377 x_hash=c268fbff5344edea
+  slot=37 seed=38 aos_hash=b80c9c8f5eb99d49 b_hash=5d2303f5dd11d77d x_hash=c268fbff5344edea
+  slot=38 seed=39 aos_hash=8c7cd8ab6f64b7eb b_hash=3e5333c08a7b918b x_hash=c268fbff5344edea
+  slot=39 seed=40 aos_hash=5b9a8e94e5e19447 b_hash=af1f68a2e3a90bbb x_hash=c268fbff5344edea
+  slot=40 seed=41 aos_hash=76925d9f18b13f3e b_hash=6bd65c731468cbe6 x_hash=c268fbff5344edea
+  slot=41 seed=42 aos_hash=6621a54fcb54ff2b b_hash=3bd42a2c0abadec3 x_hash=c268fbff5344edea
+  slot=42 seed=43 aos_hash=c4fd65fe024a166a b_hash=60c03269243b0afa x_hash=c268fbff5344edea
+  slot=43 seed=44 aos_hash=795d1e42eb2b2862 b_hash=5059432acd24cbb6 x_hash=c268fbff5344edea
+  slot=44 seed=45 aos_hash=bf3f908299f49a50 b_hash=b3f2268fde1f93b8 x_hash=c268fbff5344edea
+  slot=45 seed=46 aos_hash=b363c92fbae7ffdc b_hash=94ad26ef3891491c x_hash=c268fbff5344edea
+  slot=46 seed=47 aos_hash=370cbfd81a2dd41c b_hash=e9b0e1f2d66cf668 x_hash=c268fbff5344edea
+  slot=47 seed=48 aos_hash=deedcc6a62e23cb3 b_hash=ee7f28eda99b1023 x_hash=c268fbff5344edea
+  slot=48 seed=49 aos_hash=9bdac43ba34b047d b_hash=73d41de270ec93b5 x_hash=c268fbff5344edea
+  slot=49 seed=50 aos_hash=2e3b8894e01510c7 b_hash=e50942827481c8cf x_hash=c268fbff5344edea
+  slot=50 seed=51 aos_hash=fef09c44525559da b_hash=a9a0ae659f37c0c2 x_hash=c268fbff5344edea
+  slot=51 seed=52 aos_hash=673f18742ba5e321 b_hash=a8fba93cc4269425 x_hash=c268fbff5344edea
+  slot=52 seed=53 aos_hash=aa17e4d1b70e0b2b b_hash=374b67ac3eeea7b7 x_hash=c268fbff5344edea
+  slot=53 seed=54 aos_hash=05787f7183d17cbc b_hash=d0f17b9c02701e3c x_hash=c268fbff5344edea
+  slot=54 seed=55 aos_hash=03bc13706dcdc544 b_hash=2daf2b77eb40eccc x_hash=c268fbff5344edea
+  slot=55 seed=56 aos_hash=0a1d85c3f76b03e8 b_hash=1768cf12b8ec968c x_hash=c268fbff5344edea
+  slot=56 seed=57 aos_hash=1172641fda8896cd b_hash=9a8ad833e1617891 x_hash=c268fbff5344edea
+  slot=57 seed=58 aos_hash=99e3447bb35362a3 b_hash=c3b567dbedc1403f x_hash=c268fbff5344edea
+  slot=58 seed=59 aos_hash=ed63cea112fa0bce b_hash=fec649c822983f92 x_hash=c268fbff5344edea
+  slot=59 seed=60 aos_hash=ba1d6d66ce9e924a b_hash=7523fac6883ae6ce x_hash=c268fbff5344edea
+  slot=60 seed=61 aos_hash=f69892a10ca6eacd b_hash=937b948c3a9ff085 x_hash=c268fbff5344edea
+  slot=61 seed=62 aos_hash=de39173bbeaa25b0 b_hash=eb8f53fa7461f9f0 x_hash=c268fbff5344edea
+  slot=62 seed=63 aos_hash=39c23473c0eb25c7 b_hash=25646a6f8f3deb73 x_hash=c268fbff5344edea
+  slot=63 seed=64 aos_hash=c85fd20a483dd836 b_hash=d82aa76c28ce9d1e x_hash=c268fbff5344edea
+  slot=64 seed=65 aos_hash=93cf01e7b28e0c6e b_hash=d29f0c8dd00afbee x_hash=c268fbff5344edea
+  slot=65 seed=66 aos_hash=3ecb745467cb5c11 b_hash=02748610468d4fdd x_hash=c268fbff5344edea
+  slot=66 seed=67 aos_hash=545b923b04c754fd b_hash=4c6949620ed17e69 x_hash=c268fbff5344edea
+  slot=67 seed=68 aos_hash=f3d446a247319fe4 b_hash=539116c3e487c088 x_hash=c268fbff5344edea
+  slot=68 seed=69 aos_hash=5e5dcf57b0959125 b_hash=fedad6aaeed9276d x_hash=c268fbff5344edea
+  slot=69 seed=70 aos_hash=5bae10002fe3f06e b_hash=b39381f191eb6dc6 x_hash=c268fbff5344edea
+  slot=70 seed=71 aos_hash=64617224dd26c610 b_hash=9b1730f8ec870688 x_hash=c268fbff5344edea
+  slot=71 seed=72 aos_hash=7b9aeb5ad7c556a8 b_hash=dfa4d74177309484 x_hash=c268fbff5344edea
+  slot=72 seed=73 aos_hash=d389e4d754185d1d b_hash=a8b5e3935c7d6399 x_hash=c268fbff5344edea
+  slot=73 seed=74 aos_hash=22536985054d9de9 b_hash=c188c96613a5fae1 x_hash=c268fbff5344edea
+  slot=74 seed=75 aos_hash=ab3c66be017a1055 b_hash=fe7aa6023ca8a761 x_hash=c268fbff5344edea
+  slot=75 seed=76 aos_hash=9453bcc030224a65 b_hash=812970948e197d59 x_hash=c268fbff5344edea
+  slot=76 seed=77 aos_hash=fda54a68ef15a741 b_hash=72e1e31ae4bed3d9 x_hash=c268fbff5344edea
+  slot=77 seed=78 aos_hash=a9c105365e052dd0 b_hash=bcbd4bcdca0124fc x_hash=c268fbff5344edea
+  slot=78 seed=79 aos_hash=7bfa3ef88f8641b8 b_hash=e2a611ded636d868 x_hash=c268fbff5344edea
+  slot=79 seed=80 aos_hash=0bfe54236472b279 b_hash=23972cd3f92a0369 x_hash=c268fbff5344edea
+  slot=80 seed=81 aos_hash=672432efe56bb3c9 b_hash=4fc8179a255bf39d x_hash=c268fbff5344edea
+  slot=81 seed=82 aos_hash=62fcc0453dbf16e5 b_hash=6a9ab483b0a4ab19 x_hash=c268fbff5344edea
+  slot=82 seed=83 aos_hash=68d0fc8939dd8346 b_hash=508248a7ed00b646 x_hash=c268fbff5344edea
+  slot=83 seed=84 aos_hash=dfad9f4c383b166e b_hash=082c02684f391bca x_hash=c268fbff5344edea
+  slot=84 seed=85 aos_hash=461b430f6dc646a5 b_hash=d2346c9035f4cc4d x_hash=c268fbff5344edea
+  slot=85 seed=86 aos_hash=fd1a516a3c160ebe b_hash=8f2918dbf962398e x_hash=c268fbff5344edea
+  slot=86 seed=87 aos_hash=10f70a0d028dc3dd b_hash=a561807f911f67fd x_hash=c268fbff5344edea
+  slot=87 seed=88 aos_hash=12f50486ad788142 b_hash=b31b8c54571877de x_hash=c268fbff5344edea
+  slot=88 seed=89 aos_hash=83a392feafd0c63b b_hash=cb5ce3cc55edaf63 x_hash=c268fbff5344edea
+  slot=89 seed=90 aos_hash=52a6a82d93aab453 b_hash=3669d52f47033bab x_hash=c268fbff5344edea
+  slot=90 seed=91 aos_hash=da38e728b6e82060 b_hash=b3615ce6d6ec36f0 x_hash=c268fbff5344edea
+  slot=91 seed=92 aos_hash=034c08f3e649712b b_hash=30e4700b913b6f7f x_hash=c268fbff5344edea
+  slot=92 seed=93 aos_hash=9a8bd6ed3196bcaa b_hash=8e96878179689612 x_hash=c268fbff5344edea
+  slot=93 seed=94 aos_hash=d4156760cae498bd b_hash=48cee54558e4340d x_hash=c268fbff5344edea
+  slot=94 seed=95 aos_hash=7178775dfb0d887e b_hash=78628497ceafec1e x_hash=c268fbff5344edea
+  slot=95 seed=96 aos_hash=5c808db58bb113f4 b_hash=6b255747c0b09558 x_hash=c268fbff5344edea
+  slot=96 seed=97 aos_hash=51f1dca859abe6ff b_hash=14f2cd708c79efe7 x_hash=c268fbff5344edea
+  slot=97 seed=98 aos_hash=7110a7d8f6fe8d29 b_hash=81a4414ef550bd85 x_hash=c268fbff5344edea
+  slot=98 seed=99 aos_hash=2289305894748228 b_hash=79ceea37ec8d5c20 x_hash=c268fbff5344edea
+  slot=99 seed=100 aos_hash=4db5ed6f2b7190eb b_hash=137dc6030b8c03ef x_hash=c268fbff5344edea
+  slot=100 seed=101 aos_hash=6dca3b6d95aca13d b_hash=fe9e482ea9e37dc9 x_hash=c268fbff5344edea
+  slot=101 seed=102 aos_hash=2462105867d0859a b_hash=141fd8a7f5170cf2 x_hash=c268fbff5344edea
+  slot=102 seed=103 aos_hash=29cd4290308b8807 b_hash=5b7502b0f1dcf937 x_hash=c268fbff5344edea
+  slot=103 seed=104 aos_hash=eed04dd94608789b b_hash=367bbf50bb0ff5d7 x_hash=c268fbff5344edea
+  slot=104 seed=105 aos_hash=e140c171041dba3d b_hash=cb8d8c4abeb7ca8d x_hash=c268fbff5344edea
+  slot=105 seed=106 aos_hash=5ff394c73431a5ea b_hash=1e4363c26bf0d816 x_hash=c268fbff5344edea
+  slot=106 seed=107 aos_hash=af6446a6cd185a01 b_hash=d30f358eff9972d5 x_hash=c268fbff5344edea
+  slot=107 seed=108 aos_hash=699dab61cae10e16 b_hash=72153d9f10d5284a x_hash=c268fbff5344edea
+  slot=108 seed=109 aos_hash=7228f3c2670b7947 b_hash=bf17e95f6444223b x_hash=c268fbff5344edea
+  slot=109 seed=110 aos_hash=82cb9ee34c957f24 b_hash=7f0145caa4316a80 x_hash=c268fbff5344edea
+  slot=110 seed=111 aos_hash=a5a694e188367486 b_hash=55bf02e57d5050ce x_hash=c268fbff5344edea
+  slot=111 seed=112 aos_hash=b1651c0c7867844e b_hash=5ac15cbbae099a66 x_hash=c268fbff5344edea
+  slot=112 seed=113 aos_hash=627b15234c388b58 b_hash=68a67304d5444bbc x_hash=c268fbff5344edea
+  slot=113 seed=114 aos_hash=4168638369ee875e b_hash=9a639de585384326 x_hash=c268fbff5344edea
+  slot=114 seed=115 aos_hash=c8b977fc9cfe3045 b_hash=dd20f51bd62d8131 x_hash=c268fbff5344edea
+  slot=115 seed=116 aos_hash=90308ace24dc5f21 b_hash=0517afcd6e8e9579 x_hash=c268fbff5344edea
+  slot=116 seed=117 aos_hash=128e61daefc3635c b_hash=572345cf5c49d828 x_hash=c268fbff5344edea
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=20 A/B all-row y-bit-diff=0
+  slot=20 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=21 A/B all-row y-bit-diff=0
+  slot=21 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=22 A/B all-row y-bit-diff=0
+  slot=22 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=23 A/B all-row y-bit-diff=0
+  slot=23 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=24 A/B all-row y-bit-diff=0
+  slot=24 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=25 A/B all-row y-bit-diff=0
+  slot=25 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=26 A/B all-row y-bit-diff=0
+  slot=26 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=27 A/B all-row y-bit-diff=0
+  slot=27 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=28 A/B all-row y-bit-diff=0
+  slot=28 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=29 A/B all-row y-bit-diff=0
+  slot=29 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=30 A/B all-row y-bit-diff=0
+  slot=30 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=31 A/B all-row y-bit-diff=0
+  slot=31 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=32 A/B all-row y-bit-diff=0
+  slot=32 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=33 A/B all-row y-bit-diff=0
+  slot=33 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=34 A/B all-row y-bit-diff=0
+  slot=34 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=35 A/B all-row y-bit-diff=0
+  slot=35 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=36 A/B all-row y-bit-diff=0
+  slot=36 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=37 A/B all-row y-bit-diff=0
+  slot=37 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=38 A/B all-row y-bit-diff=0
+  slot=38 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=39 A/B all-row y-bit-diff=0
+  slot=39 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=40 A/B all-row y-bit-diff=0
+  slot=40 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=41 A/B all-row y-bit-diff=0
+  slot=41 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=42 A/B all-row y-bit-diff=0
+  slot=42 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=43 A/B all-row y-bit-diff=0
+  slot=43 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=44 A/B all-row y-bit-diff=0
+  slot=44 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=45 A/B all-row y-bit-diff=0
+  slot=45 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=46 A/B all-row y-bit-diff=0
+  slot=46 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=47 A/B all-row y-bit-diff=0
+  slot=47 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=48 A/B all-row y-bit-diff=0
+  slot=48 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=49 A/B all-row y-bit-diff=0
+  slot=49 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=50 A/B all-row y-bit-diff=0
+  slot=50 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=51 A/B all-row y-bit-diff=0
+  slot=51 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=52 A/B all-row y-bit-diff=0
+  slot=52 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=53 A/B all-row y-bit-diff=0
+  slot=53 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=54 A/B all-row y-bit-diff=0
+  slot=54 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=55 A/B all-row y-bit-diff=0
+  slot=55 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=56 A/B all-row y-bit-diff=0
+  slot=56 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=57 A/B all-row y-bit-diff=0
+  slot=57 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=58 A/B all-row y-bit-diff=0
+  slot=58 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=59 A/B all-row y-bit-diff=0
+  slot=59 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=60 A/B all-row y-bit-diff=0
+  slot=60 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=61 A/B all-row y-bit-diff=0
+  slot=61 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=62 A/B all-row y-bit-diff=0
+  slot=62 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=63 A/B all-row y-bit-diff=0
+  slot=63 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=64 A/B all-row y-bit-diff=0
+  slot=64 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=65 A/B all-row y-bit-diff=0
+  slot=65 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=66 A/B all-row y-bit-diff=0
+  slot=66 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=67 A/B all-row y-bit-diff=0
+  slot=67 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=68 A/B all-row y-bit-diff=0
+  slot=68 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=69 A/B all-row y-bit-diff=0
+  slot=69 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=70 A/B all-row y-bit-diff=0
+  slot=70 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=71 A/B all-row y-bit-diff=0
+  slot=71 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=72 A/B all-row y-bit-diff=0
+  slot=72 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=73 A/B all-row y-bit-diff=0
+  slot=73 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=74 A/B all-row y-bit-diff=0
+  slot=74 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=75 A/B all-row y-bit-diff=0
+  slot=75 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=76 A/B all-row y-bit-diff=0
+  slot=76 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=77 A/B all-row y-bit-diff=0
+  slot=77 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=78 A/B all-row y-bit-diff=0
+  slot=78 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=79 A/B all-row y-bit-diff=0
+  slot=79 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=80 A/B all-row y-bit-diff=0
+  slot=80 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=81 A/B all-row y-bit-diff=0
+  slot=81 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=82 A/B all-row y-bit-diff=0
+  slot=82 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=83 A/B all-row y-bit-diff=0
+  slot=83 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=84 A/B all-row y-bit-diff=0
+  slot=84 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=85 A/B all-row y-bit-diff=0
+  slot=85 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=86 A/B all-row y-bit-diff=0
+  slot=86 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=87 A/B all-row y-bit-diff=0
+  slot=87 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=88 A/B all-row y-bit-diff=0
+  slot=88 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=89 A/B all-row y-bit-diff=0
+  slot=89 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=90 A/B all-row y-bit-diff=0
+  slot=90 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=91 A/B all-row y-bit-diff=0
+  slot=91 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=92 A/B all-row y-bit-diff=0
+  slot=92 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=93 A/B all-row y-bit-diff=0
+  slot=93 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=94 A/B all-row y-bit-diff=0
+  slot=94 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=95 A/B all-row y-bit-diff=0
+  slot=95 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=96 A/B all-row y-bit-diff=0
+  slot=96 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=97 A/B all-row y-bit-diff=0
+  slot=97 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=98 A/B all-row y-bit-diff=0
+  slot=98 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=99 A/B all-row y-bit-diff=0
+  slot=99 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=100 A/B all-row y-bit-diff=0
+  slot=100 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=101 A/B all-row y-bit-diff=0
+  slot=101 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=102 A/B all-row y-bit-diff=0
+  slot=102 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=103 A/B all-row y-bit-diff=0
+  slot=103 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=104 A/B all-row y-bit-diff=0
+  slot=104 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=105 A/B all-row y-bit-diff=0
+  slot=105 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=106 A/B all-row y-bit-diff=0
+  slot=106 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=107 A/B all-row y-bit-diff=0
+  slot=107 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=108 A/B all-row y-bit-diff=0
+  slot=108 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=109 A/B all-row y-bit-diff=0
+  slot=109 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=110 A/B all-row y-bit-diff=0
+  slot=110 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=111 A/B all-row y-bit-diff=0
+  slot=111 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=112 A/B all-row y-bit-diff=0
+  slot=112 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=113 A/B all-row y-bit-diff=0
+  slot=113 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=114 A/B all-row y-bit-diff=0
+  slot=114 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=115 A/B all-row y-bit-diff=0
+  slot=115 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=116 A/B all-row y-bit-diff=0
+  slot=116 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=33 K=512 arm0/A aos-gfx1201.hsaco: 1.49 us/dispatch  logical 7 GB/s  (median t1=127us tN=301us iters=117 slots=117)
+  raw t1_us=[127.222,200.093,122.345] tN_us=[296.860,374.897,300.515] marginal_us=[1.462,1.507,1.536] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1050192
+M=33 K=512 arm1/B soa-gfx1201.hsaco: 1.40 us/dispatch  logical 8 GB/s  (median t1=134us tN=297us iters=117 slots=117)
+  raw t1_us=[200.144,134.093,123.497] tN_us=[294.826,296.639,381.508] marginal_us=[0.816,1.401,2.224] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1050192
+M=33 K=512 ratio b/a=0.938 (parity gated pre-timing; timed order=A,B)
+M=33 K=768 gpr=3 weight_bytes=13464 slots=78 working_set_bytes=1050192 seed=1
+  slot=0 seed=1 aos_hash=0082007b98504fd6 b_hash=cc7a3737011f04ce x_hash=92c8142c4da6700b
+  slot=1 seed=2 aos_hash=53bde6382321f395 b_hash=0c4b497e1d021801 x_hash=92c8142c4da6700b
+  slot=2 seed=3 aos_hash=438ee474d32383a2 b_hash=540bb3f4264b1b52 x_hash=92c8142c4da6700b
+  slot=3 seed=4 aos_hash=a2e0ecbc7a5c226f b_hash=a7a49d6e65cf5017 x_hash=92c8142c4da6700b
+  slot=4 seed=5 aos_hash=d695bb40e35fdc24 b_hash=fddc23eb0e7132b8 x_hash=92c8142c4da6700b
+  slot=5 seed=6 aos_hash=997fbfb8c9a3929f b_hash=ee10a8a217335beb x_hash=92c8142c4da6700b
+  slot=6 seed=7 aos_hash=9e4878e12f366d87 b_hash=5f470d53c2e437ab x_hash=92c8142c4da6700b
+  slot=7 seed=8 aos_hash=833b4f0bde61c1c0 b_hash=85ec6258bc77f9dc x_hash=92c8142c4da6700b
+  slot=8 seed=9 aos_hash=49008b8bf4db49f8 b_hash=88510462dcaebb54 x_hash=92c8142c4da6700b
+  slot=9 seed=10 aos_hash=2761467c93363ffa b_hash=08ea1465651dd28a x_hash=92c8142c4da6700b
+  slot=10 seed=11 aos_hash=7d31257a3d095678 b_hash=6a1fd0c5930b0b28 x_hash=92c8142c4da6700b
+  slot=11 seed=12 aos_hash=1e376442ee80ec2d b_hash=c6eeccf05fca51c1 x_hash=92c8142c4da6700b
+  slot=12 seed=13 aos_hash=729840fc9dda3171 b_hash=3ad45c3aa9702d49 x_hash=92c8142c4da6700b
+  slot=13 seed=14 aos_hash=3fc9f624d06d2cd3 b_hash=457d130a7f9cd843 x_hash=92c8142c4da6700b
+  slot=14 seed=15 aos_hash=63cca1bc3cc090a0 b_hash=6f07094f86a55b68 x_hash=92c8142c4da6700b
+  slot=15 seed=16 aos_hash=e8f5153a9d99a736 b_hash=7ca2167a4d69d022 x_hash=92c8142c4da6700b
+  slot=16 seed=17 aos_hash=7a5754fdbc43c4ba b_hash=74d10e22b45647c2 x_hash=92c8142c4da6700b
+  slot=17 seed=18 aos_hash=902e0dee552c6fba b_hash=dc2f88f4ca3e02fa x_hash=92c8142c4da6700b
+  slot=18 seed=19 aos_hash=68825220cab9ecf3 b_hash=3c71fa43eb51da8b x_hash=92c8142c4da6700b
+  slot=19 seed=20 aos_hash=79253e92e980d172 b_hash=c76d43b4fe07f59e x_hash=92c8142c4da6700b
+  slot=20 seed=21 aos_hash=a9c7217bce7bf5c1 b_hash=710b0267c004a9fd x_hash=92c8142c4da6700b
+  slot=21 seed=22 aos_hash=95949ae02682f50b b_hash=68f10741c94001a3 x_hash=92c8142c4da6700b
+  slot=22 seed=23 aos_hash=de8380ffd6c6333e b_hash=5833052f30671346 x_hash=92c8142c4da6700b
+  slot=23 seed=24 aos_hash=128ee8e7dcfc0177 b_hash=584fddec1047b54f x_hash=92c8142c4da6700b
+  slot=24 seed=25 aos_hash=f913da3d9c1bab11 b_hash=7ad048ffd0a65591 x_hash=92c8142c4da6700b
+  slot=25 seed=26 aos_hash=68bfc1fb416ddfc0 b_hash=16c45813ec5f0b50 x_hash=92c8142c4da6700b
+  slot=26 seed=27 aos_hash=3c2b66e05177ce17 b_hash=373b53e14cbfcd87 x_hash=92c8142c4da6700b
+  slot=27 seed=28 aos_hash=fb0fe2116ababab8 b_hash=b763abdcc10cd3e8 x_hash=92c8142c4da6700b
+  slot=28 seed=29 aos_hash=54f7e2e04f9ebcab b_hash=49daece8f53962cb x_hash=92c8142c4da6700b
+  slot=29 seed=30 aos_hash=dcb70467858e1925 b_hash=5c96b72087d85b41 x_hash=92c8142c4da6700b
+  slot=30 seed=31 aos_hash=ead7034346bbb306 b_hash=6a7c364f774d9762 x_hash=92c8142c4da6700b
+  slot=31 seed=32 aos_hash=25be5c55299f704d b_hash=87b89164b7bf2561 x_hash=92c8142c4da6700b
+  slot=32 seed=33 aos_hash=d7892c5465b3817f b_hash=8f4d6a74e2ae79d3 x_hash=92c8142c4da6700b
+  slot=33 seed=34 aos_hash=a41cc17de9b2bdbc b_hash=778a983f9e4a94b8 x_hash=92c8142c4da6700b
+  slot=34 seed=35 aos_hash=fcc7d83a3caea793 b_hash=ba47e64a8167c9af x_hash=92c8142c4da6700b
+  slot=35 seed=36 aos_hash=0a842b70e5db2d84 b_hash=06261c71677b31f4 x_hash=92c8142c4da6700b
+  slot=36 seed=37 aos_hash=bfd1fc638ce23f39 b_hash=d7771cffc421151d x_hash=92c8142c4da6700b
+  slot=37 seed=38 aos_hash=3bed318b27fcc208 b_hash=17aa0cf2cec57510 x_hash=92c8142c4da6700b
+  slot=38 seed=39 aos_hash=01226e7241a46f20 b_hash=48793aa6b74afe78 x_hash=92c8142c4da6700b
+  slot=39 seed=40 aos_hash=fb5e4739a7231e34 b_hash=6f240bdbee5403c8 x_hash=92c8142c4da6700b
+  slot=40 seed=41 aos_hash=be849472aec248f7 b_hash=6082a79fea9d8f27 x_hash=92c8142c4da6700b
+  slot=41 seed=42 aos_hash=d83dca906fd031f8 b_hash=20d00c8dfa2e4584 x_hash=92c8142c4da6700b
+  slot=42 seed=43 aos_hash=29372e759e8aa084 b_hash=63da3dcbaafe5e24 x_hash=92c8142c4da6700b
+  slot=43 seed=44 aos_hash=69287b048f77e2d2 b_hash=f4c3d19ec7cf099e x_hash=92c8142c4da6700b
+  slot=44 seed=45 aos_hash=1af08454c7d123a7 b_hash=b8a5eea9b71eaed3 x_hash=92c8142c4da6700b
+  slot=45 seed=46 aos_hash=5a376883b36a0fd0 b_hash=feeb6024606c713c x_hash=92c8142c4da6700b
+  slot=46 seed=47 aos_hash=3625fdd5757a6b1a b_hash=981d792d8670aca2 x_hash=92c8142c4da6700b
+  slot=47 seed=48 aos_hash=b34342f2ab17ef95 b_hash=2d74153c45fca81d x_hash=92c8142c4da6700b
+  slot=48 seed=49 aos_hash=e240471a963d2eb7 b_hash=a5b03a0de70fb4bf x_hash=92c8142c4da6700b
+  slot=49 seed=50 aos_hash=8b69d9011ab56a1b b_hash=6d19df3548d81f9b x_hash=92c8142c4da6700b
+  slot=50 seed=51 aos_hash=860198d1898ba53d b_hash=93ec2dd7ba821fa5 x_hash=92c8142c4da6700b
+  slot=51 seed=52 aos_hash=e415ccbf48c95542 b_hash=bb6dc7472fbf4d4e x_hash=92c8142c4da6700b
+  slot=52 seed=53 aos_hash=cd796cea854afa0c b_hash=16eeda05c6340794 x_hash=92c8142c4da6700b
+  slot=53 seed=54 aos_hash=6afc1e7c8dad7f45 b_hash=d9aeb6a2aee6c831 x_hash=92c8142c4da6700b
+  slot=54 seed=55 aos_hash=f90bd37397b6ff8d b_hash=779bc041ff588809 x_hash=92c8142c4da6700b
+  slot=55 seed=56 aos_hash=13764869603ddcd8 b_hash=bac8e208b852a8a0 x_hash=92c8142c4da6700b
+  slot=56 seed=57 aos_hash=6d1048b9b987195b b_hash=ac08c678b892d5cb x_hash=92c8142c4da6700b
+  slot=57 seed=58 aos_hash=421111c4a307c8ae b_hash=4746b91a08e39d5a x_hash=92c8142c4da6700b
+  slot=58 seed=59 aos_hash=129b68bcb82d2705 b_hash=300d8b2b5af24ed1 x_hash=92c8142c4da6700b
+  slot=59 seed=60 aos_hash=506366f993b2a903 b_hash=c36d12ca77436b2f x_hash=92c8142c4da6700b
+  slot=60 seed=61 aos_hash=76faae53758b6302 b_hash=1cab35920c1ba326 x_hash=92c8142c4da6700b
+  slot=61 seed=62 aos_hash=e62f6fa8dcd3103d b_hash=ccd6106cbef6958d x_hash=92c8142c4da6700b
+  slot=62 seed=63 aos_hash=93ca829256089ab0 b_hash=67770d8abfc98e30 x_hash=92c8142c4da6700b
+  slot=63 seed=64 aos_hash=ac0dc3436f5cfaaf b_hash=418775438eb52ed7 x_hash=92c8142c4da6700b
+  slot=64 seed=65 aos_hash=9e99ddc2447b7ae8 b_hash=a6aededecc39db90 x_hash=92c8142c4da6700b
+  slot=65 seed=66 aos_hash=5ef1bdd727c7e244 b_hash=6a5ce6776c78397c x_hash=92c8142c4da6700b
+  slot=66 seed=67 aos_hash=1b74fd2b7811db0a b_hash=c94f22bbcb89f972 x_hash=92c8142c4da6700b
+  slot=67 seed=68 aos_hash=3576ee2958c7d0cc b_hash=5c28f3c688822b54 x_hash=92c8142c4da6700b
+  slot=68 seed=69 aos_hash=2747b26488ae3cc4 b_hash=2ec8abec3b646234 x_hash=92c8142c4da6700b
+  slot=69 seed=70 aos_hash=06bc3575e75c9f43 b_hash=2c48e11a857f3bbf x_hash=92c8142c4da6700b
+  slot=70 seed=71 aos_hash=b06ca547aebc9a48 b_hash=1e63a3fbb04a4330 x_hash=92c8142c4da6700b
+  slot=71 seed=72 aos_hash=6c9c69d18809b599 b_hash=873c810a47cbe3b5 x_hash=92c8142c4da6700b
+  slot=72 seed=73 aos_hash=2b03fc292e5fd808 b_hash=b6a5ef4be896a064 x_hash=92c8142c4da6700b
+  slot=73 seed=74 aos_hash=90d22aba8ae23aa4 b_hash=376adfa732fc88d8 x_hash=92c8142c4da6700b
+  slot=74 seed=75 aos_hash=f056bc42a111252e b_hash=51eb0df7f3923ea2 x_hash=92c8142c4da6700b
+  slot=75 seed=76 aos_hash=6b8780c38419c8f7 b_hash=5d6f8b87d6cf4ad7 x_hash=92c8142c4da6700b
+  slot=76 seed=77 aos_hash=1f021613990ad41e b_hash=18b2d75028d974ba x_hash=92c8142c4da6700b
+  slot=77 seed=78 aos_hash=3bcf349af87c5135 b_hash=8ae6aaaf67666ca9 x_hash=92c8142c4da6700b
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=20 A/B all-row y-bit-diff=0
+  slot=20 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=21 A/B all-row y-bit-diff=0
+  slot=21 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=22 A/B all-row y-bit-diff=0
+  slot=22 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=23 A/B all-row y-bit-diff=0
+  slot=23 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=24 A/B all-row y-bit-diff=0
+  slot=24 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=25 A/B all-row y-bit-diff=0
+  slot=25 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=26 A/B all-row y-bit-diff=0
+  slot=26 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=27 A/B all-row y-bit-diff=0
+  slot=27 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=28 A/B all-row y-bit-diff=0
+  slot=28 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=29 A/B all-row y-bit-diff=0
+  slot=29 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=30 A/B all-row y-bit-diff=0
+  slot=30 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=31 A/B all-row y-bit-diff=0
+  slot=31 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=32 A/B all-row y-bit-diff=0
+  slot=32 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=33 A/B all-row y-bit-diff=0
+  slot=33 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=34 A/B all-row y-bit-diff=0
+  slot=34 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=35 A/B all-row y-bit-diff=0
+  slot=35 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=36 A/B all-row y-bit-diff=0
+  slot=36 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=37 A/B all-row y-bit-diff=0
+  slot=37 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=38 A/B all-row y-bit-diff=0
+  slot=38 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=39 A/B all-row y-bit-diff=0
+  slot=39 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=40 A/B all-row y-bit-diff=0
+  slot=40 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=41 A/B all-row y-bit-diff=0
+  slot=41 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=42 A/B all-row y-bit-diff=0
+  slot=42 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=43 A/B all-row y-bit-diff=0
+  slot=43 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=44 A/B all-row y-bit-diff=0
+  slot=44 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=45 A/B all-row y-bit-diff=0
+  slot=45 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=46 A/B all-row y-bit-diff=0
+  slot=46 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=47 A/B all-row y-bit-diff=0
+  slot=47 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=48 A/B all-row y-bit-diff=0
+  slot=48 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=49 A/B all-row y-bit-diff=0
+  slot=49 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=50 A/B all-row y-bit-diff=0
+  slot=50 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=51 A/B all-row y-bit-diff=0
+  slot=51 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=52 A/B all-row y-bit-diff=0
+  slot=52 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=53 A/B all-row y-bit-diff=0
+  slot=53 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=54 A/B all-row y-bit-diff=0
+  slot=54 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=55 A/B all-row y-bit-diff=0
+  slot=55 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=56 A/B all-row y-bit-diff=0
+  slot=56 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=57 A/B all-row y-bit-diff=0
+  slot=57 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=58 A/B all-row y-bit-diff=0
+  slot=58 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=59 A/B all-row y-bit-diff=0
+  slot=59 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=60 A/B all-row y-bit-diff=0
+  slot=60 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=61 A/B all-row y-bit-diff=0
+  slot=61 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=62 A/B all-row y-bit-diff=0
+  slot=62 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=63 A/B all-row y-bit-diff=0
+  slot=63 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=64 A/B all-row y-bit-diff=0
+  slot=64 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=65 A/B all-row y-bit-diff=0
+  slot=65 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=66 A/B all-row y-bit-diff=0
+  slot=66 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=67 A/B all-row y-bit-diff=0
+  slot=67 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=68 A/B all-row y-bit-diff=0
+  slot=68 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=69 A/B all-row y-bit-diff=0
+  slot=69 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=70 A/B all-row y-bit-diff=0
+  slot=70 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=71 A/B all-row y-bit-diff=0
+  slot=71 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=72 A/B all-row y-bit-diff=0
+  slot=72 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=73 A/B all-row y-bit-diff=0
+  slot=73 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=74 A/B all-row y-bit-diff=0
+  slot=74 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=75 A/B all-row y-bit-diff=0
+  slot=75 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=76 A/B all-row y-bit-diff=0
+  slot=76 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=77 A/B all-row y-bit-diff=0
+  slot=77 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=33 K=768 arm0/A aos-gfx1201.hsaco: 1.93 us/dispatch  logical 9 GB/s  (median t1=94us tN=242us iters=78 slots=78)
+  raw t1_us=[95.805,93.682,93.903] tN_us=[241.796,242.287,242.888] marginal_us=[1.896,1.930,1.935] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1050192
+M=33 K=768 arm1/B soa-gfx1201.hsaco: 1.93 us/dispatch  logical 9 GB/s  (median t1=96us tN=244us iters=78 slots=78)
+  raw t1_us=[95.515,94.994,170.748] tN_us=[246.403,242.437,244.390] marginal_us=[1.960,1.915,0.956] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1050192
+M=33 K=768 ratio b/a=1.003 (parity gated pre-timing; timed order=A,B)
+M=33 K=1024 gpr=4 weight_bytes=17952 slots=59 working_set_bytes=1059168 seed=1
+  slot=0 seed=1 aos_hash=63fa8dfd41ecdde7 b_hash=a08f9fcee8305803 x_hash=40c2132637668506
+  slot=1 seed=2 aos_hash=9962405f74fec0f2 b_hash=0e95655c8969fb16 x_hash=40c2132637668506
+  slot=2 seed=3 aos_hash=1974b960a0fab38a b_hash=c2cd51976fc8a7d6 x_hash=40c2132637668506
+  slot=3 seed=4 aos_hash=e8f2b54ee3632828 b_hash=214eb2d1e73fb9e8 x_hash=40c2132637668506
+  slot=4 seed=5 aos_hash=11b1ba1c4106b31d b_hash=4fd08237a175fc95 x_hash=40c2132637668506
+  slot=5 seed=6 aos_hash=d4bb5715fb87d19d b_hash=fa5de756d35242b1 x_hash=40c2132637668506
+  slot=6 seed=7 aos_hash=4872c552dfd32175 b_hash=a8494dcea938dddd x_hash=40c2132637668506
+  slot=7 seed=8 aos_hash=82d72efa3d354ce0 b_hash=f9fda450beb0c9ac x_hash=40c2132637668506
+  slot=8 seed=9 aos_hash=161fbac9cdb5c1f4 b_hash=7f2c367751a74390 x_hash=40c2132637668506
+  slot=9 seed=10 aos_hash=36df09d23bcf4e87 b_hash=a06cf68d0438c883 x_hash=40c2132637668506
+  slot=10 seed=11 aos_hash=e8a3bf5f809ed79e b_hash=4cbc6d430c2fc78a x_hash=40c2132637668506
+  slot=11 seed=12 aos_hash=fcc9cf12237accf4 b_hash=e70ba9cd7513ebd4 x_hash=40c2132637668506
+  slot=12 seed=13 aos_hash=b64dd662750df965 b_hash=f98c8e3c6ab6b975 x_hash=40c2132637668506
+  slot=13 seed=14 aos_hash=4e01f958124dedce b_hash=59f702153960d86e x_hash=40c2132637668506
+  slot=14 seed=15 aos_hash=56bf796531dc669d b_hash=a2a9af2dcabf061d x_hash=40c2132637668506
+  slot=15 seed=16 aos_hash=01111811862442b1 b_hash=94af2a00c4009f05 x_hash=40c2132637668506
+  slot=16 seed=17 aos_hash=d40a95271fcdd55a b_hash=30adaddb662f63ce x_hash=40c2132637668506
+  slot=17 seed=18 aos_hash=c7e53c95fb23ac38 b_hash=f473199d889c0ba4 x_hash=40c2132637668506
+  slot=18 seed=19 aos_hash=15d64cb4fa310b37 b_hash=04b476f2a3638eab x_hash=40c2132637668506
+  slot=19 seed=20 aos_hash=aa7c6e6ac7133bae b_hash=8e1af68b41aacaf2 x_hash=40c2132637668506
+  slot=20 seed=21 aos_hash=abb577bf68164d62 b_hash=bff66525aa301d6a x_hash=40c2132637668506
+  slot=21 seed=22 aos_hash=02efb5513718702a b_hash=252fb8d6131ff98e x_hash=40c2132637668506
+  slot=22 seed=23 aos_hash=2ed2fe4eebe5a093 b_hash=5c74acd57ccc244f x_hash=40c2132637668506
+  slot=23 seed=24 aos_hash=c07ba61382fb8814 b_hash=56478faa6039a1d0 x_hash=40c2132637668506
+  slot=24 seed=25 aos_hash=9a8a68d74f279b5f b_hash=aa04c64990294adb x_hash=40c2132637668506
+  slot=25 seed=26 aos_hash=4cda98fa1dd9b46d b_hash=b7ae192ccf422765 x_hash=40c2132637668506
+  slot=26 seed=27 aos_hash=1c4be162b88fcb3e b_hash=28fe03240650bc42 x_hash=40c2132637668506
+  slot=27 seed=28 aos_hash=29ff6819006ac5ce b_hash=f2872348edad6372 x_hash=40c2132637668506
+  slot=28 seed=29 aos_hash=77c7299d36dc6449 b_hash=949d14388c03b975 x_hash=40c2132637668506
+  slot=29 seed=30 aos_hash=d0288319471a6c28 b_hash=d4cd804d23905820 x_hash=40c2132637668506
+  slot=30 seed=31 aos_hash=d83ecd4006d25eb3 b_hash=550d33f03ea03d9b x_hash=40c2132637668506
+  slot=31 seed=32 aos_hash=df85b0ad59a3b4e9 b_hash=238d1e6e1d557a3d x_hash=40c2132637668506
+  slot=32 seed=33 aos_hash=deaf4a9e18c3c00f b_hash=49afbe3caefc675b x_hash=40c2132637668506
+  slot=33 seed=34 aos_hash=6f4e6736b79ddf1f b_hash=c50b80baa2abec8b x_hash=40c2132637668506
+  slot=34 seed=35 aos_hash=71bdb75d436aed4d b_hash=dcabaa09deccefa1 x_hash=40c2132637668506
+  slot=35 seed=36 aos_hash=50c1bebc0244d2bd b_hash=719d97a5acdf501d x_hash=40c2132637668506
+  slot=36 seed=37 aos_hash=1f07c39032656bd8 b_hash=a2b10026c7c8bfdc x_hash=40c2132637668506
+  slot=37 seed=38 aos_hash=ea8f8373d2f03f97 b_hash=e43f0e7ce59224ff x_hash=40c2132637668506
+  slot=38 seed=39 aos_hash=25a67902628ba3fc b_hash=4069cfbc1b33d530 x_hash=40c2132637668506
+  slot=39 seed=40 aos_hash=a8f9808a2ab4a122 b_hash=54bcab1f6e02e32e x_hash=40c2132637668506
+  slot=40 seed=41 aos_hash=11eeb14791e3651b b_hash=9a52482f5fd2e817 x_hash=40c2132637668506
+  slot=41 seed=42 aos_hash=216d8a28203280bf b_hash=58ed6d29599f8d6b x_hash=40c2132637668506
+  slot=42 seed=43 aos_hash=125d56572025b094 b_hash=77fe0bbc86ec2ca8 x_hash=40c2132637668506
+  slot=43 seed=44 aos_hash=508bc316f743a155 b_hash=87fd3613ba39bdd1 x_hash=40c2132637668506
+  slot=44 seed=45 aos_hash=0f2be0dd2c06ca7c b_hash=73dc1267a10d1c64 x_hash=40c2132637668506
+  slot=45 seed=46 aos_hash=35a3b0e95cd59499 b_hash=52efbd7c389c8079 x_hash=40c2132637668506
+  slot=46 seed=47 aos_hash=a6e3d07a23d638b2 b_hash=f509bd5676e17ede x_hash=40c2132637668506
+  slot=47 seed=48 aos_hash=1faa0107c9c86457 b_hash=673337b174bfb61f x_hash=40c2132637668506
+  slot=48 seed=49 aos_hash=5cca0eeb327ba2f3 b_hash=8d6804fc63a200fb x_hash=40c2132637668506
+  slot=49 seed=50 aos_hash=f8f0f0eea3155232 b_hash=de47b9dcab982c96 x_hash=40c2132637668506
+  slot=50 seed=51 aos_hash=7dfd7a3f1745f187 b_hash=29a4385b3089a58b x_hash=40c2132637668506
+  slot=51 seed=52 aos_hash=868f9634454633a2 b_hash=c06ffbcc321ef706 x_hash=40c2132637668506
+  slot=52 seed=53 aos_hash=80962eb1e4ebb079 b_hash=a80f3ea81dc0cca1 x_hash=40c2132637668506
+  slot=53 seed=54 aos_hash=df2feeb215161700 b_hash=cee82689b05e2998 x_hash=40c2132637668506
+  slot=54 seed=55 aos_hash=ef5976836b3939ab b_hash=d7571c2a47b6bacb x_hash=40c2132637668506
+  slot=55 seed=56 aos_hash=b19b318bf4c1ab77 b_hash=a64ea450c3f97b0b x_hash=40c2132637668506
+  slot=56 seed=57 aos_hash=61ed51aa684f66e4 b_hash=1131f27c582a5d0c x_hash=40c2132637668506
+  slot=57 seed=58 aos_hash=8ef8fca57ef39ee4 b_hash=530cf06ad1fa1260 x_hash=40c2132637668506
+  slot=58 seed=59 aos_hash=8b7dabe131781dee b_hash=38eb185a78ec9dd6 x_hash=40c2132637668506
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=20 A/B all-row y-bit-diff=0
+  slot=20 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=21 A/B all-row y-bit-diff=0
+  slot=21 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=22 A/B all-row y-bit-diff=0
+  slot=22 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=23 A/B all-row y-bit-diff=0
+  slot=23 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=24 A/B all-row y-bit-diff=0
+  slot=24 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=25 A/B all-row y-bit-diff=0
+  slot=25 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=26 A/B all-row y-bit-diff=0
+  slot=26 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=27 A/B all-row y-bit-diff=0
+  slot=27 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=28 A/B all-row y-bit-diff=0
+  slot=28 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=29 A/B all-row y-bit-diff=0
+  slot=29 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=30 A/B all-row y-bit-diff=0
+  slot=30 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=31 A/B all-row y-bit-diff=0
+  slot=31 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=32 A/B all-row y-bit-diff=0
+  slot=32 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=33 A/B all-row y-bit-diff=0
+  slot=33 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=34 A/B all-row y-bit-diff=0
+  slot=34 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=35 A/B all-row y-bit-diff=0
+  slot=35 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=36 A/B all-row y-bit-diff=0
+  slot=36 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=37 A/B all-row y-bit-diff=0
+  slot=37 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=38 A/B all-row y-bit-diff=0
+  slot=38 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=39 A/B all-row y-bit-diff=0
+  slot=39 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=40 A/B all-row y-bit-diff=0
+  slot=40 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=41 A/B all-row y-bit-diff=0
+  slot=41 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=42 A/B all-row y-bit-diff=0
+  slot=42 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=43 A/B all-row y-bit-diff=0
+  slot=43 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=44 A/B all-row y-bit-diff=0
+  slot=44 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=45 A/B all-row y-bit-diff=0
+  slot=45 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=46 A/B all-row y-bit-diff=0
+  slot=46 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=47 A/B all-row y-bit-diff=0
+  slot=47 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=48 A/B all-row y-bit-diff=0
+  slot=48 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=49 A/B all-row y-bit-diff=0
+  slot=49 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=50 A/B all-row y-bit-diff=0
+  slot=50 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=51 A/B all-row y-bit-diff=0
+  slot=51 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=52 A/B all-row y-bit-diff=0
+  slot=52 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=53 A/B all-row y-bit-diff=0
+  slot=53 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=54 A/B all-row y-bit-diff=0
+  slot=54 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=55 A/B all-row y-bit-diff=0
+  slot=55 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=56 A/B all-row y-bit-diff=0
+  slot=56 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=57 A/B all-row y-bit-diff=0
+  slot=57 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=58 A/B all-row y-bit-diff=0
+  slot=58 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=33 K=1024 arm0/A aos-gfx1201.hsaco: 1.48 us/dispatch  logical 15 GB/s  (median t1=80us tN=166us iters=59 slots=59)
+  raw t1_us=[80.311,80.362,84.498] tN_us=[166.612,165.080,166.432] marginal_us=[1.488,1.461,1.413] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1059168
+M=33 K=1024 arm1/B soa-gfx1201.hsaco: 1.50 us/dispatch  logical 15 GB/s  (median t1=81us tN=168us iters=59 slots=59)
+  raw t1_us=[81.143,81.143,80.963] tN_us=[171.139,168.265,167.594] marginal_us=[1.552,1.502,1.494] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1059168
+M=33 K=1024 ratio b/a=1.012 (parity gated pre-timing; timed order=A,B)
+M=33 K=1280 gpr=5 weight_bytes=22440 slots=47 working_set_bytes=1054680 seed=1
+  slot=0 seed=1 aos_hash=b918c0334a2047f8 b_hash=0273e05296f32260 x_hash=eae93b2554a4d9c7
+  slot=1 seed=2 aos_hash=afea39249d5af56c b_hash=65b99e2537bb331c x_hash=eae93b2554a4d9c7
+  slot=2 seed=3 aos_hash=6e0a473018293cbf b_hash=f5811c144ce648bb x_hash=eae93b2554a4d9c7
+  slot=3 seed=4 aos_hash=16fd0b78a35d967c b_hash=c4247025773bd890 x_hash=eae93b2554a4d9c7
+  slot=4 seed=5 aos_hash=e9c5a482a1f4568c b_hash=22f9d949edd09fd8 x_hash=eae93b2554a4d9c7
+  slot=5 seed=6 aos_hash=355ddca13fcbe8aa b_hash=a3db11c711f104aa x_hash=eae93b2554a4d9c7
+  slot=6 seed=7 aos_hash=b730ee7521349ec1 b_hash=54465560f85190d9 x_hash=eae93b2554a4d9c7
+  slot=7 seed=8 aos_hash=fa0e9d2442dfc383 b_hash=0ae893f1572cefa7 x_hash=eae93b2554a4d9c7
+  slot=8 seed=9 aos_hash=2d28a0dd2eadb4b9 b_hash=cb51b6b66f9f0d5d x_hash=eae93b2554a4d9c7
+  slot=9 seed=10 aos_hash=31689f147f54f002 b_hash=5c48fe3e50a37862 x_hash=eae93b2554a4d9c7
+  slot=10 seed=11 aos_hash=b47d8f4abebda0c8 b_hash=286eb4daf1a27460 x_hash=eae93b2554a4d9c7
+  slot=11 seed=12 aos_hash=cdadaed8b2fc7d92 b_hash=2defecaa6874e60e x_hash=eae93b2554a4d9c7
+  slot=12 seed=13 aos_hash=928704c20ee77c98 b_hash=8638860615c4df94 x_hash=eae93b2554a4d9c7
+  slot=13 seed=14 aos_hash=b4c3351dc3085653 b_hash=e53aa0852e09b617 x_hash=eae93b2554a4d9c7
+  slot=14 seed=15 aos_hash=27a637a7480a57f1 b_hash=a3917a92e72f8579 x_hash=eae93b2554a4d9c7
+  slot=15 seed=16 aos_hash=59b2065bb191988b b_hash=6c76d9fa07b7e6d3 x_hash=eae93b2554a4d9c7
+  slot=16 seed=17 aos_hash=d53d50fff25bd6a4 b_hash=e996f38fcbb35b90 x_hash=eae93b2554a4d9c7
+  slot=17 seed=18 aos_hash=096dcf8a2d9c74be b_hash=17093f2ef165da26 x_hash=eae93b2554a4d9c7
+  slot=18 seed=19 aos_hash=aab051afe7dae052 b_hash=45841605191eeb0a x_hash=eae93b2554a4d9c7
+  slot=19 seed=20 aos_hash=3de8f557f30d8f65 b_hash=4a0524476e83afa5 x_hash=eae93b2554a4d9c7
+  slot=20 seed=21 aos_hash=cd7275cda51f920e b_hash=23f7b06dbe30273e x_hash=eae93b2554a4d9c7
+  slot=21 seed=22 aos_hash=ef77fcb39a2593f3 b_hash=17905002973fcdc3 x_hash=eae93b2554a4d9c7
+  slot=22 seed=23 aos_hash=89cb11e0aaf8f512 b_hash=1b62d7adf4d1eba2 x_hash=eae93b2554a4d9c7
+  slot=23 seed=24 aos_hash=243bda836eea7480 b_hash=c6f101f8990e0cd0 x_hash=eae93b2554a4d9c7
+  slot=24 seed=25 aos_hash=563e27b8c9a0f551 b_hash=16081d47296c8c99 x_hash=eae93b2554a4d9c7
+  slot=25 seed=26 aos_hash=33d21389d2dbfa1e b_hash=1919d6a6681aacb6 x_hash=eae93b2554a4d9c7
+  slot=26 seed=27 aos_hash=e6ff24f00d22acdf b_hash=364bf55498fe12a7 x_hash=eae93b2554a4d9c7
+  slot=27 seed=28 aos_hash=95d7673625d20afe b_hash=61e88628fe8be1a6 x_hash=eae93b2554a4d9c7
+  slot=28 seed=29 aos_hash=96465b461cf3d1a4 b_hash=e33856377c77eae4 x_hash=eae93b2554a4d9c7
+  slot=29 seed=30 aos_hash=f7c72e8be894a433 b_hash=795f8680e56ff357 x_hash=eae93b2554a4d9c7
+  slot=30 seed=31 aos_hash=5faaad917d5e9e33 b_hash=b71e4bf97d253047 x_hash=eae93b2554a4d9c7
+  slot=31 seed=32 aos_hash=eb7fd49a6716840e b_hash=db92c5097619943e x_hash=eae93b2554a4d9c7
+  slot=32 seed=33 aos_hash=fe97e649484d2330 b_hash=fa841ef4ec964234 x_hash=eae93b2554a4d9c7
+  slot=33 seed=34 aos_hash=8e3250fc4850f50a b_hash=d20d893907fe0eca x_hash=eae93b2554a4d9c7
+  slot=34 seed=35 aos_hash=a7339c44adc3224f b_hash=5dd4c15f348648b3 x_hash=eae93b2554a4d9c7
+  slot=35 seed=36 aos_hash=292c3ec2377c1add b_hash=68803b7deef116c9 x_hash=eae93b2554a4d9c7
+  slot=36 seed=37 aos_hash=acd78ffce60772d6 b_hash=1248682d92579d76 x_hash=eae93b2554a4d9c7
+  slot=37 seed=38 aos_hash=8df2e097859dbef3 b_hash=4aaa3171908c6a73 x_hash=eae93b2554a4d9c7
+  slot=38 seed=39 aos_hash=05a49a3804d29efe b_hash=04685c1c372867de x_hash=eae93b2554a4d9c7
+  slot=39 seed=40 aos_hash=ca28c804c299c1c8 b_hash=a73665240638ad34 x_hash=eae93b2554a4d9c7
+  slot=40 seed=41 aos_hash=2d462af08a707651 b_hash=fa1d377f424dbac5 x_hash=eae93b2554a4d9c7
+  slot=41 seed=42 aos_hash=b7d8e190046e5153 b_hash=00c80be7fd0377d7 x_hash=eae93b2554a4d9c7
+  slot=42 seed=43 aos_hash=44bb9746cb81c792 b_hash=8aacecdbb4cfaa8e x_hash=eae93b2554a4d9c7
+  slot=43 seed=44 aos_hash=60b0f68e39c909e3 b_hash=33eeeedd7e24bb5b x_hash=eae93b2554a4d9c7
+  slot=44 seed=45 aos_hash=acc67a292e41f4ab b_hash=1081e3db084550d3 x_hash=eae93b2554a4d9c7
+  slot=45 seed=46 aos_hash=a56a28ccd40cf143 b_hash=f5f81f84eba7b537 x_hash=eae93b2554a4d9c7
+  slot=46 seed=47 aos_hash=3939a397841a6cec b_hash=eb9bf432d31589f0 x_hash=eae93b2554a4d9c7
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=20 A/B all-row y-bit-diff=0
+  slot=20 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=21 A/B all-row y-bit-diff=0
+  slot=21 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=22 A/B all-row y-bit-diff=0
+  slot=22 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=23 A/B all-row y-bit-diff=0
+  slot=23 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=24 A/B all-row y-bit-diff=0
+  slot=24 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=25 A/B all-row y-bit-diff=0
+  slot=25 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=26 A/B all-row y-bit-diff=0
+  slot=26 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=27 A/B all-row y-bit-diff=0
+  slot=27 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=28 A/B all-row y-bit-diff=0
+  slot=28 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=29 A/B all-row y-bit-diff=0
+  slot=29 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=30 A/B all-row y-bit-diff=0
+  slot=30 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=31 A/B all-row y-bit-diff=0
+  slot=31 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=32 A/B all-row y-bit-diff=0
+  slot=32 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=33 A/B all-row y-bit-diff=0
+  slot=33 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=34 A/B all-row y-bit-diff=0
+  slot=34 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=35 A/B all-row y-bit-diff=0
+  slot=35 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=36 A/B all-row y-bit-diff=0
+  slot=36 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=37 A/B all-row y-bit-diff=0
+  slot=37 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=38 A/B all-row y-bit-diff=0
+  slot=38 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=39 A/B all-row y-bit-diff=0
+  slot=39 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=40 A/B all-row y-bit-diff=0
+  slot=40 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=41 A/B all-row y-bit-diff=0
+  slot=41 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=42 A/B all-row y-bit-diff=0
+  slot=42 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=43 A/B all-row y-bit-diff=0
+  slot=43 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=44 A/B all-row y-bit-diff=0
+  slot=44 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=45 A/B all-row y-bit-diff=0
+  slot=45 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=46 A/B all-row y-bit-diff=0
+  slot=46 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=33 K=1280 arm0/A aos-gfx1201.hsaco: 1.72 us/dispatch  logical 16 GB/s  (median t1=73us tN=152us iters=47 slots=47)
+  raw t1_us=[72.840,72.329,72.971] tN_us=[152.931,151.229,151.961] marginal_us=[1.741,1.715,1.717] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1054680
+M=33 K=1280 arm1/B soa-gfx1201.hsaco: 1.86 us/dispatch  logical 15 GB/s  (median t1=73us tN=158us iters=47 slots=47)
+  raw t1_us=[73.401,72.499,72.801] tN_us=[155.405,160.804,158.380] marginal_us=[1.783,1.920,1.860] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1054680
+M=33 K=1280 ratio b/a=1.082 (parity gated pre-timing; timed order=A,B)
+M=33 K=1792 gpr=7 weight_bytes=31416 slots=34 working_set_bytes=1068144 seed=1
+  slot=0 seed=1 aos_hash=8ef38dab855d20f8 b_hash=80627ae8732142f0 x_hash=6709c3ce0ce5eabd
+  slot=1 seed=2 aos_hash=2f86524d9129f937 b_hash=0e3c06e31b8320bb x_hash=6709c3ce0ce5eabd
+  slot=2 seed=3 aos_hash=b3aba875bd68cc95 b_hash=ac3d891d575a29cd x_hash=6709c3ce0ce5eabd
+  slot=3 seed=4 aos_hash=bb23dfe9cdcb2028 b_hash=2ad8a6b4ca7a3fc8 x_hash=6709c3ce0ce5eabd
+  slot=4 seed=5 aos_hash=d1e02d329a15aec3 b_hash=b2ce60e209a5ce27 x_hash=6709c3ce0ce5eabd
+  slot=5 seed=6 aos_hash=e2238daff1839f08 b_hash=26979434f6a06d14 x_hash=6709c3ce0ce5eabd
+  slot=6 seed=7 aos_hash=fc7d6ee644dfaa17 b_hash=462bd2c09fbb1f27 x_hash=6709c3ce0ce5eabd
+  slot=7 seed=8 aos_hash=8a0896d43f31c787 b_hash=f07820d91cf9eef3 x_hash=6709c3ce0ce5eabd
+  slot=8 seed=9 aos_hash=5be09eae27a8bb12 b_hash=ab28c4e6a58b40d2 x_hash=6709c3ce0ce5eabd
+  slot=9 seed=10 aos_hash=c9f4ca198fded0d2 b_hash=55bdcf7b4ce9db6a x_hash=6709c3ce0ce5eabd
+  slot=10 seed=11 aos_hash=5d95c5db6d8fb373 b_hash=175fe26f71a97adf x_hash=6709c3ce0ce5eabd
+  slot=11 seed=12 aos_hash=36fc423786f11788 b_hash=da29cfb0cf3a8c18 x_hash=6709c3ce0ce5eabd
+  slot=12 seed=13 aos_hash=6b557bd08dd38b64 b_hash=f6141e84d17cf980 x_hash=6709c3ce0ce5eabd
+  slot=13 seed=14 aos_hash=6f566d24219eff44 b_hash=a734b5751cd612c4 x_hash=6709c3ce0ce5eabd
+  slot=14 seed=15 aos_hash=24a46b49df6c03e2 b_hash=5ff43f68d9287a4a x_hash=6709c3ce0ce5eabd
+  slot=15 seed=16 aos_hash=d7d1f53418c470c3 b_hash=223f84097ed8ba37 x_hash=6709c3ce0ce5eabd
+  slot=16 seed=17 aos_hash=f7da30ac71f4e3e2 b_hash=9bfcffcfe338300a x_hash=6709c3ce0ce5eabd
+  slot=17 seed=18 aos_hash=094c0d15d227b84d b_hash=b47c2f0ac35fd3d1 x_hash=6709c3ce0ce5eabd
+  slot=18 seed=19 aos_hash=d580094c800d9134 b_hash=8818c120c057490c x_hash=6709c3ce0ce5eabd
+  slot=19 seed=20 aos_hash=af57836e2d16d871 b_hash=d10712df4a6e82e9 x_hash=6709c3ce0ce5eabd
+  slot=20 seed=21 aos_hash=eac4069c63adc760 b_hash=f91bf1bd01c6bcd8 x_hash=6709c3ce0ce5eabd
+  slot=21 seed=22 aos_hash=2b31f676f52477eb b_hash=8ddaba1e40685ddf x_hash=6709c3ce0ce5eabd
+  slot=22 seed=23 aos_hash=e2776973dff88b20 b_hash=8cf6e935de4e3778 x_hash=6709c3ce0ce5eabd
+  slot=23 seed=24 aos_hash=042500ac4abded58 b_hash=f5d55f9fefea9314 x_hash=6709c3ce0ce5eabd
+  slot=24 seed=25 aos_hash=4aab9d363bb52ab3 b_hash=2213c31141399c37 x_hash=6709c3ce0ce5eabd
+  slot=25 seed=26 aos_hash=3e782ffd86f8dcce b_hash=7b86ef97b1827296 x_hash=6709c3ce0ce5eabd
+  slot=26 seed=27 aos_hash=fa2ea67e27fff58b b_hash=f04e33e30bb054d7 x_hash=6709c3ce0ce5eabd
+  slot=27 seed=28 aos_hash=15a70574d76db830 b_hash=915d81ca473d72ec x_hash=6709c3ce0ce5eabd
+  slot=28 seed=29 aos_hash=d0a2e23264a6ce9d b_hash=37c03e6420f4da91 x_hash=6709c3ce0ce5eabd
+  slot=29 seed=30 aos_hash=772b61c9a8c001a5 b_hash=8256979fff26163d x_hash=6709c3ce0ce5eabd
+  slot=30 seed=31 aos_hash=2ff4a296d907d037 b_hash=da640187bb11627f x_hash=6709c3ce0ce5eabd
+  slot=31 seed=32 aos_hash=d06515d4b60979d2 b_hash=f32371956a865422 x_hash=6709c3ce0ce5eabd
+  slot=32 seed=33 aos_hash=d4672cae797d31de b_hash=759e8e6698935b26 x_hash=6709c3ce0ce5eabd
+  slot=33 seed=34 aos_hash=2ec159f53c387b41 b_hash=a2a37f940d385cc1 x_hash=6709c3ce0ce5eabd
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=20 A/B all-row y-bit-diff=0
+  slot=20 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=21 A/B all-row y-bit-diff=0
+  slot=21 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=22 A/B all-row y-bit-diff=0
+  slot=22 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=23 A/B all-row y-bit-diff=0
+  slot=23 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=24 A/B all-row y-bit-diff=0
+  slot=24 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=25 A/B all-row y-bit-diff=0
+  slot=25 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=26 A/B all-row y-bit-diff=0
+  slot=26 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=27 A/B all-row y-bit-diff=0
+  slot=27 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=28 A/B all-row y-bit-diff=0
+  slot=28 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=29 A/B all-row y-bit-diff=0
+  slot=29 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=30 A/B all-row y-bit-diff=0
+  slot=30 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=31 A/B all-row y-bit-diff=0
+  slot=31 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=32 A/B all-row y-bit-diff=0
+  slot=32 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=33 A/B all-row y-bit-diff=0
+  slot=33 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=33 K=1792 arm0/A aos-gfx1201.hsaco: 2.21 us/dispatch  logical 18 GB/s  (median t1=65us tN=138us iters=34 slots=34)
+  raw t1_us=[64.998,69.145,63.306] tN_us=[139.271,137.839,137.648] marginal_us=[2.251,2.082,2.253] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1068144
+M=33 K=1792 arm1/B soa-gfx1201.hsaco: 2.34 us/dispatch  logical 17 GB/s  (median t1=63us tN=140us iters=34 slots=34)
+  raw t1_us=[65.820,63.145,63.116] tN_us=[140.293,140.252,139.111] marginal_us=[2.257,2.337,2.303] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=1068144
+M=33 K=1792 ratio b/a=1.059 (parity gated pre-timing; timed order=A,B)

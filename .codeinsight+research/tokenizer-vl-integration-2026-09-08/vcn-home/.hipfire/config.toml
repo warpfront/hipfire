@@ -1,0 +1,17 @@
+[serve]
+host="127.0.0.1"
+port=18771
+[vision]
+mode="on"
+[speculation]
+mode="off"
+dflash="off"
+mtp="off"
+ngram="off"
+[memory]
+kv_cache="q8"
+[reasoning]
+mode="off"
+effort="none"
+[image]
+decode="vcn"

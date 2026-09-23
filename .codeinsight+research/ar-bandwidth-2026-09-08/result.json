@@ -1,0 +1,1309 @@
+{
+  "date": "2026-09-08",
+  "lifecycle": "historical",
+  "disposition": "research only; no production promotion or end-to-end speedup claim",
+  "source_commit": "705df9b29",
+  "worktree": "/home/kaden/ClaudeCode/warpfront/wt-vcn",
+  "gpu": "RX 7900 XTX gfx1100 on hipx",
+  "hip_version": "7.15.26333-0000000",
+  "compiler": "AMD clang 23.0.0git 8f497e0992fb7513f7f78a6f6b6f1056c375e961",
+  "probe_binary_md5": "2dad8ce5db65ad672d50aa3e00004e84",
+  "aos_elf_md5": "d998cb67d91974f8bb24a6716fc465ea",
+  "soa_elf_md5": "8c6f07f9615cf2f93c6b3f4d799c57ad",
+  "ro_elf_md5": "e08f74eee6f5d0e122d4b5c9c91564ff",
+  "fixture": {
+    "kernel_inputs": "deterministic synthetic MQ4V2 matrices at real model shapes; seed1; per-slot distinct seed/address/content; input MD5s in raw logs",
+    "target_model": "qwen3.8-27b.mq4-xt",
+    "target_model_md5": "e45d15bfe0c9a87132697101d17cbed6",
+    "active_qt44_tensors": 497,
+    "active_qt44_bytes_per_ar_token": 13611663360,
+    "idealized_weight_only_roofline_gbs": 960,
+    "idealized_weight_only_roofline_tps": 70.52775069512151,
+    "roofline_caveat": "Not physical DRAM counters, not attainable end-to-end prediction. Excludes KV/state/activations, cache reuse, overfetch and scheduling/compute."
+  },
+  "method": {
+    "route": "native HIP event-timed streaming GEMV; not raw PM4",
+    "working_set_mib_min": 256,
+    "warmup_ms_min_per_arm": 250,
+    "launches_per_window": 1200,
+    "windows_per_arm": 3,
+    "headline": "median within process; three independent processes and median paired B/A ratio",
+    "process_order": [
+      "A,B",
+      "B,A",
+      "A,B"
+    ],
+    "controls": "same native AoS kernel/codebytes/input as both arms; three fresh processes",
+    "parity": "all output rows bit-exact for every slot before timing, inverse repack exact; CPUfinite combinedabs1e-5/rel1e-4 reference; RO exactchecksum oracle"
+  },
+  "comparison": [
+    {
+      "m": 5120,
+      "k": 5120,
+      "aos_us": 20.1955,
+      "soa_us": 19.6933,
+      "paired_time_ratio_median": 0.974509794229733,
+      "paired_time_ratios": [
+        0.9757176689754948,
+        0.9740585774058579,
+        0.974509794229733
+      ],
+      "aa_control_time_ratios": [
+        1.0010804006403107,
+        0.9969200090820245,
+        1.0055807775420789
+      ]
+    },
+    {
+      "m": 17408,
+      "k": 5120,
+      "aos_us": 60.2404,
+      "soa_us": 56.348,
+      "paired_time_ratio_median": 0.9353855552087967,
+      "paired_time_ratios": [
+        0.934495091571444,
+        0.9353855552087967,
+        0.9375421007023852
+      ],
+      "aa_control_time_ratios": [
+        0.9996923353245613,
+        1.0006599091087405,
+        1.0003688700281472
+      ]
+    },
+    {
+      "m": 5120,
+      "k": 17408,
+      "aos_us": 60.422,
+      "soa_us": 65.1223,
+      "paired_time_ratio_median": 1.077452391588491,
+      "paired_time_ratios": [
+        1.0763873465639946,
+        1.077452391588491,
+        1.0778590579590217
+      ],
+      "aa_control_time_ratios": [
+        0.9926747820365193,
+        1.0019212705303002,
+        0.9907046958414536
+      ]
+    },
+    {
+      "m": 248320,
+      "k": 5120,
+      "aos_us": 757.5903,
+      "soa_us": 742.9232,
+      "paired_time_ratio_median": 0.9806397996384061,
+      "paired_time_ratios": [
+        0.9809330397422638,
+        0.9803595538060548,
+        0.9806397996384061
+      ],
+      "aa_control_time_ratios": [
+        1.0000750981125823,
+        0.9999970963776915,
+        0.9999463007199265
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "label": "gfx1100-hip-stream-ab-1",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ab-1.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1834 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=19.6933 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.2535 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=56.3066 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.3346 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=64.9434 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.4254 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=742.9836 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9906 route=soa"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "hipcc": 20.1834,
+            "soa": 19.6933
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              20.1834,
+              20.203,
+              20.1679
+            ],
+            "soa": [
+              19.7265,
+              19.6664,
+              19.6933
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.2535,
+            "soa": 56.3066
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.2604,
+              60.2535,
+              60.0991
+            ],
+            "soa": [
+              56.2582,
+              56.3131,
+              56.3066
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.3346,
+            "soa": 64.9434
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.3346,
+              60.3159,
+              60.4076
+            ],
+            "soa": [
+              64.9769,
+              64.9434,
+              64.9191
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "hipcc": 757.4254,
+            "soa": 742.9836
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              757.4254,
+              757.1589,
+              757.4752
+            ],
+            "soa": [
+              742.7254,
+              742.9964,
+              742.9836
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "71cc8c18d2974292921c91bf4cee8ea92f999c362fdfc9816afac02953f813af"
+    },
+    {
+      "label": "gfx1100-hip-stream-aa-1",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --elf=/home/kaden/ar-bandwidth-2026-09-08/aos-native-gfx1100.hsaco"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-aa-1.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1777 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=20.1995 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1304 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.1119 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.7900 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.3447 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.6755 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=757.7324 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=aos-native-gfx1100   md5=d998cb67d91974f8bb24a6716fc465ea ratio=0.9984 route=aos-elf"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "hipcc": 20.1777,
+            "aos-native-gfx1100": 20.1995
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              20.1142,
+              20.1777,
+              20.1961
+            ],
+            "aos-native-gfx1100": [
+              20.2156,
+              20.1875,
+              20.1995
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.1304,
+            "aos-native-gfx1100": 60.1119
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.277,
+              60.1235,
+              60.1304
+            ],
+            "aos-native-gfx1100": [
+              60.2651,
+              60.1119,
+              60.1093
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.79,
+            "aos-native-gfx1100": 60.3447
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.9062,
+              60.79,
+              60.7673
+            ],
+            "aos-native-gfx1100": [
+              60.3331,
+              60.3447,
+              60.3735
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "hipcc": 757.6755,
+            "aos-native-gfx1100": 757.7324
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              757.7306,
+              757.6315,
+              757.6755
+            ],
+            "aos-native-gfx1100": [
+              757.5691,
+              757.7324,
+              757.8217
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "d1a3c237b35b2e17f6a125b70ad08151dac7f001ac253414efda519035f955f6"
+    },
+    {
+      "label": "gfx1100-hip-stream-ro-1",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --read-only"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ro-1.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=20.2715 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=23.2472 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=59.3447 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=60.0852 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=61.7678 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=65.5470 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=806.2366 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=774.2389 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=ro-aos               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.000 (reference) route=ro",
+        "[summary] arm=ro-soa               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.0430 route=ro-soa"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "ro-aos": 20.2715,
+            "ro-soa": 23.2472
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              20.2715,
+              20.2916,
+              20.2573
+            ],
+            "ro-soa": [
+              23.2587,
+              23.2465,
+              23.2472
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "ro-aos": 59.3447,
+            "ro-soa": 60.0852
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              59.3573,
+              59.3245,
+              59.3447
+            ],
+            "ro-soa": [
+              60.1552,
+              60.0852,
+              60.0409
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "ro-aos": 61.7678,
+            "ro-soa": 65.547
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              61.7678,
+              61.7974,
+              61.7537
+            ],
+            "ro-soa": [
+              65.565,
+              65.5395,
+              65.547
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "ro-aos": 806.2366,
+            "ro-soa": 774.2389
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              806.2366,
+              806.2282,
+              806.2788
+            ],
+            "ro-soa": [
+              774.0351,
+              774.3218,
+              774.2389
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "c6c8200db352e537dd50791745229415b0fde2a45bf31eb0d59a824c50c4d595"
+    },
+    {
+      "label": "gfx1100-hip-stream-ab-2",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --reverse"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ab-2.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1955 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=19.6716 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.2404 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=56.3480 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.4410 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=65.1223 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.7781 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=742.8950 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9905 route=soa"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "hipcc": 20.1955,
+            "soa": 19.6716
+          },
+          "raw_batch_us": {
+            "soa": [
+              19.726,
+              19.6544,
+              19.6716
+            ],
+            "hipcc": [
+              20.1955,
+              20.253,
+              20.1891
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.2404,
+            "soa": 56.348
+          },
+          "raw_batch_us": {
+            "soa": [
+              56.4184,
+              56.348,
+              56.2802
+            ],
+            "hipcc": [
+              60.2404,
+              60.2511,
+              60.1515
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.441,
+            "soa": 65.1223
+          },
+          "raw_batch_us": {
+            "soa": [
+              65.2265,
+              65.091,
+              65.1223
+            ],
+            "hipcc": [
+              60.441,
+              60.3726,
+              60.5252
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "hipcc": 757.7781,
+            "soa": 742.895
+          },
+          "raw_batch_us": {
+            "soa": [
+              742.895,
+              743.0959,
+              742.8167
+            ],
+            "hipcc": [
+              757.7832,
+              757.5959,
+              757.7781
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "be1e32d0dcdf90a33a887b689425cf36074fe53d45f0c0ab76f1088c6c44911c"
+    },
+    {
+      "label": "gfx1100-hip-stream-aa-2",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --elf=/home/kaden/ar-bandwidth-2026-09-08/aos-native-gfx1100.hsaco --reverse"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-aa-2.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.2598 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=20.1974 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1598 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.1995 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=61.0013 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=61.1185 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.6743 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=757.6721 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=aos-native-gfx1100   md5=d998cb67d91974f8bb24a6716fc465ea ratio=0.9999 route=aos-elf"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "hipcc": 20.2598,
+            "aos-native-gfx1100": 20.1974
+          },
+          "raw_batch_us": {
+            "aos-native-gfx1100": [
+              20.0816,
+              20.2189,
+              20.1974
+            ],
+            "hipcc": [
+              20.2806,
+              20.2598,
+              20.2442
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.1598,
+            "aos-native-gfx1100": 60.1995
+          },
+          "raw_batch_us": {
+            "aos-native-gfx1100": [
+              60.1408,
+              60.3197,
+              60.1995
+            ],
+            "hipcc": [
+              60.0942,
+              60.1598,
+              60.2402
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 61.0013,
+            "aos-native-gfx1100": 61.1185
+          },
+          "raw_batch_us": {
+            "aos-native-gfx1100": [
+              60.9955,
+              61.1185,
+              61.2182
+            ],
+            "hipcc": [
+              60.9062,
+              61.0013,
+              61.201
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "hipcc": 757.6743,
+            "aos-native-gfx1100": 757.6721
+          },
+          "raw_batch_us": {
+            "aos-native-gfx1100": [
+              757.7466,
+              757.5812,
+              757.6721
+            ],
+            "hipcc": [
+              757.561,
+              757.7405,
+              757.6743
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "2b69a58e2c034f3627aad9fdfadefdfa5ab875097ea28c8ef3144e74b19cd6ea"
+    },
+    {
+      "label": "gfx1100-hip-stream-ro-2",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --read-only --reverse"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ro-2.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=20.2663 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=23.3128 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=59.2822 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=60.1029 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=61.5657 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=65.4979 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=806.5281 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=774.1451 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=ro-aos               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.000 (reference) route=ro",
+        "[summary] arm=ro-soa               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.0446 route=ro-soa"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "ro-aos": 20.2663,
+            "ro-soa": 23.3128
+          },
+          "raw_batch_us": {
+            "ro-soa": [
+              23.3128,
+              23.317,
+              23.2991
+            ],
+            "ro-aos": [
+              20.3016,
+              20.2663,
+              20.2601
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "ro-aos": 59.2822,
+            "ro-soa": 60.1029
+          },
+          "raw_batch_us": {
+            "ro-soa": [
+              60.0721,
+              60.1029,
+              60.1771
+            ],
+            "ro-aos": [
+              59.2803,
+              59.2822,
+              59.2828
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "ro-aos": 61.5657,
+            "ro-soa": 65.4979
+          },
+          "raw_batch_us": {
+            "ro-soa": [
+              65.5038,
+              65.4716,
+              65.4979
+            ],
+            "ro-aos": [
+              61.6032,
+              61.5657,
+              61.4687
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "ro-aos": 806.5281,
+            "ro-soa": 774.1451
+          },
+          "raw_batch_us": {
+            "ro-soa": [
+              774.1451,
+              774.4081,
+              774.0053
+            ],
+            "ro-aos": [
+              806.7141,
+              806.4914,
+              806.5281
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "4b61d4af3290c8d9e1af4dffd480d1237145cdfc91dd44d6fbc9a61687e77801"
+    },
+    {
+      "label": "gfx1100-hip-stream-ab-3",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ab-3.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.2313 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=19.7156 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1237 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=56.3685 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.4220 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=65.1264 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.5903 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=742.9232 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9913 route=soa"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "hipcc": 20.2313,
+            "soa": 19.7156
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              20.1486,
+              20.2313,
+              20.2441
+            ],
+            "soa": [
+              19.7185,
+              19.7156,
+              19.6907
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.1237,
+            "soa": 56.3685
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.1291,
+              60.1054,
+              60.1237
+            ],
+            "soa": [
+              56.362,
+              56.3685,
+              56.45
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.422,
+            "soa": 65.1264
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.422,
+              60.4427,
+              60.3786
+            ],
+            "soa": [
+              65.1865,
+              65.1264,
+              65.1177
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "hipcc": 757.5903,
+            "soa": 742.9232
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              757.6124,
+              757.5894,
+              757.5903
+            ],
+            "soa": [
+              742.9232,
+              743.0319,
+              742.8847
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "f85e3145df7de53dbf52f1bc3c714e9b4b2d9f82a8ec8054756d520203b1ec8c"
+    },
+    {
+      "label": "gfx1100-hip-stream-aa-3",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --elf=/home/kaden/ar-bandwidth-2026-09-08/aos-native-gfx1100.hsaco"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-aa-3.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1764 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=20.2890 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1838 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.2060 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=61.0093 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.4422 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.9245 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=757.8838 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=aos-native-gfx1100   md5=d998cb67d91974f8bb24a6716fc465ea ratio=0.9991 route=aos-elf"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "hipcc": 20.1764,
+            "aos-native-gfx1100": 20.289
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              20.0342,
+              20.1764,
+              20.2536
+            ],
+            "aos-native-gfx1100": [
+              20.2589,
+              20.289,
+              20.2899
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 60.1838,
+            "aos-native-gfx1100": 60.206
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              60.1515,
+              60.1838,
+              60.2307
+            ],
+            "aos-native-gfx1100": [
+              60.2158,
+              60.1097,
+              60.206
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "hipcc": 61.0093,
+            "aos-native-gfx1100": 60.4422
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              61.0093,
+              61.0197,
+              60.9875
+            ],
+            "aos-native-gfx1100": [
+              60.4233,
+              60.4554,
+              60.4422
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "hipcc": 757.9245,
+            "aos-native-gfx1100": 757.8838
+          },
+          "raw_batch_us": {
+            "hipcc": [
+              757.9245,
+              757.8031,
+              757.9912
+            ],
+            "aos-native-gfx1100": [
+              757.9484,
+              757.8732,
+              757.8838
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "ab499baf2b309303dee5d38a3b4edd4e1ff9d1c4153c2219fa7b8f843d92e111"
+    },
+    {
+      "label": "gfx1100-hip-stream-ro-3",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --read-only"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ro-3.log",
+      "summary": [
+        "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=20.2234 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=23.2851 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=59.3709 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=60.0168 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=61.8082 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=65.4469 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+        "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=806.5513 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=773.4586 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=ro-aos               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.000 (reference) route=ro",
+        "[summary] arm=ro-soa               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.0427 route=ro-soa"
+      ],
+      "shapes": [
+        {
+          "m": 5120,
+          "k": 5120,
+          "slots": 20,
+          "working_set_bytes": 278528000,
+          "median_us": {
+            "ro-aos": 20.2234,
+            "ro-soa": 23.2851
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              20.2488,
+              20.2194,
+              20.2234
+            ],
+            "ro-soa": [
+              23.2921,
+              23.2851,
+              23.2744
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 17408,
+          "k": 5120,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "ro-aos": 59.3709,
+            "ro-soa": 60.0168
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              59.3709,
+              59.3656,
+              59.3988
+            ],
+            "ro-soa": [
+              60.0119,
+              60.0591,
+              60.0168
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 5120,
+          "k": 17408,
+          "slots": 6,
+          "working_set_bytes": 284098560,
+          "median_us": {
+            "ro-aos": 61.8082,
+            "ro-soa": 65.4469
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              61.8005,
+              61.942,
+              61.8082
+            ],
+            "ro-soa": [
+              65.4424,
+              65.4539,
+              65.4469
+            ]
+          },
+          "all_slots_pass": true
+        },
+        {
+          "m": 248320,
+          "k": 5120,
+          "slots": 1,
+          "working_set_bytes": 675430400,
+          "median_us": {
+            "ro-aos": 806.5513,
+            "ro-soa": 773.4586
+          },
+          "raw_batch_us": {
+            "ro-aos": [
+              806.6693,
+              806.5513,
+              806.4914
+            ],
+            "ro-soa": [
+              773.4586,
+              773.7322,
+              773.2156
+            ]
+          },
+          "all_slots_pass": true
+        }
+      ],
+      "log_sha256": "08f9b09f5ace8317e0c4ca9267045b2c32617f89531d870bbf008251702f5d8a"
+    }
+  ],
+  "cross_arch_smokes": [
+    {
+      "label": "gfx1100-hip-final-parity",
+      "argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "hipx",
+        "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=1 --iters=60 --shapes=33x256,33x512,33x768,33x1024,33x1280,33x1792 --seed=1 --soa"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-final-parity.log",
+      "summary": [
+        "== shape M=33 K=256 (groups=1) weight_bytes=4488 slots=234 working_set_bytes=1050192 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.5347 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=3.5270 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=512 (groups=2) weight_bytes=8976 slots=117 working_set_bytes=1050192 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.8844 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=3.8694 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=768 (groups=3) weight_bytes=13464 slots=78 working_set_bytes=1050192 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=4.2200 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=4.2036 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=1024 (groups=4) weight_bytes=17952 slots=59 working_set_bytes=1059168 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.5424 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=3.5519 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=1280 (groups=5) weight_bytes=22440 slots=47 working_set_bytes=1054680 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.7706 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=3.7659 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=1792 (groups=7) weight_bytes=31416 slots=34 working_set_bytes=1068144 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=4.2000 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=4.2012 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+        "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9986 route=soa"
+      ]
+    },
+    {
+      "label": "gfx1201-hip-final-parity",
+      "argv": [
+        "flock",
+        "-w",
+        "300",
+        "/tmp/hipfire-gpu.lock",
+        "env",
+        "HIP_VISIBLE_DEVICES=0",
+        "/home/kaden/ClaudeCode/warpfront/wt-vcn/target/release/examples/gemv_mq4_ab",
+        "--working-set-mib=1",
+        "--iters=60",
+        "--shapes=33x256,33x512,33x768,33x1024,33x1280,33x1792",
+        "--seed=1",
+        "--soa"
+      ],
+      "returncode": 0,
+      "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1201-hip-final-parity.log",
+      "summary": [
+        "== shape M=33 K=256 (groups=1) weight_bytes=4488 slots=234 working_set_bytes=1050192 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=2.7479 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=2.7682 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=512 (groups=2) weight_bytes=8976 slots=117 working_set_bytes=1050192 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=2.9457 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=2.9474 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=768 (groups=3) weight_bytes=13464 slots=78 working_set_bytes=1050192 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.1303 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=3.1400 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=1024 (groups=4) weight_bytes=17952 slots=59 working_set_bytes=1059168 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=2.7434 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=2.7827 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=1280 (groups=5) weight_bytes=22440 slots=47 working_set_bytes=1054680 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=2.9498 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=2.9626 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "== shape M=33 K=1792 (groups=7) weight_bytes=31416 slots=34 working_set_bytes=1068144 ==",
+        "[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.3147 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[gemv-ab] arm=soa gpu_us_per_launch_median=3.3400 n_samples=3 (3 whole-batch windows; no min/best-of)",
+        "[summary] arm=hipcc                md5=537211649696823eca1545ce7549b8ca ratio=1.000 (reference) route=aos",
+        "[summary] arm=soa                  md5=c0401ba2f0248b60d26e39592e949b33 ratio=1.0062 route=soa"
+      ]
+    }
+  ],
+  "interpretation": [
+    "Global SoA preserves exact weights/output but does not remove logical bytes. Gains are shape-specific: down projection regresses; not a generic bandwidth fix.",
+    "No production data layout/loader/prefill/decode change. Shape-specialized savings cannot be summed into an engine speedup without measuring the actual fused path.",
+    "Read-only counterfactual was often slower than full GEMV and does not establish a hardware bandwidth floor.",
+    "Stock CPU lossless codecs save about7.66% on a bounded real-weight sample; not GPU decoder performance and not full-model compressibility.",
+    "gfx1100 FETCH_SIZE and rawGL2C counters returned zero with positive SQ_WAVES; no physical-DRAM claim accepted.",
+    "Raw PM4 microbench A/A produced illegal command packet and recovered compute-ring reset. All raw PM4 timings excluded; source code/text/descriptors identical between local/native artifacts. Earlier cross-compiler theory was refuted."
+  ],
+  "artifacts": {
+    "entropy": "weight_entropy.json",
+    "entropy_script": "weight_entropy.py",
+    "raw_hip_manifest": "hip-measured-runs.json",
+    "raw_pm4_failure": "gfx1100-stream-aa-n240-1.log"
+  }
+}

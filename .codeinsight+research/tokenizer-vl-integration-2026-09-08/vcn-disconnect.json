@@ -1,0 +1,43 @@
+{
+  "label": "vcn-disconnect",
+  "image": "doge.jpeg",
+  "prompt": "Describe every visible detail of this image in a long paragraph. /no_think",
+  "stream": true,
+  "disconnect": true,
+  "text": "The",
+  "reasoning": "",
+  "done": false,
+  "wall_ms": 9614,
+  "events": [
+    {
+      "id": "chatcmpl-3291940-9",
+      "object": "chat.completion.chunk",
+      "created": 1788837879,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-9",
+      "object": "chat.completion.chunk",
+      "created": 1788837879,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "The"
+          },
+          "finish_reason": null
+        }
+      ]
+    }
+  ]
+}

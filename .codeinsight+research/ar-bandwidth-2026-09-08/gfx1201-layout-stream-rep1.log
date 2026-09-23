@@ -1,0 +1,137 @@
+[redline] DRM version 3.64
+[redline] GPU: gfx1201 (asic 0x7551) — 64 CUs, 4 SEs, 34.1 GB VRAM
+[redline] Compute context created
+gfx_arch=gfx1201 gran=512 layout_b=soa soa_b=true ws_mib=256 ro=0 reverse=0 iters=240 seed=1 route=pm4-prod-barrier
+elf_a=/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/aos-gfx1201.hsaco hash=f36ba84dc5639b4a sym=gemv_mq4g256v2 block=32 grid_div=1
+elf_b=/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/soa-gfx1201.hsaco hash=9017c48398c1fe56 sym=gemv_mq4g256v2_soa block=32 grid_div=1
+M=5120 K=5120 gpr=20 weight_bytes=13926400 slots=20 working_set_bytes=278528000 seed=1
+  slot=0 seed=1 aos_hash=2d3d55ed0402d025 b_hash=58534f662d637599 x_hash=ad7ea9a1c61df885
+  slot=1 seed=2 aos_hash=259cfd60771478c6 b_hash=ed834737334c7ce2 x_hash=ad7ea9a1c61df885
+  slot=2 seed=3 aos_hash=8851a4d64e280766 b_hash=374fc87a8480944e x_hash=ad7ea9a1c61df885
+  slot=3 seed=4 aos_hash=592407d891c61ba8 b_hash=58199091749c9244 x_hash=ad7ea9a1c61df885
+  slot=4 seed=5 aos_hash=d51e3d2f55d3655c b_hash=779c28fb41010ca8 x_hash=ad7ea9a1c61df885
+  slot=5 seed=6 aos_hash=f86ec60eb6a61437 b_hash=75302786cf51b817 x_hash=ad7ea9a1c61df885
+  slot=6 seed=7 aos_hash=c4e79cffc2022902 b_hash=dc4feb0f65cc6616 x_hash=ad7ea9a1c61df885
+  slot=7 seed=8 aos_hash=77ce0aa3e1cdf2f7 b_hash=c3c1b1c17068266b x_hash=ad7ea9a1c61df885
+  slot=8 seed=9 aos_hash=a7278a7882fc1e12 b_hash=a36de23c95e9c41e x_hash=ad7ea9a1c61df885
+  slot=9 seed=10 aos_hash=652bc45658ec559b b_hash=32b80e137880ce33 x_hash=ad7ea9a1c61df885
+  slot=10 seed=11 aos_hash=81abae7cd518268c b_hash=1cee3c80caf1cd94 x_hash=ad7ea9a1c61df885
+  slot=11 seed=12 aos_hash=cd25be96bf68fde7 b_hash=a79d141dc1c421a7 x_hash=ad7ea9a1c61df885
+  slot=12 seed=13 aos_hash=10eb4d2323199d18 b_hash=d10dd407abbf1200 x_hash=ad7ea9a1c61df885
+  slot=13 seed=14 aos_hash=6c52d8951afb0ee0 b_hash=0f7b64772b003450 x_hash=ad7ea9a1c61df885
+  slot=14 seed=15 aos_hash=6758009483243a9b b_hash=e31b8d2499d04c0f x_hash=ad7ea9a1c61df885
+  slot=15 seed=16 aos_hash=cc293847851f9407 b_hash=747df09ec1fb4b33 x_hash=ad7ea9a1c61df885
+  slot=16 seed=17 aos_hash=40cb6618344a2c6e b_hash=52239f13304ab3be x_hash=ad7ea9a1c61df885
+  slot=17 seed=18 aos_hash=0b2f297e5df022c3 b_hash=6733a708982d3c1f x_hash=ad7ea9a1c61df885
+  slot=18 seed=19 aos_hash=fbdff59cb8510336 b_hash=58ffc0eef7840842 x_hash=ad7ea9a1c61df885
+  slot=19 seed=20 aos_hash=4d58335bd746c5d1 b_hash=1a551ec8eaf3d1d1 x_hash=ad7ea9a1c61df885
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=6 A/B all-row y-bit-diff=0
+  slot=6 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=7 A/B all-row y-bit-diff=0
+  slot=7 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=8 A/B all-row y-bit-diff=0
+  slot=8 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=9 A/B all-row y-bit-diff=0
+  slot=9 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=10 A/B all-row y-bit-diff=0
+  slot=10 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=11 A/B all-row y-bit-diff=0
+  slot=11 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=12 A/B all-row y-bit-diff=0
+  slot=12 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=13 A/B all-row y-bit-diff=0
+  slot=13 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=14 A/B all-row y-bit-diff=0
+  slot=14 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=15 A/B all-row y-bit-diff=0
+  slot=15 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=16 A/B all-row y-bit-diff=0
+  slot=16 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=17 A/B all-row y-bit-diff=0
+  slot=17 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=18 A/B all-row y-bit-diff=0
+  slot=18 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=19 A/B all-row y-bit-diff=0
+  slot=19 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=5120 K=5120 arm0/A aos-gfx1201.hsaco: 39.09 us/dispatch  logical 357 GB/s  (median t1=126us tN=9468us iters=240 slots=20)
+  raw t1_us=[135.355,126.071,111.098] tN_us=[9603.614,9467.888,9366.585] marginal_us=[39.616,39.087,38.726] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=278528000
+M=5120 K=5120 arm1/B soa-gfx1201.hsaco: 25.94 us/dispatch  logical 538 GB/s  (median t1=110us tN=6309us iters=240 slots=20)
+  raw t1_us=[127.724,110.026,83.517] tN_us=[6314.793,6309.385,6295.053] marginal_us=[25.887,25.939,25.990] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=278528000
+M=5120 K=5120 ratio b/a=0.664 (parity gated pre-timing; timed order=A,B)
+M=17408 K=5120 gpr=20 weight_bytes=47349760 slots=6 working_set_bytes=284098560 seed=1
+  slot=0 seed=1 aos_hash=791670b7a38a600e b_hash=42edcdd024756bc6 x_hash=ad7ea9a1c61df885
+  slot=1 seed=2 aos_hash=a796bb9ff64ff03d b_hash=a950467849e38b1d x_hash=ad7ea9a1c61df885
+  slot=2 seed=3 aos_hash=bb3dd62ed12fcb43 b_hash=588be1abe609cb47 x_hash=ad7ea9a1c61df885
+  slot=3 seed=4 aos_hash=5fcaeeac225bc786 b_hash=49e58bca62c0e212 x_hash=ad7ea9a1c61df885
+  slot=4 seed=5 aos_hash=aa45ef591f5beec4 b_hash=9b07ab0f512add8c x_hash=ad7ea9a1c61df885
+  slot=5 seed=6 aos_hash=da3321476f70f809 b_hash=1f5bf3f7e9a45de9 x_hash=ad7ea9a1c61df885
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=17408 K=5120 arm0/A aos-gfx1201.hsaco: 82.35 us/dispatch  logical 576 GB/s  (median t1=136us tN=19817us iters=240 slots=6)
+  raw t1_us=[190.789,136.096,128.545] tN_us=[19845.784,19780.354,19817.021] marginal_us=[82.238,82.194,82.379] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=284098560
+M=17408 K=5120 arm1/B soa-gfx1201.hsaco: 78.47 us/dispatch  logical 605 GB/s  (median t1=128us tN=18882us iters=240 slots=6)
+  raw t1_us=[154.304,128.354,127.673] tN_us=[18860.963,18881.582,18907.154] marginal_us=[78.271,78.465,78.575] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=284098560
+M=17408 K=5120 ratio b/a=0.953 (parity gated pre-timing; timed order=A,B)
+M=5120 K=17408 gpr=68 weight_bytes=47349760 slots=6 working_set_bytes=284098560 seed=1
+  slot=0 seed=1 aos_hash=791670b7a38a600e b_hash=42edcdd024756bc6 x_hash=4658b8f9b8aa7244
+  slot=1 seed=2 aos_hash=a796bb9ff64ff03d b_hash=a950467849e38b1d x_hash=4658b8f9b8aa7244
+  slot=2 seed=3 aos_hash=bb3dd62ed12fcb43 b_hash=588be1abe609cb47 x_hash=4658b8f9b8aa7244
+  slot=3 seed=4 aos_hash=5fcaeeac225bc786 b_hash=49e58bca62c0e212 x_hash=4658b8f9b8aa7244
+  slot=4 seed=5 aos_hash=aa45ef591f5beec4 b_hash=9b07ab0f512add8c x_hash=4658b8f9b8aa7244
+  slot=5 seed=6 aos_hash=da3321476f70f809 b_hash=1f5bf3f7e9a45de9 x_hash=4658b8f9b8aa7244
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=1 A/B all-row y-bit-diff=0
+  slot=1 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=2 A/B all-row y-bit-diff=0
+  slot=2 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=3 A/B all-row y-bit-diff=0
+  slot=3 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=4 A/B all-row y-bit-diff=0
+  slot=4 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+  slot=5 A/B all-row y-bit-diff=0
+  slot=5 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=5120 K=17408 arm0/A aos-gfx1201.hsaco: 80.76 us/dispatch  logical 587 GB/s  (median t1=139us tN=19440us iters=240 slots=6)
+  raw t1_us=[194.445,132.721,138.750] tN_us=[19469.535,19424.635,19439.980] marginal_us=[80.649,80.719,80.758] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=284098560
+M=5120 K=17408 arm1/B soa-gfx1201.hsaco: 84.47 us/dispatch  logical 562 GB/s  (median t1=130us tN=20319us iters=240 slots=6)
+  raw t1_us=[159.611,130.418,127.423] tN_us=[20300.821,20319.213,20342.297] marginal_us=[84.273,84.472,84.581] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=284098560
+M=5120 K=17408 ratio b/a=1.046 (parity gated pre-timing; timed order=A,B)
+M=248320 K=5120 gpr=20 weight_bytes=675430400 slots=1 working_set_bytes=675430400 seed=1
+  slot=0 seed=1 aos_hash=b496b79b239388b6 b_hash=6da1225cae971daa x_hash=ad7ea9a1c61df885
+  slot=0 A/B all-row y-bit-diff=0
+  slot=0 plain CPU oracle rows 0/M-1 ok (full plain also: all-row A/B + parent HIP CPU gate)
+M=248320 K=5120 arm0/A aos-gfx1201.hsaco: 1068.39 us/dispatch  logical 633 GB/s  (median t1=1175us tN=256520us iters=240 slots=1)
+  raw t1_us=[1337.165,1175.069,1122.339] tN_us=[256757.030,256519.728,256517.805] marginal_us=[1068.702,1068.388,1068.600] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=675430400
+M=248320 K=5120 arm1/B soa-gfx1201.hsaco: 1068.22 us/dispatch  logical 633 GB/s  (median t1=1163us tN=256467us iters=240 slots=1)
+  raw t1_us=[1281.821,1150.362,1162.911] tN_us=[256283.801,256668.403,256467.412] marginal_us=[1066.954,1069.113,1068.220] order=A,B
+  note: logical GB/s = analytical bytes/us; not a DRAM bandwidth claim. working_set_bytes=675430400
+M=248320 K=5120 ratio b/a=1.000 (parity gated pre-timing; timed order=A,B)

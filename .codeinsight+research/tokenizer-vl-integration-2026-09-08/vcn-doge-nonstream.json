@@ -1,0 +1,74 @@
+{
+  "label": "vcn-doge-nonstream",
+  "image": "doge.jpeg",
+  "prompt": "Describe this image in 2-3 sentences. /no_think",
+  "stream": false,
+  "disconnect": false,
+  "text": "- The image features a close-up of a Shiba Inu dog with a light brown and white coat.\n- The dog has a slightly tilted head, dark eyes, and a black nose, giving it an expressive and curious look.\n- The background is softly blurred, keeping the focus on the dog's face.",
+  "reasoning": "",
+  "done": true,
+  "wall_ms": 11352,
+  "events": [
+    {
+      "id": "chatcmpl-3291940-3",
+      "object": "chat.completion",
+      "created": 1788837821,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "- The image features a close-up of a Shiba Inu dog with a light brown and white coat.\n- The dog has a slightly tilted head, dark eyes, and a black nose, giving it an expressive and curious look.\n- The background is softly blurred, keeping the focus on the dog's face."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 320,
+        "completion_tokens": 66,
+        "total_tokens": 386,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "ttft_ms": 8893.1,
+        "prefill_ms": 8893.1,
+        "prefill_tok_s": 36,
+        "decode_tok_s": 35.6,
+        "latency_ms": null,
+        "tau": null,
+        "cycles": null,
+        "dflash": null,
+        "mtp": null,
+        "mtp_ngram": null,
+        "ngram_mod_windows": null,
+        "ngram_mod_drafts": null,
+        "ngram_mod_accepted": null,
+        "ngram_mod_accept_rate": null,
+        "mtp_windows": null,
+        "ar_windows": null,
+        "mtp_retired": null,
+        "mtp_window_timings": null
+      },
+      "hipfire": {
+        "tok_s": 6.1,
+        "prefill_tok_s": 36,
+        "decode_tok_s": 35.6,
+        "execution_mode": null,
+        "continuous_batch": null,
+        "reasoning": {
+          "contract": "qwen_jinja",
+          "mode": "disabled",
+          "effort": null,
+          "max_think_tokens": null,
+          "cap_source": "none"
+        },
+        "config_warnings": [
+          "reasoning.effort 'xhigh' dropped: thinking disabled"
+        ]
+      }
+    }
+  ]
+}

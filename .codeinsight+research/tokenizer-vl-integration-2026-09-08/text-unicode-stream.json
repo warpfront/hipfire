@@ -1,0 +1,138 @@
+{
+  "label": "text-unicode-stream",
+  "image": null,
+  "prompt": "Output exactly this text without quotation marks: 世界 🚀 café /no_think",
+  "stream": true,
+  "disconnect": false,
+  "text": "世界 🚀 café",
+  "reasoning": "",
+  "done": true,
+  "wall_ms": 7266,
+  "events": [
+    {
+      "id": "chatcmpl-3291940-13",
+      "object": "chat.completion.chunk",
+      "created": 1788837900,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-13",
+      "object": "chat.completion.chunk",
+      "created": 1788837900,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "世界"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-13",
+      "object": "chat.completion.chunk",
+      "created": 1788837900,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " "
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-13",
+      "object": "chat.completion.chunk",
+      "created": 1788837900,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "🚀"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-13",
+      "object": "chat.completion.chunk",
+      "created": 1788837900,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " café"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-13",
+      "object": "chat.completion.chunk",
+      "created": 1788837900,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {},
+          "finish_reason": "stop"
+        }
+      ],
+      "timings": {
+        "ttft_ms": 6205.7,
+        "prefill_ms": 6205.7,
+        "prefill_tok_s": 4.8,
+        "decode_tok_s": 5.7,
+        "latency_ms": null,
+        "tau": null,
+        "cycles": null,
+        "dflash": null,
+        "mtp": null,
+        "mtp_ngram": null,
+        "ngram_mod_windows": null,
+        "ngram_mod_drafts": null,
+        "ngram_mod_accepted": null,
+        "ngram_mod_accept_rate": null,
+        "mtp_windows": null,
+        "ar_windows": null,
+        "mtp_retired": null,
+        "mtp_window_timings": null
+      },
+      "hipfire": {
+        "tok_s": 0.8,
+        "prefill_tok_s": 4.8,
+        "decode_tok_s": 5.7,
+        "execution_mode": null,
+        "continuous_batch": null,
+        "reasoning": {
+          "contract": "qwen_jinja",
+          "mode": "disabled",
+          "effort": null,
+          "max_think_tokens": null,
+          "cap_source": "none"
+        },
+        "config_warnings": [
+          "reasoning.effort 'xhigh' dropped: thinking disabled"
+        ]
+      }
+    }
+  ]
+}

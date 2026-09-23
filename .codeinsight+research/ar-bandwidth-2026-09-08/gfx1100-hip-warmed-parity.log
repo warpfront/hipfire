@@ -1,0 +1,1808 @@
+[gemv-ab] hip arch=gfx1100 iters=60 seed=1 soa=true read_only=false working_set_mib=1 reverse=false
+[gemv-ab] hipcc /home/kaden/hipfire-vcn/crates/saddle-lab/../../kernels/src/gemv_mq4g256v2.hip -> /tmp/gemv_mq4_ab/gemv_mq4g256v2.hsaco ...
+[gemv-ab] hipcc 0.45s
+[gemv-ab] hsaco md5=d998cb67d91974f8bb24a6716fc465ea (10728B) src=/home/kaden/hipfire-vcn/crates/saddle-lab/../../kernels/src/gemv_mq4g256v2.hip
+[gemv-ab] arm hipcc: md5=d998cb67d91974f8bb24a6716fc465ea (10728B) src=hipcc /tmp/gemv_mq4_ab/gemv_mq4g256v2.hsaco symbol=gemv_mq4g256v2 soa=false ro=false
+[gemv-ab] hipcc /home/kaden/hipfire-vcn/crates/saddle-lab/../../kernels/src/gemv_mq4g256v2_soa_test.hip -> /tmp/gemv_mq4_ab/gemv_mq4g256v2_soa.hsaco ...
+[gemv-ab] hipcc 0.37s
+[gemv-ab] hsaco md5=8c6f07f9615cf2f93c6b3f4d799c57ad (14504B) src=/home/kaden/hipfire-vcn/crates/saddle-lab/../../kernels/src/gemv_mq4g256v2_soa_test.hip
+[gemv-ab] arm soa: md5=8c6f07f9615cf2f93c6b3f4d799c57ad (14504B) src=hipcc /tmp/gemv_mq4_ab/gemv_mq4g256v2_soa.hsaco symbol=gemv_mq4g256v2_soa soa=true ro=false
+== shape M=33 K=256 (groups=1) weight_bytes=4488 slots=234 working_set_bytes=1050192 ==
+[gemv-ab] logical_bytes/launch=5644 (analytical; not DRAM)
+[gemv-ab] slot=0 seed=1 aos_md5=dc606aca4864f6093ac4f07cf7b7c9ce x_md5=d01bb035b4ed8e80a6c37c73786450cb
+[gemv-ab] slot=0 soa_md5=643490dc87e273eaf113cec0e17e02fc inverse=OK
+[gemv-ab] slot=1 seed=2 aos_md5=90278940b59507aab2764987dffe8be3 x_md5=1bc71af594f1897ca5f2134565108bc9
+[gemv-ab] slot=1 soa_md5=2acafe56c74c70f221120c6a3ac88ee3 inverse=OK
+[gemv-ab] slot=2 seed=3 aos_md5=c6191c3aeb529eac379e254ba4f6e445 x_md5=253fdce9e802b82e3eab35b947786c94
+[gemv-ab] slot=2 soa_md5=fe7613156eb0fc42c36ed701e7eda2f5 inverse=OK
+[gemv-ab] slot=3 seed=4 aos_md5=109d80ef3a717e6ea07b6e961cad7a92 x_md5=67d4c9ae3616c992d098fc66fbe568a4
+[gemv-ab] slot=3 soa_md5=9b0abe127496e30afecd9617f0870c53 inverse=OK
+[gemv-ab] slot=4 seed=5 aos_md5=7714a31b5327eb8f3a01c58c6de8eaee x_md5=f9153cdf585d38800048478da17dfce4
+[gemv-ab] slot=4 soa_md5=5baff70de7f2b7bfa81a81eca46e729e inverse=OK
+[gemv-ab] slot=5 seed=6 aos_md5=f0199843c1f07ad11390d923263495e4 x_md5=ecf0052216761889c8c5f6003db959d8
+[gemv-ab] slot=5 soa_md5=b8be3c92e8b0d1a33a722de00d422935 inverse=OK
+[gemv-ab] slot=6 seed=7 aos_md5=a5a1c5733a954d57c3f181a37b234832 x_md5=dbacaca0d9b37d3cd376fa1f80f3decf
+[gemv-ab] slot=6 soa_md5=c4e0c533381c7f2d27ebb9089e6062d3 inverse=OK
+[gemv-ab] slot=7 seed=8 aos_md5=c5acee6ee5c455ae16443e52971d07de x_md5=f44e1ac2f531c35cd84bafb4b1da75ed
+[gemv-ab] slot=7 soa_md5=9782b7653d55d2640229d44cdcace454 inverse=OK
+[gemv-ab] slot=8 seed=9 aos_md5=12ff7baa0285458b19806eac296dfc31 x_md5=491624ec4c51f71d9cad22a79b713463
+[gemv-ab] slot=8 soa_md5=91a6310d0e392c538fdb8c8ee7f9e070 inverse=OK
+[gemv-ab] slot=9 seed=10 aos_md5=c6b253a0ad8d4f8516b1cc64908765bb x_md5=756cc19a77a21129fe588069bf1a34fd
+[gemv-ab] slot=9 soa_md5=4dc60d228a66625dec17db4bdc7f0060 inverse=OK
+[gemv-ab] slot=10 seed=11 aos_md5=738ca0a548b37638dd0d131f2e737912 x_md5=67e02a246f008f15c1a105d7b0a39ae7
+[gemv-ab] slot=10 soa_md5=b66b37bbd639ea1f87e1331eb1f564d4 inverse=OK
+[gemv-ab] slot=11 seed=12 aos_md5=34f5f5b3cd521a9d7ced488414619470 x_md5=6883a9a9a46941492d790c296a256d40
+[gemv-ab] slot=11 soa_md5=2f67a012a2ed6b89478933693c05dbdc inverse=OK
+[gemv-ab] slot=12 seed=13 aos_md5=f83fd3b199100cd7bbfd6aadf8fd4a2a x_md5=74e5bbb09f88251c5222b04769a94277
+[gemv-ab] slot=12 soa_md5=91f3ca23b77c6bced0d5ebd56d6806b3 inverse=OK
+[gemv-ab] slot=13 seed=14 aos_md5=092af10c1906b0c20c7bc02626bef54b x_md5=0b00db3f48ffb651c6fcd95863351596
+[gemv-ab] slot=13 soa_md5=ff87f39edf401a995ecc0256eeea0c3a inverse=OK
+[gemv-ab] slot=14 seed=15 aos_md5=b7e7a7e7970502271d05f6b2bd04d363 x_md5=8a380dd33221a6d9ee6f380b6b1491b3
+[gemv-ab] slot=14 soa_md5=9d1239850c767b0750ec9cc2e61c43f2 inverse=OK
+[gemv-ab] slot=15 seed=16 aos_md5=11edc20fd7440b2eb85c20281333fc33 x_md5=87b1e22964c5fc218f6ac246883eb5c4
+[gemv-ab] slot=15 soa_md5=137545de32c3b113a7684fa0fb4d3878 inverse=OK
+[gemv-ab] slot=16 seed=17 aos_md5=f063d9a3d6d0bdda52c6770c3f1bea92 x_md5=d83f946322c3c5df15193ae2c755ea46
+[gemv-ab] slot=16 soa_md5=b856526417e35b89f9b149b4c43f10cb inverse=OK
+[gemv-ab] slot=17 seed=18 aos_md5=b65a6c72ea4cccec32b096fced6d3c08 x_md5=5065ac83cb2d450a8356005eeb50bae3
+[gemv-ab] slot=17 soa_md5=7e9bdcf55cd57b94105bca10a8ec1b55 inverse=OK
+[gemv-ab] slot=18 seed=19 aos_md5=646e3161df294959cf07539fce64f115 x_md5=3eb77b50d5b757cc14098c7fa151de7d
+[gemv-ab] slot=18 soa_md5=5a1d6804d3b80b9c0e1126b51183c147 inverse=OK
+[gemv-ab] slot=19 seed=20 aos_md5=b3146c53a50fcd1504a6ef357d663c38 x_md5=0be2f88e3bf6ab2ac31ab9482796f59f
+[gemv-ab] slot=19 soa_md5=19ea1d3b19b2f4714bc32774724fee38 inverse=OK
+[gemv-ab] slot=20 seed=21 aos_md5=30bc430ae8eaf3d9cc90c720a133312c x_md5=140e525b4c48a5b06be99f5a610792ed
+[gemv-ab] slot=20 soa_md5=5c45b32e378f07b9b478fd59f88530c7 inverse=OK
+[gemv-ab] slot=21 seed=22 aos_md5=a2f0488e5a6f6515effe5be68cd6f7dd x_md5=ee91db01355255d3f1ceaf1abf8393c4
+[gemv-ab] slot=21 soa_md5=e1bcd83d636230e795374280aaf470b3 inverse=OK
+[gemv-ab] slot=22 seed=23 aos_md5=67f2566b55c50e8a903db0b27274893e x_md5=126b8c5fb922be4c8d4411ee6600a51b
+[gemv-ab] slot=22 soa_md5=d24a904d2fa7cb6e39c05036b3ce42a3 inverse=OK
+[gemv-ab] slot=23 seed=24 aos_md5=df51bc9b98df50d204e5b576486fb3b0 x_md5=d23157a6d246b081d5f3ab49d3f73a71
+[gemv-ab] slot=23 soa_md5=37f4f0be406731351037aea1df6fdc7f inverse=OK
+[gemv-ab] slot=24 seed=25 aos_md5=530a6b066c021f66821b0aed8e0e264b x_md5=9d2c8f03749a31e1e5eeb3281fdfc91d
+[gemv-ab] slot=24 soa_md5=2463b7a750ec16ed070ab77dda8d610d inverse=OK
+[gemv-ab] slot=25 seed=26 aos_md5=dcc1e84a74b5aac1f1060d92dc0ecb07 x_md5=c6a9f27b5cada4144ea40aa51067e258
+[gemv-ab] slot=25 soa_md5=6487ac17cea68c7c02bd19712b2aa25b inverse=OK
+[gemv-ab] slot=26 seed=27 aos_md5=d40236d9e9bef10d6494a568c05e5cf7 x_md5=c4e9e1d045ce596f1a5947fa6389d00f
+[gemv-ab] slot=26 soa_md5=8390a7c3e9870ff2f988c6db7479d8a9 inverse=OK
+[gemv-ab] slot=27 seed=28 aos_md5=15cf2ccf076bd8298dde3c05d39969b3 x_md5=a25d610f381054208c0b2f7cac61db69
+[gemv-ab] slot=27 soa_md5=cffb5c6302533225c7734710699b1488 inverse=OK
+[gemv-ab] slot=28 seed=29 aos_md5=943cf1743083aef265842909a144a228 x_md5=c1cabc19e067e91561e2201160361e1b
+[gemv-ab] slot=28 soa_md5=54eef50504615c9a3f022f611cc0efbd inverse=OK
+[gemv-ab] slot=29 seed=30 aos_md5=8a3a4c4fbd1eb18d9f41ca85407de164 x_md5=fb8930e105e576510838d37e5ca2931f
+[gemv-ab] slot=29 soa_md5=083b53c2ef644f3926cff17abd2c3288 inverse=OK
+[gemv-ab] slot=30 seed=31 aos_md5=ea28237f62cd4539db42749efc340a00 x_md5=f7fc147f72888e73d059d5358ee644bc
+[gemv-ab] slot=30 soa_md5=9b7e768e38dbc54405287b0f69cd11a2 inverse=OK
+[gemv-ab] slot=31 seed=32 aos_md5=387f22f1a2eed05e48859eaf1ecb53bc x_md5=be4e910c2d4ee4c325b2ef66bcfe7d45
+[gemv-ab] slot=31 soa_md5=d5c5b880eb803bf281d28ab1d9291389 inverse=OK
+[gemv-ab] slot=32 seed=33 aos_md5=3d7b096e0d8168427e71da280c46722c x_md5=498374c40e5ba52195d701b21c251d3d
+[gemv-ab] slot=32 soa_md5=fb3381c8ff05a642efc75e280770fb06 inverse=OK
+[gemv-ab] slot=33 seed=34 aos_md5=ac7daa56ab31b51191c9521487b35a51 x_md5=9dcbbbe9c5b99d0bf8c08453680195a6
+[gemv-ab] slot=33 soa_md5=4e11e2d7f73a4a8a2d5db8ad6e829a93 inverse=OK
+[gemv-ab] slot=34 seed=35 aos_md5=5d5f89a62600af2875ef9783f7573e1d x_md5=d703919635167e39db4ddccf89b55e05
+[gemv-ab] slot=34 soa_md5=0bc92f34e40fbaea9f530f8f2f754a1d inverse=OK
+[gemv-ab] slot=35 seed=36 aos_md5=e761fdbda2ffc75e66fb4dde949cd1f4 x_md5=c2e447047f3d427218f5c63cb4998ec5
+[gemv-ab] slot=35 soa_md5=fa3a5165b2988d76959769f0d65954df inverse=OK
+[gemv-ab] slot=36 seed=37 aos_md5=95884673f45c4a9f5fff85c11e22e120 x_md5=57c4cb5a8c9f28b9b0687d9f79018b71
+[gemv-ab] slot=36 soa_md5=3926fad67894cd055e298d0228370e56 inverse=OK
+[gemv-ab] slot=37 seed=38 aos_md5=26dd134f96c4bca79c8109147831454d x_md5=38a079776013a7f7224d539561c1316d
+[gemv-ab] slot=37 soa_md5=aae6865493c28a2630c53f4bc084c74e inverse=OK
+[gemv-ab] slot=38 seed=39 aos_md5=baa716e9407a5cba9ba74728c08db319 x_md5=a7e3f2d7ed8bf9bbf31b02a80c79f075
+[gemv-ab] slot=38 soa_md5=d3f6f6d5491d77b5206d68f7b49c123b inverse=OK
+[gemv-ab] slot=39 seed=40 aos_md5=80f3a170d491655204658c51f3a4e546 x_md5=aa74fa79e804a986cb896aa8c29e0907
+[gemv-ab] slot=39 soa_md5=c6c86e2b2349f898bf8e6609eb8fc727 inverse=OK
+[gemv-ab] slot=40 seed=41 aos_md5=a9882089a99a89a760bbd6571f07129d x_md5=e676c4cd30d5a458c9ca420dfe990899
+[gemv-ab] slot=40 soa_md5=f465aef88ad7e653c31f766ee667833a inverse=OK
+[gemv-ab] slot=41 seed=42 aos_md5=ec44168d44c0e54c5bb49f58eb52bffc x_md5=acb815eb6adcedcb5d28819320be2e09
+[gemv-ab] slot=41 soa_md5=145da9d94cd87283e0f45dc40bcd5992 inverse=OK
+[gemv-ab] slot=42 seed=43 aos_md5=b15d29902f151359529bcfb5dafee048 x_md5=51c93611505e777a612805556cfb06d3
+[gemv-ab] slot=42 soa_md5=30ff2f2e115d3395d589d40711571d39 inverse=OK
+[gemv-ab] slot=43 seed=44 aos_md5=95075b7fbd097f5d7017697c43c7a57c x_md5=982e82effc00a4f31ccb17fc9c831940
+[gemv-ab] slot=43 soa_md5=63b379b531fac3bce6a214c0b6c1e095 inverse=OK
+[gemv-ab] slot=44 seed=45 aos_md5=5fccd8197c2b73022e1d7b8228bb9fd1 x_md5=3646a90b24f6e0f11bcdb43471b0cdab
+[gemv-ab] slot=44 soa_md5=2f7e0e68997a1dc01f5b3827bccce473 inverse=OK
+[gemv-ab] slot=45 seed=46 aos_md5=cd37ac50732c02d7cf113f07a38bb7c2 x_md5=2d2b1660d08a7f960629efe191cf5f1c
+[gemv-ab] slot=45 soa_md5=50fed63890108f183f87ef579f522878 inverse=OK
+[gemv-ab] slot=46 seed=47 aos_md5=c5e449295e86920d112fb0ea7f3f620b x_md5=396f321c11cc29e98ac3d6dbc749bcfc
+[gemv-ab] slot=46 soa_md5=f72ce0a3ba2655fbc5de23a262504b66 inverse=OK
+[gemv-ab] slot=47 seed=48 aos_md5=9710cd4812908998527778b2c2df889e x_md5=2c928e05f68d93b1d7cec1b15c433ee5
+[gemv-ab] slot=47 soa_md5=e3fe772d90319270b12617d6d96a06c2 inverse=OK
+[gemv-ab] slot=48 seed=49 aos_md5=9c61c6f5327f580055744cd330cf307b x_md5=eed97f168672b20e026dd543d5fbb8a8
+[gemv-ab] slot=48 soa_md5=cfe93eabef281fcf86d175634748e446 inverse=OK
+[gemv-ab] slot=49 seed=50 aos_md5=341660c1d7b25b101e9adb52f04806a8 x_md5=b9c5fb5cab6767d3ffaf42e2fc253005
+[gemv-ab] slot=49 soa_md5=7ee6c7b40cbe41e742a17d4c3d0eb8ea inverse=OK
+[gemv-ab] slot=50 seed=51 aos_md5=5056708a24eba3b774598357c2d43e15 x_md5=34e8377592e3af8919dab65787ffd794
+[gemv-ab] slot=50 soa_md5=4d8ae15ffbbedbd488ae76808c2e8c26 inverse=OK
+[gemv-ab] slot=51 seed=52 aos_md5=337d71b428ad395752cefd3619191f94 x_md5=b624fbbe97b0f2632878693e82917196
+[gemv-ab] slot=51 soa_md5=7b6f53f3ee0de0f42a700902bd650f9e inverse=OK
+[gemv-ab] slot=52 seed=53 aos_md5=a6cd5de6bf88224593f0f3c8f3be649f x_md5=cbfa7e9a35e98c3342da52ff01caadce
+[gemv-ab] slot=52 soa_md5=81b2c8607c2e97e707fa5501a09ffc35 inverse=OK
+[gemv-ab] slot=53 seed=54 aos_md5=926d89046209553a185ef63576b3675a x_md5=88393d132d4b84c59c31c98267cb151c
+[gemv-ab] slot=53 soa_md5=9a5df2e42e6517db8caad803d4a4f96e inverse=OK
+[gemv-ab] slot=54 seed=55 aos_md5=3e82410a605617fba058d00244471b43 x_md5=7f27b5d0ed754f2d4681a21d858846b4
+[gemv-ab] slot=54 soa_md5=cbc39efb32ca31eabdc390c6a10f71da inverse=OK
+[gemv-ab] slot=55 seed=56 aos_md5=2738baf16e4869c5c3901c249ca971cf x_md5=3f2f1644c994f8e40e0cc5accf5ff18f
+[gemv-ab] slot=55 soa_md5=31ec58952d90c0484ed685be0cce574f inverse=OK
+[gemv-ab] slot=56 seed=57 aos_md5=509d3ee748b8b474ff1c119464ee280f x_md5=4b4a08395178e980a50caeb9445f2e0c
+[gemv-ab] slot=56 soa_md5=ba1713198e119360011d1832c56e56ad inverse=OK
+[gemv-ab] slot=57 seed=58 aos_md5=439f676f942b384e6d73cb83ab56f90e x_md5=0b5a98c77c311cdfb130fc0471397d07
+[gemv-ab] slot=57 soa_md5=02a7b267bf4107df7df2d294a1d3f993 inverse=OK
+[gemv-ab] slot=58 seed=59 aos_md5=b38f05452ebeb8309e6c468adafb9c33 x_md5=6c6919f153493b562efc64db4678a6ca
+[gemv-ab] slot=58 soa_md5=1414aaed9bc1e003b6d23e1b2e2a913f inverse=OK
+[gemv-ab] slot=59 seed=60 aos_md5=4830beb3cd64e00aaad188a6798360e9 x_md5=1a43dec9e542c4b61b2ca1fc06a82247
+[gemv-ab] slot=59 soa_md5=cb861097c9b70c6ea8c2e8927493387a inverse=OK
+[gemv-ab] slot=60 seed=61 aos_md5=e6e65b15d5aea7e337a36f92514a440c x_md5=c2f72080ab6873751c4a96d911b7269b
+[gemv-ab] slot=60 soa_md5=abf1c6195dd29ee37e2fc05a60ad2725 inverse=OK
+[gemv-ab] slot=61 seed=62 aos_md5=302ac6fa0ae7d03e5a42dc4c8f23e614 x_md5=92b0087bf390acf57481745ab94343bd
+[gemv-ab] slot=61 soa_md5=78ba087203c5c6543ceedc1f306d4bce inverse=OK
+[gemv-ab] slot=62 seed=63 aos_md5=b52a9f946355f79d14b981e40711f745 x_md5=2a1cc4d8e6da8e57acfc53145a2dcb6f
+[gemv-ab] slot=62 soa_md5=7e0c5592bade3ac99e577b82740c7a34 inverse=OK
+[gemv-ab] slot=63 seed=64 aos_md5=8cbe5b68753a42139fd4ddb001b56342 x_md5=b32ba90a0b548b6fc97321d4a02f503e
+[gemv-ab] slot=63 soa_md5=72d07eee22bca8f3c41edd8cf5f49fab inverse=OK
+[gemv-ab] slot=64 seed=65 aos_md5=413acab46cafe5c7736950900fe7dd96 x_md5=a470cb6fc9e5775e1c3cdf53f23d2c5c
+[gemv-ab] slot=64 soa_md5=a5aece1efa626ec539b8fd7461b3396d inverse=OK
+[gemv-ab] slot=65 seed=66 aos_md5=befb6f2e5498f4760fde02b089df9512 x_md5=9e645961e9058fd3d7b53925b3a0dbf7
+[gemv-ab] slot=65 soa_md5=6967c7357fbb895ee95c70f74dca967e inverse=OK
+[gemv-ab] slot=66 seed=67 aos_md5=f679da07744161e9e6a50bc11aa4f23a x_md5=dff1c7bef0c728699e3cd931770bf3bf
+[gemv-ab] slot=66 soa_md5=9b793d8056a17191342b892f3550644c inverse=OK
+[gemv-ab] slot=67 seed=68 aos_md5=21f79c65d0f3612b8a20b56ee45d9f91 x_md5=3372990c0ff2bc2f6e5dc2c5027a875c
+[gemv-ab] slot=67 soa_md5=3e58d4bfe73625454b59037b8b44a513 inverse=OK
+[gemv-ab] slot=68 seed=69 aos_md5=a1644d9021f707bc1f2cd90d404756a2 x_md5=ec511dd337947f1cc06609933c98a140
+[gemv-ab] slot=68 soa_md5=44bceafae051c74e4768b97d752151ed inverse=OK
+[gemv-ab] slot=69 seed=70 aos_md5=56d895109e0fdbcc25039e434a478eca x_md5=5d60e39a12d68dd72cbde5de398a9b27
+[gemv-ab] slot=69 soa_md5=d50ba8440fe56a7e0ff39484b9676e73 inverse=OK
+[gemv-ab] slot=70 seed=71 aos_md5=7079408bbfe8880638d298db9c4bd83c x_md5=192108dd952b7bd82dd29c3474c48f9f
+[gemv-ab] slot=70 soa_md5=1432087c2418cb56b0dfc82e22f98510 inverse=OK
+[gemv-ab] slot=71 seed=72 aos_md5=f09d03bb6571b5b97b392efa6b56ce87 x_md5=afa6189e9b4b369374ac8f23a9aa40b3
+[gemv-ab] slot=71 soa_md5=07d44663a77db12fb6c50b0b84e76335 inverse=OK
+[gemv-ab] slot=72 seed=73 aos_md5=fae79e59f0f04c2479b19ccb9392de31 x_md5=d94c4d3fcfdfc6316e7fb133b74669ae
+[gemv-ab] slot=72 soa_md5=900eac602c7b637e0d722a4f7a8e6d59 inverse=OK
+[gemv-ab] slot=73 seed=74 aos_md5=6cee835adc038af1e1ea31e7bc44e40e x_md5=291ba1f5e6332b58d07f0cc0442ccdd7
+[gemv-ab] slot=73 soa_md5=2f4839ad9aca562f9b692e1957debc30 inverse=OK
+[gemv-ab] slot=74 seed=75 aos_md5=2bf2a93a4739af9563bd7b38303bae05 x_md5=57976db684fe4f5d8fbeb14f4e7500ac
+[gemv-ab] slot=74 soa_md5=55ecfe2769226ddda7b9ea82dcc3207a inverse=OK
+[gemv-ab] slot=75 seed=76 aos_md5=0665cae280ad21a39820be55d8c1c40f x_md5=4211cace01b6d09ff549e792b4336580
+[gemv-ab] slot=75 soa_md5=660c81d8fa8a6693db925e865904c859 inverse=OK
+[gemv-ab] slot=76 seed=77 aos_md5=97206bab5a95f08ca1b32db3468eae91 x_md5=429316197edf941371bc6d79699faadb
+[gemv-ab] slot=76 soa_md5=1a3b3a89004f7d7b62ec3b5bdab33443 inverse=OK
+[gemv-ab] slot=77 seed=78 aos_md5=e8f007b043646eb66277590d44c55d3e x_md5=b70f97940c33b9fd519dd1d9bb2746c5
+[gemv-ab] slot=77 soa_md5=a7754e384219f3f98bd28d4d0ce08d13 inverse=OK
+[gemv-ab] slot=78 seed=79 aos_md5=e694bfd31ec3c735eb7c01ce31a0f522 x_md5=3c777cd6487a7ce844759b3f3ebe99fe
+[gemv-ab] slot=78 soa_md5=ea71a9083c45e502268b73a73547ec37 inverse=OK
+[gemv-ab] slot=79 seed=80 aos_md5=cefedd925d09d0e1b560e170453bff0a x_md5=abf859b7ba070368ebe779272a65e258
+[gemv-ab] slot=79 soa_md5=4ba0d75d8a507fc243ac2a9fad3819fd inverse=OK
+[gemv-ab] slot=80 seed=81 aos_md5=3bae9a051ea5d66f1068bbcf26b17ab5 x_md5=e16578263bfd3e60d9bdd873e3e8f95a
+[gemv-ab] slot=80 soa_md5=7634d0d63636ec966c0c5be536db988c inverse=OK
+[gemv-ab] slot=81 seed=82 aos_md5=27e0e0b79386a0032cc8d1528cd1aedc x_md5=4cdf6ed0c5d5381e4a53f8f678c99251
+[gemv-ab] slot=81 soa_md5=42a7aa7ddd662add867b0923127c0bea inverse=OK
+[gemv-ab] slot=82 seed=83 aos_md5=a593b5b7877399beda8d21a7ec502e06 x_md5=b9fa67ce6d7f213588db89da6d3f7a3a
+[gemv-ab] slot=82 soa_md5=6a39cde1d12a8bd0bfd8a88682e68f37 inverse=OK
+[gemv-ab] slot=83 seed=84 aos_md5=40d8053cf9d09dd6783843383b7ec9c2 x_md5=0a5ed52d640a9fe63563f680680d4d36
+[gemv-ab] slot=83 soa_md5=05cb2d8ffe515898c142dbd26e1beb99 inverse=OK
+[gemv-ab] slot=84 seed=85 aos_md5=a28f7f995e519e525e212e96cc2cad96 x_md5=b5ad2a88944de9da884fce4c34e7d214
+[gemv-ab] slot=84 soa_md5=9bd98a680ba63cd4f0957f61441432fa inverse=OK
+[gemv-ab] slot=85 seed=86 aos_md5=82021fe1530ea1fde641ff032af4b843 x_md5=e40dc5e39105bb333a897dbce63c41c1
+[gemv-ab] slot=85 soa_md5=194fca471f5d7f444a3eb3a2538df963 inverse=OK
+[gemv-ab] slot=86 seed=87 aos_md5=ec3cbefa472be7ea668e322ad0835a2e x_md5=ce0e15d62a7b39c57fa24c835b9ae142
+[gemv-ab] slot=86 soa_md5=faf02810913360cfe9e6c270366b56d0 inverse=OK
+[gemv-ab] slot=87 seed=88 aos_md5=a5f8cf34000fc850637a5276122f0e13 x_md5=35c079c7973a842f71286a67686e3331
+[gemv-ab] slot=87 soa_md5=24050600948b05056f7602c016ee8fe1 inverse=OK
+[gemv-ab] slot=88 seed=89 aos_md5=c502917eeca1b8a2cebbebb58759a4bd x_md5=af8b97f70d67d8c8dc582c35e9a35edb
+[gemv-ab] slot=88 soa_md5=47004ac9e9c06bad3b7e0a7b9a0d818d inverse=OK
+[gemv-ab] slot=89 seed=90 aos_md5=f294d38603917dab6dd18afe4e09f972 x_md5=916a2b34745f4094e6b3c25f30909928
+[gemv-ab] slot=89 soa_md5=3d0a5ebcb0153cac929389dc816df04d inverse=OK
+[gemv-ab] slot=90 seed=91 aos_md5=79e27a2a81e397868d5f5a7fdd6cc9d2 x_md5=c020a88014fe9516ec26adb7b7e73005
+[gemv-ab] slot=90 soa_md5=f68b2adbdebc81f92e1b71fa7b70b3a1 inverse=OK
+[gemv-ab] slot=91 seed=92 aos_md5=5dcf2a143d28a134a03a2ecb5799e58a x_md5=b9698c6d4aeaeeba1e2ea3f06c3ed668
+[gemv-ab] slot=91 soa_md5=9b423ab19ad6e0bbcbc3105a3107a0f9 inverse=OK
+[gemv-ab] slot=92 seed=93 aos_md5=c92b9233c9f0aae961912d40763e8e8c x_md5=ca106e2646e27e04f89d327b80ba95e5
+[gemv-ab] slot=92 soa_md5=9b1c1a231334831730faf31634c112f0 inverse=OK
+[gemv-ab] slot=93 seed=94 aos_md5=c9681b0471dc6ce5f473f06cfce24514 x_md5=de7be8b9f146ae1c6f22bced2780e6af
+[gemv-ab] slot=93 soa_md5=46ac0f44f92ab9a9707088309aeee5d8 inverse=OK
+[gemv-ab] slot=94 seed=95 aos_md5=db7bf43cc900974bbfa1524bda468ae8 x_md5=39f93d8b428838442129eebd95e288b2
+[gemv-ab] slot=94 soa_md5=3eebb97d106c4da3ffd5df6bf2428138 inverse=OK
+[gemv-ab] slot=95 seed=96 aos_md5=65523b9c1f07cfdb239f6841a0856583 x_md5=5369802540f542962797fedcb9573c80
+[gemv-ab] slot=95 soa_md5=c3318ff31ae10079d20033068eacb8f4 inverse=OK
+[gemv-ab] slot=96 seed=97 aos_md5=7668ee5d0bf9bd7eebe32706fd2086d4 x_md5=014765f12863c215750559d40f244056
+[gemv-ab] slot=96 soa_md5=ec784eafe4245d579927ab1b1049b7c4 inverse=OK
+[gemv-ab] slot=97 seed=98 aos_md5=90cb90918329cac00b8f580ddc1616e2 x_md5=74d8338172dc6229f47beea36b3aa14f
+[gemv-ab] slot=97 soa_md5=5bdaf79af8726cfc12b121e77f2c1019 inverse=OK
+[gemv-ab] slot=98 seed=99 aos_md5=dfe8ca971d11095b5d094e6c63f20ac8 x_md5=d1432d94cb582dba395806fbaaaadb27
+[gemv-ab] slot=98 soa_md5=010757e90695bc0e97e7d9c65012fcba inverse=OK
+[gemv-ab] slot=99 seed=100 aos_md5=4fa2ee33713e13a11fb1dd31298e6491 x_md5=cc2ff7c6343683613f304d9e37c2fe7b
+[gemv-ab] slot=99 soa_md5=20af132431ceca48749a77ae3fe1d52b inverse=OK
+[gemv-ab] slot=100 seed=101 aos_md5=878bee63df40d9dc76456b1e48b27f76 x_md5=5fdc3960f55db4ff06e3ea32555dc5d1
+[gemv-ab] slot=100 soa_md5=a77a139b3563903334a0771e2c5adf8b inverse=OK
+[gemv-ab] slot=101 seed=102 aos_md5=a251b7978fc7108083ff0dad14f52945 x_md5=3addc0c3f3b988082484e81588fb97db
+[gemv-ab] slot=101 soa_md5=8ba8fb9b294bbba5861f47c0f0ac71cc inverse=OK
+[gemv-ab] slot=102 seed=103 aos_md5=6200a98eec93a27df1b4c527fb443be9 x_md5=03367397ffeea8bdda2a0083c6ffe3ac
+[gemv-ab] slot=102 soa_md5=35dbfe905d7123fa58a0e6c1f8b44ab9 inverse=OK
+[gemv-ab] slot=103 seed=104 aos_md5=c5f98c6cbe745814a683e1dda1ab07a1 x_md5=71aafafcbd211f9d51db2838082f2cb0
+[gemv-ab] slot=103 soa_md5=96ddea41db46bf7ffb0149740df1c7a7 inverse=OK
+[gemv-ab] slot=104 seed=105 aos_md5=66cf185f0d5e7ce4f0d2f14f94734a7b x_md5=3fd63fbac1888e153cfbfe9be42400cd
+[gemv-ab] slot=104 soa_md5=98b784bed77856d8538d5ed5b6635256 inverse=OK
+[gemv-ab] slot=105 seed=106 aos_md5=e151e29594cd7839a3c3a2f5eaf78932 x_md5=2023420802c41b9b5c6940162751bc20
+[gemv-ab] slot=105 soa_md5=a795f667e72dd740dfd03711ede9d201 inverse=OK
+[gemv-ab] slot=106 seed=107 aos_md5=bff73b7e4f2390450fff67f2e4d49b35 x_md5=5b27320af4275e7c85caa09bb655669b
+[gemv-ab] slot=106 soa_md5=fe4e0c62c5c63dc5638d761f4bad18d9 inverse=OK
+[gemv-ab] slot=107 seed=108 aos_md5=e0148c231d0db52dea5b532f879de7b1 x_md5=2013f0ad075ffdb1ed625f8ceedfb39f
+[gemv-ab] slot=107 soa_md5=66ae08554f70a9ecdac869c4534f0555 inverse=OK
+[gemv-ab] slot=108 seed=109 aos_md5=1ee6581407091a93b4023084fe93aeb7 x_md5=0f46234c7dbab3072754fcdbc4b7eeaa
+[gemv-ab] slot=108 soa_md5=9df106215bf6e06ff684e81505c30dd2 inverse=OK
+[gemv-ab] slot=109 seed=110 aos_md5=60a18d7824df97a03dc7f6877227c771 x_md5=b61bf9b66364a0b38c9706e8ed340b4d
+[gemv-ab] slot=109 soa_md5=2563e31755a770d976ea44c4586c0b73 inverse=OK
+[gemv-ab] slot=110 seed=111 aos_md5=71c2e383d2d0505056d3b7c060af2ab5 x_md5=31c4c10bc7f2b7ea131dc6726ee855b3
+[gemv-ab] slot=110 soa_md5=dae126a1f70cbb6c424938afe4127a2e inverse=OK
+[gemv-ab] slot=111 seed=112 aos_md5=bde064c4aae453fa9b21d5dc83ee1585 x_md5=f7b183c813f34f4e97e1f849011f6286
+[gemv-ab] slot=111 soa_md5=88d78b858c9b5c43f0860e2b5b712ac9 inverse=OK
+[gemv-ab] slot=112 seed=113 aos_md5=dca0eb287bea8edb74b78e02790c528c x_md5=aa1cced6d513b511a43374f2f0d7b8aa
+[gemv-ab] slot=112 soa_md5=0e203717594cc21193146bd207516e9a inverse=OK
+[gemv-ab] slot=113 seed=114 aos_md5=7c9ec83200cc5fe3cf39b6d18e0f1f23 x_md5=fb9a250fedf427bce6b7eb664ef6c6e9
+[gemv-ab] slot=113 soa_md5=f63efbe473a2de3377987b502178c494 inverse=OK
+[gemv-ab] slot=114 seed=115 aos_md5=944820f4a917ae484731ae6a7f44bfd9 x_md5=7bdd82c7b5636bd0452c7d5613207771
+[gemv-ab] slot=114 soa_md5=fef63dc92a2705c9ffca20bd8afd79c4 inverse=OK
+[gemv-ab] slot=115 seed=116 aos_md5=2b5243c970a6394dbc457ce7e8808302 x_md5=aedc6b69da27f500e48f432842831dce
+[gemv-ab] slot=115 soa_md5=87d27494c8c3da8cb1842058fcc350a9 inverse=OK
+[gemv-ab] slot=116 seed=117 aos_md5=caf49c9a51a7bb51aebfe32fb020c26d x_md5=b8ab4aba07fd82c173de0f69da93ac0b
+[gemv-ab] slot=116 soa_md5=64f8c8665d9400a2dc99b72b13919733 inverse=OK
+[gemv-ab] slot=117 seed=118 aos_md5=9e754716cbe9abbc5fe84b1d70cc02a4 x_md5=5810fc265711d977e8b2c2d52313d0a7
+[gemv-ab] slot=117 soa_md5=200f8109e82fc09fe5cad12e8930ab8d inverse=OK
+[gemv-ab] slot=118 seed=119 aos_md5=d18f172ed1549be7bd9e0f07795d955f x_md5=0089bd9f17e71b924583b26139afb757
+[gemv-ab] slot=118 soa_md5=75ec43b72a6c5bc2badd2867a6efdb0f inverse=OK
+[gemv-ab] slot=119 seed=120 aos_md5=d8f5c9e49a7ed22a0bbefdc8ea0c81db x_md5=91490c0d0d2c8b59341d381e5cad41f1
+[gemv-ab] slot=119 soa_md5=80272b5a61c38b47e51d3133793c803f inverse=OK
+[gemv-ab] slot=120 seed=121 aos_md5=1245e8ab02cfbbe2261e3dc3f1daa96c x_md5=59db986ae9651fefbbd86e078861aff2
+[gemv-ab] slot=120 soa_md5=484dec77e91e4311fdcd6df41c42ce66 inverse=OK
+[gemv-ab] slot=121 seed=122 aos_md5=e997bb25c1753c50e0ae26842c1d615e x_md5=673d81b33eaf021ed397af9dc5078865
+[gemv-ab] slot=121 soa_md5=aec74fc1adaad816262e227633cc9f7f inverse=OK
+[gemv-ab] slot=122 seed=123 aos_md5=707c9991b7e1ceb0bfd0fcd3ff00e7ef x_md5=f34af857c48ce7a1faede053ffceaa3b
+[gemv-ab] slot=122 soa_md5=668831c76a61247cff57658e1afbfd39 inverse=OK
+[gemv-ab] slot=123 seed=124 aos_md5=64f270f921c7d293570f4b5454e746c2 x_md5=2202c72b509a6d606900f0849c3a3e86
+[gemv-ab] slot=123 soa_md5=c17ef0f21701f5345a882f2b1ef2d057 inverse=OK
+[gemv-ab] slot=124 seed=125 aos_md5=4029cac223ff1e1d8063508523e09e57 x_md5=a0975a95721ee719acde93c066194f6d
+[gemv-ab] slot=124 soa_md5=865f537f09325e42a89e5e2ec752fc7f inverse=OK
+[gemv-ab] slot=125 seed=126 aos_md5=480569d606b10ff9b95a0d06b645028f x_md5=cac52f219152df76825a47457d072a2e
+[gemv-ab] slot=125 soa_md5=22cd2348cf97c813cbd336097e7d69f1 inverse=OK
+[gemv-ab] slot=126 seed=127 aos_md5=86f95d2221946e5a21893ed0f78d31f5 x_md5=a403b43a81deb1af44a96cc24d96a51d
+[gemv-ab] slot=126 soa_md5=fb3689d5baa82be22aab28fc1dd7f761 inverse=OK
+[gemv-ab] slot=127 seed=128 aos_md5=78808296fe3afd63eb80215aee629e97 x_md5=0f5da599b2c856f3769da6d278a12622
+[gemv-ab] slot=127 soa_md5=b7c1be18e4fc83762f7a0f2e98e8234d inverse=OK
+[gemv-ab] slot=128 seed=129 aos_md5=11163b35e14af55167447848418bdd37 x_md5=31f9a59648085832e1883848358247dd
+[gemv-ab] slot=128 soa_md5=cd749df91368ee9acc3c0184ec63ac2f inverse=OK
+[gemv-ab] slot=129 seed=130 aos_md5=68fcfb25088a4dca6c854cf08e73b2b0 x_md5=921069474613b2a160d13034be9d9a69
+[gemv-ab] slot=129 soa_md5=007a07eb0bc08cd1a24db5b8609b071f inverse=OK
+[gemv-ab] slot=130 seed=131 aos_md5=44464d35e973847737289d0eebda8c7e x_md5=58e1e3b86dd511ffcf0a6b6b110a3a3f
+[gemv-ab] slot=130 soa_md5=54b1fb8d977dea7dc0d444e633c34f75 inverse=OK
+[gemv-ab] slot=131 seed=132 aos_md5=cc5d690aadd38a5587c1b69c5a676954 x_md5=90f232671831d97883475d881905531e
+[gemv-ab] slot=131 soa_md5=b90d24c8dd47eb6d5f9917748acb30b7 inverse=OK
+[gemv-ab] slot=132 seed=133 aos_md5=c2112ba6f69e7e9943a4d37019385323 x_md5=e909a496398153bd01672c898db0823c
+[gemv-ab] slot=132 soa_md5=4dad2d42a9a406b6e4219d62ebe08539 inverse=OK
+[gemv-ab] slot=133 seed=134 aos_md5=4ff5f136d245746f9abcd931cd7fb137 x_md5=4192109860599510925df54473465723
+[gemv-ab] slot=133 soa_md5=9def58cee150f2822f8791cf7a121449 inverse=OK
+[gemv-ab] slot=134 seed=135 aos_md5=da79de6418b00edf7e1e4f0389608762 x_md5=aa207a57e8e5bd7719e0eeda5ba8af0d
+[gemv-ab] slot=134 soa_md5=0fc74b47900124a4f2fbb5bc63dd03ad inverse=OK
+[gemv-ab] slot=135 seed=136 aos_md5=1905a71cf27ca7dae5b91399cbe9b569 x_md5=77cb9cdcac38c3e9425a8bb35487c5b5
+[gemv-ab] slot=135 soa_md5=33762513babde3c931cc53774266ab2e inverse=OK
+[gemv-ab] slot=136 seed=137 aos_md5=9df5b626b7fd86f0a03552ccd058859a x_md5=4f1fed1333bef5b5c25721f9b0a6bc64
+[gemv-ab] slot=136 soa_md5=36cf1cc0fcdb7e2a12ab56d66f7ad1aa inverse=OK
+[gemv-ab] slot=137 seed=138 aos_md5=8ae43c43fc95fc8750f7e9c3e8e93621 x_md5=1f57d58d585bd1f8f32cee499b559cc3
+[gemv-ab] slot=137 soa_md5=57f1c08a96836c5801616ab75061db6a inverse=OK
+[gemv-ab] slot=138 seed=139 aos_md5=6aeb01852cc66075b4ae7591c7f02ee9 x_md5=fe178b1852cd39eb14c1fa66168d7743
+[gemv-ab] slot=138 soa_md5=c781e33caaff0d8cf51cc0781888ffb8 inverse=OK
+[gemv-ab] slot=139 seed=140 aos_md5=943da9568dbb85af02f3e51cd70b8f5f x_md5=90bb31b9c996746ebd3f6e90f44e943b
+[gemv-ab] slot=139 soa_md5=62b6da791bd1ce1f95e2ef14a4df6c9b inverse=OK
+[gemv-ab] slot=140 seed=141 aos_md5=590a181578a5d5c980a3bd5bd5f615e2 x_md5=076cbdc8e369d549eb959937e790303e
+[gemv-ab] slot=140 soa_md5=5241a16af8589e4512f8020fca69cef3 inverse=OK
+[gemv-ab] slot=141 seed=142 aos_md5=45edd68e53899c3a80344e22e42f1016 x_md5=afa0bcde8eafb7e7aa647cc4f913e9af
+[gemv-ab] slot=141 soa_md5=6f8c0572568e27d2f2df0ab466b8f8ab inverse=OK
+[gemv-ab] slot=142 seed=143 aos_md5=d60a38dc17ed81667757d91d76a9746b x_md5=e5497b9a218095f131c299d2d9459663
+[gemv-ab] slot=142 soa_md5=b7275bfe25c5376aa69d8158356da015 inverse=OK
+[gemv-ab] slot=143 seed=144 aos_md5=8eda854b37eeb7849673ef705db8a226 x_md5=c8b92cfcf67f4c8ac6ef584f572f8b94
+[gemv-ab] slot=143 soa_md5=cfc291767c98533d0fe3d5bdc26ccc87 inverse=OK
+[gemv-ab] slot=144 seed=145 aos_md5=66bc41f879b8b5a2324e01ba7cdc97bf x_md5=93c48a574523f66f54871d4881033d80
+[gemv-ab] slot=144 soa_md5=51aab6bd03ad609ed3bb1457e004a77d inverse=OK
+[gemv-ab] slot=145 seed=146 aos_md5=3354921d7a1702a8ea393981181238bd x_md5=a2ba4d101c1eaf8f694f9fcdf321cc38
+[gemv-ab] slot=145 soa_md5=83f1d94ca42dea5dc0c84022f79b44c9 inverse=OK
+[gemv-ab] slot=146 seed=147 aos_md5=36073859d14d29faf18f885c2acf0342 x_md5=9286654e4e987c7235cd89e85fb6d406
+[gemv-ab] slot=146 soa_md5=5c8a8146c61f8a8ab6db06192557b270 inverse=OK
+[gemv-ab] slot=147 seed=148 aos_md5=aab6e790dd6e6e0b3385d16172880e9e x_md5=9b08cd4e7cac5b3151c66e600906b93b
+[gemv-ab] slot=147 soa_md5=66784f993c55facd166224b57589de00 inverse=OK
+[gemv-ab] slot=148 seed=149 aos_md5=e3838f7def7d411d2db2f4ca5606a749 x_md5=8f010231bd090c8fddeb28e79f8921f2
+[gemv-ab] slot=148 soa_md5=0a52986f8b13096d3717a4eaddf3b2c5 inverse=OK
+[gemv-ab] slot=149 seed=150 aos_md5=87584f8cb5ca3dc73a997a5b9599534f x_md5=0ddacc3e8d3e5fc98834cdbddf7da929
+[gemv-ab] slot=149 soa_md5=95a9e0cff4df7dffd253f6902610c3fa inverse=OK
+[gemv-ab] slot=150 seed=151 aos_md5=2e26b43b84d278f157f61c58005dfc25 x_md5=18b2b9e115b63ae16f331b37af37ac8c
+[gemv-ab] slot=150 soa_md5=344181f3d83ceee86513b09808633f98 inverse=OK
+[gemv-ab] slot=151 seed=152 aos_md5=8584e9b064aa2734d67438ffe9c3e699 x_md5=3d3203e5b6509a453b9cf34f65df830f
+[gemv-ab] slot=151 soa_md5=76de694b31d4a44faa63ae8539fc8f0e inverse=OK
+[gemv-ab] slot=152 seed=153 aos_md5=e637a6c818b6138cb4941553c70d1b82 x_md5=8a783909b929d2fa01e1d49bd6fa7461
+[gemv-ab] slot=152 soa_md5=48ffeffdd63bf148ea80b1a1ffa60559 inverse=OK
+[gemv-ab] slot=153 seed=154 aos_md5=9385bf700514dc316cd9774871203ccf x_md5=70fb172df0e03c4b5799c3aabd36dd82
+[gemv-ab] slot=153 soa_md5=38e450509954438291cfd637535b744b inverse=OK
+[gemv-ab] slot=154 seed=155 aos_md5=924ce5d9681f94923fd42fdb106adbc3 x_md5=82658f5e312dc2d256527825b8c04b5f
+[gemv-ab] slot=154 soa_md5=81bd2a17302b269335c36d7f5d1d3cd6 inverse=OK
+[gemv-ab] slot=155 seed=156 aos_md5=e34f86a028d4d02744c7dc6eb4b62562 x_md5=642b05afd32fec22c6c458691675b580
+[gemv-ab] slot=155 soa_md5=0def8e8ba5d6c52db4c17670c59b9938 inverse=OK
+[gemv-ab] slot=156 seed=157 aos_md5=e354be50326dd44f987698cd3d5ba923 x_md5=37bb9e91f50de4b3e925f7a9699800c2
+[gemv-ab] slot=156 soa_md5=ce3ac5f71302426ea52e20b3a00574be inverse=OK
+[gemv-ab] slot=157 seed=158 aos_md5=6087a606819f19f1f9f1106cc4d06887 x_md5=162ba45fb90d26c7fe26b2e39b738788
+[gemv-ab] slot=157 soa_md5=a9d49b92bf118cce2aaaf15cce50a15e inverse=OK
+[gemv-ab] slot=158 seed=159 aos_md5=aaa35b13566e9d395cccee72abf405d1 x_md5=f627da6ee4f48c6d5c1d2e9faaadbeb8
+[gemv-ab] slot=158 soa_md5=6531d3b0480dd1b79744b9850b9a3776 inverse=OK
+[gemv-ab] slot=159 seed=160 aos_md5=9f610b45d50907d4b29d685b37d36580 x_md5=3bab40c4ab30cabe60153f4a11939880
+[gemv-ab] slot=159 soa_md5=86c8a34341f10cf8ad49bccf421a71d4 inverse=OK
+[gemv-ab] slot=160 seed=161 aos_md5=da5122a22115fb93ab0b8964a60f0fee x_md5=d5a281f1214941573ee66ab059548b23
+[gemv-ab] slot=160 soa_md5=b950fbaf1a416608d0bd7a8eccf20ee2 inverse=OK
+[gemv-ab] slot=161 seed=162 aos_md5=61dd11f6db2cc24be73d54db444bc498 x_md5=94530bb0e9b7625bd61f0e54c1219ea9
+[gemv-ab] slot=161 soa_md5=6181bc36eb5fb41620cc882fd1f90f48 inverse=OK
+[gemv-ab] slot=162 seed=163 aos_md5=996ef546f54a0c46d4c43db25d896f58 x_md5=96f448b43e708e86dbadae5bf067fddc
+[gemv-ab] slot=162 soa_md5=a723e31b6b00f14c237a0f8a0fa85d34 inverse=OK
+[gemv-ab] slot=163 seed=164 aos_md5=96c038a8eef142803b700c7779f7d8da x_md5=6e5fe6d26fae2d33940af36202c0c83e
+[gemv-ab] slot=163 soa_md5=f1fd034f13fc182e6a3468942d4e85f1 inverse=OK
+[gemv-ab] slot=164 seed=165 aos_md5=962464314585f5f9d32a2be1d37801f7 x_md5=0a4662090d82e48d8b31ce623c25917a
+[gemv-ab] slot=164 soa_md5=cac9baaf49be618e8196a701c975f405 inverse=OK
+[gemv-ab] slot=165 seed=166 aos_md5=e7a94f43331568afd1668112e0b16277 x_md5=71ef6362a23ae1e5c250dc78d1bf306f
+[gemv-ab] slot=165 soa_md5=593329121770a9bad8120cbae336abe7 inverse=OK
+[gemv-ab] slot=166 seed=167 aos_md5=1ba9d3cf7f37514515c88e96005a8c4f x_md5=3f9cc3a02975d1989fe9a27def72c897
+[gemv-ab] slot=166 soa_md5=e7f21e4070c0fe2dec16dd1fa651e6ce inverse=OK
+[gemv-ab] slot=167 seed=168 aos_md5=1ceafafb25fe0e2d49072b4d08e2e6e4 x_md5=7b2a2418514db55af9b253cd6358cc29
+[gemv-ab] slot=167 soa_md5=de0524d41d9bc54d51bbd4288763b9fe inverse=OK
+[gemv-ab] slot=168 seed=169 aos_md5=f9765042043bac922677c8993465a58e x_md5=d108483fdd0055482356c1e584622e6c
+[gemv-ab] slot=168 soa_md5=d3db464f892a9596770fd8c9b427a06e inverse=OK
+[gemv-ab] slot=169 seed=170 aos_md5=9b9c12694e6bb3250c700e35fcdb241e x_md5=4adb2c59a35b9722a7d3152e0a07b489
+[gemv-ab] slot=169 soa_md5=71982b5e2d5aee2c922909b81d838071 inverse=OK
+[gemv-ab] slot=170 seed=171 aos_md5=9c1e95124e41a4d697d39eef637fa6ce x_md5=a1a3b53e3a2ffe2f0c1915dcb49eaa45
+[gemv-ab] slot=170 soa_md5=8c38866dad01e000b07736639f7ece2f inverse=OK
+[gemv-ab] slot=171 seed=172 aos_md5=1e2370f56ecddd543be3189945d9d61e x_md5=212a0b21f473846d33900f15b867005b
+[gemv-ab] slot=171 soa_md5=69c89c909590e9351773b0e7120a699b inverse=OK
+[gemv-ab] slot=172 seed=173 aos_md5=f6764362b3b47e9abc95fada3eac77b4 x_md5=487003774a75beb0033ff23504b9ab7b
+[gemv-ab] slot=172 soa_md5=3557b547a440e53c384d59e61cb31b06 inverse=OK
+[gemv-ab] slot=173 seed=174 aos_md5=2d5596c5b1721a3aa3ad6c2d13a9cd86 x_md5=001d0cde972a35273197881283d448e7
+[gemv-ab] slot=173 soa_md5=94de66656fa66d6ad73e93ce21f2b481 inverse=OK
+[gemv-ab] slot=174 seed=175 aos_md5=6c7c2d2fcf578eef111129ebd1662714 x_md5=c6e86cdeaa98e6b1b3216f398c8b469c
+[gemv-ab] slot=174 soa_md5=23dd4ea000cc3ab04470bb9427e63e46 inverse=OK
+[gemv-ab] slot=175 seed=176 aos_md5=e142c0ec2eeefb3782e01c5cf25dacc5 x_md5=752429248019e24e2db29fc841ab8c9d
+[gemv-ab] slot=175 soa_md5=6961ba6ffa8dbab601a780aabfcaa7df inverse=OK
+[gemv-ab] slot=176 seed=177 aos_md5=3f5acaeda3515e33f2e0b6f8bb2fe383 x_md5=6352b856ce2ae679b58707bd0f0f23f6
+[gemv-ab] slot=176 soa_md5=4e9d736795854a1a53e919d8f3fc5aee inverse=OK
+[gemv-ab] slot=177 seed=178 aos_md5=052638f718541cdb930d195c6f010c66 x_md5=a627f66a037bbcc12394b695d68f9e80
+[gemv-ab] slot=177 soa_md5=fcd67d4f5e0fc6800070dab86e9894f8 inverse=OK
+[gemv-ab] slot=178 seed=179 aos_md5=0ede58ae7f896be5de22a63b301234c9 x_md5=44cb2a6757f655979ad24e91f22ba722
+[gemv-ab] slot=178 soa_md5=83b2f4b5aeb8dc4ba831622ecd6d7a86 inverse=OK
+[gemv-ab] slot=179 seed=180 aos_md5=b66b7181ed14004eaf910190e11ad110 x_md5=45058f491569bd0dd92bc4d8d151304f
+[gemv-ab] slot=179 soa_md5=94fbd26527f87b8918bdd6acc5820aae inverse=OK
+[gemv-ab] slot=180 seed=181 aos_md5=b4e2eb36a06e5b27a94b1eb7ee1a3cb7 x_md5=170e9c3506a9382292db9c5be4cd6bac
+[gemv-ab] slot=180 soa_md5=2c237bbe426f058e6a34af521138c71d inverse=OK
+[gemv-ab] slot=181 seed=182 aos_md5=3bafe6a7bf6caef5dfc5f40dcdfc6b8d x_md5=c6ae3da9ca65b98f9c79493556ed7ada
+[gemv-ab] slot=181 soa_md5=fb0b0ea60b82139ae519dbda5bc1ac28 inverse=OK
+[gemv-ab] slot=182 seed=183 aos_md5=be2860eb6e363880c101ce68d92d089a x_md5=83309eb77c40dc2008697c8170026795
+[gemv-ab] slot=182 soa_md5=8e6165d7fb543ad385586065f7f2bfd9 inverse=OK
+[gemv-ab] slot=183 seed=184 aos_md5=3880db77e3715895fe0fcd9afbc7e723 x_md5=b8035969ca200b0396677212fa43caa6
+[gemv-ab] slot=183 soa_md5=1a00f240ec40074a4e5a02dc55c513cc inverse=OK
+[gemv-ab] slot=184 seed=185 aos_md5=6f5b17d45a97699ec374f4dc1573a38d x_md5=5ddf5865328edd72e81a0f8154ca7923
+[gemv-ab] slot=184 soa_md5=0b381a6d2c39f5b67a743810bb31277d inverse=OK
+[gemv-ab] slot=185 seed=186 aos_md5=974ce655d281c7f4743de97d2e116446 x_md5=9b997933b796423cd5d274da3c270fe3
+[gemv-ab] slot=185 soa_md5=9d36a57f6189036b5541401bb6c3393a inverse=OK
+[gemv-ab] slot=186 seed=187 aos_md5=9efbdcbfa9c1f4349ee2b4f50e000aa4 x_md5=b42a5fe39aff6f5d826b44141d582347
+[gemv-ab] slot=186 soa_md5=e6abc76705c78600030d9ef4a0851824 inverse=OK
+[gemv-ab] slot=187 seed=188 aos_md5=bade2ef50fc9566f553c144f0e015f3b x_md5=5d5659da75615bf26e9fd14a77cfa6a3
+[gemv-ab] slot=187 soa_md5=8fecd41f3dc8d4a0df53264ad8a976b5 inverse=OK
+[gemv-ab] slot=188 seed=189 aos_md5=fddcce1379ac5796b057fa4f962668f1 x_md5=2a40c14e8f55409578c20f3df8acbf36
+[gemv-ab] slot=188 soa_md5=0c73616cf3f4f16fadcdd25d8be12de1 inverse=OK
+[gemv-ab] slot=189 seed=190 aos_md5=79e592346a4adf3e372f93f599efe052 x_md5=8393c58d6711061f079b1321680f4fa2
+[gemv-ab] slot=189 soa_md5=2c821c6c1a2c9ac5fb1bdcd4f0b94180 inverse=OK
+[gemv-ab] slot=190 seed=191 aos_md5=d8360347324b4b50850ae72c1e12dfc9 x_md5=73e29e449cbcb2be8fb770385c984356
+[gemv-ab] slot=190 soa_md5=05929761174fbc24f13be08790e187fb inverse=OK
+[gemv-ab] slot=191 seed=192 aos_md5=130c2d2482ca861131c9feb7d84a5a8e x_md5=0e04e11db37d0e1ee9607468a5e55b00
+[gemv-ab] slot=191 soa_md5=66a99ac32dd8a4a4c6959e91c4e5c146 inverse=OK
+[gemv-ab] slot=192 seed=193 aos_md5=a14107dc9b9d92d3815fcdd655a9a5fc x_md5=cac4387f09f74b1da65a3906ba5c555b
+[gemv-ab] slot=192 soa_md5=d6591efc07d03b3c2804bb36966538c4 inverse=OK
+[gemv-ab] slot=193 seed=194 aos_md5=867fc21c89f4214f8dfd9d1c9e8c548d x_md5=8a6710c9c866f1c24952a89adca03c91
+[gemv-ab] slot=193 soa_md5=67ac9ccbb4f87d8d77713d1e96e16078 inverse=OK
+[gemv-ab] slot=194 seed=195 aos_md5=2bca0bdd5c6c579cdf422292d89b51d6 x_md5=378d865f5fcb37ea834b89e0c28ad5c4
+[gemv-ab] slot=194 soa_md5=a6b2eb2192fd921d87c2af1f7c3f15c2 inverse=OK
+[gemv-ab] slot=195 seed=196 aos_md5=259d45c3c7e2b097ff6e2a61b2ad7521 x_md5=7dde5b826e2bbdef7d231ba73e3a7c76
+[gemv-ab] slot=195 soa_md5=f1435138645dbdd9072eab40aecc9787 inverse=OK
+[gemv-ab] slot=196 seed=197 aos_md5=b9bf35b456f0ca1e044dc4f981bd42b1 x_md5=95d26ec50d507aaf735a29d7b0fe1778
+[gemv-ab] slot=196 soa_md5=682d02a59965ff05ac10dbc50ab922ad inverse=OK
+[gemv-ab] slot=197 seed=198 aos_md5=aaaf82c7ef03fface78c16730ce0795f x_md5=12fe827c37281cb48c2bd1ebc7e09aab
+[gemv-ab] slot=197 soa_md5=64ae9edf3fb5937a35d958d384f1294d inverse=OK
+[gemv-ab] slot=198 seed=199 aos_md5=b053ea67b096ca131cc2eac9aa5cf274 x_md5=5b98fbda219f0dbf95bb8578b0780de7
+[gemv-ab] slot=198 soa_md5=5ba588ece7f1aff762435153aa88858d inverse=OK
+[gemv-ab] slot=199 seed=200 aos_md5=01eb39c462f8dd6601868068fe57795e x_md5=ca27b43a89ea4bd46cdd94b658863400
+[gemv-ab] slot=199 soa_md5=da328ef5034c14c94d2d1e1bee8ba3de inverse=OK
+[gemv-ab] slot=200 seed=201 aos_md5=71b938a2591f13045c83d3825aa59db6 x_md5=a42540aa74dd735a708a21cf332ef5ff
+[gemv-ab] slot=200 soa_md5=63578ebed08261dbdddc6b206ff83b74 inverse=OK
+[gemv-ab] slot=201 seed=202 aos_md5=ecbfd793f88b54fc5db4aa868129ddad x_md5=7f766d8c9cf7efaaf66c457632bab6cb
+[gemv-ab] slot=201 soa_md5=970fd993b898db0c841e9038268130f4 inverse=OK
+[gemv-ab] slot=202 seed=203 aos_md5=dca24c98419e8cae276e0c766daa5de6 x_md5=7cde7654d4bbf076c87733241bb7afd8
+[gemv-ab] slot=202 soa_md5=3d5a77991b8512f579a488ec2e0842b8 inverse=OK
+[gemv-ab] slot=203 seed=204 aos_md5=313c1bd45261f8a992fc8c160c807ae3 x_md5=c5bb2c57980fb7a88351cd8435b05549
+[gemv-ab] slot=203 soa_md5=b8def103cccc02f2838ec219cb98bb08 inverse=OK
+[gemv-ab] slot=204 seed=205 aos_md5=118d9a72a7f64c7b50f99c40976670c0 x_md5=ccea6cef45fc4f29adfe1e5f5c9ac8a6
+[gemv-ab] slot=204 soa_md5=7eb0ea74dbd4e838fe03215410a0ff34 inverse=OK
+[gemv-ab] slot=205 seed=206 aos_md5=46e20bd2ee886059bdb0e9c84c3c9d90 x_md5=22ff42c9529ba8e6bfe497dfeb3dfb76
+[gemv-ab] slot=205 soa_md5=c37887bcf46957ad4020264fa099d70f inverse=OK
+[gemv-ab] slot=206 seed=207 aos_md5=2048838922e38003a8b3a7281d65f672 x_md5=0a35688878092c52c5f72b860d3c6d08
+[gemv-ab] slot=206 soa_md5=74af56c7a312bc0f89a4319624017abb inverse=OK
+[gemv-ab] slot=207 seed=208 aos_md5=2b9b4a52b16a58068d46ee601dae378a x_md5=6655348de26f5e7737346c29acae9f99
+[gemv-ab] slot=207 soa_md5=9f86f03b574089b6ad9f5829b4509e77 inverse=OK
+[gemv-ab] slot=208 seed=209 aos_md5=7c1fb431e92e5278c3ae390777dea0e0 x_md5=58deb689f7b9b36d80b2afbbff9c510d
+[gemv-ab] slot=208 soa_md5=7a15182c8c3fe1d42264a8ba286eea89 inverse=OK
+[gemv-ab] slot=209 seed=210 aos_md5=e0d511db7108e876bd074e16782461bd x_md5=2f9fd59b3676ba73d200063135be0ff3
+[gemv-ab] slot=209 soa_md5=a254d07465aec04e6919131c6c0a1164 inverse=OK
+[gemv-ab] slot=210 seed=211 aos_md5=006ba92257ac07cec2e9264e1465cefe x_md5=6745ad2fc8406f8bc90588030ce1c4cc
+[gemv-ab] slot=210 soa_md5=6df719d5bc3704a169bbd05b84b6a9e1 inverse=OK
+[gemv-ab] slot=211 seed=212 aos_md5=d8e6d9425d0d5c91339a20d260d7f1a0 x_md5=33062e8d61f43d5a39b94a7ba2e320b5
+[gemv-ab] slot=211 soa_md5=970a0c34f79067135abeee50e797aabf inverse=OK
+[gemv-ab] slot=212 seed=213 aos_md5=4d7fa6327e4266954f54277820e8a33c x_md5=cb64268ef2595690f7c35deee283da30
+[gemv-ab] slot=212 soa_md5=800820e1bb3f1c3c6f2f848e1cb21554 inverse=OK
+[gemv-ab] slot=213 seed=214 aos_md5=d27b26675b2faaab589e555404017ba7 x_md5=e082af7f3139a08ab2652afd175c7abc
+[gemv-ab] slot=213 soa_md5=50bbb2b2794769f5a7b70167ea727ae7 inverse=OK
+[gemv-ab] slot=214 seed=215 aos_md5=1849484f2eab109760737aa69e7cf1fa x_md5=eb3f6dea00640ae11b91020d662c8c5b
+[gemv-ab] slot=214 soa_md5=7fa2108b1bdd23b54395ff7aee18ec46 inverse=OK
+[gemv-ab] slot=215 seed=216 aos_md5=7034284d588492c242f2eaf147e18135 x_md5=9a44785fb0763ae134cc5ed2cb8ccb2b
+[gemv-ab] slot=215 soa_md5=8a2de16dc22c678d225c8e3905d838bf inverse=OK
+[gemv-ab] slot=216 seed=217 aos_md5=91cbdb94350d359e05f5cc95716d4ca4 x_md5=b891c11830483cb459a0333676033457
+[gemv-ab] slot=216 soa_md5=a2f304421b3e6877f33a489062515dfe inverse=OK
+[gemv-ab] slot=217 seed=218 aos_md5=1386a0f32fc2cdc079f9789d0ee70b98 x_md5=4f65bbf68b0cb4ef373dce8d911ca825
+[gemv-ab] slot=217 soa_md5=5edb7b207b5ff5143a9cc1399f468880 inverse=OK
+[gemv-ab] slot=218 seed=219 aos_md5=4f886a4a68514f7cac32a2b0f405ed06 x_md5=4ee5974c9ea414cea752b6664045245c
+[gemv-ab] slot=218 soa_md5=aef64a60e85574f12f1deb80f778c45e inverse=OK
+[gemv-ab] slot=219 seed=220 aos_md5=10a5b217ba1f9943dd80d9edaa241e5b x_md5=e4317dc8021bc89f84bde65f74acc8c3
+[gemv-ab] slot=219 soa_md5=3bfe91ebd010203efc7364aac6880c70 inverse=OK
+[gemv-ab] slot=220 seed=221 aos_md5=1ad929b1ba8a248c56da3c6ed791bbb6 x_md5=04e0076933f50206c4d724631fbc1b45
+[gemv-ab] slot=220 soa_md5=daeaa4bd6cb2c06cfe17e21581ab6e63 inverse=OK
+[gemv-ab] slot=221 seed=222 aos_md5=f79c391334ebe1812dbd7f1ad10384a4 x_md5=4d177c5ebd51cb15eb7245c821afa640
+[gemv-ab] slot=221 soa_md5=8dec3eb8c21b36ba760a149b9e3569f4 inverse=OK
+[gemv-ab] slot=222 seed=223 aos_md5=9fbb2253aa0875e7e5f449c7968e5f8a x_md5=aa003f474f1a024196ef900cd13c5e62
+[gemv-ab] slot=222 soa_md5=f4bc3bbe352ba851f71a16cbc25c1f3f inverse=OK
+[gemv-ab] slot=223 seed=224 aos_md5=867eb95d9b2b900a4918e9825884f5db x_md5=f77b96d33f7f36e33b40f0846b1a17d1
+[gemv-ab] slot=223 soa_md5=ea7286911489bef4ffe8d27fb19aa04b inverse=OK
+[gemv-ab] slot=224 seed=225 aos_md5=52d977ee6284200a477c9afd70c18db7 x_md5=2b8a04f7df3ccd49d6e7580d4556ec85
+[gemv-ab] slot=224 soa_md5=6f00a4b4e441dc2e3d0b4024f29a47c9 inverse=OK
+[gemv-ab] slot=225 seed=226 aos_md5=fcfdc4b30f0114d6709876f90c1c2e41 x_md5=d8262ccb17a73be149cf2dc511185657
+[gemv-ab] slot=225 soa_md5=75846df6ab264188baa1ea64ffd8b906 inverse=OK
+[gemv-ab] slot=226 seed=227 aos_md5=ed0f8346818f982a17c52119adf619cb x_md5=af03b496cc9cb92e8ab6cc9dcb7ea919
+[gemv-ab] slot=226 soa_md5=453d2763ed79a3b39e637c2efc7b03d8 inverse=OK
+[gemv-ab] slot=227 seed=228 aos_md5=5c67e29fd7cf8de6489a9f8cd1670e62 x_md5=fd83f62dae516dafed89dae0bfc3978a
+[gemv-ab] slot=227 soa_md5=fd38c17dc0f7bc7d0d9b9257b4258ee7 inverse=OK
+[gemv-ab] slot=228 seed=229 aos_md5=b95183d74b98b999d09d25867d9765ed x_md5=db9b5c8c8efd004bed6529abb964307b
+[gemv-ab] slot=228 soa_md5=fec576254b20391a7ba3573df810b5bf inverse=OK
+[gemv-ab] slot=229 seed=230 aos_md5=c8699eb70cfac5c846c6a27a64e61d72 x_md5=7d8857b9a1c43962dc31647f3f9a999a
+[gemv-ab] slot=229 soa_md5=709fc84fe6e5e34417d4a04d00595541 inverse=OK
+[gemv-ab] slot=230 seed=231 aos_md5=d83c163f8dd77d2e1a0eb06c69a6253d x_md5=79979501befbfedb355d258c46042720
+[gemv-ab] slot=230 soa_md5=db59e248feb50dfa57ea099525574668 inverse=OK
+[gemv-ab] slot=231 seed=232 aos_md5=21ff45b8146446fe618ad511eaf008da x_md5=d5788a3e3dcc693a46b724699e42174f
+[gemv-ab] slot=231 soa_md5=d476163fe2f0cb61d86b9196f2d9f89f inverse=OK
+[gemv-ab] slot=232 seed=233 aos_md5=6df668766ae696312516e4ca6ab7419c x_md5=591f2b4f295644a074cfd9fe81cdccbe
+[gemv-ab] slot=232 soa_md5=069e692fbb167b085dd73a0c65a86734 inverse=OK
+[gemv-ab] slot=233 seed=234 aos_md5=b5f3a2d161424c51a481145af611bcdd x_md5=d2d8b54c57618ae71d06f57aa8a778d2
+[gemv-ab] slot=233 soa_md5=35bef85cd5973aa08b4dc783a243d9c7 inverse=OK
+[gemv-ab] verify slot=0 seed=1 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=1 seed=2 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=2 seed=3 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=3 seed=4 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=4 seed=5 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=5 seed=6 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=6 seed=7 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=7 seed=8 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=8 seed=9 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=9 seed=10 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=10 seed=11 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=11 seed=12 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=12 seed=13 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=13 seed=14 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=14 seed=15 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=15 seed=16 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=16 seed=17 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=17 seed=18 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=18 seed=19 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=19 seed=20 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=20 seed=21 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=21 seed=22 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=22 seed=23 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=23 seed=24 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=24 seed=25 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=25 seed=26 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=26 seed=27 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=27 seed=28 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=28 seed=29 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=29 seed=30 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=30 seed=31 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=31 seed=32 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=32 seed=33 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=33 seed=34 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=34 seed=35 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=35 seed=36 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=36 seed=37 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=37 seed=38 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=38 seed=39 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=39 seed=40 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=40 seed=41 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=41 seed=42 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=42 seed=43 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=43 seed=44 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=44 seed=45 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=45 seed=46 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=46 seed=47 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=47 seed=48 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=48 seed=49 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=49 seed=50 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=50 seed=51 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=51 seed=52 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=52 seed=53 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=53 seed=54 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=54 seed=55 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=55 seed=56 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=56 seed=57 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=57 seed=58 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=58 seed=59 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=59 seed=60 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=60 seed=61 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=61 seed=62 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=62 seed=63 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=63 seed=64 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=64 seed=65 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=65 seed=66 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=66 seed=67 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=67 seed=68 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=68 seed=69 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=69 seed=70 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=70 seed=71 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=71 seed=72 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=72 seed=73 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=73 seed=74 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=74 seed=75 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=75 seed=76 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=76 seed=77 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=77 seed=78 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=78 seed=79 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=79 seed=80 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=80 seed=81 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=81 seed=82 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=82 seed=83 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=83 seed=84 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=84 seed=85 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=85 seed=86 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=86 seed=87 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=87 seed=88 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=88 seed=89 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=89 seed=90 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=90 seed=91 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=91 seed=92 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=92 seed=93 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=93 seed=94 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=94 seed=95 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=95 seed=96 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=96 seed=97 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=97 seed=98 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=98 seed=99 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=99 seed=100 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=100 seed=101 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=101 seed=102 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=102 seed=103 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=103 seed=104 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=104 seed=105 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=105 seed=106 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=106 seed=107 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=107 seed=108 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=108 seed=109 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=109 seed=110 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=110 seed=111 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=111 seed=112 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=112 seed=113 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=113 seed=114 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=114 seed=115 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=115 seed=116 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=116 seed=117 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=117 seed=118 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=118 seed=119 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=119 seed=120 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=120 seed=121 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=121 seed=122 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=122 seed=123 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=123 seed=124 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=124 seed=125 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=125 seed=126 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=126 seed=127 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=127 seed=128 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=128 seed=129 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=129 seed=130 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=130 seed=131 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=131 seed=132 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=132 seed=133 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=133 seed=134 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=134 seed=135 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=135 seed=136 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=136 seed=137 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=137 seed=138 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=138 seed=139 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=139 seed=140 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=140 seed=141 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=141 seed=142 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=142 seed=143 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=143 seed=144 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=144 seed=145 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=145 seed=146 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=146 seed=147 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=147 seed=148 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=148 seed=149 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=149 seed=150 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=150 seed=151 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=151 seed=152 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=152 seed=153 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=153 seed=154 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=154 seed=155 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=155 seed=156 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=156 seed=157 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=157 seed=158 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=158 seed=159 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=159 seed=160 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=160 seed=161 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=161 seed=162 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=162 seed=163 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=163 seed=164 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=164 seed=165 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=165 seed=166 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=166 seed=167 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=167 seed=168 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=168 seed=169 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=169 seed=170 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=170 seed=171 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=171 seed=172 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=172 seed=173 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=173 seed=174 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=174 seed=175 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=175 seed=176 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=176 seed=177 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=177 seed=178 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=178 seed=179 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=179 seed=180 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=180 seed=181 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=181 seed=182 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=182 seed=183 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=183 seed=184 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=184 seed=185 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=185 seed=186 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=186 seed=187 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=187 seed=188 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=188 seed=189 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=189 seed=190 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=190 seed=191 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=191 seed=192 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=192 seed=193 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=193 seed=194 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=194 seed=195 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=195 seed=196 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=196 seed=197 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=197 seed=198 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=198 seed=199 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=199 seed=200 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=200 seed=201 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=201 seed=202 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=202 seed=203 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=203 seed=204 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=204 seed=205 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=205 seed=206 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=206 seed=207 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=207 seed=208 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=208 seed=209 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=209 seed=210 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=210 seed=211 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=211 seed=212 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=212 seed=213 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=213 seed=214 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=214 seed=215 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=215 seed=216 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=216 seed=217 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=217 seed=218 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=218 seed=219 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=219 seed=220 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=220 seed=221 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=221 seed=222 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=222 seed=223 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=223 seed=224 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=224 seed=225 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=225 seed=226 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=226 seed=227 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=227 seed=228 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=228 seed=229 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=229 seed=230 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=230 seed=231 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=231 seed=232 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=232 seed=233 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=233 seed=234 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] timing rotations=1 timed_iters=234 (requested iters=60)
+[gemv-ab] per-arm wall warmup_ms=250
+[gemv-ab] arm=hipcc host_submit_mean=0.695us host_window=2541.6us
+[gemv-ab] arm=hipcc raw_host_submit_us=1.2030,0.6910,0.6210,0.6010,0.5910,1.0220,0.6110,0.6210,0.5810,0.5910,0.5810,1.0110,0.6020,1.0420,0.8010,1.2730,0.7910,0.9620,0.7510,1.1530,0.8510,1.0820,0.8520,1.0220,1.1520,0.8420,1.5330,0.6610,1.0920,1.3430,0.9010,0.9210,0.9520,0.7620,1.0120,1.0820,1.0920,0.7310,0.8320,0.8010,1.2330,0.8710,0.6420,0.5910,0.6110,0.6010,0.5710,0.5910,1.0510,0.5710,0.5710,0.6910,0.5810,0.6010,1.0020,0.5910,0.9710,0.5820,1.0320,1.1320,0.6010,0.6010,0.5810,0.5810,0.5710,0.6020,1.1920,1.0420,0.5910,0.6110,0.5910,0.5820,0.5910,0.6110,0.6010,0.5610,0.5910,0.5920,0.5810,1.0220,0.6010,0.6010,0.6010,0.5910,0.5920,0.5810,0.5910,0.5910,0.5810,1.0020,0.5610,0.6010,0.5710,0.5710,0.9920,0.9510,1.0320,0.5810,0.5910,0.5610,0.5910,1.0120,0.5710,0.6010,0.6010,0.5710,0.5910,0.5710,0.5910,0.5810,0.5910,1.1720,0.6110,0.6010,0.6010,1.0220,0.6010,0.5910,0.5610,0.5920,0.5910,0.5910,0.6010,0.5910,0.5810,0.6020,1.0220,0.5810,0.5910,0.6010,0.5910,0.5910,0.5920,0.5710,1.3620,1.0220,0.9920,0.5810,0.5910,0.5920,0.5910,0.5910,0.5810,0.5810,0.5910,0.5920,0.6010,0.6410,0.5910,0.6010,0.6120,0.5810,0.6010,0.5910,0.5910,1.0320,0.5810,0.5810,0.5820,0.5710,0.5810,0.5810,0.5710,0.6410,0.5710,0.6110,0.5810,0.5910,0.5810,0.5610,0.5810,0.6420,0.6110,0.5710,0.5610,0.5910,0.5910,0.6020,0.6010,0.6410,0.5810,0.5910,0.5710,0.5910,0.6010,0.5910,0.6010,0.6410,1.0320,0.6120,0.5910,1.0720,0.5710,0.5910,0.5910,0.6620,0.6010,0.5910,0.5910,0.9920,0.5810,0.5910,0.6210,0.6510,0.5710,1.0520,0.6010,1.0520,0.6010,0.5910,0.6120,0.7510,0.5910,0.6010,0.5720,0.5910,1.0320,0.5910,0.5910,0.5910,0.5910,0.5920,0.6010,0.5910,0.5910,0.5810,0.5710,0.6220,0.5810,0.5610,0.5710,0.5810,0.5510,0.5910,1.0120,0.5910,1.0110,0.6320,0.6110,0.5910,0.5810,0.5810,0.6010,0.5910,0.6210,1.0220,0.5810,0.5810,0.5710,1.1420,0.5910,0.7010,0.5710,1.0220,0.6210,0.6120,0.6410,0.5910,0.5910,0.5910,1.0120,0.5910,0.6620,0.5910,0.5810,0.5910,1.1020,1.1320,0.5820,0.6310,0.6210,0.6210,0.5810,1.0020,0.6220,0.5910,0.6210,0.6310,1.0320,0.5810,0.5810,0.6120,0.6710,0.6810,0.6210,1.0920,0.6310,0.5810,0.6110,0.5910,0.5810,1.0720,1.0520,0.6410,0.6210,0.6210,0.6010,0.5820,0.5810,0.6010,0.6010,0.5910,0.5710,0.6220,0.9910,1.0420,0.6210,0.6110,0.5910,0.5910,0.5910,0.5820,0.6110,0.5910,0.6010,0.9920,0.9820,0.5910,0.5810,0.5810,0.5920,0.5810,0.6010,0.6310,0.6010,1.2930,0.6310,0.5910,1.0320,0.6010,0.5910,1.0310,0.5810,0.5910,0.5910,0.5910,0.5810,0.5910,0.6020,0.5910,0.5810,0.6110,1.0320,0.5710,0.5810,0.5710,0.5810,0.6010,0.5910,0.5910,0.5810,0.5910,0.5920,0.5910,0.5910,0.5710,0.5910,1.0620,0.5810,0.5820,0.5910,0.5810,1.0320,0.5810,0.5810,0.5910,1.0520,0.5910,0.5710,0.5710,1.0120,1.0120,0.5810,0.5910,0.5610,0.5910,0.5810,0.5810,0.5810,0.5710,0.5910,0.6210,0.5710,0.6210,0.5810,1.0420,0.6210,0.6110,0.6210,0.6210,0.6210,1.0620,1.0420,0.5810,0.5910,0.5810,1.0220,0.5810,0.5810,0.6210,0.6210,1.0120,0.6210,0.6410,0.5810,0.5810,1.1020,0.6110,0.5810,0.5810,0.6210,0.6720,0.5810,1.0220,0.5810,0.6110,0.6210,0.6220,0.5910,0.6410,0.6210,0.5910,1.0310,0.5720,1.0220,0.5810,0.5810,0.5910,1.0120,0.6110,0.5910,0.5910,0.6110,1.0720,0.5810,0.6510,0.5810,0.5910,0.5810,0.6210,0.6110,0.5710,0.6110,1.1830,0.5810,0.6210,0.5810,1.0220,1.0520,0.6110,0.6320,0.6610,0.6210,0.5910,0.5810,0.6120,0.5910,0.5910,0.6210,0.5910,1.0420,0.6010,0.5820,0.6310,0.5810,1.0420,0.5910,0.6410,1.0320,0.6210,0.6210,0.5810,0.9910,0.6120,0.6610,0.5910,0.5710,0.6010,0.5910,1.0620,0.5910,1.0520,0.6110,0.6310,0.5810,0.6220,1.0320,0.5810,0.6110,0.6010,1.1120,0.5810,1.0320,1.0120,0.5810,0.5920,0.5910,0.5810,1.0720,0.5910,0.5810,0.6310,0.6010,0.5810,0.5810,0.6210,0.6210,0.5720,1.0210,0.6010,1.0220,1.0420,1.0520,1.0220,1.5530,1.1320,0.7910,0.6720,0.7710,0.7010,0.7210,0.5610,0.6510,1.3530,0.7010,1.0020,1.2630,0.9910,0.5610,0.6810,0.8620,0.5610,0.6310,0.5610,0.5610,1.0220,0.6410,0.5610,0.5610,0.5610,0.7710,0.6820,0.5710,0.5510,0.5510,0.5610,0.7210,1.0320,0.5510,0.5620,0.5510,0.5910,0.7010,0.5610,0.5510,0.6720,0.5610,0.5610,0.9820,0.5510,0.6810,0.5610,0.5710,0.5620,0.9110,0.6820,0.6510,0.6610,0.6510,1.1720,1.1120,0.7610,0.6620,1.3220,1.1720,0.7020,0.6910,0.6710,0.6620,1.2120,1.0520,0.7920,0.6610,0.8310,0.5710,0.5510,1.1220,0.5510,0.5610,0.5610,0.5610,0.7120,0.5610,0.5610,0.9920,0.5710,0.9820,0.5610,0.5610,0.5510,0.5510,0.5510,0.5610,0.5510,0.5510,0.5610,0.5510,1.0120,0.5510,0.5610,0.5610,0.5510,0.5610,0.5610,0.9720,0.9820,0.5510,0.5510,0.5510,0.5610,1.0020,0.5820,0.5510,1.0220,0.5510,0.5610,0.5610,0.5510,0.5610,0.5610,0.5510,0.5610,0.5510,0.9920,1.1730,1.0020,0.9710,0.5620,0.5510,0.5510,0.5610,0.5710,0.5610,0.5610,1.0220,0.5910,1.0220,0.5510,0.5610,0.5620,1.2320,0.5610,0.5510,0.5610,0.5510,1.1120,0.6820,0.6910,0.7010,0.8310,1.1220,0.5710,0.5510,0.5510,0.5610,0.5610,0.5710,0.5510,0.5610,0.5610,0.5610,1.0020,0.5510,0.5810,0.5520,1.0010,0.5620,0.5610,0.5610,0.5610,0.5510,0.5510,0.5610,0.5610,0.5510,0.5610,1.0010,0.5510,0.5610,0.6610,0.5610,0.5610,0.5610,0.5610,0.5510,0.5610,1.0110,0.9520,0.9420,1.0020,0.5610,1.0120
+[gemv-ab] arm=hipcc raw_gpu_us_per_launch=3.5767,3.5275,3.5330
+[gemv-ab] arm=hipcc sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233
+[gemv-ab] arm=soa host_submit_mean=0.661us host_window=2539.3us
+[gemv-ab] arm=soa raw_host_submit_us=0.6820,1.0920,0.5910,0.6210,0.6110,1.0220,0.6220,0.5910,0.5810,0.5910,0.6110,1.2830,0.5710,0.6210,0.5810,0.6010,0.5920,0.5710,0.6110,1.0320,0.5910,0.5810,0.5910,0.5910,0.5820,0.8810,1.2430,0.8710,1.0320,1.9940,0.7520,1.4620,0.8020,1.0420,0.9720,1.1620,0.9120,0.8510,0.9110,0.8320,1.1720,0.8520,0.7310,1.1820,0.8020,1.0020,0.7310,0.8220,1.1020,0.8020,0.6410,0.6310,0.8020,1.0920,0.5910,0.6110,1.3230,0.5710,0.5910,0.5910,0.5810,0.5910,0.5920,0.5910,0.5810,0.5910,0.6110,0.5910,0.5720,0.5810,0.5910,0.5910,0.5910,0.5910,0.5810,0.6010,0.6010,0.5910,0.5810,1.0520,0.5910,0.6010,0.6010,0.5910,0.5710,0.5810,0.5910,1.0420,0.5910,0.6120,0.5710,0.5810,0.5910,0.5910,0.6010,0.5920,0.6010,0.5910,0.6010,0.6010,1.0020,0.5910,0.5920,0.6010,0.5910,0.6010,0.5710,0.5910,0.6020,0.6010,0.5910,0.6010,0.6010,0.5910,0.6020,0.5910,0.6110,0.5910,0.5810,0.5810,1.0320,0.5910,0.5910,0.6010,0.5910,0.5910,0.5810,0.5910,1.0410,0.6010,0.5910,0.5910,0.5810,0.5910,0.5710,0.6020,0.6010,0.5910,0.5910,0.5710,0.5910,0.5920,0.5910,0.5810,0.6010,0.5910,0.9720,0.5910,0.5810,0.5820,0.5710,0.6010,0.6110,0.6010,0.5910,0.5920,0.5810,0.5710,0.5910,0.5810,0.5910,0.5910,0.5920,0.6210,1.2920,0.5810,0.5920,0.6010,0.6010,0.5810,0.6010,0.6110,0.5810,0.5610,0.5710,0.6010,0.6010,0.5710,0.5910,0.5910,0.5910,1.0420,0.6010,0.5910,0.6010,0.5910,0.5910,0.6210,1.0220,0.6010,0.6010,0.5910,0.6120,1.0120,0.6010,0.5710,0.5810,0.5710,0.6110,0.5910,0.6110,0.6110,0.5910,0.5910,1.0120,0.5910,0.5810,0.5920,0.6010,0.6110,0.5910,0.5910,1.0320,0.5810,1.0620,0.5810,0.5910,0.5910,0.6210,0.5710,0.5910,0.6010,0.5910,0.5910,0.5910,0.5910,0.5910,0.6010,0.9820,0.5810,0.5810,0.5810,0.5910,0.6110,0.6610,0.6220,0.9910,0.5910,0.5810,0.5910,0.5910,0.6210,0.5920,1.0720,0.6210,0.5810,1.0620,0.6110,0.5910,1.0420,1.0420,0.6020,0.6210,0.5710,1.0120,0.5910,0.6110,0.6210,0.6220,0.5910,0.6110,0.6110,0.6010,0.5820,0.5910,1.0620,0.5910,1.0320,0.5910,0.6210,0.5810,0.5820,0.6210,1.0120,0.6110,0.5910,0.5810,0.5910,0.5820,0.5710,0.5910,0.6210,0.5810,0.5910,0.5810,0.5910,0.5710,1.0220,0.5910,0.5910,1.0020,0.6110,0.6210,0.5820,0.5810,0.6210,0.6110,0.5910,0.5910,0.6410,0.6110,0.5910,0.5810,0.6110,0.5920,0.6310,3.4560,0.7120,0.6310,0.6010,0.5710,0.6010,1.0830,0.6110,0.6010,0.5810,0.6110,1.0320,0.5810,0.5820,0.5910,0.5910,0.6510,0.6210,0.5920,arm                       us/launch  logicalGB/s  vs-base host_sub_us  exactness
+hipcc                          3.53          1.6    1.000      0.695  ref
+[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.5330 n_samples=3 (3 whole-batch windows; no min/best-of)
+soa                            3.54          1.6    1.002      0.661  pre-verified
+[gemv-ab] arm=soa gpu_us_per_launch_median=3.5388 n_samples=3 (3 whole-batch windows; no min/best-of)
+0.6110,0.5910,0.6210,0.5910,1.0320,0.5910,0.6320,0.5810,0.5910,0.5910,0.6210,0.5810,0.5810,0.6110,0.5910,0.6210,0.5910,0.5920,1.0110,0.9910,0.6220,0.6210,0.6210,0.5710,1.0120,1.0220,0.5910,0.6210,0.5810,0.6110,0.5910,0.5910,0.5710,0.5810,0.6120,0.6010,1.1120,0.6210,0.6210,0.5710,0.6210,0.6110,0.6210,0.5910,0.5910,0.6020,1.0320,0.5810,0.6310,1.0220,0.5810,0.6010,0.5910,0.5820,0.6010,0.6110,0.5910,0.6010,0.5810,0.6220,0.6010,0.5910,1.0220,0.5910,0.6210,0.5810,0.5810,1.0520,0.6110,0.5910,0.5910,1.0920,0.6110,0.6110,0.5810,0.5810,0.5910,0.5810,0.5910,0.6220,1.0720,0.5710,0.5710,1.0520,0.5810,0.6110,0.6220,0.6210,0.6210,1.0620,0.5910,0.6210,0.5820,0.6210,0.5910,0.6210,0.5710,0.5810,0.5820,0.6010,0.6210,0.5810,0.5710,0.6210,0.6220,0.6110,0.6210,0.5910,0.5910,0.6120,0.5910,0.5810,0.5810,1.0020,0.5910,0.5810,0.5810,0.5920,0.6010,0.6410,1.0420,0.5910,0.5910,0.6120,1.2520,0.6210,0.6010,0.5810,0.6010,0.5810,0.6110,0.5910,0.5810,0.5810,0.5910,1.0320,0.6210,0.5810,0.6310,0.5810,0.6120,0.6310,0.6010,0.6610,0.5720,0.5910,0.6110,0.6010,0.5810,0.6110,0.5920,0.6110,0.5710,0.6210,0.5810,0.5810,0.6020,0.6010,0.6310,0.5710,0.5810,0.6210,0.6410,0.5910,0.5710,0.6110,0.5910,0.5920,1.0420,0.6210,0.6210,1.0520,0.6210,1.0620,0.6320,0.6110,0.6210,1.0020,0.5810,0.5810,0.5910,0.5810,0.5810,0.6310,0.6110,0.5810,0.6010,0.6320,0.6110,0.6610,0.6510,0.6620,0.5610,0.6210,1.2620,0.6620,0.5710,1.1620,0.5810,0.5610,0.5510,0.5510,0.5610,0.5610,0.5610,0.7610,0.5510,0.5510,0.5520,1.3320,0.6210,0.5910,0.5510,0.5510,0.5610,0.6810,0.5610,0.5710,1.0020,0.5610,0.5610,0.5610,0.5610,0.5510,0.5510,0.5510,1.0420,0.6110,0.5610,0.5510,0.5510,0.5520,0.5610,0.5710,0.5710,0.5510,0.5610,1.0220,0.5910,0.6310,0.5510,0.5510,1.0120,1.0010,0.5510,0.5710,0.5510,0.5510,0.5610,0.5610,0.5610,0.5610,0.5610,0.5610,0.5610,0.5510,0.5610,0.5710,0.7710,0.5920,0.5710,0.5610,0.5610,0.5610,0.5510,0.5510,0.5610,0.5610,0.5510,0.5610,0.5610,0.9720,0.5510,0.5710,0.5510,0.5510,0.5510,0.5610,0.5610,0.5510,0.5510,0.5620,0.5610,0.5510,0.5610,0.5610,0.5710,0.5610,0.5610,0.5510,1.0120,0.5610,0.5510,0.5710,0.5610,0.5610,0.5610,0.5510,0.5610,0.5610,0.5510,0.9820,0.5610,1.0120,1.0120,0.9820,0.5710,0.5610,0.5510,0.5620,0.6010,0.5610,0.5610,0.5510,0.5510,0.5610,0.5610,0.5610,0.9720,0.5610,0.9620,0.9320,0.5810,0.9820,1.0120,1.0120,0.5610,0.9820,0.5610,0.5710,0.5510,0.5610,0.5620,0.5610,1.2120,0.5510,0.5510,0.5510,0.5610,0.5510,0.5620,0.5510,0.5610,0.9820,0.5510,0.5510,1.0120,0.5510,0.5710,0.5510,0.5610,0.5510,0.5610,0.5610,0.9810,0.5510,0.5620,0.5610,0.5610,0.5710,0.5610,0.5510,0.5610,0.5710,0.5610,0.5510,0.5710,0.5510,0.5710,0.5510,0.9920,0.9420,0.5710,0.5510,0.5610,0.5510,0.5610
+[gemv-ab] arm=soa raw_gpu_us_per_launch=3.5388,3.5870,3.5306
+[gemv-ab] arm=soa sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233
+== shape M=33 K=512 (groups=2) weight_bytes=8976 slots=117 working_set_bytes=1050192 ==
+[gemv-ab] logical_bytes/launch=11156 (analytical; not DRAM)
+[gemv-ab] slot=0 seed=1 aos_md5=6ed0a16a466e52d765899c507638d83f x_md5=04afca6cee9937deddcb64fff63e9406
+[gemv-ab] slot=0 soa_md5=42714bcfad004bf1b69a375219bdc84d inverse=OK
+[gemv-ab] slot=1 seed=2 aos_md5=2e050387180ec9fe901ce2d881f2c320 x_md5=f0c6c0752cfeb8866ab9ae628d39863a
+[gemv-ab] slot=1 soa_md5=1fe9fa218c1678d67a15e6a934118e60 inverse=OK
+[gemv-ab] slot=2 seed=3 aos_md5=5ad2f894b1a917e56cc334dda2534532 x_md5=e11cc7959d240a3a771a48a063865620
+[gemv-ab] slot=2 soa_md5=7241524eac25fbc64965bcbabb96dc7b inverse=OK
+[gemv-ab] slot=3 seed=4 aos_md5=58f333280e950dd1c017e213015b7976 x_md5=7f5bdfe7c86f4887f7a498249551ea29
+[gemv-ab] slot=3 soa_md5=598f99aa32ec11abe293fd7649319125 inverse=OK
+[gemv-ab] slot=4 seed=5 aos_md5=df3a8af38b6c1812bc91d019835e266c x_md5=bd615f0885a0222a9b0f842e4d9056f6
+[gemv-ab] slot=4 soa_md5=b6fd28f8489925cd12e91cc77fea4cf7 inverse=OK
+[gemv-ab] slot=5 seed=6 aos_md5=ba7f50e9eb8592fcb33f30a881a8fad0 x_md5=11eaf84838481941173274ea418439a2
+[gemv-ab] slot=5 soa_md5=573cfd5516e195e98553312d11e669ef inverse=OK
+[gemv-ab] slot=6 seed=7 aos_md5=d1c9ab3cb71388e10936f608b1f85418 x_md5=61dd40ecc4d83bb6374b977b82ecfca1
+[gemv-ab] slot=6 soa_md5=17b1bdefb2263203e53ad49ba27d86cc inverse=OK
+[gemv-ab] slot=7 seed=8 aos_md5=7a1d75e694a007fc9f982682d4ddf2a0 x_md5=9cfcf206cc6cfa43f24e499a1240bcc5
+[gemv-ab] slot=7 soa_md5=4d85aae7e0a5b78a0cfc6b49aa983d6c inverse=OK
+[gemv-ab] slot=8 seed=9 aos_md5=22a9dca10515c2305801d91fb6fe93c5 x_md5=ed228d35ffd36af33da0e5f8cc6d6e27
+[gemv-ab] slot=8 soa_md5=ed617063da68129d5db48b7ea716c859 inverse=OK
+[gemv-ab] slot=9 seed=10 aos_md5=216071507a6fd1c3b02cd8f9989b5169 x_md5=f92adfc7b57c2e185f3e7caa7c589e29
+[gemv-ab] slot=9 soa_md5=96a7fc20ed7023224578486fec602c7e inverse=OK
+[gemv-ab] slot=10 seed=11 aos_md5=ae7affeb5f32dc549133726bf8d3b696 x_md5=a73d93f259084ebe6f634d845e74fa1a
+[gemv-ab] slot=10 soa_md5=d35bc47f9890d937011ff9f1f29ee4bb inverse=OK
+[gemv-ab] slot=11 seed=12 aos_md5=2562019875e1db9c04edb628a3c967e8 x_md5=f62e41d164201c37c42a61fd44d63fcf
+[gemv-ab] slot=11 soa_md5=27892575a2e7bb5bf4918f2c59f320dd inverse=OK
+[gemv-ab] slot=12 seed=13 aos_md5=116f7601f182bafded1b26dc92461f77 x_md5=df73ccc71487c84664842eb2e731a1a1
+[gemv-ab] slot=12 soa_md5=273b0ae9408b94ca5746c017c08afea8 inverse=OK
+[gemv-ab] slot=13 seed=14 aos_md5=b341e8c8df6fed3d1d1ceec71cf8de70 x_md5=03c0121c5d5593384f5d3473da0fb16f
+[gemv-ab] slot=13 soa_md5=d0c77c109856dd2e37cc69de165e2834 inverse=OK
+[gemv-ab] slot=14 seed=15 aos_md5=fec5b0a9d05a5febf5764bca9dcff5cd x_md5=4af80476240cbf8a14f35ca5ada1532e
+[gemv-ab] slot=14 soa_md5=d34f3fbe80641978b06627d5b1cb403a inverse=OK
+[gemv-ab] slot=15 seed=16 aos_md5=01734e30184920847a006c16a6ede57f x_md5=e20b2827b1569644feee40c06b90c7f7
+[gemv-ab] slot=15 soa_md5=2e2274cfacc70e0b11d31fb6dfd3225e inverse=OK
+[gemv-ab] slot=16 seed=17 aos_md5=42b9bf7d91c6b470246855c1323e1204 x_md5=3e9e13da8fab3cc13990e133d8b03c5b
+[gemv-ab] slot=16 soa_md5=6bf097d078248e1ba3bd140696dc66bc inverse=OK
+[gemv-ab] slot=17 seed=18 aos_md5=cee231ab9767f63c59b89ef162f20c5d x_md5=7f04a6ea3fbfd435e457ef825d420c28
+[gemv-ab] slot=17 soa_md5=2602ec14e9b09607355e17cc8dbf0e66 inverse=OK
+[gemv-ab] slot=18 seed=19 aos_md5=2f287a7f6e3e9afeb98a456c67ddc9c7 x_md5=e710f5ac946649acf11a3b94e6f7b2b8
+[gemv-ab] slot=18 soa_md5=92bb21e34210131c2fa6cca964d4a186 inverse=OK
+[gemv-ab] slot=19 seed=20 aos_md5=4c60d7cbf9c24ef60e76d70512bfc6eb x_md5=77af57c6d39e3ac4767ded664608a704
+[gemv-ab] slot=19 soa_md5=b32e077f758497d48d748be12ecd8a1b inverse=OK
+[gemv-ab] slot=20 seed=21 aos_md5=11a567dd48a4e09dbe8a82bf8a680811 x_md5=321cba9f59877d593b0d1a16737ebdbf
+[gemv-ab] slot=20 soa_md5=a5780cadb905048a9bcc3062253d1629 inverse=OK
+[gemv-ab] slot=21 seed=22 aos_md5=15bbdce40c4f2f19f61f89ee7951f670 x_md5=d4194560407969d6b70e6c65afb7f04e
+[gemv-ab] slot=21 soa_md5=52ab1542f638986f8fc3f2e37e00bc85 inverse=OK
+[gemv-ab] slot=22 seed=23 aos_md5=4dce0c7d21938cebb2f20514214ce476 x_md5=df73214b94893f6ea8375968a9a326a6
+[gemv-ab] slot=22 soa_md5=469086d22871412037b5690e9c919ebc inverse=OK
+[gemv-ab] slot=23 seed=24 aos_md5=cccb251e5253360d6fbde3921a61ca65 x_md5=a873416ffc9437ad9fd2fcd2c11f54e1
+[gemv-ab] slot=23 soa_md5=9463c1a07e5850debc39d050eb19acef inverse=OK
+[gemv-ab] slot=24 seed=25 aos_md5=20ef33958cd6c41c42eec40abb8b5b94 x_md5=05fb2c8aa180388ad64168249b0e4645
+[gemv-ab] slot=24 soa_md5=fe1163ab4a1b8a580d394280877ce2b6 inverse=OK
+[gemv-ab] slot=25 seed=26 aos_md5=5a43d5458525140b06d1c53db5e88e03 x_md5=0c4890a8009de8ef277826947ed37e17
+[gemv-ab] slot=25 soa_md5=67bf3e3add89cba1f9352c570a353585 inverse=OK
+[gemv-ab] slot=26 seed=27 aos_md5=554878326f148c9bfc631df823b7db83 x_md5=fa37b5fa043ed28bf8d58468ffb1b6f7
+[gemv-ab] slot=26 soa_md5=8a4f9d72cbf4b26857068a94120389fd inverse=OK
+[gemv-ab] slot=27 seed=28 aos_md5=50da732fd56d6bf107d75a291164384c x_md5=ef4344d2548f1883a94db6a8fff6e91d
+[gemv-ab] slot=27 soa_md5=6c9c06d403728decdf1863daaaa0b8d6 inverse=OK
+[gemv-ab] slot=28 seed=29 aos_md5=fdc04a62ae320ab7461bdf1386133bdf x_md5=423541c4f75b3031f5f03240e67f5f85
+[gemv-ab] slot=28 soa_md5=c245bfd6ea7adbd7bc988062abe4f9cf inverse=OK
+[gemv-ab] slot=29 seed=30 aos_md5=0d0472735a74ca799911ab98582922fc x_md5=655c1229551087b071ae83243fbfcd07
+[gemv-ab] slot=29 soa_md5=6134c905e02051be3368adf947e31371 inverse=OK
+[gemv-ab] slot=30 seed=31 aos_md5=a2e718e2c1d180f80c7ed1b81dd04984 x_md5=5b4840fef96886c65f1acd820da5c7bc
+[gemv-ab] slot=30 soa_md5=84bdc6191d7c86a2aa57a095dc3159d3 inverse=OK
+[gemv-ab] slot=31 seed=32 aos_md5=ef27e0d257cbb716967b3aeb5e16e5d9 x_md5=3aad63010fb9c8bd98de7d367e02ac76
+[gemv-ab] slot=31 soa_md5=90d8c1525f7580753d078f7b9c5fd28d inverse=OK
+[gemv-ab] slot=32 seed=33 aos_md5=e743d03b0041dafddd8eadad92834be9 x_md5=e099e59048825f572f84b9aa2406be50
+[gemv-ab] slot=32 soa_md5=e072071b0c6396f1a2e5b79ddb048a12 inverse=OK
+[gemv-ab] slot=33 seed=34 aos_md5=de3bff1ff089dae6746fd0ba9775f5ed x_md5=686fddcebe4e23fce981f86746fa4d91
+[gemv-ab] slot=33 soa_md5=169de1d2f0e313f9ae6bb90fde3beffa inverse=OK
+[gemv-ab] slot=34 seed=35 aos_md5=2771d4dc19e08bd6a7cfc1b448fe490a x_md5=58ab22a0f2741cd5ffe7b8dcd59cb06b
+[gemv-ab] slot=34 soa_md5=de59179c38f2f23f48f800b04d095708 inverse=OK
+[gemv-ab] slot=35 seed=36 aos_md5=a3d86045180899a3a061161db26192dd x_md5=486f2673fa98c79cfb03f8bd4579bbc8
+[gemv-ab] slot=35 soa_md5=3f5e982359d8dc5b6e5da9ebb2832d7c inverse=OK
+[gemv-ab] slot=36 seed=37 aos_md5=a34e6246724e89fb859033181ea651c2 x_md5=f15e38b61ef842e215c1ee36a0cd1465
+[gemv-ab] slot=36 soa_md5=7ac313c9e23e4e11f9387602e0e798ff inverse=OK
+[gemv-ab] slot=37 seed=38 aos_md5=84bb3aa088c810019557fe8b65f16a75 x_md5=1959b98458bb362d4fc92232bf5ea7c6
+[gemv-ab] slot=37 soa_md5=e3ff1bf82e7cf5b995ffbf9c9f0c7c52 inverse=OK
+[gemv-ab] slot=38 seed=39 aos_md5=2681e8fad42f24a689bb6017ff1a7f1c x_md5=6e7900ee7baa26715bf57f489aa5637d
+[gemv-ab] slot=38 soa_md5=5d44202b69e1cb676c37faca0a2a98b3 inverse=OK
+[gemv-ab] slot=39 seed=40 aos_md5=03397bafbd74dafae3b3cc5878d7978f x_md5=ca4bff4164f1ef01324920815d5a43d2
+[gemv-ab] slot=39 soa_md5=7b7a894a579f8741440b7e0944001b57 inverse=OK
+[gemv-ab] slot=40 seed=41 aos_md5=abe388b67dcc97fbc19fe1edd90ec6c4 x_md5=1f7e2e4f0f806a74a70264bab45bebb0
+[gemv-ab] slot=40 soa_md5=d2bf9dd55ef8e221b81c9c8a9eff09d7 inverse=OK
+[gemv-ab] slot=41 seed=42 aos_md5=549ae08acf9a5a5e7eeea575e2bfcfd1 x_md5=e2ae089e9f7de5ad0df1ffb76b73b79e
+[gemv-ab] slot=41 soa_md5=5047b2132cbac0298a231e851f3f979f inverse=OK
+[gemv-ab] slot=42 seed=43 aos_md5=fb64d81eaa0b09ef8cc62ce014088023 x_md5=fa10c0b07440791b585225e150156c72
+[gemv-ab] slot=42 soa_md5=c4d9f7e9a70f5ce66744442e601b508b inverse=OK
+[gemv-ab] slot=43 seed=44 aos_md5=23445298f36d93a0971331d426297d34 x_md5=dae7b9486b4a13e4c3789f2d8d0d6d69
+[gemv-ab] slot=43 soa_md5=2160eee89540c9376f0c862e77926bc2 inverse=OK
+[gemv-ab] slot=44 seed=45 aos_md5=de77de09cf2e54f174813de20fa36df7 x_md5=2f89c0c17681b7a62a668a641a89d3a8
+[gemv-ab] slot=44 soa_md5=16fa4fb8ad6fe2c1dc05cb797eac150e inverse=OK
+[gemv-ab] slot=45 seed=46 aos_md5=2d65c3e3a1e63e33ce96c1c74ed5d5ae x_md5=3b3fafc4a77af3afbe6ef66d92bd8d96
+[gemv-ab] slot=45 soa_md5=a6990f5ead4c252b2f57e315019d29c2 inverse=OK
+[gemv-ab] slot=46 seed=47 aos_md5=dbc90983609faec83d6daa9b813c8218 x_md5=a8b1cfb08cf2084b9f9967133b3548ee
+[gemv-ab] slot=46 soa_md5=8332eb39044df2cae73006baf0b34156 inverse=OK
+[gemv-ab] slot=47 seed=48 aos_md5=a813a459e218692312c604983e6ca3b7 x_md5=5ec2c9ad5f3d77c17cd34772f080e8b7
+[gemv-ab] slot=47 soa_md5=f55d07cc182c5467b66945a2d66aacf4 inverse=OK
+[gemv-ab] slot=48 seed=49 aos_md5=5c7121f197cc972b15d441eaf1363126 x_md5=3e3d66296b010d967662d89a295866e2
+[gemv-ab] slot=48 soa_md5=ec137a0c9fd00653db5ee969afbe2d18 inverse=OK
+[gemv-ab] slot=49 seed=50 aos_md5=0b438b1cf16bca7a1bde3617fea5ec59 x_md5=ababfdb0470b35f9db7207be9e398e9b
+[gemv-ab] slot=49 soa_md5=3a782ec3c6f9205d5ea1dee20f537bb9 inverse=OK
+[gemv-ab] slot=50 seed=51 aos_md5=fc7ba2fb5abbd9bea21955b0d5853676 x_md5=30ae1cdce4db07a3cae88674a4c1f622
+[gemv-ab] slot=50 soa_md5=b2a61e2776f7be694ad106909121dea8 inverse=OK
+[gemv-ab] slot=51 seed=52 aos_md5=984d79fd7dac9029b367644d1c40a07f x_md5=524f12c188048b7a2e7e7b9959fa546a
+[gemv-ab] slot=51 soa_md5=d70e80ac9626076957d544af5d5cfb3f inverse=OK
+[gemv-ab] slot=52 seed=53 aos_md5=52baeaa3078f2477d6c573c2cee13c98 x_md5=75d8b7949f93dd9b4e70488001ce192a
+[gemv-ab] slot=52 soa_md5=4d7b486f9a88bd52dbfa779ad621c33b inverse=OK
+[gemv-ab] slot=53 seed=54 aos_md5=943b7baec557ab86a8d5b510ab44e419 x_md5=a8e669cfd28465eb68c3e6a8fd824746
+[gemv-ab] slot=53 soa_md5=c5840837f3acec20d8aa007d5652de03 inverse=OK
+[gemv-ab] slot=54 seed=55 aos_md5=8242a54e92c977f8cb48a3a6fa7ad033 x_md5=c23b0132f2c238551b40ae2345d1ab06
+[gemv-ab] slot=54 soa_md5=88e8f8d84de34c9774f34b16b5ecfb71 inverse=OK
+[gemv-ab] slot=55 seed=56 aos_md5=bc9faed481fa62ee7853cc4c5ac25a31 x_md5=a3fe375f85e97987e04d37a339937cb4
+[gemv-ab] slot=55 soa_md5=b3923efc4511a562c73920cfc0e43069 inverse=OK
+[gemv-ab] slot=56 seed=57 aos_md5=51c4dc1f77141bcf06dda719ef25870b x_md5=bfd67b9798dcc3552ad860f6ecfc9b91
+[gemv-ab] slot=56 soa_md5=1ec343b24362bf0cc5d6224d53d53e18 inverse=OK
+[gemv-ab] slot=57 seed=58 aos_md5=42abff144923532e17809a083b9a6fbf x_md5=1da6980654e83912f2c65a9baf7dd0dd
+[gemv-ab] slot=57 soa_md5=75297d33e30bb7a6f3ffae2b64dff7ce inverse=OK
+[gemv-ab] slot=58 seed=59 aos_md5=8644cc19f8057b52e53ef9347b7106bd x_md5=8d2359ea7c4e3a8e2178d5e6ba0f15da
+[gemv-ab] slot=58 soa_md5=29dc50cbf4bfce5844157a037e0f62fd inverse=OK
+[gemv-ab] slot=59 seed=60 aos_md5=45774b32ca465fffd9796bedb34a26c8 x_md5=04f550006c41e54b46bcd3e76cad98e9
+[gemv-ab] slot=59 soa_md5=4e1b522cda2748d0c2aaf4c86b7437ea inverse=OK
+[gemv-ab] slot=60 seed=61 aos_md5=5e3a49a681548a71f2c0a8b59f1ddc4e x_md5=ae059989802aee153151beaad6a8159c
+[gemv-ab] slot=60 soa_md5=1b8239279bd04893e438ad838d5fced1 inverse=OK
+[gemv-ab] slot=61 seed=62 aos_md5=756cfc539c00ec11073ad39ce041bd60 x_md5=6655e88acc3e1d7d0bfbb7f042fd8f0a
+[gemv-ab] slot=61 soa_md5=798fc2fc1b81ecab5721478b1d644b20 inverse=OK
+[gemv-ab] slot=62 seed=63 aos_md5=ec6b34eff7733ee9c658234305b8c738 x_md5=b19a251d3f52cf9201eccd3d466d1cfb
+[gemv-ab] slot=62 soa_md5=ddace51ee5c2c268f5d04e2ef3cbb641 inverse=OK
+[gemv-ab] slot=63 seed=64 aos_md5=bf90de28dce01072d61ca5a08e923bc5 x_md5=973b8287eeae1df611ecbef2ab574a33
+[gemv-ab] slot=63 soa_md5=b208c9d4b2f32089cd02d26a77b40cfb inverse=OK
+[gemv-ab] slot=64 seed=65 aos_md5=1b17d1a4faecfd24ad7c0adb306403c7 x_md5=e97de8ea8a346ed257ad6eec4cc6b3f4
+[gemv-ab] slot=64 soa_md5=4f94e197ae48ef504449115c331362f9 inverse=OK
+[gemv-ab] slot=65 seed=66 aos_md5=d05f295522e2fa8c2a1819b615b06d40 x_md5=036d6d08fc2e282ff0f5ba51ecb1af14
+[gemv-ab] slot=65 soa_md5=9d9e565ffd0484c8ba7ed087b999565e inverse=OK
+[gemv-ab] slot=66 seed=67 aos_md5=ad4eccb44a796e1533589f5cbcf746b2 x_md5=caba700350861e073e68626f81ff2a3f
+[gemv-ab] slot=66 soa_md5=20bf2d3a111280c73c664972b195acd9 inverse=OK
+[gemv-ab] slot=67 seed=68 aos_md5=7c4c45b3f1686a2c5296853f48573cbd x_md5=8d0c698b63ce1d3da3260f8ee1c9ea0c
+[gemv-ab] slot=67 soa_md5=3931a4af6f216c77ae5eb485121e97f4 inverse=OK
+[gemv-ab] slot=68 seed=69 aos_md5=b0a7b249b3bdb05f37050a4c6f7e70f2 x_md5=8fa70819a83b9a7dd33194b7848d13da
+[gemv-ab] slot=68 soa_md5=7f5321a3e8230e7c8494ced1a13abf27 inverse=OK
+[gemv-ab] slot=69 seed=70 aos_md5=e7ec2ca8da76d1f45d9a7ba37b6bbd59 x_md5=75a09369cd7afe7292e09fb8d51df0e6
+[gemv-ab] slot=69 soa_md5=00d3924350cf4c4593bc04d1083bba0a inverse=OK
+[gemv-ab] slot=70 seed=71 aos_md5=e65dd9cfe04a9b34ee27c1eb9568b4b7 x_md5=6a65b76562d6a3885c443c79aef89979
+[gemv-ab] slot=70 soa_md5=2ad3b2e3de2838933a8f518f3e5f856a inverse=OK
+[gemv-ab] slot=71 seed=72 aos_md5=8c72a10b74f678c38de02c5adc8d9066 x_md5=4cd8acb2c83a6f577b6d8c20ea22e6da
+[gemv-ab] slot=71 soa_md5=9a8a9d86683395e849074726194dd180 inverse=OK
+[gemv-ab] slot=72 seed=73 aos_md5=c1b7b6ace22914e8f856adc4d88cdf69 x_md5=be921b9b3a7df0478a3293f50a18b87c
+[gemv-ab] slot=72 soa_md5=84ed6a7b7583c1c6f89e4b4932b34bd5 inverse=OK
+[gemv-ab] slot=73 seed=74 aos_md5=a8bbb0bc36385ba9b31257e7217dbc38 x_md5=ec6d8f6da69562b310014d1df6b8167e
+[gemv-ab] slot=73 soa_md5=1abd0802fc240d8114ac1b4ea18681e2 inverse=OK
+[gemv-ab] slot=74 seed=75 aos_md5=cc9d731977cb73062027178cca6b0ffc x_md5=ed24f063c47c5e98d8015a2a1867ade7
+[gemv-ab] slot=74 soa_md5=e7f7c3e83aceb68936870ada5454a006 inverse=OK
+[gemv-ab] slot=75 seed=76 aos_md5=859f29ede22002e4629960084acc9d38 x_md5=331d2b067a09f81392974d0e9cacb2bc
+[gemv-ab] slot=75 soa_md5=0ef70c2234334d17a1f418e2dddf9b1a inverse=OK
+[gemv-ab] slot=76 seed=77 aos_md5=1df61a4dd87ca779bdb22b7f5a5d182f x_md5=da915111e94a8197561b6769a53c8435
+[gemv-ab] slot=76 soa_md5=cc407401434dddeca27efd15273bba4e inverse=OK
+[gemv-ab] slot=77 seed=78 aos_md5=450cbb09ac0d8ccc1a0962657e3140c0 x_md5=42c32e12f977b044e6251e0f9dddf947
+[gemv-ab] slot=77 soa_md5=e09586311303c1ca985136645dcf8b73 inverse=OK
+[gemv-ab] slot=78 seed=79 aos_md5=fecde8e097ec9662ff652de74d39e02b x_md5=1ea96e0b4edd9e82dc304316e2b3e086
+[gemv-ab] slot=78 soa_md5=4280d210eb2b57f7cdbbc0fde67f7961 inverse=OK
+[gemv-ab] slot=79 seed=80 aos_md5=0f7758ad01ef1362a6b316312dc08e98 x_md5=6cc6098aabc3e6f149329c68590fae36
+[gemv-ab] slot=79 soa_md5=f606a7cf35f204623de6415a5e3471bc inverse=OK
+[gemv-ab] slot=80 seed=81 aos_md5=80d843951531cf9324c4161a0dc5e5e7 x_md5=8e26d85ccd3fd642942868c15a860522
+[gemv-ab] slot=80 soa_md5=9c12cf9e3391c79682e78a85832f4c95 inverse=OK
+[gemv-ab] slot=81 seed=82 aos_md5=ccf8441aa3435880bceb8c5c17428e00 x_md5=66146017a508c5f49c47f1816cbcfbca
+[gemv-ab] slot=81 soa_md5=6e5d9debcd562f4e58e075e1fad6d61e inverse=OK
+[gemv-ab] slot=82 seed=83 aos_md5=c9ac3a68c61e3bb58d44fba5d89ba5ca x_md5=e93cd9a439bf3545cfdaac6c325303c9
+[gemv-ab] slot=82 soa_md5=a68f233273b06bebaf3d03e0dc521228 inverse=OK
+[gemv-ab] slot=83 seed=84 aos_md5=7e2419f893c65bf6a0193574e26e6592 x_md5=e81de0de45f8ada1aa81a64e3110af15
+[gemv-ab] slot=83 soa_md5=db322886deeff8ba5d56e47898caa0c2 inverse=OK
+[gemv-ab] slot=84 seed=85 aos_md5=b5554240102baff21e6be67bbb2f0338 x_md5=0cc1ccd179663cbcbc2bdec47c5a4283
+[gemv-ab] slot=84 soa_md5=6da5ddc228fda4a55092ec45f7b0b5aa inverse=OK
+[gemv-ab] slot=85 seed=86 aos_md5=b7db22de9fecabdb8aad4c91358294f2 x_md5=7da95b41f5d931c31f2f5d5b243d6b72
+[gemv-ab] slot=85 soa_md5=82d076ff5dc7e8edcc7af6453945478e inverse=OK
+[gemv-ab] slot=86 seed=87 aos_md5=67c7a490aa059ba45d8ee2363c61272d x_md5=19dadbd719ed741953ac7042ad910ff7
+[gemv-ab] slot=86 soa_md5=2d41670f10c7080657bf5016b8aad3be inverse=OK
+[gemv-ab] slot=87 seed=88 aos_md5=564ca5c77bc4de352ab6746b3b21e04f x_md5=010cdf138f35000c1a6edb4e045a86e2
+[gemv-ab] slot=87 soa_md5=ac02581feacda5f07373c308e7681e40 inverse=OK
+[gemv-ab] slot=88 seed=89 aos_md5=d709548ef7391b8b1b3a1dc66ef3db5d x_md5=5e7e65ff5a4914d1b347bbee1350de10
+[gemv-ab] slot=88 soa_md5=335ccd487479b8bacdc82fe6d0556f9e inverse=OK
+[gemv-ab] slot=89 seed=90 aos_md5=2d0896ab294ae4b7a8c1e833d587b052 x_md5=3be9bceeae5ebdd64a66e717bf1e8556
+[gemv-ab] slot=89 soa_md5=bfa2b61e2e6d0a8d924225ac237dc4ae inverse=OK
+[gemv-ab] slot=90 seed=91 aos_md5=ef33839e7ae66aa587e45a5ca00d4bdc x_md5=b9dcb3ba904a23bdcff9abc0aa06dacc
+[gemv-ab] slot=90 soa_md5=3c505bbc941feffe62e246e6300ed166 inverse=OK
+[gemv-ab] slot=91 seed=92 aos_md5=13742199ec7f864c4045e2803e9d18ac x_md5=fe5bcccea2f7a2a758edf90873eb718a
+[gemv-ab] slot=91 soa_md5=0bc234fa13bade64f292f6ca00f49e02 inverse=OK
+[gemv-ab] slot=92 seed=93 aos_md5=b5ca1f875007997cfc67caf31d4d58e6 x_md5=5e04c95bbfbecc2335eea21e78d0d9d9
+[gemv-ab] slot=92 soa_md5=57b49cc692f4634783e2fc991c608a02 inverse=OK
+[gemv-ab] slot=93 seed=94 aos_md5=1b02ff216d9bf71951ff729396c8ca17 x_md5=f7ae8cd101e019a77b65c76e12f7d9c7
+[gemv-ab] slot=93 soa_md5=3e31a3c82c7f34f5773d1a8ee7d4e016 inverse=OK
+[gemv-ab] slot=94 seed=95 aos_md5=30e604ff9063974e27e75b664c679198 x_md5=891292adc07b6ef758f6626c9777bef6
+[gemv-ab] slot=94 soa_md5=7751808a75e909989bd0c0031e9a2922 inverse=OK
+[gemv-ab] slot=95 seed=96 aos_md5=a733e829c73bcdaf562afdf58c3e05ad x_md5=3b2fc7e11d17a4fd0a786f43f494f445
+[gemv-ab] slot=95 soa_md5=39abd42a5ff04b95baca4a7037033d1c inverse=OK
+[gemv-ab] slot=96 seed=97 aos_md5=b910dd4e5b9b7d1411412acf2e9d9943 x_md5=811b7b03e91a07bdf435abf34eb5a052
+[gemv-ab] slot=96 soa_md5=89136d23c9f15034f5fdb12e4e27bd35 inverse=OK
+[gemv-ab] slot=97 seed=98 aos_md5=9bdd8f4f881cf1994d46f91b34974c4d x_md5=f3eb6a8147d9fef68d5fd2180daa4b2c
+[gemv-ab] slot=97 soa_md5=bf8f0d3c5d7ef503999e90fe1d305db8 inverse=OK
+[gemv-ab] slot=98 seed=99 aos_md5=f9aebccf95f5844efd9e3525573d499a x_md5=c430fab80d0457229199e6fdbe4cd1e6
+[gemv-ab] slot=98 soa_md5=e7b286df5dafdae21388842b1bd596d2 inverse=OK
+[gemv-ab] slot=99 seed=100 aos_md5=92a766a9a518b28b8db6dcee61cc2fc2 x_md5=9d46a9c6940221bb3d4ccde60a1886eb
+[gemv-ab] slot=99 soa_md5=77871667d03739b229f9ebde573f7170 inverse=OK
+[gemv-ab] slot=100 seed=101 aos_md5=40c8bcdbe7dfffe443abb31a1f6f7c8b x_md5=5ad930059999665653d6ae187d9ad941
+[gemv-ab] slot=100 soa_md5=aa5b2758359743033a645e7f4a32c6db inverse=OK
+[gemv-ab] slot=101 seed=102 aos_md5=c16beff49bbc2b9b89b03808a017bbab x_md5=b249b7856f0cde156d7a7e7c6c5d9a7e
+[gemv-ab] slot=101 soa_md5=67ed363fd7e6e51ea55798ff0a0087f7 inverse=OK
+[gemv-ab] slot=102 seed=103 aos_md5=0f1ce8aaf734db851618c007a5b590df x_md5=9777b6923438f2c22bfe76d783a9e935
+[gemv-ab] slot=102 soa_md5=9bb808fd65ae735b46d710854168d496 inverse=OK
+[gemv-ab] slot=103 seed=104 aos_md5=445e6d8f17877d76b79ae978ccbb3144 x_md5=e67a1213e29e295b19683c25e689e404
+[gemv-ab] slot=103 soa_md5=7bf292c105a48eab7dabb36d55131777 inverse=OK
+[gemv-ab] slot=104 seed=105 aos_md5=10f3212fe293807cc93f769e694d027f x_md5=8ecaa1510eb9f42a49f20ec00286dff6
+[gemv-ab] slot=104 soa_md5=b52570a32fab42bbff98cbc9b7a6f7b5 inverse=OK
+[gemv-ab] slot=105 seed=106 aos_md5=4a1e54dd8b2799ccd5e7331de97a6255 x_md5=4fe8f7bceec3ddb152dcb039d36641b0
+[gemv-ab] slot=105 soa_md5=e43a2e974ae3e24aa082fa34968b17f8 inverse=OK
+[gemv-ab] slot=106 seed=107 aos_md5=f0e78b6608104c91003574346c549b1d x_md5=1237ba45c5db3ecdfc4121214cd5e8f1
+[gemv-ab] slot=106 soa_md5=8391eea32f2cd5a7f74171c88fa5eb20 inverse=OK
+[gemv-ab] slot=107 seed=108 aos_md5=f30fdd7ffebb3b1d5400451eacccba9d x_md5=e51f34030ffa52632b33ff3abb1f3c56
+[gemv-ab] slot=107 soa_md5=fc735d4aa3a936f4126f73c2b11d8d63 inverse=OK
+[gemv-ab] slot=108 seed=109 aos_md5=731de1025cf186895934bf3ee14c4a95 x_md5=82577af006b068f33fe749d0926ee992
+[gemv-ab] slot=108 soa_md5=83dfee533a254a9d8ac57bc8602d9e37 inverse=OK
+[gemv-ab] slot=109 seed=110 aos_md5=7854f6ed515c61721270dda91eb971a6 x_md5=f837a7ebc5efc135ae643e5b117ddafa
+[gemv-ab] slot=109 soa_md5=0ff337c23ff63ece076cbe627da31e13 inverse=OK
+[gemv-ab] slot=110 seed=111 aos_md5=3cd595df037c7b9caf09808e96e117cc x_md5=d5031a3fb61adc4dc2059292e578e526
+[gemv-ab] slot=110 soa_md5=5cbb2a27a982a85bae6b582ca7d94847 inverse=OK
+[gemv-ab] slot=111 seed=112 aos_md5=a0b00756fba3dd31a1ae12be844c8407 x_md5=8dc74da70e0f812cc2b06c672031bcc4
+[gemv-ab] slot=111 soa_md5=2ff0d125f704b920be4b0553d16c4e97 inverse=OK
+[gemv-ab] slot=112 seed=113 aos_md5=86107679aaa3ca18810a75aff8790e36 x_md5=a8de60a9dd0f594b30c61070a99bcc30
+[gemv-ab] slot=112 soa_md5=3c0fcfd11a0115addf86b5e7e0f46e9e inverse=OK
+[gemv-ab] slot=113 seed=114 aos_md5=592186017e26a56795e432192723cd92 x_md5=92f22afcb4689d37040254bd8cda0e29
+[gemv-ab] slot=113 soa_md5=08d0284cec08573e51a65bdfc31d1684 inverse=OK
+[gemv-ab] slot=114 seed=115 aos_md5=33a423f2522a54ef63d0cc43888ff5b1 x_md5=6eb2ca8e31d4738d38704be0404c147d
+[gemv-ab] slot=114 soa_md5=1a785997acfe439b995be25639800886 inverse=OK
+[gemv-ab] slot=115 seed=116 aos_md5=8024137cddba44f2c6fb3cfa38e5b81e x_md5=dd74caafe6b2c25f937ac61d3aca8453
+[gemv-ab] slot=115 soa_md5=10045ae93a60046ebecf7d580266eace inverse=OK
+[gemv-ab] slot=116 seed=117 aos_md5=a6a780f8806feb634f24e4d70c81e4f6 x_md5=30a72a538b94a75ed6712dd2f1df0752
+[gemv-ab] slot=116 soa_md5=5a75cca51effe4411c90e319665d8103 inverse=OK
+[gemv-ab] verify slot=0 seed=1 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=1 seed=2 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=2 seed=3 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=3 seed=4 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=4 seed=5 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=5 seed=6 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=6 seed=7 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=7 seed=8 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=8 seed=9 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=9 seed=10 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=10 seed=11 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=11 seed=12 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=12 seed=13 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=13 seed=14 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=14 seed=15 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=15 seed=16 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=16 seed=17 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=17 seed=18 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=18 seed=19 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=19 seed=20 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=20 seed=21 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=21 seed=22 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=22 seed=23 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=23 seed=24 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=24 seed=25 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=25 seed=26 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=26 seed=27 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=27 seed=28 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=28 seed=29 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=29 seed=30 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=30 seed=31 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=31 seed=32 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=32 seed=33 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=33 seed=34 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=34 seed=35 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=35 seed=36 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=36 seed=37 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=37 seed=38 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=38 seed=39 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=39 seed=40 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=40 seed=41 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=41 seed=42 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=42 seed=43 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=43 seed=44 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=44 seed=45 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=45 seed=46 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=46 seed=47 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=47 seed=48 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=48 seed=49 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=49 seed=50 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=50 seed=51 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=51 seed=52 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=52 seed=53 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=53 seed=54 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=54 seed=55 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=55 seed=56 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=56 seed=57 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=57 seed=58 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=58 seed=59 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=59 seed=60 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=60 seed=61 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=61 seed=62 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=62 seed=63 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=63 seed=64 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=64 seed=65 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=65 seed=66 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=66 seed=67 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=67 seed=68 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=68 seed=69 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=69 seed=70 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=70 seed=71 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=71 seed=72 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=72 seed=73 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=73 seed=74 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=74 seed=75 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=75 seed=76 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=76 seed=77 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=77 seed=78 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=78 seed=79 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=79 seed=80 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=80 seed=81 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=81 seed=82 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=82 seed=83 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=83 seed=84 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=84 seed=85 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=85 seed=86 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=86 seed=87 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=87 seed=88 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=88 seed=89 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=89 seed=90 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=90 seed=91 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=91 seed=92 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=92 seed=93 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=93 seed=94 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=94 seed=95 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=95 seed=96 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=96 seed=97 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=97 seed=98 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=98 seed=99 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=99 seed=100 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=100 seed=101 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=101 seed=102 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=102 seed=103 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=103 seed=104 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=104 seed=105 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=105 seed=106 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=106 seed=107 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=107 seed=108 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=108 seed=109 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=109 seed=110 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=110 seed=111 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=111 seed=112 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=112 seed=113 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=113 seed=114 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=114 seed=115 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=115 seed=116 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=116 seed=117 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] timing rotations=1 timed_iters=117 (requested iters=60)
+[gemv-ab] per-arm wall warmup_ms=250
+[gemv-ab] arm=hipcc host_submit_mean=0.646us host_window=1408.8us
+[gemv-ab] arm=hipcc raw_host_submit_us=1.6330,0.6710,1.1220,0.6410,0.6010,0.6310,0.6010,0.6010,0.5910,0.6010,0.6020,1.3020,0.7420,1.1920,1.7130,0.7920,0.5910,1.0320,1.0120,1.0420,1.0120,0.6010,0.5710,0.6010,0.5910,0.6020,0.6310,0.5710,0.5710,0.6010,0.5910,0.5820,0.5710,0.6310,0.5610,1.0120,1.0420,0.5810,1.0620,0.5710,0.5810,0.5920,0.5910,0.6210,0.5810,0.5910,0.5610,0.5510,0.6020,0.5710,0.5810,0.5710,0.5910,0.5910,0.5710,0.5620,0.5710,0.5710,0.5910,0.6310,0.5610,0.5610,1.0020,1.0720,0.5820,0.5810,0.5710,0.9820,0.5810,0.5710,0.5710,0.6210,0.5910,0.5710,0.5810,0.5710,0.5810,0.5610,2.6150,0.6110,1.0220,0.6110,0.6020,0.9920,0.5710,0.5610,0.5710,0.5910,0.5710,0.5710,0.6010,0.5810,0.6110,0.5810,0.5710,0.5610,0.5810,0.5610,0.9720,0.5610,0.5920,0.5810,0.5710,1.3420,0.9920,0.5610,0.5620,1.0110,0.5610,0.5610,0.5610,0.5510,0.5610,0.5610,0.5610,0.5610,0.5710,1.1430,0.6210,0.5910,0.6110,1.0120,0.6010,0.6010,0.6020,0.5910,0.5910,0.5910,0.5910,0.6110,0.5810,0.5910,0.6010,0.6210,0.5810,0.5910,0.5910,0.5910,0.6110,0.5910,1.0320,1.0420,0.5910,0.5810,0.6010,0.5910,0.6010,0.6110,0.6110,0.5610,0.6010,0.5710,0.6110,0.6110,0.6010,0.5910,1.0110,0.5910,0.5610,0.5610,0.5710,0.5910,0.5910,0.5910,1.0620,1.0010,0.6020,0.5910,0.5910,1.0420,0.5910,0.5910,0.6010,0.5820,0.5910,0.5810,0.5610,0.5710,0.5510,0.5610,0.5610,0.5920,0.5910,0.5810,0.5910,1.0120,0.5910,0.5610,0.6010,0.5910,0.5910,0.5810,0.5710,0.5710,0.5710,1.0320,0.6010,0.6010,0.5810,0.5910,0.6010,0.6010,0.6010,0.5710,0.6010,1.0320,0.5710,0.5610,0.5910,0.6010,0.5920,0.6010,0.6010,0.5810,0.5910,0.5910,0.5810,0.6010,0.5910,0.5610,0.6010,1.0020,0.5710,0.6710,0.5610,0.5610,0.5610,0.5710,0.5610,0.5710,0.5610,0.5510,0.5610,0.9920,0.9920,0.5610,0.5610,0.5610,0.5510,0.5910,0.5610,0.5710,0.6520,0.5510,0.5710,0.5510,0.5610,0.5510,0.5710,1.0120,0.5610,0.5610,0.5610,0.6510,0.5610,0.5510,0.5610,0.5510,0.5610,0.5710,0.5610,0.5510,0.5610,0.6010,0.5710,0.5610,0.5710,0.5610,0.5610,0.5510,0.5510,0.6010,0.5610,0.5610,0.5510,0.5510,0.5610,0.5510,0.5620,0.6010,0.5610,0.5510,0.5610,0.5610,0.5610,0.5510,0.9820,0.6010,0.5510,0.9810,0.9820,1.1320,0.5510,0.5610,0.5510,1.0620,0.5610,0.5610,0.9820,0.5610,0.5610,0.5610,0.5610,0.5610,0.5620,0.5510,0.5510,0.5510,0.5610,0.5510,0.5610,1.0020,0.5610,0.5610,0.5610,0.5510,0.5620,0.5510,0.5610,0.6110,0.5510,0.5610,0.5510,0.5610,0.5610,0.5510,0.5610,0.5510,0.5610,0.5610,0.5610,0.5610,0.5710,0.5510,0.5510,0.5620,0.5510,0.5610,0.5610,0.5510,0.5610,0.5610,0.5510,0.6010,0.5610,0.5710,0.5510,0.5710,0.5610,0.5510,0.9620
+[gemv-ab] arm=hipcc raw_gpu_us_per_launch=3.8742,3.8732,3.8814
+[gemv-ab] arm=hipcc sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116
+[gemv-ab] arm=soa host_submit_mean=0.634us host_window=1420.9us
+[gemv-ab] arm=soa raw_host_submit_us=1.9840,0.6110,0.6810,0.6210,0.6020,0.6310,0.6610,0.5710,0.6210,0.6120,0.6710,0.6810,1.2530,1.3720,0.7820,0.6410,1.0520,0.5710,1.0420,0.5710,0.6220,0.5810,0.6210,0.5810,0.6010,0.5710,0.5910,0.6510,0.5710,0.5710,0.6110,0.5710,0.5610,0.5820,0.5810,0.6210,1.0020,0.5510,0.5910,0.5810,0.5810,0.6220,0.5710,0.5510,0.5610,0.5710,0.5710,0.5710,0.6110,0.5510,0.5710,1.0020,0.5610,0.5610,0.5810,0.5810,0.6310,0.5920,0.5710,0.5710,0.5610,0.5610,1.0220,0.5710,0.5710,0.5910,0.6420,0.5710,0.5710,0.5610,0.5610,0.5710,0.5810,0.5710,0.5710,0.5610,0.5910,0.6310,0.6010,0.5710,0.9720,0.5510,0.5610,0.5710,0.5610,0.5510,0.5710,0.5710,0.6210,0.5610,0.5920,0.5510,0.5510,0.5610,0.5610,0.5510,0.5710,0.5610,0.5710,0.5610,1.0010,0.5720,0.5610,0.5610,0.5610,0.5510,0.5710,0.5510,0.5610,0.5510,0.5610,0.5620,0.5510,0.5610,0.5610,0.9920,0.5610,0.6710,1.0620,0.6110,0.6010,1.0320,0.6010,0.6020,0.5810,0.5810,0.5810,0.5910,0.6010,0.5820,0.5910,0.5910,0.5910,0.5910,0.6110,0.5920,0.5810,0.5910,0.5910,1.2120,0.5710,0.5910,0.5810,0.5910,0.5910,0.5910,0.6110,0.6110,0.5810,0.5910,0.6010,1.3030,0.5910,0.5910,0.6010,0.9920,0.5810,0.5910,0.5920,0.6010,0.5710,0.6010,0.6010,1.0320,0.6010,0.5920,1.0420,0.5910,0.5910,0.5910,0.6110,0.6010,0.5920,0.5910,0.6010,0.5910,0.5810,0.5610,0.5810,arm                       us/launch  logicalGB/s  vs-base host_sub_us  exactness
+hipcc                          3.87          2.9    1.000      0.646  ref
+[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.8742 n_samples=3 (3 whole-batch windows; no min/best-of)
+soa                            3.89          2.9    1.004      0.634  pre-verified
+[gemv-ab] arm=soa gpu_us_per_launch_median=3.8909 n_samples=3 (3 whole-batch windows; no min/best-of)
+== shape M=33 K=768 (groups=3) weight_bytes=13464 slots=78 working_set_bytes=1050192 ==
+[gemv-ab] logical_bytes/launch=16668 (analytical; not DRAM)
+[gemv-ab] slot=0 seed=1 aos_md5=a7c12bcbe48850627f3e8e081274e9fe x_md5=a365c75bcf5ef6fc7967d4e4865fde62
+[gemv-ab] slot=0 soa_md5=02cfc8cdbdb8e66df1484fe7baa4e334 inverse=OK
+[gemv-ab] slot=1 seed=2 aos_md5=458d89ef772e37916bfe1d89af9f8eaa x_md5=2995657f9985e4b0a7bde37e703e0a90
+1.0310,0.6020,0.5910,0.6010,0.5910,0.5910,0.5910,0.6010,0.5810,0.5910,1.0220,0.5910,0.5710,0.5710,0.5610,0.5820,0.5710,0.5810,0.5910,0.6010,0.6010,0.5920,0.6010,0.5910,1.0120,0.5810,0.5910,0.6010,0.5710,0.6020,0.5810,0.5910,0.5810,0.5910,0.6010,0.5920,0.6010,0.6010,0.5910,0.6010,1.0020,0.6010,0.5920,0.5910,0.5710,0.5710,0.5510,0.5610,0.5610,0.5610,0.5820,0.5810,0.5710,0.5610,0.5610,0.5910,0.6410,0.5610,0.5510,0.5610,0.9720,0.5710,0.5820,0.5810,1.0320,0.5810,0.5610,0.5710,0.5710,0.5810,0.5810,0.5720,0.5810,0.5610,0.5510,0.5610,0.5510,0.5610,0.5610,0.5610,0.5720,0.5610,1.0020,0.5610,0.5810,0.5710,0.9920,0.5810,0.5610,0.5610,0.5510,0.5610,0.5610,0.5810,0.5710,0.5610,0.5910,0.5710,0.5810,0.5610,0.6020,0.5710,0.9820,0.5610,0.5810,0.5610,0.5610,0.5610,0.5910,0.5510,0.5620,0.5710,1.1820,0.5810,0.5510,0.6010,0.5810,0.5610,0.5810,0.5810,0.5810,0.5510,0.5410,0.5710,0.5610,0.5720,0.9910,0.5720,0.5710,0.5610,0.5510,0.5610,0.6110,0.5610,0.5510,0.5610,0.9810,0.5510,0.5510,0.5510,0.5610,0.5810,0.5810,0.5710,0.5610,0.5610,1.0420,0.5720,0.5610,0.5610,1.1120,0.5610,0.9820,0.5710,0.5710,0.5610,0.5810,1.0220,0.5610,0.5620,0.5810,0.5710,0.5810,0.5810,0.5810,0.5710,1.0220,1.0220,0.9920,0.5510,0.9820,0.5710
+[gemv-ab] arm=soa raw_gpu_us_per_launch=3.8909,3.8745,3.9993
+[gemv-ab] arm=soa sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116
+[gemv-ab] slot=1 soa_md5=0986673faaa2e6ef905ee548bfdcdab9 inverse=OK
+[gemv-ab] slot=2 seed=3 aos_md5=5577ffd60d818bcb4a634e7b3e7289b4 x_md5=1a82b927eed4395afdc535fa6ee1004a
+[gemv-ab] slot=2 soa_md5=b1cb453fc611ae5ac95425e101c2fbad inverse=OK
+[gemv-ab] slot=3 seed=4 aos_md5=c82875ccb4a2c5e15a13718300aeb9ea x_md5=8aa6228e43cb1de1b7eaf6160c15b994
+[gemv-ab] slot=3 soa_md5=b957b48df731cc4152f8a1a10ae09ed1 inverse=OK
+[gemv-ab] slot=4 seed=5 aos_md5=0bcf4d844d49a7d75dcb8aac7828a6a5 x_md5=fb27497c81c6ecd0ef2daca49b1e8b65
+[gemv-ab] slot=4 soa_md5=184117ac9f6dc4a34d0b4c0d6b177d40 inverse=OK
+[gemv-ab] slot=5 seed=6 aos_md5=78b3239f89e8a9a64bf76a80b8526482 x_md5=f143fd9f98e81a8bf735e94ade69039e
+[gemv-ab] slot=5 soa_md5=d3f0170e9aebab8ddf6b562962b2853e inverse=OK
+[gemv-ab] slot=6 seed=7 aos_md5=4956e833d014c5467e7f25bbbe75c773 x_md5=8af6436163a1b1ca166f12ff04c4e8d3
+[gemv-ab] slot=6 soa_md5=e9440f947616ff7a34f81aa8369bc665 inverse=OK
+[gemv-ab] slot=7 seed=8 aos_md5=15d3bc7f6dd0a3a42c900ee391e39107 x_md5=ec020da9d655f09a549eb125c60f34a6
+[gemv-ab] slot=7 soa_md5=50f4fc41053d769ee344d027053aeddf inverse=OK
+[gemv-ab] slot=8 seed=9 aos_md5=82901fc943e722b5ac3bc352436c26bb x_md5=d0c764efb59b53d263ac939247b47966
+[gemv-ab] slot=8 soa_md5=cc707c5b95cc503530df4c132319fe03 inverse=OK
+[gemv-ab] slot=9 seed=10 aos_md5=6ce30302f53932964e8e9e8e3116706e x_md5=5d16fae3ee2cea2378efa8c5313abc42
+[gemv-ab] slot=9 soa_md5=c0bdbedf7a832e7ecdaea5fea37c6357 inverse=OK
+[gemv-ab] slot=10 seed=11 aos_md5=d0b138821cf9a789551015e15fc7b4e5 x_md5=d632286a1acb33820da3be7d641776ee
+[gemv-ab] slot=10 soa_md5=d0d669d249defa2631d95a3f330e1145 inverse=OK
+[gemv-ab] slot=11 seed=12 aos_md5=a8e3791eae7b58daeb20b2311a08e97f x_md5=2306e937bceb908efe7db25472a3ec69
+[gemv-ab] slot=11 soa_md5=7546bf94e10c011dc7ec5e2aac6bc3fa inverse=OK
+[gemv-ab] slot=12 seed=13 aos_md5=ce2b21f0b8d2ee1f15dfae5764952b6c x_md5=a6870a27eb747dae444cd4d3c340aa79
+[gemv-ab] slot=12 soa_md5=833091eed879e12c81c1d4c389a9a11a inverse=OK
+[gemv-ab] slot=13 seed=14 aos_md5=b72092514b5f788b2a92b76ea46c7112 x_md5=7d65dcc5314c5d56af06e3147e25e5f8
+[gemv-ab] slot=13 soa_md5=a3f353fb14627efe9e68f48c1201d79e inverse=OK
+[gemv-ab] slot=14 seed=15 aos_md5=1b7dde5af6358f63fdcf92be0945a989 x_md5=a3ea8631e49707b664364b828b2ccdeb
+[gemv-ab] slot=14 soa_md5=f76e697d593943446bf49fa04dfd48a1 inverse=OK
+[gemv-ab] slot=15 seed=16 aos_md5=8b850fc77ccde1190d31664c4ff197d6 x_md5=3f959bf2fc50f1e3421cd32112fe0bda
+[gemv-ab] slot=15 soa_md5=730bb11534f42db4e83418ba38b6217a inverse=OK
+[gemv-ab] slot=16 seed=17 aos_md5=71cc86fb145b6da9ffb4274cf8e59e9c x_md5=95584902a659de8f05fa28350118ef51
+[gemv-ab] slot=16 soa_md5=7f1fbb73d598b83cf8e5c463a406ee0c inverse=OK
+[gemv-ab] slot=17 seed=18 aos_md5=7ffaf51eb4d4ade3dc08b00ea84895d4 x_md5=6d6ab9cd94c127cde4b99f1edb0bb0ac
+[gemv-ab] slot=17 soa_md5=9405598073773278ef10967f93d40fc3 inverse=OK
+[gemv-ab] slot=18 seed=19 aos_md5=75b09cd2fad0d06c10987d92543b8d5f x_md5=95f4f94a5be153ce7d03932d3ea36392
+[gemv-ab] slot=18 soa_md5=a3c227a9af385cf0c7b8a30244e76c2e inverse=OK
+[gemv-ab] slot=19 seed=20 aos_md5=e5f7d101e19888e31cd7fff0a66e3da4 x_md5=27507f1440e47df81982ea09cf0efb05
+[gemv-ab] slot=19 soa_md5=6d542b3d6366fa3f84e6dd00db86dd39 inverse=OK
+[gemv-ab] slot=20 seed=21 aos_md5=d36347ae4b3766bf1570d72fbfc8b6bc x_md5=39ae70e15035c6f3a9ac8a7f742bb242
+[gemv-ab] slot=20 soa_md5=33f66a8919883982fed8333bf0995546 inverse=OK
+[gemv-ab] slot=21 seed=22 aos_md5=c890a0f40bf3aaf4d5aec53610300d05 x_md5=11cf7e330021ddc3fe4eb7ab56b3b8be
+[gemv-ab] slot=21 soa_md5=5006ff834bcfd61ee017433955bd3c16 inverse=OK
+[gemv-ab] slot=22 seed=23 aos_md5=d4b3561a4c3252a8dcc9b031535bd09b x_md5=81022b73015dcf14a60b2e12d21f6ed1
+[gemv-ab] slot=22 soa_md5=a87df0a7276e64cad037213511721aeb inverse=OK
+[gemv-ab] slot=23 seed=24 aos_md5=0436c66e887c80e4ecc12db73533826d x_md5=fa211a42e67ae8f74025729518956178
+[gemv-ab] slot=23 soa_md5=7ff2872c2853ed64f58f32c2a590ad09 inverse=OK
+[gemv-ab] slot=24 seed=25 aos_md5=f93efd9562ebc925dc79af339a7e49ac x_md5=2795b62ddd74273663c67b035cd577d4
+[gemv-ab] slot=24 soa_md5=4bff06e7c9d65d5f4cc5588a19c64b7b inverse=OK
+[gemv-ab] slot=25 seed=26 aos_md5=000c14e47798b069bcc0cd5748ac3add x_md5=3324ea43c10d8f5192b75ada9b405307
+[gemv-ab] slot=25 soa_md5=25880c50618af0484141ecea8ae1e33e inverse=OK
+[gemv-ab] slot=26 seed=27 aos_md5=15e661cf8e7ac5069477667958d6274e x_md5=e260be6479c602e81844bcdc9ee7db16
+[gemv-ab] slot=26 soa_md5=fe936e781789e901b4d49e26789862e9 inverse=OK
+[gemv-ab] slot=27 seed=28 aos_md5=33dbc09b534a339cd438334e822387d1 x_md5=786f12ef122a6c64db9cdfb5402e0b29
+[gemv-ab] slot=27 soa_md5=7d024fa1775be12ddb6ea08ab106ad14 inverse=OK
+[gemv-ab] slot=28 seed=29 aos_md5=33c8395a2aad7c70d35ad19a27e751aa x_md5=be4246b652cbc158c48fe0e610b82b47
+[gemv-ab] slot=28 soa_md5=cb606ed46f94b812feeffd8bc48e9d63 inverse=OK
+[gemv-ab] slot=29 seed=30 aos_md5=e44f6c09b12e521d713825197f2d4939 x_md5=a3ad443c8bc393b54dd41cc759c90782
+[gemv-ab] slot=29 soa_md5=dd5b23cb7d17ff9e91c6e8ccf8edef3b inverse=OK
+[gemv-ab] slot=30 seed=31 aos_md5=c35a9b7964919385e4c80d949717e858 x_md5=dcb421edfdb5a654592d4684997f323e
+[gemv-ab] slot=30 soa_md5=3dbc4fe00a229390462ebc0c359376c8 inverse=OK
+[gemv-ab] slot=31 seed=32 aos_md5=cf79659af15d097c1b801f795c568298 x_md5=b7a225f8ed266723c3dc2c6e0d5db76a
+[gemv-ab] slot=31 soa_md5=8056c1a7e3bd67d886b01a0250dd72a3 inverse=OK
+[gemv-ab] slot=32 seed=33 aos_md5=3f460c49a8b0b0dc874f4024297bda68 x_md5=6d3fdf351f5d5602234d7ba52ded7403
+[gemv-ab] slot=32 soa_md5=612236894a1d3b40120ea1add31576c6 inverse=OK
+[gemv-ab] slot=33 seed=34 aos_md5=84c9c3aba425985acc5def71fd5b6ebe x_md5=e8d5c4d5e855cf86ceb3a2fdb21a4e54
+[gemv-ab] slot=33 soa_md5=a874e8ff173c3046196aafefaf19a3c8 inverse=OK
+[gemv-ab] slot=34 seed=35 aos_md5=a050475297191862c33d56b7b175a843 x_md5=0b56daa63b7d283df79044d30b43cbca
+[gemv-ab] slot=34 soa_md5=032fd545fc69cf9144adf41142f8704f inverse=OK
+[gemv-ab] slot=35 seed=36 aos_md5=8613d5ee3c30f309d447dbb0c9110334 x_md5=572a4f91968a503099bda1c440fe8aa7
+[gemv-ab] slot=35 soa_md5=68c6c977768aeb3b8b51b255e94397be inverse=OK
+[gemv-ab] slot=36 seed=37 aos_md5=fbe5fbfe65fb03523231d9e490c1b3d2 x_md5=e9bccc719693c2fa19ade766260471cf
+[gemv-ab] slot=36 soa_md5=4d46003bfdcafcc85f4b7be45e560c0b inverse=OK
+[gemv-ab] slot=37 seed=38 aos_md5=013060bf5f3352f38850e59756dee77c x_md5=3b3e42ecdf91703c09f40ed7f9930b06
+[gemv-ab] slot=37 soa_md5=21be377a93db91456357fc423072d8fb inverse=OK
+[gemv-ab] slot=38 seed=39 aos_md5=a534f77b66e3281219ef4e27aabf7216 x_md5=364264a41c7e680bcde8c20266266532
+[gemv-ab] slot=38 soa_md5=ea8535fc79995f0014cdfe498f034d7d inverse=OK
+[gemv-ab] slot=39 seed=40 aos_md5=f6222dca333ac1264a1081f7df25a064 x_md5=0dba9bbbfd2bb4ee59a62c9478409051
+[gemv-ab] slot=39 soa_md5=78584dc326c14f4776f8fc5c7a1978a6 inverse=OK
+[gemv-ab] slot=40 seed=41 aos_md5=ad9777969be61f925b0fe02ea1bc011e x_md5=7ed56b6210e9daaf8ada98222e9e9b3c
+[gemv-ab] slot=40 soa_md5=d9f01a19138b58bbad564e494c0ed17a inverse=OK
+[gemv-ab] slot=41 seed=42 aos_md5=a43cde2ec640be19a151339b16e0c5a6 x_md5=de7a8710d9dc90ab74835fe5c2e2c34c
+[gemv-ab] slot=41 soa_md5=79f701851c6a6155a66f737fa46beb19 inverse=OK
+[gemv-ab] slot=42 seed=43 aos_md5=2cb416450d320c8322ebc1cbec730b1a x_md5=52c48d13bcf7470fbfa8bfaa7b805c3b
+[gemv-ab] slot=42 soa_md5=23cda03fdaf7641b4231f9a7644c7a50 inverse=OK
+[gemv-ab] slot=43 seed=44 aos_md5=e98913a4ff91048db4591a114301eb85 x_md5=92a2a7114f4761db4442b006d9fe2561
+[gemv-ab] slot=43 soa_md5=715ccda716eb8419802b1e118150d56e inverse=OK
+[gemv-ab] slot=44 seed=45 aos_md5=597826871f1254d0c796e88e4ba0ecd7 x_md5=957e488b9b7c739a5c6ceb6bc614f2d5
+[gemv-ab] slot=44 soa_md5=570e322f651da707f810a8e5242384b2 inverse=OK
+[gemv-ab] slot=45 seed=46 aos_md5=7280feabf33e38c4eb1f8b2abb44ceee x_md5=c29b70730cc73a07c18df4a626c6cfdf
+[gemv-ab] slot=45 soa_md5=581f8081064af3cbb52567230a73e9c1 inverse=OK
+[gemv-ab] slot=46 seed=47 aos_md5=05d22bbd8ace7697a63b12ec18625adc x_md5=6594a78738e14baa50f09949cc3012a4
+[gemv-ab] slot=46 soa_md5=05513202689c1ba3ab037c75fe71607d inverse=OK
+[gemv-ab] slot=47 seed=48 aos_md5=8263cbf08959b0e29220bf1fd5fca9fb x_md5=8296cdfab02440ec978a5d51d0022d3a
+[gemv-ab] slot=47 soa_md5=8908c2748c011dad70afab2cb56fc155 inverse=OK
+[gemv-ab] slot=48 seed=49 aos_md5=3649c8da5ce8be6774f508e8f7e02cba x_md5=5792b0fc0a0fd22b2738178ae662c197
+[gemv-ab] slot=48 soa_md5=03547d956b76d6fe230aa4fe21f6bec8 inverse=OK
+[gemv-ab] slot=49 seed=50 aos_md5=7855a75f6afe78be6d8cc4c2ac297446 x_md5=8720e6303c3b2c0fbaacb212e26c5c02
+[gemv-ab] slot=49 soa_md5=99cf0a59669749c40f356d1440a7a0fa inverse=OK
+[gemv-ab] slot=50 seed=51 aos_md5=19cc5c93265c7822526e938c08c42e25 x_md5=ae765352967b2bc7becdca6197231049
+[gemv-ab] slot=50 soa_md5=aa76f83463822341884d96d14209a11f inverse=OK
+[gemv-ab] slot=51 seed=52 aos_md5=2041844add013725e3e6bcea2f3aace4 x_md5=529d8594ae0f6259033e9278622e53bd
+[gemv-ab] slot=51 soa_md5=266654b34026adf9c0ca9c1a2358bb67 inverse=OK
+[gemv-ab] slot=52 seed=53 aos_md5=6b3444e37fc3bfd92fbef8b2aa262295 x_md5=d4d31ec833c46c87af471db08888b781
+[gemv-ab] slot=52 soa_md5=3a0b64c545bbe0ec089a73fd0b300608 inverse=OK
+[gemv-ab] slot=53 seed=54 aos_md5=445d4ee6dbdd1a672bb62e1362db7376 x_md5=bd9044cf1b0fd6cb89836c7d03ba5074
+[gemv-ab] slot=53 soa_md5=76e84810fbecd4cc6720a922b40244ed inverse=OK
+[gemv-ab] slot=54 seed=55 aos_md5=c59f004ae32fc6c7207b7131c6238f9d x_md5=8b61482aa359f4a9b14117a1a241ba78
+[gemv-ab] slot=54 soa_md5=72eafa4f3eb81f494db713937e7da206 inverse=OK
+[gemv-ab] slot=55 seed=56 aos_md5=26e6a09e56bab823f0706dac3f0e1dfa x_md5=3cc5bbbc008bbe65822297d1943336ec
+[gemv-ab] slot=55 soa_md5=026fc329868e40c44d9e5491434a7dfc inverse=OK
+[gemv-ab] slot=56 seed=57 aos_md5=e072f2143d7edc78d7ce0f198f2cd98b x_md5=25dcf36167834a7a05e10dbb1168f973
+[gemv-ab] slot=56 soa_md5=eaf2e1684a265cdf20d4314c07121235 inverse=OK
+[gemv-ab] slot=57 seed=58 aos_md5=449cbb1eb0d3aee57a2a590911118d36 x_md5=24bdf80f2229a59077d0877951570282
+[gemv-ab] slot=57 soa_md5=eece9617b11792549edd8a49c871694d inverse=OK
+[gemv-ab] slot=58 seed=59 aos_md5=37b329055fad140ef8ed483a8ef58d55 x_md5=36c919c0a9b7edcf647dd2371baf66d7
+[gemv-ab] slot=58 soa_md5=fc30dc5469ffb0830634c82acc597475 inverse=OK
+[gemv-ab] slot=59 seed=60 aos_md5=5ee7821aad16b37502472abfce26a038 x_md5=0035515166505061fb7cb3223a702186
+[gemv-ab] slot=59 soa_md5=bdc4fefcdbc0c4c1895efadab7f0e4b8 inverse=OK
+[gemv-ab] slot=60 seed=61 aos_md5=d50f40a4a5fd206a4ae85dccce1ed0d6 x_md5=3a6f49be0c17e82ee5932981497b8a64
+[gemv-ab] slot=60 soa_md5=b3b74758fc0a24adeac517edd406c778 inverse=OK
+[gemv-ab] slot=61 seed=62 aos_md5=b3d48260740bdba838046cfc3f2dd594 x_md5=75d16a5e078f81737b44c65ddc29675f
+[gemv-ab] slot=61 soa_md5=7732b17c5d335fcd18dac6ccc3af6f2d inverse=OK
+[gemv-ab] slot=62 seed=63 aos_md5=9d7e0188b652cc35a45d2a5fed16b18c x_md5=89f7cfdce77c688f33c3d123cb949fc4
+[gemv-ab] slot=62 soa_md5=99764a9ffae8eb8401bacb135e4a61dd inverse=OK
+[gemv-ab] slot=63 seed=64 aos_md5=5ca39145c5b4643c86cfe1b5f86eb162 x_md5=c209302f71bec280121ca73d2896a98b
+[gemv-ab] slot=63 soa_md5=c785389d291dc5b2c31771479cebbbf0 inverse=OK
+[gemv-ab] slot=64 seed=65 aos_md5=1de04dc76e65862d3d7fcadc21b2750f x_md5=92644d7122d9ecc73d67fd241a0d51da
+[gemv-ab] slot=64 soa_md5=16c69cf1084fc00cf67d741165c8bf61 inverse=OK
+[gemv-ab] slot=65 seed=66 aos_md5=a6f2141dc409594f421428f9421c90e2 x_md5=b94b9ef4a0f19c6d78286bb2daeda318
+[gemv-ab] slot=65 soa_md5=e8fbbd2bdb88f22d124d593ace048302 inverse=OK
+[gemv-ab] slot=66 seed=67 aos_md5=9fdeb8ee5cd78266264e7ad17bafc7f1 x_md5=26c46140489cf91cf446ddf856c9d13e
+[gemv-ab] slot=66 soa_md5=b8887cd6f02571e3d7fac0b6efba43a9 inverse=OK
+[gemv-ab] slot=67 seed=68 aos_md5=016c15413e7722d6c2cfe30e72e80b7c x_md5=b0cb19026210e9f5d418e3cefd1075aa
+[gemv-ab] slot=67 soa_md5=455706401b2f02e6e55f9c468fdcf7d0 inverse=OK
+[gemv-ab] slot=68 seed=69 aos_md5=5d6115c6945449e3ca8fb53c0f240c80 x_md5=954fdd83741621c34e34f4c11213887a
+[gemv-ab] slot=68 soa_md5=0ebbc09464481a2696ab64ef326e7a88 inverse=OK
+[gemv-ab] slot=69 seed=70 aos_md5=1d828181d1a177e346c1bfb457a1a12a x_md5=81c2513bd06eb16bee8ef33fc7bc8221
+[gemv-ab] slot=69 soa_md5=0d5a04f212b683e4c89238cb1f8abf91 inverse=OK
+[gemv-ab] slot=70 seed=71 aos_md5=ae298354c9a59475c228c7633358a508 x_md5=40e757296450ea71b76e2ff1b7b6b540
+[gemv-ab] slot=70 soa_md5=51e4f75c0b53fe67cf274ddd06fde5fd inverse=OK
+[gemv-ab] slot=71 seed=72 aos_md5=a8f4422ce3fcd9989a8bbd411cc9d463 x_md5=d35c82a1438e0f0bc30aeea73d4f13ba
+[gemv-ab] slot=71 soa_md5=0570966cc160e092a1835ff5e0f6b663 inverse=OK
+[gemv-ab] slot=72 seed=73 aos_md5=59db83218708c76ce2de555e3c47d632 x_md5=8acaad5849566b626d0616bd53585ec0
+[gemv-ab] slot=72 soa_md5=6a3ebee2ea49a764bc5c5bce0ed32d7c inverse=OK
+[gemv-ab] slot=73 seed=74 aos_md5=adcdc3dbb70bbfb1af3b242c3082bad2 x_md5=dfe2219f990d8088f24f3c5d0f37830d
+[gemv-ab] slot=73 soa_md5=8e6fca3eed3119062046589991ea63e3 inverse=OK
+[gemv-ab] slot=74 seed=75 aos_md5=7161857ebd1c98b5f34b0dea8abe5708 x_md5=02ab4aa6805848ac75ca972c226f917e
+[gemv-ab] slot=74 soa_md5=8c7c3a76d6d42fc7d7a8efb675eb9c29 inverse=OK
+[gemv-ab] slot=75 seed=76 aos_md5=981494616aac1211154b8e0a8a97135f x_md5=37e68b949367fc4e09da992c70a4d17b
+[gemv-ab] slot=75 soa_md5=7a87b361ea739cc70c1c6bc095950de4 inverse=OK
+[gemv-ab] slot=76 seed=77 aos_md5=eebb88ef4bc19efcadebb4abbcbd2090 x_md5=e287bacd6027e5518aa135e1393c37a4
+[gemv-ab] slot=76 soa_md5=32abb70af9e6879295df586c9b549f6d inverse=OK
+[gemv-ab] slot=77 seed=78 aos_md5=33caaca10a62491fe5e5f0bf788325d4 x_md5=c8703563364860c635314d248f7bfeb9
+[gemv-ab] slot=77 soa_md5=87c28be8b75de5717c28ea80b49cdbc4 inverse=OK
+[gemv-ab] verify slot=0 seed=1 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=1 seed=2 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=2 seed=3 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=3 seed=4 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=4 seed=5 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=5 seed=6 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=6 seed=7 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=7 seed=8 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=8 seed=9 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=9 seed=10 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=10 seed=11 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=11 seed=12 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=12 seed=13 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=13 seed=14 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=14 seed=15 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=15 seed=16 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=16 seed=17 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=17 seed=18 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=18 seed=19 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=19 seed=20 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=20 seed=21 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=21 seed=22 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=22 seed=23 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=23 seed=24 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=24 seed=25 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=25 seed=26 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=26 seed=27 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=27 seed=28 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=28 seed=29 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=29 seed=30 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=30 seed=31 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=31 seed=32 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=32 seed=33 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=33 seed=34 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=34 seed=35 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=35 seed=36 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=36 seed=37 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=37 seed=38 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=38 seed=39 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=39 seed=40 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=40 seed=41 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=41 seed=42 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=42 seed=43 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=43 seed=44 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=44 seed=45 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=45 seed=46 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=46 seed=47 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=47 seed=48 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=48 seed=49 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=49 seed=50 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=50 seed=51 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=51 seed=52 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=52 seed=53 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=53 seed=54 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=54 seed=55 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=55 seed=56 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=56 seed=57 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=57 seed=58 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=58 seed=59 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=59 seed=60 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=60 seed=61 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=61 seed=62 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=62 seed=63 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=63 seed=64 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=64 seed=65 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=65 seed=66 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=66 seed=67 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=67 seed=68 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=68 seed=69 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=69 seed=70 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=70 seed=71 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=71 seed=72 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=72 seed=73 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=73 seed=74 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=74 seed=75 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=75 seed=76 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=76 seed=77 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=77 seed=78 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] timing rotations=1 timed_iters=78 (requested iters=60)
+[gemv-ab] per-arm wall warmup_ms=250
+[gemv-ab] arm=hipcc host_submit_mean=0.649us host_window=1032.4us
+[gemv-ab] arm=hipcc raw_host_submit_us=1.4930,0.6820,0.6210,0.5610,0.6310,1.2730,1.0520,1.4920,1.5720,0.8610,0.6710,0.6210,0.6010,0.6110,1.2930,0.5810,0.6210,0.5610,0.6310,0.5510,0.5910,0.5710,0.6210,0.6210,0.5710,0.5810,1.0920,0.9720,1.0320,1.0620,1.0120,0.5610,0.5920,0.5810,0.5710,0.5610,0.5710,0.5810,0.5610,0.5710,0.5620,0.5710,0.6310,0.5710,0.5710,0.5710,0.5710,0.6020,0.9810,0.5710,0.5610,0.5610,0.5610,0.6210,0.5610,0.5610,0.5610,0.5910,0.5610,0.5810,1.0220,0.5710,0.5710,0.5610,0.5610,0.5710,0.5720,0.6010,0.6010,0.5910,0.5610,0.5710,0.5810,0.5820,0.5810,0.5710,0.9920,0.5710,0.6810,0.6110,0.6010,0.6020,0.5910,0.5910,1.2220,0.5810,0.5910,0.6010,0.5910,0.6010,0.5810,0.6010,0.5810,0.5910,0.6010,1.0320,0.6010,0.5910,0.5910,0.5810,0.5910,0.5910,0.6010,0.6010,0.6010,0.6120,0.5910,0.5910,0.6110,0.6010,0.5910,0.5920,0.6110,0.6010,0.5910,0.6010,0.5910,0.5910,0.6110,0.6010,0.6210,0.6010,0.5920,0.5910,0.5810,0.5910,0.5910,0.6010,0.5920,0.6010,1.3020,1.0220,0.5910,0.5920,0.6010,0.5910,0.5810,0.5910,0.5910,0.5610,0.5710,0.5610,0.5810,0.5710,0.5610,0.5710,0.5610,0.5610,0.5720,0.5610,0.5810,0.5610,0.5610,1.0120,0.5510,0.9920,0.9820,0.5810,0.6020,0.5810,0.9720,0.5710,0.5610,0.5610,0.5810,0.6010,0.5810,0.5820,0.5910,0.5810,0.7710,0.6010,1.0310,0.5810,0.5910,0.5910,0.5810,0.5810,0.5610,0.5510,0.5620,0.5610,0.6610,0.5710,0.5910,0.6110,0.5720,0.5910,0.5510,0.5610,0.5510,0.6010,0.5810,0.6820,0.5610,0.5610,0.5610,0.5610,0.6710,1.0420,0.5610,0.7210,0.5610,0.5510,0.5510,0.5510,0.5610,0.6320,0.6210,0.5810,0.5710,0.5610,0.5510,0.5610,1.0120,1.0520,1.0220,1.0020,0.5510,0.5610,0.5510,0.5510,0.5610,0.6010,0.5610,0.5810,0.5610,0.5610,0.5510,0.5710,0.5710,0.5510,0.5610,0.5610
+[gemv-ab] arm=hipcc raw_gpu_us_per_launch=4.1964,4.1944,4.2533
+[gemv-ab] arm=hipcc sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77
+[gemv-ab] arm=soa host_submit_mean=0.675us host_window=1033.5us
+[gemv-ab] arm=soa raw_host_submit_us=2.0230,0.6220,0.6810,1.5430,0.9120,1.6830,1.3020,0.7920,1.2220,0.8520,0.9020,1.2720,0.6610,1.0420,0.6120,1.0620,0.6010,0.5810,0.6410,0.5910,0.6420,0.6110,0.5710,0.6010,0.6310,0.6020,0.5710,0.5610,0.7910,0.5910,0.5810,0.5610,0.6210,0.5810,1.0020,0.5710,0.5810,0.6420,0.5810,0.5610,0.5710,0.5610,0.6310,0.5810,1.0320,0.5810,1.0210,0.6310,0.5810,0.5510,0.5710,0.5610,0.6110,0.5610,0.5510,0.5710,0.5810,1.0020,0.5810,0.6410,0.5610,0.5510,0.5710,1.0210,0.5610,0.5610,0.5710,0.5710,0.6410,0.5610,0.5810,0.5620,0.5610,0.5610,0.5610,0.5610,1.0320,0.5510,1.0920,0.5810,0.6510,0.5910,1.1930,0.5810,0.5810,0.6010,0.6010,0.6010,0.6020,0.6110,0.5910,0.5910,0.6010,0.5810,0.6210,0.5910,0.5910,0.5910,0.5810,1.0320,0.5910,0.5910,0.6210,1.0120,0.5910,0.6010,0.6010,1.0420,0.5910,0.5810,1.0120,0.5810,0.5910,0.5910,0.5710,0.6010,1.2830,0.6510,1.0320,0.5710,0.5810,0.5610,0.5820,0.5510,0.5910,0.5910,0.5610,0.5710,0.5610,0.5910,0.5710,0.5610,0.5510,0.5610,0.5610,0.5710,0.6710,0.6020,0.6010,1.0520,0.5910,0.5610,0.9620,0.9920,1.2620,0.5610,0.5510,0.6010,0.5910,0.5610,0.5910,0.5910,0.5910,0.6020,0.5910,0.6110,0.5910,0.5610,0.5610,1.0220,0.5610,0.5610,0.5610,arm                       us/launch  logicalGB/s  vs-base host_sub_us  exactness
+hipcc                          4.20          4.0    1.000      0.649  ref
+[gemv-ab] arm=hipcc gpu_us_per_launch_median=4.1964 n_samples=3 (3 whole-batch windows; no min/best-of)
+soa                            4.20          4.0    1.001      0.675  pre-verified
+[gemv-ab] arm=soa gpu_us_per_launch_median=4.2010 n_samples=3 (3 whole-batch windows; no min/best-of)
+== shape M=33 K=1024 (groups=4) weight_bytes=17952 slots=59 working_set_bytes=1059168 ==
+[gemv-ab] logical_bytes/launch=22180 (analytical; not DRAM)
+[gemv-ab] slot=0 seed=1 aos_md5=4494ff39bfbc95c03536b2b3f6021ccc x_md5=27001ffa77befc0b6f26524151f75230
+[gemv-ab] slot=0 soa_md5=8c8644540f13669d332c8c337a19d8a7 inverse=OK
+[gemv-ab] slot=1 seed=2 aos_md5=443ea4fd64f943028cdb18f4e0d3b5be x_md5=6b5016fb5e6632bc22dbe4dcd25a0e86
+[gemv-ab] slot=1 soa_md5=9a8a50db2684442ff5d7c6c33a741229 inverse=OK
+[gemv-ab] slot=2 seed=3 aos_md5=bb160c07fa042f45d55cf5fc27ae40cf x_md5=6a9881af7a7fb5b62e50b515dba6d545
+0.5710,0.5710,0.5510,0.5610,0.5610,0.5610,0.5910,0.5810,0.5720,0.5610,0.5610,0.5710,0.5610,0.5610,0.5810,0.5510,0.5710,0.9720,0.5510,0.5620,0.5710,0.5610,0.5510,0.5610,0.5710,0.5710,0.5710,0.5610,0.5520,0.5610,0.5610,0.5610,0.5610,0.5510,0.5910,0.5710,0.6020,0.5910,1.0320,1.0620,1.0220,0.5410,0.5610,0.9920,0.5610,0.9820,0.5610,0.5510,0.5710,1.0020,0.5510,0.6010,0.6110,0.6010,0.5810,0.6010,0.5610,0.5610,0.5510,0.9720,0.9920,0.5910,0.6010,0.5820,0.5910,0.5710,0.9720,0.5510,0.5610,1.0020,1.0720
+[gemv-ab] arm=soa raw_gpu_us_per_launch=4.2631,4.2005,4.2010
+[gemv-ab] arm=soa sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77
+[gemv-ab] slot=2 soa_md5=f8a7825fe9fa8168ef10a3b609c90918 inverse=OK
+[gemv-ab] slot=3 seed=4 aos_md5=df77d247a3800ec206289e0f9c63ffd5 x_md5=7caf0eb50170d7210889810e6d35230b
+[gemv-ab] slot=3 soa_md5=1cee2a153f41bdd3c82b6b5a5592b577 inverse=OK
+[gemv-ab] slot=4 seed=5 aos_md5=198dd6ed43e328c7df24b1649ee2fde7 x_md5=d987804d19c526fde83adfedbbf889d8
+[gemv-ab] slot=4 soa_md5=fa508af9d11774c94f693810a9d86719 inverse=OK
+[gemv-ab] slot=5 seed=6 aos_md5=f03394d407cb46cd03477f457171ab9d x_md5=9057709218be089a1a079742c9d2802b
+[gemv-ab] slot=5 soa_md5=0715ad178765b28656d3fb94f326efc9 inverse=OK
+[gemv-ab] slot=6 seed=7 aos_md5=1733867daacc7a05595aefe72815ab09 x_md5=6c307d5c22b6406e9820141be1270988
+[gemv-ab] slot=6 soa_md5=0b6e1687b9713f75ec5167ba6725e8e3 inverse=OK
+[gemv-ab] slot=7 seed=8 aos_md5=aaa6c69fa1c0ef0f8c444b3acf2855c3 x_md5=ff864ff9f0abb72d968ee575d94b5f18
+[gemv-ab] slot=7 soa_md5=65cdff9b98978281a3f472fd4fcaa087 inverse=OK
+[gemv-ab] slot=8 seed=9 aos_md5=5e796e33605c58ed8f0c679f93197e1f x_md5=355d2c1ef9b2b9c38689a1bad405c6a3
+[gemv-ab] slot=8 soa_md5=e280f38bbea903dcc2ad43f2fbcb114b inverse=OK
+[gemv-ab] slot=9 seed=10 aos_md5=938ebe733a3e884643efeda14d9b359f x_md5=17c151eb429064840416245fd7190d1d
+[gemv-ab] slot=9 soa_md5=d992eb376ec4043958a26747132f1694 inverse=OK
+[gemv-ab] slot=10 seed=11 aos_md5=0556106c60ae60164f81782e35c9b8ff x_md5=a87d960c8334dd68f2dd812fa24bc930
+[gemv-ab] slot=10 soa_md5=74afb86f026754c8ea897f14c2362447 inverse=OK
+[gemv-ab] slot=11 seed=12 aos_md5=3ae87c98f91ef3e3404369615f4264b5 x_md5=c8e9990ceb9b71af15c651d77c44a6f1
+[gemv-ab] slot=11 soa_md5=2ce55bf096b9f7feeb10292ba4197292 inverse=OK
+[gemv-ab] slot=12 seed=13 aos_md5=a2e4f58646f629c7e1fd47ab058e78fb x_md5=2fa6994dac4d7b08050f3d410fe79471
+[gemv-ab] slot=12 soa_md5=d9536f066d2bf5f331370a8e16c8cd59 inverse=OK
+[gemv-ab] slot=13 seed=14 aos_md5=a7b970a07cd87ad2292e7642617736b5 x_md5=3a7bcee462a2571b433359f9aac8eca2
+[gemv-ab] slot=13 soa_md5=5fd5758e3fff519cd0d234dd5b2816d4 inverse=OK
+[gemv-ab] slot=14 seed=15 aos_md5=aaa9c05710ab2ff2d1c76789cacd8e3a x_md5=bfc3860118c9cac94cc39ffbfa86df4a
+[gemv-ab] slot=14 soa_md5=132604b8080be04ee977f71ce7fcedf4 inverse=OK
+[gemv-ab] slot=15 seed=16 aos_md5=27e02d57a016c682c93d18b0803ad0be x_md5=0422c43019e95f56a24da87a556957fe
+[gemv-ab] slot=15 soa_md5=799e3c50a4bd8fc470de2ff7fe5f57ad inverse=OK
+[gemv-ab] slot=16 seed=17 aos_md5=6fe4d69357919c1b55f5286196bb4818 x_md5=a2540255016ef60da3c74bf13b85c587
+[gemv-ab] slot=16 soa_md5=3047b7f05595594b754de5b73799f57e inverse=OK
+[gemv-ab] slot=17 seed=18 aos_md5=f191fa1c87acb90752361eb32e53816e x_md5=fdc67a44bb7a25cd6deaf72409561488
+[gemv-ab] slot=17 soa_md5=c6771afebc449c7ca54b85c47c9bfd07 inverse=OK
+[gemv-ab] slot=18 seed=19 aos_md5=40e7995c37cf154d3edc5daf969856f7 x_md5=8c016d127a89fefc0edf197ac6508cbf
+[gemv-ab] slot=18 soa_md5=0ce53b3c06890a2e27028257f6a72976 inverse=OK
+[gemv-ab] slot=19 seed=20 aos_md5=87a60b1d1e633178eec3e99dd446cb12 x_md5=07dd3d49df5dabe59a4669c5d77a1355
+[gemv-ab] slot=19 soa_md5=19b3b9e0cedc8494c1d7857996ec37cd inverse=OK
+[gemv-ab] slot=20 seed=21 aos_md5=eb5f3cf642375cbd816f4b85019e0be9 x_md5=cbad13cb7ee077872a76412af460fe43
+[gemv-ab] slot=20 soa_md5=04fa488c00baa7951f177144f8700e2a inverse=OK
+[gemv-ab] slot=21 seed=22 aos_md5=e7bf59c8e4271df2f206d0ee61241c82 x_md5=4af78156f8e2e375434761244469c237
+[gemv-ab] slot=21 soa_md5=228960241ff2a0ccfca1d19e7123eb91 inverse=OK
+[gemv-ab] slot=22 seed=23 aos_md5=7a37cca23f7446507cb95a39ae43a759 x_md5=c74d2f7b224c4b99a0e84b0e92aeea5e
+[gemv-ab] slot=22 soa_md5=08fe0ffded2390968b8389feb2082bf1 inverse=OK
+[gemv-ab] slot=23 seed=24 aos_md5=3619d921551f405c6735acb96d8c6434 x_md5=245415b80304bf77b1515d9151b8cc50
+[gemv-ab] slot=23 soa_md5=b515d05d743a53256ec5a524c9dc6682 inverse=OK
+[gemv-ab] slot=24 seed=25 aos_md5=faa9968ae4d4f4b3866b5c178cfef419 x_md5=14b2b193f22f959845645ae640ddc0ad
+[gemv-ab] slot=24 soa_md5=cebab304f256e9e7f158aba4d39caae7 inverse=OK
+[gemv-ab] slot=25 seed=26 aos_md5=5bd6585ec334c7a862dd8855929c7c89 x_md5=92cbcb71f4ff71bde80f1adcfc9af2ad
+[gemv-ab] slot=25 soa_md5=76c4396a7f2bf4c4a99dd6e9ac85a6b4 inverse=OK
+[gemv-ab] slot=26 seed=27 aos_md5=b0cf25b4d43d363d01fd0d5ed6a0d26b x_md5=a47c49953f835a70428b203396e547cf
+[gemv-ab] slot=26 soa_md5=3a422917f92cbd9d19ad52f6f764c638 inverse=OK
+[gemv-ab] slot=27 seed=28 aos_md5=5aa5da4134e2bfe42a4624e5cfc3afb0 x_md5=82a8a04187c785bfe06d83c2273e5fdf
+[gemv-ab] slot=27 soa_md5=fc2a59e5d08df60675d766ce52d4fc81 inverse=OK
+[gemv-ab] slot=28 seed=29 aos_md5=b3652ab9654fc987514b73cb0fb8d225 x_md5=6872c4d2b351c003ebd7dfec7c1ffb84
+[gemv-ab] slot=28 soa_md5=c7a2d8ecb14970f46e8a293aa45dfde6 inverse=OK
+[gemv-ab] slot=29 seed=30 aos_md5=a2a55e3c7e9e48f4a44743bb32b0607d x_md5=57cddc5b92503dbb0d0eee89a8eb65c9
+[gemv-ab] slot=29 soa_md5=be902709e920cdcf1691b1103bb1ed98 inverse=OK
+[gemv-ab] slot=30 seed=31 aos_md5=1a2a7a576c23a34ed0b8368e612e77f1 x_md5=d66eb938ee32947cadea9510e5e43194
+[gemv-ab] slot=30 soa_md5=203614e9dccf011d99c607cb51195fe2 inverse=OK
+[gemv-ab] slot=31 seed=32 aos_md5=acdda7d69b1d51696073541b85777925 x_md5=1d5743c628642eb1c2d507be04946a4f
+[gemv-ab] slot=31 soa_md5=22793895a6be0dc407f8814ceaf2afc5 inverse=OK
+[gemv-ab] slot=32 seed=33 aos_md5=b9324e478e16b0b0de9368d4140af527 x_md5=568bd2862cb00f586908dd3d92fe3e4b
+[gemv-ab] slot=32 soa_md5=395a59183b28b9bb59f03911a2b9b694 inverse=OK
+[gemv-ab] slot=33 seed=34 aos_md5=fa68cac8b39509ebc16df6c7bef19464 x_md5=a2311d3e5aefc4c6de792972fa8c7ccc
+[gemv-ab] slot=33 soa_md5=5604e4b31cee34293de18ecc68b24d8d inverse=OK
+[gemv-ab] slot=34 seed=35 aos_md5=10228ce99f3a592fbca46a8da1020ddf x_md5=36ef581252a6e437e44424c46402b1b0
+[gemv-ab] slot=34 soa_md5=63c5f21699b35d6d5a47970937908956 inverse=OK
+[gemv-ab] slot=35 seed=36 aos_md5=81de2211339ecc14457a4cb961419c39 x_md5=c32df4edfe8c9a91620aecb059641192
+[gemv-ab] slot=35 soa_md5=af3299be3ab5744ee323ab2e94d7bb51 inverse=OK
+[gemv-ab] slot=36 seed=37 aos_md5=866d43816c5b6741b7689085335fa174 x_md5=5d1d1adfb8a6dc21e32301f89796d081
+[gemv-ab] slot=36 soa_md5=eae9e73c62b61cea57b4a6343fa24720 inverse=OK
+[gemv-ab] slot=37 seed=38 aos_md5=0855f4ebf5fa1fcfe526958b1f638ce6 x_md5=5f933c3a7bd847dc20384af63fb6300b
+[gemv-ab] slot=37 soa_md5=14a0d70c58c6f471def9a5a0abbbbd1d inverse=OK
+[gemv-ab] slot=38 seed=39 aos_md5=12a10170ded486ac711579526d38a071 x_md5=3e4d2c4b6c7a0a440fba625b48d118b9
+[gemv-ab] slot=38 soa_md5=564711721b67c9f9cd55baaa966f7ee4 inverse=OK
+[gemv-ab] slot=39 seed=40 aos_md5=fd6e3db6dc6bef7c2ec68d24fd7e536e x_md5=9860035351d452ca1c82b59e958a386f
+[gemv-ab] slot=39 soa_md5=d7c045b54fee5803ce5067c4af2052a3 inverse=OK
+[gemv-ab] slot=40 seed=41 aos_md5=8f666aa534aaa1fb39f43e4df9737707 x_md5=52b8728158ce5b855164fca16d68cfc0
+[gemv-ab] slot=40 soa_md5=b4d68d477fe4cf0a05c63730a151e871 inverse=OK
+[gemv-ab] slot=41 seed=42 aos_md5=fd29d77b82b028fc559697c7ca9d1c06 x_md5=29b1cefb585cd5e09b4f34bc58932373
+[gemv-ab] slot=41 soa_md5=589934edf95ff1343c9a117f7abd2de0 inverse=OK
+[gemv-ab] slot=42 seed=43 aos_md5=d8cc21be473a9294a37b5d97a981fac1 x_md5=020ed7678d003ef3c342db3c3ff90d7d
+[gemv-ab] slot=42 soa_md5=4f9ab8064fed3cac0cd070d17096a1a7 inverse=OK
+[gemv-ab] slot=43 seed=44 aos_md5=a21e22e0b44767f430fe5d9484df351d x_md5=dde7c23c990c3917f107bef7265b03a5
+[gemv-ab] slot=43 soa_md5=a7a92cc5fa4be305761979c043a9ea46 inverse=OK
+[gemv-ab] slot=44 seed=45 aos_md5=e7856a8ad6d8308aa506680ffe7afc78 x_md5=046cde70fc09f165b3dcd0572f485c4e
+[gemv-ab] slot=44 soa_md5=c0cba4319ed18a288527055ab9bb6d43 inverse=OK
+[gemv-ab] slot=45 seed=46 aos_md5=53c277de2166695ea2ce48b7057d50ee x_md5=eded4a826e470f8a7411b6056b33ee49
+[gemv-ab] slot=45 soa_md5=4fd3a8fbdcb15c7f4aeebf53f82dbb15 inverse=OK
+[gemv-ab] slot=46 seed=47 aos_md5=d1d301231eed8630bed21ff0ec13eec6 x_md5=d03ee64e990ca7f1fce8bdf265884f45
+[gemv-ab] slot=46 soa_md5=8c2f29af7b1c50c7a5b7c9489ab3eb20 inverse=OK
+[gemv-ab] slot=47 seed=48 aos_md5=e98b03e7a6cf1e374ab4ab34c90d5372 x_md5=e06a826ac7ded1347f2df6706b873166
+[gemv-ab] slot=47 soa_md5=028a13e8339861e82ff772f327bc13ab inverse=OK
+[gemv-ab] slot=48 seed=49 aos_md5=4091de8866f6d4a9615b4896f3e00f19 x_md5=b1ddc0dc82e763dfd9f045c10768bcbb
+[gemv-ab] slot=48 soa_md5=e237cff90505f28a694d34255b3739a2 inverse=OK
+[gemv-ab] slot=49 seed=50 aos_md5=c634c2d16fa7420ba22d82f84ce53658 x_md5=61ce089c6eddc4c791aa6c6fdc4f2f52
+[gemv-ab] slot=49 soa_md5=b3558f7e65c7723f7677cc30928c113e inverse=OK
+[gemv-ab] slot=50 seed=51 aos_md5=f54c3a711f450d6c7455d297308c1abc x_md5=bb1eb90e21e44f5c6d6fd6ed87ad928a
+[gemv-ab] slot=50 soa_md5=8054a5e77f49117ac78c43e8eb50fb44 inverse=OK
+[gemv-ab] slot=51 seed=52 aos_md5=ddc8777e91ad83b99aa8e04f4fbc574b x_md5=dc07d15d8bd838f9122b646b72610593
+[gemv-ab] slot=51 soa_md5=8dbc5e6e9c9ba1e67b2e5c8b2522baf9 inverse=OK
+[gemv-ab] slot=52 seed=53 aos_md5=3e59372792285950d8ec571db4c26fff x_md5=219c14a594daef64e32db6ba18e31b77
+[gemv-ab] slot=52 soa_md5=2dcdd1be5895ef5e71f383d6c1df8764 inverse=OK
+[gemv-ab] slot=53 seed=54 aos_md5=450cfc8a5d18c7484f2f64674158821b x_md5=19093b52bd9b2a90f92a91c6991fa827
+[gemv-ab] slot=53 soa_md5=1d83561841f616fcceae8761c690dc2e inverse=OK
+[gemv-ab] slot=54 seed=55 aos_md5=3630eed69312dfe5b625b05c43ab374c x_md5=5b5eacc478c53de75d4ccc98a2ef2567
+[gemv-ab] slot=54 soa_md5=513595a9702b4d7cb349019ee59cce6d inverse=OK
+[gemv-ab] slot=55 seed=56 aos_md5=727525c4118f5be319397ad69f2c5c56 x_md5=284b0e42076299661144cef7f798c9cd
+[gemv-ab] slot=55 soa_md5=6ecfa645bd688f17e3fc2db4d713fbcd inverse=OK
+[gemv-ab] slot=56 seed=57 aos_md5=aa902c067bfd7c2f8f201961fa353fd6 x_md5=0689f39de108b2916f3f08ef2c7ff317
+[gemv-ab] slot=56 soa_md5=1629a86430ce5854de71d4ebf8b6658c inverse=OK
+[gemv-ab] slot=57 seed=58 aos_md5=d692df324937b6e78f5d818602307053 x_md5=04ebfcbcbe3c0d4c4962d8394f1e057c
+[gemv-ab] slot=57 soa_md5=58371680bd895911f88987a261e868b1 inverse=OK
+[gemv-ab] slot=58 seed=59 aos_md5=f708dbdd127337504ae6866f8a0049ba x_md5=0236fb5130bf08687451e04820104d5a
+[gemv-ab] slot=58 soa_md5=3f5acaf08095616e2308ab9ad6749f86 inverse=OK
+[gemv-ab] verify slot=0 seed=1 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=1 seed=2 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=2 seed=3 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=3 seed=4 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=4 seed=5 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=5 seed=6 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=6 seed=7 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=7 seed=8 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=8 seed=9 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=9 seed=10 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=10 seed=11 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=11 seed=12 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=12 seed=13 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=13 seed=14 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=14 seed=15 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=15 seed=16 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=16 seed=17 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=17 seed=18 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=18 seed=19 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=19 seed=20 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=20 seed=21 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=21 seed=22 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=22 seed=23 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=23 seed=24 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=24 seed=25 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=25 seed=26 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=26 seed=27 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=27 seed=28 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=28 seed=29 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=29 seed=30 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=30 seed=31 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=31 seed=32 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=32 seed=33 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=33 seed=34 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=34 seed=35 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=35 seed=36 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=36 seed=37 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=37 seed=38 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=38 seed=39 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=39 seed=40 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=40 seed=41 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=41 seed=42 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=42 seed=43 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=43 seed=44 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=44 seed=45 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=45 seed=46 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=46 seed=47 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=47 seed=48 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=48 seed=49 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=49 seed=50 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=50 seed=51 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=51 seed=52 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=52 seed=53 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=53 seed=54 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=54 seed=55 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=55 seed=56 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=56 seed=57 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=57 seed=58 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=58 seed=59 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] timing rotations=2 timed_iters=118 (requested iters=60)
+[gemv-ab] per-arm wall warmup_ms=250
+[gemv-ab] arm=hipcc host_submit_mean=0.679us host_window=1308.0us
+[gemv-ab] arm=hipcc raw_host_submit_us=1.8630,0.6320,0.6510,0.6610,0.6110,1.2530,1.3020,0.9120,1.7130,1.7540,1.3520,0.9120,1.7230,1.2330,0.8810,1.6030,0.8720,1.0820,0.7720,1.2120,0.7710,0.5910,0.6210,0.5810,0.6210,1.2330,0.6110,0.5610,0.6310,0.5710,0.6210,0.5610,0.6110,0.5610,0.5610,0.6410,0.5810,0.5720,0.5910,0.5810,0.5910,0.6210,1.0420,0.5810,0.5510,0.5810,0.6110,0.5610,0.5810,0.5610,0.6310,0.6220,0.5610,0.5710,0.5810,0.5810,0.6110,0.5710,0.5610,0.5810,0.5610,0.6110,0.5610,0.5610,1.0220,0.5710,0.6020,0.5610,0.5710,0.5610,0.5710,0.6010,0.5610,0.5610,0.5820,0.5610,0.5910,0.6310,0.5610,0.9920,0.5510,0.5610,0.5810,0.6220,0.5810,0.9720,0.5910,0.5610,0.5610,1.0220,0.5910,0.5510,1.0020,0.5710,0.5710,0.9720,1.0120,0.6210,0.5620,0.5610,0.5810,0.5710,0.5610,0.5610,0.6010,0.6110,0.5610,0.9810,0.5610,0.5810,0.5610,0.5710,0.5710,0.5710,0.6110,0.5720,0.5510,0.5610,0.5910,1.0320,1.0020,1.0420,0.6310,0.5510,0.5510,0.5610,0.5610,2.1540,1.0120,0.7020,0.5510,0.5610,0.5510,0.5710,1.2930,0.5510,0.5610,0.5610,0.5510,0.5710,0.5410,0.5910,1.0720,0.5710,0.5610,0.5610,0.5510,0.5610,0.5610,0.5610,0.6810,0.5510,0.5610,0.6910,0.5610,0.5510,0.5510,1.0020,0.5610,0.5610,0.5510,1.0310,1.1230,0.5710,0.5510,1.1720,0.7210,1.6730,1.5330,0.5610,0.5510,0.5510,0.5410,0.5610,0.5610,0.6110,0.5610,0.5620,0.5510,0.5610,0.5610,0.6510,1.0720,0.5610,0.5610,0.5610,0.5710,0.5510,0.5510,0.5610,1.1020,0.6110,0.5510,0.5610,0.5510,1.2720,0.5610,0.5610,0.5610,0.5610,0.5610,0.5720,0.5510,0.6010,0.5510,0.9620,0.5610,0.5510,0.5610,0.8420,0.7710,0.9820,0.5810,0.6820,0.5710,0.5710,0.5610,0.5810,1.2620,0.9910,0.5510,0.5510,1.0120,0.5510,0.6210,0.5510,0.5610,0.5510,0.5610,0.5510,0.5510,0.6120,0.5710,0.5610,1.0320,0.5510,1.0420,0.7110,0.5510,0.5610,0.5610,0.5510,0.5610,0.5710,0.5510,0.5610,0.5610,0.5810,0.5510,0.5520,0.5710,0.5510,1.0420,0.5510,0.6610,0.6010,0.5710,1.2730,0.5510,0.5510,0.5610,0.5710,0.5610,0.6120,0.5610,0.5610,0.5710,0.5610,1.0020,0.5510,0.5510,0.6010,0.5510,0.5720,0.5610,0.5610,0.5510,0.5710,0.5510,0.6010,1.0120,0.9720,0.5710,0.9520,0.9820,0.5510,0.5610,0.5910,0.5710,0.5510,0.5620,0.5510,1.0020,0.5610,0.5610,1.0520,0.6910,1.1320,0.5510,0.5520,0.5510,0.5510,0.5510,0.5610,0.5710,0.5610,0.5510,0.5610,0.5710,0.5520,0.5510,0.5610,0.5610,0.5610,0.5510,0.5510,1.0020,0.5610,0.5510,0.5510,0.5610,0.9820,0.5510,0.5510,0.5510,0.5710,0.5610,0.5510,0.5910,0.5510,0.5610,0.5510,0.9620,0.5610,0.5510,0.6120,0.5710,0.5610,1.0120,0.5510,0.5510,0.5710,0.5710,0.5610,0.5610,1.0020,0.5510,1.2030,0.5710,0.5710,0.5510,0.5510,0.5510,0.5610
+[gemv-ab] arm=hipcc raw_gpu_us_per_launch=3.5692,3.5447,3.5546
+[gemv-ab] arm=hipcc sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58
+[gemv-ab] arm=soa host_submit_mean=0.685us host_window=1306.3us
+[gemv-ab] arm=soa raw_host_submit_us=1.8330,0.6220,0.6210,0.6210,0.6210,0.6510,1.2920,0.9020,1.2320,0.8420,2.0040,1.2720,0.6410,0.9820,1.4030,1.3020,1.4030,1.2820,0.8620,1.2020,0.7720,1.0220,0.6110,0.6010,1.0620,0.5810,0.6320,0.5610,1.1020,0.5610,0.6310,0.5710,0.6320,0.5710,0.5910,0.5610,1.0220,0.5610,0.5810,0.5910,0.5610,0.5910,0.6110,0.5810,0.5810,1.0220,0.6010,0.5710,1.0620,0.5920,0.5610,0.6110,0.5610,0.5610,0.6010,0.6220,1.0310,0.5610,0.5910,0.6310,0.5810,0.5810,0.5610,0.5720,0.6010,0.5710,0.5910,0.5610,0.5610,1.0420,0.5610,0.5610,0.5620,0.5610,0.6110,0.5810,0.5510,0.5810,0.5810,0.6320,0.5610,0.5610,0.5710,0.5610,0.5610,0.5910,0.5610,0.5720,1.0320,1.2820,1.0020,1.0320,0.5910,0.5910,0.5610,0.5610,0.5620,0.5710,0.5810,0.5910,1.1020,0.5910,0.5610,0.5610,0.5710,0.5810,0.6310,0.5610,0.5610,0.5710,0.5710,1.0210,0.5720,0.5810,0.5910,0.6210,0.5610,0.5610,1.0220,0.5810,0.5810,0.5720,0.5910,0.7110,0.5610,0.5610,0.9520,0.5610,0.5710,0.6120,0.5810,1.0420,0.5710,0.5710,0.5810,0.5910,0.5810,0.5820,0.5610,0.5910,0.5610,0.6010,0.5910,0.6520,0.5810,0.5710,0.5710,0.9620,0.6610,0.5610,1.0320,1.0320,1.0220,1.0220,1.0020,1.0220,0.5610,0.5610,1.0020,0.5810,0.5710,0.5720,0.5710,0.5810,0.5510,0.5510,0.5610,0.5810,0.5510,0.5610,0.9920,0.5510,0.5820,0.5910,0.5810,0.5510,0.5610,0.5910,0.5610,0.5510,0.5510,0.5610,1.0020,0.7110,0.5910,0.5810,0.5710,0.5710,0.5710,0.5810,0.5610,0.5710,0.5510,0.5810,0.5510,0.5610,0.5510,0.5610,0.5710,0.5710,0.5610,0.5710,0.5710,0.5710,1.0420,0.5710,0.5620,0.5810,0.5610,0.5710,0.5610,0.5610,1.0020,1.0120,0.5610,1.0220,0.5610,1.0020,0.5610,0.5710,0.5510,0.5720,1.0320,0.5910,0.5910,0.6810,1.0020,0.5510,0.6410,0.5610,0.5510,0.5610,0.5710,0.5610,1.2720,0.5620,1.0220,1.0620,1.0020,0.5710,0.5510,0.5710,0.5510,0.5610,0.5720,0.5710,0.5710,0.5710,0.5610,0.6010,0.5710,0.5610,0.9820,0.5910,0.5810,0.5710,0.5710,0.9820,0.5510,0.5410,0.5710,0.5510,0.5610,0.5710,1.0020,0.5910,0.5710,0.5610,0.5610,0.5510,0.5710,0.5710,0.5710,0.5610,0.6020,0.5610,0.9720,0.5610,0.5610,0.5710,0.5810,1.0120,0.5910,0.5710,1.0120,0.5610,0.5710,0.5720,0.6010,0.5710,1.0020,0.5710,0.5510,0.5610,0.5610,0.5610,0.5710,1.0020,1.2130,0.5810,0.9920,0.5710,0.5710,0.5810,0.5810,1.0420,0.5510,0.5510,1.0220,0.5510,0.5710,0.5610,0.5510,0.5710,0.5810,0.5710,1.0220,0.9720,0.5710,0.5710,0.5610,1.0020,0.5610,0.5620,0.5510,0.5510,0.6010,0.5610,0.9820,0.5610,1.0720,0.5710,0.5610,0.arm                       us/launch  logicalGB/s  vs-base host_sub_us  exactness
+hipcc                          3.55          6.2    1.000      0.679  ref
+[gemv-ab] arm=hipcc gpu_us_per_launch_median=3.5546 n_samples=3 (3 whole-batch windows; no min/best-of)
+soa                            3.56          6.2    1.002      0.685  pre-verified
+[gemv-ab] arm=soa gpu_us_per_launch_median=3.5617 n_samples=3 (3 whole-batch windows; no min/best-of)
+== shape M=33 K=1280 (groups=5) weight_bytes=22440 slots=47 working_set_bytes=1054680 ==
+[gemv-ab] logical_bytes/launch=27692 (analytical; not DRAM)
+[gemv-ab] slot=0 seed=1 aos_md5=7024925c875191e732c7ad94e5c31841 x_md5=971c3ab7917aa48cb723daf30d9e7fa1
+[gemv-ab] slot=0 soa_md5=2296235619e240f0b098b6b55d8f8b43 inverse=OK
+[gemv-ab] slot=1 seed=2 aos_md5=4b03c74b9fa4da389e0f327d07a94344 x_md5=29dab6e0a0662e0ba26c415065c1df19
+[gemv-ab] slot=1 soa_md5=0e8f9ccf5607d00e119bee5eb2aa038d inverse=OK
+[gemv-ab] slot=2 seed=3 aos_md5=6b0d6dc1cc790c4c5247c0ab1ffcc5d1 x_md5=5dfc5a76e5e041920c1ee495c1d40d11
+[gemv-ab] slot=2 soa_md5=0b0194dac376b0bb683511ee6bf24dfa inverse=OK
+[gemv-ab] slot=3 seed=4 aos_md5=8910db3c422ca519523246f9f62e6b14 x_md5=4a591fea9327fc3bb96685998493ac1d
+[gemv-ab] slot=3 soa_md5=0a77db33707e43fbcbb919fade015c31 inverse=OK
+[gemv-ab] slot=4 seed=5 aos_md5=0d95f9aae45aaa90cb4cf838ed07118c x_md5=403ad5965eb91fc3791b276bd3a614c6
+[gemv-ab] slot=4 soa_md5=23eaf0c12252e78a4234298e96d796f7 inverse=OK
+[gemv-ab] slot=5 seed=6 aos_md5=2bb9ce4a409bc1605a5f0042871ed986 x_md5=1c7c4689bb6a9b89f9e59a3c37ec9291
+[gemv-ab] slot=5 soa_md5=20a12c7dfe7ed8b712146254b79ea251 inverse=OK
+5610,1.1130,0.9510,0.9920,0.9920,1.0020,0.5710,1.0020,0.5610,0.5710,0.6120,0.5710,1.0120,0.5710,0.5810,1.0320,0.5710,0.5710,0.5810,0.5910,0.5810
+[gemv-ab] arm=soa raw_gpu_us_per_launch=3.5600,3.5617,3.5692
+[gemv-ab] arm=soa sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58
+[gemv-ab] slot=6 seed=7 aos_md5=ae1067349a452af3c10262b4eb4bf79e x_md5=11279f5f6de2d193b0625a407e2ac8cf
+[gemv-ab] slot=6 soa_md5=9f39016725be9e24bae05b4baebcdc7d inverse=OK
+[gemv-ab] slot=7 seed=8 aos_md5=0ed24335d41b68f495c8ab44e4473423 x_md5=64a5d31f68973a1ed003e3fdb8c55cdd
+[gemv-ab] slot=7 soa_md5=fc85537608f05e57df4729285cb10cd5 inverse=OK
+[gemv-ab] slot=8 seed=9 aos_md5=bbfa34729d09645173963db17b5c8a79 x_md5=2cd17bce69807ccfb6f0221300a12a45
+[gemv-ab] slot=8 soa_md5=f82c49dfea1886bb2d6ee13d1ecf9ebe inverse=OK
+[gemv-ab] slot=9 seed=10 aos_md5=d45b465f2f35e7c3f3bae4dcde4f94b7 x_md5=449f4d2ff33149bc92488017ced4be66
+[gemv-ab] slot=9 soa_md5=36760eec9b5b6d27e15771c3acf15efd inverse=OK
+[gemv-ab] slot=10 seed=11 aos_md5=1f880461c3f0811416176fc6bacb7264 x_md5=d5173fc6b960a3d5cdd8113eb0ec6bd1
+[gemv-ab] slot=10 soa_md5=c115ce0aad38a2450a2e5d1270fcbf54 inverse=OK
+[gemv-ab] slot=11 seed=12 aos_md5=c9884ed7f38a7a32c313261cb9668a2a x_md5=71a8647c9fc36d6fe9534a154939beb7
+[gemv-ab] slot=11 soa_md5=55d9518e733285a849754428b389aff3 inverse=OK
+[gemv-ab] slot=12 seed=13 aos_md5=9a0762066e74fd596fce3c2fc793910f x_md5=b92f5d25eb34fba02f7d75fdf8b6780f
+[gemv-ab] slot=12 soa_md5=ef46df5e241eb121f80ea236ea01948f inverse=OK
+[gemv-ab] slot=13 seed=14 aos_md5=2bb5691959f390eb50bb7e87fbe83418 x_md5=4117e6859e0e2892b60002b264db52cc
+[gemv-ab] slot=13 soa_md5=7a4ffb144880e902ae12be0a58f977da inverse=OK
+[gemv-ab] slot=14 seed=15 aos_md5=5deca8eb89f9614d63e3f46f7f41d9b3 x_md5=d15b51081eeae265ca8a64d0d2ec328d
+[gemv-ab] slot=14 soa_md5=810037c51cacd45898d48b063b32086c inverse=OK
+[gemv-ab] slot=15 seed=16 aos_md5=05d9f66723d6447377ddcfc2628d67df x_md5=a4cd6c5d0b64c50d41a32bd8da4bd507
+[gemv-ab] slot=15 soa_md5=f58be2703acc54736c9864bbae24aca2 inverse=OK
+[gemv-ab] slot=16 seed=17 aos_md5=cf07b23e1192a9158168658db1975111 x_md5=6b9c13cfea1502a8b0c37829b0556dc2
+[gemv-ab] slot=16 soa_md5=79fbfb512055829b3f8626047f90116a inverse=OK
+[gemv-ab] slot=17 seed=18 aos_md5=fc86947709c00aa2f7248b69ffa0e576 x_md5=5247ce76357843083c10cc900fba697e
+[gemv-ab] slot=17 soa_md5=916f2ae9c1afb6357350b635388ae890 inverse=OK
+[gemv-ab] slot=18 seed=19 aos_md5=c0a9d4e6c647c38ecd347d61bf84ecdc x_md5=033f022b68760370e0206b403c9d2447
+[gemv-ab] slot=18 soa_md5=05205f7f5d5db9ff4a8538afafffa83b inverse=OK
+[gemv-ab] slot=19 seed=20 aos_md5=917756aaf6f0d09d9dba647862f580da x_md5=a4312af1bda740d24b82b3b0664f57ee
+[gemv-ab] slot=19 soa_md5=7d0d0e018ea110128acb77172dd25696 inverse=OK
+[gemv-ab] slot=20 seed=21 aos_md5=e659f047f59da3f0d6b8e0e7791a6daf x_md5=454629e50720cf0506cbf9f84663cb90
+[gemv-ab] slot=20 soa_md5=070072c0e0df71aa1ee274cfb6e78ba1 inverse=OK
+[gemv-ab] slot=21 seed=22 aos_md5=74263cbb10dd5eb1bfb451f3ff1e4050 x_md5=11f37c8edd3f84882c913c6e7aaa2c01
+[gemv-ab] slot=21 soa_md5=ecfa9b3041ecd545e3ee69296091fc4b inverse=OK
+[gemv-ab] slot=22 seed=23 aos_md5=a3ff8718c5de39ce9ad8dae4bc173d4f x_md5=6d53f3c5afa56841fec67b90ece1ddbb
+[gemv-ab] slot=22 soa_md5=d9ab8c698f4537c13bc29d0092f0def2 inverse=OK
+[gemv-ab] slot=23 seed=24 aos_md5=54e2e3c423e6766ad6ac3860d2b3e990 x_md5=f7c1920230e5b9ef4f981da37bb2f8ab
+[gemv-ab] slot=23 soa_md5=bc3f99f65a157f10d42b3e8a2235e569 inverse=OK
+[gemv-ab] slot=24 seed=25 aos_md5=d093a880fe3c577ff27561a29d3f6297 x_md5=aa5763162a41fa7b3771e0feddf9da6d
+[gemv-ab] slot=24 soa_md5=40f283d6882c03a243b8a517698e4b59 inverse=OK
+[gemv-ab] slot=25 seed=26 aos_md5=7c3bbfd41e7fb8f8f5947fb52339f704 x_md5=b40571484342b97c1ca51a0e8cbe5072
+[gemv-ab] slot=25 soa_md5=e4eb4d1497663159e4be5a3a2f9e1807 inverse=OK
+[gemv-ab] slot=26 seed=27 aos_md5=e1aa2039537794a93858e4ee9b67cce1 x_md5=714838087de4b5310d618010551cd3d7
+[gemv-ab] slot=26 soa_md5=ab4fd4b6dac3819f5d8422423ba9328e inverse=OK
+[gemv-ab] slot=27 seed=28 aos_md5=383a68047aa2b8c3f3787a0fee52a015 x_md5=25d278d914a5d7a40c7e369806cd57e2
+[gemv-ab] slot=27 soa_md5=354e25548387b6066ec3f9f57e8bfd83 inverse=OK
+[gemv-ab] slot=28 seed=29 aos_md5=9c77814ee7c40c516f3b950bf05024bf x_md5=6176205259f14e72f509a5cbe46ac30c
+[gemv-ab] slot=28 soa_md5=8a9aede4a7ff601bd8530e89d814ec6a inverse=OK
+[gemv-ab] slot=29 seed=30 aos_md5=64a113be905f4098f91e65eba83fb7fb x_md5=13d39d17ff94096579156e1bd48ead7b
+[gemv-ab] slot=29 soa_md5=03a7b9b4b141b32181c80aef0a10a7af inverse=OK
+[gemv-ab] slot=30 seed=31 aos_md5=930bae9833ba4d4821512326b0f5f2a0 x_md5=19a5b2283d97fea26921b342b5a15e6b
+[gemv-ab] slot=30 soa_md5=fcb9e41866ea3cc7c1baea56f3c58cf6 inverse=OK
+[gemv-ab] slot=31 seed=32 aos_md5=615dd7877ab24bf34d2fbfc45069a0dd x_md5=e92ead1819ee19b77208fde513831400
+[gemv-ab] slot=31 soa_md5=0e6fcac77a4cf48f34310c659fc22347 inverse=OK
+[gemv-ab] slot=32 seed=33 aos_md5=1ce99e788a6252a177267d1aecf2f973 x_md5=809163462a127077a7a1b8f6e6efd788
+[gemv-ab] slot=32 soa_md5=cb3e8c105f9333affde6e7ef1e8cde52 inverse=OK
+[gemv-ab] slot=33 seed=34 aos_md5=b602220c53f3ac1fdcf141ebbecdb849 x_md5=edbb8671cb4ccf9199dd4441af4253b2
+[gemv-ab] slot=33 soa_md5=e049968c992766a78880dc73398988f6 inverse=OK
+[gemv-ab] slot=34 seed=35 aos_md5=69cbe8410c1d69c7328eb7aa33b41780 x_md5=1377be23136f3bbf2f92fb179cd77871
+[gemv-ab] slot=34 soa_md5=8fa411fa73cf19e9bf20c88ef3f23be9 inverse=OK
+[gemv-ab] slot=35 seed=36 aos_md5=a68249a72524ad971e30e99a5811463b x_md5=eac557b3a81111424479fb256f9333cf
+[gemv-ab] slot=35 soa_md5=92a8888d8cd6b88abd83b6729cb40d9b inverse=OK
+[gemv-ab] slot=36 seed=37 aos_md5=cd6576c1c30dd177caced5eda6f391f1 x_md5=125cc5593e17aa26672363e3e1d5a7c9
+[gemv-ab] slot=36 soa_md5=fcd9dd5b72f7282d5e1c95d9fd8541c6 inverse=OK
+[gemv-ab] slot=37 seed=38 aos_md5=83799e41b7b2ebf4a100e0abf756c2e8 x_md5=b51f08c3eac6d9b9c130ccbb8b11f1e5
+[gemv-ab] slot=37 soa_md5=90dee31c7e4ad143c2be1927edc58bb2 inverse=OK
+[gemv-ab] slot=38 seed=39 aos_md5=1e3085dd6fe1acd49de71cc112f460cb x_md5=483fedf93abac866e70fd86392a82c98
+[gemv-ab] slot=38 soa_md5=8ab09efced4374f0f7f1d8328eaa1623 inverse=OK
+[gemv-ab] slot=39 seed=40 aos_md5=f61be8d28c2352d5cfd7a18db4f8f9bf x_md5=4423d6b4d8ee9fb1491826d9d53192ef
+[gemv-ab] slot=39 soa_md5=681a5f13a7486f39f7602d6150a16312 inverse=OK
+[gemv-ab] slot=40 seed=41 aos_md5=92021a48ade273cf20699c017a196c7e x_md5=3e604ce2dc2f696f641daa33849211f3
+[gemv-ab] slot=40 soa_md5=cc374f231ba7d27215b711560f53dde3 inverse=OK
+[gemv-ab] slot=41 seed=42 aos_md5=e93e233e3d4e684fe0ca8a7e2377195c x_md5=4479b93a9f0d3b9ec9639cad3e6085b1
+[gemv-ab] slot=41 soa_md5=7ee66fce4122ffc79f1a72db2d36a1f7 inverse=OK
+[gemv-ab] slot=42 seed=43 aos_md5=4a2f3a66d72a0c823bcf933abd13787c x_md5=cd7d594855b24ce6c2fda9cb05a878a9
+[gemv-ab] slot=42 soa_md5=65dcbad4fe187fcbe3f4eb99f50dcc1e inverse=OK
+[gemv-ab] slot=43 seed=44 aos_md5=c9b1262054eb441563bc6831c764f02f x_md5=1924fadf282c044ee15f1c4e95c0e075
+[gemv-ab] slot=43 soa_md5=a5b7baf5ecbd83cfc05fe48f2f73dac4 inverse=OK
+[gemv-ab] slot=44 seed=45 aos_md5=3ee75786eb3dc99f03777ace991698cb x_md5=63860b55352227d947204109b233627f
+[gemv-ab] slot=44 soa_md5=6b1f0338a3d3c29ad74664e5e8cb1636 inverse=OK
+[gemv-ab] slot=45 seed=46 aos_md5=ece49492dd16c1c13c33902bf764fcd5 x_md5=66c41878b2abfc85916868c48b9abc7f
+[gemv-ab] slot=45 soa_md5=f776ed0c792ec5251ac46be71d8ee27f inverse=OK
+[gemv-ab] slot=46 seed=47 aos_md5=59f4f3ebb38f62a935e279303dc28c30 x_md5=3a9dcfe140271b6ad2ba2f3a5ce30b3d
+[gemv-ab] slot=46 soa_md5=79c911c7a6e20f39ef4de9ee144bb2bc inverse=OK
+[gemv-ab] verify slot=0 seed=1 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=1 seed=2 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=2 seed=3 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=3 seed=4 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=4 seed=5 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=5 seed=6 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=6 seed=7 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=7 seed=8 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=8 seed=9 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=9 seed=10 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=10 seed=11 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=11 seed=12 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=12 seed=13 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=13 seed=14 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=14 seed=15 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=15 seed=16 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=16 seed=17 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=17 seed=18 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=18 seed=19 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=19 seed=20 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=20 seed=21 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=21 seed=22 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=22 seed=23 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=23 seed=24 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=24 seed=25 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=25 seed=26 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=26 seed=27 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=27 seed=28 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=28 seed=29 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=29 seed=30 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=30 seed=31 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=31 seed=32 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=32 seed=33 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=33 seed=34 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=34 seed=35 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=35 seed=36 FAIL CPU FAIL arm=hipcc slot=35 row=32 expect=-0.0004811287 got=-0.00048089027 abs=0.00000023841858 rel=4.955e-4; arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=36 seed=37 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=37 seed=38 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=38 seed=39 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=39 seed=40 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=40 seed=41 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=41 seed=42 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=42 seed=43 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=43 seed=44 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=44 seed=45 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=45 seed=46 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=46 seed=47 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] FAIL parity/CPU on M=33 K=1280: skipping timing for this shape
+== shape M=33 K=1792 (groups=7) weight_bytes=31416 slots=34 working_set_bytes=1068144 ==
+[gemv-ab] logical_bytes/launch=38716 (analytical; not DRAM)
+[gemv-ab] slot=0 seed=1 aos_md5=f810e2a88e1a0e8d07f488f5f26d2c4b x_md5=3e8f88029436dcb639bede4d58b51206
+[gemv-ab] slot=0 soa_md5=5ea6fd9d09b682fa7e992c0319af1714 inverse=OK
+[gemv-ab] slot=1 seed=2 aos_md5=2cad5be9b403c275978591ffe9c2d7b8 x_md5=ac317e8a83d58c026e11b179927b3905
+[gemv-ab] slot=1 soa_md5=b07bbc79fca49c2aead3ffef4354f7b7 inverse=OK
+[gemv-ab] slot=2 seed=3 aos_md5=f6f36ca56e412231d2c3d434dcbc22d2 x_md5=9e309d52cd56b8000ff13e164a4fd628
+[gemv-ab] slot=2 soa_md5=658d38c7881e3433c8c42572f750b4b0 inverse=OK
+[gemv-ab] slot=3 seed=4 aos_md5=2aa10f6aa7a1bdf80684ab19b51a77bd x_md5=8da0643b16f4cd0009709caf577da1f4
+[gemv-ab] slot=3 soa_md5=91b587b88e7f9b934da71fe24626f458 inverse=OK
+[gemv-ab] slot=4 seed=5 aos_md5=d48750166790677ade383af5ddbcbc07 x_md5=2dfc5ca1a07bd494e233841e9bff312c
+[gemv-ab] slot=4 soa_md5=859393ab5a88a961c114d46620484c38 inverse=OK
+[gemv-ab] slot=5 seed=6 aos_md5=5a9a2650f13c6567940b10618b9501b6 x_md5=39748cb3b4ccbb5bd3deb06e601cbec1
+[gemv-ab] slot=5 soa_md5=b2f81deea9ff1d3e0329c19e3ca96858 inverse=OK
+[gemv-ab] slot=6 seed=7 aos_md5=3ba84ef3897f1d419af0dac50c8cbb61 x_md5=9a467c384b8df06b8a5fd5ec8087f6a9
+[gemv-ab] slot=6 soa_md5=ab6ae7ab037f5da856ff1fe97b20df2d inverse=OK
+[gemv-ab] slot=7 seed=8 aos_md5=05320adb915400381550cfaabc5e6c65 x_md5=f19afde00621d2148db057805b8aabea
+[gemv-ab] slot=7 soa_md5=599a56788333b26cb7b7203e9d2d3e98 inverse=OK
+[gemv-ab] slot=8 seed=9 aos_md5=34c7c0a755c5f004df3cd939c2169871 x_md5=941cbcf1b4c3d6468d764eb21986fd59
+[gemv-ab] slot=8 soa_md5=14b73ee7baaee08bc88283d606b4c627 inverse=OK
+[gemv-ab] slot=9 seed=10 aos_md5=2b5c15ceaa0b9b6a216cb80af5175675 x_md5=4de47b5d6e766876dc790e298fbf56c8
+[gemv-ab] slot=9 soa_md5=32b778bc6ef48895287e5af17d5e3633 inverse=OK
+[gemv-ab] slot=10 seed=11 aos_md5=8ce61da69560c52aaa1b53dec7343591 x_md5=22c948c0f246ebeb9763bfa7d59bad4e
+[gemv-ab] slot=10 soa_md5=5bf17f7c53d4a910dae01007e8dfde77 inverse=OK
+[gemv-ab] slot=11 seed=12 aos_md5=96b379a2f7e54ea35859f1dbb1f64218 x_md5=3394bbf1f4d0c5cfb1b7f6b461edfda5
+[gemv-ab] slot=11 soa_md5=99edc916d62d177dff20e4ca86939247 inverse=OK
+[gemv-ab] slot=12 seed=13 aos_md5=671db5c812a1be04bb43456b07f139ca x_md5=7942b75a847b4586bfd933a554b93515
+[gemv-ab] slot=12 soa_md5=d3aa74bb0896444817b403d133e9440f inverse=OK
+[gemv-ab] slot=13 seed=14 aos_md5=719b0264be774a93daba3beacca5cb4f x_md5=491677903f0d36c6250258f435a99cde
+[gemv-ab] slot=13 soa_md5=0e1f2c93aa5067f4203216766208352e inverse=OK
+[gemv-ab] slot=14 seed=15 aos_md5=2709dd80e14a5cee79df6339204b1ed8 x_md5=3f75245f38bfd998eaf842d79b8080ce
+[gemv-ab] slot=14 soa_md5=3efb49a5230bb6cc0033a74446a4b094 inverse=OK
+[gemv-ab] slot=15 seed=16 aos_md5=e2766c3a8116638c2e26cb4494e1497e x_md5=72a3bb2a75021e434766ebf8627a66d4
+[gemv-ab] slot=15 soa_md5=1aa053188082387d825e66018a059ebd inverse=OK
+[gemv-ab] slot=16 seed=17 aos_md5=6264925cfb95700cb5f41d6dd4c69871 x_md5=2e4f1053164bc64c619d0085280e9aea
+[gemv-ab] slot=16 soa_md5=369577aa22457b0a219e74b1436ecc20 inverse=OK
+[gemv-ab] slot=17 seed=18 aos_md5=80de8edabd60206bbaf2dc48ce5c0925 x_md5=f1b2550376c9ece41e91f01fbe6fa59d
+[gemv-ab] slot=17 soa_md5=3455df9dcbbfaa2999f9253e5ed5dabf inverse=OK
+[gemv-ab] slot=18 seed=19 aos_md5=e3c6f0a1c5d911e1fff853e93c098b48 x_md5=022997f4849773c2dffdd4cab636919a
+[gemv-ab] slot=18 soa_md5=6a0cba9ecbdee9c98efce7b3de223cc6 inverse=OK
+[gemv-ab] slot=19 seed=20 aos_md5=374189e8a39c12502af93f8231f18034 x_md5=7d40718c852a9ef1b8a8f40a6ba2716d
+[gemv-ab] slot=19 soa_md5=fb2bad00fdb7f6b748dcfb916befc4f0 inverse=OK
+[gemv-ab] slot=20 seed=21 aos_md5=26e36d5e7a03d5dab7f0a8e1050ced9b x_md5=3a4f7745ae541f2b0d321b34ed762a37
+[gemv-ab] slot=20 soa_md5=c7f3b7247c41378551d389a8e6038039 inverse=OK
+[gemv-ab] slot=21 seed=22 aos_md5=f57db263ef0264cb9364fddaa3421a87 x_md5=055c308847cc5bf8d1e502c47e346aa0
+[gemv-ab] slot=21 soa_md5=21e8509a511c601f7e5a388b798bfe1e inverse=OK
+[gemv-ab] slot=22 seed=23 aos_md5=a7601a75a37966a1d47afe0c442945a6 x_md5=0645a6d8639c10104c650ce72011495c
+[gemv-ab] slot=22 soa_md5=3be3f3d47e1ef7cc589027e6ab90439a inverse=OK
+[gemv-ab] slot=23 seed=24 aos_md5=f0cce742ea7e46140e82c18148a51756 x_md5=2395d3bdf9932209a881d7f3e9d0099b
+[gemv-ab] slot=23 soa_md5=c7883b2f84e4ebc90877d7e49264fc42 inverse=OK
+[gemv-ab] slot=24 seed=25 aos_md5=703c456832420354bfbd14568ac70a4b x_md5=84844b7d4798d5ba5f893f242e1bda42
+[gemv-ab] slot=24 soa_md5=1295e58b40f718da87bf4aaca5bd9057 inverse=OK
+[gemv-ab] slot=25 seed=26 aos_md5=bc1d3207b63bc477d7d953e20cedf683 x_md5=1e0ec7f70549a461a7eb84dc13f2ee1b
+[gemv-ab] slot=25 soa_md5=edf364176416b594a14fdcf89c5a1c17 inverse=OK
+[gemv-ab] slot=26 seed=27 aos_md5=0062b42114628e6d29ac432c6f52d1f7 x_md5=11c23b24a0a5f7dce9f1feb55514499a
+[gemv-ab] slot=26 soa_md5=48e56e9c69847f1916e2c086c0d1986d inverse=OK
+[gemv-ab] slot=27 seed=28 aos_md5=34ecda0f32a3ef925af87413dae2dff9 x_md5=0adb1f119949ea46a5a76587a6287e2d
+[gemv-ab] slot=27 soa_md5=ce64bab0248d530ec8cf54a99889f666 inverse=OK
+[gemv-ab] slot=28 seed=29 aos_md5=eeb3e1a1e425a7edb567f2ff7ecf8e9e x_md5=d6a0de1e470a3207232b672a685abba9
+[gemv-ab] slot=28 soa_md5=8d7f00c9d815c1a9cd12d1cd82198d7c inverse=OK
+[gemv-ab] slot=29 seed=30 aos_md5=101200943c19654897b003b3c63fd523 x_md5=0e642eb93a6c44ccf718b8330803f24f
+[gemv-ab] slot=29 soa_md5=d3c92d9515ce5892315ab06c441cb1e3 inverse=OK
+[gemv-ab] slot=30 seed=31 aos_md5=7e4a4c704b148d22dff41f752f6e7261 x_md5=5fd23cee390a98eaf1754ac0ca742ed7
+[gemv-ab] slot=30 soa_md5=e8e2507865ab90c863312f2cc06ca140 inverse=OK
+[gemv-ab] slot=31 seed=32 aos_md5=dab7e9f4cc48f495af09393df180bd06 x_md5=8f28d7e4f965956232730c2067618f92
+[gemv-ab] slot=31 soa_md5=856974edf74687506bef5711899dc277 inverse=OK
+[gemv-ab] slot=32 seed=33 aos_md5=38f1378c28a61c9bd15062a621778fb2 x_md5=b1955ca43557c1adc21e120912e6b284
+[gemv-ab] slot=32 soa_md5=05b1b72b08d9182f3cec42d2d241945c inverse=OK
+[gemv-ab] slot=33 seed=34 aos_md5=c88b64c36e5e11646c0a1297876d5e1f x_md5=e5db3136bfcc22d91cd09b2d775716b6
+[gemv-ab] slot=33 soa_md5=9d6edb324ebedcc7832f478b99ffe03a inverse=OK
+[gemv-ab] verify slot=0 seed=1 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=1 seed=2 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=2 seed=3 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=3 seed=4 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=4 seed=5 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=5 seed=6 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=6 seed=7 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=7 seed=8 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=8 seed=9 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=9 seed=10 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=10 seed=11 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=11 seed=12 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=12 seed=13 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=13 seed=14 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=14 seed=15 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=15 seed=16 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=16 seed=17 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=17 seed=18 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=18 seed=19 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=19 seed=20 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=20 seed=21 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=21 seed=22 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=22 seed=23 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=23 seed=24 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=24 seed=25 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=25 seed=26 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=26 seed=27 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=27 seed=28 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=28 seed=29 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=29 seed=30 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=30 seed=31 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=31 seed=32 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=32 seed=33 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] verify slot=33 seed=34 OK arm=hipcc ref; arm=soa bit-exact
+[gemv-ab] timing rotations=2 timed_iters=68 (requested iters=60)
+[gemv-ab] per-arm wall warmup_ms=250
+[gemv-ab] arm=hipcc host_submit_mean=0.633us host_window=905.6us
+[gemv-ab] arm=hipcc raw_host_submit_us=1.4330,1.1320,0.6010,0.6510,0.6510,0.6710,0.5810,0.6010,0.8910,0.5820,0.6310,0.6610,0.6310,1.2330,0.6010,0.6010,0.5810,1.0020,0.6210,0.5810,0.5910,0.5710,0.5910,0.5910,0.5810,0.6520,0.5910,0.6210,0.6110,0.6110,0.5910,0.6120,0.6310,0.6310,0.5710,0.5910,0.6220,0.5810,0.5810,0.6310,0.5810,1.1320,0.6010,0.6010,0.6010,0.6010,0.5810,0.5910,0.5910,0.5610,0.5610,0.6010,0.5510,0.5510,0.6010,0.5720,0.5810,0.5910,0.5810,1.0020,0.6110,0.5810,0.5610,0.6020,0.9910,0.5610,0.5910,0.6010,1.3420,0.7020,0.5810,0.5610,0.5710,0.5810,0.6010,0.5710,0.5720,0.6010,0.5810,0.5610,0.5610,0.6010,0.9820,0.5610,0.5710,0.6320,0.5610,0.5610,0.5710,0.5610,0.5710,0.5610,0.5610,0.5620,0.5610,0.5610,0.5610,0.5510,0.7610,0.5610,0.5610,0.5510,0.5510,0.5710,0.5610,0.5710,0.5510,0.5610,0.5710,0.5620,0.6510,0.5610,0.5710,0.5510,0.9620,0.5610,0.5510,0.5610,0.5510,0.5610,0.5610,0.6110,0.5910,0.6610,0.5610,0.5610,0.5520,0.5610,0.5510,0.5610,0.5610,0.5610,0.5610,0.5610,0.5510,0.5610,1.0320,0.5610,0.5620,0.5610,0.9720,0.5610,0.5610,0.5610,0.6510,0.5510,0.5510,0.6010,0.5710,0.9710,0.5610,0.5610,0.5610,0.6010,0.5510,0.5610,0.5510,0.5610,0.5610,0.5610,0.5510,0.5610,0.5510,0.5610,0.5610,0.9720,0.5510,0.5610,0.5610,0.5610,0.5510,0.5620,0.5610,0.5910,0.5610,0.5610,1.0220,0.5510,0.5610,0.5610,0.5710,0.5620,0.5710,0.5610,0.5510,0.6110,1.0020,0.5610,0.5710,1.0220,1.0920,1.0120,0.5510,0.6420,0.5810,0.5910,0.9920,0.9520,1.0220,0.6110,0.5610,0.5510,0.5610,0.5610
+[gemv-ab] arm=hipcc raw_gpu_us_per_launch=4.2047,4.2153,4.2000
+[gemv-ab] arm=hipcc sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33
+[gemv-ab] arm=soa host_submit_mean=0.676us host_window=903.4us
+[gemv-ab] arm=soa raw_host_submit_us=1.7740,0.6610,0.6210,0.6610,0.6220,0.6010,0.7910,1.0320,1.4030,0.6510,0.6320,0.6810,0.6010,1.0520,0.6010,0.6010,0.5920,0.5910,0.5910,0.6110,0.5910,1.0520,0.6010,0.6010,0.6110,0.6110,0.6110,0.6320,0.6010,0.6110,0.5910,0.6310,0.6010,1.0510,0.5610,0.6010,0.5710,0.6010,0.5710,0.5910,0.5710,0.6110,0.5710,0.6010,0.5710,0.5910,0.5810,0.5820,0.5710,0.6010,0.5710,0.5710,0.6110,0.5710,0.5920,0.6110,0.5710,0.5710,0.5910,0.5710,0.5710,1.0620,0.9710,0.9920,1.0320,0.5710,0.5510,1.0820,0.7110,1.0320,0.5810,1.0020,0.5810,0.6710,0.5710,0.5810,0.5810,0.5610,1.0120,0.5610,0.5710,1.0310,0.5610,0.5810,0.5710,1.0920,0.5610,0.5610,0.6810,1.0520,0.5510,1.0020,0.5610,1.0020,0.6010,0.5910,0.5610,0.5610,0.5810,0.5610,0.5610,0.5710,0.6310,0.5610,0.5610,0.5710,1.2830,0.5510,0.5510,0.5610,0.5710,0.5610,0.5710,0.5610,0.5610,1.0010,0.5720,0.5710,0.5910,0.5810,0.5710,0.5710,0.6110,0.6820,1.1720,0.5510,0.5710,0.5710,0.5510,1.0120,0.9520,0.5610,0.9920,0.5810,0.5720,0.5610,0.6010,1.0020,0.9820,1.0420,0.5910,0.5710,0.5510,0.5710,0.5610,0.6010,0.6510,0.5710,0.5510,0.5710,0.5710,0.5910,0.5710,0.5810,0.5810,0.5710,1.0120,0.5610,0.5610,0.arm                       us/launch  logicalGB/s  vs-base host_sub_us  exactness
+hipcc                          4.20          9.2    1.000      0.633  ref
+[gemv-ab] arm=hipcc gpu_us_per_launch_median=4.2047 n_samples=3 (3 whole-batch windows; no min/best-of)
+soa                            4.20          9.2    1.000      0.676  pre-verified
+[gemv-ab] arm=soa gpu_us_per_launch_median=4.2041 n_samples=3 (3 whole-batch windows; no min/best-of)
+[summary] geometric-mean time ratio vs baseline over 5 shapes:
+[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos
+[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=1.0018 route=soa
+5910,0.5910,0.5810,0.5610,0.5710,0.5710,0.6020,0.5910,0.6010,0.5710,0.6010,0.5810,0.6120,0.6010,0.5710,0.5710,1.0120,0.6110,1.0120,0.5810,0.6010,1.0120,0.5820,0.9610,0.5820,0.5610,0.5610,1.0220,0.5510,0.5610,0.5510,0.5510,0.5610,0.5610,0.5710,0.5820,0.9810,0.5610,0.6010,0.6410,0.5610,1.0020,0.9520,0.9420,1.0120
+[gemv-ab] arm=soa raw_gpu_us_per_launch=4.2041,4.2135,4.1971
+[gemv-ab] arm=soa sample_slot_seq=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33
+[gemv-ab] FAIL: parity or CPU oracle failure(s); exiting nonzero

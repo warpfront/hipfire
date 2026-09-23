@@ -1,0 +1,13 @@
+[redline] DRM version 3.64
+[redline] GPU: gfx1100 (asic 0x744c) — 96 CUs, 6 SEs, 25.7 GB VRAM
+[redline] Compute context created
+gfx_arch=gfx1100 gran=512 layout_b=soa soa_b=true ws_mib=0 ro=0 reverse=0 iters=20 seed=1 route=pm4-prod-barrier
+elf_a=/home/kaden/ar-bandwidth-2026-09-08/aos-gfx1100.hsaco hash=9215cc32b996c6da sym=gemv_mq4g256v2 block=32 grid_div=1
+elf_b=/home/kaden/ar-bandwidth-2026-09-08/soa-gfx1100.hsaco hash=734ba83df4f51eb9 sym=gemv_mq4g256v2_soa block=32 grid_div=1
+M=33 K=256 gpr=1 weight_bytes=4488 slots=1 working_set_bytes=4488 seed=1
+  slot=0 seed=1 aos_hash=bd45aed04ec23bac b_hash=7db234d60501df3c x_hash=80f3e9c561de555d
+FAIL M=33 K=256 slot=0: A/B y-bit-diff rows=33 (all-row)
+  row=0 A=3e3efb76 (0.18650612) B=00000000 (0)
+  row=1 A=bf0ebc66 (-0.55756223) B=00000000 (0)
+  row=2 A=3fabe244 (1.3428426) B=00000000 (0)
+  row=3 A=bdd0e7a0 (-0.10200429) B=00000000 (0)

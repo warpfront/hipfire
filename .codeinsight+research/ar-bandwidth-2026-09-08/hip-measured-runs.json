@@ -1,0 +1,254 @@
+[
+  {
+    "label": "gfx1100-hip-stream-ab-1",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ab-1.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1834 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=19.6933 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.2535 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=56.3066 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.3346 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=64.9434 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.4254 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=742.9836 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+      "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9906 route=soa"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-aa-1",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --elf=/home/kaden/ar-bandwidth-2026-09-08/aos-native-gfx1100.hsaco"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-aa-1.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1777 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=20.1995 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1304 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.1119 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.7900 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.3447 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.6755 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=757.7324 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+      "[summary] arm=aos-native-gfx1100   md5=d998cb67d91974f8bb24a6716fc465ea ratio=0.9984 route=aos-elf"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-ro-1",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --read-only"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ro-1.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=20.2715 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=23.2472 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=59.3447 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=60.0852 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=61.7678 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=65.5470 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=806.2366 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=774.2389 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=ro-aos               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.000 (reference) route=ro",
+      "[summary] arm=ro-soa               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.0430 route=ro-soa"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-ab-2",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --reverse"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ab-2.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1955 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=19.6716 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.2404 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=56.3480 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.4410 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=65.1223 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.7781 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=742.8950 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+      "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9905 route=soa"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-aa-2",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --elf=/home/kaden/ar-bandwidth-2026-09-08/aos-native-gfx1100.hsaco --reverse"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-aa-2.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.2598 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=20.1974 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1598 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.1995 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=61.0013 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=61.1185 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.6743 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=757.6721 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+      "[summary] arm=aos-native-gfx1100   md5=d998cb67d91974f8bb24a6716fc465ea ratio=0.9999 route=aos-elf"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-ro-2",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --read-only --reverse"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ro-2.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=20.2663 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=23.3128 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=59.2822 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=60.1029 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=61.5657 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=65.4979 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=806.5281 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=774.1451 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=ro-aos               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.000 (reference) route=ro",
+      "[summary] arm=ro-soa               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.0446 route=ro-soa"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-ab-3",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ab-3.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.2313 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=19.7156 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1237 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=56.3685 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.4220 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=65.1264 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.5903 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=soa gpu_us_per_launch_median=742.9232 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+      "[summary] arm=soa                  md5=8c6f07f9615cf2f93c6b3f4d799c57ad ratio=0.9913 route=soa"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-aa-3",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --elf=/home/kaden/ar-bandwidth-2026-09-08/aos-native-gfx1100.hsaco"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-aa-3.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=20.1764 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=20.2890 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=60.1838 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.2060 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=61.0093 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=60.4422 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=hipcc gpu_us_per_launch_median=757.9245 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=aos-native-gfx1100 gpu_us_per_launch_median=757.8838 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=hipcc                md5=d998cb67d91974f8bb24a6716fc465ea ratio=1.000 (reference) route=aos",
+      "[summary] arm=aos-native-gfx1100   md5=d998cb67d91974f8bb24a6716fc465ea ratio=0.9991 route=aos-elf"
+    ]
+  },
+  {
+    "label": "gfx1100-hip-stream-ro-3",
+    "argv": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "hipx",
+      "flock -w 300 /tmp/hipfire-gpu.lock env HIP_VISIBLE_DEVICES=0 /home/kaden/hipfire-vcn/target/release/examples/gemv_mq4_ab --working-set-mib=256 --iters=1200 --shapes=5120x5120,17408x5120,5120x17408,248320x5120 --seed=1 --soa --read-only"
+    ],
+    "returncode": 0,
+    "log": "/home/kaden/ClaudeCode/warpfront/wt-vcn/.codeinsight+research/ar-bandwidth-2026-09-08/gfx1100-hip-stream-ro-3.log",
+    "summary": [
+      "== shape M=5120 K=5120 (groups=20) weight_bytes=13926400 slots=20 working_set_bytes=278528000 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=20.2234 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=23.2851 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=17408 K=5120 (groups=20) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=59.3709 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=60.0168 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=5120 K=17408 (groups=68) weight_bytes=47349760 slots=6 working_set_bytes=284098560 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=61.8082 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=65.4469 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "== shape M=248320 K=5120 (groups=20) weight_bytes=675430400 slots=1 working_set_bytes=675430400 ==",
+      "[gemv-ab] arm=ro-aos gpu_us_per_launch_median=806.5513 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[gemv-ab] arm=ro-soa gpu_us_per_launch_median=773.4586 n_samples=3 (3 whole-batch windows; no min/best-of)",
+      "[summary] arm=ro-aos               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.000 (reference) route=ro",
+      "[summary] arm=ro-soa               md5=e08f74eee6f5d0e122d4b5c9c91564ff ratio=1.0427 route=ro-soa"
+    ]
+  }
+]

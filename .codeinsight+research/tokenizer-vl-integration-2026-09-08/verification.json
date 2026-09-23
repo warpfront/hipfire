@@ -1,0 +1,68 @@
+{
+  "worktree": "/home/kaden/ClaudeCode/warpfront/wt-vcn",
+  "branch": "experiment/vcn-jpeg",
+  "base_commit": "216eb7601",
+  "model_sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
+  "vision_sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+  "draft_sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+  "final_binary_md5": {
+    "hipfire": "e6ac93b6ee26b0a92a9c33eff3160322",
+    "daemon": "27086be47a07040bfa1c74a8ae1263ab"
+  },
+  "pre_format_daemon_md5": "6f3d1ef011c922feb43924b2903fc515",
+  "checks": {
+    "workspace_check": "pass",
+    "tokenizer_tests": 69,
+    "spec_emit_tests": 14,
+    "va_bridge_tests": 3,
+    "windows_gnu_va_bridge_check": "pass; compile only",
+    "jpeg_patch_parity": {
+      "fixtures": 5,
+      "worst_rel_l1": 0.008354,
+      "bound": 0.01,
+      "gpu": "gfx1201"
+    },
+    "surface_lease_proof": [
+      "gfx1201",
+      "gfx1100 (hipx)"
+    ],
+    "quarantine_proof": "simulated completion-failure disposition; no GPU hang induced",
+    "empty_parity_filter": "exit 1, refusing empty pass",
+    "serving": [
+      "VCN JPEG description",
+      "VCN OCR",
+      "PNG CPU fallback",
+      "stream/nonstream identical content",
+      "disconnect then successful image request",
+      "exact Unicode 世界 🚀 café",
+      "CPU default without VCN initialization",
+      "auto fallback with deliberately unavailable libva driver",
+      "AR battery/chain",
+      "DFlash battery/chain with dflash=true"
+    ]
+  },
+  "caveats": [
+    "Initial AR battery at 256 tokens truncated the arithmetic answer; at 512 tokens it completed correctly with 210 miles. Both artifacts retained.",
+    "AR and final VCN matrix used pre-format daemon; rebuilt release binary separately passed VCN+Unicode smoke and DFlash battery/chain.",
+    "No end-to-end performance claim; Windows was cross-compiled, not run."
+  ],
+  "reports": [
+    "final-ar-battery.json",
+    "final-ar-battery-512.json",
+    "final-ar-chain.json",
+    "final-dflash-battery.json",
+    "final-dflash-chain.json",
+    "final-vcn-doge-stream.json",
+    "final-vcn-doge-nonstream.json",
+    "final-vcn-scene-ocr.json",
+    "final-vcn-png-fallback.json",
+    "final-vcn-disconnect.json",
+    "final-vcn-disconnect-followup.json",
+    "final-text-unicode.json",
+    "final-default-cpu-doge.json",
+    "final-auto-missing-driver-doge.json",
+    "release-vcn-doge.json",
+    "release-text-unicode.json"
+  ],
+  "commit": "214459cfe"
+}

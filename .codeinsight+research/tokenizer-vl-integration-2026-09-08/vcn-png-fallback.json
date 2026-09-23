@@ -1,0 +1,438 @@
+{
+  "label": "vcn-png-fallback",
+  "image": "doge_napping.png",
+  "prompt": "Transcribe any visible text, signs, or written words in this image. If there is no text, say so. /no_think",
+  "stream": true,
+  "disconnect": false,
+  "text": "Much weak\nSuch comfortable\nSleep like a doge\nSo stretch\nPointy teeths wow\nNot scare now",
+  "reasoning": "",
+  "done": true,
+  "wall_ms": 21192,
+  "events": [
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "Much"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " weak"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "\n"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "Such"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " comfortable"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "\n"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "Sleep"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " like"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " a"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " dog"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "e"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "\n"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "So"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " stretch"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "\n"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "Point"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "y"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " teeth"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "s"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " wow"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "\n"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": "Not"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " scare"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "content": " now"
+          },
+          "finish_reason": null
+        }
+      ]
+    },
+    {
+      "id": "chatcmpl-3291940-7",
+      "object": "chat.completion.chunk",
+      "created": 1788837857,
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {},
+          "finish_reason": "stop"
+        }
+      ],
+      "timings": {
+        "ttft_ms": 18020.6,
+        "prefill_ms": 18020.6,
+        "prefill_tok_s": 35.8,
+        "decode_tok_s": 35.4,
+        "latency_ms": null,
+        "tau": null,
+        "cycles": null,
+        "dflash": null,
+        "mtp": null,
+        "mtp_ngram": null,
+        "ngram_mod_windows": null,
+        "ngram_mod_drafts": null,
+        "ngram_mod_accepted": null,
+        "ngram_mod_accept_rate": null,
+        "mtp_windows": null,
+        "ar_windows": null,
+        "mtp_retired": null,
+        "mtp_window_timings": null
+      },
+      "hipfire": {
+        "tok_s": 1.3,
+        "prefill_tok_s": 35.8,
+        "decode_tok_s": 35.4,
+        "execution_mode": null,
+        "continuous_batch": null,
+        "reasoning": {
+          "contract": "qwen_jinja",
+          "mode": "disabled",
+          "effort": null,
+          "max_think_tokens": null,
+          "cap_source": "none"
+        },
+        "config_warnings": [
+          "reasoning.effort 'xhigh' dropped: thinking disabled"
+        ]
+      }
+    }
+  ]
+}
