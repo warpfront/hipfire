@@ -1,0 +1,7 @@
+{"type":"configured","schema_version":1}
+{"type":"pong"}
+{"type":"diag","arch":"gfx1201","hip_version":"7.15","vram_free_mb":32548,"vram_total_mb":32624,"model_loaded":false,"model_arch":"none","kernels":0,"kernel_hashes":0}
+{"type":"loaded","arch":"qwen3_5","dim":5120,"layers":64,"vocab":248320,"vl":false,"reasoning_contract":"qwen_jinja","reasoning_effort_native":true,"reasoning_efforts":["low","medium","xhigh"],"cache_capable":true,"retry_reset_eligible":true,"continuous_batch_capable":false}
+{"type":"diag","arch":"gfx1201","hip_version":"7.15","vram_free_mb":17514,"vram_total_mb":32624,"model_loaded":true,"model_arch":"qwen3_5","kernels":0,"kernel_hashes":0}
+{"type":"prefill_result","tokens":8192,"ms":4645.03,"tok_s":1763.6}
+{"type":"prefill_result","tokens":8192,"ms":2488.83,"tok_s":3291.5}
