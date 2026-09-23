@@ -11,7 +11,7 @@ const SAMPLES: usize = 20;
 const BM: usize = 128;
 const BN: usize = 128;
 const FP8_LDS: u32 = 19_968;
-const IU4_LDS: u32 = 19_456;
+const IU4_LDS: u32 = 16_384;
 
 const FP8_GATE_SHIPPED: &str = concat!(
     "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 128\n#define HIPFIRE_FP8_V2_BN 128\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_GATEUP_KERNEL kx3_fp8_gate_shipped\n",

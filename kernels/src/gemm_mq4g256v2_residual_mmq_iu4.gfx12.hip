@@ -50,9 +50,9 @@
 //     (frA/frW tables); slab/sb/nb/rg are unroll constants, so the K-step
 //     carries no dynamic address math.
 //   - A and W are double-buffered per 64-K slab: slot 0 is (A0,W0), slot 1
-//     is (A1,W1). DS and SZ metadata ping-pong per half-block (plane[h],
-//     kb = 2g+h) while token (d,s) is re-read from the DS plane at fold time
-//     (same values, same DAG).
+//     is (A1,W1). Per-half token/row metadata is read directly from the
+//     immutable Xq/A inputs at fold time; keeping it out of LDS removes the
+//     former 4 KiB DS/SZ ping-pong planes without changing arithmetic.
 //     Steady state per block: prefetch slab 1 into A_pf/W_pf while computing
 //     slab 0 from slot 0, publish slab 1 to the free slot 1, then rendezvous
 //     once for both slot-0 retirement and slot-1 readiness. The next-block
@@ -62,7 +62,7 @@
 //     Two barriers per block; each publish targets the alternate slot, so no
 //     readers-done barrier is needed before its stores. Bit-identical: same K
 //     order and pinned IU4_FOLD_RN DAG.
-//     LDS 20480 B keeps 3 WG/CU on gfx1201 (3 x 20480 = 61440 <= 65536/CU).
+//     LDS 16384 B admits 4 WG/CU on gfx1201 (4 x 16384 = 65536 B/CU).
 //   - Coalesced store (fp8 K2 mechanism): each (rg, nb) phase dumps the
 //     wave's 16x16 f32 sub-tile to an LDS slot ([16][20], stride-20 pad for
 //     bank-clean streaming), then all 256 threads stream 64 rows x 32 cols
@@ -72,17 +72,13 @@
 //     column block (same K order), same pinned IU4_FOLD_RN DAG. Integer MMA:
 //     any oracle difference is a bug.
 //
-// LDS layout (20480 B = 20 KiB on gfx1201; compute planes and store slots
-// overlap — A/W/DS/SZ are all dead once folds complete):
+// LDS layout (16384 B = 16 KiB on gfx1201; compute planes and store slots
+// overlap — A/W are dead once folds complete):
 //   A0 = 16 WMMA fragments x 256 B (fragment order, below)  @ 0     (4096 B)
 //   W0 = 16 WMMA fragments x 256 B                         @ 4096  (4096 B)
-//   W1 = 16 WMMA fragments x 256 B                         @ 8192  (4096 B)
-//   DS0 = [128][8] token (d f32, s i32), even halves        @ 12288 (1024 B)
-//   DS1 = [128][8] token (d f32, s i32), odd halves         @ 13312 (1024 B)
-//   SZ0 = [128][8] row (sc f32, zp f32), even halves        @ 14336 (1024 B)
-//   SZ1 = [128][8] row (sc f32, zp f32), odd halves         @ 15360 (1024 B)
-//   A1 = 16 WMMA fragments x 256 B                         @ 16384 (4096 B)
-//   end                                                             = 20480 B
+//   A1 = 16 WMMA fragments x 256 B                         @ 8192  (4096 B)
+//   W1 = 16 WMMA fragments x 256 B                         @ 12288 (4096 B)
+//   end                                                             = 16384 B
 //   store slots = 8 waves x [16][20] f32 @ 0                        (10240 B)
 //
 // Fragment order (probe-verified on gfx1201, 2026-09-18: the old
@@ -109,12 +105,12 @@
 // Store stream reads: bank = 5*i + x/4, 5 coprime 32 (2-way floor across
 // x-pairs); global stores are 2x64 B segments per wave32.
 //
-// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 20480 bytes.
+// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 16384 bytes.
 //
 // Sweep note: 64x256 / 256x64 aspects need a different wave map (wt_pair /
 // tok_half split) plus matching host grid/LDS; the fold/prefetch/store
 // mechanisms transfer unchanged. Host, oracle, and timing launchers hardcode
-// the same 128/128/256-thread, 20480-byte contract and must change together.
+// the same 128/128/256-thread, 16384-byte contract and must change together.
 //
 // Compile gate: gfx1200 / gfx1201 only. Non-gfx12 archs get empty stubs (the
 
@@ -155,16 +151,10 @@
 #define IU4_W_BYTES (IU4_W_FRAGS * IU4_FRAG_BYTES)
 #define IU4_A_OFF 0
 #define IU4_W0_OFF (IU4_A_OFF + IU4_A_BYTES)
-#define IU4_W1_OFF (IU4_W0_OFF + IU4_W_BYTES)
-#define IU4_DS_OFF (IU4_W1_OFF + IU4_W_BYTES)
-#define IU4_DS_BYTES (IU4_BM * 8)
-#define IU4_DS1_OFF (IU4_DS_OFF + IU4_DS_BYTES)
-#define IU4_SZ0_OFF (IU4_DS1_OFF + IU4_DS_BYTES)
-#define IU4_SZ_BYTES (IU4_BN * 8)
-#define IU4_SZ1_OFF (IU4_SZ0_OFF + IU4_SZ_BYTES)
-#define IU4_A1_OFF (IU4_SZ1_OFF + IU4_SZ_BYTES)
-#define IU4_LDS_BYTES (IU4_A1_OFF + IU4_A_BYTES)
-_Static_assert(IU4_LDS_BYTES <= 20480, "iu4 fragment planes exceed host LDS");
+#define IU4_A1_OFF (IU4_W0_OFF + IU4_W_BYTES)
+#define IU4_W1_OFF (IU4_A1_OFF + IU4_A_BYTES)
+#define IU4_LDS_BYTES (IU4_W1_OFF + IU4_W_BYTES)
+_Static_assert(IU4_LDS_BYTES <= 16384, "iu4 fragment planes exceed host LDS");
 // Store slots reuse LDS base: 8 waves x [16][20] f32.
 #define IU4_SLOT_COLS 20
 #define IU4_SLOT_FLOATS (16 * IU4_SLOT_COLS)
@@ -297,7 +287,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // The current A/W slab always shares slot parity.
     char* __restrict__ a_lds = LDS + IU4_A_OFF;
     char* __restrict__ w_lds = LDS + IU4_W0_OFF;
-    // DS/SZ ping-pong bases (plane[h], kb = 2g+h) selected inside the loop.
     // Hoisted K-loop addresses: full LDS byte offsets of every fragment this
     // lane will ever read. Computed once at kernel top (outside ALL loops);
     // the K-step indexes them with unroll constants only.
@@ -381,38 +370,11 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // pairs, same 8 dwords/lane as before (2 rounds x 1 u32x2 per plane).
     u32x2_t A_pf[2];
     u32x2_t W_pf[2];
-    // Next-block raw metadata words for the rescheduled fetch epoch (loaded
-    // after B1, consumed at the publish below B2a): one token DS word and
-    // one packed weight header word per lane.
-    unsigned ds_nx = 0u;
-    unsigned sz_nx = 0u;
+    // Per-half metadata is read directly from Xq/A at fold time. Avoiding
+    // staged DS/SZ planes is the 4 KiB LDS reduction; immutable inputs and
+    // the unchanged conversion/fold DAG preserve the arithmetic.
 
-    // Token (d, s) for this lane's column blocks is re-read from the staged
-    // DS plane at fold time (same f32/i32 values, same DAG order) instead of
-    // being held in td_x/ts_x across compute: frees 8 VGPRs in the hot
-    // compute+staging window. DS-next staging still waits for the fold.
-
-    // --- Prologue: DS[0] + SZ[0] + slab 0 of block 0 (A plane + W0). ---
-    for (int i = tid; i < IU4_BM * 2; i += IU4_NTHREADS) {
-        const int tok_idx = i >> 1;
-        const int w = i & 1;
-        const int tok = bs + tok_idx;
-        const unsigned dw = (tok < N)
-            ? ((const unsigned*)(Xq + tok))[w]
-            : 0u;
-        ((unsigned*)(LDS + IU4_DS_OFF + tok_idx * 8))[w] = dw;
-    }
-    for (int i = tid; i < IU4_BN * 2; i += IU4_NTHREADS) {
-        const int row_idx = i >> 1;
-        const int w = i & 1;
-        const int grow = rs + row_idx;
-        const int src_row = (grow < M) ? grow : (M - 1);
-        const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136);
-        const float f = (w == 0)
-            ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
-            : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
-        ((float*)(LDS + IU4_SZ0_OFF + row_idx * 8))[w] = (grow < M) ? f : 0.0f;
-    }
+    // --- Prologue: slab 0 of block 0 (A0 + W0). ---
     // Prologue slab 0 of block 0, b64-coalesced (same map as the K-loop).
     {
         const char* __restrict__ xqB0 = (const char*)Xq + 8;
@@ -435,11 +397,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         for (int h = 0; h < 2; h++) {
             const int kb = 2 * g + h;
             const bool last = (h == 1) && (g + 1 == groups_per_row);
-            // DS/SZ planes for this half-block (kb parity = h); the next
-            // block stages the opposite planes, so its writes never race
-            // this block's compute+fold reads.
-            char* __restrict__ ds_lds = LDS + ((h == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
-            char* __restrict__ sz_lds = LDS + ((h == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
             // --- Slot 0 compute with slot 1 prefetch as producer. ---
             {
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
@@ -473,15 +430,10 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // Slot-0 retirement plus slot-1 readiness.
                 __syncthreads();
                 if (!last) {
-                    // Next-block fetch epoch: all six next-block raw loads
-                    // (4 b64 nibble + 1 DS word + 1 packed header word) issue
-                    // here, immediately after B1, into private registers. No
-                    // masks, header conversion, DS stores or first use yet:
-                    // first use is the alternate-slot publish after compute1
-                    // plus fold, so the waits overlap that useful window.
-                    // A_pf/W_pf are dead (slab 1 published above) and reused
-                    // as the next-payload nibble words; ds_nx/sz_nx hold the
-                    // raw next metadata words.
+                    // Next-block fetch epoch: four next-block b64 nibble
+                    // loads issue here, immediately after B1, into private
+                    // registers. A_pf/W_pf are dead (slab 1 was published
+                    // above) and reused as the next payload.
                     const int kb_nx = kb + 1;
                     const char* __restrict__ xq_nx = (const char*)(Xq + (long long)kb_nx * N) + 8;
                     #pragma unroll
@@ -495,50 +447,47 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     for (int r = 0; r < 2; r++) {
                         W_pf[r] = *(const u32x2_t*)(w_nx + st_wvoff[r]);
                     }
-                    const int tok_ds = bs + (tid >> 1);
-                    const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
-                    ds_nx = ((const unsigned*)(Xq + (long long)kb_nx * N + tok_dsc))[tid & 1];
-                    const int row_sz = rs + (tid >> 1);
-                    const int src_sz = (row_sz < M) ? row_sz : (M - 1);
-                    sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
-                        + g_nx * 136 + h_nx * 4);
                 }
             }
             // --- Slot 1 compute, current fold, next slot-0 publish. ---
             {
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
-                // Fold while the next fetch epoch remains in flight: 4 K32
-                // int32 partials per (nb, rg)
-                // through the pinned IU4_FOLD_RN DAG. Reads only cacc plus
-                // the current DS[h]/SZ[h] planes, independent of the private
-                // next payload. Same f32 values, same DAG order: per-half
-                // (sc,zp) straight from the staged SZ plane, (d,s) re-read
-                // from DS. Bank-clean on gfx1201: 8 consecutive rows x 2
-                // words hit 16 distinct banks, identical across the 16 lanes
-                // of a k_grp half (LDS broadcast); the halves cover all 32
-                // banks once.
+                // Fold while the next nibble fetch epoch remains in flight:
+                // 4 K32 int32 partials per (nb, rg) pass through the pinned
+                // IU4_FOLD_RN DAG. Metadata is read directly from immutable
+                // Xq/A. This trades cache-resident duplicate metadata loads
+                // for a 4 KiB LDS reduction; runtime occupancy remains capped
+                // at three blocks/CU by the resulting register allocation.
                 #pragma unroll
                 for (int rg = 0; rg < 2; rg++) {
                     float sc_row[8];
                     float zp_row[8];
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
-                        const unsigned jbase = (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
-                        sc_row[j] = *(const float*)(sz_lds + jbase);
-                        zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
+                        const int grow = rs + wave_row0 + rg * 16 + 8 * k_grp + j;
+                        const int src_row = (grow < M) ? grow : (M - 1);
+                        const unsigned hw = *(const unsigned*)(A
+                            + (long long)src_row * groups_per_row * 136
+                            + (long long)g * 136 + h * 4);
+                        sc_row[j] = (grow < M)
+                            ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
+                            : 0.0f;
+                        zp_row[j] = (grow < M)
+                            ? __half2float(__ushort_as_half((unsigned short)(hw >> 16)))
+                            : 0.0f;
                     }
                     #pragma unroll
                     for (int nb = 0; nb < 4; nb++) {
                         int* acc_i = (int*)&cacc[nb][rg];
-                        const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
-                        const float d_x = *(const float*)(ds_lds + tbase);
-                        const int s_x = *(const int*)(ds_lds + tbase + 4u);
+                        const int tok = bs + wave_tok0 + nb * 16 + m_lane;
+                        const int tok_c = (tok < N) ? tok : (N - 1);
+                        const u32x2_t ds_raw = (tok < N)
+                            ? *(const u32x2_t*)(Xq + (long long)kb * N + tok_c)
+                            : z64;
+                        const float d_x = __builtin_bit_cast(float, ds_raw[0]);
+                        const int s_x = (int)ds_raw[1];
 #if defined(__gfx1201__)
-                        // Paired fold: same values, same DAG as IU4_FOLD_RN;
-                        // sf hoisted (the int sum is loop-invariant, the
-                        // compiler CSEs the baseline's per-j conversion to
-                        // one anyway: 4 sf converts per half, unchanged).
                         const float sf_x = (float)s_x;
                         #pragma unroll
                         for (int j = 0; j < 8; j += 2) {
@@ -562,30 +511,14 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // while slot 1 computes, so publish needs no readers-done
                 // barrier here.
                 if (!last) {
-                    // Publish next block into free slot 0 (first use of the
-                    // fetch epoch): original A zero-select, clamped W value,
-                    // masked DS word and converted header word.
+                    // Publish the next block into free slot 0 (first use of
+                    // the fetch epoch): original A zero-select and clamped W.
                     a_lds = LDS + IU4_A_OFF;
                     w_lds = LDS + IU4_W0_OFF;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? A_pf[r] : z64;
                         *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
-                    }
-                    const int h_np = h ^ 1;
-                    char* __restrict__ ds_n = LDS + ((h_np == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
-                    {
-                        const int tok_dsp = bs + (tid >> 1);
-                        ((unsigned*)(ds_n + (tid >> 1) * 8))[tid & 1] = (tok_dsp < N) ? ds_nx : 0u;
-                    }
-                    char* __restrict__ sz_n = LDS + ((h_np == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
-                    {
-                        const int row_szp = rs + (tid >> 1);
-                        const int w_szp = tid & 1;
-                        const float f = (w_szp == 0)
-                            ? __half2float(__ushort_as_half((unsigned short)(sz_nx & 0xFFFFu)))
-                            : __half2float(__ushort_as_half((unsigned short)(sz_nx >> 16)));
-                        ((float*)(sz_n + (tid >> 1) * 8))[w_szp] = (row_szp < M) ? f : 0.0f;
                     }
                 }
                 // Slot-1 retirement plus next slot-0 readiness; on the last

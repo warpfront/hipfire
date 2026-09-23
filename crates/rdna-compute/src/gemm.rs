@@ -19597,9 +19597,9 @@ impl Gpu {
         if self.arch.as_str() == "gfx1201" {
             // gfx12 K32 v2 staged tile: 128-row x 128-col workgroups
             // (8 waves; each wave covers 2 16-row groups x 4 16-col blocks).
-            // A + W slabs and DS/SZ metadata staged in LDS once per WG per
-            // 128-K block; partial M/N handled natively (zero-filled slab /
-            // guarded writeback). Block [256,1,1].
+            // A/W slabs are double-buffered in LDS; immutable DS/SZ metadata
+            // is read directly from Xq/A at fold time. Partial M/N is handled
+            // natively (zero-filled slab / guarded writeback). Block [256,1,1].
             let kernel_name = if add {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add"
             } else {
@@ -19632,9 +19632,8 @@ impl Gpu {
             let batch_tiles = batch_size.div_ceil(128);
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-            // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
-            // slots overlap).
-            let lds_bytes: u32 = 20480;
+            // LDS: 16384 B (two A/W slab slots; store slots overlap).
+            let lds_bytes: u32 = 16384;
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
