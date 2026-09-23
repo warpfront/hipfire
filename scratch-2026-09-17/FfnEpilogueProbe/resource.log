@@ -1,0 +1,13 @@
+gemm_up_silu_combined.hip:703:16: warning: the 'amdgpu_num_vgpr' attribute is deprecated; use 'amdgpu_waves_per_eu' instead [-Wdeprecated-declarations]
+  703 | __attribute__((amdgpu_num_vgpr(208)))
+      |                ^
+1 warning generated when compiling for gfx1201.
+remark: gemm_up_silu_combined.hip:713:0: Function Name: gemm_up_silu_mq4g256v2_iu4_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     TotalSGPRs: 48 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     VGPRs: 208 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: gemm_up_silu_combined.hip:713:0:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

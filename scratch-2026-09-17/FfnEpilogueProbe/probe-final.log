@@ -1,0 +1,26 @@
+DEVICE,name=AMD Radeon AI PRO R9700,arch=gfx1201,cu=32
+RESOURCE_RUNTIME,numRegs=208,staticShared=0,localBytes=0,maxThreads=256,dynamicLds=25600,blocksPerMP=2
+BYTE_IDENTITY,N=128,bytes=1253376,mismatches=0,first=none0
+BYTE_IDENTITY,N=4096,bytes=40108032,mismatches=0,first=none0
+EVENT,0,old_us=12464.837,new_us=14130.209
+EVENT,1,old_us=12514.078,new_us=14132.009
+EVENT,2,old_us=12383.437,new_us=14056.846
+EVENT,3,old_us=12430.478,new_us=14100.526
+EVENT,4,old_us=12431.317,new_us=14044.206
+EVENT,5,old_us=12476.196,new_us=14063.206
+EVENT,6,old_us=12477.396,new_us=14129.527
+EVENT,7,old_us=12471.678,new_us=13976.087
+EVENT,8,old_us=12380.998,new_us=14197.249
+EVENT,9,old_us=12459.318,new_us=14096.326
+EVENT,10,old_us=12477.916,new_us=14104.886
+EVENT,11,old_us=12410.836,new_us=14010.847
+EVENT,12,old_us=12498.958,new_us=14053.248
+EVENT,13,old_us=12473.838,new_us=14088.129
+EVENT,14,old_us=12436.718,new_us=14082.367
+EVENT,15,old_us=12408.797,new_us=14083.607
+EVENT,16,old_us=12425.518,new_us=14038.088
+EVENT,17,old_us=12420.117,new_us=14108.527
+EVENT,18,old_us=12488.998,new_us=14188.528
+EVENT,19,old_us=12467.438,new_us=14128.928
+CHAIN,N=4096,warmups=20,events=20,old_median_us=12462.078,new_median_us=14092.228,layer_net_us_per_token=-0.397986,network64_net_us_per_token=-25.471085,ship_threshold=6.4,pass=0
+VERDICT,KILL_PERFORMANCE
