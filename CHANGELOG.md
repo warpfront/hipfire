@@ -16,6 +16,12 @@ tok/s respectively; final turns remain at 160.3 tok/s at 18.2K, 82.5 tok/s at
 approximately 110 to 203.9 tok/s without speculative decoding or manual clock
 pinning.
 
+The certified single-GPU gfx1151 `.mq4r` route now selects the same retained-PM4
+default as gfx12. Model shape, container extension, topology, and LM-head format
+must all match; other loads remain on HIP. Raw HSA replay selects its device by
+the HIP device's PCI BDF, so `HIP_VISIBLE_DEVICES` remapping cannot route a
+captured tape to the wrong physical GPU.
+
 Contributor deltas staged for this release:
 
 - #465: LLaMA Site A attention dispatch and expanded HFQ KV policy.
@@ -33,6 +39,8 @@ Contributor deltas staged for this release:
 - #513: native Qwen XML tool calls across CLI, daemon, and cached history.
 - #528: DeepSeek V4 DSpark sidecar registration and re-pull discovery.
 - #529: quickstart refresh and historical benchmark labeling.
+- #533: gfx10 MQ2-Lloyd grouped prefill reaches 2006.8 tok/s on RX 6950 XT,
+  with channel-tested sdot4 MMQ kernels and gfx10-only batch admission.
 
 The release also refreshes the Rust and Bun dependency surface, adds standard
 `clap`/`safetensors`/`half`/`tracing` support, introduces Redline property

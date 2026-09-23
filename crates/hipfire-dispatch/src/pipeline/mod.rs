@@ -445,8 +445,7 @@ pub fn run_moe_decode(
         }
     }
     let gfx1100_router_mode = std::env::var("HIPFIRE_GFX1100_ROUTER_W64").ok();
-    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151()
-        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1");
+    let gfx1151_radiowave_fusions = gpu.gfx1151_radiowave_fusions_enabled();
     let exact_wave64_router = p.n_exp == 256
         && ((ctx.arch.is_gfx1100()
             // The exact fused router is the production gfx1100 path. `0` retains
@@ -1722,9 +1721,7 @@ fn select_grouped_lloyd_variant(
 fn use_gfx1151_i8_moe(arch: &str) -> bool {
     // gfx1151: i8 WMMA MMQ. gfx10*: sdot4 MMQ (same host contract, different
     // inner product). Both share GroupedLloydVariant::I8 → auto-route.
-    arch == "gfx1151"
-        || arch.starts_with("gfx103")
-        || arch.starts_with("gfx101")
+    arch == "gfx1151" || rdna_compute::arch_caps::ArchCaps::arch_has_hfq3_sdot4(arch)
 }
 
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
@@ -2837,9 +2834,15 @@ mod mixed_dispatch_tests {
     use rdna_compute::DType::*;
 
     #[test]
-    fn deepseek4_i8_moe_is_exact_gfx1151_only() {
-        assert!(use_gfx1151_i8_moe("gfx1151"));
-        for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201"] {
+    fn i8_moe_arch_gate_matches_backend_capabilities() {
+        for arch in [
+            "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032", "gfx1151",
+        ] {
+            assert!(use_gfx1151_i8_moe(arch), "missing i8 route on {arch}");
+        }
+        for arch in [
+            "gfx1010", "gfx1013", "gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201",
+        ] {
             assert!(!use_gfx1151_i8_moe(arch), "unexpected i8 route on {arch}");
         }
     }

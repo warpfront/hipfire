@@ -1245,6 +1245,16 @@ pub const GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256.hip")
 );
+/// Product-certified gfx1151 LM-head layout: original HFQ4/MQ4 AoS weights
+/// remain resident at offset zero; this symbol consumes the load-time AoSoA4
+/// shadow with contiguous headers and lane-major nibble payloads.
+pub const GEMV_HFQ4G256_LM_HEAD_AOSOA4_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_lm_head_aosoa4.gfx1151.hip")
+);
 /// gfx1151 LM-head structural experiment: inline F32->FP16 activation packing,
 /// packed FP16 HFQ dequant, and four independent v_dot2_f32_f16 operations per
 /// group. The distinct symbol/code object is required to keep gfx1100 and

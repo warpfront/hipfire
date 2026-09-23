@@ -403,6 +403,9 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Physical HIP device identity used to select the same raw HSA agent even
+    /// when visible device ordinals have been remapped.
+    pub pci_bus_id: String,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -413,6 +416,10 @@ pub struct Gpu {
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Model-scoped admission for the product-certified gfx1151 Qwen A3B
+    /// Radiowave schedules. Reset on model unload; explicit experimental
+    /// opt-in remains available through the immutable feature flags.
+    gfx1151_certified_radiowave: bool,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
@@ -672,6 +679,18 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
+    /// Set the model-scoped gfx1151 Radiowave admission before scratch sizing
+    /// or forward dispatch. The exact model loader owns this decision.
+    pub fn configure_gfx1151_certified_radiowave(&mut self, enabled: bool) {
+        self.gfx1151_certified_radiowave = self.arch_caps.is_gfx1151() && enabled;
+    }
+
+    #[inline]
+    pub fn gfx1151_radiowave_fusions_enabled(&self) -> bool {
+        self.arch_caps.is_gfx1151()
+            && (self.gfx1151_certified_radiowave || self.flags.gfx1151_radiowave_fusions)
+    }
+
     /// Bind this `Gpu`'s device on the calling thread. Delegates to
     /// `crate::graph::bind_thread`.
     #[inline]
@@ -764,6 +783,7 @@ impl Gpu {
         // set_device must precede try_init_rocblas — rocBLAS captures the
         // currently-bound device into its handle.
         hip.set_device(id)?;
+        let pci_bus_id = hip.device_pci_bus_id(id)?;
 
         // HIPFIRE_TARGET_ARCH overrides the detected GPU arch for kernel
         // compilation. Used to test cross-arch family targets like
@@ -818,6 +838,7 @@ impl Gpu {
             flags,
             arch_caps,
             device_id: id,
+            pci_bus_id,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
@@ -850,6 +871,7 @@ impl Gpu {
                 sample_partials_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_env(),
+            gfx1151_certified_radiowave: false,
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
@@ -1863,6 +1885,7 @@ impl Gpu {
     ///     entries are released back to the pool here.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
+        self.gfx1151_certified_radiowave = false;
         self.mmq_screen.cache.clear();
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {

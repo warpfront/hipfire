@@ -79,6 +79,14 @@ pub struct ArchCaps {
 }
 
 impl ArchCaps {
+    pub fn arch_has_hfq3_sdot4(arch: &str) -> bool {
+        matches!(arch, "gfx1011" | "gfx1012" | "gfx1030" | "gfx1031" | "gfx1032")
+    }
+
+    pub fn arch_has_certified_radiowave_fusions(arch: &str) -> bool {
+        arch == "gfx1151"
+    }
+
     pub fn new(arch: &str, flags: std::sync::Arc<FeatureFlags>) -> Self {
         // Atoms
         let is_gfx906 = arch == "gfx906";
@@ -129,7 +137,7 @@ impl ArchCaps {
         let is_gcn5_wave64 = is_gfx906 || (is_gfx908 && flags.gcn5_wave64_hybrid.unwrap_or(false));
         let is_wave32 = is_rdna1 || is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let is_wave64_native = is_gfx906 || is_gfx908 || is_cdna3;
-        let has_hfq3_sdot4 = is_rdna1p1 || is_rdna2;
+        let has_hfq3_sdot4 = Self::arch_has_hfq3_sdot4(arch);
 
         // Env-gated capabilities
         let has_hfq3_dp4a = flags.hfq3_dp4a.unwrap_or(false) && has_hfq3_sdot4;
@@ -285,6 +293,9 @@ impl ArchCaps {
     }
     pub fn is_gfx1151(&self) -> bool {
         self.is_gfx1151
+    }
+    pub fn has_certified_radiowave_fusions(&self) -> bool {
+        Self::arch_has_certified_radiowave_fusions(&self.arch)
     }
     pub fn is_gfx1152(&self) -> bool {
         self.is_gfx1152
@@ -485,6 +496,14 @@ mod tests {
         assert!(!caps.is_rdna3_dgpu());
         assert!(caps.is_rdna3p5());
         assert!(caps.is_gfx1151());
+    }
+
+    #[test]
+    fn certified_radiowave_fusions_are_gfx1151_only() {
+        assert!(make_caps("gfx1151").has_certified_radiowave_fusions());
+        for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1201"] {
+            assert!(!make_caps(arch).has_certified_radiowave_fusions(), "{arch}");
+        }
     }
 
     #[test]

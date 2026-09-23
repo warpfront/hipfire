@@ -2852,18 +2852,18 @@ impl Gpu {
         static GFX1151_QKVZA_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && *GFX1151_QKVZA_ALL_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER").as_deref() == Ok("1")
-                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
-            });
+            && (self.gfx1151_radiowave_fusions_enabled()
+                || *GFX1151_QKVZA_ALL_BUFFER.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER").as_deref() == Ok("1")
+                }));
         static GFX1151_QKVZA_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_hybrid_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m == 1_281
-            && *GFX1151_QKVZA_HYBRID_BUFFER.get_or_init(|| {
-                std::env::var("HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER").as_deref() == Ok("1")
-                    || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
-            });
+            && (self.gfx1151_radiowave_fusions_enabled()
+                || *GFX1151_QKVZA_HYBRID_BUFFER.get_or_init(|| {
+                    std::env::var("HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER").as_deref() == Ok("1")
+                }));
         static GFX1151_QKVZA_X_BUFFER_LARGE: OnceLock<bool> = OnceLock::new();
         let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
             && k == 2_048
@@ -11631,7 +11631,7 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !(self.arch.starts_with("gfx103") || self.arch.starts_with("gfx101")) {
+        if !self.arch_caps.has_hfq3_sdot4() {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -11819,7 +11819,7 @@ impl Gpu {
                 m_total,
                 x_src_rows,
             )
-        } else if (self.arch.starts_with("gfx103") || self.arch.starts_with("gfx101"))
+        } else if self.arch_caps.has_hfq3_sdot4()
             && m % 16 == 0
             && k % 256 == 0
         {
@@ -18770,7 +18770,7 @@ impl Gpu {
         }
         // gfx10 (no WMMA): sdot4 MMQ. Scalar gemm_q8_0_batched ~91% GPU on A3B-MQ2.
         if !use_legacy
-            && self.arch.starts_with("gfx10")
+            && self.arch_caps.has_hfq3_sdot4()
             && k % 128 == 0
             && n > 0
         {
@@ -18848,7 +18848,7 @@ impl Gpu {
                 return self.gemm_q8_0_wmma(weight, scratch, y, m, k, n);
             }
         }
-        if self.arch.starts_with("gfx10") && k % 128 == 0 && n > 0 {
+        if self.arch_caps.has_hfq3_sdot4() && k % 128 == 0 && n > 0 {
             return self.gemm_q8_0_mmq_gfx1030(weight, x, y, m, k, n);
         }
         self.gemm_q8_0_batched_chunked(weight, x, y, m, k, n)
@@ -21086,7 +21086,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch.starts_with("gfx10") {
+        if !self.arch_caps.has_hfq3_sdot4() {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -21122,13 +21122,13 @@ impl Gpu {
             eprintln!("[q8-mmq-shape] m={m} k={k} n={batch_size}");
         }
         let row_tiles = ((m + 31) / 32) as u32;
-        let col_tiles = ((batch_size + 63) / 64) as u32;
+        let col_tiles = ((batch_size + 127) / 128) as u32;
         let bytes = m * (k / 32) * 34 + batch_size * (k / 128) * 144 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, col_tiles, 1],
-            [128, 1, 1],
+            [256, 1, 1],
             0,
             &mut params,
             || {

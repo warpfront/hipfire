@@ -54,6 +54,7 @@ pub fn q8_flash_tile_size(
     n_kv_heads: usize,
     head_dim: usize,
     max_seq: usize,
+    gfx1151_radiowave_fusions: bool,
 ) -> usize {
     static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
     OVERRIDE
@@ -70,7 +71,7 @@ pub fn q8_flash_tile_size(
                 n_kv_heads,
                 head_dim,
                 max_seq,
-                std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1"),
+                gfx1151_radiowave_fusions,
             )
         })
 }
@@ -2063,6 +2064,7 @@ impl Gpu {
             n_kv_heads,
             head_dim,
             max_seq,
+            self.gfx1151_radiowave_fusions_enabled(),
         );
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.

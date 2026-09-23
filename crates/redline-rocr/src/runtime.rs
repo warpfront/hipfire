@@ -105,6 +105,10 @@ impl Runtime {
                 .into_iter()
                 .nth(ordinal)
                 .ok_or(RuntimeError::GpuOrdinalOutOfRange { ordinal }),
+            GpuSelector::PciBusId(pci_bus_id) => devices
+                .into_iter()
+                .find(|device| device.pci_bus_id() == pci_bus_id)
+                .ok_or(RuntimeError::GpuPciBusIdNotFound { pci_bus_id }),
             GpuSelector::NameContains(needle) => {
                 let needle_lower = needle.to_ascii_lowercase();
                 devices
@@ -432,6 +436,7 @@ impl std::str::FromStr for PciBusId {
 pub enum GpuSelector<'a> {
     Ordinal(usize),
     NameContains(&'a str),
+    PciBusId(PciBusId),
 }
 
 #[derive(Clone)]
@@ -2165,6 +2170,9 @@ pub enum RuntimeError {
     GpuNameNotFound {
         needle: String,
     },
+    GpuPciBusIdNotFound {
+        pci_bus_id: PciBusId,
+    },
     InvalidQueueSize {
         requested: u32,
         min: u32,
@@ -2238,6 +2246,9 @@ impl fmt::Display for RuntimeError {
             }
             Self::GpuNameNotFound { needle } => {
                 write!(f, "no HSA GPU name contains {needle:?}")
+            }
+            Self::GpuPciBusIdNotFound { pci_bus_id } => {
+                write!(f, "no HSA GPU has PCI bus ID {pci_bus_id}")
             }
             Self::InvalidQueueSize {
                 requested,

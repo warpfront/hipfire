@@ -1,0 +1,37 @@
+- id: port-gfx10-prefill
+  subject: Port gfx10-only MQ2 prefill improvements
+  status: in_progress
+  description: Apply only gfx1030 kernel and strictly gfx10-gated host changes from e017f83.
+  effort: large
+  category: feature
+  route_family: execution
+  load: 0.9
+  failure_modes: [cross-architecture-regression, incomplete-port]
+  route_fit: dominant
+  authorization: witnessed
+  blocking: []
+  blockedBy: []
+  acceptance:
+    - pp2048 is at least 2000 tok/s on gfx1030
+    - no shared or gfx1151 kernel source changes
+  edge_cases:
+    - gfx11 and gfx12 retain the original prefill batch path
+- id: default-gfx1151-golden
+  subject: Default immutable gfx1151 MQ4R PM4 golden path
+  status: pending
+  description: Make the certified Radiowave and AoSoA4 PM4 configuration automatic for the exact gfx1151 MQ4R product shape without changing its dispatch contract.
+  effort: medium
+  category: feature
+  route_family: boundary
+  load: 0.9
+  failure_modes: [golden-regression, unintended-architecture-routing]
+  route_fit: dominant
+  authorization: witnessed
+  blocking: []
+  blockedBy: [port-gfx10-prefill]
+  acceptance:
+    - default environment produces the certified PM4 sequence on gfx1151 MQ4R
+    - PM4 median remains at least 115.021 tok/s
+    - explicit incompatible overrides cannot disable the certified exact-shape default
+  edge_cases:
+    - non-gfx1151 and non-MQ4R models retain existing backend selection

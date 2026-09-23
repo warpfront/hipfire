@@ -153,6 +153,7 @@ pub struct HipRuntime {
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
     fn_set_device_flags: unsafe extern "C" fn(c_uint) -> u32,
     fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    fn_device_get_pci_bus_id: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32,
 
     // Multi-device / peer access
     fn_device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -319,6 +320,11 @@ impl HipRuntime {
                     lib,
                     "hipGetDevice",
                     unsafe extern "C" fn(*mut c_int) -> u32
+                ),
+                fn_device_get_pci_bus_id: load_fn!(
+                    lib,
+                    "hipDeviceGetPCIBusId",
+                    unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32
                 ),
                 fn_device_can_access_peer: load_fn!(
                     lib,
@@ -604,6 +610,29 @@ impl HipRuntime {
         self.check(code, "hipGetDevice")?;
         Ok(id)
     }
+    /// Stable physical PCI identity for a HIP-visible device.
+    ///
+    /// Unlike the visible device ordinal, this survives `HIP_VISIBLE_DEVICES`
+    /// remapping and can therefore identify the matching raw HSA agent.
+    pub fn device_pci_bus_id(&self, device_id: i32) -> HipResult<String> {
+        let mut buf = [0 as c_char; 32];
+        let code = unsafe {
+            (self.fn_device_get_pci_bus_id)(
+                buf.as_mut_ptr(),
+                buf.len() as c_int,
+                device_id as c_int,
+            )
+        };
+        self.check(code, "hipDeviceGetPCIBusId")?;
+        let pci_bus_id = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if pci_bus_id.is_empty() {
+            return Err(HipError::new(0, "hipDeviceGetPCIBusId returned an empty identity"));
+        }
+        Ok(pci_bus_id)
+    }
+
 
     // ── Multi-device / peer access ──────────────────────────────
 

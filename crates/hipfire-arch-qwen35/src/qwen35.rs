@@ -1252,6 +1252,110 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
+/// Exact model-shape half of the certified gfx1151 Qwen3.6-35B-A3B MQ4R
+/// product contract. Weight format and architecture are proved separately by
+/// the loader and daemon because neither layer owns both facts.
+pub fn is_certified_qwen35_a3b_mq4r_config(config: &Qwen35Config) -> bool {
+    config.dim == 2_048
+        && config.n_layers == 40
+        && config.vocab_size == 248_320
+        && config.n_heads == 16
+        && config.n_kv_heads == 2
+        && config.head_dim == 256
+        && config.num_experts == 256
+        && config.num_experts_per_tok == 8
+        && config.moe_intermediate_size == 512
+        && config.shared_expert_intermediate_size == 512
+        && config.has_shared_expert
+        && config.layer_types.len() == 40
+        && config.layer_types.iter().enumerate().all(|(layer, layer_type)| {
+            if layer % 4 == 3 {
+                matches!(layer_type, LayerType::FullAttention)
+            } else {
+                matches!(layer_type, LayerType::LinearAttention)
+            }
+        })
+        && !config.paged_experts
+        && config.reap_keep.is_none()
+}
+
+fn certified_gfx1151_mq4r_lm_head(
+    arch: &str,
+    name: &str,
+    quant_type: u8,
+    certified_single_gpu_mq4r: bool,
+    config: &Qwen35Config,
+) -> bool {
+    arch == "gfx1151"
+        && certified_single_gpu_mq4r
+        && name.ends_with("lm_head.weight")
+        && quant_type == 13
+        && is_certified_qwen35_a3b_mq4r_config(config)
+}
+
+fn upload_hfq4g256_weight(
+    gpu: &Gpu,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    append_aosoa4_shadow: bool,
+) -> HipResult<GpuTensor> {
+    if append_aosoa4_shadow {
+        let staged = rdna_compute::hfq4_soa::append_shadow(data, m, k).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!(
+                    "gfx1151 HFQ4 AoSoA4 shadow rejected malformed shape/data: \
+                     M={m} K={k} bytes={}",
+                    data.len()
+                ),
+            )
+        })?;
+        // Preserve the tensor's logical AoS shape while the owning allocation
+        // also carries the stable PM4-capturable shadow.
+        gpu.upload_raw(&staged, &[data.len()])
+    } else {
+        gpu.upload_raw(data, &[data.len()])
+    }
+}
+
+fn load_weight_tensor_raw_with_shadow(
+    gpu: &Gpu,
+    quant_type: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    append_aosoa4_shadow: bool,
+) -> HipResult<WeightTensor> {
+    match quant_type {
+        6 => {
+            let buf = upload_hfq4g256_weight(gpu, data, m, k, append_aosoa4_shadow)?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::HFQ4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        13 => {
+            let buf = upload_hfq4g256_weight(gpu, data, m, k, append_aosoa4_shadow)?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        _ => load_weight_tensor_raw(gpu, quant_type, data, m, k),
+    }
+}
+
 fn load_weight_tensor_raw(
     gpu: &Gpu,
     quant_type: u8,
@@ -1261,7 +1365,7 @@ fn load_weight_tensor_raw(
 ) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_hfq4g256_weight(gpu, data, m, k, false)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G256,
@@ -1322,7 +1426,7 @@ fn load_weight_tensor_raw(
         }
         13 => {
             // MQ4-G256
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_hfq4g256_weight(gpu, data, m, k, false)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256,
@@ -3306,10 +3410,15 @@ pub fn load_weights(
 pub struct HfqSource<'a> {
     hfq: &'a mut HfqFile,
     c: &'a Qwen35Config,
+    single_gpu: bool,
 }
 impl<'a> HfqSource<'a> {
     pub fn new(hfq: &'a mut HfqFile, c: &'a Qwen35Config) -> Self {
-        Self { hfq, c }
+        Self {
+            hfq,
+            c,
+            single_gpu: false,
+        }
     }
 }
 impl WeightSource for HfqSource<'_> {
@@ -3320,6 +3429,7 @@ impl WeightSource for HfqSource<'_> {
     }
 
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        self.single_gpu = n_devices == 1;
         #[cfg(unix)]
         if n_devices == 1 {
             self.hfq.drop_mmap();
@@ -3362,6 +3472,14 @@ impl WeightSource for HfqSource<'_> {
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
         let c = self.c;
+        gpu.configure_gfx1151_certified_radiowave(false);
+        let certified_single_gpu_mq4r = self.single_gpu
+            && self
+                .hfq
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"));
         let hfq = &*self.hfq;
         let has_separate = qwen35_tensor_name_candidates("lm_head.weight")
             .iter()
@@ -3377,7 +3495,28 @@ impl WeightSource for HfqSource<'_> {
             |gpu| {
                 let (lm_info, lm_data) =
                     qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
-                load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
+                let certified = certified_gfx1151_mq4r_lm_head(
+                    &gpu.arch,
+                    "lm_head.weight",
+                    lm_info.quant_type,
+                    certified_single_gpu_mq4r,
+                    c,
+                );
+                let append_aosoa4 = certified
+                    || (gpu.arch_caps.is_gfx1151()
+                        && matches!(lm_info.quant_type, 6 | 13)
+                        && c.vocab_size == 248_320
+                        && c.dim == 2_048
+                        && gpu.flags.gfx1151_hfq4_aosoa4_lm_head);
+                gpu.configure_gfx1151_certified_radiowave(certified);
+                load_weight_tensor_raw_with_shadow(
+                    gpu,
+                    lm_info.quant_type,
+                    &lm_data,
+                    c.vocab_size,
+                    c.dim,
+                    append_aosoa4,
+                )
             },
             |gpu| {
                 let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
@@ -4831,6 +4970,7 @@ impl Qwen35Scratch {
                     config.n_kv_heads,
                     config.head_dim,
                     kv_max_seq,
+                    gpu.gfx1151_radiowave_fusions_enabled(),
                 )
                 .min(128);
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
@@ -5312,11 +5452,11 @@ pub fn forward_scratch(
         let prepare = if gpu.replay.uses_pm4_transport() {
             let launches = gpu.replay.recorded_launches().len();
             gpu.replay
-                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                .prepare_pm4_prefix(&gpu.pci_bus_id, launches)
                 .map(|_| ())
         } else {
             gpu.replay
-                .prepare_linear_aql(gpu.device_id as usize)
+                .prepare_linear_aql(&gpu.pci_bus_id)
                 .map(|_| ())
         };
         if let Err(reason) = prepare {
@@ -5841,6 +5981,35 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 
 const MOE_GROUPED_BLOCK_M: usize = 16;
 
+const MQ2L_GFX10_PREFILL_BATCH: usize = 2048;
+
+fn prefill_max_batch_policy(arch: &str, has_mq2l: bool, plain_prefill: bool) -> usize {
+    if plain_prefill
+        && has_mq2l
+        && rdna_compute::arch_caps::ArchCaps::arch_has_hfq3_sdot4(arch)
+    {
+        MQ2L_GFX10_PREFILL_BATCH
+    } else {
+        PREFILL_MAX_BATCH
+    }
+}
+
+fn has_mq2l_moe_weights(weights: &Qwen35Weights) -> bool {
+    weights.layers.iter().any(|layer| {
+        let ffn = match layer {
+            LayerWeights::DeltaNetMoe(layer) => Some(&layer.ffn),
+            LayerWeights::FullAttnMoe(layer) => Some(&layer.ffn),
+            _ => None,
+        };
+        ffn.is_some_and(|ffn| {
+            ffn.experts.first().is_some_and(|expert| {
+                expert.gate_up.gpu_dtype == DType::MQ2G256Lloyd
+                    || expert.down.gpu_dtype == DType::MQ2G256Lloyd
+            })
+        })
+    })
+}
+
 #[inline]
 fn prefill_should_emit_last_token_logits(
     has_per_token_hidden_out: bool,
@@ -6288,11 +6457,16 @@ pub fn forward_prefill_batch_with_pbs_opts(
     //
     // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
     // staging can match the chunk upper bound.
+    let plain_prefill = hidden_rb.is_none() && tree_verify.is_none() && gdn_tape.is_none();
+    let has_mq2l = has_mq2l_moe_weights(weights);
+    let mq2l_gfx10_plain = plain_prefill
+        && has_mq2l
+        && rdna_compute::arch_caps::ArchCaps::arch_has_hfq3_sdot4(&gpu.arch);
     let max_batch: usize = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or(PREFILL_MAX_BATCH);
+        .unwrap_or_else(|| prefill_max_batch_policy(&gpu.arch, has_mq2l, plain_prefill));
 
     let n = tokens.len();
     if n == 0 {
@@ -6486,7 +6660,11 @@ pub fn forward_prefill_batch_with_pbs_opts(
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None => {
-                own_pbs = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+                own_pbs = Some(if mq2l_gfx10_plain {
+                    PrefillBatchScratch::new_opt(gpu, config, max_batch, false)?
+                } else {
+                    PrefillBatchScratch::new(gpu, config, max_batch)?
+                });
                 own_pbs.as_ref().unwrap()
             }
         };
@@ -14412,11 +14590,7 @@ fn forward_lowered_enabled() -> bool {
 /// gfx1151 has a different cache hierarchy and occupancy balance, so each
 /// schedule must earn its own stationary product result before defaulting on.
 fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    gpu.arch_caps.is_gfx1151()
-        && *ENABLED.get_or_init(|| {
-            std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref() == Ok("1")
-        })
+    gpu.gfx1151_radiowave_fusions_enabled()
 }
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and
@@ -16885,6 +17059,121 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mq2l_gfx10_plain_prefill_uses_2048_rows() {
+        for arch in ["gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032"] {
+            assert_eq!(
+                prefill_max_batch_policy(arch, true, true),
+                2048,
+                "{arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1151_mq4r_lm_head_enables_certified_radiowave_default_only() {
+        let layer_types = (0..40)
+            .map(|layer| {
+                if layer % 4 == 3 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = from_config_value(&serde_json::json!({
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "layer_types": layer_types,
+        }))
+        .expect("certified config parses");
+        assert!(certified_gfx1151_mq4r_lm_head(
+            "gfx1151",
+            "model.language_model.lm_head.weight",
+            13,
+            true,
+            &config,
+        ));
+
+        let mut dense_same_lm_head = config.clone();
+        dense_same_lm_head.num_experts = 0;
+        assert!(!certified_gfx1151_mq4r_lm_head(
+            "gfx1151",
+            "lm_head.weight",
+            13,
+            true,
+            &dense_same_lm_head,
+        ));
+
+        for (arch, name, quant_type) in [
+            ("gfx1100", "lm_head.weight", 13),
+            ("gfx1201", "lm_head.weight", 13),
+            ("gfx1151", "lm_head.weight", 6),
+            ("gfx1151", "model.embed_tokens.weight", 13),
+        ] {
+            assert!(
+                !certified_gfx1151_mq4r_lm_head(
+                    arch,
+                    name,
+                    quant_type,
+                    true,
+                    &config,
+                ),
+                "{arch} {name} qt={quant_type}",
+            );
+        }
+
+        let mut wrong_layer_pattern = config.clone();
+        wrong_layer_pattern.layer_types[0] = LayerType::FullAttention;
+        assert!(!certified_gfx1151_mq4r_lm_head(
+            "gfx1151",
+            "lm_head.weight",
+            13,
+            true,
+            &wrong_layer_pattern,
+        ));
+
+        let mut wrong_shape = config.clone();
+        wrong_shape.vocab_size += 1;
+        assert!(!certified_gfx1151_mq4r_lm_head(
+            "gfx1151",
+            "lm_head.weight",
+            13,
+            true,
+            &wrong_shape,
+        ));
+        assert!(!certified_gfx1151_mq4r_lm_head(
+            "gfx1151",
+            "lm_head.weight",
+            13,
+            false,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn large_prefill_batch_is_gfx10_mq2l_plain_only() {
+        for (arch, has_mq2l, plain_prefill) in [
+            ("gfx1151", true, true),
+            ("gfx1201", true, true),
+            ("gfx1030", false, true),
+            ("gfx1030", true, false),
+        ] {
+            assert_eq!(
+                prefill_max_batch_policy(arch, has_mq2l, plain_prefill),
+                PREFILL_MAX_BATCH
+            );
+        }
+    }
 
     // ── SP2 — per-expert mixed-tier table builder (CPU-pure) ──────────────
     // `mixed_tier_table` is the testable core of `per_expert_tier_tables`:

@@ -1686,12 +1686,25 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default = hipfire_runtime::config::gfx12_mq4r_redline_default(
-                            &gpu.arch, path, m.arch_id, pp, tp,
+                        let certified_model_shape = m.state.as_ref().is_some_and(|state| {
+                            matches!(
+                                state,
+                                ModelState::Qwen35(bundle)
+                                    if hipfire_arch_qwen35::qwen35::
+                                        is_certified_qwen35_a3b_mq4r_config(&bundle.config)
+                            )
+                        });
+                        let redline_default = hipfire_runtime::config::mq4r_redline_default(
+                            &gpu.arch,
+                            path,
+                            m.arch_id,
+                            pp,
+                            tp,
+                            certified_model_shape,
                         );
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
-                                "[redline] enabling fail-closed gfx12 MQ4R default (transport={})",
+                                "[redline] enabling product-certified MQ4R default (transport={})",
                                 gpu.replay.transport_name()
                             );
                         }
@@ -3188,7 +3201,7 @@ fn main() {
             }
 
             "redline_probe_aql" => {
-                match gpu.replay.probe_aql_contracts(gpu.device_id as usize) {
+                match gpu.replay.probe_aql_contracts(&gpu.pci_bus_id) {
                     Ok(probes) => {
                         let rows = probes
                             .into_iter()
@@ -3258,11 +3271,11 @@ fn main() {
                 let prepared = match if pm4 {
                     let launch_count = gpu.replay.recorded_launches().len();
                     gpu.replay
-                        .prepare_pm4_prefix(gpu.device_id as usize, launch_count)
+                        .prepare_pm4_prefix(&gpu.pci_bus_id, launch_count)
                         .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
                 } else {
                     gpu.replay
-                        .prepare_linear_aql(gpu.device_id as usize)
+                        .prepare_linear_aql(&gpu.pci_bus_id)
                         .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
                 } {
                     Ok(summary) => summary,
@@ -3529,7 +3542,7 @@ fn main() {
                         let launch = gpu.replay.recorded_launches()[prefix - 1].clone();
                         let (_, dwords, _) = gpu
                             .replay
-                            .prepare_pm4_prefix(gpu.device_id as usize, prefix)?;
+                            .prepare_pm4_prefix(&gpu.pci_bus_id, prefix)?;
                         let mut samples = Vec::with_capacity(repeats);
                         for _ in 0..repeats {
                             let loaded = model.as_mut().expect("eligibility checked");
@@ -3636,11 +3649,11 @@ fn main() {
                 }
                 let prepared = match if pm4 {
                     gpu.replay
-                        .prepare_pm4_prefix(gpu.device_id as usize, prefix)
+                        .prepare_pm4_prefix(&gpu.pci_bus_id, prefix)
                         .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
                 } else {
                     gpu.replay
-                        .prepare_linear_aql_prefix(gpu.device_id as usize, prefix)
+                        .prepare_linear_aql_prefix(&gpu.pci_bus_id, prefix)
                         .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
                 } {
                     Ok(summary) => summary,

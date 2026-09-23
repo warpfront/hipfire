@@ -41,6 +41,13 @@ pub struct FeatureFlags {
     /// explicitly compiled wave64 on RDNA3. Default off until model-level
     /// correctness and throughput gates promote it.
     pub rdna3_hfq4_qkv_wave64: bool,
+    /// Explicitly admit the certified gfx1151 Radiowave schedules on other
+    /// model shapes. The exact Qwen A3B MQ4R product path is model-defaulted
+    /// independently and does not depend on this opt-in.
+    pub gfx1151_radiowave_fusions: bool,
+    /// Explicitly build the gfx1151 LM-head AoSoA4 shadow on compatible
+    /// HFQ4/MQ4 shapes outside the certified MQ4R product default.
+    pub gfx1151_hfq4_aosoa4_lm_head: bool,
     /// Radiowave experiment: split each gfx1100 QKVZA output row across two
     /// lighter wave32s and join their partials through LDS.
     pub rdna3_hfq4_qkvza_2wave: bool,
@@ -346,6 +353,14 @@ impl FeatureFlags {
             fp8_wmma: std::env::var("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
             dot2_gemv: std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
             gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
+            gfx1151_radiowave_fusions: parse_bool(
+                "HIPFIRE_GFX1151_RADIOWAVE_FUSIONS",
+            )
+            .unwrap_or(false),
+            gfx1151_hfq4_aosoa4_lm_head: parse_bool(
+                "HIPFIRE_GFX1151_HFQ4_AOSOA4_LM_HEAD",
+            )
+            .unwrap_or(false),
             rdna3_hfq4_qkv_wave64: std::env::var("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref()
                 == Ok("1"),
             rdna3_hfq4_qkvza_2wave: std::env::var("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref()
@@ -638,6 +653,8 @@ impl FeatureFlags {
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
+            gfx1151_radiowave_fusions: false,
+            gfx1151_hfq4_aosoa4_lm_head: false,
             rdna3_hfq4_qkv_wave64: false,
             rdna3_hfq4_qkvza_2wave: false,
             rdna3_hfq4_qkvza_wavepack4: false,

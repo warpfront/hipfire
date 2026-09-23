@@ -9,7 +9,7 @@
 //! `void**` arguments: a model adapter must supply explicit resource accesses
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
 //! Replay remains default-off except for the product-certified, single-GPU
-//! gfx12 Qwen A3B `.mq4r` route selected by the daemon after model load.
+//! gfx1151/gfx12 Qwen A3B `.mq4r` routes selected by the daemon after model load.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
     Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy,
-    KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy,
+    KernargBuffer, KernargPool, Kernel, LaunchGeometry, PciBusId, PhasedMultiQueuePm4Ib, QueuePolicy,
     RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
@@ -297,6 +297,7 @@ fn radiowave_vmem_only_consumer(kernel: &str) -> bool {
             | "gated_norm_f32"
             | "gated_norm_mq_rotate_gfx1100"
             | "gated_norm_mq_rotate_gfx1151"
+            | "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
             | "gemv_hfq4g256_residual_rt_low_gfx1151"
             | "moe_router_softmax_topk_k8_wave64_exact"
             | "moe_topk_renorm_k8"
@@ -586,6 +587,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
+        | "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
@@ -763,6 +765,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256"
         | "gemv_hfq4g256_lm_head_dot2_gfx1151"
+        | "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151"
         | "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"
         | "gemv_hfq4g256_k2048"
         | "gemv_hfq4g256_residual"
@@ -1880,6 +1883,10 @@ pub struct ReplayController {
     prepared: Option<PreparedLinearAqlReplay>,
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
+    /// True only for the daemon's exact single-GPU Qwen A3B MQ4R product
+    /// predicate. Used to retain the certified gfx1151 PM4 cache contract
+    /// without requiring the former Radiowave environment gate.
+    certified_mq4r_model_default: bool,
     forward_eligible: bool,
 }
 
@@ -1924,6 +1931,7 @@ impl ReplayController {
             prepared: None,
             prepared_pm4: None,
             auto_lifecycle: false,
+            certified_mq4r_model_default: false,
             forward_eligible: true,
         }
     }
@@ -1935,17 +1943,27 @@ impl ReplayController {
         }
         controller
     }
+    fn select_hsa_gpu(runtime: &Runtime, pci_bus_id: &str) -> Result<GpuDevice, String> {
+        let pci_bus_id = pci_bus_id
+            .parse::<PciBusId>()
+            .map_err(|error| error.to_string())?;
+        runtime
+            .select_gpu(GpuSelector::PciBusId(pci_bus_id))
+            .map_err(|error| error.to_string())
+    }
+
 
     /// Apply the daemon's model-scoped replay default after a successful load.
     ///
     /// An explicit backend selection always wins. Otherwise every successful
     /// model load resets the process-local controller so prepared queues,
     /// command buffers, and fallback state cannot bleed across model swaps.
-    /// The certified gfx12 MQ4R route defaults to retained PM4; all other
-    /// models return to ordinary HIP. An explicit transport still overrides
-    /// the PM4 transport choice for diagnostics.
-    pub fn configure_model_default(&mut self, enable_gfx12_mq4r: bool) -> bool {
+    /// The certified gfx1151/gfx12 MQ4R routes default to retained PM4; all
+    /// other models return to ordinary HIP. An explicit transport still
+    /// overrides the PM4 transport choice for diagnostics.
+    pub fn configure_model_default(&mut self, enable_certified_mq4r: bool) -> bool {
         let manual = manual_capture_requested();
+        self.certified_mq4r_model_default = enable_certified_mq4r;
         if std::env::var_os("HIPFIRE_REPLAY_BACKEND").is_some() || manual {
             self.reset_for_model(
                 ReplayBackendRequest::from_env(),
@@ -1956,17 +1974,18 @@ impl ReplayController {
         }
 
         let transport =
-            if enable_gfx12_mq4r && std::env::var_os("HIPFIRE_REPLAY_TRANSPORT").is_none() {
+            if enable_certified_mq4r && std::env::var_os("HIPFIRE_REPLAY_TRANSPORT").is_none() {
                 ReplayTransport::Pm4Ib
             } else {
                 ReplayTransport::from_env()
             };
-        self.apply_model_default(enable_gfx12_mq4r, transport);
+        self.apply_model_default(enable_certified_mq4r, transport);
         true
     }
 
-    fn apply_model_default(&mut self, enable_gfx12_mq4r: bool, transport: ReplayTransport) {
-        let request = if enable_gfx12_mq4r {
+    fn apply_model_default(&mut self, enable_certified_mq4r: bool, transport: ReplayTransport) {
+        self.certified_mq4r_model_default = enable_certified_mq4r;
+        let request = if enable_certified_mq4r {
             ReplayBackendRequest::Auto
         } else {
             ReplayBackendRequest::Hip
@@ -2060,13 +2079,11 @@ impl ReplayController {
     /// HIP launch used. This creates no queue and executes no packet.
     pub fn probe_aql_contracts(
         &self,
-        device_ordinal: usize,
+        device_pci_bus_id: &str,
     ) -> Result<Vec<AqlContractProbe>, String> {
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-        let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
-            .map_err(|error| error.to_string())?;
+        let device = Self::select_hsa_gpu(&runtime, device_pci_bus_id)?;
         let mut seen = BTreeSet::new();
         let mut probes = Vec::new();
         for launch in &self.recorded {
@@ -2106,14 +2123,15 @@ impl ReplayController {
     /// geometry, matching CLR's module-launch path.
     pub fn prepare_linear_aql(
         &mut self,
-        device_ordinal: usize,
+        device_pci_bus_id: &str,
     ) -> Result<(usize, usize, u64), String> {
-        self.prepare_linear_aql_prefix(device_ordinal, self.recorded.len())
+        let prefix = self.recorded.len();
+        self.prepare_linear_aql_prefix(device_pci_bus_id, prefix)
     }
 
     pub fn prepare_linear_aql_prefix(
         &mut self,
-        device_ordinal: usize,
+        device_pci_bus_id: &str,
         prefix: usize,
     ) -> Result<(usize, usize, u64), String> {
         if self.recorded.is_empty() {
@@ -2127,9 +2145,7 @@ impl ReplayController {
         }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-        let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
-            .map_err(|error| error.to_string())?;
+        let device = Self::select_hsa_gpu(&runtime, device_pci_bus_id)?;
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut kernels = BTreeMap::<(PathBuf, String), Kernel>::new();
@@ -2263,7 +2279,7 @@ impl ReplayController {
     /// constructed; gfx10/11 and gfx12 never share register encodings.
     pub fn prepare_pm4_prefix(
         &mut self,
-        device_ordinal: usize,
+        device_pci_bus_id: &str,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
         if self.recorded.is_empty() {
@@ -2277,9 +2293,7 @@ impl ReplayController {
         }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-        let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
-            .map_err(|error| error.to_string())?;
+        let device = Self::select_hsa_gpu(&runtime, device_pci_bus_id)?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
@@ -2360,8 +2374,9 @@ impl ReplayController {
                 Ok(value) => matches!(value.as_str(), "1" | "true" | "on"),
                 Err(_) => {
                     device.name().eq_ignore_ascii_case("gfx1151")
-                        && std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref()
-                            == Ok("1")
+                        && (self.certified_mq4r_model_default
+                            || std::env::var("HIPFIRE_GFX1151_RADIOWAVE_FUSIONS").as_deref()
+                                == Ok("1"))
                 }
             };
         let mut wait_audit = Pm4WaitAudit::default();
@@ -3206,6 +3221,13 @@ mod tests {
             pointer_effects(lm_head_dot2).map(|effects| effects.len()),
             Some(3)
         );
+        let lm_head_aosoa4 = "gemv_hfq4g256_lm_head_aosoa4_scalar_gfx1151";
+        assert_eq!(expected_kernarg_bytes(lm_head_aosoa4), Some(32));
+        assert_eq!(
+            pointer_effects(lm_head_aosoa4).map(|effects| effects.len()),
+            Some(3)
+        );
+        assert!(radiowave_vmem_only_consumer(lm_head_aosoa4));
     }
 
     #[test]
@@ -3850,6 +3872,7 @@ mod tests {
         assert_eq!(controller.request(), ReplayBackendRequest::Auto);
         assert_eq!(controller.state(), ReplayState::Armed);
         assert_eq!(controller.transport_name(), "pm4");
+        assert!(controller.certified_mq4r_model_default);
         assert!(controller.recorded_launches().is_empty());
         assert_eq!(controller.fallback_reason(), None);
         controller.begin_auto_capture_if_armed().unwrap();
@@ -3859,6 +3882,7 @@ mod tests {
         assert_eq!(controller.request(), ReplayBackendRequest::Hip);
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
+        assert!(!controller.certified_mq4r_model_default);
         assert!(!controller.is_enabled());
     }
 
