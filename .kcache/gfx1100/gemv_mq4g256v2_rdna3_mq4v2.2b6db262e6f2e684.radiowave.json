@@ -1,0 +1,98 @@
+{
+  "schema_version": 4,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1788825577,
+  "source": "/home/kaden/hipfire-vcn/.kcache/gfx1100/gemv_mq4g256v2_rdna3_mq4v2.2b6db262e6f2e684.hip",
+  "output": "/home/kaden/hipfire-vcn/.kcache/gfx1100/gemv_mq4g256v2_rdna3_mq4v2.2b6db262e6f2e684.hsaco",
+  "arch": "gfx1100",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.15.26333-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.0/lib/llvm/bin",
+  "command": [
+    "/opt/rocm/core/bin/hipcc",
+    "hipfire-kernel-cache",
+    "gemv_mq4g256v2_rdna3_mq4v2"
+  ],
+  "source_sha256": "f32804d24b5213d4b5135cfeacb0cc46b73d05fb1e9f4f5f6df283b4a027dc8d",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "6510928920c27926f627d8ae2c20e82dde80077001457be5b3972014667fd30c",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1100",
+    "identity": {
+      "architecture": "gfx1100",
+      "elf_machine_id": 65,
+      "isa": {
+        "major": 11,
+        "minor": 0,
+        "stepping": 0
+      }
+    },
+    "kernels": [
+      {
+        "name": "gemv_mq4g256v2",
+        "wavefront_size": 32,
+        "vgpr_count": 76,
+        "sgpr_count": 24,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 461,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 21,
+          "global_stores": 1,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 10,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 7,
+          "wait_instructions": 81,
+          "delay_alu_instructions": 54,
+          "memory_clause_instructions": 7,
+          "max_consecutive_vmem_instructions": 8
+        }
+      }
+    ]
+  }
+}
