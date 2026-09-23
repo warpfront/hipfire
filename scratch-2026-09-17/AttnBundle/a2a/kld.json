@@ -1,0 +1,12 @@
+{
+  "variant": "A2a rcp + one Newton iteration",
+  "max_chunks": 24,
+  "pin_kld": 0.063890,
+  "allowed_regression": 0.000500,
+  "ceiling": 0.064390,
+  "measured_kld": 0.067222,
+  "delta_vs_pin": 0.003332,
+  "status": "KILL",
+  "output": "c24.bin",
+  "command": "HIPFIRE_GRAPH=0 HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_LLOYD_GFX12=1 HIPFIRE_HIPCC_EXTRA_FLAGS=-DHIPFIRE_FA2_PACKET_A2A_RCP=1 ./target/release/examples/eval_hipfire --model /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt --ref /home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin --kv-mode fp8 --kv-v q8 --scoring-mode prefill --max-chunks 24 --output scratch-2026-09-17/AttnBundle/a2a/c24.bin"
+}
