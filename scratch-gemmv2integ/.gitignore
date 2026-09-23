@@ -1,0 +1,10 @@
+# Runtime state and large binaries stay on hipx only.
+baseline-land042/
+*-home/
+home/
+bin/
+*.hsaco
+*.elf
+*.kldseq
+resource-probe
+trace/*/daemon*
