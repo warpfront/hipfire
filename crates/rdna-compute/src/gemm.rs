@@ -19883,6 +19883,77 @@ impl Gpu {
             }
             return result;
         }
+        // GEMM v2 V2B: exact gfx1151 only, on the X5 eligibility rule narrowed
+        // to M256/N256 tiles, and only when the 1-CTA/WGP grid fills at least
+        // two dispatch rounds ((M/256)*(N/256) >= CU count = 2x WGPs). On
+        // Halo every measured grid of >= 40 CTAs beat X5 (1.08-1.45x); grids
+        // of 4-12 and 24 CTAs (e.g. M1024 at N512) lost and keep X5.
+        // Same numerics as X5 bit-for-bit; reads the unchanged MQ4V2 /
+        // block_i4_128 layouts. `HIPFIRE_IU4_V2B=0` falls back to X5.
+        if symfold
+            && full
+            && use_col
+            && m > 0
+            && k > 0
+            && batch_size > 0
+            && m % 256 == 0
+            && batch_size % 256 == 0
+            && self.arch.as_str() == "gfx1151"
+            && (m / 256) * (batch_size / 256) >= self.cu_count_or_default()
+            && hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0")
+        {
+            let kernel_name = if add {
+                "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11"
+            } else {
+                "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11"
+            };
+            self.ensure_kernel(
+                "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC,
+                kernel_name,
+            )?;
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut xq_ptr = x_i4_ptr;
+            let mut y_ptr = y.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut n_val = batch_size as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut xq_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+            // Two 32 KiB K128 slots (16 KiB W + 16 KiB X payload); scales
+            // bypass LDS. Must equal the kernel's LDS_BYTES.
+            const V2B_LDS_BYTES: u32 = 65536;
+            let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+            // Token tile on x, row tile on y.
+            let result = self.launch_maybe_blob(
+                kernel_name,
+                [(batch_size / 256) as u32, (m / 256) as u32, 1],
+                [32, 16, 1],
+                V2B_LDS_BYTES,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(xq_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         let base_kernel_name = match (full || gridspec, add, use_col) {
             (true, true, true) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151"
