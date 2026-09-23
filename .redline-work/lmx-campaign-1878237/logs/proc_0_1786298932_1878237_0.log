@@ -1,0 +1,26 @@
+pm4: preflighting retained replay before benchmark warmup...
+pm4: preflight passed (344 dispatches, 13.99s)
+coherence: HIP CLI/serve Flagstaff smoke...
+HIP coherence smoke failed before benchmark warmup: hip coherence smoke failed: answer missing expected substring 'Paris is the capital of France.' (case-insensitive)
+   mtp_mode: off   mode: battery
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : 1   prompt_source: /home/kaden/hipfire-lmx-qwen/.redline-work/lmx-campaign-1878237/proc_0_1786298932_1878237_0/product-hip-coherence-1878250-lv585lx0-cf9324cc/prompts.json
+  thinking_budget: off -> thinking DISABLED (sentinel cap 1)
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 1024  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.5-0.8b.registry.mq4|off|battery  kv=q8 sampling={'temperature': 0.0} seed=1 ###
+  [custom]t1  finish=stop   ctx=25     cached=0      gen=8    (think 0/ans 6w) prefill=2323.4ms/10.8tok/s decode=9.2tok/s tau=None | 'The capital of France is Paris.'
+[qwen3.5-0.8b.registry.mq4|off|battery DONE] turns=1 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=10.8tok/s avg_decode=9.2tok/s
+

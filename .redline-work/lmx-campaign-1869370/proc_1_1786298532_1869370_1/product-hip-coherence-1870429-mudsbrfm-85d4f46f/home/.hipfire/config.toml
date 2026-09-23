@@ -1,0 +1,26 @@
+[serve]
+host = "127.0.0.1"
+port = 60729
+default_model = "/home/kaden/.hipfire/models/qwen3.5-0.8b.registry.mq4"
+
+[hardware]
+deepseek4_compute_placement = "single"
+
+[memory]
+max_seq = 2048
+kv_cache = "q8"
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[generation]
+max_tokens = 1024
+
+[reasoning]
+budget = "off"
+
+[diagnostic.replay]
+route_proof_log = true

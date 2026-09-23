@@ -1,0 +1,1 @@
+FATAL: hipfire daemon already running (PID 1878251). Run `kill 1878251` and retry.

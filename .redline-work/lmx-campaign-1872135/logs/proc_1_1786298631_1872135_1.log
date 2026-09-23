@@ -1,0 +1,16 @@
+pm4: preflighting retained replay before benchmark warmup...
+pm4: preflight passed (338 dispatches, 0.68s)
+coherence: HIP CLI/serve Flagstaff smoke...
+coherence: HIP passed (5.14s)
+coherence: auto CLI/serve Flagstaff smoke...
+coherence: auto passed (5.15s)
+hip: warming caches... took 0.81s
+hip: stationary after 20 full-tg rows (4.28s, median=504.904, slope=+0.0011%/row, spread=0.171%)
+hip: measured median=502.747 tok/s valid=False
+hip: timed route proof valid=True retained_rows=0 positions=[] lifecycle_valid=True
+auto: warming caches... took 0.76s
+auto: stationary after 84 full-tg rows (16.57s, median=551.486, slope=-0.0402%/row, spread=0.449%)
+auto: measured median=550.192 tok/s valid=True
+auto: timed route proof valid=True retained_rows=5 positions=[128, 227] lifecycle_valid=True
+benchmark samples or route proof are invalid
+hip=502.747 tok/s auto=550.192 tok/s speedup=1.09437 valid=False report=/home/kaden/hipfire-lmx-qwen/.redline-work/lmx-campaign-1872135/proc_1_1786298631_1872135_1/product_bench.json
