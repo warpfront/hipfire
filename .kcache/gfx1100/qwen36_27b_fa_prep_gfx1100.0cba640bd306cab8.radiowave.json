@@ -1,0 +1,126 @@
+{
+  "schema_version": 4,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1788823031,
+  "source": "/home/kaden/hipfire-ab-fdb750d6d3138269523ec1094fb189b465f1438c/.kcache/gfx1100/qwen36_27b_fa_prep_gfx1100.0cba640bd306cab8.hip",
+  "output": "/home/kaden/hipfire-ab-fdb750d6d3138269523ec1094fb189b465f1438c/.kcache/gfx1100/qwen36_27b_fa_prep_gfx1100.0cba640bd306cab8.hsaco",
+  "arch": "gfx1100",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.15.26333-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.0/lib/llvm/bin",
+  "command": [
+    "/opt/rocm/core/bin/hipcc",
+    "hipfire-kernel-cache",
+    "qwen36_27b_fa_prep_gfx1100"
+  ],
+  "source_sha256": "d4ff57f7f3f4e8d4de23a2ff0ebf4834b504bc178a89212284d7dab57bfa7e97",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "4253fc5e8237ba9836e34989d4b9d50031e93a1b3c237269c21200c38a9cc8ee",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1100",
+    "identity": {
+      "architecture": "gfx1100",
+      "elf_machine_id": 65,
+      "isa": {
+        "major": 11,
+        "minor": 0,
+        "stepping": 0
+      }
+    },
+    "kernels": [
+      {
+        "name": "qwen36_27b_fa_prep_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 27,
+        "sgpr_count": 26,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 694,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 4,
+          "global_stores": 4,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 4,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 1,
+          "wait_instructions": 174,
+          "delay_alu_instructions": 142,
+          "memory_clause_instructions": 3,
+          "max_consecutive_vmem_instructions": 2
+        }
+      }
+    ]
+  }
+}
