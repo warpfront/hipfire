@@ -1,0 +1,105 @@
+{
+  "schema_version": 4,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1790019003,
+  "source": "/home/kaden/ClaudeCode/warpfront/wt-a4fine/scratch-a4fine/cache-pristine/gfx1201/gdn_chunk_kkt_solve.7c7466ad65dd0f74.hip",
+  "output": "/home/kaden/ClaudeCode/warpfront/wt-a4fine/scratch-a4fine/cache-pristine/gfx1201/gdn_chunk_kkt_solve.7c7466ad65dd0f74.hsaco",
+  "arch": "gfx1201",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/bin/hipcc",
+  "hipcc_version": "HIP version: 7.15.26333-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.0/lib/llvm/bin",
+  "command": [
+    "/opt/rocm/bin/hipcc",
+    "hipfire-kernel-cache",
+    "gdn_chunk_kkt_solve"
+  ],
+  "source_sha256": "72c24eb01fb36d5e71be38978c322dc41a688e8ec8504fdf14afd7611661fd46",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "971c612da2481d69e1a90ac6835a87b31595109253e6b31b37064a0413eb1ac4",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "identity": {
+      "architecture": "gfx1201",
+      "elf_machine_id": 78,
+      "isa": {
+        "major": 12,
+        "minor": 0,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "gdn_chunk_kkt_solve",
+        "wavefront_size": 32,
+        "vgpr_count": 101,
+        "sgpr_count": 27,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 5588,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 102,
+          "global_stores": 9,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 2,
+          "kernarg_scalar_loads": 2,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 1407,
+          "delay_alu_instructions": 599,
+          "memory_clause_instructions": 5,
+          "max_consecutive_vmem_instructions": 32
+        }
+      }
+    ]
+  }
+}

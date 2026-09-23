@@ -1,0 +1,147 @@
+{
+  "schema_version": 4,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1790019004,
+  "source": "/home/kaden/ClaudeCode/warpfront/wt-a4fine/scratch-a4fine/cache-pristine/gfx1201/gdn_chunk_scan.9f41e2f54d5adc11.hip",
+  "output": "/home/kaden/ClaudeCode/warpfront/wt-a4fine/scratch-a4fine/cache-pristine/gfx1201/gdn_chunk_scan.9f41e2f54d5adc11.hsaco",
+  "arch": "gfx1201",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/bin/hipcc",
+  "hipcc_version": "HIP version: 7.15.26333-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.0/lib/llvm/bin",
+  "command": [
+    "/opt/rocm/bin/hipcc",
+    "hipfire-kernel-cache",
+    "gdn_chunk_scan"
+  ],
+  "source_sha256": "6b5fd5ee2c3b45aea6e5c6535e0e4f9cb46494f6b2fa0698749c4a944dd31e1d",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "4b328a6005413fe935fb20b849bcb27dd2bb059de07b2975c83fb46263bd8dde",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "identity": {
+      "architecture": "gfx1201",
+      "elf_machine_id": 78,
+      "isa": {
+        "major": 12,
+        "minor": 0,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "gdn_chunk_scan",
+        "wavefront_size": 32,
+        "vgpr_count": 190,
+        "sgpr_count": 58,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 80,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 84,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 2678,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 91,
+          "global_stores": 15,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 4,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 1,
+          "wait_instructions": 561,
+          "delay_alu_instructions": 225,
+          "memory_clause_instructions": 42,
+          "max_consecutive_vmem_instructions": 5
+        }
+      }
+    ]
+  }
+}
