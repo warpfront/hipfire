@@ -1084,6 +1084,37 @@ struct DdtreeState {
     path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+/// Expert-parallel serving state (task #26 — see docs/plans/daemon-ep-wiring.md).
+/// Present only when the load message requested `tp > 1`. Mirrors the PP path
+/// (`pp_gpus`) but routes the forward through `forward_ep` (replicated attention
+/// + sharded experts + all-reduce) instead of pipeline layer-split. When
+/// `Some`, the single-GPU arch fields stay `None` and generate routes through
+/// `generate_ep`.
+#[allow(dead_code)] // gpus/inner consumed by load_model_ep + generate_ep (next increment)
+struct EpState {
+    gpus: Gpus,
+    inner: EpArch,
+}
+
+/// Per-arch EP rank state. One `Vec` entry per rank (rank r owns experts
+/// `e % tp == r`). Add `Qwen35`/`Minimax` variants with their increments.
+#[allow(dead_code)] // populated by load_model_ep (next increment)
+enum EpArch {
+    Ds4 {
+        config: hipfire_arch_deepseek4::DeepseekV4Config,
+        weights: Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
+        state: Vec<hipfire_arch_deepseek4::DeepseekV4State>,
+        /// Per-rank `[hidden]` F32 all-reduce partial.
+        partials: Vec<rdna_compute::GpuTensor>,
+    },
+    Minimax {
+        config: minimax::MiniMaxConfig,
+        weights: Vec<minimax::MiniMaxWeights>,
+        state: Vec<minimax::MiniMaxState>,
+        partials: Vec<rdna_compute::GpuTensor>,
+    },
+}
+
 struct LoadedModel {
     arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
@@ -1102,6 +1133,11 @@ struct LoadedModel {
     /// kept so `unload_model` and the reset handler can route per-layer
     /// memsets to the correct device.
     pp_dn_la_to_device: Option<Vec<u8>>,
+    /// Expert-parallel serving (task #26). `Some` only when the load message
+    /// requested `tp > 1`. When `Some`, the single-GPU arch fields stay `None`
+    /// and generate routes through `generate_ep`. See docs/plans/daemon-ep-wiring.md.
+    #[allow(dead_code)] // consumed by load_model_ep + generate_ep (next increment)
+    ep: Option<EpState>,
     // Qwen3.5 state
     q35_config: Option<qwen35::Qwen35Config>,
     q35_weights: Option<qwen35::Qwen35Weights>,
@@ -1801,6 +1837,30 @@ fn main() {
                     .and_then(|p| p.get("pp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
+                // Expert-parallel degree (EP, task #26). tp>1 shards routed
+                // experts across ranks via load_model_ep. Mutually exclusive
+                // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
+                let tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                if tp > 1 && pp > 1 {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"tp (expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if tp > 1 && draft_path.is_some() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"EP serving (tp>1) does not support DFlash drafters in v1; reload without a draft."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if pp > 1 {
                     if draft_path.is_some()
                         && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
@@ -1839,17 +1899,22 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                match load_model(
-                    path,
-                    max_seq,
-                    draft_path.as_deref(),
-                    kv_mode_override.as_deref(),
-                    kv_adaptive_override.as_deref(),
-                    state_quant_override.as_deref(),
-                    &cask,
-                    pp,
-                    &mut gpu,
-                ) {
+                let loaded = if tp > 1 {
+                    load_model_ep(path, max_seq, tp)
+                } else {
+                    load_model(
+                        path,
+                        max_seq,
+                        draft_path.as_deref(),
+                        kv_mode_override.as_deref(),
+                        kv_adaptive_override.as_deref(),
+                        state_quant_override.as_deref(),
+                        &cask,
+                        pp,
+                        &mut gpu,
+                    )
+                };
+                match loaded {
                     Ok(mut m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -3422,6 +3487,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3506,6 +3572,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3611,6 +3678,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3709,6 +3777,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -3822,6 +3891,7 @@ fn load_model(
         return Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4281,6 +4351,7 @@ fn load_model(
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4355,6 +4426,7 @@ fn load_model(
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4515,6 +4587,7 @@ fn load_model_safetensors(
         return Ok(LoadedModel {
             arch_id,
             pp: 1,
+            ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -4657,6 +4730,7 @@ fn load_model_safetensors(
     Ok(LoadedModel {
         arch_id,
         pp: 1,
+        ep: None,
         pp_gpus: None,
         pp_scratch_set: None,
         pp_dn_la_to_device: None,
@@ -4898,6 +4972,7 @@ fn load_model_pp(
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
         pp,
+        ep: None,
         pp_gpus: Some(gpus),
         pp_scratch_set: Some(scratch_set),
         pp_dn_la_to_device: Some(la_to_device),
@@ -5015,6 +5090,425 @@ fn screen_weights_qwen35(
     }
 
     (n_safe, n_unsafe)
+}
+
+/// Expert-parallel (EP) model load — shards the routed experts across `tp`
+/// ranks (`Gpus::init_tp` + `DeepseekV4::load_weights_sharded`). ds4-first
+/// (task #26; docs/plans/daemon-ep-wiring.md). The single-GPU arch fields stay
+/// `None`; the model serves through `generate_ep`. DFlash/CASK/PFlash/VL
+/// refusals are enforced upstream in the "load" handler before we get here.
+#[allow(dead_code)] // wired by the load_model `tp > 1` dispatch (next increment)
+fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let arch_id = hfq.arch_id;
+    if arch_id == 10 {
+        return load_model_ep_minimax(path, max_seq, tp);
+    }
+    if arch_id != 9 {
+        return Err(format!(
+            "EP serving (tp={tp}) supports DeepSeek-V4 (9) and MiniMax-M2 (10); got arch_id {arch_id}"
+        ));
+    }
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    let n_exp = config.n_routed_experts;
+
+    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let n = gpus.devices.len();
+    if n != tp {
+        return Err(format!(
+            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    eprintln!("[daemon] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
+    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let mut weights = Vec::with_capacity(n);
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+        let w = deepseek4::DeepseekV4::load_weights_sharded(&mut h, &config, &mut gpus.devices[r], &shard, r)
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        weights.push(w);
+    }
+    let mut state = Vec::with_capacity(n);
+    let mut partials = Vec::with_capacity(n);
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        state.push(deepseek4::DeepseekV4State::new(&config).map_err(|e| format!("state {r}: {e:?}"))?);
+        partials.push(
+            gpus.devices[r]
+                .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+                .map_err(|e| format!("partial {r}: {e:?}"))?,
+        );
+    }
+    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
+
+    let eos_tok: u32 = {
+        let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
+        if ids.len() == 1 { ids[0] } else { 1 }
+    };
+    let chat_template = resolve_chat_template(&hfq, path);
+
+    Ok(LoadedModel {
+        arch_id,
+        pp: 1,
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Ds4 { config, weights, state, partials },
+        }),
+        pp_gpus: None,
+        pp_scratch_set: None,
+        pp_dn_la_to_device: None,
+        q35_config: None,
+        q35_weights: None,
+        q35_scratch: None,
+        kv_cache: None,
+        dn_state: None,
+        llama_config: None,
+        llama_weights: None,
+        llama_scratch: None,
+        llama_kv: None,
+        qwen2_config: None,
+        qwen2_weights: None,
+        qwen2_state: None,
+        deepseek4_config: None,
+        deepseek4_weights: None,
+        deepseek4_state: None,
+        deepseek4_pbs: None,
+        deepseek4_eos_tok: eos_tok,
+        lfm2moe_config: None,
+        lfm2moe_weights: None,
+        lfm2moe_state: None,
+        lfm2moe_eos_tok: 0,
+        minimax_config: None,
+        minimax_weights: None,
+        minimax_state: None,
+        minimax_eos_tok: 0,
+        mtp_mode: "auto".to_string(),
+        mtp_k: 3,
+        mtp_weights_present: false,
+        dots_ocr_config: None,
+        dots_ocr_weights: None,
+        vision_config: None,
+        vision_weights: None,
+        tokenizer: Some(tokenizer),
+        seq_pos: 0,
+        max_seq,
+        physical_cap: max_seq,
+        eviction: None,
+        kv_adaptive: None,
+        conversation_tokens: Vec::new(),
+        asst_turn_cache: AsstTurnCache::new_from_env(),
+        prefill_checkpoints: Vec::new(),
+        dflash_checkpoints: Vec::new(),
+        decoded_vocab: None,
+        model_path: path.to_string(),
+        dflash: None,
+        chat_template,
+    })
+}
+
+/// MiniMax-M2 EP load (arch_id 10) — mirrors `load_model_ep` (ds4) with the
+/// MiniMax types: `MiniMaxConfig::from_hfq`, `n_exp = num_local_experts`,
+/// per-rank `MiniMaxWeights::load(.., Some((&shard,r)))`, `MiniMaxState::
+/// new_with_max_seq`. See docs/plans/daemon-ep-wiring.md.
+fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
+    let n_exp = config.num_local_experts;
+
+    let mut gpus = Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let n = gpus.devices.len();
+    if n != tp {
+        return Err(format!(
+            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    eprintln!("[daemon] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
+    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, n_exp, ExpertAssign::Stride)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let mut weights = Vec::with_capacity(n);
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+        let w = minimax::MiniMaxWeights::load(&mut h, &config, &mut gpus.devices[r], Some((&shard, r)))
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        weights.push(w);
+    }
+    let mut state = Vec::with_capacity(n);
+    let mut partials = Vec::with_capacity(n);
+    for r in 0..n {
+        gpus.devices[r].bind_thread().map_err(|e| format!("bind {r}: {e:?}"))?;
+        state.push(
+            minimax::MiniMaxState::new_with_max_seq(&mut gpus.devices[r], &config, max_seq)
+                .map_err(|e| format!("state {r}: {e:?}"))?,
+        );
+        partials.push(
+            gpus.devices[r]
+                .zeros(&[config.hidden_size], rdna_compute::DType::F32)
+                .map_err(|e| format!("partial {r}: {e:?}"))?,
+        );
+    }
+    let peer = gpus.enable_peer_all().map_err(|e| format!("enable_peer_all: {e:?}"))?;
+    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    eprintln!("[daemon] EP load complete: {n} ranks, peer_access={peer}");
+
+    let eos_tok: u32 = {
+        let try_one = |s: &str| -> Option<u32> {
+            let ids = tokenizer.encode(s);
+            if ids.len() == 1 { Some(ids[0]) } else { None }
+        };
+        try_one("[e~[")
+            .or_else(|| try_one("<|im_end|>"))
+            .or_else(|| try_one("</s>"))
+            .or_else(|| try_one("<|endoftext|>"))
+            .unwrap_or(1)
+    };
+    let chat_template = resolve_chat_template(&hfq, path);
+
+    Ok(LoadedModel {
+        arch_id: hfq.arch_id,
+        pp: 1,
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Minimax { config, weights, state, partials },
+        }),
+        pp_gpus: None,
+        pp_scratch_set: None,
+        pp_dn_la_to_device: None,
+        q35_config: None,
+        q35_weights: None,
+        q35_scratch: None,
+        kv_cache: None,
+        dn_state: None,
+        llama_config: None,
+        llama_weights: None,
+        llama_scratch: None,
+        llama_kv: None,
+        qwen2_config: None,
+        qwen2_weights: None,
+        qwen2_state: None,
+        deepseek4_config: None,
+        deepseek4_weights: None,
+        deepseek4_state: None,
+        deepseek4_pbs: None,
+        deepseek4_eos_tok: 0,
+        lfm2moe_config: None,
+        lfm2moe_weights: None,
+        lfm2moe_state: None,
+        lfm2moe_eos_tok: 0,
+        minimax_config: None,
+        minimax_weights: None,
+        minimax_state: None,
+        minimax_eos_tok: eos_tok,
+        mtp_mode: "auto".to_string(),
+        mtp_k: 3,
+        mtp_weights_present: false,
+        dots_ocr_config: None,
+        dots_ocr_weights: None,
+        vision_config: None,
+        vision_weights: None,
+        tokenizer: Some(tokenizer),
+        seq_pos: 0,
+        max_seq,
+        physical_cap: max_seq,
+        eviction: None,
+        kv_adaptive: None,
+        conversation_tokens: Vec::new(),
+        asst_turn_cache: AsstTurnCache::new_from_env(),
+        prefill_checkpoints: Vec::new(),
+        dflash_checkpoints: Vec::new(),
+        decoded_vocab: None,
+        model_path: path.to_string(),
+        dflash: None,
+        chat_template,
+    })
+}
+
+/// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
+/// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
+/// the host. v1: greedy + basic token streaming (no grammar / tool-calls /
+/// think-budget — absent on the EP path). The DeepSeek chat template
+/// (`<｜User｜>…<｜Assistant｜>`) is applied here; the daemon's full prompt-frame
+/// (multi-turn, messages_history) is a follow-up. See docs/plans/daemon-ep-wiring.md.
+fn generate_ep(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    stop: &[String],
+) {
+    // ── Generic prompt render via the arch's chat_template (ds4/minimax/qwen35) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        if let Some(template) = m.chat_template.as_ref() {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            match frame.render() {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP jinja render: {}"}}"#, id, format!("{e}").replace('"', "'"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        } else {
+            // No embedded template — minimal ds4-style fallback.
+            let mut ids = Vec::new();
+            if let Some(b) = tokenizer.special_token_id("<｜begin▁of▁sentence｜>") { ids.push(b); }
+            ids.extend(tokenizer.encode(&format!("<｜User｜>{prompt}<｜Assistant｜>")));
+            ids
+        }
+    };
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP: empty prompt after render"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+    let eos_tok = if m.arch_id == 10 { m.minimax_eos_tok } else { m.deepseek4_eos_tok };
+    match m.arch_id {
+        10 => ep_serve_minimax(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop),
+        _ => ep_serve_ds4(m, stdout, id, &prompt_ids, eos_tok, max_tokens, stop),
+    }
+}
+
+/// Stream a token JSON event; returns true if a stop sequence is now satisfied.
+fn ep_emit_token(stdout: &mut std::io::Stdout, id: &str, piece: &str, text_acc: &mut String, stop: &[String]) -> bool {
+    text_acc.push_str(piece);
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"token","id":"{}","text":{}}}"#,
+        id,
+        serde_json::to_string(piece).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    let _ = stdout.flush();
+    stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
+}
+
+fn ep_emit_done(stdout: &mut std::io::Stdout, id: &str, generated: usize, prompt_n: usize, prefill_ms: f64, decode_ms: f64) {
+    let decode_tok_s = if decode_ms > 0.0 { generated as f64 / (decode_ms / 1000.0) } else { 0.0 };
+    let prefill_tok_s = if prefill_ms > 0.0 { prompt_n as f64 / (prefill_ms / 1000.0) } else { 0.0 };
+    eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated, decode_tok_s, prompt_n, prefill_ms, prefill_tok_s, decode_tok_s, prefill_ms
+    );
+    let _ = stdout.flush();
+}
+
+/// ds4 EP prefill + greedy decode.
+fn ep_serve_ds4(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String]) {
+    use std::time::Instant;
+    let prompt_n = prompt_ids.len();
+    let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+    let EpArch::Ds4 { config, weights, state, partials } = inner else {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected ds4)"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    };
+    let t_prefill = Instant::now();
+    for (pos, &t) in prompt_ids.iter().enumerate() {
+        if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+            let _ = stdout.flush();
+            return;
+        }
+    }
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let _ = gpus.devices[0].bind_thread();
+    let mut logits = match state[0].logits.as_ref() {
+        Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(),
+        None => { let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP logits unset after prefill"}}"#, id); return; }
+    };
+    let t_decode = Instant::now();
+    let mut generated = 0usize;
+    let mut pos = prompt_n;
+    let mut text_acc = String::new();
+    while generated < max_tokens {
+        let mut next = 0u32;
+        let mut best = f32::NEG_INFINITY;
+        for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
+        if next == eos_tok { break; }
+        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        generated += 1;
+        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) { break; }
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Ds4 { config, weights, state, partials } = inner else { break; };
+        if let Err(e) = deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32) {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#, id, format!("{e}").replace('"', "'")); return;
+        }
+        pos += 1;
+        let _ = gpus.devices[0].bind_thread();
+        logits = match state[0].logits.as_ref() { Some(l) => gpus.devices[0].download_f32(l).unwrap_or_default(), None => break };
+    }
+    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// MiniMax-M2 EP prefill + greedy decode (mirror of ep_serve_ds4, MiniMax types).
+fn ep_serve_minimax(m: &mut LoadedModel, stdout: &mut std::io::Stdout, id: &str, prompt_ids: &[u32], eos_tok: u32, max_tokens: usize, stop: &[String]) {
+    use std::time::Instant;
+    let prompt_n = prompt_ids.len();
+    let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+    let EpArch::Minimax { config, weights, state, partials } = inner else {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"EP arch mismatch (expected minimax)"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    };
+    let t_prefill = Instant::now();
+    for (pos, &t) in prompt_ids.iter().enumerate() {
+        if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32) {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#, id, format!("{e}").replace('"', "'"));
+            let _ = stdout.flush();
+            return;
+        }
+    }
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let _ = gpus.devices[0].bind_thread();
+    let mut logits = gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default();
+    let t_decode = Instant::now();
+    let mut generated = 0usize;
+    let mut pos = prompt_n;
+    let mut text_acc = String::new();
+    while generated < max_tokens {
+        let mut next = 0u32;
+        let mut best = f32::NEG_INFINITY;
+        for (i, &x) in logits.iter().enumerate() { if x > best { best = x; next = i as u32; } }
+        if next == eos_tok { break; }
+        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        generated += 1;
+        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) { break; }
+        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
+        let EpArch::Minimax { config, weights, state, partials } = inner else { break; };
+        if let Err(e) = minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32) {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#, id, format!("{e}").replace('"', "'")); return;
+        }
+        pos += 1;
+        let _ = gpus.devices[0].bind_thread();
+        logits = gpus.devices[0].download_f32(&state[0].logits).unwrap_or_default();
+    }
+    ep_emit_done(stdout, id, generated, prompt_n, prefill_ms, t_decode.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
@@ -7635,6 +8129,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // Expert-parallel (task #26): route to generate_ep BEFORE any arch
+    // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
+    // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
+    // would unwrap-panic / error on the missing config.
+    if m.ep.is_some() {
+        generate_ep(m, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, stop);
+        return;
+    }
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -7772,6 +8274,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
         return;
     }
+    // Expert-parallel dispatch (task #26). ep.is_some() → generate_ep (AR via
+    // forward_ep, full sampler on rank-0 logits). Refusals enforced at load.
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
