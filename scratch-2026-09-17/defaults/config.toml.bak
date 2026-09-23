@@ -1,0 +1,24 @@
+[serve]
+host = "127.0.0.1"
+port = 11533
+default_model = "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt"
+
+[hardware]
+deepseek4_compute_placement = "single"
+
+[memory]
+max_seq = 262144
+kv_cache = "q8"
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[generation]
+max_tokens = 256
+
+[reasoning]
+budget = "off"
+effort = "xhigh"

@@ -1,0 +1,117 @@
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 16840,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "redline_pm4": false,
+  "kv_mode": "q8",
+  "runs": 3,
+  "prefill": [
+    {
+      "tokens": 512,
+      "stats": {
+        "median": 1806.2,
+        "mean": 1802.7333333333336,
+        "min": 1794.9,
+        "max": 1807.1,
+        "stdev": 5.551176051572758
+      },
+      "samples": [
+        1794.9,
+        1807.1,
+        1806.2
+      ]
+    },
+    {
+      "tokens": 2048,
+      "stats": {
+        "median": 1806.5,
+        "mean": 1805.8999999999999,
+        "min": 1803.4,
+        "max": 1807.8,
+        "stdev": 1.8457157599875604
+      },
+      "samples": [
+        1803.4,
+        1806.5,
+        1807.8
+      ]
+    },
+    {
+      "tokens": 8192,
+      "stats": {
+        "median": 1652.2,
+        "mean": 1652.4333333333334,
+        "min": 1651.6,
+        "max": 1653.5,
+        "stdev": 0.7930251502247153
+      },
+      "samples": [
+        1651.6,
+        1652.2,
+        1653.5
+      ]
+    },
+    {
+      "tokens": 32768,
+      "stats": {
+        "median": 1214.6,
+        "mean": 1210.4333333333334,
+        "min": 1201.7,
+        "max": 1215.0,
+        "stdev": 6.177557949725903
+      },
+      "samples": [
+        1201.7,
+        1214.6,
+        1215.0
+      ]
+    }
+  ],
+  "decode": [
+    {
+      "context": 128,
+      "tokens": 64,
+      "stats": {
+        "median": 36.50553720323332,
+        "mean": 36.50549000558218,
+        "min": 36.50361057839636,
+        "max": 36.50732223511688,
+        "stdev": 0.0015156449928325094
+      },
+      "samples": [
+        36.50732223511688,
+        36.50553720323332,
+        36.50361057839636
+      ]
+    }
+  ],
+  "sustained": []
+}

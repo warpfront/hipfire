@@ -1,0 +1,3 @@
+6ee57b32585cc47ab781ec41ceb51279  target/release/hipfire
+dacce8db81c33430bdcc785267a69e62  target/release/daemon
+0552078a50b9e6ae9d896171e9ffb690  target/release/examples/eval_hipfire
