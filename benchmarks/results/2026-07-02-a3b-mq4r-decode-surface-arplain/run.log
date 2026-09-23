@@ -1,0 +1,56 @@
+=== bun resolve ===
+/home/kaden/.bun/bin/bun
+=== step 1: force DPM high on all cards (should already be high) ===
+/sys/class/drm/card0/device: high
+/sys/class/drm/card1/device: high
+/sys/class/drm/card2/device: high
+/sys/class/drm/card3/device: high
+=== step 2: throwaway warmup decode (32 tok, --spec off) ===
+Thu Jul  2 12:01:34 PM UTC 2026
+warmup exit=0
+[hipfire] DFlash disabled (dflash_mode=off).
+native-manifest gfx1201: expected scalar fallback: gate_up, down, qkvza
+[32 tok, 5.6 tok/s]
+Thu Jul  2 12:01:49 PM UTC 2026
+=== step 3: measured rocprof-wrapped decode (200 tok, --spec off) ===
+Thu Jul  2 12:01:49 PM UTC 2026
+measured exit=124
+[hipfire] DFlash disabled (dflash_mode=off).
+native-manifest gfx1201: expected scalar fallback: gate_up, down, qkvza
+[200 tok, 24 tok/s]
+Thu Jul  2 12:03:49 PM UTC 2026
+=== step 4: reap any lingering daemon/rocprofv3 for THIS run ===
+=== step 5: csv check ===
+total 8
+drwxrwxr-x 2 kaden kaden 4096 Jul  2 12:01 .
+drwxrwxr-x 3 kaden kaden 4096 Jul  2 12:01 ..
+wc: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface-arplain/rocprof/trace_kernel_stats.csv: No such file or directory
+DONE
+=== step 3 (retry): measured rocprof-wrapped decode (200 tok, --spec off), backgrounded ===
+Thu Jul  2 12:05:09 PM UTC 2026
+wrapper pid=36373
+completion marker seen at iter=15
+FOUND=1
+[hipfire] DFlash disabled (dflash_mode=off).
+native-manifest gfx1201: expected scalar fallback: gate_up, down, qkvza
+[200 tok, 23.9 tok/s]
+daemon_pid=36393
+csv check (post signal):
+total 23176
+drwxrwxr-x 2 kaden kaden     4096 Jul  2 12:05 .
+drwxrwxr-x 3 kaden kaden     4096 Jul  2 12:05 ..
+-rw-rw-r-- 1 kaden kaden     2111 Jul  2 12:05 trace_agent_info.csv
+-rw-rw-r-- 1 kaden kaden      163 Jul  2 12:05 trace_domain_stats.csv
+-rw-rw-r-- 1 kaden kaden     4073 Jul  2 12:05 trace_kernel_stats.csv
+-rw-rw-r-- 1 kaden kaden 23711346 Jul  2 12:05 trace_kernel_trace.csv
+=== final csv check ===
+total 23176
+drwxrwxr-x 2 kaden kaden     4096 Jul  2 12:05 .
+drwxrwxr-x 3 kaden kaden     4096 Jul  2 12:05 ..
+-rw-rw-r-- 1 kaden kaden     2111 Jul  2 12:05 trace_agent_info.csv
+-rw-rw-r-- 1 kaden kaden      163 Jul  2 12:05 trace_domain_stats.csv
+-rw-rw-r-- 1 kaden kaden     4073 Jul  2 12:05 trace_kernel_stats.csv
+-rw-rw-r-- 1 kaden kaden 23711346 Jul  2 12:05 trace_kernel_trace.csv
+50 /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface-arplain/rocprof/trace_kernel_stats.csv
+Thu Jul  2 12:05:29 PM UTC 2026
+DONE

@@ -1,0 +1,99 @@
+=== step 1: force DPM high on all cards ===
+/sys/class/drm/card0/device: high
+/sys/class/drm/card1/device: high
+/sys/class/drm/card2/device: high
+/sys/class/drm/card3/device: high
+=== step 2: throwaway warmup decode (32 tok) ===
+Thu Jul  2 11:45:28 AM UTC 2026
+warmup exit=127
+timeout: failed to execute process: No such file or directory (os error 2)
+Thu Jul  2 11:45:28 AM UTC 2026
+=== step 3: measured rocprof-wrapped decode (200 tok) ===
+Thu Jul  2 11:45:28 AM UTC 2026
+measured exit=1
+[rocprof-wrap] output dir: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof
+[rocprof-wrap] stats CSV:  /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_kernel_stats.csv
+[rocprof-wrap] command:    bun cli/index.ts run qwen3.6:35b-a3b-mq4r --kv-mode q8 -n 200 Explain the quicksort algorithm.
+Traceback (most recent call last):
+  File "/usr/bin/rocprofv3", line 1804, in <module>
+    ec = main(sys.argv[1:])
+  File "/usr/bin/rocprofv3", line 1785, in main
+    ec = run(app_args, args, pass_id=pass_idx)
+  File "/usr/bin/rocprofv3", line 1713, in run
+    os.execvpe(app_args[0], app_args, env=app_env)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 613, in execvpe
+  File "<frozen os>", line 646, in _execvpe
+  File "<frozen os>", line 637, in _execvpe
+FileNotFoundError: [Errno 2] No such file or directory: b'/snap/bin/bun'
+Thu Jul  2 11:45:29 AM UTC 2026
+=== step 4: csv check ===
+total 8
+drwxrwxr-x 2 kaden kaden 4096 Jul  2 11:45 .
+drwxrwxr-x 3 kaden kaden 4096 Jul  2 11:45 ..
+wc: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_kernel_stats.csv: No such file or directory
+DONE
+=== bun resolve ===
+/home/kaden/.bun/bin/bun
+1.3.13
+=== step 1: force DPM high on all cards ===
+/sys/class/drm/card0/device: high
+/sys/class/drm/card1/device: high
+/sys/class/drm/card2/device: high
+/sys/class/drm/card3/device: high
+=== step 2: throwaway warmup decode (32 tok) ===
+Thu Jul  2 11:46:12 AM UTC 2026
+warmup exit=0
+[qwen3_5_moe] 2048d 40L 248320 vocab
+native-manifest gfx1201: expected scalar fallback: gate_up, down, qkvza
+Here[verify-graph] warmup for B=16 complete — capture next cycle at this B
+'s a thinking process:
+
+1. [verify-graph] captured for B=16 with 1236 blobs (cache size: 1)
+ **Understand User Request**: The user wants an explanation of the quicksort algorithm. This is a classic computer
+[32 tok, 2 tok/s]
+Thu Jul  2 11:46:38 AM UTC 2026
+=== step 3: measured rocprof-wrapped decode (200 tok) ===
+Thu Jul  2 11:46:38 AM UTC 2026
+measured exit=124
+[200 tok, 25.1 tok/s]
+W20260702 11:46:51.386954 128967741174208 tool.cpp:3104] [PPID=33559][PID=33574][TID=33574][rocprofv3_error_signal_handler] rocprofv3 caught signal 15...
+W20260702 11:46:51.387000 128967741174208 tool.cpp:3127] [PPID=33559][PID=33574][TID=33574][rocprofv3_error_signal_handler] rocprofv3 will wait for 0 children to exit
+W20260702 11:46:51.387002 128967741174208 tool.cpp:3142] [PPID=33559][PID=33574][TID=33574][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 15...
+E20260702 11:46:51.403107 128967741174208 output_stream.cpp:111] Opened result file: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_kernel_stats.csv
+E20260702 11:46:51.403260 128967741174208 output_stream.cpp:111] Opened result file: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_kernel_trace.csv
+E20260702 11:46:51.563225 128967741174208 output_stream.cpp:111] Opened result file: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_agent_info.csv
+E20260702 11:46:51.563310 128967741174208 output_stream.cpp:111] Opened result file: /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_domain_stats.csv
+W20260702 11:46:51.564897 128967741174208 simple_timer.cpp:55] [rocprofv3] output generation ::     0.175370 sec
+W20260702 11:46:51.564948 128967741174208 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.175445 sec
+W20260702 11:46:51.565111 128967741174208 tool.cpp:3184] [PPID=33559][PID=33574][TID=33574][rocprofv3_error_signal_handler] rocprofv3 found chained signal handler for 15... executing chained sigaction (SIGINFO)
+W20260702 11:46:51.565129 128967741174208 tool.cpp:3104] [PPID=33559][PID=33574][TID=33574][rocprofv3_error_signal_handler] rocprofv3 caught signal 15...
+W20260702 11:56:38.801975 132682497300992 tool.cpp:3104] [PPID=33558][PID=33559][TID=33559][rocprofv3_error_signal_handler] rocprofv3 caught signal 15...
+W20260702 11:56:38.802050 132682497300992 tool.cpp:3127] [PPID=33558][PID=33559][TID=33559][rocprofv3_error_signal_handler] rocprofv3 will wait for 1 children to exit
+W20260702 11:56:38.902202 132682497300992 tool.cpp:3142] [PPID=33558][PID=33559][TID=33559][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 15...
+W20260702 11:56:38.902697 132682497300992 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000341 sec
+W20260702 11:56:38.902714 132682497300992 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000453 sec
+W20260702 11:56:38.902822 132682497300992 tool.cpp:3184] [PPID=33558][PID=33559][TID=33559][rocprofv3_error_signal_handler] rocprofv3 found chained signal handler for 15... executing chained sigaction (SIGINFO)
+*** Aborted at 1782993398 (unix time) try "date -d @1782993398" if you are using GNU date ***
+PC: @          0x3c727da (unknown)
+*** SIGTERM (@0x3e800008316) received by PID 33559 (TID 0x78ac8d1e9a00) from PID 33558; stack trace: ***
+    @     0x78ac96ea97f4 (unknown)
+    @     0x78ac96ea9869 pthread_once
+    @     0x78ac9800aa20 (unknown)
+    @     0x78ac97c90f04 (unknown)
+    @     0x78ac96ea97f4 (unknown)
+    @     0x78ac96ea9869 pthread_once
+    @     0x78ac97c8a018 (unknown)
+    @     0x78ac96e45cb0 (unknown)
+    @          0x3c727da (unknown)
+Thu Jul  2 11:56:38 AM UTC 2026
+=== step 4: csv check ===
+total 25060
+drwxrwxr-x 2 kaden kaden     4096 Jul  2 11:46 .
+drwxrwxr-x 3 kaden kaden     4096 Jul  2 11:45 ..
+-rw-rw-r-- 1 kaden kaden     2111 Jul  2 11:46 trace_agent_info.csv
+-rw-rw-r-- 1 kaden kaden      164 Jul  2 11:46 trace_domain_stats.csv
+-rw-rw-r-- 1 kaden kaden     3445 Jul  2 11:46 trace_kernel_stats.csv
+-rw-rw-r-- 1 kaden kaden 25640076 Jul  2 11:46 trace_kernel_trace.csv
+42 /home/kaden/hipfire-perfmaxx/benchmarks/results/2026-07-02-a3b-mq4r-decode-surface/rocprof/trace_kernel_stats.csv
+DONE
