@@ -1,0 +1,14 @@
+arm=candidate
+slot=0
+order_index=1
+cli=/home/kaden/xtx-gfx1100-baseline/target/release/hipfire
+daemon=/home/kaden/xtx-gfx1100-baseline/target/release/daemon
+cli_md5=dd231b5f027a4d674ca20edfdcf9ab08
+daemon_md5=c693213a10aa11ab18ece222cb5b5dc1
+start=2026-09-08T06:30:27Z
+argv= /home/kaden/xtx-gfx1100-baseline/target/release/hipfire bench qwen3.8:27b-mq4-xt --spec dflash --runs 5 --warmups 3 --max-tokens 256 --backend noslots --workload stateless --kv-mode q8 --json --prompt-file /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+HIPFIRE_DAEMON_BIN=/home/kaden/xtx-gfx1100-baseline/target/release/daemon
+HIPFIRE_DFLASH_DRAFT=/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+HIPFIRE_LOCAL=1
+HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models
+model=qwen3.8:27b-mq4-xt

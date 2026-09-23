@@ -1,0 +1,15 @@
+{
+  "status": "baseline_and_candidate_fail_aql_shadow_parity",
+  "capture_fingerprint": "92ede73d35f4a51f",
+  "launches": 659,
+  "kernels": 16,
+  "contracts_identical": true,
+  "hip_and_blob_state_hashes_identical_across_arms": true,
+  "aql_state_hashes_differ_across_arms": true,
+  "gdn_frame_exact": true,
+  "not_a_pm4_acceptance": true,
+  "baseline_daemon_md5": "2c671267160c1635cae95715d61d25ef",
+  "candidate_daemon_md5": "2c91546f40a10f6afca937b07f2b3557",
+  "scope": "No AQL/PM4 improvement or parity claim. The existing baseline also fails. Eager HIP/blob states match across arms.",
+  "supersedes_prior_run_condition": "Current pair reached AQL shadow; not the earlier private12 preparation refusal."
+}

@@ -1,0 +1,101 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 24522,
+  "max_tokens": 256,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 38,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_chars": 140,
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 291.6,
+    "mean": 291.7,
+    "min": 291.4,
+    "max": 292.0,
+    "stdev": 0.21908902300206437
+  },
+  "prefill_tok_s": {
+    "median": 324.6,
+    "mean": 326.12,
+    "min": 323.0,
+    "max": 334.9,
+    "stdev": 4.445851999335997
+  },
+  "wall_tok_s": {
+    "median": 239.4,
+    "mean": 239.5,
+    "min": 238.9,
+    "max": 240.6,
+    "stdev": 0.5899152481501024
+  },
+  "ttft_ms": {
+    "median": 117.1,
+    "mean": 116.56000000000002,
+    "min": 113.5,
+    "max": 117.6,
+    "stdev": 1.549967741599803
+  },
+  "samples": {
+    "decode": [
+      291.6,
+      292.0,
+      291.6,
+      291.4,
+      291.9
+    ],
+    "prefill": [
+      334.9,
+      324.8,
+      323.0,
+      323.3,
+      324.6
+    ],
+    "wall": [
+      240.6,
+      239.5,
+      239.1,
+      238.9,
+      239.4
+    ],
+    "ttft_ms": [
+      113.5,
+      117.0,
+      117.6,
+      117.6,
+      117.1
+    ]
+  }
+}

@@ -1,0 +1,66 @@
+[
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-1-base",
+    "elements": 557056,
+    "relative_l2": 0.0,
+    "max_abs": 0.0,
+    "bit_identical": true
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-2-ldsstage",
+    "elements": 557056,
+    "relative_l2": 7.888207740282124e-06,
+    "max_abs": 0.00396728515625,
+    "bit_identical": false
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-3-ldsstage",
+    "elements": 557056,
+    "relative_l2": 7.888207740282124e-06,
+    "max_abs": 0.00396728515625,
+    "bit_identical": false
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-4-base",
+    "elements": 557056,
+    "relative_l2": 0.0,
+    "max_abs": 0.0,
+    "bit_identical": true
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-5-ldsstage",
+    "elements": 557056,
+    "relative_l2": 7.888207740282124e-06,
+    "max_abs": 0.00396728515625,
+    "bit_identical": false
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-6-base",
+    "elements": 557056,
+    "relative_l2": 0.0,
+    "max_abs": 0.0,
+    "bit_identical": true
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-7-base",
+    "elements": 557056,
+    "relative_l2": 0.0,
+    "max_abs": 0.0,
+    "bit_identical": true
+  },
+  {
+    "reference": "stream-1-base",
+    "candidate": "stream-8-ldsstage",
+    "elements": 557056,
+    "relative_l2": 7.888207740282124e-06,
+    "max_abs": 0.00396728515625,
+    "bit_identical": false
+  }
+]

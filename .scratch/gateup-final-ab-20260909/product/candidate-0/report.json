@@ -1,0 +1,101 @@
+{
+  "batch": 1,
+  "decode_tok_s": {
+    "max": 291.1,
+    "mean": 290.78000000000003,
+    "median": 290.8,
+    "min": 290.3,
+    "stdev": 0.2785677655436845
+  },
+  "gpu": {
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "kernel_hashes": 0,
+    "kernels": 0,
+    "model_arch": "qwen3_5",
+    "model_loaded": true,
+    "type": "diag",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560
+  },
+  "loaded": {
+    "arch": "qwen3_5",
+    "cache_capable": true,
+    "continuous_batch_capable": false,
+    "dim": 5120,
+    "layers": 64,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "retry_reset_eligible": true,
+    "type": "loaded",
+    "vl": false,
+    "vocab": 248320
+  },
+  "max_tokens": 256,
+  "model": "qwen3.8:27b-mq4-xt",
+  "prefill_tok_s": {
+    "max": 330.9,
+    "mean": 324.23999999999995,
+    "median": 323.2,
+    "min": 320.5,
+    "stdev": 3.5074777262300554
+  },
+  "prompt_chars": 140,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_tokens": 38,
+  "protocol": "native-generate-v1",
+  "runs": 5,
+  "samples": {
+    "decode": [
+      291.0,
+      291.1,
+      290.3,
+      290.8,
+      290.7
+    ],
+    "prefill": [
+      330.9,
+      323.2,
+      320.5,
+      323.7,
+      322.9
+    ],
+    "ttft_ms": [
+      114.9,
+      117.6,
+      118.6,
+      117.4,
+      117.7
+    ],
+    "wall": [
+      239.6,
+      238.7,
+      237.8,
+      238.6,
+      238.4
+    ]
+  },
+  "ttft_ms": {
+    "max": 118.6,
+    "mean": 117.23999999999998,
+    "median": 117.6,
+    "min": 114.9,
+    "stdev": 1.2403225386970889
+  },
+  "vram_free_before_mb": 24522,
+  "wall_tok_s": {
+    "max": 239.6,
+    "mean": 238.61999999999998,
+    "median": 238.6,
+    "min": 237.8,
+    "stdev": 0.5810335618533521
+  },
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+  ]
+}

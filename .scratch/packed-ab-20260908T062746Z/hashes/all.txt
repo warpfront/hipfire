@@ -1,0 +1,21 @@
+# packed-ab provenance hashes 2026-09-08T06:27:46Z
+git_head fdb750d6d3138269523ec1094fb189b465f1438c
+0af1096bd7a140c468a9834e45a796d2  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire
+e8b3089a9f6c997d99956eb42a3be562  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+48135c46bfd4c93d38f367dfb86a9b42  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+dd231b5f027a4d674ca20edfdcf9ab08  /home/kaden/xtx-gfx1100-baseline/target/release/hipfire
+c693213a10aa11ab18ece222cb5b5dc1  /home/kaden/xtx-gfx1100-baseline/target/release/daemon
+0133457b7134b42f8d4100ce36bbec90  /home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+253c7ac50857fe6d0e10fb0d2c5e35c0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+--- sha256 ---
+ad08d2a9ed0a7e511a6cfb0ffd911562da3b865e31bab62c03923d2a800d789f  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire
+2c023040666ed79dfc2de45ec43dcc48e6d58fa76748e5ca2d9b76a6f8fb12aa  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+a6983ef6053652776a8dc962d5cd8c5b22e5b4a3b0ef298322bece93c3f922bc  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+4783df7a923799b2396f3aad735a881b351c20b718d5776b868308192c479d47  /home/kaden/xtx-gfx1100-baseline/target/release/hipfire
+79dd62688a18f24ac00d030038edaecfee56eaef072b9a22827a6f73049c3c7b  /home/kaden/xtx-gfx1100-baseline/target/release/daemon
+eb1b357b4a749c9bde1b6d5f7a8f632fcd252a519a10b5a293f7be209c78cdd0  /home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt

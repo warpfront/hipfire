@@ -1,0 +1,9 @@
+arm=candidate
+slot=0
+order_index=1
+throwaway=0
+bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+bin_md5=e421fe7e80b5093e20b1b3053dbd0cbc
+start=2026-09-09T02:24:56Z
+argv="/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo" "--target" "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt" "--draft" "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq" "--prompt-file" "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt" "--max" "256" "--temp" "0.0" "--no-chatml" "--kv-mode" "q8" "--ctx" "4096" "--no-adaptive-b"
+HIPFIRE_RESIDUAL_LDSSTAGE=1

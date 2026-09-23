@@ -1,0 +1,55 @@
+{
+  "probe": "xtx_single_kernel_pmc",
+  "elf": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-residual.gfx1100.o",
+  "arch": "gfx1100",
+  "shape": {
+    "m": 5120,
+    "k": 6144,
+    "n": 16,
+    "kw": 4
+  },
+  "kernel": "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
+  "grid": [
+    320,
+    1,
+    1
+  ],
+  "block": [
+    128,
+    1,
+    1
+  ],
+  "launches": 1,
+  "steps": [
+    "PID",
+    "BEFORE_LAUNCH",
+    "AFTER_SYNC"
+  ],
+  "allocations": {
+    "a_bytes": 16711680,
+    "x_bytes": 196608,
+    "y_bytes": 327680,
+    "total_bytes": 17235968,
+    "max_allocation_bytes": 16711680,
+    "budget_bytes": 134217728
+  },
+  "finite": true,
+  "output": {
+    "len": 81920,
+    "min": -349.4786071777344,
+    "max": 312.7088317871094,
+    "mean": 10.220806977260509,
+    "first8": [
+      -163.1275177001953,
+      42.00917053222656,
+      72.41268920898438,
+      43.3011589050293,
+      -161.71617126464844,
+      42.236572265625,
+      73.3315658569336,
+      44.47174072265625
+    ]
+  },
+  "perf_claim": "none: single cold launch proves liveness only",
+  "result": "PASS"
+}

@@ -1,0 +1,18 @@
+{
+  "md5": {
+    "baseline-daemon": "2c671267160c1635cae95715d61d25ef",
+    "baseline-dflash_spec_demo": "56156096890dc835e17ca1546665885f",
+    "baseline-hipfire": "7064516a8b06e77a9c002e0c95bb7af9",
+    "candidate-daemon": "7ec29e8dbdd2a88f8a98f9840a098576",
+    "candidate-dflash_spec_demo": "424fb08a77d5e2cee85ccc93452b605c",
+    "candidate-hipfire": "a2515e4864f8b9861f98aadd1a217794"
+  },
+  "sha256": {
+    "baseline-daemon": "1a3100ecbb6b9b290707627d9e80563f3956186b9bfdeec88909bbdc589e6ace",
+    "baseline-dflash_spec_demo": "5eac99806da93292ac1927e0b47bd0e1d2a50d5bc437f2da96d2f69f105e79c4",
+    "baseline-hipfire": "51f0d4fe73a68c7a3be751be852827c58d4ebff066c90c83008917c5b8e4dda5",
+    "candidate-daemon": "c86d4e98ab17aceead3082ba829934d3f0e57337a6b55f3003f52935e4a43212",
+    "candidate-dflash_spec_demo": "36a4cce98760f5ac77b8b6010662a934f4c05aa94ca1e47f6f866e5fef107db1",
+    "candidate-hipfire": "36958b4e4056ebeaf80f44bd9ad1e456968829ee5b16b294fb4c9be19ab753f2"
+  }
+}

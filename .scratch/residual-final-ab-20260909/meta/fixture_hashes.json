@@ -1,0 +1,12 @@
+{
+  "md5": {
+    "draft-qwen38-27b-dflash-mq4.hfq": "013395583cd04206c8aa68f4d061983d",
+    "model-qwen3.8-27b.mq4-xt": "e45d15bfe0c9a87132697101d17cbed6",
+    "prompt-merge_sort_thinking_off": "253c7ac50857fe6d0e10fb0d2c5e35c0"
+  },
+  "sha256": {
+    "draft-qwen38-27b-dflash-mq4.hfq": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+    "model-qwen3.8-27b.mq4-xt": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
+    "prompt-merge_sort_thinking_off": "d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0"
+  }
+}

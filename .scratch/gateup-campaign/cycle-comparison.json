@@ -1,0 +1,28 @@
+{
+  "baseline": {
+    "median_union_ms": 39.3938235,
+    "median_span_ms": 47.1690055,
+    "gate_up": {
+      "kernel": "gemm_gate_up_mq4g256v2_wmma",
+      "median_ms": 11.887796,
+      "calls_per_cycle": [
+        64
+      ]
+    }
+  },
+  "candidate": {
+    "median_union_ms": 37.7526405,
+    "median_span_ms": 45.6372255,
+    "gate_up": {
+      "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage": {
+        "median_ms": 10.352264,
+        "calls": [
+          64
+        ]
+      }
+    },
+    "median_launches": 1114.0,
+    "steady_cycles": 8
+  },
+  "caveat": "rocprof kernel-trace attribution only; DPM unset; not a throughput claim"
+}

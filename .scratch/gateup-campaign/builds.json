@@ -1,0 +1,48 @@
+{
+  "base": {
+    "commands": [
+      [
+        "/opt/rocm/bin/hipcc",
+        "--genco",
+        "-O3",
+        "--offload-arch=gfx1100",
+        "/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/kernels/src/gemm_gate_up_mq4g256v2_wmma.hip",
+        "-o",
+        "/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/base.hsaco"
+      ],
+      [
+        "/opt/rocm/llvm/bin/clang-offload-bundler",
+        "--unbundle",
+        "--type=o",
+        "--targets=hipv4-amdgcn-amd-amdhsa--gfx1100",
+        "--input=/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/base.hsaco",
+        "--output=/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/base.o"
+      ]
+    ],
+    "source_sha256": "718657bd9a400ffb37c37417e59a852d98841b4ae31a8dc5c6d2007a440a1756",
+    "elf_sha256": "8e857e16386dc3f2c43211ae6c2548143f33c22c11ee8d4e23dfada69f223fd6"
+  },
+  "lds": {
+    "commands": [
+      [
+        "/opt/rocm/bin/hipcc",
+        "--genco",
+        "-O3",
+        "--offload-arch=gfx1100",
+        "/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/gateup-ldsstage.hip",
+        "-o",
+        "/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/lds.hsaco"
+      ],
+      [
+        "/opt/rocm/llvm/bin/clang-offload-bundler",
+        "--unbundle",
+        "--type=o",
+        "--targets=hipv4-amdgcn-amd-amdhsa--gfx1100",
+        "--input=/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/lds.hsaco",
+        "--output=/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/.scratch/gateup-campaign/lds.o"
+      ]
+    ],
+    "source_sha256": "8644c83d4eec918ab99b3540326a7202d8d1376c067dee2655d077e9af84160a",
+    "elf_sha256": "2082cc78a713c94209017e99b0e0c78b437a3d125df372564661e6070a0f299b"
+  }
+}

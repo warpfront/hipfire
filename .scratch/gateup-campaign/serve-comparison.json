@@ -1,0 +1,18 @@
+{
+  "battery": {
+    "turns": 5,
+    "all_finish_stop": true,
+    "content_and_reasoning_byte_identical": true,
+    "request_hashes_identical": true,
+    "dflash_on": true,
+    "no_runaway_empty_attractor_or_retrieval_miss": true
+  },
+  "chain": {
+    "turns": 5,
+    "all_finish_stop": true,
+    "content_and_reasoning_byte_identical": true,
+    "request_hashes_identical": true,
+    "dflash_on": true,
+    "no_runaway_empty_attractor_or_retrieval_miss": true
+  }
+}

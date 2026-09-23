@@ -1,0 +1,31 @@
+{
+  "git_head": "fdb750d6d3138269523ec1094fb189b465f1438c",
+  "run_dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-ab-20260908T062746Z",
+  "prompt": "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt",
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "demo": {
+    "target": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+    "baseline_bin": "/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo",
+    "candidate_bin": "/home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo",
+    "flags": ["--max","256","--temp","0.0","--no-chatml","--kv-mode","q8","--ctx","4096","--no-adaptive-b"],
+    "env": {"HIPFIRE_VERIFY_GRAPH": "0"},
+    "order": "ABBAABBA",
+    "runs_per_arm": 4
+  },
+  "product": {
+    "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+    "baseline_cli": "/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire",
+    "baseline_daemon": "/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon",
+    "candidate_cli": "/home/kaden/xtx-gfx1100-baseline/target/release/hipfire",
+    "candidate_daemon": "/home/kaden/xtx-gfx1100-baseline/target/release/daemon",
+    "flags": ["bench","--spec","dflash","--runs","5","--warmups","3","--max-tokens","256","--backend","noslots","--workload","stateless","--kv-mode","q8","--json","--prompt-file"],
+    "env": {"HIPFIRE_VERIFY_GRAPH": "0", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_DFLASH_DRAFT": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq"},
+    "order": "ABBAAB",
+    "runs_per_arm": 3,
+    "note": "baseline CLI points baseline daemon; candidate CLI points candidate daemon"
+  },
+  "routes_isolated": true,
+  "never_compare_demo_vs_product": true
+}

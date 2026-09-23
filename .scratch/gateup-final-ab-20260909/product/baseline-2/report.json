@@ -1,0 +1,101 @@
+{
+  "batch": 1,
+  "decode_tok_s": {
+    "max": 281.7,
+    "mean": 281.58000000000004,
+    "median": 281.7,
+    "min": 281.3,
+    "stdev": 0.1599999999999909
+  },
+  "gpu": {
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "kernel_hashes": 0,
+    "kernels": 0,
+    "model_arch": "qwen3_5",
+    "model_loaded": true,
+    "type": "diag",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560
+  },
+  "loaded": {
+    "arch": "qwen3_5",
+    "cache_capable": true,
+    "continuous_batch_capable": false,
+    "dim": 5120,
+    "layers": 64,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "retry_reset_eligible": true,
+    "type": "loaded",
+    "vl": false,
+    "vocab": 248320
+  },
+  "max_tokens": 256,
+  "model": "qwen3.8:27b-mq4-xt",
+  "prefill_tok_s": {
+    "max": 336.1,
+    "mean": 325.18,
+    "median": 322.7,
+    "min": 321.9,
+    "stdev": 5.470795189001334
+  },
+  "prompt_chars": 140,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_tokens": 38,
+  "protocol": "native-generate-v1",
+  "runs": 5,
+  "samples": {
+    "decode": [
+      281.7,
+      281.5,
+      281.7,
+      281.3,
+      281.7
+    ],
+    "prefill": [
+      336.1,
+      322.9,
+      322.7,
+      321.9,
+      322.3
+    ],
+    "ttft_ms": [
+      113.1,
+      117.7,
+      117.7,
+      118.1,
+      117.9
+    ],
+    "wall": [
+      233.9,
+      232.2,
+      232.3,
+      231.9,
+      232.2
+    ]
+  },
+  "ttft_ms": {
+    "max": 118.1,
+    "mean": 116.9,
+    "median": 117.7,
+    "min": 113.1,
+    "stdev": 1.9057806799314578
+  },
+  "vram_free_before_mb": 24522,
+  "wall_tok_s": {
+    "max": 233.9,
+    "mean": 232.5,
+    "median": 232.2,
+    "min": 231.9,
+    "stdev": 0.712741187248221
+  },
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+  ]
+}

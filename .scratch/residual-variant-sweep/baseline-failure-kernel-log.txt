@@ -1,0 +1,80 @@
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: DisallowGfxOff(41) response:0xFFFFFFFF 
+Sep 09 02:05:30 hipx kernel: in params:00000000
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: Failed to disable gfxoff!
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: Dumping IP State Completed
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: [drm] AMDGPU device coredump file has been created
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: [drm] Check your /sys/class/drm/card0/device/devcoredump/data
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: ring sdma1 timeout, signaled seq=554, emitted seq=556
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: Starting sdma1 ring reset
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: reset sdma queue (1:0:0)
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: failed to wait on sdma queue reset done
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: failed to reset legacy queue
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: Ring sdma1 reset failed
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: GPU reset begin!. Source:  1
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: GPU reset end with ret = -19
+Sep 09 02:05:30 hipx kernel: amdgpu 0000:66:00.0: GPU Recovery Failed: -19
+Sep 09 02:05:33 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:33 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:33 hipx kernel: in params:00000005
+Sep 09 02:05:33 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:33 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:33 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:33 hipx kernel: in params:00000005
+Sep 09 02:05:33 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:38 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:38 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:38 hipx kernel: in params:00000005
+Sep 09 02:05:38 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:38 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:38 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:38 hipx kernel: in params:00000005
+Sep 09 02:05:38 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:43 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:43 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:43 hipx kernel: in params:00000005
+Sep 09 02:05:43 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:43 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:43 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:43 hipx kernel: in params:00000005
+Sep 09 02:05:43 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:48 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:48 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:48 hipx kernel: in params:00000005
+Sep 09 02:05:48 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:48 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:48 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:48 hipx kernel: in params:00000005
+Sep 09 02:05:48 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:53 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:53 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:53 hipx kernel: in params:00000005
+Sep 09 02:05:53 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:53 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:53 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:53 hipx kernel: in params:00000005
+Sep 09 02:05:53 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:58 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:58 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:58 hipx kernel: in params:00000005
+Sep 09 02:05:58 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:05:58 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:05:58 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:05:58 hipx kernel: in params:00000005
+Sep 09 02:05:58 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:06:03 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:06:03 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:06:03 hipx kernel: in params:00000005
+Sep 09 02:06:03 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:06:03 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:06:03 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:06:03 hipx kernel: in params:00000005
+Sep 09 02:06:03 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:06:08 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:06:08 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:06:08 hipx kernel: in params:00000005
+Sep 09 02:06:08 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!
+Sep 09 02:06:08 hipx kernel: amdgpu 0000:66:00.0: device lost from bus!
+Sep 09 02:06:08 hipx kernel: amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+Sep 09 02:06:08 hipx kernel: in params:00000005
+Sep 09 02:06:08 hipx kernel: amdgpu 0000:66:00.0: Failed to export SMU metrics table!

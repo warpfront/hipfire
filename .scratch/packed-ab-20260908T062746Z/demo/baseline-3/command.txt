@@ -1,0 +1,7 @@
+arm=baseline
+slot=3
+order_index=7
+bin=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+bin_md5=48135c46bfd4c93d38f367dfb86a9b42
+start=2026-09-08T06:30:00Z
+argv= /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo --target /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt --draft /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq --prompt-file /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 --no-adaptive-b

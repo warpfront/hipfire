@@ -1,0 +1,3 @@
+loaded arch=qwen3_5 dim=5120 layers=64 vocab=248320
+decode: stable=True launches=659 kernels=16 hash=0ba75d3e8ba1bb8f median=46.7 tok/s
+aql-contracts: kernels=16

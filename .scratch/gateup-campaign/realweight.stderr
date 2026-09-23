@@ -1,0 +1,10 @@
+model has 64 qt44 gate layers; oracle picks [0, 63]
+layer 0: model.language_model.layers.0.mlp.gate_proj.weight [17408,5120] + model.language_model.layers.0.mlp.up_proj.weight [17408,5120]
+layer 63: model.language_model.layers.63.mlp.gate_proj.weight [17408,5120] + model.language_model.layers.63.mlp.up_proj.weight [17408,5120]
+layer 0 N=1: relL2 gate=1.397e-5 up=1.397e-5 maxabs gate=2.408e-5 up=2.444e-5 cos gate=1.00000000 up=1.00000000 bitexact=true guard=true finite=true nondeg=true -> PASS
+layer 0 N=8: relL2 gate=1.384e-5 up=1.385e-5 maxabs gate=3.576e-5 up=2.563e-5 cos gate=1.00000000 up=1.00000000 bitexact=true guard=true finite=true nondeg=true -> PASS
+layer 0 N=16: relL2 gate=1.389e-5 up=1.386e-5 maxabs gate=3.600e-5 up=2.849e-5 cos gate=1.00000000 up=1.00000000 bitexact=true guard=true finite=true nondeg=true -> PASS
+layer 63 N=1: relL2 gate=1.363e-5 up=1.361e-5 maxabs gate=3.767e-5 up=4.697e-5 cos gate=1.00000000 up=1.00000000 bitexact=true guard=true finite=true nondeg=true -> PASS
+layer 63 N=8: relL2 gate=1.387e-5 up=1.392e-5 maxabs gate=4.578e-5 up=4.697e-5 cos gate=1.00000000 up=1.00000000 bitexact=true guard=true finite=true nondeg=true -> PASS
+layer 63 N=16: relL2 gate=1.395e-5 up=1.400e-5 maxabs gate=4.578e-5 up=4.697e-5 cos gate=1.00000000 up=1.00000000 bitexact=true guard=true finite=true nondeg=true -> PASS
+PASS: real-weight oracle accepted the candidate; see /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/realweight.json

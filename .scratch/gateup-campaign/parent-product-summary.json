@@ -1,0 +1,20 @@
+{
+  "method": "median of three fresh-process five-sample medians",
+  "per_process_medians": {
+    "baseline": [
+      281.0,
+      281.7,
+      281.7
+    ],
+    "candidate": [
+      290.8,
+      291.2,
+      291.6
+    ]
+  },
+  "median": {
+    "baseline": 281.7,
+    "candidate": 291.2
+  },
+  "gain_pct": 3.372381966631166
+}

@@ -1,0 +1,101 @@
+{
+  "batch": 1,
+  "decode_tok_s": {
+    "max": 271.9,
+    "mean": 271.64,
+    "median": 271.7,
+    "min": 271.2,
+    "stdev": 0.24166091947189086
+  },
+  "gpu": {
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "kernel_hashes": 0,
+    "kernels": 0,
+    "model_arch": "qwen3_5",
+    "model_loaded": true,
+    "type": "diag",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560
+  },
+  "loaded": {
+    "arch": "qwen3_5",
+    "cache_capable": true,
+    "continuous_batch_capable": false,
+    "dim": 5120,
+    "layers": 64,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "retry_reset_eligible": true,
+    "type": "loaded",
+    "vl": false,
+    "vocab": 248320
+  },
+  "max_tokens": 256,
+  "model": "qwen3.8:27b-mq4-xt",
+  "prefill_tok_s": {
+    "max": 337.2,
+    "mean": 324.98,
+    "median": 322.7,
+    "min": 320.3,
+    "stdev": 6.182362008164836
+  },
+  "prompt_chars": 140,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_tokens": 38,
+  "protocol": "native-generate-v1",
+  "runs": 5,
+  "samples": {
+    "decode": [
+      271.9,
+      271.8,
+      271.7,
+      271.2,
+      271.6
+    ],
+    "prefill": [
+      337.2,
+      323.0,
+      320.3,
+      322.7,
+      321.7
+    ],
+    "ttft_ms": [
+      112.7,
+      117.7,
+      118.6,
+      117.8,
+      118.1
+    ],
+    "wall": [
+      227.3,
+      225.5,
+      225.2,
+      225.1,
+      225.2
+    ]
+  },
+  "ttft_ms": {
+    "max": 118.6,
+    "mean": 116.97999999999999,
+    "median": 117.8,
+    "min": 112.7,
+    "stdev": 2.1627759939485154
+  },
+  "vram_free_before_mb": 24522,
+  "wall_tok_s": {
+    "max": 227.3,
+    "mean": 225.66,
+    "median": 225.2,
+    "min": 225.1,
+    "stdev": 0.8309031231136473
+  },
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+  ]
+}

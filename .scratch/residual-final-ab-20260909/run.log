@@ -1,0 +1,46 @@
+[residual-final] hashing binaries + fixtures (pre-GPU reject gate)
+[residual-final] READY run_dir=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-final-ab-20260909 head=fdb750d6d3138269523ec1094fb189b465f1438c
+[residual-final] routes=demo(throwaway×2 + ABBAABBA dflash_spec_demo) product(throwaway×2 + ABBAAB hipfire-bench) — never cross-compared
+[residual-final] ROUTE demo THROW AWAY START (1/arm)
+[residual-final] DEMO START arm=baseline throwaway=True slot=None order=None bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=baseline throwaway=True slot=None rc=0 tok_s=285.32 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=candidate throwaway=True slot=None order=None bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=candidate throwaway=True slot=None rc=0 tok_s=103.74 tau=13.1818 sha8=bf4e0cf2
+[residual-final] ROUTE demo MEASURED START order=ABBAABBA
+[residual-final] DEMO START arm=baseline throwaway=False slot=0 order=0 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=baseline throwaway=False slot=0 rc=0 tok_s=291.41 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=candidate throwaway=False slot=0 order=1 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=candidate throwaway=False slot=0 rc=0 tok_s=302.64 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=candidate throwaway=False slot=1 order=2 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=candidate throwaway=False slot=1 rc=0 tok_s=301.19 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=baseline throwaway=False slot=1 order=3 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=baseline throwaway=False slot=1 rc=0 tok_s=290.75 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=baseline throwaway=False slot=2 order=4 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=baseline throwaway=False slot=2 rc=0 tok_s=290.45 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=candidate throwaway=False slot=2 order=5 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=candidate throwaway=False slot=2 rc=0 tok_s=301.13 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=candidate throwaway=False slot=3 order=6 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=candidate throwaway=False slot=3 rc=0 tok_s=300.67 tau=13.1818 sha8=bf4e0cf2
+[residual-final] DEMO START arm=baseline throwaway=False slot=3 order=7 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+[residual-final] DEMO DONE arm=baseline throwaway=False slot=3 rc=0 tok_s=289.97 tau=13.1818 sha8=bf4e0cf2
+[residual-final] ROUTE demo DONE baseline_slots=4 candidate_slots=4
+[residual-final] ROUTE product THROW AWAY START (1/arm, --runs 1)
+[residual-final] PRODUCT START arm=baseline throwaway=True slot=None order=None cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon runs=1
+[residual-final] PRODUCT DONE arm=baseline throwaway=True slot=None rc=0 tok_s=271.7
+[residual-final] PRODUCT START arm=candidate throwaway=True slot=None order=None cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon runs=1
+[residual-final] PRODUCT DONE arm=candidate throwaway=True slot=None rc=0 tok_s=281.3
+[residual-final] ROUTE product MEASURED START order=ABBAAB
+[residual-final] PRODUCT START arm=baseline throwaway=False slot=0 order=0 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon runs=5
+[residual-final] PRODUCT DONE arm=baseline throwaway=False slot=0 rc=0 tok_s=271.64
+[residual-final] PRODUCT START arm=candidate throwaway=False slot=0 order=1 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon runs=5
+[residual-final] PRODUCT DONE arm=candidate throwaway=False slot=0 rc=0 tok_s=281.2
+[residual-final] PRODUCT START arm=candidate throwaway=False slot=1 order=2 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon runs=5
+[residual-final] PRODUCT DONE arm=candidate throwaway=False slot=1 rc=0 tok_s=281.12
+[residual-final] PRODUCT START arm=baseline throwaway=False slot=1 order=3 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon runs=5
+[residual-final] PRODUCT DONE arm=baseline throwaway=False slot=1 rc=0 tok_s=272.02000000000004
+[residual-final] PRODUCT START arm=baseline throwaway=False slot=2 order=4 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon runs=5
+[residual-final] PRODUCT DONE arm=baseline throwaway=False slot=2 rc=0 tok_s=272.3
+[residual-final] PRODUCT START arm=candidate throwaway=False slot=2 order=5 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon runs=5
+[residual-final] PRODUCT DONE arm=candidate throwaway=False slot=2 rc=0 tok_s=280.8
+[residual-final] ROUTE product DONE baseline_slots=3 candidate_slots=3
+[residual-final] ALL-DONE run_dir=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-final-ab-20260909 summary=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-final-ab-20260909/summary.json

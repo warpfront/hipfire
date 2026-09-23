@@ -1,0 +1,22 @@
+[
+  "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire",
+  "bench",
+  "qwen3.8:27b-mq4-xt",
+  "--spec",
+  "dflash",
+  "--runs",
+  "5",
+  "--warmups",
+  "3",
+  "--max-tokens",
+  "256",
+  "--backend",
+  "noslots",
+  "--workload",
+  "stateless",
+  "--kv-mode",
+  "q8",
+  "--json",
+  "--prompt-file",
+  "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt"
+]

@@ -1,0 +1,1 @@
+PASS: out arch=gfx1100 variant=Some("ks2") symbol=gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds copies=33 single_copy_no_residency_delta=false working=551485440B; report in /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/out-ks2-r2.json

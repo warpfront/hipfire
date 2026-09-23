@@ -1,0 +1,46 @@
+[gateup-final] hashing binaries + fixtures (pre-GPU reject gate)
+[gateup-final] READY run_dir=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-final-ab-20260909 head=fdb750d6d3138269523ec1094fb189b465f1438c
+[gateup-final] routes=demo(throwaway×2 + ABBAABBA dflash_spec_demo) product(throwaway×2 + ABBAAB hipfire-bench) — never cross-compared
+[gateup-final] ROUTE demo THROW AWAY START (1/arm)
+[gateup-final] DEMO START arm=baseline throwaway=True slot=None order=None bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=baseline throwaway=True slot=None rc=0 tok_s=304.45 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=candidate throwaway=True slot=None order=None bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=candidate throwaway=True slot=None rc=0 tok_s=315.48 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] ROUTE demo MEASURED START order=ABBAABBA
+[gateup-final] DEMO START arm=baseline throwaway=False slot=0 order=0 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=baseline throwaway=False slot=0 rc=0 tok_s=303.76 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=candidate throwaway=False slot=0 order=1 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=candidate throwaway=False slot=0 rc=0 tok_s=312.56 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=candidate throwaway=False slot=1 order=2 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=candidate throwaway=False slot=1 rc=0 tok_s=312.90 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=baseline throwaway=False slot=1 order=3 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=baseline throwaway=False slot=1 rc=0 tok_s=302.79 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=baseline throwaway=False slot=2 order=4 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=baseline throwaway=False slot=2 rc=0 tok_s=302.43 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=candidate throwaway=False slot=2 order=5 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=candidate throwaway=False slot=2 rc=0 tok_s=312.12 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=candidate throwaway=False slot=3 order=6 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=candidate throwaway=False slot=3 rc=0 tok_s=312.00 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] DEMO START arm=baseline throwaway=False slot=3 order=7 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+[gateup-final] DEMO DONE arm=baseline throwaway=False slot=3 rc=0 tok_s=300.68 tau=13.1818 sha8=bf4e0cf2
+[gateup-final] ROUTE demo DONE baseline_slots=4 candidate_slots=4
+[gateup-final] ROUTE product THROW AWAY START (1/arm, --runs 1)
+[gateup-final] PRODUCT START arm=baseline throwaway=True slot=None order=None cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/daemon runs=1
+[gateup-final] PRODUCT DONE arm=baseline throwaway=True slot=None rc=0 tok_s=282.3
+[gateup-final] PRODUCT START arm=candidate throwaway=True slot=None order=None cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon runs=1
+[gateup-final] PRODUCT DONE arm=candidate throwaway=True slot=None rc=0 tok_s=291.6
+[gateup-final] ROUTE product MEASURED START order=ABBAAB
+[gateup-final] PRODUCT START arm=baseline throwaway=False slot=0 order=0 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/daemon runs=5
+[gateup-final] PRODUCT DONE arm=baseline throwaway=False slot=0 rc=0 tok_s=281.08000000000004
+[gateup-final] PRODUCT START arm=candidate throwaway=False slot=0 order=1 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon runs=5
+[gateup-final] PRODUCT DONE arm=candidate throwaway=False slot=0 rc=0 tok_s=290.78000000000003
+[gateup-final] PRODUCT START arm=candidate throwaway=False slot=1 order=2 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon runs=5
+[gateup-final] PRODUCT DONE arm=candidate throwaway=False slot=1 rc=0 tok_s=291.26
+[gateup-final] PRODUCT START arm=baseline throwaway=False slot=1 order=3 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/daemon runs=5
+[gateup-final] PRODUCT DONE arm=baseline throwaway=False slot=1 rc=0 tok_s=281.68
+[gateup-final] PRODUCT START arm=baseline throwaway=False slot=2 order=4 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/daemon runs=5
+[gateup-final] PRODUCT DONE arm=baseline throwaway=False slot=2 rc=0 tok_s=281.58000000000004
+[gateup-final] PRODUCT START arm=candidate throwaway=False slot=2 order=5 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon runs=5
+[gateup-final] PRODUCT DONE arm=candidate throwaway=False slot=2 rc=0 tok_s=291.7
+[gateup-final] ROUTE product DONE baseline_slots=3 candidate_slots=3
+[gateup-final] ALL-DONE run_dir=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-final-ab-20260909 summary=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-final-ab-20260909/summary.json

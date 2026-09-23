@@ -1,0 +1,1 @@
+PASS: down arch=gfx1100 variant=Some("ldsstage") symbol=gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage copies=12 single_copy_no_residency_delta=false working=568197120B; report in /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/down-ldsstage-r3.json

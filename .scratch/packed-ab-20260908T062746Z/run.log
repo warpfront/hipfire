@@ -1,0 +1,120 @@
+pgrep: pattern that searches for process name longer than 15 characters will result in zero matches
+Try `pgrep -f' option to match against the complete command line.
+[packed-ab] head=fdb750d6d3138269523ec1094fb189b465f1438c
+# packed-ab provenance hashes 2026-09-08T06:27:46Z
+git_head fdb750d6d3138269523ec1094fb189b465f1438c
+0af1096bd7a140c468a9834e45a796d2  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire
+e8b3089a9f6c997d99956eb42a3be562  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+48135c46bfd4c93d38f367dfb86a9b42  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+dd231b5f027a4d674ca20edfdcf9ab08  /home/kaden/xtx-gfx1100-baseline/target/release/hipfire
+c693213a10aa11ab18ece222cb5b5dc1  /home/kaden/xtx-gfx1100-baseline/target/release/daemon
+0133457b7134b42f8d4100ce36bbec90  /home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+253c7ac50857fe6d0e10fb0d2c5e35c0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+--- sha256 ---
+ad08d2a9ed0a7e511a6cfb0ffd911562da3b865e31bab62c03923d2a800d789f  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire
+2c023040666ed79dfc2de45ec43dcc48e6d58fa76748e5ca2d9b76a6f8fb12aa  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+a6983ef6053652776a8dc962d5cd8c5b22e5b4a3b0ef298322bece93c3f922bc  /home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+4783df7a923799b2396f3aad735a881b351c20b718d5776b868308192c479d47  /home/kaden/xtx-gfx1100-baseline/target/release/hipfire
+79dd62688a18f24ac00d030038edaecfee56eaef072b9a22827a6f73049c3c7b  /home/kaden/xtx-gfx1100-baseline/target/release/daemon
+eb1b357b4a749c9bde1b6d5f7a8f632fcd252a519a10b5a293f7be209c78cdd0  /home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+[gpu-lock] acquired by packed-ab-rtz-fma
+[packed-ab] READY run_dir=/home/kaden/xtx-gfx1100-baseline/.scratch/packed-ab-20260908T062746Z head=fdb750d6d3138269523ec1094fb189b465f1438c
+[packed-ab] routes=demo(ABBAABBA x dflash_spec_demo) product(ABBAAB x hipfire-bench) — never cross-compared
+[packed-ab] ROUTE demo START order=ABBAABBA
+[packed-ab] DEMO START arm=baseline slot=0 order=0 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+decode_tok_s=288.15
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=baseline slot=0 rc=0 decode_tok_s=288.15 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=candidate slot=0 order=1 bin=/home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+decode_tok_s=289.83
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=candidate slot=0 rc=0 decode_tok_s=289.83 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=candidate slot=1 order=2 bin=/home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+decode_tok_s=289.30
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=candidate slot=1 rc=0 decode_tok_s=289.30 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=baseline slot=1 order=3 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+decode_tok_s=286.40
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=baseline slot=1 rc=0 decode_tok_s=286.40 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=baseline slot=2 order=4 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+decode_tok_s=285.59
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=baseline slot=2 rc=0 decode_tok_s=285.59 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=candidate slot=2 order=5 bin=/home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+decode_tok_s=289.56
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=candidate slot=2 rc=0 decode_tok_s=289.56 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=candidate slot=3 order=6 bin=/home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+decode_tok_s=290.01
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=candidate slot=3 rc=0 decode_tok_s=290.01 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] DEMO START arm=baseline slot=3 order=7 bin=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/dflash_spec_demo
+decode_tok_s=286.50
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39
+[packed-ab] DEMO DONE arm=baseline slot=3 rc=0 decode_tok_s=286.50 decode_tau=13.1818 decode_tokens_emitted=157 cycles=11 decode_accept_rate=0.8788 token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104 token_sha8=c2313b39 
+[packed-ab] ROUTE demo DONE baseline_slots=4 candidate_slots=4
+[packed-ab] ROUTE product START order=ABBAAB
+[packed-ab] PRODUCT START arm=baseline slot=0 order=0 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+[packed-ab] PRODUCT DONE arm=baseline slot=0 rc=0 decode_tok_s.mean=265.96 decode_tok_s.median=266.0 decode_tok_s.min=265.2 decode_tok_s.max=266.8 prefill_tok_s.mean=318.76 prefill_tok_s.median=319.2 prefill_to
+[packed-ab] PRODUCT START arm=candidate slot=0 order=1 cli=/home/kaden/xtx-gfx1100-baseline/target/release/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/target/release/daemon
+[packed-ab] PRODUCT DONE arm=candidate slot=0 rc=0 decode_tok_s.mean=269.18 decode_tok_s.median=269.1 decode_tok_s.min=268.7 decode_tok_s.max=270.1 prefill_tok_s.mean=324.6 prefill_tok_s.median=324.1 prefill_tok
+[packed-ab] PRODUCT START arm=candidate slot=1 order=2 cli=/home/kaden/xtx-gfx1100-baseline/target/release/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/target/release/daemon
+[packed-ab] PRODUCT DONE arm=candidate slot=1 rc=0 decode_tok_s.mean=268.58000000000004 decode_tok_s.median=268.6 decode_tok_s.min=268.3 decode_tok_s.max=269.0 prefill_tok_s.mean=324.16 prefill_tok_s.median=323.
+[packed-ab] PRODUCT START arm=baseline slot=1 order=3 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+[packed-ab] PRODUCT DONE arm=baseline slot=1 rc=0 decode_tok_s.mean=265.16 decode_tok_s.median=265.0 decode_tok_s.min=264.9 decode_tok_s.max=265.9 prefill_tok_s.mean=318.66 prefill_tok_s.median=318.0 prefill_to
+[packed-ab] PRODUCT START arm=baseline slot=2 order=4 cli=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/baseline-bin/daemon
+[packed-ab] PRODUCT DONE arm=baseline slot=2 rc=0 decode_tok_s.mean=264.93999999999994 decode_tok_s.median=264.8 decode_tok_s.min=264.5 decode_tok_s.max=265.8 prefill_tok_s.mean=316.26 prefill_tok_s.median=314.
+[packed-ab] PRODUCT START arm=candidate slot=2 order=5 cli=/home/kaden/xtx-gfx1100-baseline/target/release/hipfire daemon=/home/kaden/xtx-gfx1100-baseline/target/release/daemon
+[packed-ab] PRODUCT DONE arm=candidate slot=2 rc=0 decode_tok_s.mean=268.28000000000003 decode_tok_s.median=268.3 decode_tok_s.min=267.6 decode_tok_s.max=268.9 prefill_tok_s.mean=323.0 prefill_tok_s.median=322.1
+[packed-ab] ROUTE product DONE baseline_slots=3 candidate_slots=3
+[packed-ab] SUMMARY wrote /home/kaden/xtx-gfx1100-baseline/.scratch/packed-ab-20260908T062746Z/summary.json
+[packed-ab] demo: baseline={'n': 4, 'mean': 286.65999999999997, 'median': 286.45, 'min': 285.59, 'max': 288.15, 'values': [285.59, 286.4, 286.5, 288.15]} candidate={'n': 4, 'mean': 289.675, 'median': 289.695, 'min': 289.3, 'max': 290.01, 'values': [289.3, 289.56, 289.83, 290.01]} gain_pct=1.0517686457824753
+[packed-ab] product: baseline={'n': 3, 'mean': 265.3533333333333, 'median': 265.16, 'min': 264.93999999999994, 'max': 265.96, 'values': [264.93999999999994, 265.16, 265.96]} candidate={'n': 3, 'mean': 268.68, 'median': 268.58000000000004, 'min': 268.28000000000003, 'max': 269.18, 'values': [268.28000000000003, 268.58000000000004, 269.18]} gain_pct=1.2536743461548292
+[gpu-lock] released
+[packed-ab] ALL-DONE run_dir=/home/kaden/xtx-gfx1100-baseline/.scratch/packed-ab-20260908T062746Z summary=/home/kaden/xtx-gfx1100-baseline/.scratch/packed-ab-20260908T062746Z/summary.json

@@ -1,0 +1,16 @@
+{
+  "experiment": "One raw HIP residual ks4 dispatch, gfx1100, M5120 K6144 N16, 320 workgroups of 128 threads",
+  "plain_hip": "Completed, finite output",
+  "profiled_runs": "All three completed safely and matched plain-HIP output summaries",
+  "expected_waves": 1280,
+  "observed_waves": 1280,
+  "unusable_zero_counters": ["FETCH_SIZE", "GRBM_GUI_ACTIVE", "SQ_INSTS_VALU", "SQ_WAIT_ANY", "SQ_WAVE_CYCLES"],
+  "conclusion": "Counter attachment is demonstrated by correct wave count, but traffic/utilization counters are unusable. No bandwidth, ALU utilization, or roofline can be inferred.",
+  "current_demo_tps": 296.085,
+  "target_assessment": {
+    "350": "Requires approximately 15.4% less execution time at unchanged acceptance; plausible stretch hypothesis, not demonstrated headroom.",
+    "450": "Requires approximately 34.2% less execution time at unchanged acceptance; no measured support."
+  },
+  "next_valid_method": "Controlled kernel timing experiments with explicit cache-pressure and arithmetic changes; distinguish warm resident-weight screens from full-model streaming. Do not retry full-model PMC collection.",
+  "scope": "No production code changes; DFlash PM4 remains excluded."
+}

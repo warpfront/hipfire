@@ -1,0 +1,85 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 24522,
+  "max_tokens": 256,
+  "runs": 1,
+  "batch": 1,
+  "prompt_tokens": 38,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_chars": 140,
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 282.3,
+    "mean": 282.3,
+    "min": 282.3,
+    "max": 282.3,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 336.9,
+    "mean": 336.9,
+    "min": 336.9,
+    "max": 336.9,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 234.4,
+    "mean": 234.4,
+    "min": 234.4,
+    "max": 234.4,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 112.8,
+    "mean": 112.8,
+    "min": 112.8,
+    "max": 112.8,
+    "stdev": 0.0
+  },
+  "samples": {
+    "decode": [
+      282.3
+    ],
+    "prefill": [
+      336.9
+    ],
+    "wall": [
+      234.4
+    ],
+    "ttft_ms": [
+      112.8
+    ]
+  }
+}

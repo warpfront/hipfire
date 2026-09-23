@@ -1,0 +1,20 @@
+# gateup-final provenance hashes 2026-09-09T03:19:44Z
+git_head fdb750d6d3138269523ec1094fb189b465f1438c
+md5 7064516a8b06e77a9c002e0c95bb7af9  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/hipfire
+sha256 51f0d4fe73a68c7a3be751be852827c58d4ebff066c90c83008917c5b8e4dda5  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/hipfire
+md5 2c671267160c1635cae95715d61d25ef  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/daemon
+sha256 1a3100ecbb6b9b290707627d9e80563f3956186b9bfdeec88909bbdc589e6ace  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/daemon
+md5 56156096890dc835e17ca1546665885f  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+sha256 5eac99806da93292ac1927e0b47bd0e1d2a50d5bc437f2da96d2f69f105e79c4  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/baseline-bin/dflash_spec_demo
+md5 a2515e4864f8b9861f98aadd1a217794  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire
+sha256 36958b4e4056ebeaf80f44bd9ad1e456968829ee5b16b294fb4c9be19ab753f2  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire
+md5 7ec29e8dbdd2a88f8a98f9840a098576  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon
+sha256 c86d4e98ab17aceead3082ba829934d3f0e57337a6b55f3003f52935e4a43212  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon
+md5 424fb08a77d5e2cee85ccc93452b605c  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+sha256 36a4cce98760f5ac77b8b6010662a934f4c05aa94ca1e47f6f866e5fef107db1  /home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/dflash_spec_demo
+md5 253c7ac50857fe6d0e10fb0d2c5e35c0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+sha256 d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+md5 e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+sha256 9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+md5 013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+sha256 d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq

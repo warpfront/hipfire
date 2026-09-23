@@ -1,0 +1,17 @@
+Traceback (most recent call last):
+  File "/home/kaden/xtx-gfx1100-baseline/scripts/redline_daemon_harness.py", line 623, in <module>
+    main()
+    ~~~~^^
+  File "/home/kaden/xtx-gfx1100-baseline/scripts/redline_daemon_harness.py", line 546, in main
+    report["aql_shadow"] = daemon.request(
+                           ~~~~~~~~~~~~~~^
+        {
+        ^
+    ...<5 lines>...
+        }
+        ^
+    )
+    ^
+  File "/home/kaden/xtx-gfx1100-baseline/scripts/redline_daemon_harness.py", line 70, in request
+    raise RuntimeError(response.get("message", "daemon error"))
+RuntimeError: redline AQL prepare failed: gemv_mq4g256v2_residual: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=12, dynamic_callstack=false)

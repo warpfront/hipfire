@@ -1,0 +1,109 @@
+{
+  "contract_env": {
+    "baseline": {
+      "HIPFIRE_RESIDUAL_LDSSTAGE": "0"
+    },
+    "both": {
+      "HIPFIRE_DPM_WARMUP_SECS": "10",
+      "HIPFIRE_NO_REGISTRY_FETCH": "1",
+      "HIPFIRE_REPLAY_BACKEND": "hip",
+      "HIPFIRE_RESIDUAL_KSPLIT_OFF": "0",
+      "HIPFIRE_VERIFY_GRAPH": "0",
+      "HIP_VISIBLE_DEVICES": "0"
+    },
+    "candidate": {
+      "HIPFIRE_RESIDUAL_LDSSTAGE": "1"
+    }
+  },
+  "demo": {
+    "baseline_bin": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo",
+    "candidate_bin": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo",
+    "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+    "flags": [
+      "--max",
+      "256",
+      "--temp",
+      "0.0",
+      "--no-chatml",
+      "--kv-mode",
+      "q8",
+      "--ctx",
+      "4096",
+      "--no-adaptive-b"
+    ],
+    "order": "ABBAABBA",
+    "runs_per_arm": 4,
+    "target": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "throwaway_per_arm": 1
+  },
+  "draft_md5": "013395583cd04206c8aa68f4d061983d",
+  "draft_path": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+  "draft_sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+  "git_head": "fdb750d6d3138269523ec1094fb189b465f1438c",
+  "locks": "parent-owned (GPU + shared hwgate); runner does not acquire",
+  "model_md5": "e45d15bfe0c9a87132697101d17cbed6",
+  "model_path": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+  "model_sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
+  "never_compare_demo_vs_product": true,
+  "proc_timeout_s": 240,
+  "product": {
+    "baseline_cli": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire",
+    "baseline_daemon": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon",
+    "candidate_cli": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire",
+    "candidate_daemon": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon",
+    "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+    "flags_measured": [
+      "bench",
+      "qwen3.8:27b-mq4-xt",
+      "--spec",
+      "dflash",
+      "--runs",
+      "5",
+      "--warmups",
+      "3",
+      "--max-tokens",
+      "256",
+      "--backend",
+      "noslots",
+      "--workload",
+      "stateless",
+      "--kv-mode",
+      "q8",
+      "--json",
+      "--prompt-file",
+      "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt"
+    ],
+    "flags_throwaway": [
+      "bench",
+      "qwen3.8:27b-mq4-xt",
+      "--spec",
+      "dflash",
+      "--runs",
+      "1",
+      "--warmups",
+      "3",
+      "--max-tokens",
+      "256",
+      "--backend",
+      "noslots",
+      "--workload",
+      "stateless",
+      "--kv-mode",
+      "q8",
+      "--json",
+      "--prompt-file",
+      "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt"
+    ],
+    "model": "qwen3.8:27b-mq4-xt",
+    "model_path": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "note": "baseline CLI \u2192 baseline daemon; candidate CLI \u2192 candidate daemon",
+    "order": "ABBAAB",
+    "runs_per_arm": 3,
+    "throwaway_per_arm": 1,
+    "warmups_note": "--warmups 3 is passed consistently; prior scout found standard bench does one Hello warmup, not necessarily 3."
+  },
+  "prompt": "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt",
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "routes_isolated": true,
+  "run_dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/residual-final-ab-20260909"
+}

@@ -1,0 +1,101 @@
+{
+  "batch": 1,
+  "decode_tok_s": {
+    "max": 265.9,
+    "mean": 265.16,
+    "median": 265.0,
+    "min": 264.9,
+    "stdev": 0.3773592452822608
+  },
+  "gpu": {
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "kernel_hashes": 0,
+    "kernels": 0,
+    "model_arch": "qwen3_5",
+    "model_loaded": true,
+    "type": "diag",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560
+  },
+  "loaded": {
+    "arch": "qwen3_5",
+    "cache_capable": true,
+    "continuous_batch_capable": false,
+    "dim": 5120,
+    "layers": 64,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "retry_reset_eligible": true,
+    "type": "loaded",
+    "vl": false,
+    "vocab": 248320
+  },
+  "max_tokens": 256,
+  "model": "qwen3.8:27b-mq4-xt",
+  "prefill_tok_s": {
+    "max": 322.6,
+    "mean": 318.66,
+    "median": 318.0,
+    "min": 316.1,
+    "stdev": 2.179541236132045
+  },
+  "prompt_chars": 140,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_tokens": 38,
+  "protocol": "native-generate-v1",
+  "runs": 5,
+  "samples": {
+    "decode": [
+      265.9,
+      265.1,
+      265.0,
+      264.9,
+      264.9
+    ],
+    "prefill": [
+      322.6,
+      316.1,
+      318.0,
+      319.0,
+      317.6
+    ],
+    "ttft_ms": [
+      117.8,
+      120.2,
+      119.5,
+      119.1,
+      119.6
+    ],
+    "wall": [
+      221.5,
+      220.1,
+      220.3,
+      220.3,
+      220.2
+    ]
+  },
+  "ttft_ms": {
+    "max": 120.2,
+    "mean": 119.24000000000001,
+    "median": 119.5,
+    "min": 117.8,
+    "stdev": 0.8014985963805565
+  },
+  "vram_free_before_mb": 24522,
+  "wall_tok_s": {
+    "max": 221.5,
+    "mean": 220.47999999999996,
+    "median": 220.3,
+    "min": 220.1,
+    "stdev": 0.5153639490690055
+  },
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+  ]
+}

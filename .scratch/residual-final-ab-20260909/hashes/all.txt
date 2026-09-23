@@ -1,0 +1,20 @@
+# residual-final provenance hashes 2026-09-09T02:23:31Z
+git_head fdb750d6d3138269523ec1094fb189b465f1438c
+md5 213a0bcc8b67e2e981ddf36cd0eb13d9  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire
+sha256 0e3067a7b1584f3e955a856fd171096f4ecd19d346a189ff8617a2e92cb8a20a  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire
+md5 9e1d8edfbade9f22d79ff0200626e530  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon
+sha256 c4daf7061ebeb19ef757f048a524682c06404034a882a48e04e01efded6c82cb  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon
+md5 95806308c8567ded2d848c7e4eea7b48  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+sha256 09cda031efc6e96ce187794b16e126d76d8a164d4d55453a6c7519b4ee0553a8  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/dflash_spec_demo
+md5 33119f2cd99e1afd5606b524a5cedb64  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire
+sha256 2ea19b60a23a4cb54d70eb177a610a7c33a6c983de1129a2a1d2acdb778bdc89  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/hipfire
+md5 f026fc24d4bda0ea609ae0afd8381e50  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon
+sha256 691b046ef89167f3acb9d847b49bc841f90c14983d4bbc4454dd15229c2c6ea5  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/daemon
+md5 e421fe7e80b5093e20b1b3053dbd0cbc  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+sha256 c42e822e74a5d2949cf68dd7cbe1c875f940c69a88a7505e7b11c8a23f1b20fa  /home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/candidate-bin/dflash_spec_demo
+md5 253c7ac50857fe6d0e10fb0d2c5e35c0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+sha256 d671894964cb957643fcb961151f3d1b407cb5c206766eaed60e9c593e6ed9d0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+md5 e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+sha256 9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+md5 013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+sha256 d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq

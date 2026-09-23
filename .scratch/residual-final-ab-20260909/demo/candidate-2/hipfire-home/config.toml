@@ -1,0 +1,5 @@
+schema_version = 1
+
+[speculation]
+dflash = "on"
+mtp = "off"

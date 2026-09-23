@@ -1,0 +1,11 @@
+{
+  "status": "blocked",
+  "experiment": "rocprofv3 FETCH_SIZE GRBM_GUI_ACTIVE SQ_WAVES; gate_up/residual kernel filter; iterations145-148; HIP DFlash demo",
+  "outcome": "180s timeout; verified process1876149 terminated with SIGTERM; no remaining daemon/demo or D-state processes in host check; kernel logs device lost from bus for0000:66:00.0",
+  "recovery": "No GPU reset or host reboot attempted; requires owner recovery decision.",
+  "validated_commits_before_experiment": [
+    "1d18b91f6",
+    "14e824ef5"
+  ],
+  "performance_claim": "No valid hardware-counter result; no bandwidth/compute roofline inferred."
+}

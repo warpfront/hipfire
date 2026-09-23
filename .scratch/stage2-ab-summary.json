@@ -1,0 +1,1404 @@
+{
+  "binary_md5": {
+    "baseline-daemon": "f55313c3f1edc40c89f6ea5c920df391",
+    "baseline-dflash_spec_demo": "69f0e7f2de60cf5e8bd646ce088dacc1",
+    "baseline-hipfire": "46c807bf312a12670d0e167a3933ddaa",
+    "candidate-daemon": "9e1d8edfbade9f22d79ff0200626e530",
+    "candidate-dflash_spec_demo": "95806308c8567ded2d848c7e4eea7b48",
+    "candidate-hipfire": "213a0bcc8b67e2e981ddf36cd0eb13d9",
+    "prompt-merge_sort_thinking_off": "253c7ac50857fe6d0e10fb0d2c5e35c0"
+  },
+  "bins": {
+    "demo": {
+      "baseline_bin": "/home/kaden/xtx-gfx1100-baseline/.scratch/stage2-baseline-bin/dflash_spec_demo",
+      "candidate_bin": "/home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo",
+      "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+      "env": {
+        "HIPFIRE_VERIFY_GRAPH": "0"
+      },
+      "flags": [
+        "--max",
+        "256",
+        "--temp",
+        "0.0",
+        "--no-chatml",
+        "--kv-mode",
+        "q8",
+        "--ctx",
+        "4096",
+        "--no-adaptive-b"
+      ],
+      "order": "ABBAABBA",
+      "runs_per_arm": 4,
+      "target": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt"
+    },
+    "git_head": "fdb750d6d3138269523ec1094fb189b465f1438c",
+    "never_compare_demo_vs_product": true,
+    "product": {
+      "baseline_cli": "/home/kaden/xtx-gfx1100-baseline/.scratch/stage2-baseline-bin/hipfire",
+      "baseline_daemon": "/home/kaden/xtx-gfx1100-baseline/.scratch/stage2-baseline-bin/daemon",
+      "candidate_cli": "/home/kaden/xtx-gfx1100-baseline/target/release/hipfire",
+      "candidate_daemon": "/home/kaden/xtx-gfx1100-baseline/target/release/daemon",
+      "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+      "env": {
+        "HIPFIRE_DFLASH_DRAFT": "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq",
+        "HIPFIRE_NO_REGISTRY_FETCH": "1",
+        "HIPFIRE_VERIFY_GRAPH": "0"
+      },
+      "flags": [
+        "bench",
+        "--spec",
+        "dflash",
+        "--runs",
+        "5",
+        "--warmups",
+        "3",
+        "--max-tokens",
+        "256",
+        "--backend",
+        "noslots",
+        "--workload",
+        "stateless",
+        "--kv-mode",
+        "q8",
+        "--json",
+        "--prompt-file"
+      ],
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+      "note": "baseline CLI points baseline daemon; candidate CLI points candidate daemon",
+      "order": "ABBAAB",
+      "runs_per_arm": 3
+    },
+    "prompt": "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt",
+    "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+    "routes_isolated": true,
+    "run_dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z"
+  },
+  "demo": {
+    "baseline_decode_tau": {
+      "max": 13.1818,
+      "mean": 13.1818,
+      "median": 13.1818,
+      "min": 13.1818,
+      "n": 4,
+      "values": [
+        13.1818,
+        13.1818,
+        13.1818,
+        13.1818
+      ]
+    },
+    "baseline_decode_tok_s": {
+      "max": 291.61,
+      "mean": 290.375,
+      "median": 290.57,
+      "min": 288.75,
+      "n": 4,
+      "values": [
+        288.75,
+        290.46,
+        290.68,
+        291.61
+      ]
+    },
+    "candidate_decode_tau": {
+      "max": 13.1818,
+      "mean": 13.1818,
+      "median": 13.1818,
+      "min": 13.1818,
+      "n": 4,
+      "values": [
+        13.1818,
+        13.1818,
+        13.1818,
+        13.1818
+      ]
+    },
+    "candidate_decode_tok_s": {
+      "max": 296.98,
+      "mean": 258.8175,
+      "median": 296.61,
+      "min": 145.07,
+      "n": 4,
+      "values": [
+        145.07,
+        296.59,
+        296.63,
+        296.98
+      ]
+    },
+    "order": "ABBAABBA",
+    "runs": [
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-0/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-0",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "288.75",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 0,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "288.75",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-0/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-0/stdout"
+      },
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-1/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-1",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "290.68",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 1,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "290.68",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-1/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-1/stdout"
+      },
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-2/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-2",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "291.61",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 2,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "291.61",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-2/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-2/stdout"
+      },
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-3/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-3",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "290.46",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 3,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "290.46",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-3/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/baseline-3/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-0/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-0",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "145.07",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 0,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "145.07",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-0/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-0/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-1/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-1",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "296.98",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 1,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "296.98",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-1/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-1/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-2/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-2",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "296.59",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 2,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "296.59",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-2/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-2/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-3/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-3",
+        "exit_status": 0,
+        "metrics": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "296.63",
+          "decode_tokens_emitted": "157",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "slot": 3,
+        "status": {
+          "cycles": "11",
+          "decode_accept_rate": "0.8788",
+          "decode_tau": "13.1818",
+          "decode_tok_s": "296.63",
+          "decode_tokens_emitted": "157",
+          "rc": "0",
+          "token_sha256": "c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104",
+          "token_sha8": "c2313b39"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-3/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/demo/candidate-3/stdout"
+      }
+    ],
+    "runs_per_arm": 4,
+    "token_sha8_by_run": [
+      {
+        "arm": "baseline",
+        "slot": 0,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "baseline",
+        "slot": 1,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "baseline",
+        "slot": 2,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "baseline",
+        "slot": 3,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "candidate",
+        "slot": 0,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "candidate",
+        "slot": 1,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "candidate",
+        "slot": 2,
+        "token_sha8": "c2313b39"
+      },
+      {
+        "arm": "candidate",
+        "slot": 3,
+        "token_sha8": "c2313b39"
+      }
+    ],
+    "within_route_gain_pct": -10.867843306069739
+  },
+  "git_head": "fdb750d6d3138269523ec1094fb189b465f1438c",
+  "note": "Routes are independent. NEVER compare demo tok/s against product bench tok/s.",
+  "product": {
+    "baseline_decode_tok_s": {
+      "max": 270.65999999999997,
+      "mean": 270.1933333333333,
+      "median": 270.24,
+      "min": 269.67999999999995,
+      "n": 3,
+      "values": [
+        269.67999999999995,
+        270.24,
+        270.65999999999997
+      ]
+    },
+    "candidate_decode_tok_s": {
+      "max": 275.97999999999996,
+      "mean": 275.6933333333333,
+      "median": 275.84,
+      "min": 275.26,
+      "n": 3,
+      "values": [
+        275.26,
+        275.84,
+        275.97999999999996
+      ]
+    },
+    "order": "ABBAAB",
+    "runs": [
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-0/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-0",
+        "exit_status": 0,
+        "metrics": {
+          "decode_samples": "[271.3, 270.5, 270.8, 270.2, 270.5]",
+          "decode_tok_s.max": "271.3",
+          "decode_tok_s.mean": "270.65999999999997",
+          "decode_tok_s.median": "270.5",
+          "decode_tok_s.min": "270.2",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "329.9",
+          "prefill_tok_s.mean": "324.03999999999996",
+          "prefill_tok_s.median": "322.6",
+          "prefill_tok_s.min": "321.4",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "runs": "5",
+          "ttft_ms.max": "118.2",
+          "ttft_ms.mean": "117.28",
+          "ttft_ms.median": "117.8",
+          "ttft_ms.min": "115.2",
+          "wall_tok_s.max": "226.0",
+          "wall_tok_s.mean": "224.88000000000002",
+          "wall_tok_s.median": "224.8",
+          "wall_tok_s.min": "224.3"
+        },
+        "report": {
+          "batch": 1,
+          "decode_tok_s": {
+            "max": 271.3,
+            "mean": 270.65999999999997,
+            "median": 270.5,
+            "min": 270.2,
+            "stdev": 0.3720215047547731
+          },
+          "gpu": {
+            "arch": "gfx1100",
+            "hip_version": "7.15",
+            "kernel_hashes": 0,
+            "kernels": 0,
+            "model_arch": "qwen3_5",
+            "model_loaded": true,
+            "type": "diag",
+            "vram_free_mb": 4552,
+            "vram_total_mb": 24560
+          },
+          "loaded": {
+            "arch": "qwen3_5",
+            "cache_capable": true,
+            "continuous_batch_capable": false,
+            "dim": 5120,
+            "layers": 64,
+            "reasoning_contract": "qwen_jinja",
+            "reasoning_effort_native": true,
+            "reasoning_efforts": [
+              "low",
+              "medium",
+              "xhigh"
+            ],
+            "retry_reset_eligible": true,
+            "type": "loaded",
+            "vl": false,
+            "vocab": 248320
+          },
+          "max_tokens": 256,
+          "model": "qwen3.8:27b-mq4-xt",
+          "prefill_tok_s": {
+            "max": 329.9,
+            "mean": 324.03999999999996,
+            "median": 322.6,
+            "min": 321.4,
+            "stdev": 3.0858386218336107
+          },
+          "prompt_chars": 140,
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": 38,
+          "protocol": "native-generate-v1",
+          "runs": 5,
+          "samples": {
+            "decode": [
+              271.3,
+              270.5,
+              270.8,
+              270.2,
+              270.5
+            ],
+            "prefill": [
+              329.9,
+              322.0,
+              322.6,
+              321.4,
+              324.3
+            ],
+            "ttft_ms": [
+              115.2,
+              118.0,
+              117.8,
+              118.2,
+              117.2
+            ],
+            "wall": [
+              226.0,
+              224.5,
+              224.8,
+              224.3,
+              224.8
+            ]
+          },
+          "ttft_ms": {
+            "max": 118.2,
+            "mean": 117.28,
+            "median": 117.8,
+            "min": 115.2,
+            "stdev": 1.092520022699812
+          },
+          "vram_free_before_mb": 24522,
+          "wall_tok_s": {
+            "max": 226.0,
+            "mean": 224.88000000000002,
+            "median": 224.8,
+            "min": 224.3,
+            "stdev": 0.5912698199637765
+          },
+          "warnings": [
+            "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+          ]
+        },
+        "report_json": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-0/report.json",
+        "slot": 0,
+        "status": {
+          "decode_samples": "[271.3, 270.5, 270.8, 270.2, 270.5]",
+          "decode_tok_s.max": "271.3",
+          "decode_tok_s.mean": "270.65999999999997",
+          "decode_tok_s.median": "270.5",
+          "decode_tok_s.min": "270.2",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "329.9",
+          "prefill_tok_s.mean": "324.03999999999996",
+          "prefill_tok_s.median": "322.6",
+          "prefill_tok_s.min": "321.4",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "rc": "0",
+          "report": "present",
+          "runs": "5",
+          "ttft_ms.max": "118.2",
+          "ttft_ms.mean": "117.28",
+          "ttft_ms.median": "117.8",
+          "ttft_ms.min": "115.2",
+          "wall_tok_s.max": "226.0",
+          "wall_tok_s.mean": "224.88000000000002",
+          "wall_tok_s.median": "224.8",
+          "wall_tok_s.min": "224.3"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-0/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-0/stdout"
+      },
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-1/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-1",
+        "exit_status": 0,
+        "metrics": {
+          "decode_samples": "[271.5, 269.9, 270.3, 269.8, 269.7]",
+          "decode_tok_s.max": "271.5",
+          "decode_tok_s.mean": "270.24",
+          "decode_tok_s.median": "269.9",
+          "decode_tok_s.min": "269.7",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "332.3",
+          "prefill_tok_s.mean": "325.8",
+          "prefill_tok_s.median": "322.4",
+          "prefill_tok_s.min": "320.8",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "runs": "5",
+          "ttft_ms.max": "118.5",
+          "ttft_ms.mean": "116.68000000000002",
+          "ttft_ms.median": "117.8",
+          "ttft_ms.min": "114.4",
+          "wall_tok_s.max": "226.3",
+          "wall_tok_s.mean": "224.82000000000002",
+          "wall_tok_s.median": "224.2",
+          "wall_tok_s.min": "224.0"
+        },
+        "report": {
+          "batch": 1,
+          "decode_tok_s": {
+            "max": 271.5,
+            "mean": 270.24,
+            "median": 269.9,
+            "min": 269.7,
+            "stdev": 0.6621178142898768
+          },
+          "gpu": {
+            "arch": "gfx1100",
+            "hip_version": "7.15",
+            "kernel_hashes": 0,
+            "kernels": 0,
+            "model_arch": "qwen3_5",
+            "model_loaded": true,
+            "type": "diag",
+            "vram_free_mb": 4552,
+            "vram_total_mb": 24560
+          },
+          "loaded": {
+            "arch": "qwen3_5",
+            "cache_capable": true,
+            "continuous_batch_capable": false,
+            "dim": 5120,
+            "layers": 64,
+            "reasoning_contract": "qwen_jinja",
+            "reasoning_effort_native": true,
+            "reasoning_efforts": [
+              "low",
+              "medium",
+              "xhigh"
+            ],
+            "retry_reset_eligible": true,
+            "type": "loaded",
+            "vl": false,
+            "vocab": 248320
+          },
+          "max_tokens": 256,
+          "model": "qwen3.8:27b-mq4-xt",
+          "prefill_tok_s": {
+            "max": 332.3,
+            "mean": 325.8,
+            "median": 322.4,
+            "min": 320.8,
+            "stdev": 4.9771477775931015
+          },
+          "prompt_chars": 140,
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": 38,
+          "protocol": "native-generate-v1",
+          "runs": 5,
+          "samples": {
+            "decode": [
+              271.5,
+              269.9,
+              270.3,
+              269.8,
+              269.7
+            ],
+            "prefill": [
+              331.4,
+              320.8,
+              332.3,
+              322.4,
+              322.1
+            ],
+            "ttft_ms": [
+              114.7,
+              118.5,
+              114.4,
+              117.8,
+              118.0
+            ],
+            "wall": [
+              226.3,
+              224.0,
+              225.6,
+              224.2,
+              224.0
+            ]
+          },
+          "ttft_ms": {
+            "max": 118.5,
+            "mean": 116.68000000000002,
+            "median": 117.8,
+            "min": 114.4,
+            "stdev": 1.7565876010037165
+          },
+          "vram_free_before_mb": 24522,
+          "wall_tok_s": {
+            "max": 226.3,
+            "mean": 224.82000000000002,
+            "median": 224.2,
+            "min": 224.0,
+            "stdev": 0.9516301802696298
+          },
+          "warnings": [
+            "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+          ]
+        },
+        "report_json": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-1/report.json",
+        "slot": 1,
+        "status": {
+          "decode_samples": "[271.5, 269.9, 270.3, 269.8, 269.7]",
+          "decode_tok_s.max": "271.5",
+          "decode_tok_s.mean": "270.24",
+          "decode_tok_s.median": "269.9",
+          "decode_tok_s.min": "269.7",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "332.3",
+          "prefill_tok_s.mean": "325.8",
+          "prefill_tok_s.median": "322.4",
+          "prefill_tok_s.min": "320.8",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "rc": "0",
+          "report": "present",
+          "runs": "5",
+          "ttft_ms.max": "118.5",
+          "ttft_ms.mean": "116.68000000000002",
+          "ttft_ms.median": "117.8",
+          "ttft_ms.min": "114.4",
+          "wall_tok_s.max": "226.3",
+          "wall_tok_s.mean": "224.82000000000002",
+          "wall_tok_s.median": "224.2",
+          "wall_tok_s.min": "224.0"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-1/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-1/stdout"
+      },
+      {
+        "arm": "baseline",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-2/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-2",
+        "exit_status": 0,
+        "metrics": {
+          "decode_samples": "[270.3, 269.5, 269.9, 269.4, 269.3]",
+          "decode_tok_s.max": "270.3",
+          "decode_tok_s.mean": "269.67999999999995",
+          "decode_tok_s.median": "269.5",
+          "decode_tok_s.min": "269.3",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "330.3",
+          "prefill_tok_s.mean": "323.9",
+          "prefill_tok_s.median": "322.7",
+          "prefill_tok_s.min": "321.5",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "runs": "5",
+          "ttft_ms.max": "118.2",
+          "ttft_ms.mean": "117.34",
+          "ttft_ms.median": "117.8",
+          "ttft_ms.min": "115.0",
+          "wall_tok_s.max": "225.4",
+          "wall_tok_s.mean": "224.22000000000003",
+          "wall_tok_s.median": "224.0",
+          "wall_tok_s.min": "223.7"
+        },
+        "report": {
+          "batch": 1,
+          "decode_tok_s": {
+            "max": 270.3,
+            "mean": 269.67999999999995,
+            "median": 269.5,
+            "min": 269.3,
+            "stdev": 0.37094473981983034
+          },
+          "gpu": {
+            "arch": "gfx1100",
+            "hip_version": "7.15",
+            "kernel_hashes": 0,
+            "kernels": 0,
+            "model_arch": "qwen3_5",
+            "model_loaded": true,
+            "type": "diag",
+            "vram_free_mb": 4552,
+            "vram_total_mb": 24560
+          },
+          "loaded": {
+            "arch": "qwen3_5",
+            "cache_capable": true,
+            "continuous_batch_capable": false,
+            "dim": 5120,
+            "layers": 64,
+            "reasoning_contract": "qwen_jinja",
+            "reasoning_effort_native": true,
+            "reasoning_efforts": [
+              "low",
+              "medium",
+              "xhigh"
+            ],
+            "retry_reset_eligible": true,
+            "type": "loaded",
+            "vl": false,
+            "vocab": 248320
+          },
+          "max_tokens": 256,
+          "model": "qwen3.8:27b-mq4-xt",
+          "prefill_tok_s": {
+            "max": 330.3,
+            "mean": 323.9,
+            "median": 322.7,
+            "min": 321.5,
+            "stdev": 3.2372828112477334
+          },
+          "prompt_chars": 140,
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": 38,
+          "protocol": "native-generate-v1",
+          "runs": 5,
+          "samples": {
+            "decode": [
+              270.3,
+              269.5,
+              269.9,
+              269.4,
+              269.3
+            ],
+            "prefill": [
+              330.3,
+              322.9,
+              322.1,
+              322.7,
+              321.5
+            ],
+            "ttft_ms": [
+              115.0,
+              117.7,
+              118.0,
+              117.8,
+              118.2
+            ],
+            "wall": [
+              225.4,
+              224.0,
+              224.2,
+              223.8,
+              223.7
+            ]
+          },
+          "ttft_ms": {
+            "max": 118.2,
+            "mean": 117.34,
+            "median": 117.8,
+            "min": 115.0,
+            "stdev": 1.182539639927559
+          },
+          "vram_free_before_mb": 24522,
+          "wall_tok_s": {
+            "max": 225.4,
+            "mean": 224.22000000000003,
+            "median": 224.0,
+            "min": 223.7,
+            "stdev": 0.6144916598294913
+          },
+          "warnings": [
+            "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+          ]
+        },
+        "report_json": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-2/report.json",
+        "slot": 2,
+        "status": {
+          "decode_samples": "[270.3, 269.5, 269.9, 269.4, 269.3]",
+          "decode_tok_s.max": "270.3",
+          "decode_tok_s.mean": "269.67999999999995",
+          "decode_tok_s.median": "269.5",
+          "decode_tok_s.min": "269.3",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "330.3",
+          "prefill_tok_s.mean": "323.9",
+          "prefill_tok_s.median": "322.7",
+          "prefill_tok_s.min": "321.5",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "rc": "0",
+          "report": "present",
+          "runs": "5",
+          "ttft_ms.max": "118.2",
+          "ttft_ms.mean": "117.34",
+          "ttft_ms.median": "117.8",
+          "ttft_ms.min": "115.0",
+          "wall_tok_s.max": "225.4",
+          "wall_tok_s.mean": "224.22000000000003",
+          "wall_tok_s.median": "224.0",
+          "wall_tok_s.min": "223.7"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-2/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/baseline-2/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-0/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-0",
+        "exit_status": 0,
+        "metrics": {
+          "decode_samples": "[276.5, 275.9, 275.8, 275.7, 275.3]",
+          "decode_tok_s.max": "276.5",
+          "decode_tok_s.mean": "275.84",
+          "decode_tok_s.median": "275.8",
+          "decode_tok_s.min": "275.3",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "336.5",
+          "prefill_tok_s.mean": "326.96",
+          "prefill_tok_s.median": "324.8",
+          "prefill_tok_s.min": "324.0",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "runs": "5",
+          "ttft_ms.max": "117.3",
+          "ttft_ms.mean": "116.23999999999998",
+          "ttft_ms.median": "117.0",
+          "ttft_ms.min": "112.9",
+          "wall_tok_s.max": "230.4",
+          "wall_tok_s.mean": "228.8",
+          "wall_tok_s.median": "228.4",
+          "wall_tok_s.min": "228.2"
+        },
+        "report": {
+          "batch": 1,
+          "decode_tok_s": {
+            "max": 276.5,
+            "mean": 275.84,
+            "median": 275.8,
+            "min": 275.3,
+            "stdev": 0.3878143885933031
+          },
+          "gpu": {
+            "arch": "gfx1100",
+            "hip_version": "7.15",
+            "kernel_hashes": 0,
+            "kernels": 0,
+            "model_arch": "qwen3_5",
+            "model_loaded": true,
+            "type": "diag",
+            "vram_free_mb": 4552,
+            "vram_total_mb": 24560
+          },
+          "loaded": {
+            "arch": "qwen3_5",
+            "cache_capable": true,
+            "continuous_batch_capable": false,
+            "dim": 5120,
+            "layers": 64,
+            "reasoning_contract": "qwen_jinja",
+            "reasoning_effort_native": true,
+            "reasoning_efforts": [
+              "low",
+              "medium",
+              "xhigh"
+            ],
+            "retry_reset_eligible": true,
+            "type": "loaded",
+            "vl": false,
+            "vocab": 248320
+          },
+          "max_tokens": 256,
+          "model": "qwen3.8:27b-mq4-xt",
+          "prefill_tok_s": {
+            "max": 336.5,
+            "mean": 326.96,
+            "median": 324.8,
+            "min": 324.0,
+            "stdev": 4.779372343728828
+          },
+          "prompt_chars": 140,
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": 38,
+          "protocol": "native-generate-v1",
+          "runs": 5,
+          "samples": {
+            "decode": [
+              276.5,
+              275.9,
+              275.8,
+              275.7,
+              275.3
+            ],
+            "prefill": [
+              336.5,
+              324.8,
+              324.0,
+              324.7,
+              324.8
+            ],
+            "ttft_ms": [
+              112.9,
+              117.0,
+              117.3,
+              117.0,
+              117.0
+            ],
+            "wall": [
+              230.4,
+              228.6,
+              228.4,
+              228.4,
+              228.2
+            ]
+          },
+          "ttft_ms": {
+            "max": 117.3,
+            "mean": 116.23999999999998,
+            "median": 117.0,
+            "min": 112.9,
+            "stdev": 1.6740370366273234
+          },
+          "vram_free_before_mb": 24522,
+          "wall_tok_s": {
+            "max": 230.4,
+            "mean": 228.8,
+            "median": 228.4,
+            "min": 228.2,
+            "stdev": 0.8099382692526665
+          },
+          "warnings": [
+            "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+          ]
+        },
+        "report_json": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-0/report.json",
+        "slot": 0,
+        "status": {
+          "decode_samples": "[276.5, 275.9, 275.8, 275.7, 275.3]",
+          "decode_tok_s.max": "276.5",
+          "decode_tok_s.mean": "275.84",
+          "decode_tok_s.median": "275.8",
+          "decode_tok_s.min": "275.3",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "336.5",
+          "prefill_tok_s.mean": "326.96",
+          "prefill_tok_s.median": "324.8",
+          "prefill_tok_s.min": "324.0",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "rc": "0",
+          "report": "present",
+          "runs": "5",
+          "ttft_ms.max": "117.3",
+          "ttft_ms.mean": "116.23999999999998",
+          "ttft_ms.median": "117.0",
+          "ttft_ms.min": "112.9",
+          "wall_tok_s.max": "230.4",
+          "wall_tok_s.mean": "228.8",
+          "wall_tok_s.median": "228.4",
+          "wall_tok_s.min": "228.2"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-0/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-0/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-1/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-1",
+        "exit_status": 0,
+        "metrics": {
+          "decode_samples": "[276.7, 276.0, 275.8, 275.9, 275.5]",
+          "decode_tok_s.max": "276.7",
+          "decode_tok_s.mean": "275.97999999999996",
+          "decode_tok_s.median": "275.9",
+          "decode_tok_s.min": "275.5",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "333.4",
+          "prefill_tok_s.mean": "325.6",
+          "prefill_tok_s.median": "324.1",
+          "prefill_tok_s.min": "322.3",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "runs": "5",
+          "ttft_ms.max": "117.9",
+          "ttft_ms.mean": "116.72",
+          "ttft_ms.median": "117.2",
+          "ttft_ms.min": "114.0",
+          "wall_tok_s.max": "230.2",
+          "wall_tok_s.mean": "228.76",
+          "wall_tok_s.median": "228.5",
+          "wall_tok_s.min": "228.0"
+        },
+        "report": {
+          "batch": 1,
+          "decode_tok_s": {
+            "max": 276.7,
+            "mean": 275.97999999999996,
+            "median": 275.9,
+            "min": 275.5,
+            "stdev": 0.39698866482557993
+          },
+          "gpu": {
+            "arch": "gfx1100",
+            "hip_version": "7.15",
+            "kernel_hashes": 0,
+            "kernels": 0,
+            "model_arch": "qwen3_5",
+            "model_loaded": true,
+            "type": "diag",
+            "vram_free_mb": 4552,
+            "vram_total_mb": 24560
+          },
+          "loaded": {
+            "arch": "qwen3_5",
+            "cache_capable": true,
+            "continuous_batch_capable": false,
+            "dim": 5120,
+            "layers": 64,
+            "reasoning_contract": "qwen_jinja",
+            "reasoning_effort_native": true,
+            "reasoning_efforts": [
+              "low",
+              "medium",
+              "xhigh"
+            ],
+            "retry_reset_eligible": true,
+            "type": "loaded",
+            "vl": false,
+            "vocab": 248320
+          },
+          "max_tokens": 256,
+          "model": "qwen3.8:27b-mq4-xt",
+          "prefill_tok_s": {
+            "max": 333.4,
+            "mean": 325.6,
+            "median": 324.1,
+            "min": 322.3,
+            "stdev": 4.033856715353177
+          },
+          "prompt_chars": 140,
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": 38,
+          "protocol": "native-generate-v1",
+          "runs": 5,
+          "samples": {
+            "decode": [
+              276.7,
+              276.0,
+              275.8,
+              275.9,
+              275.5
+            ],
+            "prefill": [
+              333.4,
+              325.3,
+              322.9,
+              324.1,
+              322.3
+            ],
+            "ttft_ms": [
+              114.0,
+              116.8,
+              117.7,
+              117.2,
+              117.9
+            ],
+            "wall": [
+              230.2,
+              228.8,
+              228.3,
+              228.5,
+              228.0
+            ]
+          },
+          "ttft_ms": {
+            "max": 117.9,
+            "mean": 116.72,
+            "median": 117.2,
+            "min": 114.0,
+            "stdev": 1.4133647795243818
+          },
+          "vram_free_before_mb": 24522,
+          "wall_tok_s": {
+            "max": 230.2,
+            "mean": 228.76,
+            "median": 228.5,
+            "min": 228.0,
+            "stdev": 0.7657675887630604
+          },
+          "warnings": [
+            "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+          ]
+        },
+        "report_json": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-1/report.json",
+        "slot": 1,
+        "status": {
+          "decode_samples": "[276.7, 276.0, 275.8, 275.9, 275.5]",
+          "decode_tok_s.max": "276.7",
+          "decode_tok_s.mean": "275.97999999999996",
+          "decode_tok_s.median": "275.9",
+          "decode_tok_s.min": "275.5",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "333.4",
+          "prefill_tok_s.mean": "325.6",
+          "prefill_tok_s.median": "324.1",
+          "prefill_tok_s.min": "322.3",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "rc": "0",
+          "report": "present",
+          "runs": "5",
+          "ttft_ms.max": "117.9",
+          "ttft_ms.mean": "116.72",
+          "ttft_ms.median": "117.2",
+          "ttft_ms.min": "114.0",
+          "wall_tok_s.max": "230.2",
+          "wall_tok_s.mean": "228.76",
+          "wall_tok_s.median": "228.5",
+          "wall_tok_s.min": "228.0"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-1/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-1/stdout"
+      },
+      {
+        "arm": "candidate",
+        "command": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-2/command.txt",
+        "dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-2",
+        "exit_status": 0,
+        "metrics": {
+          "decode_samples": "[276.5, 275.0, 275.0, 274.8, 275.0]",
+          "decode_tok_s.max": "276.5",
+          "decode_tok_s.mean": "275.26",
+          "decode_tok_s.median": "275.0",
+          "decode_tok_s.min": "274.8",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "331.4",
+          "prefill_tok_s.mean": "325.78000000000003",
+          "prefill_tok_s.median": "324.6",
+          "prefill_tok_s.min": "323.5",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "runs": "5",
+          "ttft_ms.max": "117.5",
+          "ttft_ms.mean": "116.67999999999999",
+          "ttft_ms.median": "117.1",
+          "ttft_ms.min": "114.7",
+          "wall_tok_s.max": "229.8",
+          "wall_tok_s.mean": "228.24",
+          "wall_tok_s.median": "227.9",
+          "wall_tok_s.min": "227.7"
+        },
+        "report": {
+          "batch": 1,
+          "decode_tok_s": {
+            "max": 276.5,
+            "mean": 275.26,
+            "median": 275.0,
+            "min": 274.8,
+            "stdev": 0.6248199740725306
+          },
+          "gpu": {
+            "arch": "gfx1100",
+            "hip_version": "7.15",
+            "kernel_hashes": 0,
+            "kernels": 0,
+            "model_arch": "qwen3_5",
+            "model_loaded": true,
+            "type": "diag",
+            "vram_free_mb": 4552,
+            "vram_total_mb": 24560
+          },
+          "loaded": {
+            "arch": "qwen3_5",
+            "cache_capable": true,
+            "continuous_batch_capable": false,
+            "dim": 5120,
+            "layers": 64,
+            "reasoning_contract": "qwen_jinja",
+            "reasoning_effort_native": true,
+            "reasoning_efforts": [
+              "low",
+              "medium",
+              "xhigh"
+            ],
+            "retry_reset_eligible": true,
+            "type": "loaded",
+            "vl": false,
+            "vocab": 248320
+          },
+          "max_tokens": 256,
+          "model": "qwen3.8:27b-mq4-xt",
+          "prefill_tok_s": {
+            "max": 331.4,
+            "mean": 325.78000000000003,
+            "median": 324.6,
+            "min": 323.5,
+            "stdev": 2.9026884090442655
+          },
+          "prompt_chars": 140,
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": 38,
+          "protocol": "native-generate-v1",
+          "runs": 5,
+          "samples": {
+            "decode": [
+              276.5,
+              275.0,
+              275.0,
+              274.8,
+              275.0
+            ],
+            "prefill": [
+              331.4,
+              324.6,
+              325.6,
+              323.8,
+              323.5
+            ],
+            "ttft_ms": [
+              114.7,
+              117.1,
+              116.7,
+              117.4,
+              117.5
+            ],
+            "wall": [
+              229.8,
+              227.9,
+              228.0,
+              227.7,
+              227.8
+            ]
+          },
+          "ttft_ms": {
+            "max": 117.5,
+            "mean": 116.67999999999999,
+            "median": 117.1,
+            "min": 114.7,
+            "stdev": 1.0283968105745946
+          },
+          "vram_free_before_mb": 24522,
+          "wall_tok_s": {
+            "max": 229.8,
+            "mean": 228.24,
+            "median": 227.9,
+            "min": 227.7,
+            "stdev": 0.7863841300535044
+          },
+          "warnings": [
+            "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+          ]
+        },
+        "report_json": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-2/report.json",
+        "slot": 2,
+        "status": {
+          "decode_samples": "[276.5, 275.0, 275.0, 274.8, 275.0]",
+          "decode_tok_s.max": "276.5",
+          "decode_tok_s.mean": "275.26",
+          "decode_tok_s.median": "275.0",
+          "decode_tok_s.min": "274.8",
+          "max_tokens": "256",
+          "prefill_tok_s.max": "331.4",
+          "prefill_tok_s.mean": "325.78000000000003",
+          "prefill_tok_s.median": "324.6",
+          "prefill_tok_s.min": "323.5",
+          "prompt_chars": "140",
+          "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+          "prompt_tokens": "38",
+          "rc": "0",
+          "report": "present",
+          "runs": "5",
+          "ttft_ms.max": "117.5",
+          "ttft_ms.mean": "116.67999999999999",
+          "ttft_ms.median": "117.1",
+          "ttft_ms.min": "114.7",
+          "wall_tok_s.max": "229.8",
+          "wall_tok_s.mean": "228.24",
+          "wall_tok_s.median": "227.9",
+          "wall_tok_s.min": "227.7"
+        },
+        "stderr": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-2/stderr",
+        "stdout": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z/product/candidate-2/stdout"
+      }
+    ],
+    "runs_per_arm": 3,
+    "within_route_gain_pct": 2.035579461620075
+  },
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "run_dir": "/home/kaden/xtx-gfx1100-baseline/.scratch/packed-stage2-ab-20260908T083043Z",
+  "schema": "packed-ab-v1"
+}

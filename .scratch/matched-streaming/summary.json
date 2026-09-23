@@ -1,0 +1,145 @@
+{
+  "experiment": "Matched production HIP MQ4V2 operators, N=16; rotating weights larger than 512 MiB; resident control",
+  "method": "Median of three fresh-process per-process medians, 40 samples per mode, 128 launches per sample. No hardware counters. Telemetry was collected in separate runs, not concurrently with accepted timing samples.",
+  "devices": {
+    "xtx": {
+      "hip_device": 0,
+      "pci": "0000:66:00.0"
+    },
+    "r9700": {
+      "hip_device": 3,
+      "rocm_smi_device": 1,
+      "pci": "0000:13:00.0"
+    }
+  },
+  "probe_sha256_both_hosts": "86dd2f503a7ddc94be221786b3b43d4b7b52dae9f7fd7fe291f24c79ba3634c0",
+  "results": {
+    "gateup": {
+      "xtx": {
+        "resident_us": 166.46448522806168,
+        "streaming_us": 198.29082489013672
+      },
+      "r9700": {
+        "resident_us": 170.077845454216,
+        "streaming_us": 191.57496839761734
+      },
+      "xtx_streaming_latency_over_r9700_pct": 3.5056022969454315
+    },
+    "out": {
+      "xtx": {
+        "resident_us": 30.62153048813343,
+        "streaming_us": 49.06650818884373
+      },
+      "r9700": {
+        "resident_us": 31.551409512758255,
+        "streaming_us": 38.73910568654537
+      },
+      "xtx_streaming_latency_over_r9700_pct": 26.65885626235611
+    },
+    "down": {
+      "xtx": {
+        "resident_us": 87.90985122323036,
+        "streaming_us": 118.57141926884651
+      },
+      "r9700": {
+        "resident_us": 84.39232036471367,
+        "streaming_us": 107.89479315280914
+      },
+      "xtx_streaming_latency_over_r9700_pct": 9.895404406509488
+    }
+  },
+  "cross_arch_output_error": {
+    "gateup": {
+      "elements": 557056,
+      "relative_l2": 9.737418548774613e-06,
+      "max_abs": 0.006072998046875,
+      "byte_equal": false
+    },
+    "out": {
+      "elements": 81920,
+      "relative_l2": 8.846165843491673e-06,
+      "max_abs": 0.0033111572265625,
+      "byte_equal": false
+    },
+    "down": {
+      "elements": 81920,
+      "relative_l2": 1.9441813302543038e-05,
+      "max_abs": 0.017852783203125,
+      "byte_equal": false
+    }
+  },
+  "cross_arch_caveat": "Same inputs but production architecture-specific kernels have different arithmetic/reductions; output is not bit-exact across architectures. All compared outputs finite; each architecture separately passed address-copy bit parity and write-semantics checks.",
+  "input_checksums_match": {
+    "gateup": true,
+    "out": true,
+    "down": true
+  },
+  "code_objects_sha256": {
+    "matched-gateup-gfx1201.o": "57847e0fad17d9980d49635989b1c76bda7555fd2b778562fe18c293051dfce0",
+    "matched-residual-gfx1100.o": "02f61016de6d371d1a7f2274225ddfc0982e0db76544040b9e418d1c76d546e9",
+    "matched-gateup-gfx1100.o": "f08473ca982717241e9704231b444e9b5644f81f6082432519e23fb8a2b92870",
+    "matched-residual-gfx1201.o": "ef6207ad7aed9ed00649d1185c3897dbe9bdcfbd478d23c3b27648a01cc65ba6"
+  },
+  "raw_reports": {
+    "xtx-gateup": [
+      "xtx-gateup-r1.json",
+      "xtx-gateup-r2.json",
+      "xtx-gateup-r3.json"
+    ],
+    "xtx-out": [
+      "xtx-out-r1.json",
+      "xtx-out-r2.json",
+      "xtx-out-r3.json"
+    ],
+    "xtx-down": [
+      "xtx-down-r1.json",
+      "xtx-down-r2.json",
+      "xtx-down-r3.json"
+    ],
+    "r9700-gateup": [
+      "r9700-gateup-r1.json",
+      "r9700-gateup-r2.json",
+      "r9700-gateup-r3.json"
+    ],
+    "r9700-out": [
+      "r9700-out-r1.json",
+      "r9700-out-r2.json",
+      "r9700-out-r3.json"
+    ],
+    "r9700-down": [
+      "r9700-down-r1.json",
+      "r9700-down-r2.json",
+      "r9700-down-r3.json"
+    ]
+  },
+  "telemetry": {
+    "xtx": {
+      "host": "xtx",
+      "rc": 0,
+      "samples": [
+        "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[0]\t\t: Temperature (Sensor edge) (C): 27.0\nGPU[0]\t\t: Temperature (Sensor junction) (C): 31.0\nGPU[0]\t\t: Temperature (Sensor memory) (C): 50.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[0]\t\t: dcefclk clock level: 0: (145Mhz)\nGPU[0]\t\t: fclk clock level: 0: (601Mhz)\nGPU[0]\t\t: mclk clock level: 0: (96Mhz)\nGPU[0]\t\t: sclk clock level: S: (11Mhz)\nGPU[0]\t\t: socclk clock level: 0: (500Mhz)\nGPU[0]\t\t: pcie clock level: 2 (16.0GT/s x4)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[0]\t\t: Average Graphics Package Power (W): 15.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+        "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[0]\t\t: Temperature (Sensor edge) (C): 28.0\nGPU[0]\t\t: Temperature (Sensor junction) (C): 48.0\nGPU[0]\t\t: Temperature (Sensor memory) (C): 52.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[0]\t\t: dcefclk clock level: 0: (145Mhz)\nGPU[0]\t\t: fclk clock level: 4: (2000Mhz)\nGPU[0]\t\t: mclk clock level: 3: (1249Mhz)\nGPU[0]\t\t: sclk clock level: 1: (2641Mhz)\nGPU[0]\t\t: socclk clock level: 1: (1285Mhz)\nGPU[0]\t\t: pcie clock level: 2 (16.0GT/s x4)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[0]\t\t: Average Graphics Package Power (W): 350.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+        "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[0]\t\t: Temperature (Sensor edge) (C): 34.0\nGPU[0]\t\t: Temperature (Sensor junction) (C): 54.0\nGPU[0]\t\t: Temperature (Sensor memory) (C): 54.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[0]\t\t: dcefclk clock level: 0: (145Mhz)\nGPU[0]\t\t: fclk clock level: 4: (2000Mhz)\nGPU[0]\t\t: mclk clock level: 3: (1249Mhz)\nGPU[0]\t\t: sclk clock level: 1: (2526Mhz)\nGPU[0]\t\t: socclk clock level: 1: (1285Mhz)\nGPU[0]\t\t: pcie clock level: 2 (16.0GT/s x4)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[0]\t\t: Average Graphics Package Power (W): 343.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+        "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[0]\t\t: Temperature (Sensor edge) (C): 35.0\nGPU[0]\t\t: Temperature (Sensor junction) (C): 56.0\nGPU[0]\t\t: Temperature (Sensor memory) (C): 56.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[0]\t\t: dcefclk clock level: 0: (145Mhz)\nGPU[0]\t\t: fclk clock level: 4: (2000Mhz)\nGPU[0]\t\t: mclk clock level: 3: (1249Mhz)\nGPU[0]\t\t: sclk clock level: 1: (2526Mhz)\nGPU[0]\t\t: socclk clock level: 1: (1285Mhz)\nGPU[0]\t\t: pcie clock level: 2 (16.0GT/s x4)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[0]\t\t: Average Graphics Package Power (W): 341.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+        "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[0]\t\t: Temperature (Sensor edge) (C): 36.0\nGPU[0]\t\t: Temperature (Sensor junction) (C): 58.0\nGPU[0]\t\t: Temperature (Sensor memory) (C): 58.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[0]\t\t: dcefclk clock level: 0: (145Mhz)\nGPU[0]\t\t: fclk clock level: 4: (2000Mhz)\nGPU[0]\t\t: mclk clock level: 3: (1249Mhz)\nGPU[0]\t\t: sclk clock level: 1: (2598Mhz)\nGPU[0]\t\t: socclk clock level: 1: (1285Mhz)\nGPU[0]\t\t: pcie clock level: 2 (16.0GT/s x4)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[0]\t\t: Average Graphics Package Power (W): 367.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+        "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[0]\t\t: Temperature (Sensor edge) (C): 37.0\nGPU[0]\t\t: Temperature (Sensor junction) (C): 56.0\nGPU[0]\t\t: Temperature (Sensor memory) (C): 58.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[0]\t\t: dcefclk clock level: 0: (145Mhz)\nGPU[0]\t\t: fclk clock level: 4: (2000Mhz)\nGPU[0]\t\t: mclk clock level: 3: (1249Mhz)\nGPU[0]\t\t: sclk clock level: 1: (2724Mhz)\nGPU[0]\t\t: socclk clock level: 1: (1285Mhz)\nGPU[0]\t\t: pcie clock level: 2 (16.0GT/s x4)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[0]\t\t: Average Graphics Package Power (W): 132.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+      ],
+      "stderr": "PASS: gateup arch=gfx1100 copies=6 working=568197120B; report in /home/kaden/xtx-gfx1100-baseline/.scratch/telemetry-streaming-xtx.json\n"
+    },
+    "r9700_corrected": [
+      "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[1]\t\t: Temperature (Sensor edge) (C): 39.0\nGPU[1]\t\t: Temperature (Sensor junction) (C): 42.0\nGPU[1]\t\t: Temperature (Sensor memory) (C): 42.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[1]\t\t: dcefclk clock level: 1: (219Mhz)\nGPU[1]\t\t: fclk clock level: 1: (582Mhz)\nGPU[1]\t\t: mclk clock level: 0: (96Mhz)\nGPU[1]\t\t: sclk clock level: S: (41Mhz)\nGPU[1]\t\t: socclk clock level: 0: (417Mhz)\nGPU[1]\t\t: pcie clock level: 2 (32.0GT/s x16)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[1]\t\t: Average Graphics Package Power (W): 22.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+      "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[1]\t\t: Temperature (Sensor edge) (C): 41.0\nGPU[1]\t\t: Temperature (Sensor junction) (C): 52.0\nGPU[1]\t\t: Temperature (Sensor memory) (C): 48.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[1]\t\t: dcefclk clock level: 1: (219Mhz)\nGPU[1]\t\t: fclk clock level: 1: (2016Mhz)\nGPU[1]\t\t: mclk clock level: 5: (1258Mhz)\nGPU[1]\t\t: sclk clock level: 1: (2614Mhz)\nGPU[1]\t\t: socclk clock level: 1: (1280Mhz)\nGPU[1]\t\t: pcie clock level: 2 (32.0GT/s x16)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[1]\t\t: Average Graphics Package Power (W): 301.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+      "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[1]\t\t: Temperature (Sensor edge) (C): 42.0\nGPU[1]\t\t: Temperature (Sensor junction) (C): 59.0\nGPU[1]\t\t: Temperature (Sensor memory) (C): 52.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[1]\t\t: dcefclk clock level: 1: (219Mhz)\nGPU[1]\t\t: fclk clock level: 1: (2016Mhz)\nGPU[1]\t\t: mclk clock level: 5: (1258Mhz)\nGPU[1]\t\t: sclk clock level: 1: (2655Mhz)\nGPU[1]\t\t: socclk clock level: 1: (1280Mhz)\nGPU[1]\t\t: pcie clock level: 2 (32.0GT/s x16)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[1]\t\t: Average Graphics Package Power (W): 304.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+      "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[1]\t\t: Temperature (Sensor edge) (C): 43.0\nGPU[1]\t\t: Temperature (Sensor junction) (C): 60.0\nGPU[1]\t\t: Temperature (Sensor memory) (C): 52.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[1]\t\t: dcefclk clock level: 1: (219Mhz)\nGPU[1]\t\t: fclk clock level: 1: (2016Mhz)\nGPU[1]\t\t: mclk clock level: 5: (1258Mhz)\nGPU[1]\t\t: sclk clock level: 1: (2643Mhz)\nGPU[1]\t\t: socclk clock level: 1: (1280Mhz)\nGPU[1]\t\t: pcie clock level: 2 (32.0GT/s x16)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[1]\t\t: Average Graphics Package Power (W): 317.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+      "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[1]\t\t: Temperature (Sensor edge) (C): 43.0\nGPU[1]\t\t: Temperature (Sensor junction) (C): 61.0\nGPU[1]\t\t: Temperature (Sensor memory) (C): 54.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[1]\t\t: dcefclk clock level: 1: (219Mhz)\nGPU[1]\t\t: fclk clock level: 1: (2016Mhz)\nGPU[1]\t\t: mclk clock level: 5: (1258Mhz)\nGPU[1]\t\t: sclk clock level: 1: (2557Mhz)\nGPU[1]\t\t: socclk clock level: 1: (1280Mhz)\nGPU[1]\t\t: pcie clock level: 2 (32.0GT/s x16)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[1]\t\t: Average Graphics Package Power (W): 311.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n",
+      "\n\n============================ ROCm System Management Interface ============================\n====================================== Temperature =======================================\nGPU[1]\t\t: Temperature (Sensor edge) (C): 44.0\nGPU[1]\t\t: Temperature (Sensor junction) (C): 61.0\nGPU[1]\t\t: Temperature (Sensor memory) (C): 54.0\n==========================================================================================\n=============================== Current clock frequencies ================================\nGPU[1]\t\t: dcefclk clock level: 1: (219Mhz)\nGPU[1]\t\t: fclk clock level: 1: (2016Mhz)\nGPU[1]\t\t: mclk clock level: 5: (1258Mhz)\nGPU[1]\t\t: sclk clock level: 1: (2568Mhz)\nGPU[1]\t\t: socclk clock level: 1: (1280Mhz)\nGPU[1]\t\t: pcie clock level: 2 (32.0GT/s x16)\n==========================================================================================\n=================================== Power Consumption ====================================\nGPU[1]\t\t: Average Graphics Package Power (W): 313.0\n==========================================================================================\n================================== End of ROCm SMI Log ===================================\n"
+    ],
+    "note": "The initial R9700 telemetry polled management index 3, not HIP index 3. Those idle readings are excluded; PCI mapping resolved management index 1."
+  },
+  "next_experiment": "On XTX, compare legal residual K-split configurations under the same resident/streaming protocol for out/down, using production ks4 as control; only change shape-specific dispatch if parity and full-model HIP timing corroborate. Investigate weight-load scheduling if split tuning does not recover streaming throughput.",
+  "limitations": [
+    "Logical weight throughput is not measured physical DRAM bandwidth.",
+    "Synthetic operator probes are not an end-to-end tok/s result or proof of 450 tok/s attainability.",
+    "Observed normal loaded clocks do not exclude all power/thermal effects."
+  ]
+}

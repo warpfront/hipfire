@@ -1,0 +1,473 @@
+warning: field `cpu` is never read
+    --> crates/redline-rocr/src/runtime.rs:1683:5
+     |
+1679 | struct KernargPoolInner {
+     |        ---------------- field in this struct
+...
+1683 |     cpu: Option<abi::Agent>,
+     |     ^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `device_local` is never read
+    --> crates/redline-rocr/src/runtime.rs:2094:5
+     |
+2092 | pub struct KernargBuffer {
+     |            ------------- field in this struct
+2093 |     pool: Arc<KernargPoolInner>,
+2094 |     device_local: bool,
+     |     ^^^^^^^^^^^^
+
+warning: `redline-rocr` (lib) generated 2 warnings
+warning: method `replay_and_wait_inner` is never used
+   --> crates/redline-dispatch/src/aql/replay.rs:606:15
+    |
+ 91 | impl SingleQueuePm4Ib {
+    | --------------------- method in this implementation
+...
+606 |     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `redline-dispatch` (lib) generated 1 warning
+   Compiling rdna-compute v0.3.0 (/home/kaden/ClaudeCode/warpfront/hipfire-xtx-baseline/crates/rdna-compute)
+warning: unused import: `std::ffi::c_void`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:19:5
+   |
+19 | use std::ffi::c_void;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `GpuTensor` and `Gpu`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:21:23
+   |
+21 | use crate::dispatch::{Gpu, GpuTensor};
+   |                       ^^^  ^^^^^^^^^
+
+warning: unused import: `hip_bridge::HipResult`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:22:5
+   |
+22 | use hip_bridge::HipResult;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/attention.rs:7975:13
+     |
+7975 |         let func = &self.functions["kv_cache_write"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/gemm.rs:27108:13
+      |
+27108 |         let func = &self.functions["gemv_q8_0_moe_gate_up_k8_indexed"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:372:5
+    |
+372 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:389:5
+    |
+389 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:454:9
+    |
+454 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:479:9
+    |
+479 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:504:9
+    |
+504 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:523:9
+    |
+523 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:828:9
+    |
+828 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:855:9
+    |
+855 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:882:9
+    |
+882 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:902:9
+    |
+902 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `func`
+   --> crates/rdna-compute/src/norm.rs:786:13
+    |
+786 |         let func = &self.functions["rope_f32"];
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:4852:13
+     |
+4852 |         let func = &self.functions["bias_add_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/replay.rs:4532:13
+     |
+4532 |         let mut dynamic_gdn_frames = Vec::new();
+     |             ----^^^^^^^^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `N_TILE` is never used
+    --> crates/rdna-compute/src/attention.rs:2891:15
+     |
+2891 |         const N_TILE: usize = 16;
+     |               ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `GEMV_MQ6G256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1055:11
+     |
+1055 | pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+     |           ^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ5G256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1061:11
+     |
+1061 | pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
+     |           ^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ5G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4425:11
+     |
+4425 | pub const FUSED_QKV_MQ5G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ6G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4432:11
+     |
+4432 | pub const FUSED_QKV_MQ6G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ3G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4439:11
+     |
+4439 | pub const FUSED_QKV_MQ3G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ2G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4446:11
+     |
+4446 | pub const FUSED_QKV_MQ2G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `DYNAMIC_CAUSAL_CONV_F32_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4930:11
+     |
+4930 | pub const DYNAMIC_CAUSAL_CONV_F32_SRC: &str = DYNAMIC_CONV_F32_SRC;
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_FAST_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5951:11
+     |
+5951 | pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B2_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5957:11
+     |
+5957 | pub const GATED_DELTA_NET_Q8_COMPACT2_B2_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT3_B2_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5961:11
+     |
+5961 | pub const GATED_DELTA_NET_Q8_COMPACT3_B2_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B4_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5965:11
+     |
+5965 | pub const GATED_DELTA_NET_Q8_COMPACT2_B4_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B8_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5969:11
+     |
+5969 | pub const GATED_DELTA_NET_Q8_COMPACT2_B8_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B12_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5973:11
+     |
+5973 | pub const GATED_DELTA_NET_Q8_COMPACT2_B12_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B16_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5977:11
+     |
+5977 | pub const GATED_DELTA_NET_Q8_COMPACT2_B16_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5985:11
+     |
+5985 | pub const GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5993:11
+     |
+5993 | pub const GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6000:11
+     |
+6000 | pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B32_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6071:11
+     |
+6071 | pub const CONV1D_SILU_SPLIT_QKNORM_B32_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B64_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6075:11
+     |
+6075 | pub const CONV1D_SILU_SPLIT_QKNORM_B64_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B128_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6079:11
+     |
+6079 | pub const CONV1D_SILU_SPLIT_QKNORM_B128_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6083:11
+     |
+6083 | pub const CONV1D_SILU_SPLIT_QKNORM_B256_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6087:11
+     |
+6087 | pub const CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6093:11
+     |
+6093 | pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `REPEAT_INTERLEAVE_QK_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6408:11
+     |
+6408 | pub const REPEAT_INTERLEAVE_QK_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6458:11
+     |
+6458 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6460:11
+     |
+6460 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6462:11
+     |
+6462 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6467:11
+     |
+6467 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6469:11
+     |
+6469 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6471:11
+     |
+6471 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6473:11
+     |
+6473 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6475:11
+     |
+6475 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6849:11
+     |
+6849 | pub const V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMM_HFQ4G256_WMMA_GFX12_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7087:11
+     |
+7087 | pub const GEMM_HFQ4G256_WMMA_GFX12_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_ASYM3_TILE_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7103:11
+     |
+7103 | pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7105:11
+     |
+7105 | pub const ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7107:11
+     |
+7107 | pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7109:11
+     |
+7109 | pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_FWHT3_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7111:11
+     |
+7111 | pub const KV_CACHE_WRITE_FWHT3_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7113:11
+     |
+7113 | pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_FWHT3_TILE_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7115:11
+     |
+7115 | pub const ATTENTION_FLASH_FWHT3_TILE_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7117:11
+     |
+7117 | pub const ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dn_requant_per_token` is never used
+  --> crates/rdna-compute/src/norm.rs:48:4
+   |
+48 | fn dn_requant_per_token() -> bool {
+   |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:360:5
+    |
+358 | struct RawKernelMeta {
+    |        ------------- field in this struct
+359 |     pgm_rsrc1: u32,
+360 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+warning: constant `FA_PREP_BATCHED_SRC` is never used
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:24:7
+   |
+24 | const FA_PREP_BATCHED_SRC: &str =
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_PAIR_BATCHED_SRC` is never used
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:26:7
+   |
+26 | const KV_PAIR_BATCHED_SRC: &str =
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: method `replay_and_wait_profiled` is never used
+    --> crates/rdna-compute/src/replay.rs:3565:15
+     |
+3564 | impl PreparedPm4Graph {
+     | --------------------- method in this implementation
+3565 |     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sample_top_p_parallel_precompile_specs` is never used
+  --> crates/rdna-compute/src/sampling.rs:68:15
+   |
+68 | pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String); 4] {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `use_blob_path` is never used
+   --> crates/rdna-compute/src/scratch.rs:255:15
+    |
+255 | pub(crate) fn use_blob_path(is_recording: bool, capture_mode: bool, force_blob_path: bool) -> bool {
+    |               ^^^^^^^^^^^^^
+
+warning: unused `Result` that must be used
+     --> crates/rdna-compute/src/gemv.rs:12025:9
+      |
+12025 |         crate::profile::end_timer(&self.hip, timer);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+12025 |         let _ = crate::profile::end_timer(&self.hip, timer);
+      |         +++++++
+
+warning: `rdna-compute` (lib) generated 69 warnings (run `cargo fix --lib -p rdna-compute` to apply 18 suggestions)
+    Finished `release` profile [optimized] target(s) in 36.75s
+     Running `target/release/examples/xtx_gateup_ldsstage_flag_smoke`

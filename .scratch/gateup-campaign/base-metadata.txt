@@ -1,0 +1,70 @@
+Displaying notes found in: .note
+  Owner                Data size 	Description
+  AMDGPU               0x00000454	NT_AMDGPU_METADATA (AMDGPU Metadata)
+    AMDGPU Metadata:
+        ---
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         40
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         44
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         48
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         52
+        .size:           4
+        .value_kind:     by_value
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 56
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 32
+    .name:           gemm_gate_up_mq4g256v2_wmma
+    .private_segment_fixed_size: 0
+    .sgpr_count:     22
+    .sgpr_spill_count: 0
+    .symbol:         gemm_gate_up_mq4g256v2_wmma.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     72
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
+amdhsa.version:
+  - 1
+  - 2
+...
+

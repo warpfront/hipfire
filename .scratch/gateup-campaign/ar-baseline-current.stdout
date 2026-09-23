@@ -1,0 +1,5 @@
+loaded arch=qwen3_5 dim=5120 layers=64 vocab=248320
+decode: stable=True launches=659 kernels=16 hash=92ede73d35f4a51f median=47.0 tok/s
+aql-contracts: kernels=16
+shadow: backend=aql_packets exact=False gdn_frame_exact=True aql=21703.5us hip=21111.2us
+report=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/ar-baseline-current-harness.json pass=False

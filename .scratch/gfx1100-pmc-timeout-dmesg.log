@@ -1,0 +1,797 @@
+[Fri Sep  4 07:54:32 2026] KHO: Failed to reserve lowmem scratch buffer
+[Fri Sep  4 07:54:32 2026] KHO: Failed to reserve scratch area, disabling kexec handover
+[Fri Sep  4 07:54:32 2026] ACPI BIOS Error (bug): Could not resolve symbol [\_SB.PCI0.GPP9.DEV0], AE_NOT_FOUND (20251212/dswload2-162)
+[Fri Sep  4 07:54:32 2026] ACPI Error: AE_NOT_FOUND, During name lookup/catalog (20251212/psobject-220)
+[Fri Sep  4 07:54:32 2026] ACPI: IRQ 1 override to edge, low(!)
+[Fri Sep  4 07:54:32 2026] i8042: PNP: PS/2 appears to have AUX port disabled, if this is incorrect please boot with i8042.nopnp
+[Fri Sep  4 07:54:32 2026] thunderbolt 0000:69:00.0: host router reset successful
+[Fri Sep  4 07:54:33 2026] thunderbolt 0000:69:00.0: 3: DROM data CRC32 mismatch (expected: 0x9eccf4c0, got: 0xe3e40285), continuing
+[Fri Sep  4 07:54:33 2026] thunderbolt 0000:69:00.0: 3: DROM buffer overrun
+[Fri Sep  4 07:54:33 2026] thunderbolt 0000:69:00.0: 3: parsing DROM failed
+[Fri Sep  4 07:54:33 2026] thunderbolt 0-3: reading DROM failed: -5
+[Fri Sep  4 07:54:33 2026] thunderbolt 0000:69:00.0: 1: DROM data CRC32 mismatch (expected: 0x9eccf4c0, got: 0xe3e40285), continuing
+[Fri Sep  4 07:54:33 2026] thunderbolt 0000:69:00.0: 1: DROM buffer overrun
+[Fri Sep  4 07:54:33 2026] thunderbolt 0000:69:00.0: 1: parsing DROM failed
+[Fri Sep  4 07:54:33 2026] thunderbolt 0-1: reading DROM failed: -5
+[Fri Sep  4 07:54:35 2026] systemd-journald[872]: File /var/log/journal/81a00ef9b5d8439f8bebb6327cdb8d11/system.journal corrupted or uncleanly shut down, renaming and replacing.
+[Fri Sep  4 07:54:37 2026] kauditd_printk_skb: 173 callbacks suppressed
+[Fri Sep  4 07:54:37 2026] nvme nvme0: using unchecked data buffer
+[Fri Sep  4 07:54:37 2026] snd_hda_intel 0000:66:00.1: GPU sound probed, but not operational: please add a quirk to driver_denylist
+[Fri Sep  4 07:54:39 2026] iommu ivhd0: AMD-Vi: Event logged [IOTLB_INV_TIMEOUT device=0000:99:00.0 address=0x1006585f0]
+[Fri Sep  4 07:54:39 2026] pcieport 0000:67:00.0: bridge window [mem 0x8820000000-0x98200fffff 64bit pref]: was not released (still contains assigned resources)
+[Fri Sep  4 07:54:39 2026] pcieport 0000:00:03.2: bridge window [mem 0x8820000000-0x98200fffff 64bit pref]: was not released (still contains assigned resources)
+[Fri Sep  4 07:54:42 2026] pcieport 0000:67:00.0: bridge window [mem 0x8820000000-0x98200fffff 64bit pref]: was not released (still contains assigned resources)
+[Fri Sep  4 07:54:42 2026] pcieport 0000:00:03.2: bridge window [mem 0x8820000000-0x98200fffff 64bit pref]: was not released (still contains assigned resources)
+[Fri Sep  4 07:54:42 2026] systemd-journald[872]: File /var/log/journal/81a00ef9b5d8439f8bebb6327cdb8d11/user-1000.journal corrupted or uncleanly shut down, renaming and replacing.
+[Fri Sep  4 07:54:42 2026] nfs4: Deprecated parameter 'intr'
+[Fri Sep  4 07:54:42 2026] amdgpu 0000:99:00.0: Fence fallback timer expired on ring sdma0
+[Fri Sep  4 07:54:43 2026] amdgpu 0000:99:00.0: Fence fallback timer expired on ring sdma0
+[Fri Sep  4 07:54:43 2026] snd_hda_intel 0000:6e:00.1: GPU sound probed, but not operational: please add a quirk to driver_denylist
+[Fri Sep  4 07:54:43 2026] snd_hda_intel 0000:99:00.1: GPU sound probed, but not operational: please add a quirk to driver_denylist
+[Fri Sep  4 07:54:44 2026] iommu ivhd0: AMD-Vi: Event logged [IOTLB_INV_TIMEOUT device=0000:99:00.0 address=0x100658b00]
+[Fri Sep  4 07:54:45 2026] iommu ivhd0: AMD-Vi: Event logged [IOTLB_INV_TIMEOUT device=0000:99:00.0 address=0x100658c00]
+[Fri Sep  4 09:07:52 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 09:08:29 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:13:32 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 7 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:14:53 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:14:53 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:14:54 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 7 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:14:55 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 11 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:17:24 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:17:37 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 19 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:17:37 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:17:37 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:17:41 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 7 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:17:43 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 11 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 10:30:11 2026] hrtimer: interrupt took 33863 ns
+[Fri Sep  4 11:18:40 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 35 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 11:19:59 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 11:21:34 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 11 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 11:27:22 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 19 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 11:42:45 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 7 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 14:46:53 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 67 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 14:49:02 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 19 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 15:26:47 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 11 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 15:27:07 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 35 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 17:25:38 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 131 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 17:25:38 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 35 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 17:29:08 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 19 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 18:03:06 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 67 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 20:00:23 2026] workqueue: inode_switch_wbs_work_fn hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 20:12:55 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 35 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 21:33:00 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 67 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 21:33:56 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 259 times, consider switching to WQ_UNBOUND
+[Fri Sep  4 23:40:16 2026] workqueue: svm_range_deferred_list_work [amdgpu] hogged CPU for >10000us 131 times, consider switching to WQ_UNBOUND
+[Sat Sep  5 02:31:13 2026] workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 515 times, consider switching to WQ_UNBOUND
+[Mon Sep  7 04:46:43 2026] workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 67 times, consider switching to WQ_UNBOUND
+[Mon Sep  7 04:47:28 2026] workqueue: svm_range_evict_svm_bo_worker [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[Mon Sep  7 04:48:50 2026] workqueue: svm_range_evict_svm_bo_worker [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+[Mon Sep  7 04:50:21 2026] workqueue: svm_range_evict_svm_bo_worker [amdgpu] hogged CPU for >10000us 7 times, consider switching to WQ_UNBOUND
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x000000010f812000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x00701431
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: 	 Faulty UTCL2 client ID: SQC (data) (0xa)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: 	 MORE_FAULTS: 0x1
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: 	 WALKER_ERROR: 0x0
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: 	 PERMISSION_FAULTS: 0x3
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: 	 MAPPING_ERROR: 0x0
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: 	 RW: 0x0
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x000000016a9a3000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001910c5000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001c6aff000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001a1591000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x0000000130fc4000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x000000019873b000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x0000ffd700000000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x0000ffd600000000 from client 10
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:7 pasid:3313)
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:29 2026] amdgpu 0000:66:00.0:   in page starting at address 0x0000ffd500000000 from client 10
+[Mon Sep  7 21:10:31 2026] amdgpu 0000:66:00.0: ring comp_1.1.0 timeout, signaled seq=146, emitted seq=147
+[Mon Sep  7 21:10:31 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:31 2026] amdgpu 0000:66:00.0: Starting comp_1.1.0 ring reset
+[Mon Sep  7 21:10:31 2026] amdgpu 0000:66:00.0: Ring comp_1.1.0 reset succeeded
+[Mon Sep  7 21:10:33 2026] amdgpu 0000:66:00.0: ring comp_1.2.0 timeout, signaled seq=89, emitted seq=90
+[Mon Sep  7 21:10:33 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605394 thread poc_lds_probe pid 1605394
+[Mon Sep  7 21:10:33 2026] amdgpu 0000:66:00.0: Starting comp_1.2.0 ring reset
+[Mon Sep  7 21:10:33 2026] amdgpu 0000:66:00.0: Ring comp_1.2.0 reset succeeded
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: ring comp_1.1.0 timeout, signaled seq=148, emitted seq=149
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: Starting comp_1.1.0 ring reset
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: Ring comp_1.1.0 reset succeeded
+[Mon Sep  7 21:10:35 2026] gmc_v11_0_process_interrupt: 45 callbacks suppressed
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001175b8000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x00701431
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: 	 Faulty UTCL2 client ID: SQC (data) (0xa)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: 	 MORE_FAULTS: 0x1
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: 	 WALKER_ERROR: 0x0
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: 	 PERMISSION_FAULTS: 0x3
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: 	 MAPPING_ERROR: 0x0
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: 	 RW: 0x0
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001f639b000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001f7159000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001f9994000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001e3e6a000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001b0e5f000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001ed6dc000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x000000019a933000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001ef30f000 from client 10
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:7 pasid:3314)
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:35 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00000001f6b7b000 from client 10
+[Mon Sep  7 21:10:37 2026] amdgpu 0000:66:00.0: ring comp_1.2.0 timeout, signaled seq=91, emitted seq=92
+[Mon Sep  7 21:10:37 2026] amdgpu 0000:66:00.0:  Process poc_lds_probe pid 1605430 thread poc_lds_probe pid 1605430
+[Mon Sep  7 21:10:37 2026] amdgpu 0000:66:00.0: Starting comp_1.2.0 ring reset
+[Mon Sep  7 21:10:37 2026] amdgpu 0000:66:00.0: Ring comp_1.2.0 reset succeeded
+[Tue Sep  8 01:14:23 2026] x86/split lock detection: #DB: gemv_mq4_ab/1686940 took a bus_lock trap at address: 0x7a84a1c15321
+[Tue Sep  8 01:14:23 2026] x86/split lock detection: #DB: gemv_mq4_ab/1686940 took a bus_lock trap at address: 0x7a84a1c249a3
+[Tue Sep  8 01:14:23 2026] x86/split lock detection: #DB: gemv_mq4_ab/1686940 took a bus_lock trap at address: 0x7a84a1c249a3
+[Tue Sep  8 01:16:11 2026] x86/split lock detection: #DB: gemv_mq4_ab/1687972 took a bus_lock trap at address: 0x7ebdf2215321
+[Tue Sep  8 01:16:11 2026] x86/split lock detection: #DB: gemv_mq4_ab/1687972 took a bus_lock trap at address: 0x7ebdf22249a3
+[Tue Sep  8 01:16:11 2026] x86/split lock detection: #DB: gemv_mq4_ab/1687972 took a bus_lock trap at address: 0x7ebdf22249a3
+[Tue Sep  8 01:44:45 2026] [drm:gfx_v11_0_bad_op_irq [amdgpu]] *ERROR* Illegal opcode in command stream
+[Tue Sep  8 01:44:45 2026] amdgpu 0000:66:00.0: ring comp_1.1.0 timeout, signaled seq=554, emitted seq=555
+[Tue Sep  8 01:44:45 2026] amdgpu 0000:66:00.0:  Process poc_gemv_ab pid 1696855 thread poc_gemv_ab pid 1696855
+[Tue Sep  8 01:44:45 2026] amdgpu 0000:66:00.0: Starting comp_1.1.0 ring reset
+[Tue Sep  8 01:44:45 2026] amdgpu 0000:66:00.0: Ring comp_1.1.0 reset succeeded
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:59 2026] handle_bus_lock: 467 callbacks suppressed
+[Tue Sep  8 04:58:59 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:58:59 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:01 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:02 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:03 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:04 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:07 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:08 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:08 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:08 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:09 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:09 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:11 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:15 2026] handle_bus_lock: 33 callbacks suppressed
+[Tue Sep  8 04:59:15 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:15 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:16 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:17 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:18 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:20 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:25 2026] handle_bus_lock: 1068 callbacks suppressed
+[Tue Sep  8 04:59:25 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:26 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:28 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:29 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] handle_bus_lock: 9 callbacks suppressed
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:30 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:32 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:32 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:36 2026] handle_bus_lock: 189 callbacks suppressed
+[Tue Sep  8 04:59:36 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:36 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:36 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:36 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:37 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:37 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:37 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:38 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:38 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:39 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:41 2026] handle_bus_lock: 1 callbacks suppressed
+[Tue Sep  8 04:59:41 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:41 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:41 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:41 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:42 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:42 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:42 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:42 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:42 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:42 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:46 2026] handle_bus_lock: 20 callbacks suppressed
+[Tue Sep  8 04:59:46 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:46 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:47 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:52 2026] handle_bus_lock: 16752 callbacks suppressed
+[Tue Sep  8 04:59:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:52 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:53 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:53 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:53 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:54 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:55 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:55 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:55 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:55 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] handle_bus_lock: 2 callbacks suppressed
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 04:59:58 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:03 2026] handle_bus_lock: 27 callbacks suppressed
+[Tue Sep  8 05:00:03 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:04 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:00:06 2026] x86/split lock detection: #DB: daemon/1759572 took a bus_lock trap at address: 0x78dda0015321
+[Tue Sep  8 05:04:29 2026] handle_bus_lock: 847 callbacks suppressed
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 05:04:29 2026] x86/split lock detection: #DB: dflash_spec_dem/1772771 took a bus_lock trap at address: 0x75c735c15321
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:01:27 2026] gmc_v11_0_process_interrupt: 22 callbacks suppressed
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e03000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x00841051
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: 	 MORE_FAULTS: 0x1
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: 	 WALKER_ERROR: 0x0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: 	 PERMISSION_FAULTS: 0x5
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: 	 MAPPING_ERROR: 0x0
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: 	 RW: 0x1
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e08000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e0e000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e14000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e09000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e1a000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e0f000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e15000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e1b000 from client 10
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10684)
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:  Process daemon pid 1794379 thread daemon pid 1794379
+[Tue Sep  8 06:01:27 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007b71c7e04000 from client 10
+[Tue Sep  8 06:05:04 2026] print_sq_intr_info_error: 2550 callbacks suppressed
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 2, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 2, simd_id 0, wgp_id 0
+[Tue Sep  8 06:05:04 2026] gmc_v11_0_process_interrupt: 232 callbacks suppressed
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b807000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x00841051
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: 	 MORE_FAULTS: 0x1
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: 	 WALKER_ERROR: 0x0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: 	 PERMISSION_FAULTS: 0x5
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: 	 MAPPING_ERROR: 0x0
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: 	 RW: 0x1
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b802000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b80d000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b813000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b808000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b80e000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b819000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b814000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b803000 from client 10
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10692)
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:  Process daemon pid 1796263 thread daemon pid 1796263
+[Tue Sep  8 06:05:04 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007eec2b81a000 from client 10
+[Tue Sep  8 06:30:13 2026] workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 131 times, consider switching to WQ_UNBOUND
+[Tue Sep  8 07:39:32 2026] print_sq_intr_info_error: 2550 callbacks suppressed
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 2, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 0, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 0, wave_id 1, simd_id 0, wgp_id 0
+[Tue Sep  8 07:39:32 2026] gmc_v11_0_process_interrupt: 264 callbacks suppressed
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b804000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x00841051
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: 	 MORE_FAULTS: 0x1
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: 	 WALKER_ERROR: 0x0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: 	 PERMISSION_FAULTS: 0x5
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: 	 MAPPING_ERROR: 0x0
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: 	 RW: 0x1
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b806000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b80c000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b80a000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b812000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b810000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b816000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b818000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b81c000 from client 10
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0: [gfxhub] page fault (src_id:0 ring:40 vmid:8 pasid:10980)
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:  Process daemon pid 1837949 thread daemon pid 1837949
+[Tue Sep  8 07:39:32 2026] amdgpu 0000:66:00.0:   in page starting at address 0x00007ef88b805000 from client 10
+[Tue Sep  8 08:38:46 2026] handle_bus_lock: 12553 callbacks suppressed
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:38:46 2026] x86/split lock detection: #DB: dflash_spec_dem/1868305 took a bus_lock trap at address: 0x7fa0e8415321
+[Tue Sep  8 08:59:01 2026] handle_bus_lock: 12553 callbacks suppressed
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:01 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a15321
+[Tue Sep  8 08:59:05 2026] print_sq_intr_info_error: 2550 callbacks suppressed
+[Tue Sep  8 08:59:05 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 1, priv 1, wave_id 9, simd_id 0, wgp_id 0
+[Tue Sep  8 08:59:05 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 1, sh 0, priv 1, wave_id 7, simd_id 0, wgp_id 0
+[Tue Sep  8 08:59:05 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 1, sh 0, priv 1, wave_id 10, simd_id 0, wgp_id 0
+[Tue Sep  8 08:59:05 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 1, wave_id 8, simd_id 0, wgp_id 0
+[Tue Sep  8 08:59:05 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 0, priv 1, wave_id 9, simd_id 0, wgp_id 0
+[Tue Sep  8 08:59:05 2026] amdgpu 0000:66:00.0: sq_intr: error, detail 0x00000000, type 2, sh 1, priv 1, wave_id 9, simd_id 0, wgp_id 0
+[Tue Sep  8 08:59:06 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:06 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:06 2026] in params:00000009
+[Tue Sep  8 08:59:06 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:06 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:06 2026] in params:00000009
+[Tue Sep  8 08:59:07 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:07 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:07 2026] in params:00000009
+[Tue Sep  8 08:59:07 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:07 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:07 2026] in params:00000009
+[Tue Sep  8 08:59:10 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:10 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:10 2026] in params:00000005
+[Tue Sep  8 08:59:10 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:10 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:10 2026] in params:00000005
+[Tue Sep  8 08:59:11 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:11 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:11 2026] in params:00000009
+[Tue Sep  8 08:59:11 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:11 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:11 2026] in params:00000009
+[Tue Sep  8 08:59:15 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:15 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:15 2026] in params:00000005
+[Tue Sep  8 08:59:15 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:15 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:15 2026] in params:00000005
+[Tue Sep  8 08:59:20 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:20 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:20 2026] in params:00000005
+[Tue Sep  8 08:59:20 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:20 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:20 2026] in params:00000005
+[Tue Sep  8 08:59:22 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:22 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:22 2026] in params:00000009
+[Tue Sep  8 08:59:22 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:22 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:22 2026] in params:00000009
+[Tue Sep  8 08:59:24 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:24 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:24 2026] in params:00000009
+[Tue Sep  8 08:59:24 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:24 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:24 2026] in params:00000009
+[Tue Sep  8 08:59:25 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:25 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:25 2026] in params:00000005
+[Tue Sep  8 08:59:25 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:25 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:25 2026] in params:00000005
+[Tue Sep  8 08:59:27 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:27 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:27 2026] in params:00000009
+[Tue Sep  8 08:59:27 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:27 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableDram2Smu(19) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:27 2026] in params:00000009
+[Tue Sep  8 08:59:30 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:30 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:30 2026] in params:00000005
+[Tue Sep  8 08:59:30 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:30 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:30 2026] in params:00000005
+[Tue Sep  8 08:59:35 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:35 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:35 2026] in params:00000005
+[Tue Sep  8 08:59:35 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:35 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:35 2026] in params:00000005
+[Tue Sep  8 08:59:40 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:40 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:40 2026] in params:00000005
+[Tue Sep  8 08:59:40 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:40 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:40 2026] in params:00000005
+[Tue Sep  8 08:59:45 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:45 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:45 2026] in params:00000005
+[Tue Sep  8 08:59:45 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:45 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:45 2026] in params:00000005
+[Tue Sep  8 08:59:50 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:50 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:50 2026] in params:00000005
+[Tue Sep  8 08:59:50 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:50 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:50 2026] in params:00000005
+[Tue Sep  8 08:59:55 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:55 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:55 2026] in params:00000005
+[Tue Sep  8 08:59:55 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 08:59:55 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 08:59:55 2026] in params:00000005
+[Tue Sep  8 09:00:00 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:00 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:00 2026] in params:00000005
+[Tue Sep  8 09:00:00 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:00 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:00 2026] in params:00000005
+[Tue Sep  8 09:00:05 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:05 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:05 2026] in params:00000005
+[Tue Sep  8 09:00:05 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:05 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:05 2026] in params:00000005
+[Tue Sep  8 09:00:10 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:10 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:10 2026] in params:00000005
+[Tue Sep  8 09:00:10 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:10 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:10 2026] in params:00000005
+[Tue Sep  8 09:00:15 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:15 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:15 2026] in params:00000005
+[Tue Sep  8 09:00:15 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:15 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:15 2026] in params:00000005
+[Tue Sep  8 09:00:20 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:20 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:20 2026] in params:00000005
+[Tue Sep  8 09:00:20 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:20 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:20 2026] in params:00000005
+[Tue Sep  8 09:00:25 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:25 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:25 2026] in params:00000005
+[Tue Sep  8 09:00:25 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:25 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:25 2026] in params:00000005
+[Tue Sep  8 09:00:30 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:30 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:30 2026] in params:00000005
+[Tue Sep  8 09:00:30 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:30 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:30 2026] in params:00000005
+[Tue Sep  8 09:00:36 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:36 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:36 2026] in params:00000005
+[Tue Sep  8 09:00:36 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:36 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:36 2026] in params:00000005
+[Tue Sep  8 09:00:41 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:41 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:41 2026] in params:00000005
+[Tue Sep  8 09:00:41 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:41 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:41 2026] in params:00000005
+[Tue Sep  8 09:00:46 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:46 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:46 2026] in params:00000005
+[Tue Sep  8 09:00:46 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:46 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:46 2026] in params:00000005
+[Tue Sep  8 09:00:51 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:51 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:51 2026] in params:00000005
+[Tue Sep  8 09:00:51 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:51 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:51 2026] in params:00000005
+[Tue Sep  8 09:00:56 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:56 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:56 2026] in params:00000005
+[Tue Sep  8 09:00:56 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:00:56 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:00:56 2026] in params:00000005
+[Tue Sep  8 09:01:01 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:01 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:01 2026] in params:00000005
+[Tue Sep  8 09:01:01 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:01 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:01 2026] in params:00000005
+[Tue Sep  8 09:01:06 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:06 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:06 2026] in params:00000005
+[Tue Sep  8 09:01:06 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:06 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:06 2026] in params:00000005
+[Tue Sep  8 09:01:11 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:11 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:11 2026] in params:00000005
+[Tue Sep  8 09:01:11 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:11 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:11 2026] in params:00000005
+[Tue Sep  8 09:01:16 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:16 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:16 2026] in params:00000005
+[Tue Sep  8 09:01:16 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:16 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:16 2026] in params:00000005
+[Tue Sep  8 09:01:21 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:21 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:21 2026] in params:00000005
+[Tue Sep  8 09:01:21 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:21 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:21 2026] in params:00000005
+[Tue Sep  8 09:01:26 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:26 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:26 2026] in params:00000005
+[Tue Sep  8 09:01:26 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:26 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:26 2026] in params:00000005
+[Tue Sep  8 09:01:31 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:31 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:31 2026] in params:00000005
+[Tue Sep  8 09:01:31 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:31 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:31 2026] in params:00000005
+[Tue Sep  8 09:01:36 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:36 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:36 2026] in params:00000005
+[Tue Sep  8 09:01:36 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:36 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:36 2026] in params:00000005
+[Tue Sep  8 09:01:41 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:41 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:41 2026] in params:00000005
+[Tue Sep  8 09:01:41 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:41 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:41 2026] in params:00000005
+[Tue Sep  8 09:01:46 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:46 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:46 2026] in params:00000005
+[Tue Sep  8 09:01:46 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:46 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:46 2026] in params:00000005
+[Tue Sep  8 09:01:51 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:51 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:51 2026] in params:00000005
+[Tue Sep  8 09:01:51 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:51 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:51 2026] in params:00000005
+[Tue Sep  8 09:01:56 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:56 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:56 2026] in params:00000005
+[Tue Sep  8 09:01:56 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:01:56 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:01:56 2026] in params:00000005
+[Tue Sep  8 09:02:01 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:01 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:01 2026] in params:00000005
+[Tue Sep  8 09:02:01 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:01 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:01 2026] in params:00000005
+[Tue Sep  8 09:02:06 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:06 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:06 2026] in params:00000005
+[Tue Sep  8 09:02:06 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:06 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:06 2026] in params:00000005
+[Tue Sep  8 09:02:11 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:11 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:11 2026] in params:00000005
+[Tue Sep  8 09:02:11 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:11 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:11 2026] in params:00000005
+[Tue Sep  8 09:02:16 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:16 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:16 2026] in params:00000005
+[Tue Sep  8 09:02:16 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:16 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:16 2026] in params:00000005
+[Tue Sep  8 09:02:21 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:21 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:21 2026] in params:00000005
+[Tue Sep  8 09:02:21 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:21 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:21 2026] in params:00000005
+[Tue Sep  8 09:02:24 2026] handle_bus_lock: 8740 callbacks suppressed
+[Tue Sep  8 09:02:24 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a249a3
+[Tue Sep  8 09:02:24 2026] x86/split lock detection: #DB: dflash_spec_dem/1876149 took a bus_lock trap at address: 0x772f14a249a3
+[Tue Sep  8 09:02:26 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:26 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:26 2026] in params:00000005
+[Tue Sep  8 09:02:26 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:26 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:26 2026] in params:00000005
+[Tue Sep  8 09:02:31 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:31 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:31 2026] in params:00000005
+[Tue Sep  8 09:02:31 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:31 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:31 2026] in params:00000005
+[Tue Sep  8 09:02:36 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:36 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:36 2026] in params:00000005
+[Tue Sep  8 09:02:36 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:36 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:36 2026] in params:00000005
+[Tue Sep  8 09:02:41 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:41 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:41 2026] in params:00000005
+[Tue Sep  8 09:02:41 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:41 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:41 2026] in params:00000005
+[Tue Sep  8 09:02:46 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:46 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:46 2026] in params:00000005
+[Tue Sep  8 09:02:46 2026] amdgpu 0000:66:00.0: device lost from bus!
+[Tue Sep  8 09:02:46 2026] amdgpu 0000:66:00.0: SMU: bus error for message: TransferTableSmu2Dram(18) response:0xFFFFFFFF 
+[Tue Sep  8 09:02:46 2026] in params:00000005

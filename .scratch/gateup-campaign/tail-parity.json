@@ -1,0 +1,26 @@
+[
+  {
+    "reference": "tail-n1-base",
+    "candidate": "tail-n1-ldsstage",
+    "elements": 93,
+    "relative_l2": 8.62984977302422e-07,
+    "max_abs": 4.57763671875e-05,
+    "bit_identical": false
+  },
+  {
+    "reference": "tail-n8-base",
+    "candidate": "tail-n8-ldsstage",
+    "elements": 744,
+    "relative_l2": 1.2578479592755238e-06,
+    "max_abs": 0.000152587890625,
+    "bit_identical": false
+  },
+  {
+    "reference": "tail-n16-base",
+    "candidate": "tail-n16-ldsstage",
+    "elements": 1488,
+    "relative_l2": 1.1545741670685236e-06,
+    "max_abs": 0.000152587890625,
+    "bit_identical": false
+  }
+]

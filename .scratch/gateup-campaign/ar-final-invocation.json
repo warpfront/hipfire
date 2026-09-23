@@ -1,0 +1,35 @@
+{
+  "argv": [
+    "python3",
+    "/home/kaden/xtx-gfx1100-baseline/scripts/redline_daemon_harness.py",
+    "--model",
+    "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "--daemon",
+    "/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/final-bin/daemon",
+    "--skip-prefill",
+    "--kv-mode",
+    "q8",
+    "--decode-context",
+    "128",
+    "--capture-repeats",
+    "2",
+    "--measure-repeats",
+    "5",
+    "--decode-iterations",
+    "100",
+    "--shadow-iterations",
+    "1",
+    "--max-seq",
+    "2048",
+    "--timeout",
+    "120",
+    "--log",
+    "/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/ar-final.log",
+    "--out",
+    "/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/ar-final-harness.json"
+  ],
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0"
+  },
+  "returncode": 1
+}

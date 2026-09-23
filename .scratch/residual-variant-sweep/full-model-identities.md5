@@ -1,0 +1,6 @@
+213a0bcc8b67e2e981ddf36cd0eb13d9  /home/kaden/xtx-gfx1100-baseline/target/release/hipfire
+9e1d8edfbade9f22d79ff0200626e530  /home/kaden/xtx-gfx1100-baseline/target/release/daemon
+95806308c8567ded2d848c7e4eea7b48  /home/kaden/xtx-gfx1100-baseline/target/release/examples/dflash_spec_demo
+253c7ac50857fe6d0e10fb0d2c5e35c0  /home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt
+e45d15bfe0c9a87132697101d17cbed6  /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+013395583cd04206c8aa68f4d061983d  /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq

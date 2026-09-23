@@ -1,0 +1,35 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+  registry tag  : qwen3.8:27b
+  kv_mode       : q8 [explicit(--kv)]   kv_backend: vmm [explicit(--kv-backend)]   mtp_mode: off   mode: chain
+  max_seq       : 4096 [explicit(--max-seq)]
+  dflash        : on   draft: /home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 256 [explicit(--max-tokens)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.8-27b.mq4-xt|off|chain  kv=q8 sampling={'temperature': 0.0} seed=None ###
+  [code]t1  finish=stop   ctx=84     cached=0      gen=200  (think 60/ans 47w) prefill=9967.3ms/8.4tok/s decode=14.1tok/s tau=5.06 | '```python\ndef merge_sorted(a, b):\n    """Merge two sorted lists into a single sorted list.'
+  [reason]t2  finish=stop   ctx=342    cached=0      gen=155  (think 22/ans 44w) prefill=1911.5ms/178.9tok/s decode=101.0tok/s tau=7.16 | 'Step 1: Distance at 60 mph for 2.5 hours  \n\\(60 \\times 2.5 = 150\\) miles\n\nStep 2: Distance'
+  [factual]t3  finish=stop   ctx=525    cached=256    gen=150  (think 69/ans 48w) prefill=325.8ms/825.7tok/s decode=103.8tok/s tau=3.84 | "Earth's seasons are caused mainly by the tilt of Earth's axis relative to its orbital plan"
+  [prose]t4  finish=stop   ctx=711    cached=256    gen=211  (think 93/ans 71w) prefill=2550.7ms/178.4tok/s decode=75.2tok/s tau=3.14 | 'Elias wiped the salt from his lantern and walked the jagged rocks at dawn, when a strange '
+  [instruct]t5  finish=stop   ctx=956    cached=256    gen=102  (think 21/ans 51w) prefill=825.8ms/847.7tok/s decode=73.5tok/s tau=2.52 | '1. Use clear, descriptive names for variables, functions, and modules.\n2. Keep functions s'
+[qwen3.8-27b.mq4-xt|off|chain DONE] turns=5 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=407.8tok/s avg_decode=73.5tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=3ee0db1664b8edf677a20f6bbd5ed330 step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=31e91dd7b25ac00cf1f12e29240e965b step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=f98b1d9d7b8ff2bee2bfe62941919339 step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=a5fbc2d6d69166258ac753c05eeb7fc3 step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=c3ecad41fda9c93dc794ebe79435b325 step=
+  daemon_binary_md5=7ec29e8dbdd2a88f8a98f9840a098576 path=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon

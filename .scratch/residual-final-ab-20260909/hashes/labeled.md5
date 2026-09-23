@@ -1,0 +1,9 @@
+baseline-hipfire 213a0bcc8b67e2e981ddf36cd0eb13d9
+baseline-daemon 9e1d8edfbade9f22d79ff0200626e530
+baseline-dflash_spec_demo 95806308c8567ded2d848c7e4eea7b48
+candidate-hipfire 33119f2cd99e1afd5606b524a5cedb64
+candidate-daemon f026fc24d4bda0ea609ae0afd8381e50
+candidate-dflash_spec_demo e421fe7e80b5093e20b1b3053dbd0cbc
+prompt-merge_sort_thinking_off 253c7ac50857fe6d0e10fb0d2c5e35c0
+model-qwen3.8-27b.mq4-xt e45d15bfe0c9a87132697101d17cbed6
+draft-qwen38-27b-dflash-mq4.hfq 013395583cd04206c8aa68f4d061983d

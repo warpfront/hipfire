@@ -1,0 +1,7 @@
+decode_tok_s=288.15
+decode_tau=13.1818
+decode_tokens_emitted=157
+cycles=11
+decode_accept_rate=0.8788
+token_sha256=c2313b3953033b8c5f5da4c531993ea955fe926265e0a8cc20cf358bab3d6104
+token_sha8=c2313b39

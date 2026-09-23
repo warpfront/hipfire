@@ -1,0 +1,8 @@
+ok arch=gfx1100 override=None gate_up_ldsstage=true
+ok arch=gfx1151 override=None gate_up_ldsstage=false
+ok arch=gfx1201 override=None gate_up_ldsstage=false
+ok arch=gfx1100 override=Some("0") gate_up_ldsstage=false
+ok arch=gfx1100 override=Some("false") gate_up_ldsstage=false
+ok arch=gfx1100 override=Some("off") gate_up_ldsstage=false
+ok arch=gfx1100 override=Some("1") gate_up_ldsstage=true
+gateup_ldsstage_flag_smoke PASS

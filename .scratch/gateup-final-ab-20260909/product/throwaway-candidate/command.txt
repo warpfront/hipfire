@@ -1,0 +1,16 @@
+arm=candidate
+slot=None
+order_index=None
+throwaway=1
+cli=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire
+daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon
+cli_md5=a2515e4864f8b9861f98aadd1a217794
+daemon_md5=7ec29e8dbdd2a88f8a98f9840a098576
+start=2026-09-09T03:24:38Z
+argv="/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/hipfire" "bench" "qwen3.8:27b-mq4-xt" "--spec" "dflash" "--runs" "1" "--warmups" "3" "--max-tokens" "256" "--backend" "noslots" "--workload" "stateless" "--kv-mode" "q8" "--json" "--prompt-file" "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt"
+HIPFIRE_DAEMON_BIN=/home/kaden/xtx-gfx1100-baseline/.scratch/gateup-campaign/candidate-bin/daemon
+HIPFIRE_DFLASH_DRAFT=/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+HIPFIRE_LOCAL=1
+HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models
+HIPFIRE_GATEUP_LDSSTAGE=1
+model=qwen3.8:27b-mq4-xt

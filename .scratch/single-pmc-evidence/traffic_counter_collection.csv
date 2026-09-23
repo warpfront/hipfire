@@ -1,0 +1,4 @@
+"Correlation_Id","Dispatch_Id","Agent_Id","Queue_Id","Process_Id","Thread_Id","Grid_Size","Kernel_Id","Kernel_Name","Workgroup_Size","LDS_Block_Size","Scratch_Size","VGPR_Count","Accum_VGPR_Count","SGPR_Count","Counter_Name","Counter_Value","Start_Timestamp","End_Timestamp"
+1,1,"Agent 1",2,5627,5627,40960,2,"gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",128,4096,0,64,0,128,"FETCH_SIZE",0.00000000e+00,460385069706,460385141705
+1,1,"Agent 1",2,5627,5627,40960,2,"gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",128,4096,0,64,0,128,"GRBM_GUI_ACTIVE",0.00000000e+00,460385069706,460385141705
+1,1,"Agent 1",2,5627,5627,40960,2,"gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",128,4096,0,64,0,128,"SQ_WAVES",1280.000000,460385069706,460385141705

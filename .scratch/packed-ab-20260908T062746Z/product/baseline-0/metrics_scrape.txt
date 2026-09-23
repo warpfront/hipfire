@@ -1,0 +1,17 @@
+  "prompt_tokens": 38,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "decode_tok_s": {
+    "median": 266.0,
+    "mean": 265.96,
+    "median": 319.2,
+    "mean": 318.76,
+    "median": 221.2,
+    "mean": 221.01999999999998,
+    "median": 119.1,
+    "mean": 119.22,
+[req chatcmpl-1814329-1] drafter=dflash tau=9.00 tok/s=93.6 decode (10 tok, 1 windows)
+[req chatcmpl-1814329-2] drafter=dflash tau=13.18 tok/s=266.8 decode (156 tok, 11 windows)
+[req chatcmpl-1814329-3] drafter=dflash tau=13.18 tok/s=266.0 decode (156 tok, 11 windows)
+[req chatcmpl-1814329-4] drafter=dflash tau=13.18 tok/s=265.2 decode (156 tok, 11 windows)
+[req chatcmpl-1814329-5] drafter=dflash tau=13.18 tok/s=266.2 decode (156 tok, 11 windows)
+[req chatcmpl-1814329-6] drafter=dflash tau=13.18 tok/s=265.6 decode (156 tok, 11 windows)

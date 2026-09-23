@@ -1,0 +1,16 @@
+arm=baseline
+slot=0
+order_index=0
+throwaway=0
+cli=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire
+daemon=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon
+cli_md5=213a0bcc8b67e2e981ddf36cd0eb13d9
+daemon_md5=9e1d8edfbade9f22d79ff0200626e530
+start=2026-09-09T02:28:05Z
+argv="/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/hipfire" "bench" "qwen3.8:27b-mq4-xt" "--spec" "dflash" "--runs" "5" "--warmups" "3" "--max-tokens" "256" "--backend" "noslots" "--workload" "stateless" "--kv-mode" "q8" "--json" "--prompt-file" "/home/kaden/xtx-gfx1100-baseline/benchmarks/prompts/merge_sort_thinking_off.txt"
+HIPFIRE_DAEMON_BIN=/home/kaden/xtx-gfx1100-baseline/.scratch/residual-variant-sweep/baseline-bin/daemon
+HIPFIRE_DFLASH_DRAFT=/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq
+HIPFIRE_LOCAL=1
+HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models
+HIPFIRE_RESIDUAL_LDSSTAGE=0
+model=qwen3.8:27b-mq4-xt

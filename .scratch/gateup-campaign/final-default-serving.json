@@ -1,0 +1,7 @@
+{
+  "override_absent": true,
+  "turns": 10,
+  "all_finish_stop": true,
+  "content_reasoning_and_requests_match_optin": true,
+  "daemon_md5": "2c91546f40a10f6afca937b07f2b3557"
+}

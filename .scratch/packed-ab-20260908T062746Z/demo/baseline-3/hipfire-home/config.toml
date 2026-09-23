@@ -1,0 +1,8 @@
+schema_version = 1
+
+[speculation]
+dflash = "on"
+mtp = "off"
+
+[developer]
+dflash_draft = "/home/kaden/.hipfire/models/qwen38-27b-dflash-mq4.hfq"

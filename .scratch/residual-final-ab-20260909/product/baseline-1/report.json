@@ -1,0 +1,101 @@
+{
+  "batch": 1,
+  "decode_tok_s": {
+    "max": 272.5,
+    "mean": 272.02000000000004,
+    "median": 272.0,
+    "min": 271.6,
+    "stdev": 0.31240998703625716
+  },
+  "gpu": {
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "kernel_hashes": 0,
+    "kernels": 0,
+    "model_arch": "qwen3_5",
+    "model_loaded": true,
+    "type": "diag",
+    "vram_free_mb": 4552,
+    "vram_total_mb": 24560
+  },
+  "loaded": {
+    "arch": "qwen3_5",
+    "cache_capable": true,
+    "continuous_batch_capable": false,
+    "dim": 5120,
+    "layers": 64,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "retry_reset_eligible": true,
+    "type": "loaded",
+    "vl": false,
+    "vocab": 248320
+  },
+  "max_tokens": 256,
+  "model": "qwen3.8:27b-mq4-xt",
+  "prefill_tok_s": {
+    "max": 340.8,
+    "mean": 328.6,
+    "median": 324.2,
+    "min": 322.6,
+    "stdev": 7.044714330616961
+  },
+  "prompt_chars": 140,
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "prompt_tokens": 38,
+  "protocol": "native-generate-v1",
+  "runs": 5,
+  "samples": {
+    "decode": [
+      271.6,
+      271.8,
+      272.0,
+      272.5,
+      272.2
+    ],
+    "prefill": [
+      340.8,
+      323.1,
+      332.3,
+      322.6,
+      324.2
+    ],
+    "ttft_ms": [
+      111.5,
+      117.6,
+      114.4,
+      117.8,
+      117.2
+    ],
+    "wall": [
+      227.4,
+      225.6,
+      226.8,
+      226.0,
+      226.0
+    ]
+  },
+  "ttft_ms": {
+    "max": 117.8,
+    "mean": 115.7,
+    "median": 117.2,
+    "min": 111.5,
+    "stdev": 2.4331050121192863
+  },
+  "vram_free_before_mb": 24522,
+  "wall_tok_s": {
+    "max": 227.4,
+    "mean": 226.36000000000004,
+    "median": 226.0,
+    "min": 225.6,
+    "stdev": 0.6499230723708814
+  },
+  "warnings": [
+    "prompt is 38 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput \u2014 use --prompt-file with \u2265256 tokens for a prefill number"
+  ]
+}
