@@ -449,16 +449,29 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             char* __restrict__ sz_lds = LDS + ((h == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
             // --- Slab 0 compute (A, W0) with slab 1 prefetch as producer. ---
             {
-                // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
-                // kb/g/h, lane VGPR offsets were hoisted to kernel top.
+                // Slab 1 prefetch, b64-coalesced. Materialize and pin all
+                // four addresses before the load burst, then group the four
+                // VMEM reads so address VALU cannot split the burst.
                 const char* __restrict__ xqB1 = (const char*)(Xq + (long long)kb * N) + 8 + 32;
                 const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
-                #pragma unroll
-                for (int r = 0; r < 2; r++) {
-                    const u32x2_t av = *(const u32x2_t*)(xqB1 + st_avoff[r]);
-                    A_pf[r] = st_aok[r] ? av : z64;
-                    W_pf[r] = *(const u32x2_t*)(wB1 + st_wvoff[r]);
-                }
+                const u32x2_t __attribute__((address_space(1)))* xsrc0 =
+                    (const u32x2_t __attribute__((address_space(1)))*)(xqB1 + st_avoff[0]);
+                const u32x2_t __attribute__((address_space(1)))* xsrc1 =
+                    (const u32x2_t __attribute__((address_space(1)))*)(xqB1 + st_avoff[1]);
+                const u32x2_t __attribute__((address_space(1)))* wsrc0 =
+                    (const u32x2_t __attribute__((address_space(1)))*)(wB1 + st_wvoff[0]);
+                const u32x2_t __attribute__((address_space(1)))* wsrc1 =
+                    (const u32x2_t __attribute__((address_space(1)))*)(wB1 + st_wvoff[1]);
+                asm volatile("" : "+v"(xsrc0), "+v"(xsrc1), "+v"(wsrc0), "+v"(wsrc1));
+                const u32x2_t av0 = *xsrc0;
+                const u32x2_t av1 = *xsrc1;
+                const u32x2_t wv0 = *wsrc0;
+                const u32x2_t wv1 = *wsrc1;
+                __builtin_amdgcn_sched_group_barrier(0x020, 4, 0);
+                A_pf[0] = st_aok[0] ? av0 : z64;
+                A_pf[1] = st_aok[1] ? av1 : z64;
+                W_pf[0] = wv0;
+                W_pf[1] = wv1;
                 // Variant 0: NO pin barrier here. The previous trip's fold
                 // VALU (above its B2a) must be free to sink among this
                 // trip's WMMAs; a sched_barrier(0) would retire the whole
