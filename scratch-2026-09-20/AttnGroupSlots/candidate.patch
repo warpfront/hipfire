@@ -1,0 +1,627 @@
+diff --git a/crates/rdna-compute/src/attention.rs b/crates/rdna-compute/src/attention.rs
+index 1b150b0f9..4de2b0595 100644
+--- a/crates/rdna-compute/src/attention.rs
++++ b/crates/rdna-compute/src/attention.rs
+@@ -4635,16 +4635,11 @@ impl Gpu {
+         }
+         result
+     }
+-    /// Packet-minimal Q128 twin of
+-    /// [`Self::attention_fp8_e4m3_fa2_gqa_fp8_gfx1201`] (exact stage-b
+-    /// arithmetic; attention S1). Dense ownership: one workgroup owns 128
+-    /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
+-    /// `head = 6*kv_h + row%6`) over eight compute waves and KT64 tiles.
+-    /// Q f32->E4M3 conversion is fused into each owned row with the same
+-    /// amax, scale and `cvt_pk_fp8_f32` grouping as the removed pre-convert,
+-    /// writing the existing Q scratch once before the KT64 loop consumes it.
+-    /// Widened batches use a 3-D grid: z enumerates equal-length 512-row
+-    /// runs and x restarts inside each run. Block 256, 49408 B dynamic LDS.
++    /// Packet attention with exact fused Q conversion and stage-b arithmetic.
++    /// Full 512-row runs use a 768-thread Q384 body split into three independent
++    /// Q128/KT32 groups. Each group owns a private 16 KiB K/V LDS slot and a
++    /// named barrier. Other batch shapes retain the proven Q128/KT64 body so an
++    /// odd tail never participates in the wide synchronization schedule.
+     /// Default route on exact gfx1201; `kernel.gfx12_fa_packet=false` opts out.
+     #[allow(clippy::too_many_arguments)]
+     pub fn attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+@@ -4712,10 +4707,15 @@ impl Gpu {
+         // prologue and writes the existing q8+scale scratch. Each workgroup
+         // owns every scratch row it consumes, so no cross-grid barrier is
+         // required and the separate pre-convert launch disappears.
+-        const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_packet_gfx1201";
++        let wide = batch_size == 512;
++        let symbol = if wide {
++            "attention_fp8_e4m3_fa2_gqa_packet_q384_gfx1201"
++        } else {
++            "attention_fp8_e4m3_fa2_gqa_packet_gfx1201"
++        };
+         let src = kernels::ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC;
+-        if !self.functions.contains_key(SYMBOL) {
+-            self.ensure_kernel(SYMBOL, src, SYMBOL)?;
++        if !self.functions.contains_key(symbol) {
++            self.ensure_kernel(symbol, src, symbol)?;
+         }
+         let (need_fp8_bytes, _, _) =
+             crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+@@ -4730,7 +4730,7 @@ impl Gpu {
+             .scratch
+             .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+         let run_rows = batch_size.min(512);
+-        let grid_x = (run_rows * 6).div_ceil(128) as u32;
++        let grid_x = (run_rows * 6).div_ceil(if wide { 384 } else { 128 }) as u32;
+         let grid_z = batch_size.div_ceil(512) as u32;
+         let scale = 1.0f32 / (head_dim as f32).sqrt();
+         let mut q_arg = q.buf.as_ptr();
+@@ -4763,16 +4763,19 @@ impl Gpu {
+         let timer = crate::profile::begin_timer(
+             &self.hip,
+             "attention",
+-            SYMBOL,
++            symbol,
+             bytes,
+         );
+-        // Packet arms use exactly 49408 B dynamic LDS (paired planes +
+-        // transpose scratch + shared scale headers); block 256.
++        let (block, lds) = if wide {
++            (768, 49536)
++        } else {
++            (256, 49408)
++        };
+         let result = self.launch_maybe_blob(
+-            SYMBOL,
++            symbol,
+             [grid_x, 4, grid_z],
+-            [256, 1, 1],
+-            49408,
++            [block, 1, 1],
++            lds,
+             &mut params,
+             || {
+                 let mut b = hip_bridge::KernargBlob::new();
+diff --git a/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip b/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip
+index 1affc8864..bc1c51800 100644
+--- a/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip
++++ b/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip
+@@ -1723,16 +1723,12 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
+     }
+ }
+ #endif
+-// ---- Packet-minimal Q128 body (FaPacket K1, exact) ----
+-// Gated by HIPFIRE_FA2_PACKET (default route via kernel.gfx12_fa_packet): all
+-// other translation units preprocess this region away, so K0/K3/K8 objects stay
+-// byte-identical. Geometry: 256 threads / eight wave32s, ALL computing, 128
+-// densely enumerated query-head rows per KV head, KT64, 49408 B dynamic LDS.
+-// Fill is the T-verified paired mechanism (b128 K/V pairs, wave-private 2
+-// KiB transpose scratch, shared native-scale headers). Arithmetic graph is
+-// the stage-b recurrence unchanged (true divisions, serial sum, rho fold);
+-// reductions use the fixed permlanex16 partner idiom. Q fragments reload in
+-// four-fragment groups during QK so the exact transpose remains spill-free.
++// ---- Packet-minimal narrow + group-private wide bodies (exact recurrence) ----
++// Gated by HIPFIRE_FA2_PACKET: all other translation units preprocess this
++// region away, so K0/K3/K8 objects stay byte-identical. The narrow body retains
++// its 256-thread Q128/KT64 layout. The 768-thread wide body is three independent
++// eight-wave Q128/KT32 groups. Each group streams the same keys from L2 into a
++// private 16 KiB K/V slot and synchronizes only on its own named barrier.
+ #if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_PACKET)
+ static __device__ __forceinline__ float fa2_pkt_xor16(float v)
+ {
+@@ -1745,7 +1741,52 @@ static __device__ __forceinline__ float fa2_pkt_f16(uint16_t u)
+ {
+     return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+ }
+-template <bool PARTIAL, bool FUSED_Q>
++__shared__ __amdgpu_named_workgroup_barrier_t fa2_pkt_group_ready0;
++__shared__ __amdgpu_named_workgroup_barrier_t fa2_pkt_group_ready1;
++__shared__ __amdgpu_named_workgroup_barrier_t fa2_pkt_group_ready2;
++template <int GROUP>
++static __device__ __forceinline__ void fa2_pkt_group_init()
++{
++    if constexpr (GROUP == 0)
++        __builtin_amdgcn_s_barrier_init(&fa2_pkt_group_ready0, 256);
++    else if constexpr (GROUP == 1)
++        __builtin_amdgcn_s_barrier_init(&fa2_pkt_group_ready1, 256);
++    else
++        __builtin_amdgcn_s_barrier_init(&fa2_pkt_group_ready2, 256);
++}
++template <int GROUP>
++static __device__ __forceinline__ void fa2_pkt_group_join()
++{
++    if constexpr (GROUP == 0)
++        __builtin_amdgcn_s_barrier_join(&fa2_pkt_group_ready0);
++    else if constexpr (GROUP == 1)
++        __builtin_amdgcn_s_barrier_join(&fa2_pkt_group_ready1);
++    else
++        __builtin_amdgcn_s_barrier_join(&fa2_pkt_group_ready2);
++}
++template <int GROUP>
++static __device__ __forceinline__ void fa2_pkt_group_sync()
++{
++    asm volatile("s_wait_loadcnt 0\n\ts_wait_dscnt 0" ::: "memory");
++    if constexpr (GROUP == 0)
++        __builtin_amdgcn_s_barrier_signal_var(&fa2_pkt_group_ready0, 0);
++    else if constexpr (GROUP == 1)
++        __builtin_amdgcn_s_barrier_signal_var(&fa2_pkt_group_ready1, 0);
++    else
++        __builtin_amdgcn_s_barrier_signal_var(&fa2_pkt_group_ready2, 0);
++    __builtin_amdgcn_s_barrier_wait(GROUP + 1);
++    asm volatile("" ::: "memory");
++}
++static __device__ __forceinline__ void fa2_pkt_group_sync_dynamic(int group)
++{
++    if (group == 0)
++        fa2_pkt_group_sync<0>();
++    else if (group == 1)
++        fa2_pkt_group_sync<1>();
++    else
++        fa2_pkt_group_sync<2>();
++}
++template <bool PARTIAL, bool FUSED_Q, bool WIDE>
+ __device__ void fa2_stageb_packet_body(
+     const float* __restrict__ q,
+     unsigned char* __restrict__ q8_codes,
+@@ -1758,22 +1799,39 @@ __device__ void fa2_stageb_packet_body(
+     float scale_attn,
+     int kv_h,
+     int row_base,
+-    int tile0,
+-    int tile1,
++    int key_begin,
++    int key_end,
+     int split,
+     int n_splits)
+ {
++    constexpr int SUBTILES = WIDE ? 2 : 4;
++    constexpr int TILE_KEYS = SUBTILES * 16;
++    constexpr int ROWS_PER_GROUP = 128;
++    constexpr int WIDE_SLOT_BYTES = 16384;
++    constexpr int WIDE_SCALE_OFFSET = 3 * WIDE_SLOT_BYTES;
++    constexpr int WIDE_SCALE_STRIDE = 128;
+     const int tid = (int)threadIdx.x;
+     const int wave = tid >> 5;
+     const int lane = tid & 31;
+     const int ml = lane & 15;
+     const int kg = lane >> 4;
++    const int group = WIDE ? wave >> 3 : 0;
++    const int group_wave = WIDE ? wave & 7 : wave;
++    const int group_tid = group_wave * 32 + lane;
++    const int group_row_base =
++        WIDE ? row_base + group * ROWS_PER_GROUP : row_base;
+     extern __shared__ uint32_t LDS[];
+-    unsigned char* K8 = (unsigned char*)LDS;
+-    unsigned char* V8 = (unsigned char*)LDS + 16384;
+-    uint32_t* SCR = LDS + 8192 + (unsigned)wave * 512u;
+-    const uint16_t* SK = (const uint16_t*)((const unsigned char*)LDS + 49152);
+-    const uint16_t* SV = (const uint16_t*)((const unsigned char*)LDS + 49280);
++    unsigned char* K8 = (unsigned char*)LDS +
++        (WIDE ? group * WIDE_SLOT_BYTES : 0);
++    unsigned char* V8 = K8 + (WIDE ? 8192 : 16384);
++    uint32_t* SCR = WIDE
++        ? (uint32_t*)K8 + (unsigned)group_wave * 512u
++        : LDS + 8192 + (unsigned)wave * 512u;
++    uint16_t* SK = WIDE
++        ? (uint16_t*)((unsigned char*)LDS + WIDE_SCALE_OFFSET +
++                      group * WIDE_SCALE_STRIDE)
++        : (uint16_t*)((unsigned char*)LDS + 49152);
++    uint16_t* SV = WIDE ? SK + 32 : SK + 64;
+     // Dense ownership: each (query, head_local) has exactly one owner.
+     const int row = row_base + 16 * wave + ml;
+     const int query_local = row / 6;
+@@ -1840,12 +1898,11 @@ __device__ void fa2_stageb_packet_body(
+             q8_codes + (unsigned)batch_size * 24u * 256u);
+         q_row_scale = q_scales[qrow];
+     }
+-    // WG bounds: lanes 0..21 load the same guarded prefix (<=22 positions)
+-    // and reduce with the identical integer graph on every wave.
++    // Each Q128 group derives bounds only from the query rows it owns.
+     int wmx = -1;
+     int wmn = 0x7fffffff;
+     if (lane < 22) {
+-        const int qr = query_offset + row_base / 6 + lane;
++        const int qr = query_offset + group_row_base / 6 + lane;
+         if (qr < query_offset + batch_size) {
+             const int p = positions[qr];
+             wmx = p;
+@@ -1865,70 +1922,97 @@ __device__ void fa2_stageb_packet_body(
+     const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+     const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+     const int seq_len = gmax + 1;
+-    const bool qok_all = (row_base + 127 < 6 * batch_size);
+-    for (int tile = tile0; tile < tile1; ++tile) {
+-        const int ktile = tile * 64;
+-        if (ktile >= seq_len)
+-            break;
++    const bool qok_all =
++        (group_row_base + ROWS_PER_GROUP - 1 < 6 * batch_size);
++    const int key_limit = min(seq_len, key_end);
++    if constexpr (WIDE) {
++        // One setup rendezvous publishes all three barrier descriptors. Every
++        // iterative staging transition below is private to one eight-wave group.
++        if (wave == 0) {
++            fa2_pkt_group_init<0>();
++            fa2_pkt_group_init<1>();
++            fa2_pkt_group_init<2>();
++        }
++        __syncthreads();
++        if (group == 0)
++            fa2_pkt_group_join<0>();
++        else if (group == 1)
++            fa2_pkt_group_join<1>();
++        else
++            fa2_pkt_group_join<2>();
++    }
++    for (int ktile = key_begin; ktile < key_limit; ktile += TILE_KEYS) {
+         // Hoisted full-tile predicate: every K/V/header key valid and every
+         // score unmasked. Edge path keeps guarded semantics below.
+-        const bool full = qok_all && (ktile + 63 <= gmin);
+-        // ---- Paired K fill (T-verified; 8-byte-aligned u64, no b128 cast)
+-        for (int t = 0; t < 4; ++t) {
+-            const int idx = tid + t * 256;
+-            const int ln = idx & 31;
+-            const int sub = (idx >> 5) & 3;
+-            const int p = idx >> 7;
+-            const int gk = ktile + sub * 16 + (ln & 15);
+-            uint4 pair = {0u, 0u, 0u, 0u};
+-            if (gk < seq_len) {
+-                const unsigned char* rrow = k_cache +
+-                    (unsigned long long)gk * 1032ULL +
+-                    (unsigned long long)kv_h * 256ULL;
+-                const unsigned long long* r64 =
+-                    (const unsigned long long*)rrow;
+-                unsigned long long a =
+-                    r64[(unsigned)(2 * p) * 2u + (unsigned)(ln >> 4)];
+-                unsigned long long b =
+-                    r64[(unsigned)(2 * p + 1) * 2u + (unsigned)(ln >> 4)];
+-                pair.x = (uint32_t)(a & 0xffffffffULL);
+-                pair.y = (uint32_t)(a >> 32);
+-                pair.z = (uint32_t)(b & 0xffffffffULL);
+-                pair.w = (uint32_t)(b >> 32);
++        const bool full =
++            qok_all && (ktile + TILE_KEYS - 1 < key_limit) &&
++            (ktile + TILE_KEYS - 1 <= gmin);
++        // Narrow keeps its proven KT64 fill schedule. Wide first uses the K
++        // half of each private slot as four wave-local V transpose buffers.
++        if constexpr (!WIDE) {
++#pragma unroll
++            for (int t = 0; t < 4; ++t) {
++                const int idx = tid + t * 256;
++                const int ln = idx & 31;
++                const int sub = (idx >> 5) & 3;
++                const int p = idx >> 7;
++                const int gk = ktile + sub * 16 + (ln & 15);
++                uint4 pair = {0u, 0u, 0u, 0u};
++                if (gk < key_limit) {
++                    const unsigned char* rrow = k_cache +
++                        (unsigned long long)gk * 1032ULL +
++                        (unsigned long long)kv_h * 256ULL;
++                    const unsigned long long* r64 =
++                        (const unsigned long long*)rrow;
++                    const unsigned long long a =
++                        r64[(unsigned)(2 * p) * 2u + (unsigned)(ln >> 4)];
++                    const unsigned long long b =
++                        r64[(unsigned)(2 * p + 1) * 2u +
++                            (unsigned)(ln >> 4)];
++                    pair.x = (uint32_t)(a & 0xffffffffULL);
++                    pair.y = (uint32_t)(a >> 32);
++                    pair.z = (uint32_t)(b & 0xffffffffULL);
++                    pair.w = (uint32_t)(b >> 32);
++                }
++                *(uint4*)(K8 +
++                          (unsigned)(((p * 4 + sub) * 32 + ln) * 16)) = pair;
+             }
+-            *(uint4*)(K8 + (unsigned)(((p * 4 + sub) * 32 + ln) * 16)) = pair;
+         }
+-        // ---- V raw staging: wave w owns keys ktile+8w..+7 ----
+-        for (int r = 0; r < 8; ++r) {
+-            const int gkey = ktile + wave * 8 + r;
+-            const bool ok = gkey < seq_len;
+-            unsigned long long v = 0ULL;
+-            if (ok) {
+-                const unsigned char* rrow = v_cache +
+-                    (unsigned long long)gkey * 1032ULL +
+-                    (unsigned long long)kv_h * 256ULL;
+-                v = *(const unsigned long long*)(rrow + (unsigned)lane * 8u);
++        const int loader_wave = WIDE ? group_wave : wave;
++        if (loader_wave < 2 * SUBTILES) {
++            for (int r = 0; r < 8; ++r) {
++                const int gkey = ktile + loader_wave * 8 + r;
++                unsigned long long v = 0ULL;
++                if (gkey < key_limit) {
++                    const unsigned char* rrow = v_cache +
++                        (unsigned long long)gkey * 1032ULL +
++                        (unsigned long long)kv_h * 256ULL;
++                    v = *(const unsigned long long*)(rrow + (unsigned)lane * 8u);
++                }
++                SCR[((r * 64 + lane * 2) ^ ((r & 3) * 8))] =
++                    (uint32_t)(v & 0xffffffffULL);
++                SCR[((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8))] =
++                    (uint32_t)(v >> 32);
+             }
+-            SCR[(((r * 64 + lane * 2) ^ ((r & 3) * 8)))] =
+-                (uint32_t)(v & 0xffffffffULL);
+-            SCR[(((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8)))] =
+-                (uint32_t)(v >> 32);
+         }
+-        __syncthreads();
++        if constexpr (WIDE)
++            fa2_pkt_group_sync_dynamic(group);
++        else
++            __syncthreads();
+         // ---- Transpose + paired V stores (sub=w>>1, key-half=w&1) ----
+-        {
+-            const int sub = wave >> 1;
++        if (loader_wave < 2 * SUBTILES) {
++            const int sub = loader_wave >> 1;
+             const int r = ml & 3;
+             const int dq = ml >> 2;
+             const uint32_t rbase0 = (uint32_t)r * 64u;
+             const uint32_t rbase1 = (uint32_t)(r + 4) * 64u;
+             const uint32_t rmask = (uint32_t)(r & 3) * 8u;
+-            const uint32_t sel1 = ((r & 1) == 0) ? 0x06020400u : 0x03070105u;
+-            const uint32_t sel2 = (r < 2) ? 0x05040100u : 0x03020706u;
+-            (void)kg;
+-            if (((lane >> 4) & 1) == (wave & 1)) {
+-                for (int t = 0; t < 8; ++t) {
+-                    const int p = t;
++            const uint32_t sel1 =
++                ((r & 1) == 0) ? 0x06020400u : 0x03070105u;
++            const uint32_t sel2 =
++                (r < 2) ? 0x05040100u : 0x03020706u;
++            if (((lane >> 4) & 1) == (loader_wave & 1)) {
++                for (int p = 0; p < 8; ++p) {
+                     uint4 store = {0u, 0u, 0u, 0u};
+                     uint32_t* s32 = (uint32_t*)&store;
+                     for (int h = 0; h < 2; ++h) {
+@@ -1936,13 +2020,17 @@ __device__ void fa2_stageb_packet_body(
+                         const uint32_t w = (uint32_t)(dc * 4 + dq);
+                         const uint32_t d0 = SCR[((rbase0 + w) ^ rmask)];
+                         const uint32_t d1 = SCR[((rbase1 + w) ^ rmask)];
+-                        uint32_t e0 = (uint32_t)__shfl_xor((int)d0, 1, 32);
++                        uint32_t e0 =
++                            (uint32_t)__shfl_xor((int)d0, 1, 32);
+                         e0 = __builtin_amdgcn_perm(e0, d0, sel1);
+-                        uint32_t e1 = (uint32_t)__shfl_xor((int)d1, 1, 32);
++                        uint32_t e1 =
++                            (uint32_t)__shfl_xor((int)d1, 1, 32);
+                         e1 = __builtin_amdgcn_perm(e1, d1, sel1);
+-                        uint32_t f0 = (uint32_t)__shfl_xor((int)e0, 2, 32);
++                        const uint32_t f0 =
++                            (uint32_t)__shfl_xor((int)e0, 2, 32);
+                         s32[h * 2] = __builtin_amdgcn_perm(f0, e0, sel2);
+-                        uint32_t f1 = (uint32_t)__shfl_xor((int)e1, 2, 32);
++                        const uint32_t f1 =
++                            (uint32_t)__shfl_xor((int)e1, 2, 32);
+                         s32[h * 2 + 1] =
+                             __builtin_amdgcn_perm(f1, e1, sel2);
+                     }
+@@ -1952,11 +2040,45 @@ __device__ void fa2_stageb_packet_body(
+                 }
+             }
+         }
+-        // ---- Shared scale headers: threads 0..63 copy both halves ----
+-        if (tid < 64) {
+-            const int gk = ktile + tid;
++        if constexpr (WIDE) {
++            // All raw V reads and final V writes complete before K reuses the
++            // first 8 KiB of this group's slot.
++            fa2_pkt_group_sync_dynamic(group);
++#pragma unroll
++            for (int t = 0; t < 2; ++t) {
++                const int idx = group_tid + t * 256;
++                const int ln = idx & 31;
++                const int sub = (idx >> 5) & 1;
++                const int p = idx >> 6;
++                const int gk = ktile + sub * 16 + (ln & 15);
++                uint4 pair = {0u, 0u, 0u, 0u};
++                if (gk < key_limit) {
++                    const unsigned char* rrow = k_cache +
++                        (unsigned long long)gk * 1032ULL +
++                        (unsigned long long)kv_h * 256ULL;
++                    const unsigned long long* r64 =
++                        (const unsigned long long*)rrow;
++                    const unsigned long long a =
++                        r64[(unsigned)(2 * p) * 2u + (unsigned)(ln >> 4)];
++                    const unsigned long long b =
++                        r64[(unsigned)(2 * p + 1) * 2u +
++                            (unsigned)(ln >> 4)];
++                    pair.x = (uint32_t)(a & 0xffffffffULL);
++                    pair.y = (uint32_t)(a >> 32);
++                    pair.z = (uint32_t)(b & 0xffffffffULL);
++                    pair.w = (uint32_t)(b >> 32);
++                }
++                *(uint4*)(K8 +
++                          (unsigned)(((p * 2 + sub) * 32 + ln) * 16)) = pair;
++            }
++        }
++        // ---- Slot-private native scale headers ----
++        const int scale_index =
++            WIDE ? (group_wave == 0 ? lane : -1) : tid;
++        if (scale_index >= 0 && scale_index < TILE_KEYS) {
++            const int gk = ktile + scale_index;
+             uint16_t skv = 0, svv = 0;
+-            if (gk < seq_len) {
++            if (gk < key_limit) {
+                 const unsigned char* kr =
+                     k_cache + (unsigned long long)gk * 1032ULL;
+                 const unsigned char* vr =
+@@ -1966,16 +2088,15 @@ __device__ void fa2_stageb_packet_body(
+                 svv = (uint16_t)vr[1024 + kv_h * 2] |
+                     ((uint16_t)vr[1024 + kv_h * 2 + 1] << 8);
+             }
+-            ((uint16_t*)((unsigned char*)LDS + 49152))[tid] = skv;
+-            ((uint16_t*)((unsigned char*)LDS + 49280))[tid] = svv;
++            SK[scale_index] = skv;
++            SV[scale_index] = svv;
+         }
+-        __syncthreads();
+-        // ---- Compute: four KT16 recurrences, exact stage-b graph ----
++        if constexpr (WIDE)
++            fa2_pkt_group_sync_dynamic(group);
++        else
++            __syncthreads();
++        // ---- KT16 recurrences, exact stage-b graph ----
+         {
+-            const bool do0 = ktile <= gmax;
+-            const bool do1 = ktile + 16 <= gmax;
+-            const bool do2 = ktile + 32 <= gmax;
+-            const bool do3 = ktile + 48 <= gmax;
+             const float qs_tile = q_row_scale * scale_attn;
+             const int pos = (!full && qok) ? positions[query] : 0;
+             const v2i_t* Kf = (const v2i_t*)K8;
+@@ -1983,9 +2104,10 @@ __device__ void fa2_stageb_packet_body(
+             const unsigned kbn = (unsigned)lane;
+             const unsigned vbn = (unsigned)lane;
+ #pragma unroll 1
+-            for (int sub = 0; sub < 4; ++sub) {
+-                const bool dos = (sub == 0) ? do0
+-                    : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
++            for (int sub = 0; sub < SUBTILES; ++sub) {
++                const bool dos =
++                    ktile + sub * 16 < key_limit &&
++                    ktile + sub * 16 <= gmax;
+                 if (!dos)
+                     continue;
+                 float8_t sacc =
+@@ -2001,7 +2123,8 @@ __device__ void fa2_stageb_packet_body(
+                         const int p = 2 * dg + u;
+                         const uint4* kp =
+                             (const uint4*)(K8 +
+-                                (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
++                                (unsigned)(((p * SUBTILES + sub) * 32 + lane) *
++                                           16));
+                         const uint4 kv = *kp;
+                         const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                         const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+@@ -2023,7 +2146,8 @@ __device__ void fa2_stageb_packet_body(
+                 }
+                 (void)kbn;
+                 const int kt_sub = ktile + sub * 16;
+-                const bool sub_full = full || ((kt_sub + 15) <= gmin);
++                const bool sub_full =
++                    full || ((kt_sub + 15 < key_limit) && (kt_sub + 15 <= gmin));
+                 float sc[8];
+ #pragma unroll
+                 for (int j = 0; j < 8; ++j)
+@@ -2105,7 +2229,10 @@ __device__ void fa2_stageb_packet_body(
+             (void)Vf;
+             (void)Kf;
+         }
+-        __syncthreads();
++        if constexpr (WIDE)
++            fa2_pkt_group_sync_dynamic(group);
++        else
++            __syncthreads();
+     }
+     // ---- Completion (same records as the f16/stage-b bodies) ----
+     if (!PARTIAL) {
+@@ -2149,10 +2276,7 @@ __device__ void fa2_stageb_packet_body(
+         }
+     }
+ }
+-// Packet direct entry: native-fp8 fill, fused f32->E4M3 Q, dense Q128
+-// ownership. For widened prefill, z enumerates equal-length 512-row runs;
+-// x restarts within each run so the row grouping and causal bounds are
+-// identical to the former per-step launches.
++// Narrow packet entry retained for short KV extents.
+ // Grid [ceil(min(batch,512)*6/128), 4, ceil(batch/512)], block 256,
+ // 49408 B dynamic LDS.
+ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+@@ -2180,11 +2304,43 @@ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_
+     const int row_base = 128 * (int)blockIdx.x;
+     if (row_base >= 6 * run_rows)
+         return;
+-    fa2_stageb_packet_body<false, true>(
++    fa2_stageb_packet_body<false, true, false>(
+         q, q8_codes, k_cache, v_cache, out, positions, run_rows, query_offset,
+-        scale_attn, kv_h, row_base, 0, 0x3fffffff, 0, 1);
++        scale_attn, kv_h, row_base, 0, 0x7fffffff, 0, 1);
+ }
+-// Packet partial twin: same KT64 tile partition as the stage-b partial.
++// Wide packet entry for a full 512-row run: three independent Q128/KT32
++// groups, each with a private K/V slot and named barrier.
++// Grid [ceil(512*6/384), 4, 1], block 768, 49536 B dynamic LDS.
++extern "C" __global__ __launch_bounds__(768, 1) void attention_fp8_e4m3_fa2_gqa_packet_q384_gfx1201(
++    const float* __restrict__ q,
++    unsigned char* __restrict__ q8_codes,
++    const unsigned char* __restrict__ k_cache,
++    const unsigned char* __restrict__ v_cache,
++    float* __restrict__ out,
++    const int* __restrict__ positions,
++    int n_heads,
++    int n_kv_heads,
++    int head_dim,
++    int batch_size,
++    float scale_attn)
++{
++    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
++        return;
++    const int kv_h = blockIdx.y;
++    if (kv_h >= 4)
++        return;
++    const int query_offset = batch_size > 512 ? 512 * (int)blockIdx.z : 0;
++    if (query_offset >= batch_size)
++        return;
++    const int run_rows = min(512, batch_size - query_offset);
++    const int row_base = 384 * (int)blockIdx.x;
++    if (row_base >= 6 * run_rows)
++        return;
++    fa2_stageb_packet_body<false, true, true>(
++        q, q8_codes, k_cache, v_cache, out, positions, run_rows, query_offset,
++        scale_attn, kv_h, row_base, 0, 0x7fffffff, 0, 1);
++}
++// Narrow packet partial retains the external KT64 split partition.
+ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201(
+     const unsigned char* __restrict__ q8_codes,
+     const unsigned char* __restrict__ k_cache,
+@@ -2212,11 +2368,48 @@ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_
+     if (split >= n_splits)
+         return;
+     const int per = (512 + n_splits - 1) / n_splits;
+-    const int t0 = split * per;
+-    const int t1 = t0 + per;
+-    fa2_stageb_packet_body<true, false>(
++    const int key_begin = split * per * 64;
++    const int key_end = (split * per + per) * 64;
++    fa2_stageb_packet_body<true, false, false>(
++        nullptr, (unsigned char*)q8_codes, k_cache, v_cache, out, positions,
++        batch_size, 0, scale_attn, kv_h, row_base, key_begin, key_end, split,
++        n_splits);
++}
++// Wide packet partial preserves the external KT64 split interval while
++// clamping its internal KT32 tiles to that interval.
++extern "C" __global__ __launch_bounds__(768, 1) void attention_fp8_e4m3_fa2_gqa_packet_q384_partial_gfx1201(
++    const unsigned char* __restrict__ q8_codes,
++    const unsigned char* __restrict__ k_cache,
++    const unsigned char* __restrict__ v_cache,
++    float* __restrict__ out,
++    const int* __restrict__ positions,
++    int n_heads,
++    int n_kv_heads,
++    int head_dim,
++    int batch_size,
++    float scale_attn,
++    int n_splits)
++{
++    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
++        return;
++    if (n_splits < 1 || n_splits > 8)
++        return;
++    const int kv_h = blockIdx.y;
++    if (kv_h >= 4)
++        return;
++    const int row_base = 384 * (int)blockIdx.x;
++    if (row_base >= 6 * batch_size)
++        return;
++    const int split = blockIdx.z;
++    if (split >= n_splits)
++        return;
++    const int per = (512 + n_splits - 1) / n_splits;
++    const int key_begin = split * per * 64;
++    const int key_end = (split * per + per) * 64;
++    fa2_stageb_packet_body<true, false, true>(
+         nullptr, (unsigned char*)q8_codes, k_cache, v_cache, out, positions,
+-        batch_size, 0, scale_attn, kv_h, row_base, t0, t1, split, n_splits);
++        batch_size, 0, scale_attn, kv_h, row_base, key_begin, key_end, split,
++        n_splits);
+ }
+ // Packet merge: scale-free 258-float records, same body as stage-b merge
+ // under its own symbol (duplicated so the route-N object stays identical).
