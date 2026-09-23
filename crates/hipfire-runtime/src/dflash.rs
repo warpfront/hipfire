@@ -2320,6 +2320,28 @@ pub const SEED_BACKFILL_CHUNK: usize = 512;
 /// full-layer watermark to `prompt_len` so the forward's lazy fill resumes
 /// from the window edge. GEMMs, norms, and RoPE are row-local: chunked ==
 /// monolithic bit-exactly.
+/// Throwaway bisection probe for the sticky `HipError(719)` seen in gate run
+/// 33907487315: `spec_prefix_realign` reported `hipMemcpy H2D offset`, but an
+/// H2D reports whatever asynchronous kernel faulted BEFORE it, so the label
+/// names the messenger rather than the culprit. With
+/// `HIPFIRE_DFLASH_BACKFILL_SYNC=1` every op in the backfill loop is followed
+/// by a device synchronize, so the first failure is attributed to the op that
+/// actually caused it. Off by default and free when off.
+fn bf_probe(gpu: &Gpu, label: &str, row: usize, slot: usize, len: usize) -> HipResult<()> {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("HIPFIRE_DFLASH_BACKFILL_SYNC").as_deref() == Ok("1"));
+    if !*ON {
+        return Ok(());
+    }
+    match gpu.hip.device_synchronize() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("[backfill-probe] FIRST FAULT after {label} row={row} slot={slot} len={len}: {e:?}");
+            Err(e)
+        }
+    }
+}
+
 pub fn draft_seed_backfill(
     gpu: &mut Gpu,
     weights: &DflashWeights,
@@ -2368,6 +2390,7 @@ pub fn draft_seed_backfill(
                 slot0 * row_f32 * 4,
                 src_bytes,
             )?;
+            bf_probe(gpu, "h2d target_hidden", row0, slot0, seg_len)?;
             // fc + hidden_norm into the proj ring (same slots).
             let th = scratch
                 .target_hidden
@@ -2383,7 +2406,9 @@ pub fn draft_seed_backfill(
                 seg_len,
                 scratch.mq_x_rot.as_ref(),
             )?;
+            bf_probe(gpu, "gemm fc", row0, slot0, seg_len)?;
             gpu.rmsnorm_batched(&thp, &weights.hidden_norm, &thp, seg_len, h, eps)?;
+            bf_probe(gpu, "rmsnorm hidden_norm", row0, slot0, seg_len)?;
             // Last-layer wk/wv into the full_w ring (its own modulus).
             let mut r2 = row0;
             while r2 < row0 + seg_len {
@@ -2402,6 +2427,7 @@ pub fn draft_seed_backfill(
                     step,
                     scratch.mq_x_rot.as_ref(),
                 )?;
+                bf_probe(gpu, "gemm wk", r2, c_slot, step)?;
                 gemm_dispatch(
                     gpu,
                     &thp2,
@@ -2410,6 +2436,7 @@ pub fn draft_seed_backfill(
                     step,
                     scratch.mq_x_rot.as_ref(),
                 )?;
+                bf_probe(gpu, "gemm wv", r2, c_slot, step)?;
                 gpu.rmsnorm_batched(
                     &k_slot,
                     &last_layer.k_norm,
@@ -2418,12 +2445,14 @@ pub fn draft_seed_backfill(
                     hd,
                     eps,
                 )?;
+                bf_probe(gpu, "rmsnorm k_norm", r2, c_slot, step)?;
                 // The steady-state cache stores post-RoPE K, so cold-seed
                 // backfill must establish the same invariant. Prompt rows are
                 // contiguous absolute positions here; upload just this chunk's
                 // position vector into the reusable device buffer.
                 let positions: Vec<i32> = (r2..r2 + step).map(|p| p as i32).collect();
                 upload_slice_i32(gpu, &scratch.positions_k, &positions)?;
+                bf_probe(gpu, "h2d positions", r2, c_slot, step)?;
                 let positions_view = scratch.positions_k.sub_offset(0, step);
                 gpu.rope_batched_f32(
                     &scratch.q, // ignored because n_heads_q = 0
@@ -2435,6 +2464,7 @@ pub fn draft_seed_backfill(
                     cfg.rope_theta,
                     step,
                 )?;
+                bf_probe(gpu, "rope k", r2, c_slot, step)?;
                 r2 += step;
             }
         }
