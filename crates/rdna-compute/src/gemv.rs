@@ -3856,6 +3856,77 @@ impl Gpu {
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
+    /// F1-lite h-producer: [`Self::fused_silu_mul_rotate_mq_i4_batched`]'s
+    /// AWQ twin with phase 1 reading h = silu(gate)*up (FP32 [N][K], formed
+    /// by `gemm_gate_up_silu_mq4g256v2_iu4_prepared`) from one stream. Same
+    /// AWQ divide, FWHT and `block_i4_128` recipe, so the sealed sidecar is
+    /// byte-identical; no f32 rotated store (emit_f32 = false).
+    pub fn fused_silu_hin_rotate_mq_i4_batched(
+        &mut self,
+        h: &GpuTensor,
+        awq: &GpuTensor,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_silu_hin_rotate_mq_i4_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const KERNEL: &str = "fused_silu_mul_mq_rotate_awq_i4_hin";
+        self.ensure_kernel(KERNEL, kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC, KERNEL)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut hp = h.buf.as_ptr();
+        let mut awp = awq.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut xrp: *mut c_void = std::ptr::null_mut();
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut hp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 2 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(hp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
     /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128`
     /// sidecar for the down-proj input. `x_rot = None` skips the f32 store
     /// (emit_f32=false). `awq = Some` selects the AWQ twin symbol. Bit-identical

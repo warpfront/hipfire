@@ -21,6 +21,15 @@
 // happens in the loader; see hfq.rs::load_awq_scale).
 //
 // HIPFIRE_IU4_SIDECAR: C2 producer path — same as the plain silu twin.
+//
+// HIPFIRE_SILU_HIN (IU4 sidecar only): F1-lite h-producer. Phase 1 reads
+// h = SILU_MUL(g, u), already formed in FP32 by the gate/up GEMM epilogue
+// (`gemm_mq4g256v2_gate_up_silu_iu4_*`), from one stream instead of forming
+// it from gate + up. Everything from the AWQ divide on is unchanged, so the
+// x_rot / block_i4_128 outputs are bit-identical to the gate/up twin's.
+#if defined(HIPFIRE_SILU_HIN) && !defined(HIPFIRE_IU4_SIDECAR)
+#error "HIPFIRE_SILU_HIN requires HIPFIRE_IU4_SIDECAR"
+#endif
 
 #ifndef HIPFIRE_SILU_MQ_ROTATE_KERNEL
 #define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq
@@ -28,8 +37,12 @@
 
 extern "C" __launch_bounds__(32, 16)
 __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
+#ifdef HIPFIRE_SILU_HIN
+    const float* __restrict__ h,           // [N x K] silu(gate)*up, FP32
+#else
     const float* __restrict__ gate,
     const float* __restrict__ up,
+#endif
     const float* __restrict__ awq_scale,   // [K], FP32
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
@@ -52,8 +65,12 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
     // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
     const long long batch_off = (long long)blockIdx.y * K;
+#ifdef HIPFIRE_SILU_HIN
+    const float* h_b     = h     + batch_off;
+#else
     const float* gate_b  = gate  + batch_off;
     const float* up_b    = up    + batch_off;
+#endif
 #ifdef HIPFIRE_IU4_SIDECAR
           float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
 #else
@@ -67,6 +84,17 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     // silu(z) = z / (1 + exp(-z)). AWQ divide happens BEFORE signs1+FWHT
     // to mirror the offline weight-side pre-scaling W' = W · diag(s).
     // awq_scale is indexed in the unrotated feature basis (1D, length K).
+#ifdef HIPFIRE_SILU_HIN
+    float v0 = (h_b[base    ] / awq_scale[base    ]) * signs1[d0    ];
+    float v1 = (h_b[base + 1] / awq_scale[base + 1]) * signs1[d0 + 1];
+    float v2 = (h_b[base + 2] / awq_scale[base + 2]) * signs1[d0 + 2];
+    float v3 = (h_b[base + 3] / awq_scale[base + 3]) * signs1[d0 + 3];
+    float v4 = (h_b[base + 4] / awq_scale[base + 4]) * signs1[d0 + 4];
+    float v5 = (h_b[base + 5] / awq_scale[base + 5]) * signs1[d0 + 5];
+    float v6 = (h_b[base + 6] / awq_scale[base + 6]) * signs1[d0 + 6];
+    float v7 = (h_b[base + 7] / awq_scale[base + 7]) * signs1[d0 + 7];
+#else
+    // The F1-lite GEMM epilogue spells SILU_MUL identically.
     #define SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
     float g0 = gate_b[base];     float u0 = up_b[base];
     float g1 = gate_b[base + 1]; float u1 = up_b[base + 1];
@@ -86,6 +114,7 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     float v6 = (SILU_MUL(g6, u6) / awq_scale[base + 6]) * signs1[d0 + 6];
     float v7 = (SILU_MUL(g7, u7) / awq_scale[base + 7]) * signs1[d0 + 7];
     #undef SILU_MUL
+#endif
 
     // Local butterfly: strides 1, 2, 4 — identical to mq_rotate_x.
     float t;
