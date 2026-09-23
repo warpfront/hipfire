@@ -8,7 +8,8 @@
 //! Shapes target the DeepSeek V4 MoE hot path:
 //!   gate/up: M=2048 (moe_intermediate), K=4096 (hidden)
 //!   down:    M=4096 (hidden),           K=2048 (moe_intermediate)
-//! m_total covers PP_BATCH ∈ {128, 256, 1024} × top_k=6 routed slots.
+//! m_total covers decode B=1 and PP_BATCH ∈ {128, 256, 1024}, each times
+//! top_k=6 routed slots.
 //!
 //! E=1 single-expert setup keeps memory small; expert_tile_ids points
 //! every slot to expert 0. Correctness check: 4w output must match
@@ -97,9 +98,11 @@ fn main() {
 
     // (M, K, batch, label) — batch is PP_BATCH; m_total = batch × TOP_K.
     let shapes: &[(usize, usize, usize, &str)] = &[
+        (2048, 4096, 1, "gate/up B=1 (V4F AR decode)"),
         (2048, 4096, 128, "gate/up B=128"),
         (2048, 4096, 256, "gate/up B=256"),
         (2048, 4096, 1024, "gate/up B=1024 (V4F prefill default)"),
+        (4096, 2048, 1, "down B=1 (V4F AR decode)"),
         (4096, 2048, 128, "down B=128"),
         (4096, 2048, 256, "down B=256"),
         (4096, 2048, 1024, "down B=1024 (V4F prefill default)"),
@@ -160,6 +163,11 @@ fn main() {
             .collect();
         let sp_gpu = gpu.hip.malloc(perm_bytes.len()).expect("malloc SP");
         gpu.hip.memcpy_htod(&sp_gpu, &perm_bytes).expect("htod SP");
+        let topk_bytes = vec![0u8; TOP_K * std::mem::size_of::<i32>()];
+        let topk_gpu = gpu.hip.malloc(topk_bytes.len()).expect("malloc topk");
+        gpu.hip
+            .memcpy_htod(&topk_gpu, &topk_bytes)
+            .expect("htod topk");
 
         // Wrap as GpuTensor for the dispatch fn.
         let ep_t = wrap_buf(ep_gpu.as_ptr(), 8, vec![1], DType::F32);
@@ -170,6 +178,12 @@ fn main() {
             DType::F32,
         );
         let sp_t = wrap_buf(sp_gpu.as_ptr(), perm_bytes.len(), vec![m_total], DType::F32);
+        let topk_t = wrap_buf(
+            topk_gpu.as_ptr(),
+            topk_bytes.len(),
+            vec![TOP_K],
+            DType::F32,
+        );
         let x_t = wrap_buf(
             x_gpu.as_ptr(),
             x_f32_bytes.len(),
@@ -342,6 +356,41 @@ fn main() {
         gpu.hip.device_synchronize().unwrap();
         let mmq_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
         let mmq_gflops = flops / mmq_us / 1e3;
+
+        gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_perm_gfx1151(
+            &ep_t, &tp_t, &sp_t, &x_t, &ymmq_t, m, k, 1, m_total, m_total,
+        )
+        .expect("mmq perm");
+        gpu.hip.device_synchronize().expect("sync mmq perm");
+        let mut y_perm_bytes = vec![0u8; m_total * m * 4];
+        gpu.hip
+            .memcpy_dtoh(&mut y_perm_bytes, &ymmq_gpu)
+            .expect("dtoh mmq perm");
+        let y_perm: &[f32] = unsafe {
+            std::slice::from_raw_parts(y_perm_bytes.as_ptr() as *const f32, m_total * m)
+        };
+        let perm_diff = y_mmq
+            .iter()
+            .zip(y_perm)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        for _ in 0..WARMUP {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_perm_gfx1151(
+                &ep_t, &tp_t, &sp_t, &x_t, &ymmq_t, m, k, 1, m_total, m_total,
+            )
+            .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..TRIALS {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_perm_gfx1151(
+                &ep_t, &tp_t, &sp_t, &x_t, &ymmq_t, m, k, 1, m_total, m_total,
+            )
+            .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let perm_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
+
         println!(
             "  i8-mmq:        {mmq_us:>8.1} µs ({mmq_gflops:>6.0} GFLOPS)   \
              vs-4w: {:.2}×   rms_rel_vs_f16={rms_rel:.4} nan={nan2} {}",
@@ -352,10 +401,18 @@ fn main() {
                 "CHECK"
             }
         );
+        println!(
+            "  perm-decode:   {perm_us:>8.1} µs   vs-i8: {:.2}×   bit_exact={}/{}",
+            mmq_us / perm_us,
+            m_total * m - perm_diff,
+            m_total * m,
+        );
+        assert_eq!(perm_diff, 0, "perm-decode candidate changed MQ2 output");
 
         std::mem::forget(ep_t);
         std::mem::forget(tp_t);
         std::mem::forget(sp_t);
+        std::mem::forget(topk_t);
         std::mem::forget(x_t);
         std::mem::forget(yref_t);
         std::mem::forget(y4w_t);

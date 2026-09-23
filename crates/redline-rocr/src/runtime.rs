@@ -3,7 +3,7 @@
 use std::ffi::{CStr, CString, c_void};
 use std::fmt;
 use std::ptr::{self, NonNull};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -992,11 +992,7 @@ impl AqlQueue {
         let status = unsafe {
             (self.runtime().symbols.queue_cu_set_mask)(self.raw.as_ptr(), mask_bits, mask.as_ptr())
         };
-        check_status(
-            &self.runtime().symbols,
-            "hsa_amd_queue_cu_set_mask",
-            status,
-        )
+        check_status(&self.runtime().symbols, "hsa_amd_queue_cu_set_mask", status)
     }
 
     fn depth_sample(&self) -> QueueDepthSample {
@@ -1419,6 +1415,15 @@ impl QueueSet {
     }
 }
 
+/// `HIPFIRE_REPLAY_PM4_IB_DEVICE_LOCAL` — place the retained PM4 indirect
+/// buffer in device-local memory. Default off; see `allocate_indirect_bytes`.
+fn ib_device_local_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_REPLAY_PM4_IB_DEVICE_LOCAL").as_deref() == Ok("1")
+    })
+}
+
 #[derive(Clone)]
 pub struct KernargPool {
     inner: Arc<KernargPoolInner>,
@@ -1430,6 +1435,17 @@ struct KernargPoolInner {
     gpu: abi::Agent,
     granule: usize,
     alignment: usize,
+    /// Device-local (coarse-grained) pool on the GPU agent, when one exists.
+    /// The kernarg pool above is fine-grained and therefore host-coherent, so
+    /// the command processor re-fetches the retained PM4 indirect buffer
+    /// through cache-bypassing memory on every replay. The tape is written
+    /// once and replayed thousands of times, so it belongs in cacheable
+    /// device-local memory; per-position kernargs genuinely need the
+    /// host-writable fine-grained pool and stay there.
+    device_pool: Option<abi::MemoryPool>,
+    device_granule: usize,
+    device_alignment: usize,
+    cpu: abi::Agent,
 }
 
 impl KernargPool {
@@ -1503,6 +1519,8 @@ impl KernargPool {
             if granule == 0 || !alignment.is_power_of_two() {
                 continue;
             }
+            let (device_pool, device_granule, device_alignment) =
+                Self::discover_device_pool(device).unwrap_or((None, 0, 0));
             return Ok(Self {
                 inner: Arc::new(KernargPoolInner {
                     runtime: device.runtime.clone(),
@@ -1510,10 +1528,92 @@ impl KernargPool {
                     gpu: device.gpu_agent(),
                     granule,
                     alignment,
+                    device_pool,
+                    device_granule,
+                    device_alignment,
+                    cpu: cpu.handle,
                 }),
             });
         }
         Err(RuntimeError::NoKernargPool)
+    }
+
+    /// Find a device-local (coarse-grained) global pool on the GPU agent.
+    ///
+    /// Returns `Ok((None, ..))` rather than an error when the agent exposes no
+    /// such pool: device-local placement is an optimization, and every caller
+    /// falls back to the fine-grained kernarg pool.
+    fn discover_device_pool(
+        device: &GpuDevice,
+    ) -> Result<(Option<abi::MemoryPool>, usize, usize), RuntimeError> {
+        unsafe extern "C" fn collect(pool: abi::MemoryPool, data: *mut c_void) -> abi::Status {
+            // SAFETY: context is a live vector for synchronous iteration.
+            unsafe { &mut *data.cast::<Vec<abi::MemoryPool>>() }.push(pool);
+            abi::STATUS_SUCCESS
+        }
+        let mut pools = Vec::new();
+        // SAFETY: callback and context satisfy the iteration contract.
+        let status = unsafe {
+            (device.runtime.symbols.agent_iterate_memory_pools)(
+                device.gpu_agent(),
+                Some(collect),
+                (&mut pools as *mut Vec<abi::MemoryPool>).cast(),
+            )
+        };
+        check_status(
+            &device.runtime.symbols,
+            "hsa_amd_agent_iterate_memory_pools",
+            status,
+        )?;
+
+        for pool in pools {
+            let mut segment = 0_u32;
+            let mut flags = 0_u32;
+            let mut allowed = false;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_SEGMENT,
+                (&mut segment as *mut u32).cast(),
+            )?;
+            if segment != abi::AMD_SEGMENT_GLOBAL {
+                continue;
+            }
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+                (&mut flags as *mut u32).cast(),
+            )?;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED,
+                (&mut allowed as *mut bool).cast(),
+            )?;
+            if !allowed || flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED == 0 {
+                continue;
+            }
+            let mut granule = 0_usize;
+            let mut alignment = 0_usize;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE,
+                (&mut granule as *mut usize).cast(),
+            )?;
+            query_pool(
+                &device.runtime.symbols,
+                pool,
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT,
+                (&mut alignment as *mut usize).cast(),
+            )?;
+            if granule == 0 || !alignment.is_power_of_two() {
+                continue;
+            }
+            return Ok((Some(pool), granule, alignment));
+        }
+        Ok((None, 0, 0))
     }
 
     pub fn allocate_for(&self, metadata: KernelMetadata) -> Result<KernargBuffer, RuntimeError> {
@@ -1531,6 +1631,108 @@ impl KernargPool {
     /// words are data rather than shader ISA.
     pub fn allocate_executable_bytes(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
         self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
+    }
+
+    /// Allocate command memory for a retained indirect buffer, preferring the
+    /// device-local (coarse-grained) pool so the command processor fetches the
+    /// tape through cacheable memory instead of the host-coherent kernarg pool.
+    ///
+    /// The tape is written once at prepare time and replayed every decode
+    /// position, so cacheability is worth more than host-write convenience.
+    /// Enabled with `HIPFIRE_REPLAY_PM4_IB_DEVICE_LOCAL=1`.
+    ///
+    /// Fails closed to `allocate_executable_bytes` at every step — no device
+    /// pool, allocation refused, access grant refused, or a CPU write that does
+    /// not read back — because a command buffer the CP cannot fetch hangs the
+    /// queue, and the operator may have no way to recover the device.
+    pub fn allocate_indirect_bytes(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
+        if length == 0 || !ib_device_local_enabled() {
+            return self.allocate_executable_bytes(length);
+        }
+        let Some(pool) = self.inner.device_pool else {
+            return self.allocate_executable_bytes(length);
+        };
+        match self.try_allocate_device_bytes(pool, length) {
+            Ok(buffer) => Ok(buffer),
+            Err(reason) => {
+                eprintln!(
+                    "[redline] device-local indirect buffer unavailable ({reason});                      retaining the fine-grained kernarg pool"
+                );
+                self.allocate_executable_bytes(length)
+            }
+        }
+    }
+
+    fn try_allocate_device_bytes(
+        &self,
+        pool: abi::MemoryPool,
+        length: usize,
+    ) -> Result<KernargBuffer, &'static str> {
+        let granule = self.inner.device_granule.max(1);
+        let allocation_size = length
+            .checked_add(granule - 1)
+            .map(|value| value / granule * granule)
+            .ok_or("size overflow")?;
+        let mut pointer = ptr::null_mut();
+        // SAFETY: pool allows runtime allocation and the output pointer is valid.
+        let status = unsafe {
+            (self.inner.runtime.symbols.memory_pool_allocate)(
+                pool,
+                allocation_size,
+                abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG,
+                &mut pointer,
+            )
+        };
+        if status != abi::STATUS_SUCCESS {
+            return Err("pool allocation refused");
+        }
+        let pointer = NonNull::new(pointer.cast::<u8>()).ok_or("allocation returned null")?;
+        let free = || {
+            // SAFETY: pointer came from the matching allocation function.
+            let _ = unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+        };
+        if pointer.as_ptr() as usize % self.inner.device_alignment.max(16) != 0 {
+            free();
+            return Err("allocation misaligned");
+        }
+
+        // Both agents must reach it: the GPU to fetch commands, the host to
+        // write the tape in the first place.
+        let agents = [self.inner.cpu, self.inner.gpu];
+        // SAFETY: allocation came from this pool; flags are reserved and null.
+        let status = unsafe {
+            (self.inner.runtime.symbols.agents_allow_access)(
+                agents.len() as u32,
+                agents.as_ptr(),
+                ptr::null(),
+                pointer.as_ptr().cast(),
+            )
+        };
+        if status != abi::STATUS_SUCCESS {
+            free();
+            return Err("host access grant refused");
+        }
+
+        // Prove the host mapping actually works before the CP is ever pointed
+        // at this memory. A coarse-grained pool that is not host-visible would
+        // otherwise surface as a queue hang rather than an error.
+        let probe: u32 = 0x5245_444C;
+        // SAFETY: the allocation is at least 4 bytes and now host-accessible.
+        unsafe {
+            ptr::write_volatile(pointer.as_ptr().cast::<u32>(), probe);
+            if ptr::read_volatile(pointer.as_ptr().cast::<u32>()) != probe {
+                free();
+                return Err("host write did not read back");
+            }
+            ptr::write_bytes(pointer.as_ptr(), 0, allocation_size);
+        }
+
+        Ok(KernargBuffer {
+            pool: self.inner.clone(),
+            pointer: Some(pointer),
+            length,
+            allocation_size,
+        })
     }
 
     fn allocate_bytes(

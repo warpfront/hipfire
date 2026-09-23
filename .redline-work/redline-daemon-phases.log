@@ -1,0 +1,7 @@
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/kaden/.hipfire_kernels/ds4-mq2r-g3z-A/gfx1151
+deepseek4: MQ2R P3 tensor recipe verified; selected gfx1151 route v3 base policy (routed experts qt=19)
+deepseek4: opening DSpark sidecar HFQ "/home/kaden/.cache/hipfire-surgery/deepseek-v4-flash-dspark.mq2r"
+deepseek4: MQ2R DSpark v1 sidecar identity verified (target=P3; draft head=trunk E8 B4)
+deepseek4: DSpark drafter present — uploading 3 stages
+  deepseek4 DSpark speculator enabled (sidecar, block=5)

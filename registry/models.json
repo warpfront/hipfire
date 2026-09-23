@@ -62,6 +62,29 @@
       },
       "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code) and a DSpark 3-stage drafter sidecar (auto-wins over MTP under --spec dspark/auto). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant."
     },
+    "deepseek-v4-flash:mq2r": {
+      "repo": "",
+      "file": "deepseek-v4-flash.mq2r",
+      "size_gb": 82,
+      "min_vram_gb": 96,
+      "sampling": { "temperature": 1.0, "top_p": 1.0 },
+      "mtp": {
+        "file": "deepseek-v4-flash-mtp.mq2r"
+      },
+      "dspark": {
+        "file": "deepseek-v4-flash-dspark.mq2r",
+        "sha256": "620a337324955722bccc9a0233a8b6fdc89356362f1d2dc97e336d0d55148dfd",
+        "size_bytes": 5996338910
+      },
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 1.0
+      },
+      "quant_recipe": "deepseek4-mq2r-e8-p3-v1",
+      "sha256": "392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511",
+      "size_bytes": 82191362222,
+      "desc": "Frozen local SKU for DeepSeek V4 Flash MQ2R (arch_id=9): the exact P3 tensor overlay and gfx1151 kernel/dispatch bundle that produced the 30.21 tok/s AR reference. Uses dedicated MQ2R sidecars; it never resolves to or overwrites the MQ2-Lloyd artifact."
+    },
     "minimax-m2.7": {
       "repo": "hipfire-models/hipfire-MiniMax-M2.7",
       "file": "MiniMax-M2.7.mq2",
@@ -779,6 +802,8 @@
     "qwopus": "qwopus:9b",
     "deepseek4": "deepseek-v4-flash",
     "deepseek-v4": "deepseek-v4-flash",
+    "deepseek4:mq2r": "deepseek-v4-flash:mq2r",
+    "deepseek-v4:mq2r": "deepseek-v4-flash:mq2r",
     "qwen3.5:0.8b-mq4": "qwen3.5:0.8b",
     "qwen3.5:4b-mq4": "qwen3.5:4b",
     "qwen3.5:9b-mq4": "qwen3.5:9b",

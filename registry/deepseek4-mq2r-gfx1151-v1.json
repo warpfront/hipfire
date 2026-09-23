@@ -1,0 +1,163 @@
+{
+  "schema": "hipfire.deepseek4_mq2r_fixture.v1",
+  "status": "frozen_candidate_not_redline_admitted",
+  "recipe": "deepseek4-mq2r-e8-p3-v1",
+  "product_lock": {
+    "meaning": "MQ2R names only the exact P3 artifact plus the exact gfx1151 kernel and dispatch bundle measured at 30.21 tok/s AR",
+    "overlay_variants_allowed": false,
+    "kernel_variants_allowed": false,
+    "speculative_sidecars_part_of_ar_lock": false
+  },
+  "architecture": {
+    "arch_id": 9,
+    "gpu": "gfx1151",
+    "pp": 1,
+    "tp": 1
+  },
+  "artifact": {
+    "file": "deepseek-v4-flash.mq2r",
+    "size_bytes": 82191362222,
+    "sha256": "392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511",
+    "tensor_count": 34223,
+    "e8_tensor_count": 554,
+    "e8_quant_type": 35,
+    "routed_expert_quant_type": 19,
+    "embedding_quant_type": 3,
+    "runtime_overlay_allowed": false
+  },
+  "construction": {
+    "base_file": "deepseek-v4-flash.mq2lloyd",
+    "base_sha256": "ab8a8900f6792199975e7e2b15854bb869a023ca3fddf62981c1b9cd600e9b96",
+    "overlay_name": "p3-all-layers-gptq-head/overlay.hfq",
+    "overlay_sha256": "bc3644259952efca32074085ed69bcbeb0fad12fb23972fe5694ac9bf13323b8",
+    "reap_plan_sha256": "531abbe0711f52d332bd28c813f3d7ea3037724431caca3cd7f00bef98093774",
+    "bake_tool": "scripts/reap/hfq_overlay_bake.rs",
+    "copy_contract": "554 overlay payloads and every untouched base payload are copied byte-for-byte; no tensor is requantized during the bake"
+  },
+  "runtime_kernel_preset": {
+    "e8_decode_u4": true,
+    "e8_olora_grouped": true,
+    "e8_prefill_b2": true,
+    "e8_prefill_b4": true,
+    "ffn_overlap": false,
+    "hc_pingpong": true,
+    "hc_control_vec4": true,
+    "hc_finalize_fused": true,
+    "hc_control_finalize_fused": true,
+    "moe_deterministic": false,
+    "rope_wide": true,
+    "attention_scoregrid": true,
+    "rms_plain_nox": true,
+    "mq2_down_k8all": true,
+    "locked_out_experiments": [
+      "attention_ilp4",
+      "attention_warp",
+      "ffn_split",
+      "hc_control_rsqrt_once",
+      "hc_finalize_input_map",
+      "mq2_down_rankpair",
+      "mq2_down_rowtile2",
+      "mq2_gate_up_wavecb",
+      "qnorm_rotate_fused",
+      "retained_embedding",
+      "rms_warp_reduce"
+    ]
+  },
+  "accepted_tape": {
+    "launch_count": 2320,
+    "unique_kernel_count": 32,
+    "sequence_hash_u64": "16872664150355135186",
+    "symbols": [
+      "compressor_add_ape_f32_buf",
+      "compressor_overlap_concat_f32",
+      "compressor_softmax_pool_f32_buf",
+      "deepseek4_attn_swa_buf",
+      "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+      "deepseek4_fused_silu_mul_clamp_mq_rotate",
+      "deepseek4_moe_topk_bias_aware_f32",
+      "deepseek4_silu_mul_clamp_f32",
+      "deepseek4_topk_kv_gather_f32_buf",
+      "deepseek4_topk_kv_gather_identity_f32_buf",
+      "fused_rmsnorm_mq_rotate_plain_nox",
+      "gemv_mfp4g32_e8_soa_grouped_gfx1151",
+      "gemv_mfp4g32_e8_soa_u4",
+      "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed",
+      "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+      "hash_router_normalize_f32_buf",
+      "hc_compute_control_vec4_finalize",
+      "hc_head_compute_pre",
+      "hc_input_map_4stream",
+      "hc_mix_4stream",
+      "indexer_relu_score_f32_buf",
+      "indexer_top_k_buf",
+      "mq_rotate_x",
+      "rmsnorm_f32",
+      "rmsnorm_f32_at_slot_buf",
+      "rope_tail_interleaved_f32",
+      "rope_tail_yarn_interleaved_at_slot_buf_f32",
+      "rope_tail_yarn_interleaved_wide_f32",
+      "sqrt_softplus_f32",
+      "state_overlap_shift_f32_buf",
+      "state_ring_write_f32_buf",
+      "swa_ring_write_f32_buf"
+    ]
+  },
+  "kernel_sources": {
+    "kernels/src/gemv_mfp4g32_e8_soa_u4.hip": "d72266baf63776f632b89c778e3782137caff04d8320992a85e3db5dd6f8ce00",
+    "kernels/src/gemm_mfp4g32_e8_soa_grouped_wmma.gfx1151.hip": "c1377993df638de7335772eebcca4d118ddb79a4d723e56285a2c0fa2ab19897",
+    "kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip": "b9ee149f667a8626e6b4bdbc308bea3eb583a9d9907f411ed0bcd7fd18d9c3c9",
+    "kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx1151.hip": "2ad535bfba0acc89e2c7988065214034d1aaedfecc795a3ff07a489d2405d0c2",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip": "73e84d4a311b6e3ff8450469d9176e73918b57e99f2a96629340a103fbb48c11",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip": "ed5f226a7e68b7d3b1999354994395e54af04526a3b38b4047f7fd8746be96e6",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip": "37b41e12c0e4a0563314ed9dac2074aafb2a08064f22bb8039e08b43064d2a59",
+    "kernels/src/fused_rmsnorm_mq_rotate_plain.hip": "d5b78b168c0098e9a52c9a39e415113790eca6736a98172490a0c671d0f5ca3a",
+    "kernels/src/hc_compute_control.hip": "493040b0c45d6f1de93150ed63dc9ea18ef8a2a44d20fe1e715cbb1edfd5ef99",
+    "kernels/src/rope_tail_yarn_interleaved.hip": "7ffa954669f86d66118445ccc72350d23bb2e346365ccbcfbc68aa478dad2987",
+    "kernels/src/deepseek4_attn_swa_topk_buf.hip": "2b950b85b64e13b3e4f4d7d9ba394aa060ffc4a5a122e1daab53fc9708712cf8"
+  },
+  "kernel_cache_bundle_sha256": "56117f1acee3085b6877d937704663c85ed90ae42351aefe75ff8cdc045f2bdf",
+  "reference_measurement": {
+    "date_utc": "2026-07-24",
+    "binary_md5": "15473606329237ae0127f1b740ad5f83",
+    "binary_sha256": "758d4ed320fe4cac802f983c8fb12c193a99365ca117164a67307476a234b3c9",
+    "prompt_md5": "e2f8e5b972f5cb8560d004062094d8a8",
+    "transport": "explicit_retained_pm4",
+    "pm4": {
+      "queues": 1,
+      "register_policy": "static",
+      "wait_policy": "resource",
+      "mid_acquire_policy": "required-only",
+      "gcr_trim": true,
+      "dynamic_grid": false,
+      "packet_count": 1,
+      "command_dwords": 57983
+    },
+    "prefill_tok_s": 47.04,
+    "decode_tok_s": 30.21,
+    "generated_tokens": 128,
+    "coherent_chat_transfer_tok_s": [
+      29.51,
+      29.71
+    ],
+    "redline_admitted": false,
+    "note": "This freezes the measured route identity. It is not automatic Redline admission or full certification."
+  },
+  "sidecars": {
+    "mtp": {
+      "file": "deepseek-v4-flash-mtp.mq2r",
+      "status": "pending_target_aligned_build"
+    },
+    "dspark": {
+      "file": "deepseek-v4-flash-dspark.mq2r",
+      "size_bytes": 5996338910,
+      "sha256": "620a337324955722bccc9a0233a8b6fdc89356362f1d2dc97e336d0d55148dfd",
+      "source_mq2lloyd_sha256": "0ec4cdbadfd8f5b1e8eead5b864ec3ec2233839f266221e6111839efd5813375",
+      "payload_tensor_count": 2376,
+      "payload_copy_contract": "all tensor payloads are byte-identical to the pinned source; only top-level MQ2R product identity metadata was added",
+      "target_recipe": "deepseek4-mq2r-e8-p3-v1",
+      "draft_head": "trunk_mfp4_e8_soa_b4",
+      "status": "target_identity_verified_coherent_perf_not_promoted"
+    },
+    "policy": "MQ2-Lloyd sidecars are diagnostic controls only and must never resolve as MQ2R products"
+  }
+}

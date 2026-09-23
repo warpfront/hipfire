@@ -871,7 +871,6 @@ impl Gpu {
             kernels::V4F_MOE_TOPK_BIAS_AWARE_SRC,
             "deepseek4_moe_topk_bias_aware_f32",
         )?;
-        let func = &self.functions["deepseek4_moe_topk_bias_aware_f32"];
         let sp = scores.buf.as_ptr();
         let bp = bias.buf.as_ptr();
         let ip = indices.buf.as_ptr();
@@ -888,16 +887,24 @@ impl Gpu {
             &mut kt as *mut _ as *mut c_void,
             &mut rs as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [n_exp as u32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "deepseek4_moe_topk_bias_aware_f32",
+            [1, 1, 1],
+            [n_exp as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(bp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(ne);
+                b.push_i32(kt);
+                b.push_f32(rs);
+                b
+            },
+        )
     }
     pub fn deepseek4_topk_kv_gather_batched_f32(
         &mut self,
@@ -966,11 +973,34 @@ impl Gpu {
         scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "deepseek4_topk_kv_gather_f32_buf",
-            kernels::V4F_TOPK_KV_GATHER_BUF_SRC,
-            "deepseek4_topk_kv_gather_f32_buf",
-        )?;
+        static TILED_GFX1151_OVERRIDE: std::sync::OnceLock<Option<bool>> =
+            std::sync::OnceLock::new();
+        let tiled_override = *TILED_GFX1151_OVERRIDE.get_or_init(|| {
+            match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_TOPK_GATHER_TILED")
+                .ok()
+                .as_deref()
+            {
+                Some("0") => Some(false),
+                Some("1") => Some(true),
+                _ => None,
+            }
+        });
+        let tiled =
+            self.arch == "gfx1151" && tiled_override.unwrap_or(self.deepseek4_mq2r_route_v1);
+        let (logical_name, source, symbol) = if tiled {
+            (
+                "deepseek4_topk_kv_gather_tiled_gfx1151",
+                kernels::V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC,
+                "deepseek4_topk_kv_gather_tiled_f32_buf",
+            )
+        } else {
+            (
+                "deepseek4_topk_kv_gather_f32_buf",
+                kernels::V4F_TOPK_KV_GATHER_BUF_SRC,
+                "deepseek4_topk_kv_gather_f32_buf",
+            )
+        };
+        self.ensure_kernel(logical_name, source, symbol)?;
         let cp = kv_cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1005,9 +1035,17 @@ impl Gpu {
             b
         };
         self.launch_maybe_blob(
-            "deepseek4_topk_kv_gather_f32_buf",
-            [max_k as u32, 1, 1],
-            [head_dim as u32, 1, 1],
+            symbol,
+            if tiled {
+                [((max_k + 31) / 32) as u32, ((head_dim + 31) / 32) as u32, 1]
+            } else {
+                [max_k as u32, 1, 1]
+            },
+            if tiled {
+                [256, 1, 1]
+            } else {
+                [head_dim as u32, 1, 1]
+            },
             0,
             &mut params,
             blob_builder,

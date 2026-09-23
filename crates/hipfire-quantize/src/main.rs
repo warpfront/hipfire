@@ -1993,21 +1993,29 @@ fn quantize_mfp4g32_e8_soa_2d(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
+    use rayon::prelude::*;
+
     assert_eq!(f32_data.len(), m * k);
     assert!(k % 256 == 0, "mfp4-E8-SoA requires k%256==0, got k={}", k);
     let n_blocks = k / 32;
     let scale_padded = ((n_blocks + 15) >> 4) << 4;
     let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
-    let mut out = Vec::with_capacity(m * soa_row_bytes);
-    let mut row_buf = vec![0.0f32; k];
-    for r in 0..m {
-        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
-        for seg in 0..(k / 256) {
-            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
-        }
-        let aos_row = quantize_mfp4g32_e8_row(&row_buf);
-        out.extend_from_slice(&aos_to_soa_row(&aos_row, n_blocks));
-    }
+    let mut out = vec![0u8; m * soa_row_bytes];
+    out.par_chunks_mut(soa_row_bytes)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            let mut row_buf = f32_data[r * k..(r + 1) * k].to_vec();
+            for seg in 0..(k / 256) {
+                cpu_fwht_256(
+                    &mut row_buf[seg * 256..(seg + 1) * 256],
+                    signs1,
+                    signs2,
+                );
+            }
+            let aos_row = quantize_mfp4g32_e8_row(&row_buf);
+            let soa_row = aos_to_soa_row(&aos_row, n_blocks);
+            dst.copy_from_slice(&soa_row);
+        });
     out
 }
 
@@ -6219,6 +6227,138 @@ fn run_gguf_pipeline(
     Ok(())
 }
 
+fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    let n_blocks = n_elements.div_ceil(32);
+    let expected = n_blocks * 34;
+    if data.len() != expected {
+        return Err(format!(
+            "Q8F16 byte size {} != {expected} for {n_elements} elements",
+            data.len()
+        ));
+    }
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let off = b * 34;
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let start = b * 32;
+        let end = (start + 32).min(n_elements);
+        for i in start..end {
+            out[i] = (data[off + 2 + i - start] as i8) as f32 * scale;
+        }
+    }
+    Ok(out)
+}
+
+/// Build a pure-shadow overlay that moves DeepSeek V4's dense, per-token Q8
+/// projections to MFP4-E8-SoA. Routed experts, router, embeddings, and lm_head
+/// remain byte-for-byte in the base model.
+fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -> Result<(), String> {
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(input)
+        .map_err(|e| format!("open source HFQ {}: {e}", input.display()))?;
+    if hfq.arch_id != 9 {
+        return Err(format!(
+            "deepseek4 dense E8 overlay requires arch_id=9, got {}",
+            hfq.arch_id
+        ));
+    }
+    let metadata_json = hfq.metadata_json.clone();
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_json)
+        .map_err(|e| format!("source HFQ metadata JSON: {e}"))?;
+    let n_layers = metadata
+        .pointer("/config/num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "source HFQ metadata missing config.num_hidden_layers".to_string())?
+        as usize;
+    hfq.drop_mmap();
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let suffixes = [
+        "attn.wq_a.weight",
+        "attn.wq_b.weight",
+        "attn.wkv.weight",
+        "attn.wo_a.weight",
+        "attn.wo_b.weight",
+        "ffn.shared_experts.w1.weight",
+        "ffn.shared_experts.w2.weight",
+        "ffn.shared_experts.w3.weight",
+    ];
+
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create output dir {}: {e}", parent.display()))?;
+    }
+    let spill_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut spill =
+        TensorSpill::new(spill_dir).map_err(|e| format!("create tensor spill: {e}"))?;
+    let mut tensors = Vec::with_capacity(n_layers * suffixes.len());
+    let mut source_bytes = 0u64;
+    let mut overlay_bytes = 0u64;
+
+    for layer in 0..n_layers {
+        for suffix in suffixes {
+            let name = format!("layers.{layer}.{suffix}");
+            let (info, bytes) = hfq
+                .tensor_data_vec(&name)
+                .ok_or_else(|| format!("source HFQ missing dense projection '{name}'"))?;
+            if info.quant_type != QuantType::Q8F16 as u8 {
+                return Err(format!(
+                    "{name}: expected Q8F16 qt=3 source, got qt={}",
+                    info.quant_type
+                ));
+            }
+            if info.shape.len() != 2 {
+                return Err(format!("{name}: expected rank-2 shape, got {:?}", info.shape));
+            }
+            let m = info.shape[0] as usize;
+            let k = info.shape[1] as usize;
+            if k % 256 != 0 {
+                return Err(format!("{name}: E8-SoA requires K%256==0, got K={k}"));
+            }
+            let f32_data = dequantize_hfq_q8f16(&bytes, m * k)
+                .map_err(|e| format!("{name}: {e}"))?;
+            let packed =
+                quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
+            source_bytes += bytes.len() as u64;
+            overlay_bytes += packed.len() as u64;
+            eprintln!(
+                "E8-SoA {name}: [{m}, {k}] {:.2} MiB -> {:.2} MiB",
+                bytes.len() as f64 / 1_048_576.0,
+                packed.len() as f64 / 1_048_576.0
+            );
+            tensors.push(HfqTensor {
+                name,
+                quant_type: QuantType::MFP4G32E8SOA,
+                shape: info.shape.clone(),
+                group_size: 32,
+                data: packed,
+                spilled_len: 0,
+            });
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024);
+        }
+    }
+
+    write_hfq(
+        output,
+        hfq.arch_id,
+        &metadata_json,
+        &tensors,
+        Some(&mut spill),
+    )
+    .map_err(|e| format!("write overlay {}: {e}", output.display()))?;
+    eprintln!(
+        "deepseek4 dense E8-SoA overlay: {} tensors, {:.2} GiB Q8 -> {:.2} GiB E8 ({:.1}% of source)",
+        tensors.len(),
+        source_bytes as f64 / 1_073_741_824.0,
+        overlay_bytes as f64 / 1_073_741_824.0,
+        overlay_bytes as f64 * 100.0 / source_bytes as f64,
+    );
+    Ok(())
+}
+
 fn main() {
     let args = QuantizeArgs::parse();
 
@@ -6239,6 +6379,20 @@ fn main() {
     let input_dir = args.input.as_str();
     let output_path = args.output.as_str();
     let format = args.format.as_str();
+
+    if matches!(
+        format,
+        "deepseek4-dense-mfp4e8soa-overlay" | "ds4-dense-e8soa-overlay"
+    ) {
+        if let Err(e) = build_deepseek4_dense_e8soa_overlay(
+            Path::new(input_dir),
+            Path::new(output_path),
+        ) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return;
+    }
 
     // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
     // Produces a `<stem>-dspark.<ext>` HFQ carrying the 5-layer dense drafter
@@ -12271,8 +12425,8 @@ mod gptq_damping_probe {
             "{:35} {:>14} {:>14} {:>10}",
             "distribution", "fwht MSE", "no-fwht MSE", "fwht win %"
         );
-        for (label, gen) in cases {
-            let w = gen();
+        for (label, generate) in cases {
+            let w = generate();
             let n = w.len();
             let fwht_bytes = quantize_mq2g256_lloyd(&w, &signs1, &signs2);
             let fwht_recon = dequantize_mq2g256_lloyd_to_f32(&fwht_bytes, n, &signs1, &signs2);

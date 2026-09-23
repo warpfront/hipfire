@@ -299,11 +299,12 @@ impl RegistryV1 {
                     ("instruct", &profiles.instruct),
                 ] {
                     if let Some(settings) = settings {
-                        validate_recommendations(tag, settings)
-                            .map_err(|error| fail(format!("model '{tag}' profile '{name}': {error}")))?;
-                        settings
-                            .config_layer()
-                            .map_err(|error| fail(format!("model '{tag}' profile '{name}': {error}")))?;
+                        validate_recommendations(tag, settings).map_err(|error| {
+                            fail(format!("model '{tag}' profile '{name}': {error}"))
+                        })?;
+                        settings.config_layer().map_err(|error| {
+                            fail(format!("model '{tag}' profile '{name}': {error}"))
+                        })?;
                     }
                 }
             }
@@ -587,6 +588,36 @@ mod tests {
     }
 
     #[test]
+    fn bundled_mq2r_identity_is_frozen_separately_from_mq2lloyd() {
+        let registry = bundled().unwrap();
+        let (_, mq2lloyd) = registry.model("deepseek-v4-flash").unwrap();
+        let (_, mq2r) = registry.model("deepseek-v4-flash:mq2r").unwrap();
+
+        assert_eq!(mq2lloyd.file, "deepseek-v4-flash.mq2lloyd");
+        assert_eq!(mq2r.file, "deepseek-v4-flash.mq2r");
+        assert_eq!(
+            mq2r.sha256.as_deref(),
+            Some("392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511")
+        );
+        assert_eq!(
+            mq2r.quant_recipe.as_deref(),
+            Some("deepseek4-mq2r-e8-p3-v1")
+        );
+
+        let mq2r_dspark = mq2r.dspark.as_ref().unwrap();
+        assert_eq!(mq2r_dspark.file, "deepseek-v4-flash-dspark.mq2r");
+        assert_eq!(
+            mq2r_dspark.sha256.as_deref(),
+            Some("620a337324955722bccc9a0233a8b6fdc89356362f1d2dc97e336d0d55148dfd")
+        );
+        assert_ne!(
+            mq2r_dspark.file,
+            mq2lloyd.dspark.as_ref().unwrap().file,
+            "MQ2R must never resolve the MQ2-Lloyd DSpark sidecar"
+        );
+    }
+
+    #[test]
     fn aliases_and_filenames_resolve_to_canonical_tags() {
         let registry = bundled().unwrap();
         assert_eq!(registry.resolve_tag("qwen3.6"), "qwen3.6:35b-a3b");
@@ -689,7 +720,10 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("m").unwrap();
-        assert_eq!(entry.sampling_profile("coding").unwrap().temperature, Some(0.6));
+        assert_eq!(
+            entry.sampling_profile("coding").unwrap().temperature,
+            Some(0.6)
+        );
         assert_eq!(entry.sampling_profile("instruct").unwrap().top_p, Some(0.8));
         // general has no explicit profile → falls back to recommended_settings.
         assert_eq!(

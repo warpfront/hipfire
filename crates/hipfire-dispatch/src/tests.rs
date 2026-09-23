@@ -508,6 +508,7 @@ fn for_gemv_plain_maps_all_scalar_dtypes() {
         (DType::MQ4G256, KernelKey::GemvMq4G256),
         (DType::MQ3G256, KernelKey::GemvMq3G256),
         (DType::MFP4G32, KernelKey::GemvMfp4G32),
+        (DType::MFP3G32E8, KernelKey::GemvMfp3G32E8),
     ];
     for (dtype, expected) in cases {
         assert_eq!(
@@ -528,6 +529,10 @@ fn for_gemv_prerotated_maps_mq_family() {
         (DType::MQ6G256, KernelKey::GemvMq6G256Prerotated),
         (DType::MQ8G256, KernelKey::GemvMq8G256Prerotated),
         (DType::MFP4G32, KernelKey::GemvMfp4G32Prerotated),
+        (
+            DType::MFP3G32E8,
+            KernelKey::GemvMfp3G32E8Prerotated,
+        ),
     ];
     for (dtype, expected) in cases {
         assert_eq!(
@@ -743,13 +748,61 @@ fn gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna() {
     // gate is now HasWave32 (was HasWmma), so it resolves on every RDNA gen
     // (RDNA1/2/3/4) but still NOT on CDNA wave64 (a [32,1,1] kernel needs wave32).
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna1(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna4(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna1(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna4(),
+            None
+        )
+        .is_ok());
     // CDNA wave64 (gfx906) still excluded by HasWave32.
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_gfx906(), None).is_err());
-    assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_gfx906(),
+            None
+        )
+        .is_err());
+    assert!(fam
+        .resolve(
+            DType::MQ4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.
     assert!(fam

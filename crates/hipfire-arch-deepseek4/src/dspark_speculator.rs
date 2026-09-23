@@ -123,6 +123,7 @@ impl DsparkBody for Deepseek4DsparkBody {
             markov_w1: weights.markov_w1.as_ref().map(|t| t.shallow_clone()),
             markov_w2: weights.markov_w2.as_ref().map(|t| t.shallow_clone()),
             confidence_proj: weights.confidence_proj.as_ref().map(|t| t.shallow_clone()),
+            draft_head: None,
         };
 
         forward::dspark_run_body_and_hc_gate(
@@ -235,10 +236,14 @@ pub fn build_deepseek4_dspark_speculator(
         .token_embd
         .as_ref()
         .ok_or("build_deepseek4_dspark_speculator: weights.token_embd is None")?;
-    let lm_head = weights
-        .head
+    let sidecar_head_enabled =
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_DRAFT_HEAD").as_deref() != Ok("0");
+    let lm_head = dspark
+        .draft_head
         .as_ref()
-        .ok_or("build_deepseek4_dspark_speculator: weights.head is None")?;
+        .filter(|_| sidecar_head_enabled)
+        .or(weights.head.as_ref())
+        .ok_or("build_deepseek4_dspark_speculator: no draft or trunk head is present")?;
     let last_stage = dspark
         .stages
         .last()

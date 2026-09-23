@@ -5,12 +5,12 @@
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
 use crate::llama::{
-    f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
+    EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor, f16_to_f32,
 };
-use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
+use crate::model_load::{LoadedWeights, WeightSource, load_weights as rt_load_weights};
 use crate::weight_backend::{
-    decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
-    reupload_f16_as_f32, HfqBackend, WeightBackend,
+    HfqBackend, WeightBackend, decode_raw_codec, flat_name_candidates, load_embedding, raw_codec,
+    resolve_lm_head, reupload_f16_as_f32,
 };
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
@@ -181,6 +181,15 @@ impl HfqFile {
     /// True when an overlay is attached (its tensors shadow the base).
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Tensor index of the attached REAP overlay, if any. This is intentionally
+    /// read-only: architecture validators use it to prove that a surgery plan
+    /// did not smuggle unrelated tensor replacements into a frozen recipe.
+    pub fn overlay_tensors(&self) -> Option<&[HfqTensorInfo]> {
+        self.overlay
+            .as_deref()
+            .map(|overlay| overlay.tensors.as_slice())
     }
 
     /// Open an HFQM container that lives inside a larger file, starting at
@@ -762,11 +771,7 @@ impl HfqFile {
                 hi = hi.max(t.data_offset + t.data_size);
             }
         }
-        if lo < hi {
-            Some((lo, hi))
-        } else {
-            None
-        }
+        if lo < hi { Some((lo, hi)) } else { None }
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {

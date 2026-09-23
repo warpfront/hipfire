@@ -320,7 +320,7 @@ fn speculative_decode_impl(
         gpu,
         pbs,
         &verify_tokens,
-        last_position + 1,
+        last_position,
     )?;
 
     // ── 4. Per-position top-1 from the verifier (K+1 positions) ────────

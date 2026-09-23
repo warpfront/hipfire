@@ -24,7 +24,26 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
+
+/// Preserve the HFQ wire dtype when uploading dense DeepSeek projections.
+///
+/// `Raw` remains the compatibility fallback for the historical MQ4 container,
+/// but formats with distinct decode kernels must never collapse into it:
+/// doing so makes dispatch interpret their bytes as MQ4G256.
+fn dense_hfq_dtype(quant_type: u8) -> Option<DType> {
+    match quant_type {
+        1 => Some(DType::F16),
+        3 => Some(DType::Q8_0),
+        13 => Some(DType::MQ4G256),
+        24 => Some(DType::MFP4G32),
+        33 => Some(DType::MFP4G32P),
+        34 => Some(DType::MFP4G32E8),
+        35 => Some(DType::MFP4G32E8SOA),
+        36 => Some(DType::MFP3G32E8),
+        _ => None,
+    }
+}
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.
@@ -62,15 +81,13 @@ impl DeepseekV4 {
     }
 
     /// Upload a weight whose HFQ format is one of:
-    ///   - F16 (quant_type=1): decode to F32 on host, upload as F32, set
-    ///     GpuTensor.dtype = F32. Forward routes to `gemv_f32` with plain
-    ///     (non-FWHT) input.
+    ///   - F16 (quant_type=1): keep native F16 bytes and route through the
+    ///     F16 decode/prefill kernels with plain (non-FWHT) input.
     ///   - Q8F16 (quant_type=3): upload raw bytes, set GpuTensor.dtype =
     ///     Q8_0. Forward routes to `gemv_q8_0` with plain input.
-    ///   - Otherwise (e.g. quant_type=13 MQ4G256 in hypothetical future
-    ///     builds; not present in the canonical mq2lloyd file): upload raw
-    ///     bytes, dtype stays Raw. Forward routes to
-    ///     `gemv_mq4g256_prerotated` with FWHT-rotated input.
+    ///   - MQ4/MFP4-family formats: preserve their concrete dtype so dispatch
+    ///     selects the matching prerotated decoder. Unknown historical wire
+    ///     types retain the old `Raw` compatibility fallback.
     ///
     /// Distinct from `upload_global_raw` because the HC kernels
     /// (hc_compute_control, hc_apply_alpha) expect their weights as
@@ -103,14 +120,14 @@ impl DeepseekV4 {
             let mut t = gpu
                 .upload_raw(&bytes, &shape)
                 .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
-            t.dtype = rdna_compute::DType::F16;
+            t.dtype = DType::F16;
             return Ok(t);
         }
         let mut t = gpu
             .upload_raw(&bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
-        if info.quant_type == 3 {
-            t.dtype = rdna_compute::DType::Q8_0;
+        if let Some(dtype) = dense_hfq_dtype(info.quant_type) {
+            t.dtype = dtype;
         }
         Ok(t)
     }
@@ -419,10 +436,8 @@ impl DeepseekV4 {
         let mut t = gpu
             .upload_raw(&sub, &new_shape)
             .map_err(|e| format!("deepseek4: upload keep-subset '{name}' failed: {e:?}"))?;
-        match info.quant_type {
-            1 => t.dtype = rdna_compute::DType::F16,
-            3 => t.dtype = rdna_compute::DType::Q8_0,
-            _ => {}
+        if let Some(dtype) = dense_hfq_dtype(info.quant_type) {
+            t.dtype = dtype;
         }
         Ok(t)
     }
@@ -663,6 +678,308 @@ impl Architecture for DeepseekV4 {
 }
 
 impl DeepseekV4 {
+    const MQ2R_MFP3P1_RECIPE: &'static str = "deepseek4-mq2r-mfp3-p1-gptq-v1";
+
+    fn mq2r_gfx1151_route_eligible(arch: &str) -> bool {
+        arch == "gfx1151"
+    }
+
+    fn mq2r_mfp3p1_v1_selected(layer: usize, suffix: &str) -> bool {
+        matches!(
+            suffix,
+            "attn.wq_b.weight" | "attn.wo_b.weight" | "ffn.shared_experts.w1.weight"
+        ) || (suffix == "attn.wo_a.weight" && layer != 6 && layer != 7)
+    }
+
+    fn has_mq2r_mfp3p1_recipe(hfq: &HfqFile) -> Result<bool, String> {
+        let metadata: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|error| format!("deepseek4 MQ2R: invalid metadata JSON: {error}"))?;
+        Ok(metadata
+            .get("hipfire_derived_quant_recipe")
+            .and_then(serde_json::Value::as_str)
+            == Some(Self::MQ2R_MFP3P1_RECIPE))
+    }
+
+    fn validate_mq2r_tensor_policy(hfq: &HfqFile, cfg: &DeepseekV4Config) -> Result<(), String> {
+        const QT_Q8F16: u8 = 3;
+        const QT_MQ2_LLOYD: u8 = 19;
+        const QT_MFP4_E8_SOA: u8 = 35;
+        const QT_MFP3_E8: u8 = 36;
+        const EXPECTED_E8_TENSORS: usize = 554;
+
+        // The P3 shipping artifact remains immutable. G3.6 quality surgery is
+        // admitted only through the exact, explicit P1 MFP3+GPTQ recipe; all
+        // other runtime overlays remain refused. The final promoted candidate
+        // is baked under a new SKU rather than changing MQ2R identity.
+        let standalone_mfp3p1 = Self::has_mq2r_mfp3p1_recipe(hfq)?;
+        if standalone_mfp3p1 && hfq.has_overlay() {
+            return Err(
+                "deepseek4 MQ2R: standalone MFP3P1 recipe must not carry a runtime overlay"
+                    .to_owned(),
+            );
+        }
+
+        let mut surgery_tensors = std::collections::HashSet::new();
+        if standalone_mfp3p1 {
+            for layer in 0..cfg.num_hidden_layers {
+                for suffix in [
+                    "attn.wq_a.weight",
+                    "attn.wq_b.weight",
+                    "attn.wo_a.weight",
+                    "attn.wo_b.weight",
+                    "ffn.shared_experts.w1.weight",
+                    "ffn.shared_experts.w2.weight",
+                    "ffn.shared_experts.w3.weight",
+                ] {
+                    if Self::mq2r_mfp3p1_v1_selected(layer, suffix) {
+                        surgery_tensors.insert(format!("layers.{layer}.{suffix}"));
+                    }
+                }
+            }
+            if surgery_tensors.len() != 170 {
+                return Err(format!(
+                    "deepseek4 MQ2R: MFP3P1 recipe resolved {} tensors, expected 170",
+                    surgery_tensors.len()
+                ));
+            }
+        }
+        if hfq.has_overlay() {
+            let plan_dir = hipfire_config::developer_var("HIPFIRE_REAP_PLAN").map_err(|_| {
+                "deepseek4 MQ2R: overlay attached without HIPFIRE_REAP_PLAN".to_owned()
+            })?;
+            let plan_json_path = std::path::Path::new(&plan_dir).join("reap_plan.json");
+            let plan_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&plan_json_path).map_err(|error| {
+                    format!(
+                        "deepseek4 MQ2R: cannot read surgery plan {}: {error}",
+                        plan_json_path.display()
+                    )
+                })?)
+                .map_err(|error| {
+                    format!(
+                        "deepseek4 MQ2R: invalid surgery plan {}: {error}",
+                        plan_json_path.display()
+                    )
+                })?;
+            if plan_json.get("recipe").and_then(serde_json::Value::as_str)
+                != Some(Self::MQ2R_MFP3P1_RECIPE)
+            {
+                return Err(
+                    "deepseek4 MQ2R: runtime overlay is not the admitted MFP3 P1 GPTQ recipe"
+                        .to_owned(),
+                );
+            }
+            let plan = hipfire_reap::plan::ReapPlan::load(
+                &plan_dir,
+                cfg.num_hidden_layers,
+                cfg.n_routed_experts,
+            )?;
+            if plan.keep.is_some() {
+                return Err(
+                    "deepseek4 MQ2R: MFP3 P1 surgery must not prune routed experts".to_owned(),
+                );
+            }
+            for override_spec in &plan.quant_overrides {
+                if override_spec.tier != "mfp3g32e8-gptq" || override_spec.tensors.is_empty() {
+                    return Err(format!(
+                        "deepseek4 MQ2R: surgery override at layer {} must be an exact \
+                         mfp3g32e8-gptq tensor list",
+                        override_spec.layer
+                    ));
+                }
+                for name in &override_spec.tensors {
+                    let prefix = format!("layers.{}.", override_spec.layer);
+                    let suffix = name.strip_prefix(&prefix).ok_or_else(|| {
+                        format!("deepseek4 MQ2R: surgery tensor '{name}' has wrong layer prefix")
+                    })?;
+                    let role_ok = match override_spec.role {
+                        hipfire_reap::plan::Role::Attention => matches!(
+                            suffix,
+                            "attn.wq_a.weight"
+                                | "attn.wq_b.weight"
+                                | "attn.wo_a.weight"
+                                | "attn.wo_b.weight"
+                        ),
+                        hipfire_reap::plan::Role::SharedExpert => matches!(
+                            suffix,
+                            "ffn.shared_experts.w1.weight"
+                                | "ffn.shared_experts.w2.weight"
+                                | "ffn.shared_experts.w3.weight"
+                        ),
+                        _ => false,
+                    };
+                    if !role_ok {
+                        return Err(format!(
+                            "deepseek4 MQ2R: surgery tensor '{name}' is outside the P1 allowlist"
+                        ));
+                    }
+                    if !surgery_tensors.insert(name.clone()) {
+                        return Err(format!(
+                            "deepseek4 MQ2R: surgery tensor '{name}' is listed more than once"
+                        ));
+                    }
+                }
+            }
+            let overlay_tensors = hfq.overlay_tensors().ok_or_else(|| {
+                "deepseek4 MQ2R: overlay policy active but overlay index is absent".to_owned()
+            })?;
+            if overlay_tensors.len() != surgery_tensors.len() {
+                return Err(format!(
+                    "deepseek4 MQ2R: overlay carries {} tensors but plan names {}",
+                    overlay_tensors.len(),
+                    surgery_tensors.len()
+                ));
+            }
+            for tensor in overlay_tensors {
+                if !surgery_tensors.contains(&tensor.name) || tensor.quant_type != QT_MFP3_E8 {
+                    return Err(format!(
+                        "deepseek4 MQ2R: overlay tensor '{}' qt={} is not an admitted P1 MFP3 edit",
+                        tensor.name, tensor.quant_type
+                    ));
+                }
+            }
+        }
+
+        let require_qt = |name: &str, expected: u8| -> Result<(), String> {
+            let info = hfq
+                .find_tensor_info(name)
+                .ok_or_else(|| format!("deepseek4 MQ2R: missing tensor '{name}'"))?;
+            if info.quant_type != expected {
+                return Err(format!(
+                    "deepseek4 MQ2R: '{name}' has qt={}, expected qt={expected}",
+                    info.quant_type
+                ));
+            }
+            Ok(())
+        };
+
+        require_qt("embed.weight", QT_Q8F16)?;
+        require_qt("head.weight", QT_MFP4_E8_SOA)?;
+        let mut expected_e8 = 1usize; // head
+
+        for layer in 0..cfg.num_hidden_layers {
+            for suffix in [
+                "attn.wq_a.weight",
+                "attn.wq_b.weight",
+                "attn.wkv.weight",
+                "attn.wo_a.weight",
+                "attn.wo_b.weight",
+                "ffn.shared_experts.w1.weight",
+                "ffn.shared_experts.w2.weight",
+                "ffn.shared_experts.w3.weight",
+            ] {
+                let name = format!("layers.{layer}.{suffix}");
+                let expected = if surgery_tensors.contains(&name) {
+                    QT_MFP3_E8
+                } else {
+                    QT_MFP4_E8_SOA
+                };
+                require_qt(&name, expected)?;
+                expected_e8 += 1;
+            }
+
+            let ratio = cfg.compress_ratios.get(layer).copied().unwrap_or(0);
+            if ratio > 0 {
+                for suffix in ["attn.compressor.wkv.weight", "attn.compressor.wgate.weight"] {
+                    require_qt(&format!("layers.{layer}.{suffix}"), QT_MFP4_E8_SOA)?;
+                    expected_e8 += 1;
+                }
+            }
+            if ratio == 4 {
+                for suffix in [
+                    "attn.indexer.wq_b.weight",
+                    "attn.indexer.weights_proj.weight",
+                    "attn.indexer.compressor.wkv.weight",
+                    "attn.indexer.compressor.wgate.weight",
+                ] {
+                    require_qt(&format!("layers.{layer}.{suffix}"), QT_MFP4_E8_SOA)?;
+                    expected_e8 += 1;
+                }
+            }
+
+            require_qt(&format!("layers.{layer}.ffn.gate.weight"), QT_MFP4_E8_SOA)?;
+            expected_e8 += 1;
+
+            for expert in 0..cfg.n_routed_experts {
+                for projection in ["w1", "w2", "w3"] {
+                    require_qt(
+                        &format!("layers.{layer}.ffn.experts.{expert}.{projection}.weight"),
+                        QT_MQ2_LLOYD,
+                    )?;
+                }
+            }
+        }
+
+        if expected_e8 != EXPECTED_E8_TENSORS {
+            return Err(format!(
+                "deepseek4 MQ2R: recipe resolved {expected_e8} E8 tensors, expected {EXPECTED_E8_TENSORS}"
+            ));
+        }
+        let actual_mfp4 = hfq
+            .tensors()
+            .iter()
+            .filter(|tensor| tensor.quant_type == QT_MFP4_E8_SOA)
+            .count();
+        if hfq.has_overlay() {
+            if actual_mfp4 != EXPECTED_E8_TENSORS {
+                return Err(format!(
+                    "deepseek4 MQ2R: overlay base carries {actual_mfp4} MFP4 E8 tensors, \
+                     expected {EXPECTED_E8_TENSORS}"
+                ));
+            }
+        } else {
+            let actual_mfp3 = hfq
+                .tensors()
+                .iter()
+                .filter(|tensor| tensor.quant_type == QT_MFP3_E8)
+                .count();
+            if actual_mfp3 != surgery_tensors.len()
+                || actual_mfp4 + actual_mfp3 != EXPECTED_E8_TENSORS
+            {
+                return Err(format!(
+                    "deepseek4 MQ2R: artifact carries {actual_mfp4} MFP4 E8 and \
+                     {actual_mfp3} MFP3 E8 tensors; expected {} and {}",
+                    EXPECTED_E8_TENSORS - surgery_tensors.len(),
+                    surgery_tensors.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_mq2r_dspark_sidecar(sidecar: &HfqFile) -> Result<(), String> {
+        let metadata: serde_json::Value = serde_json::from_str(&sidecar.metadata_json)
+            .map_err(|error| format!("deepseek4 MQ2R DSpark: invalid metadata JSON: {error}"))?;
+        let identity = metadata
+            .get("mq2r_sidecar")
+            .ok_or("deepseek4 MQ2R DSpark: missing mq2r_sidecar metadata identity")?;
+        let target_recipe = identity
+            .get("target_recipe")
+            .and_then(serde_json::Value::as_str);
+        if target_recipe != Some("deepseek4-mq2r-e8-p3-v1") {
+            return Err(format!(
+                "deepseek4 MQ2R DSpark: target_recipe={target_recipe:?}, \
+                 expected deepseek4-mq2r-e8-p3-v1"
+            ));
+        }
+        let draft_head = identity
+            .get("draft_head")
+            .and_then(serde_json::Value::as_str);
+        if draft_head != Some("trunk_mfp4_e8_soa_b4") {
+            return Err(format!(
+                "deepseek4 MQ2R DSpark: draft_head={draft_head:?}, \
+                 expected trunk_mfp4_e8_soa_b4"
+            ));
+        }
+        if sidecar.find_tensor_info("draft_head.weight").is_some() {
+            return Err(
+                "deepseek4 MQ2R DSpark: v1 native-E8 sidecar must not carry draft_head.weight"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     /// EP shard-aware load entry (mirrors `MiniMaxWeights::load`).
     ///
     /// Loads the full model but uploads only `rank`'s owned routed experts
@@ -685,6 +1002,35 @@ impl DeepseekV4 {
         gpu: &mut Gpu,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
     ) -> Result<DeepseekV4Weights, String> {
+        // Model identity and route identity are intentionally separate.
+        // `.mq2r` fixes the exact P3 tensor recipe on every architecture.
+        // gfx1151 selects route v3 by default; other architectures keep the
+        // same artifact and use their portable fallback dispatch. Loading any
+        // other model resets the route so daemon swaps cannot inherit it.
+        // This is not automatic Redline admission.
+        gpu.deepseek4_mq2r_route_v1 = false;
+        if cfg.mq2r {
+            Self::validate_mq2r_tensor_policy(hfq, cfg)?;
+            let recipe_label = if hfq.has_overlay() || Self::has_mq2r_mfp3p1_recipe(hfq)? {
+                "MQ2R-derived MFP3 P1 GPTQ surgery"
+            } else {
+                "MQ2R P3 tensor recipe"
+            };
+            if Self::mq2r_gfx1151_route_eligible(&gpu.arch) {
+                gpu.deepseek4_mq2r_route_v1 = true;
+                eprintln!(
+                    "deepseek4: {recipe_label} verified; selected \
+                     gfx1151 route v3 base policy (routed experts qt=19)"
+                );
+            } else {
+                eprintln!(
+                    "deepseek4: {recipe_label} verified; gfx1151 route v3 \
+                     is ineligible on {}, using portable dispatch",
+                    gpu.arch
+                );
+            }
+        }
+
         // Phase 1.5 host walk verifies every expected tensor is in the
         // HFQ index. We then upload all globals and per-layer
         // non-expert tensors. The 256 routed experts per layer are
@@ -702,9 +1048,10 @@ impl DeepseekV4 {
             .ok()
             .as_deref()
             != Some("0");
-        let expert_layer_end: Option<usize> = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let expert_layer_end: Option<usize> =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+                .ok()
+                .and_then(|s| s.parse().ok());
 
         // ── MTP addon HFQ discovery ──────────────────────────────────────
         // Resolves an optional second HFQ holding only `mtp.0.*` tensors so
@@ -888,26 +1235,36 @@ impl DeepseekV4 {
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if layer.compress_ratio > 0 {
-                layer.compressor_wkv = Some(Self::upload_quant_or_f16(
-                    hfq,
-                    gpu,
-                    &format!("layers.{l}.attn.compressor.wkv.weight"),
-                )?);
-                layer.compressor_wgate = Some(Self::upload_quant_or_f16(
-                    hfq,
-                    gpu,
-                    &format!("layers.{l}.attn.compressor.wgate.weight"),
-                )?);
-                if comp_f16_wmma {
+                let compressor_wkv_name = format!("layers.{l}.attn.compressor.wkv.weight");
+                let compressor_wgate_name = format!("layers.{l}.attn.compressor.wgate.weight");
+                layer.compressor_wkv =
+                    Some(Self::upload_quant_or_f16(hfq, gpu, &compressor_wkv_name)?);
+                layer.compressor_wgate =
+                    Some(Self::upload_quant_or_f16(hfq, gpu, &compressor_wgate_name)?);
+                // REAP overlays may replace either compressor projection with
+                // a quantized format. Only retain the parallel F16 WMMA copy
+                // when the overlay-resolved tensor is actually F16; otherwise
+                // the regular dtype-aware GEMV/GEMM path below is authoritative.
+                if comp_f16_wmma
+                    && hfq
+                        .find_tensor_info(&compressor_wkv_name)
+                        .is_some_and(|info| info.quant_type == 1)
+                {
                     layer.compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
                         gpu,
-                        &format!("layers.{l}.attn.compressor.wkv.weight"),
+                        &compressor_wkv_name,
                     )?);
+                }
+                if comp_f16_wmma
+                    && hfq
+                        .find_tensor_info(&compressor_wgate_name)
+                        .is_some_and(|info| info.quant_type == 1)
+                {
                     layer.compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
                         gpu,
-                        &format!("layers.{l}.attn.compressor.wgate.weight"),
+                        &compressor_wgate_name,
                     )?);
                 }
                 layer.compressor_norm = Some(Self::upload_global_f16_as_f32(
@@ -929,6 +1286,10 @@ impl DeepseekV4 {
 
             // Indexer sub-module — only on layers with compress_ratio == 4.
             if layer.compress_ratio == 4 {
+                let indexer_compressor_wkv_name =
+                    format!("layers.{l}.attn.indexer.compressor.wkv.weight");
+                let indexer_compressor_wgate_name =
+                    format!("layers.{l}.attn.indexer.compressor.wgate.weight");
                 layer.indexer_wq_b = Some(Self::upload_quant_or_f16(
                     hfq,
                     gpu,
@@ -942,23 +1303,33 @@ impl DeepseekV4 {
                 layer.indexer_compressor_wkv = Some(Self::upload_quant_or_f16(
                     hfq,
                     gpu,
-                    &format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
+                    &indexer_compressor_wkv_name,
                 )?);
                 layer.indexer_compressor_wgate = Some(Self::upload_quant_or_f16(
                     hfq,
                     gpu,
-                    &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
+                    &indexer_compressor_wgate_name,
                 )?);
-                if comp_f16_wmma {
+                if comp_f16_wmma
+                    && hfq
+                        .find_tensor_info(&indexer_compressor_wkv_name)
+                        .is_some_and(|info| info.quant_type == 1)
+                {
                     layer.indexer_compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
                         gpu,
-                        &format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
+                        &indexer_compressor_wkv_name,
                     )?);
+                }
+                if comp_f16_wmma
+                    && hfq
+                        .find_tensor_info(&indexer_compressor_wgate_name)
+                        .is_some_and(|info| info.quant_type == 1)
+                {
                     layer.indexer_compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
                         gpu,
-                        &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
+                        &indexer_compressor_wgate_name,
                     )?);
                 }
                 layer.indexer_compressor_norm = Some(Self::upload_global_f16_as_f32(
@@ -1419,6 +1790,13 @@ impl DeepseekV4 {
                 let mut dspark_hfq = HfqFile::open(&p).map_err(|e| {
                     format!("deepseek4: failed to open DSpark sidecar {p:?}: {e:?}")
                 })?;
+                if cfg.mq2r {
+                    Self::validate_mq2r_dspark_sidecar(&dspark_hfq)?;
+                    eprintln!(
+                        "deepseek4: MQ2R DSpark v1 sidecar identity verified \
+                         (target=P3; draft head=trunk E8 B4)"
+                    );
+                }
                 dspark_hfq.drop_mmap();
                 weights.dspark = Self::load_dspark(&dspark_hfq, gpu, cfg)?;
             }
@@ -1685,6 +2063,15 @@ impl DeepseekV4 {
             gpu,
             &format!("mtp.{last}.confidence_head.proj.weight"),
         )?);
+        let draft_head = if source.find_tensor_info("draft_head.weight").is_some() {
+            eprintln!(
+                "deepseek4: DSpark sidecar draft_head.weight present — \
+                 using it for draft logits only"
+            );
+            Some(Self::upload_quant_or_f16(source, gpu, "draft_head.weight")?)
+        } else {
+            None
+        };
 
         Ok(Some(DsparkWeights {
             cfg: dspark_cfg,
@@ -1694,6 +2081,7 @@ impl DeepseekV4 {
             markov_w1,
             markov_w2,
             confidence_proj,
+            draft_head,
         }))
     }
 }
@@ -2041,9 +2429,10 @@ impl DeepseekV4 {
             .ok()
             .as_deref()
             != Some("0");
-        let expert_layer_end: Option<usize> = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let expert_layer_end: Option<usize> =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+                .ok()
+                .and_then(|s| s.parse().ok());
         let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
             .map(|s| s != "0")
             .unwrap_or(true);
@@ -2584,5 +2973,56 @@ mod tests {
     fn deepseek4_arch_id_is_nine() {
         assert_eq!(DeepseekV4::arch_id(), 9);
         assert_eq!(DeepseekV4::name(), "deepseek4");
+    }
+
+    #[test]
+    fn dense_hfq_dtype_preserves_mfp_e8_variants() {
+        assert_eq!(dense_hfq_dtype(34), Some(DType::MFP4G32E8));
+        assert_eq!(dense_hfq_dtype(35), Some(DType::MFP4G32E8SOA));
+        assert_eq!(dense_hfq_dtype(36), Some(DType::MFP3G32E8));
+        assert_eq!(dense_hfq_dtype(3), Some(DType::Q8_0));
+        assert_eq!(dense_hfq_dtype(19), None);
+    }
+
+    #[test]
+    fn mq2r_route_v3_is_arch_specific_without_arch_locking_the_recipe() {
+        assert!(DeepseekV4::mq2r_gfx1151_route_eligible("gfx1151"));
+        for arch in ["gfx1100", "gfx1150", "gfx1201", "gfx942"] {
+            assert!(
+                !DeepseekV4::mq2r_gfx1151_route_eligible(arch),
+                "{arch} must use its portable route"
+            );
+        }
+    }
+
+    #[test]
+    fn mq2r_mfp3p1_v1_map_is_the_frozen_170_tensor_recipe() {
+        let suffixes = [
+            "attn.wq_a.weight",
+            "attn.wq_b.weight",
+            "attn.wo_a.weight",
+            "attn.wo_b.weight",
+            "ffn.shared_experts.w1.weight",
+            "ffn.shared_experts.w2.weight",
+            "ffn.shared_experts.w3.weight",
+        ];
+        let selected = (0..43)
+            .flat_map(|layer| suffixes.map(move |suffix| (layer, suffix)))
+            .filter(|(layer, suffix)| DeepseekV4::mq2r_mfp3p1_v1_selected(*layer, suffix))
+            .count();
+        assert_eq!(selected, 170);
+        assert!(DeepseekV4::mq2r_mfp3p1_v1_selected(5, "attn.wo_a.weight"));
+        assert!(!DeepseekV4::mq2r_mfp3p1_v1_selected(6, "attn.wo_a.weight"));
+        assert!(!DeepseekV4::mq2r_mfp3p1_v1_selected(7, "attn.wo_a.weight"));
+        assert!(DeepseekV4::mq2r_mfp3p1_v1_selected(8, "attn.wo_a.weight"));
+        assert!(!DeepseekV4::mq2r_mfp3p1_v1_selected(0, "attn.wq_a.weight"));
+        assert!(!DeepseekV4::mq2r_mfp3p1_v1_selected(
+            0,
+            "ffn.shared_experts.w2.weight"
+        ));
+        assert!(!DeepseekV4::mq2r_mfp3p1_v1_selected(
+            0,
+            "ffn.shared_experts.w3.weight"
+        ));
     }
 }

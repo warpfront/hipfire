@@ -6,6 +6,10 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
+use radiowave::{
+    CodeObjectCertification, Compiler as RadiowaveCompiler, ExistingCodeObjectRequest,
+    Wavefront,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -160,7 +164,10 @@ impl KernelCompiler {
         let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
-                eprintln!("  hot-path seed failed at {} ({e}) — falling back to install dir reads", hot_dir.display());
+                eprintln!(
+                    "  hot-path seed failed at {} ({e}) — falling back to install dir reads",
+                    hot_dir.display()
+                );
             }
         }
         // Prefer the hot-path (tmpfs) dir when it exists and has contents.
@@ -218,10 +225,7 @@ impl KernelCompiler {
         if !gfx1151_cumode_modules.is_empty() {
             let mut modules = gfx1151_cumode_modules.iter().cloned().collect::<Vec<_>>();
             modules.sort();
-            eprintln!(
-                "  gfx1151 CU-mode modules: {}",
-                modules.join(",")
-            );
+            eprintln!("  gfx1151 CU-mode modules: {}", modules.join(","));
         }
 
         Ok(Self {
@@ -276,6 +280,46 @@ impl KernelCompiler {
         format!("{:016x}", hasher.finish())
     }
 
+    /// Bind the exact gfx1151 code object to Radiowave's fail-closed cache
+    /// classification. A missing ROCm inspection tool is non-fatal here:
+    /// replay will reject a missing/stale manifest and retain the conservative
+    /// scalar-cache acquire.
+    fn ensure_radiowave_certification(&self, name: &str, source: &str, object: &Path) {
+        if self.arch != "gfx1151" {
+            return;
+        }
+        let manifest = object.with_extension("radiowave.json");
+        if let (Ok(code), Ok(encoded)) = (
+            std::fs::read(object),
+            std::fs::read_to_string(&manifest),
+        ) {
+            if CodeObjectCertification::from_json(&code, &encoded).is_ok() {
+                return;
+            }
+        }
+
+        let source_path = self.cache_dir.join(format!("{name}.hip"));
+        if let Err(error) = std::fs::write(&source_path, source) {
+            eprintln!(
+                "  {name}: Radiowave certification skipped: cannot write {}: {error}",
+                source_path.display()
+            );
+            return;
+        }
+        let request = ExistingCodeObjectRequest::new(&source_path, object, &self.arch)
+            .wavefront(Wavefront::Wave32)
+            .command(vec![
+                "hipfire::KernelCompiler".to_owned(),
+                name.to_owned(),
+                self.arch.clone(),
+                self.extra_flags.clone(),
+            ])
+            .manifest(&manifest);
+        if let Err(error) = RadiowaveCompiler.certify_existing(&request) {
+            eprintln!("  {name}: Radiowave certification unavailable: {error}");
+        }
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
@@ -303,6 +347,7 @@ impl KernelCompiler {
                     stored.trim() == src_hash
                 };
                 if hash_ok {
+                    self.ensure_radiowave_certification(name, source, &precompiled);
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -310,6 +355,7 @@ impl KernelCompiler {
                 if !self.has_hipcc {
                     eprintln!("  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)");
                     eprintln!("           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.");
+                    self.ensure_radiowave_certification(name, source, &precompiled);
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -353,6 +399,7 @@ impl KernelCompiler {
             }
         }
 
+        self.ensure_radiowave_certification(name, source, &obj_path);
         self.compiled.insert(name.to_string(), obj_path);
         Ok(&self.compiled[name])
     }
@@ -621,38 +668,40 @@ impl KernelCompiler {
         // Spawn hipcc in parallel threads
         let results: Vec<_> = to_compile
             .into_iter()
-            .map(|(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
-                let arch = arch.clone();
-                let precompiled_dir = precompiled_dir.clone();
-                let extra_flags = self.extra_flags.clone();
-                let done = std::sync::Arc::clone(&done);
-                let handle = thread::spawn(move || {
-                    let result = Self::hipcc_compile(
-                        &arch,
-                        &src_path,
-                        &obj_path,
-                        &name,
-                        &source,
-                        &extra_flags,
-                        &module_flags,
-                    );
-                    if result.is_ok() {
-                        let _ = std::fs::write(&hash_path, &src_hash);
-                        // Write back to precompiled dir
-                        if let Some(ref dir) = precompiled_dir {
-                            let pre_hash = dir.join(format!("{name}.hash"));
-                            let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                            let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                            let _ = std::fs::write(&pre_hash, &src_hash);
+            .map(
+                |(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
+                    let arch = arch.clone();
+                    let precompiled_dir = precompiled_dir.clone();
+                    let extra_flags = self.extra_flags.clone();
+                    let done = std::sync::Arc::clone(&done);
+                    let handle = thread::spawn(move || {
+                        let result = Self::hipcc_compile(
+                            &arch,
+                            &src_path,
+                            &obj_path,
+                            &name,
+                            &source,
+                            &extra_flags,
+                            &module_flags,
+                        );
+                        if result.is_ok() {
+                            let _ = std::fs::write(&hash_path, &src_hash);
+                            // Write back to precompiled dir
+                            if let Some(ref dir) = precompiled_dir {
+                                let pre_hash = dir.join(format!("{name}.hash"));
+                                let pre_hsaco = dir.join(format!("{name}.hsaco"));
+                                let _ = std::fs::copy(&obj_path, &pre_hsaco);
+                                let _ = std::fs::write(&pre_hash, &src_hash);
+                            }
                         }
-                    }
-                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let marker = if result.is_ok() { "✓" } else { "✗" };
-                    eprintln!("  [{i:>3}/{n}] {marker} {name}");
-                    (name, obj_path, result)
-                });
-                handle
-            })
+                        let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let marker = if result.is_ok() { "✓" } else { "✗" };
+                        eprintln!("  [{i:>3}/{n}] {marker} {name}");
+                        (name, obj_path, result)
+                    });
+                    handle
+                },
+            )
             .collect();
 
         let mut errors = Vec::new();

@@ -37,18 +37,56 @@ pub struct Deepseek4Bundle {
     pub eos_tok: u32,
 }
 
-/// Thin verify scratch for the DSpark `DsparkDrafter` path. DeepSeek V4's SWA
-/// attention is stateless (no recurrent rewind needed between verify and
-/// commit_prefix), so the scratch carries no GPU buffers — the PBS lives in
-/// `state.dspark_verify_pbs` and is reused across windows.
-pub struct Deepseek4DsparkScratch;
+#[derive(Clone, Copy)]
+enum CompressorCheckpointKind {
+    MainKv,
+    MainScore,
+    IndexerKv,
+    IndexerScore,
+}
+
+#[derive(Clone, Copy)]
+struct CompressorCheckpointEntry {
+    layer: usize,
+    kind: CompressorCheckpointKind,
+    offset_bytes: usize,
+    size_bytes: usize,
+}
+
+/// Verify scratch for the DSpark `DsparkDrafter` path.
+///
+/// DeepSeek V4's SWA/full KV caches are position-indexed, so a replay can
+/// overwrite the committed positions after a partial accept. Its compressor
+/// rings are recurrent, however: a rejected verify-tail token changes the
+/// input state for the next token. Snapshot only those small ring buffers here
+/// (not the large KV caches), restore them on a partial accept, then replay the
+/// committed `[seed, accepted drafts...]` prefix.
+pub struct Deepseek4DsparkScratch {
+    compressor_checkpoint: Option<GpuTensor>,
+    compressor_entries: Vec<CompressorCheckpointEntry>,
+}
 
 impl SpecScratch for Deepseek4DsparkScratch {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
-    fn free(self: Box<Self>, _gpu: &mut Gpu) {
-        // No GPU buffers owned by this scratch.
+    fn free(mut self: Box<Self>, gpu: &mut Gpu) {
+        if let Some(checkpoint) = self.compressor_checkpoint.take() {
+            let _ = gpu.free_tensor(checkpoint);
+        }
+    }
+}
+
+fn compressor_checkpoint_tensor<'a>(
+    state: &'a DeepseekV4State,
+    entry: &CompressorCheckpointEntry,
+) -> Option<&'a GpuTensor> {
+    let layer = state._indexer.get(entry.layer)?;
+    match entry.kind {
+        CompressorCheckpointKind::MainKv => layer.main_kv_state.as_ref(),
+        CompressorCheckpointKind::MainScore => layer.main_score_state.as_ref(),
+        CompressorCheckpointKind::IndexerKv => layer.indexer_kv_state.as_ref(),
+        CompressorCheckpointKind::IndexerScore => layer.indexer_score_state.as_ref(),
     }
 }
 
@@ -266,9 +304,10 @@ impl SpecTarget for Deepseek4Bundle {
     // `forward_prefill_batch_chunk` + `final_norm_and_argmax_all_batched` —
     // so the byte-identical gate passes without any numeric change.
 
-    /// Allocate the thin DSpark verify scratch. The PBS lives in
-    /// `state.dspark_verify_pbs` (lazily allocated here on first call);
-    /// `Deepseek4DsparkScratch` itself carries no GPU buffers.
+    /// Allocate the DSpark verify scratch and checkpoint the recurrent
+    /// compressor rings. The large position-indexed KV caches are deliberately
+    /// excluded: committed positions are replayed and rejected future positions
+    /// remain invisible until their slots are overwritten.
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,
@@ -281,7 +320,75 @@ impl SpecTarget for Deepseek4Bundle {
                     .map_err(|e| format!("Deepseek4Bundle: alloc dspark_verify_pbs: {e}"))?,
             );
         }
-        Ok(Box::new(Deepseek4DsparkScratch))
+
+        let mut compressor_entries = Vec::new();
+        let mut offset_bytes = 0usize;
+        for (layer_idx, layer) in self.state._indexer.iter().enumerate() {
+            for (kind, tensor) in [
+                (
+                    CompressorCheckpointKind::MainKv,
+                    layer.main_kv_state.as_ref(),
+                ),
+                (
+                    CompressorCheckpointKind::MainScore,
+                    layer.main_score_state.as_ref(),
+                ),
+                (
+                    CompressorCheckpointKind::IndexerKv,
+                    layer.indexer_kv_state.as_ref(),
+                ),
+                (
+                    CompressorCheckpointKind::IndexerScore,
+                    layer.indexer_score_state.as_ref(),
+                ),
+            ] {
+                if let Some(tensor) = tensor {
+                    let size_bytes = tensor.byte_size();
+                    compressor_entries.push(CompressorCheckpointEntry {
+                        layer: layer_idx,
+                        kind,
+                        offset_bytes,
+                        size_bytes,
+                    });
+                    offset_bytes += size_bytes;
+                }
+            }
+        }
+
+        let compressor_checkpoint = if offset_bytes == 0 {
+            None
+        } else {
+            let checkpoint = gpu
+                .alloc_tensor(&[offset_bytes / 4], rdna_compute::DType::F32)
+                .map_err(|e| format!("Deepseek4Bundle: alloc compressor checkpoint: {e:?}"))?;
+            for entry in &compressor_entries {
+                let source = compressor_checkpoint_tensor(&self.state, entry).ok_or_else(|| {
+                    format!(
+                        "Deepseek4Bundle: compressor checkpoint source disappeared at layer {}",
+                        entry.layer
+                    )
+                })?;
+                gpu.memcpy_dtod_at_auto(
+                    &checkpoint.buf,
+                    entry.offset_bytes,
+                    &source.buf,
+                    0,
+                    entry.size_bytes,
+                )
+                .map_err(|e| {
+                    format!(
+                        "Deepseek4Bundle: snapshot compressor state at layer {}: {e:?}",
+                        entry.layer
+                    )
+                })?;
+            }
+            Some(checkpoint)
+        };
+
+        Ok(Box::new(Deepseek4DsparkScratch {
+            compressor_checkpoint,
+            compressor_entries,
+        }))
     }
 
     /// Run the trunk forward over `block` at absolute `position`, returning
@@ -413,20 +520,72 @@ impl SpecTarget for Deepseek4Bundle {
         Ok((picks, captured))
     }
 
-    /// Advance `state.n_tokens` to reflect the committed prefix. DeepSeek
-    /// V4's SWA attention is stateless so no recurrent rewind is needed;
-    /// the next verify forward simply overwrites the rejected tail slots.
+    /// Commit `[seed, accepted drafts...]`. On a partial accept, restore the
+    /// compressor-ring checkpoint taken immediately before verify and replay
+    /// only that committed input prefix. SWA/full/compressed caches are
+    /// position-indexed: the replay overwrites committed slots, while rejected
+    /// future slots are not visible to attention before they are overwritten.
     fn commit_prefix(
         &mut self,
-        _gpu: &mut Gpu,
-        _block: &[u32],
+        gpu: &mut Gpu,
+        block: &[u32],
         accept_len: usize,
         position: usize,
-        _scratch: &mut dyn SpecScratch,
+        scratch: &mut dyn SpecScratch,
     ) -> Result<(), String> {
-        // Mirrors the old inline drafter:
-        // `bundle.state.n_tokens = (position + committed.len()) as u64`
-        // where `committed.len() = accept_len + 1` (accepted drafts + bonus).
+        let committed_inputs = accept_len + 1;
+        if committed_inputs < block.len() {
+            let scratch = scratch
+                .as_any_mut()
+                .downcast_mut::<Deepseek4DsparkScratch>()
+                .ok_or("Deepseek4Bundle::commit_prefix: wrong scratch type")?;
+            if let Some(checkpoint) = scratch.compressor_checkpoint.as_ref() {
+                for entry in &scratch.compressor_entries {
+                    let destination =
+                        compressor_checkpoint_tensor(&self.state, entry).ok_or_else(|| {
+                            format!(
+                                "Deepseek4Bundle: compressor restore destination disappeared at layer {}",
+                                entry.layer
+                            )
+                        })?;
+                    gpu.memcpy_dtod_at_auto(
+                        &destination.buf,
+                        0,
+                        &checkpoint.buf,
+                        entry.offset_bytes,
+                        entry.size_bytes,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Deepseek4Bundle: restore compressor state at layer {}: {e:?}",
+                            entry.layer
+                        )
+                    })?;
+                }
+            }
+
+            // The verify capture has already been copied into the drafter-owned
+            // context buffer. Do not recapture while replaying the committed
+            // target prefix.
+            self.state.dspark_capture_active = false;
+            let pbs = self
+                .state
+                .dspark_verify_pbs
+                .take()
+                .ok_or("Deepseek4Bundle::commit_prefix: dspark_verify_pbs not allocated")?;
+            let replay_result = forward_prefill_batch_chunk(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &pbs,
+                &block[..committed_inputs],
+                position as u32,
+            );
+            self.state.dspark_verify_pbs = Some(pbs);
+            replay_result.map_err(|e| format!("Deepseek4Bundle::commit_prefix replay: {e}"))?;
+        }
+
         self.state.n_tokens = (position + accept_len + 1) as u64;
         Ok(())
     }

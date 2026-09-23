@@ -52,7 +52,6 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_u4(
 
     const char* scale_base = hdr + 16;
     const char* cw_base    = hdr + 16 + scale_padded;
-
     const int block_in_group = tid >> 2;
     const int cw_slot        = tid & 3;
 
@@ -79,19 +78,26 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_u4(
         const int base0 = g * 256 + tid * 8;
         const int base1 = base0 + 256, base2 = base0 + 512, base3 = base0 + 768;
 
-        float pe[8];
-        e8_decode_index_soa(ew0, pe);
-        acc0 += ssc0*pe[0]*x[base0]+ssc0*pe[1]*x[base0+1]+ssc0*pe[2]*x[base0+2]+ssc0*pe[3]*x[base0+3]
-              + ssc0*pe[4]*x[base0+4]+ssc0*pe[5]*x[base0+5]+ssc0*pe[6]*x[base0+6]+ssc0*pe[7]*x[base0+7];
-        e8_decode_index_soa(ew1, pe);
-        acc1 += ssc1*pe[0]*x[base1]+ssc1*pe[1]*x[base1+1]+ssc1*pe[2]*x[base1+2]+ssc1*pe[3]*x[base1+3]
-              + ssc1*pe[4]*x[base1+4]+ssc1*pe[5]*x[base1+5]+ssc1*pe[6]*x[base1+6]+ssc1*pe[7]*x[base1+7];
-        e8_decode_index_soa(ew2, pe);
-        acc2 += ssc2*pe[0]*x[base2]+ssc2*pe[1]*x[base2+1]+ssc2*pe[2]*x[base2+2]+ssc2*pe[3]*x[base2+3]
-              + ssc2*pe[4]*x[base2+4]+ssc2*pe[5]*x[base2+5]+ssc2*pe[6]*x[base2+6]+ssc2*pe[7]*x[base2+7];
-        e8_decode_index_soa(ew3, pe);
-        acc3 += ssc3*pe[0]*x[base3]+ssc3*pe[1]*x[base3+1]+ssc3*pe[2]*x[base3+2]+ssc3*pe[3]*x[base3+3]
-              + ssc3*pe[4]*x[base3+4]+ssc3*pe[5]*x[base3+5]+ssc3*pe[6]*x[base3+6]+ssc3*pe[7]*x[base3+7];
+        // Four INDEPENDENT decode buffers. A single shared pe[8] creates a
+        // write-after-read hazard chain across the quad: group 1's decode
+        // cannot issue until group 0's eight multiplies have drained it, which
+        // serializes the very unroll that exists to overlap them. Splitting the
+        // temporaries leaves every accumulator's expression byte-identical
+        // (same operands, same order) while letting all four codeword loads and
+        // decodes be in flight at once.
+        float pe0[8], pe1[8], pe2[8], pe3[8];
+        e8_decode_index_soa(ew0, pe0);
+        e8_decode_index_soa(ew1, pe1);
+        e8_decode_index_soa(ew2, pe2);
+        e8_decode_index_soa(ew3, pe3);
+        acc0 += ssc0*pe0[0]*x[base0]+ssc0*pe0[1]*x[base0+1]+ssc0*pe0[2]*x[base0+2]+ssc0*pe0[3]*x[base0+3]
+              + ssc0*pe0[4]*x[base0+4]+ssc0*pe0[5]*x[base0+5]+ssc0*pe0[6]*x[base0+6]+ssc0*pe0[7]*x[base0+7];
+        acc1 += ssc1*pe1[0]*x[base1]+ssc1*pe1[1]*x[base1+1]+ssc1*pe1[2]*x[base1+2]+ssc1*pe1[3]*x[base1+3]
+              + ssc1*pe1[4]*x[base1+4]+ssc1*pe1[5]*x[base1+5]+ssc1*pe1[6]*x[base1+6]+ssc1*pe1[7]*x[base1+7];
+        acc2 += ssc2*pe2[0]*x[base2]+ssc2*pe2[1]*x[base2+1]+ssc2*pe2[2]*x[base2+2]+ssc2*pe2[3]*x[base2+3]
+              + ssc2*pe2[4]*x[base2+4]+ssc2*pe2[5]*x[base2+5]+ssc2*pe2[6]*x[base2+6]+ssc2*pe2[7]*x[base2+7];
+        acc3 += ssc3*pe3[0]*x[base3]+ssc3*pe3[1]*x[base3+1]+ssc3*pe3[2]*x[base3+2]+ssc3*pe3[3]*x[base3+3]
+              + ssc3*pe3[4]*x[base3+4]+ssc3*pe3[5]*x[base3+5]+ssc3*pe3[6]*x[base3+6]+ssc3*pe3[7]*x[base3+7];
     }
 
     // Tail: remaining 0..3 groups, one at a time into acc0.

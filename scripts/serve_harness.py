@@ -195,6 +195,7 @@ def _native_cli():
 
 def _write_native_config(cfg, home):
     """Write the isolated harness configuration in the native sparse TOML format."""
+    speculation_mode = {"off": "off", "on": "mtp", "auto": "auto"}[cfg["mtp"]]
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
@@ -205,6 +206,7 @@ max_seq = {cfg.get("max_seq", 32768)}
 kv_cache = {json.dumps(cfg["kv"])}
 
 [speculation]
+mode = {json.dumps(speculation_mode)}
 dflash = "off"
 mtp = {json.dumps(cfg["mtp"])}
 ngram = "off"

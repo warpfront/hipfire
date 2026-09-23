@@ -407,6 +407,65 @@ fn gemv_auto_batched_wmma(
     x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
     match weight.dtype {
+        // DeepSeek MQ2R keeps the output head in MFP4-E8-SoA. Do not let it
+        // fall through to the generic HFQ4 arm below: the two formats have
+        // different row layouts, and interpreting E8 bytes as HFQ4 makes every
+        // DSpark proposal wrong even though trunk verification stays coherent.
+        //
+        // Mirror the architecture-owned DeepSeek prefill dispatch. MQ2R pins
+        // B4; diagnostic non-MQ2R artifacts retain the same opt-out controls.
+        DType::MFP4G32E8SOA if gpu.arch == "gfx1151" => {
+            let b4 = gpu.deepseek4_mq2r_route_v1
+                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_PREFILL_B4")
+                    .ok()
+                    .as_deref()
+                    != Some("0");
+            let b2 = gpu.deepseek4_mq2r_route_v1
+                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_PREFILL_B2")
+                    .ok()
+                    .as_deref()
+                    != Some("0");
+            if b4 {
+                gpu.gemm_mfp4g32_e8_soa_wmma_b4(
+                    weight,
+                    x_rotated_batch,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                )
+                .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B4: {e:?}"))
+            } else if b2 {
+                gpu.gemm_mfp4g32_e8_soa_wmma_b2(
+                    weight,
+                    x_rotated_batch,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                )
+                .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B2: {e:?}"))
+            } else {
+                gpu.gemm_mfp4g32_e8_soa_wmma(
+                    weight,
+                    x_rotated_batch,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                )
+                .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B1: {e:?}"))
+            }
+        }
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA => {
+            for batch in 0..batch_size {
+                let x_rot = x_rotated_batch.sub_offset(batch * k, k);
+                let x_plain = x_plain_batch.sub_offset(batch * k, k);
+                let y_row = y.sub_offset(batch * m, m);
+                gemv_auto(gpu, weight, &x_rot, &x_plain, &y_row, m, k)?;
+            }
+            Ok(())
+        }
         DType::F32 => gpu
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
@@ -419,7 +478,8 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out =
+                        hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -440,7 +500,8 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out_4w =
+                        hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
@@ -775,25 +836,24 @@ pub fn run_heads(
     // Reduced-vocab (d2t Some) forces the host path: each argmax is a DRAFT id
     // that must be d2t-remapped to a TARGET id before it can index the
     // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
-    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1)
-        && weights.d2t.is_none()
-    {
-        let chain = gpu
-            .alloc_tensor(&[block + 1], DType::F32)
-            .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
-        let seed_i32 = prev_token as i32;
-        let seed_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
-        gpu.hip
-            .memcpy_htod(&chain.buf, seed_bytes)
-            .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
-        let argmax_scratch = gpu
-            .alloc_tensor(&[1], DType::F32)
-            .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
-        Some((chain, argmax_scratch))
-    } else {
-        None
-    };
+    let chain_bufs: Option<(GpuTensor, GpuTensor)> =
+        if markov_w1_device_embeddable(markov_w1) && weights.d2t.is_none() {
+            let chain = gpu
+                .alloc_tensor(&[block + 1], DType::F32)
+                .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
+            let seed_i32 = prev_token as i32;
+            let seed_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
+            gpu.hip
+                .memcpy_htod(&chain.buf, seed_bytes)
+                .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
+            let argmax_scratch = gpu
+                .alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
+            Some((chain, argmax_scratch))
+        } else {
+            None
+        };
 
     // Confidence head buffers (ON GPU per slot inside the loop):
     // `conf_batch[block]` holds the per-slot confidence logit.
@@ -1173,13 +1233,14 @@ impl MtpDrafter for DsparkDrafter {
         // DEBUG: HIPFIRE_DSPARK_ZERO_CTX=1 zeros the context main_hidden to test
         // whether the drafter attends to it at all (identical drafts ⇒ ctx unused).
         let _zero_ctx_holder;
-        let main_hidden = if hipfire_config::developer_var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
-            let n: usize = main_hidden_real.shape.iter().product();
-            _zero_ctx_holder = upload_f32(gpu, &vec![0.0f32; n])?;
-            &_zero_ctx_holder
-        } else {
-            main_hidden_real
-        };
+        let main_hidden =
+            if hipfire_config::developer_var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
+                let n: usize = main_hidden_real.shape.iter().product();
+                _zero_ctx_holder = upload_f32(gpu, &vec![0.0f32; n])?;
+                &_zero_ctx_holder
+            } else {
+                main_hidden_real
+            };
 
         // ── 2. Draft the block with DsparkBody ──────────────────────────────
         let x_head_out = gpu
