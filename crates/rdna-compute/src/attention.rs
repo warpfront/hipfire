@@ -85,6 +85,20 @@ fn q8_flash_default_tile_size(
         128
     }
 }
+// Both the plain and gated flash reducers retain one f32 correction per
+// possible tile in dynamic LDS; the gated path also needs head_dim floats.
+// Keep the entire allocation below 32 KiB on GPUs with 64 KiB/workgroup LDS.
+const Q8_FLASH_REDUCE_SHARED_FLOATS: usize = 32 * 1024 / 4;
+
+fn q8_flash_reduce_safe_tile_size(tile_size: usize, head_dim: usize, max_seq: usize) -> usize {
+    let tile_capacity = Q8_FLASH_REDUCE_SHARED_FLOATS.saturating_sub(head_dim).max(1);
+    if max_seq <= tile_capacity.saturating_mul(tile_size) {
+        tile_size
+    } else {
+        max_seq.div_ceil(tile_capacity).next_power_of_two()
+    }
+}
+
 
 /// Architecture- and shape-aware tile geometry for scalar Q8 decode attention.
 ///
@@ -101,11 +115,12 @@ pub fn q8_flash_tile_size(
     head_dim: usize,
     max_seq: usize,
 ) -> usize {
-    hipfire_config::developer_var("HIPFIRE_Q8_FLASH_TILE")
+    let preferred = hipfire_config::developer_var("HIPFIRE_Q8_FLASH_TILE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
-        .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq))
+        .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq));
+    q8_flash_reduce_safe_tile_size(preferred, head_dim, max_seq)
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -19537,7 +19552,7 @@ mod tests {
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
         flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
-        q8_flash_default_tile_size, replay_stable_tile_count,
+        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, replay_stable_tile_count,
     };
     use crate::DType;
     use std::ffi::c_void;
@@ -19727,6 +19742,16 @@ mod tests {
             128
         );
         assert_eq!(q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048), 128);
+    }
+
+    #[test]
+    fn q8_flash_tile_grows_when_reducer_lds_would_exceed_capacity() {
+        // At H8/D256 and a 262K KV reservation, tile16 needs 64 KiB
+        // correction LDS before the gated reducer's extra D floats.
+        assert_eq!(q8_flash_reduce_safe_tile_size(16, 256, 2_048), 16);
+        assert_eq!(q8_flash_reduce_safe_tile_size(16, 256, 262_144), 64);
+        let tile = q8_flash_reduce_safe_tile_size(16, 256, 1_048_576);
+        assert!((1_048_576usize.div_ceil(tile) + 256) * 4 <= 32 * 1024);
     }
 
     #[test]
