@@ -1,0 +1,1 @@
+{"arch": "gfx1100", "kernel": "gemv_hfq4g256_multirow_r2", "label": "R9c0_pk64_lane_pair", "variant": "exp_R9c0.hip", "verdict": "DEAD_FILE", "WIN": false, "mwu_dominance": 0.0, "rounds": 0, "delta_pct": 0.0, "note": "kernels/src/gemv_hfq4g256_multirow_r2.hip not compiled in (include_str!) and symbol->file is 2-way \u2014 un-targetable via file-swap"}

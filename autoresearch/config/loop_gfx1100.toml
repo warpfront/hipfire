@@ -1,0 +1,17 @@
+arch = "gfx1100"
+baseline_ref = "loop_baseline_gfx1100"
+model = "qwen3.6-35b-a3b.mq4r"
+kv_mode = "q8"
+max_tokens = 128
+prompt_md5 = "d97ec9d3f761ec68093631be27d32441"
+cand_wall = 3.0
+k_exhaust = 10
+agent_harness = "codex"
+[[workers]]
+card = 0
+dev = 0
+model = "gpt-5.6-sol"
+effort = "medium"
+[bounds]
+call_budget = 400
+wall_ttl_s = 43200
