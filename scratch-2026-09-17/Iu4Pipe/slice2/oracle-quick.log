@@ -1,0 +1,13 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab2/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: tmp_iu4_gfx12_oracle_base/iu4_oracle_base_set
+JIT OK: tmp_iu4_gfx12_oracle_base/iu4_oracle_base_add
+JIT OK: tmp_iu4_gfx12_oracle_cand/iu4_oracle_cand_set
+JIT OK: tmp_iu4_gfx12_oracle_cand/iu4_oracle_cand_add
+JIT OK: tmp_iu4_gfx12_oracle_check/iu4_compare_u32
+CACHE_PATH /home/kaden/.hipfire-homes/ab2/.hipfire_kernels/gfx1201
+loaded gate_proj 17408x5120  down_proj 5120x17408
+gate/set: device_bit_mismatches=0 repeat_mismatches=0 canary_mismatches=0 cpu_mismatches=0 PASS
+down/add: device_bit_mismatches=0 repeat_mismatches=0 canary_mismatches=0 cpu_mismatches=0 PASS
+GFX12-IU4 QUICK DEVICE ORACLE PASS

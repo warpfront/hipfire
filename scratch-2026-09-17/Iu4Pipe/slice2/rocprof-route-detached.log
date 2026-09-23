@@ -1,0 +1,7 @@
+W0919 09:07:00.002577 3343034 agent.cpp:157] Attempt to enable hip visibility for agent-1 which is not visible to HSA (ROCR)
+W0919 09:07:00.024251 3343034 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000305 sec
+W0919 09:07:00.024407 3343034 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-iu4pipe/scratch-2026-09-17/Iu4Pipe/slice2/daemon-candidate' ::     0.000000 sec
+W0919 09:07:00.024696 3343034 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-iu4pipe/scratch-2026-09-17/Iu4Pipe/slice2/daemon-candidate' ::     0.000289 sec
+W0919 09:07:00.025262 3343034 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000499 sec
+W0919 09:07:00.025275 3343034 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000567 sec
+hipfire: daemon closed its output (status exit status: 0)

@@ -1,0 +1,2 @@
+error: target `tmp_iu4_gfx12_oracle` in package `hipfire-runtime` requires the features: `lab`
+Consider enabling them by passing, e.g., `--features="lab"`

@@ -1,0 +1,25 @@
+Attaching to PID 3341565 using library /opt/rocm/core-10.0/lib/librocprofiler-sdk-rocattach.so
+W0919 09:05:19.367529 3341592 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000284 sec
+E0919 09:05:19.368041 3341592 ptrace_runner.cpp:260] [rocprofiler-sdk-rocattach] ptrace call failed. errno: 1 - Operation not permitted. params(PTRACE_SEIZE(16902), 3341569, 0, 0)
+E0919 09:05:19.368053 3341592 rocattach.cpp:376] [rocprofiler-sdk-rocattach] Attachment failed to pid 3341565 with status code 5
+E0919 09:05:19.368055 3341592 rocattach.cpp:576] [rocprofiler-sdk-rocattach] rocattach_attach_tree failed for pid 3341565 with error code 5, continuing with remaining processes
+Traceback (most recent call last):
+  File "/opt/rocm/core-10.0/bin/rocprof-attach", line 218, in <module>
+    ec = main(sys.argv[1:])
+  File "/opt/rocm/core-10.0/bin/rocprof-attach", line 207, in main
+    attach(
+    ~~~~~~^
+        pid=args.pid,
+        ^^^^^^^^^^^^^
+    ...<3 lines>...
+        attach_children=args.attach_children,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/opt/rocm/core-10.0/bin/rocprof-attach", line 161, in attach
+    raise RuntimeError(
+        f"Calling attach in {attach_library} returned non-zero status {attach_status}"
+    )
+RuntimeError: Calling attach in /opt/rocm/core-10.0/lib/librocprofiler-sdk-rocattach.so returned non-zero status 5
+W0919 09:05:19.719945 3341592 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000610 sec
+W0919 09:05:19.719981 3341592 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000717 sec
