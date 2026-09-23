@@ -1,0 +1,2 @@
+6ccbc1219e69b1457dc99426f6572473  scratch-2026-09-17/Raster/arms/daemon_base
+9e01d8ebbab8cddb2d0a859167617fdc  scratch-2026-09-17/Raster/arms/hipfire_base

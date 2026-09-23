@@ -1,0 +1,2 @@
+78ffeb54f48c6160d70eb54b0ab27160  scratch-2026-09-17/Raster/arms/daemon_g16t0
+bdb4b824a6e269ea04f7b62402702c59  scratch-2026-09-17/Raster/arms/hipfire_g16t0
