@@ -1,0 +1,30 @@
+{
+  "plane_bijection": true,
+  "scratch_bijection": true,
+  "transpose_labels_exact": true,
+  "lds_bytes": 41216,
+  "old_amortized": 3980.0,
+  "consumer_packets": 2860,
+  "producer_packets": 1260,
+  "new_amortized": 3280.0,
+  "forecasts": [
+    {
+      "c": 1,
+      "ratio": 0.8680904522613065,
+      "pp8192_us": 65.9748743718593,
+      "pp32768_us": 138.89447236180905
+    },
+    {
+      "c": 4,
+      "ratio": 0.8796975252062328,
+      "pp8192_us": 66.8570119156737,
+      "pp32768_us": 140.75160403299725
+    },
+    {
+      "c": 8,
+      "ratio": 0.8923297785069729,
+      "pp8192_us": 67.81706316652995,
+      "pp32768_us": 142.77276456111568
+    }
+  ]
+}

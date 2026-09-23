@@ -1,0 +1,53 @@
+{
+  "base": "2c093bd4a4e4e994b832e35a29d7f53b027f4803",
+  "compile_pingpong": [
+    "/opt/rocm/core/bin/hipcc",
+    "-O3",
+    "--offload-arch=gfx1201",
+    "-Rpass-analysis=kernel-resource-usage",
+    "--save-temps",
+    "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan/pingpong.hip",
+    "-o",
+    "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan/pingpong"
+  ],
+  "compile_ring": [
+    "/opt/rocm/core/bin/hipcc",
+    "-O3",
+    "--offload-arch=gfx1201",
+    "-Rpass-analysis=kernel-resource-usage",
+    "--save-temps",
+    "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan/ring.hip",
+    "-o",
+    "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan/ring"
+  ],
+  "compile_placement": [
+    "/opt/rocm/core/bin/hipcc",
+    "-O3",
+    "--offload-arch=gfx1201",
+    "-Rpass-analysis=kernel-resource-usage",
+    "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan/placement.hip",
+    "-o",
+    "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan/placement"
+  ],
+  "cwd": "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan",
+  "env": {
+    "HOME": "/home/kaden/.hipfire-homes/ab0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "HIPFIRE_MODELS_DIR": "/home/kaden/.hipfire/models",
+    "HIPFIRE_KERNEL_CACHE": "/home/kaden/.hipfire-homes/ab0/.hipfire_kernels",
+    "TMPDIR": "/home/kaden/ClaudeCode/warpfront/wt-fa3/scratch-2026-09-17/Fa3Plan"
+  },
+  "timing_rows": [
+    "run_41k_b64_c1.log",
+    "run_b64_c1.log",
+    "run_b256_c1.log",
+    "run_b1_c1.log",
+    "run_b64_c4.log",
+    "run_41k_b64_c4.log",
+    "run_41k_b256_c4.log",
+    "run_41k_b256_c1.log",
+    "run_b256_c4.log"
+  ],
+  "excluded_preliminary": "pre_fence/",
+  "verdict": "No profitable equal-work consumer ping-pong overlap; no production implementation."
+}

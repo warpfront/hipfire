@@ -1,0 +1,6 @@
+tiles=1 blocks=64 consumers=6 producers=2 LDS=41216 mismatches=0
+tiles=2 blocks=64 consumers=6 producers=2 LDS=41216 mismatches=0
+tiles=3 blocks=64 consumers=6 producers=2 LDS=41216 mismatches=0
+tiles=7 blocks=64 consumers=6 producers=2 LDS=41216 mismatches=0
+tiles=65 blocks=64 consumers=6 producers=2 LDS=41216 mismatches=0
+tiles=513 blocks=64 consumers=6 producers=2 LDS=41216 mismatches=0
