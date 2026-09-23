@@ -1,0 +1,13 @@
+DEVICE arch=gfx1151 name=AMD Radeon 8060S Graphics mps=20 ROCR=1 HIP=0 pid=2029709
+OBJECT GEMM_BASE_OBJECT=bin/base_v2b-gfx1151.hsaco
+OBJECT GEMM_F1_OBJECT=bin/v2b-gfx1151.hsaco
+OBJECT PROD_SILU_OBJECT=bin/base_silu_i4-gfx1151.hsaco
+OBJECT PROD_HIN_OBJECT=bin/silu_hin-gfx1151.hsaco
+OBJECT PROD_SILU_JIT_OBJECT=/home/kaden/hipfire-prof040/scratch-fusion/bin/jit/silu_prod_jit-gfx1151.hsaco
+RESOURCE gemm_set_base vgpr=246 private=0 dynamic_lds=65536 blocks_per_mp=1
+RESOURCE gemm_set_new vgpr=246 private=0 dynamic_lds=65536 blocks_per_mp=1
+RESOURCE gemm_gate_up_silu vgpr=246 private=0 dynamic_lds=65536 blocks_per_mp=1
+RESOURCE silu_producer vgpr=55 private=0 dynamic_lds=0 blocks_per_mp=64
+RESOURCE hin_producer vgpr=76 private=0 dynamic_lds=0 blocks_per_mp=64
+RESULT arm=C_f1lite stem=v2b N=8192 total_ms=41.4218 gemm_ms=38.4386 producer_ms=2.9769 begin=1790151897.797 end=1790151898.087 all=41.4736,41.4081,41.4008,41.4218,41.4271,41.3783,41.4919,
+RESULT arm=A_pair stem=v2b N=8192 total_ms=44.3835 gemm_ms=38.6154 producer_ms=5.7908 begin=1790151898.709 end=1790151899.020 all=44.4536,44.4047,44.3772,44.3782,44.3901,44.3322,44.3835,

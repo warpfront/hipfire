@@ -1,0 +1,50 @@
+== base_silu_i4 gfx1100
+ .group_segment_fixed_size: 0	 .name: fused_silu_mul_mq_rotate_awq_i4	 .private_segment_fixed_size: 0	 .sgpr_count: 20	 .sgpr_spill_count: 0	 .vgpr_count: 55	 .vgpr_spill_count: 0	
+== silu_i4 gfx1100
+ .group_segment_fixed_size: 0	 .name: fused_silu_mul_mq_rotate_awq_i4	 .private_segment_fixed_size: 0	 .sgpr_count: 20	 .sgpr_spill_count: 0	 .vgpr_count: 55	 .vgpr_spill_count: 0	
+== silu_hin gfx1100
+ .group_segment_fixed_size: 0	 .name: fused_silu_mul_mq_rotate_awq_i4_hin	 .private_segment_fixed_size: 0	 .sgpr_count: 20	 .sgpr_spill_count: 0	 .vgpr_count: 76	 .vgpr_spill_count: 0	
+== base_v2c gfx1100
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2c_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 26	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2c_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 30	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0		
+== v2c gfx1100
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2c_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 26	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2c_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 30	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11
+ .private_segment_fixed_size: 0	 .sgpr_count: 30	 .sgpr_spill_count: 0	 .vgpr_count: 180	 .vgpr_spill_count: 0			
+== base_v2b gfx1100
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2b_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2b_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0		
+== v2b gfx1100
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2b_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2b_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11
+ .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0			
+== base_silu_i4 gfx1151
+ .group_segment_fixed_size: 0	 .name: fused_silu_mul_mq_rotate_awq_i4	 .private_segment_fixed_size: 0	 .sgpr_count: 19	 .sgpr_spill_count: 0	 .vgpr_count: 55	 .vgpr_spill_count: 0	
+== silu_i4 gfx1151
+ .group_segment_fixed_size: 0	 .name: fused_silu_mul_mq_rotate_awq_i4	 .private_segment_fixed_size: 0	 .sgpr_count: 19	 .sgpr_spill_count: 0	 .vgpr_count: 55	 .vgpr_spill_count: 0	
+== silu_hin gfx1151
+ .group_segment_fixed_size: 0	 .name: fused_silu_mul_mq_rotate_awq_i4_hin	 .private_segment_fixed_size: 0	 .sgpr_count: 19	 .sgpr_spill_count: 0	 .vgpr_count: 76	 .vgpr_spill_count: 0	
+== base_v2c gfx1151
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2c_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 26	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2c_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 30	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0		
+== v2c gfx1151
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2c_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 26	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2c_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 30	 .sgpr_spill_count: 0	 .vgpr_count: 179	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11
+ .private_segment_fixed_size: 0	 .sgpr_count: 30	 .sgpr_spill_count: 0	 .vgpr_count: 180	 .vgpr_spill_count: 0			
+== base_v2b gfx1151
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2b_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2b_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0		
+== v2b gfx1151
+ .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_residual_iu4_v2b_set_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0
+ .name: gemm_mq4g256v2_residual_iu4_v2b_add_gfx11	 .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0	 .group_segment_fixed_size: 0	 .name: gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11
+ .private_segment_fixed_size: 0	 .sgpr_count: 34	 .sgpr_spill_count: 0	 .vgpr_count: 246	 .vgpr_spill_count: 0			
+DISASM gfx1100 fused_silu_mul_mq_rotate_awq_i4 lines=1289 base=3f0540f384682199 new=3f0540f384682199 IDENTICAL
+DISASM gfx1100 gemm_mq4g256v2_residual_iu4_v2c_set_gfx11 lines=1025 base=c3bc900150cc8037 new=c3bc900150cc8037 IDENTICAL
+DISASM gfx1100 gemm_mq4g256v2_residual_iu4_v2c_add_gfx11 lines=1066 base=dbd40c3843d94b52 new=dbd40c3843d94b52 IDENTICAL
+DISASM gfx1100 gemm_mq4g256v2_residual_iu4_v2b_set_gfx11 lines=1726 base=b39be208e1e1984b new=b39be208e1e1984b IDENTICAL
+DISASM gfx1100 gemm_mq4g256v2_residual_iu4_v2b_add_gfx11 lines=1867 base=1b27ffbf6d8145d8 new=1b27ffbf6d8145d8 IDENTICAL
+DISASM gfx1151 fused_silu_mul_mq_rotate_awq_i4 lines=1292 base=020f631e6928f9f0 new=020f631e6928f9f0 IDENTICAL
+DISASM gfx1151 gemm_mq4g256v2_residual_iu4_v2c_set_gfx11 lines=1025 base=09a0d0fd4178b58d new=09a0d0fd4178b58d IDENTICAL
+DISASM gfx1151 gemm_mq4g256v2_residual_iu4_v2c_add_gfx11 lines=1067 base=ea4841eff86056df new=ea4841eff86056df IDENTICAL
+DISASM gfx1151 gemm_mq4g256v2_residual_iu4_v2b_set_gfx11 lines=1726 base=9b5c60cf1377b439 new=9b5c60cf1377b439 IDENTICAL
+DISASM gfx1151 gemm_mq4g256v2_residual_iu4_v2b_add_gfx11 lines=1867 base=4a0d4037a37e375b new=4a0d4037a37e375b IDENTICAL
