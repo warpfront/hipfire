@@ -1,0 +1,5 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+[hipfire] native serve listening on http://127.0.0.1:52491
+[hipfire] pre-warmed /home/kaden/.hipfire/models/lfm2.5-230m.mq4
+[daemon-control] received commit for id=chatcmpl-652155-1 attempt_id=1
