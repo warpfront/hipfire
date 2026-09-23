@@ -273,6 +273,7 @@ pub fn run_moe_decode(
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
+    let mut gate_up_xq: Option<*mut std::ffi::c_void> = None;
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
         if !res.routed_indexable_paro {
             hip!(gpu.ensure_mq_signs())?;
@@ -296,6 +297,18 @@ pub fn run_moe_decode(
             } else if res.gate_side_mq4 {
                 if let Some(awq) = p.router.awq_scale {
                     hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
+                } else if gpu.arch == "gfx1201"
+                    && gpu
+                        .flags
+                        .gfx1201_moe_gate_up_dp4a
+                        .as_deref()
+                        .is_some_and(|v| v.starts_with("dp4a"))
+                {
+                    gate_up_xq = Some(hip!(gpu.rotate_x_mq_q8_1(
+                        p.x_norm,
+                        p.x_rot_local,
+                        p.hidden,
+                    ))?);
                 } else {
                     hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
                 }
@@ -430,14 +443,47 @@ pub fn run_moe_decode(
             }
         }
     }
-    hip!(gpu.softmax_f32(p.router_logits))?;
-    hip!(gpu.moe_topk_renorm_k8(
-        p.router_logits,
-        p.topk_indices,
-        p.topk_weights,
-        p.n_exp,
-        p.norm_topk_prob
-    ))?;
+    if std::env::var("HIPFIRE_GFX1201_ROUTER_FUSED").as_deref() == Ok("wave64") {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else if std::env::var_os("HIPFIRE_GFX1201_ROUTER_FUSED").is_some() {
+        hip!(gpu.moe_softmax_topk_renorm_k8(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else {
+        hip!(gpu.softmax_f32(p.router_logits))?;
+        hip!(gpu.moe_topk_renorm_k8(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    }
+    // One-shot certification aid for non-bit-exact router experiments.  Each
+    // line is one layer's selected expert IDs and weights.  The explicit D2H
+    // sync is intentionally opt-in and never enters product measurements.
+    if let Ok(path) = std::env::var("HIPFIRE_DUMP_ROUTER_TOPK") {
+        use std::io::Write;
+        let idx_bits = hip!(gpu.download_f32(p.topk_indices))?;
+        let weights = hip!(gpu.download_f32(p.topk_weights))?;
+        let indices: Vec<i32> = idx_bits
+            .iter()
+            .map(|f| i32::from_ne_bytes(f.to_ne_bytes()))
+            .collect();
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{:?}\t{:?}", indices, weights);
+        }
+    }
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -510,6 +556,19 @@ pub fn run_moe_decode(
     let gate_up_k = p.routed_gate_up_k;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
+    // Experimental gfx1201 fusion: consume all routed experts and accumulate
+    // their weighted down projections directly into the residual.  This
+    // removes both the expanded [K_TOP x M] round-trip and the standalone
+    // combine dispatch.  Keep it opt-in until product/serve certification;
+    // the default path (and therefore gfx1100 codegen) is unchanged.
+    let fused_hfq4_down = std::env::var_os("HIPFIRE_GFX1201_MOE_DOWN_FUSED").is_some()
+        && p.expert_dtype_tags.is_none()
+        && !res.routed_indexable_paro
+        && p.dtypes.routed_down == DType::MQ4G256;
+    let atomic_hfq4_down = std::env::var_os("HIPFIRE_GFX1201_MOE_DOWN_ATOMIC").is_some()
+        && p.expert_dtype_tags.is_none()
+        && !res.routed_indexable_paro
+        && p.dtypes.routed_down == DType::MQ4G256;
 
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
@@ -548,16 +607,29 @@ pub fn run_moe_decode(
             // ~5us/layer slower). The merged kernel still serves the graded down via
             // the down dispatch below (it reads the same tag table). Byte-identical
             // gate_up to the all-MQ4 arm.
-            hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                xr,
-                p.gate_batch,
-                p.up_batch,
-                2 * p.mi,
-                gate_up_k,
-                p.k,
-            ))?;
+            if let Some(xq) = gate_up_xq {
+                hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    xq,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    gate_up_k,
+                    p.k,
+                ))?;
+            } else {
+                hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    xr,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    gate_up_k,
+                    p.k,
+                ))?;
+            }
         } else if let Some(tags) = p.expert_dtype_tags {
             // Per-expert mixed gate_up (N-tier graded: MQ6 hot / MQ4 mid / MQ2-Lloyd
             // or MQ3-Lloyd cold). One merged kernel; block-per-(row,krank,token)
@@ -636,16 +708,29 @@ pub fn run_moe_decode(
                 gate_up_k,
             ))?;
         } else {
-            hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                xr,
-                p.gate_batch,
-                p.up_batch,
-                2 * p.mi,
-                gate_up_k,
-                p.k,
-            ))?;
+            if let Some(xq) = gate_up_xq {
+                hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    xq,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    gate_up_k,
+                    p.k,
+                ))?;
+            } else {
+                hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    xr,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * p.mi,
+                    gate_up_k,
+                    p.k,
+                ))?;
+            }
         }
 
         // Gate→down: fused silu+mul+rotate
@@ -692,7 +777,31 @@ pub fn run_moe_decode(
 
         // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
         // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-        if let Some(tags) = p.expert_dtype_tags {
+        if atomic_hfq4_down {
+            hip!(gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if fused_hfq4_down {
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if let Some(tags) = p.expert_dtype_tags {
             // Per-expert mixed down (graded MQ6 hot / MQ2-Lloyd cold). One
             // merged kernel; block-per-(row,krank,token) reads tags[expert_id]
             // (block-uniform → no warp divergence) and branches the dequant.
@@ -815,11 +924,13 @@ pub fn run_moe_decode(
     // experts double-count (atomic + combine) or zero out (expanded written,
     // combine skipped) — silent numerical corruption. The merged kernel's
     // expanded write replaces the standalone Lloyd atomic GEMV.
-    let routed_down_self_combines = p.expert_dtype_tags.is_none()
-        && matches!(
-            p.dtypes.routed_down,
-            DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
-        );
+    let routed_down_self_combines = atomic_hfq4_down
+        || fused_hfq4_down
+        || (p.expert_dtype_tags.is_none()
+            && matches!(
+                p.dtypes.routed_down,
+                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+            ));
     if !routed_down_self_combines {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,

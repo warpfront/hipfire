@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
+use crate::dispatch::{DType, FP8_GEMV_MIN_M, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
@@ -2074,6 +2074,131 @@ impl Gpu {
         result
     }
 
+    /// gfx1201 research path: the normal fused RMSNorm+FWHT launch also emits
+    /// block_q8_1_mmq while each rotated value is still live. This removes the
+    /// standalone quantizer dispatch and its readback of `x_rot`; the returned
+    /// pointer is consumed immediately by a prequantized DP4A projection.
+    pub fn fused_rmsnorm_rotate_mq_q8_1(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate_q8_1",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_Q8_1_SRC,
+            "fused_rmsnorm_mq_rotate_q8_1",
+        )?;
+
+        let needed = ((k + 127) / 128) * 144;
+        if self.scratch.q8_1_mmq_x_scratch_bytes < needed {
+            self.scratch.q8_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
+            self.scratch.q8_1_mmq_x_scratch_bytes = needed;
+        }
+
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let q8p = self
+            .scratch
+            .q8_1_mmq_x_scratch
+            .as_ref()
+            .expect("Q8_1 scratch allocated above")
+            .as_ptr();
+        let kv = k as i32;
+        let eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &q8p as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
+        ];
+        let shared_mem = ((k + 256) * 4) as u32;
+        self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate_q8_1",
+            [1, 1, 1],
+            [256, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(q8p);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b
+            },
+        )?;
+        self.invalidate_x_caches_for(xrp);
+        Ok(q8p)
+    }
+
+    pub fn gemv_hfq4g256_dp4a_prequant(
+        &mut self,
+        a: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let variant = self.flags.gfx1201_lmhead_dp4a.as_deref().unwrap_or("r1");
+        let (name, source, rows) = match variant {
+            "r2" => ("gemv_hfq4g256_dp4a_r2", kernels::GEMV_HFQ4G256_DP4A_R2_SRC, 2u32),
+            "r4" => ("gemv_hfq4g256_dp4a_r4", kernels::GEMV_HFQ4G256_DP4A_R4_SRC, 4u32),
+            "r8" => ("gemv_hfq4g256_dp4a_r8", kernels::GEMV_HFQ4G256_DP4A_R8_SRC, 8u32),
+            "unroll2" => (
+                "gemv_hfq4g256_dp4a_unroll2",
+                kernels::GEMV_HFQ4G256_DP4A_UNROLL2_SRC,
+                1u32,
+            ),
+            _ => ("gemv_hfq4g256_dp4a", kernels::GEMV_HFQ4G256_DP4A_SRC, 1u32),
+        };
+        self.ensure_kernel(name, source, name)?;
+        let ap = a.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [((m as u32) + rows - 1) / rows, 1, 1],
+            [32 * rows, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xq);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b
+            },
+        )
+    }
+
     /// Phase A Stage A — AWQ-aware variant of fused_rmsnorm_rotate_mq.
     ///
     /// After computing the RMSNorm output, divides element-wise by
@@ -2839,6 +2964,61 @@ impl Gpu {
         }
         self.invalidate_x_caches_for(xrp);
         result
+    }
+
+    /// Decode-only MQ rotation that also emits the Q8_1 activation consumed
+    /// by the gfx1201 indexed MoE DP4A gate/up kernel.
+    pub fn rotate_x_mq_q8_1(
+        &mut self,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256_rotate_q8_1",
+            kernels::GEMV_MQ4G256_ROTATE_Q8_1_SRC,
+            "mq_rotate_x_q8_1",
+        )?;
+        self.ensure_mq_signs()?;
+        let needed = ((k + 127) / 128) * 144;
+        if self.scratch.q8_1_mmq_x_scratch_bytes < needed {
+            self.scratch.q8_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
+            self.scratch.q8_1_mmq_x_scratch_bytes = needed;
+        }
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let q8p = self.scratch.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &q8p as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "mq_rotate_x_q8_1",
+            [(k / 256) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(q8p);
+                b.push_i32(kv);
+                b
+            },
+        )?;
+        self.invalidate_x_caches_for(xrp);
+        Ok(q8p)
     }
 
     /// Batched `rotate_x_mq`. Grid.y is the batch dim.
@@ -5465,7 +5645,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "moe_softmax_topk_k8",
+            "moe_softmax_topk_renorm_k8",
             kernels::MOE_SOFTMAX_TOPK_K8_SRC,
             "moe_softmax_topk_renorm_k8",
         )?;
@@ -5508,6 +5688,87 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// gfx12 wave64 zero-LDS fused router. The source carries a per-kernel
+    /// -mwavefrontsize64 flag and therefore compiles into a separate HSACO.
+    pub fn moe_router_softmax_topk_k8_wave64(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let shape = std::env::var("HIPFIRE_GFX1201_ROUTER_W64_SHAPE").unwrap_or_default();
+        let (name, source) = match shape.as_str() {
+            "p2" => (
+                "moe_router_softmax_topk_k8_wave64_p2",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P2_SRC,
+            ),
+            "p2-lb4" => (
+                "moe_router_softmax_topk_k8_wave64_p2_lb4",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P2_LB4_SRC,
+            ),
+            "p2-lb16" => (
+                "moe_router_softmax_topk_k8_wave64_p2_lb16",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P2_LB16_SRC,
+            ),
+            "p4-lb16" => (
+                "moe_router_softmax_topk_k8_wave64_p4_lb16",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB16_SRC,
+            ),
+            "p4-lb2" => (
+                "moe_router_softmax_topk_k8_wave64_p4_lb2",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB2_SRC,
+            ),
+            "p4-lb4" => (
+                "moe_router_softmax_topk_k8_wave64_p4_lb4",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB4_SRC,
+            ),
+            "p4-lb12" => (
+                "moe_router_softmax_topk_k8_wave64_p4_lb12",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB12_SRC,
+            ),
+            _ => (
+                "moe_router_softmax_topk_k8_wave64",
+                kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC,
+            ),
+        };
+        self.ensure_kernel(
+            name,
+            source,
+            name,
+        )?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = n_exp as i32;
+        let nr = i32::from(norm_topk);
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        )
     }
 
     /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
@@ -5870,7 +6131,13 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed",
                     [32u32, 1, 1],
-                    m as u32,
+                    if self.arch_caps.arch() == "gfx1201"
+                        && self.flags.gfx1201_moe_gate_up_dp4a.as_deref() == Some("grid-trim")
+                    {
+                        ((m as u32) + 1) / 2
+                    } else {
+                        m as u32
+                    },
                 )
             }
         };
@@ -5919,6 +6186,84 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        n_ranks: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let variant = self
+            .flags
+            .gfx1201_moe_gate_up_dp4a
+            .as_deref()
+            .unwrap_or("dp4a-r1");
+        let (kernel_name, source, rows_per_block) = match variant {
+            "dp4a-r2" => (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_r2",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_R2_SRC,
+                2u32,
+            ),
+            "dp4a-r4" => (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_r4",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_R4_SRC,
+                4u32,
+            ),
+            "dp4a-unroll2" => (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_unroll2",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_UNROLL2_SRC,
+                1u32,
+            ),
+            _ => (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_SRC,
+                1u32,
+            ),
+        };
+        self.ensure_kernel(kernel_name, source, kernel_name)?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let logical_rows = ((m as u32) + 1) / 2;
+        self.launch_maybe_blob(
+            kernel_name,
+            [(logical_rows + rows_per_block - 1) / rows_per_block, n_ranks as u32, 1],
+            [32 * rows_per_block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xq);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV.
@@ -6315,7 +6660,7 @@ impl Gpu {
             )
         } else {
             self.ensure_kernel(
-                "gemv_hfq4g256_moe_down_indexed_batched",
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC,
                 "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched",
             )?;
@@ -6431,7 +6776,15 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            [m as u32, k_top as u32, batch_size as u32],
+            [
+                if std::env::var_os("HIPFIRE_GFX1201_MOE_DOWN_GRID4").is_some() {
+                    ((m + 3) / 4) as u32
+                } else {
+                    m as u32
+                },
+                k_top as u32,
+                batch_size as u32,
+            ],
             [32, 1, 1],
             0,
             &mut params,
@@ -6502,7 +6855,8 @@ impl Gpu {
         ];
         // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
         // is the routed-expert weight reads plus the per-token residual write.
-        let bytes = batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let bytes =
+            batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
@@ -6536,7 +6890,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
@@ -8246,7 +8599,7 @@ impl Gpu {
                 return Err(hip_bridge::HipError::new(
                     1,
                     "wo_per_group_batched_q8_0_multirow: rows_per_block must be 2 or 4",
-                ))
+                ));
             }
         };
         self.ensure_kernel(name, kernels::WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC, name)?;

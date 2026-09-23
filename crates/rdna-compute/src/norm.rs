@@ -97,7 +97,17 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        let wave_reduce = std::env::var_os("HIPFIRE_GFX1201_RMSNORM_WAVE_REDUCE").is_some();
+        let (kernel_key, kernel_src, kernel_name) = if wave_reduce {
+            (
+                "rmsnorm_f32_wave_reduce",
+                kernels::RMSNORM_WAVE_REDUCE_SRC,
+                "rmsnorm_f32_wave_reduce",
+            )
+        } else {
+            ("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")
+        };
+        self.ensure_kernel(kernel_key, kernel_src, kernel_name)?;
 
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
@@ -120,9 +130,9 @@ impl Gpu {
         let shared_mem = block_size * 4; // float per thread
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "rmsnorm_f32",
+            kernel_name,
             [batch as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -143,6 +153,54 @@ impl Gpu {
         result
     }
 
+    pub fn rmsnorm_f32_q8_1(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        eps: f32,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        self.ensure_kernel("rmsnorm_q8_1", kernels::RMSNORM_Q8_1_SRC, "rmsnorm_f32_q8_1")?;
+        let n = x.shape.last().copied().unwrap();
+        let needed = ((n + 127) / 128) * 144;
+        if self.scratch.q8_1_mmq_x_scratch_bytes < needed {
+            self.scratch.q8_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
+            self.scratch.q8_1_mmq_x_scratch_bytes = needed;
+        }
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let q8p = self.scratch.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &q8p as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "rmsnorm_f32_q8_1",
+            [1, 1, 1],
+            [256u32.min(n as u32), 1, 1],
+            256u32.min(n as u32) * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_ptr(q8p);
+                b.push_i32(nv);
+                b.push_f32(eps);
+                b
+            },
+        )?;
+        Ok(q8p)
+    }
+
     /// Batched RMSNorm: normalize `batch` vectors of length `n` independently.
     /// x and out can be the same buffer (in-place). Weight is [n], applied per vector.
     pub fn rmsnorm_batched(
@@ -155,7 +213,17 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        let wave_reduce = std::env::var_os("HIPFIRE_GFX1201_RMSNORM_WAVE_REDUCE").is_some();
+        let (kernel_key, kernel_src, kernel_name) = if wave_reduce {
+            (
+                "rmsnorm_f32_wave_reduce",
+                kernels::RMSNORM_WAVE_REDUCE_SRC,
+                "rmsnorm_f32_wave_reduce",
+            )
+        } else {
+            ("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")
+        };
+        self.ensure_kernel(kernel_key, kernel_src, kernel_name)?;
 
         let mut x_ptr = x.buf.as_ptr();
         let mut w_ptr = weight.buf.as_ptr();
@@ -176,7 +244,7 @@ impl Gpu {
         let bytes = crate::profile::rmsnorm_bytes(batch * n);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_batched", bytes);
         let result = self.launch_maybe_blob(
-            "rmsnorm_f32",
+            kernel_name,
             [batch as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,

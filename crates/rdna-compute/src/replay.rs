@@ -94,9 +94,32 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    if kernel.starts_with("moe_router_softmax_topk_k8_wave64") {
+        return Some(vec![read(0), write(8), write(16)]);
+    }
+    if kernel.starts_with("fused_qkvza_hfq4g256_dp4a_") {
+        return Some(vec![
+            read(0), read(8), read(16), read(24), read(32), write(40), write(48), write(56),
+            write(64),
+        ]);
+    }
+    if kernel.starts_with("gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a") {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    if kernel.starts_with("gemv_hfq4g256_dp4a") {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
     match kernel {
         "fused_rmsnorm_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
-        "fused_qkvza_hfq4g256" => Some(vec![
+        "fused_rmsnorm_mq_rotate_q8_1" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+        ]),
+        "fused_qkvza_hfq4g256" | "fused_qkvza_hfq4g256_wave64_dp4a" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -131,15 +154,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
+        "mq_rotate_x_q8_1" => Some(vec![read(0), write(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_wide"
         | "gemv_hfq4g256_multirow_r2"
         | "gemv_hfq4g256_multirow_r4"
-        | "gemv_hfq4g256_multirow_r8" => {
-            Some(vec![read(0), read(8), write(16)])
-        }
+        | "gemv_hfq4g256_multirow_r8" => Some(vec![read(0), read(8), write(16)]),
+        "quantize_q8_1_mmq_ds4" => Some(vec![read(0), write(8)]),
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
+        "moe_softmax_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
+        "moe_router_softmax_topk_k8_wave64" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu" => {
             Some(vec![read(0), read(8), write(16), read(24)])
@@ -149,6 +174,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         }
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded" => {
             Some(vec![read(0), read(8), read(16), write(24)])
+        }
+        "gemv_hfq4g256_moe_down_k8_indexed_fused_acc" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
+        }
+        "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched" => {
+            Some(vec![read(0), read(8), read(16), read(24), write(32)])
         }
         "moe_down_combine_k8_batched" => Some(vec![read(0), read(8), write(16)]),
         "fused_qkv_hfq4g256" => Some(vec![
@@ -161,7 +192,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(48),
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
-        "rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
+        "rmsnorm_f32" | "rmsnorm_f32_wave_reduce" => {
+            Some(vec![read(0), read(8), write(16)])
+        }
         "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
@@ -183,8 +216,21 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel.starts_with("moe_router_softmax_topk_k8_wave64") {
+        return Some(32);
+    }
+    if kernel.starts_with("fused_qkvza_hfq4g256_dp4a_") {
+        return Some(96);
+    }
+    if kernel.starts_with("gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a") {
+        return Some(48);
+    }
+    if kernel.starts_with("gemv_hfq4g256_dp4a") {
+        return Some(32);
+    }
     match kernel {
         "softmax_f32" => Some(16),
+        "quantize_q8_1_mmq_ds4" => Some(24),
         "fused_qk_l2_norm_scale_f32"
         | "gemv_hfq4g256_residual"
         | "gemv_hfq4g256_wide"
@@ -195,7 +241,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
         | "moe_topk_renorm_k8"
+        | "moe_softmax_topk_renorm_k8"
+        | "moe_router_softmax_topk_k8_wave64"
         | "rmsnorm_f32"
+        | "rmsnorm_f32_wave_reduce"
         | "sigmoid_mul_f32" => Some(32),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
@@ -207,13 +256,17 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "kv_cache_write_asym_k_fwht3"
         | "mq_rotate_x"
+        | "mq_rotate_x_q8_1"
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32" => Some(48),
-        "conv1d_silu_split_f32" => Some(64),
+        "gemv_hfq4g256_moe_down_k8_indexed_fused_acc"
+        | "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched" => Some(52),
+        "conv1d_silu_split_f32" | "fused_rmsnorm_mq_rotate_q8_1" => Some(64),
         "fused_qkv_hfq4g256" => Some(80),
-        "attention_flash_fwht3_tile" | "fused_qkvza_hfq4g256" | "gated_delta_net_q8_fast" => {
-            Some(96)
-        }
+        "attention_flash_fwht3_tile"
+        | "fused_qkvza_hfq4g256"
+        | "fused_qkvza_hfq4g256_wave64_dp4a"
+        | "gated_delta_net_q8_fast" => Some(96),
         _ => None,
     }
 }
@@ -257,11 +310,13 @@ fn recorded_resource_accesses(
         accesses
             .into_iter()
             .map(
-                |((allocation_base, access_base), (allocation_bytes, mode))| RecordedResourceAccess {
-                    allocation_base,
-                    allocation_bytes,
-                    access_base,
-                    mode,
+                |((allocation_base, access_base), (allocation_bytes, mode))| {
+                    RecordedResourceAccess {
+                        allocation_base,
+                        allocation_bytes,
+                        access_base,
+                        mode,
+                    }
                 },
             )
             .collect(),
@@ -519,6 +574,15 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     )
 }
 
+fn is_mq_rotate(kernel: &str) -> bool {
+    matches!(kernel, "mq_rotate_x" | "mq_rotate_x_q8_1")
+}
+
+fn is_indexed_gate_up(kernel: &str) -> bool {
+    kernel == "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        || kernel.starts_with("gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a")
+}
+
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
     (Some(previous) != excluded
         && matches!(
@@ -526,6 +590,7 @@ fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Opti
             "repeat_interleave_qk_f32"
                 | "fused_silu_mul_mq_rotate"
                 | "mq_rotate_x"
+                | "mq_rotate_x_q8_1"
                 | "rope_partial_halfsplit_f32"
         ))
         || (Some(current) != excluded
@@ -543,11 +608,8 @@ fn independent_sibling(previous: &str, current: &str) -> bool {
         ("fused_sigmoid_alpha_gate_f32", "conv1d_silu_split_f32")
             | ("rmsnorm_f32", "rmsnorm_f32")
             | ("kv_cache_write_q8_0", "kv_cache_write_q8_0")
-            | (
-                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-                "gemv_hfq4g256_moe_gate_up_k8_indexed",
-            )
-    )
+    ) || (previous == "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
+        && is_indexed_gate_up(current))
 }
 
 impl ReplayBackendRequest {
@@ -983,9 +1045,12 @@ impl ReplayController {
                 }
             } else if matches!(
                 launch.kernel.as_str(),
-                "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
+                "fused_silu_mul_mq_rotate"
+                    | "mq_rotate_x"
+                    | "mq_rotate_x_q8_1"
+                    | "rope_partial_halfsplit_f32"
             ) {
-                headers[index] = if launch.kernel == "mq_rotate_x" {
+                headers[index] = if is_mq_rotate(&launch.kernel) {
                     HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
                 } else {
                     HeaderPolicy::RECORDED_DISPATCH
@@ -1502,6 +1567,7 @@ mod tests {
 
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
+        "fused_rmsnorm_mq_rotate_q8_1",
         "fused_qkvza_hfq4g256",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
@@ -1514,14 +1580,19 @@ mod tests {
         "gemv_hfq4g256_wide",
         "softmax_f32",
         "moe_topk_renorm_k8",
+        "moe_softmax_topk_renorm_k8",
+        "moe_router_softmax_topk_k8_wave64",
         "fused_silu_mul_mq_rotate",
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
         "gemv_hfq4g256_moe_gate_up_k8_indexed",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+        "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
+        "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched",
         "moe_down_combine_k8_batched",
         "fused_qkv_hfq4g256",
         "deinterleave_f32",
         "rmsnorm_f32",
+        "rmsnorm_f32_wave_reduce",
         "rope_partial_halfsplit_f32",
         "kv_cache_write_asym_k_fwht3",
         "kv_cache_write_q8_0",

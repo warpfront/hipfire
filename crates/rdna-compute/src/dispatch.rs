@@ -1189,16 +1189,22 @@ impl Gpu {
                     .get(func_name)
                     .or_else(|| match func_name {
                         "mq_rotate_x" => self.compiler.compiled_kernels().get("gemv_mq4g256"),
+                        "mq_rotate_x_q8_1" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_mq4g256_rotate_q8_1"),
+                        "quantize_q8_1_mmq_ds4" => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemm_hfq4g256_residual_mmq"),
                         "deinterleave_f32_batched" => {
                             self.compiler.compiled_kernels().get("deinterleave_batched")
                         }
-                        name
-                            if name.starts_with(
-                                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-                            ) => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_scaled"),
+                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                            self.compiler
+                                .compiled_kernels()
+                                .get("gemv_hfq4g256_residual_scaled")
+                        }
                         "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
                             .compiler
                             .compiled_kernels()
@@ -1466,21 +1472,54 @@ impl Gpu {
         batch_size: usize,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        // bind_thread: skip — delegated to scratch.rs
-        self.scratch.ensure_q8_1_mmq_x(
-            &self.hip,
-            &mut self.compiler,
-            &mut self.modules,
-            &mut self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
-            self.device_id,
-            x,
-            batch_size,
-            k,
-        )
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mmq",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+            "quantize_q8_1_mmq_ds4",
+        )?;
+
+        let blocks_k = (k + 127) / 128;
+        let needed = blocks_k * batch_size * 144;
+        if self.scratch.q8_1_mmq_x_scratch_bytes < needed {
+            self.scratch.q8_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
+            self.scratch.q8_1_mmq_x_scratch_bytes = needed;
+        }
+
+        let src_ptr = x.buf.as_ptr();
+        let out_ptr = self
+            .scratch
+            .q8_1_mmq_x_scratch
+            .as_ref()
+            .expect("Q8_1 scratch allocated above")
+            .as_ptr();
+        let mut xp = src_ptr;
+        let mut yp = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((k + 1023) / 1024) as u32;
+        self.launch_maybe_blob(
+            "quantize_q8_1_mmq_ds4",
+            [grid_x, batch_size as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        Ok(out_ptr)
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic

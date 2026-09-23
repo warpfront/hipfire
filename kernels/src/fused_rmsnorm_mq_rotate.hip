@@ -3,6 +3,19 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+#if HIPFIRE_RMSNORM_EMIT_Q81
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_q8_1
+struct block_q8_1_mmq {
+    half2 ds4[4];
+    int8_t qs[128];
+};
+static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
+#else
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate
+#endif
 
 // Fused RMSNorm + FWHT rotation for MagnumQuant inputs.
 //
@@ -23,12 +36,15 @@
 // issue time moves earlier.
 
 __launch_bounds__(256, 1)
-extern "C" __global__ void fused_rmsnorm_mq_rotate(
+extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     const float* __restrict__ x,
     const float* __restrict__ weight,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,
+#if HIPFIRE_RMSNORM_EMIT_Q81
+    block_q8_1_mmq* __restrict__ x_q8,
+#endif
     int K,
     float eps
 ) {
@@ -172,5 +188,49 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         out1.w = v7 * s * s21.w;
         *reinterpret_cast<float4*>(x_rot_b + base) = out0;
         *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
+
+#if HIPFIRE_RMSNORM_EMIT_Q81
+        // Emit the two Q8_1 blocks covered by this 256-element FWHT group
+        // while all eight rotated values are still live. Four adjacent lanes
+        // own one 32-value Q8_1 sub-block (8 values/lane). The reduction below
+        // reproduces the standalone quantizer's virtual 8-thread tree:
+        // first values[0..3] and values[4..7] across lanes 0/2 then 0/1,
+        // followed by the final half combine.
+        float amax_a = fmaxf(fmaxf(fabsf(out0.x), fabsf(out0.y)),
+                             fmaxf(fabsf(out0.z), fabsf(out0.w)));
+        float amax_b = fmaxf(fmaxf(fabsf(out1.x), fabsf(out1.y)),
+                             fmaxf(fabsf(out1.z), fabsf(out1.w)));
+        float sum_a = out0.x + out0.y + out0.z + out0.w;
+        float sum_b = out1.x + out1.y + out1.z + out1.w;
+        amax_a = fmaxf(amax_a, __shfl_xor(amax_a, 2, 32));
+        amax_b = fmaxf(amax_b, __shfl_xor(amax_b, 2, 32));
+        sum_a += __shfl_xor(sum_a, 2, 32);
+        sum_b += __shfl_xor(sum_b, 2, 32);
+        amax_a = fmaxf(amax_a, __shfl_xor(amax_a, 1, 32));
+        amax_b = fmaxf(amax_b, __shfl_xor(amax_b, 1, 32));
+        sum_a += __shfl_xor(sum_a, 1, 32);
+        sum_b += __shfl_xor(sum_b, 1, 32);
+        const float amax = fmaxf(amax_a, amax_b);
+        const float sum = sum_a + sum_b;
+        const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        #define Q81(v) ((char)lrintf(fmaxf(-127.0f, fminf(127.0f, (v) * id))))
+        const char4 q0 = make_char4(Q81(out0.x), Q81(out0.y), Q81(out0.z), Q81(out0.w));
+        const char4 q1 = make_char4(Q81(out1.x), Q81(out1.y), Q81(out1.z), Q81(out1.w));
+        #undef Q81
+
+        const int block_in_group = lane_id >> 4;
+        const int qblock = group * 2 + block_in_group;
+        const int qbyte = (lane_id & 15) * 8;
+        block_q8_1_mmq* qb = x_q8 + qblock;
+        *reinterpret_cast<char4*>(qb->qs + qbyte) = q0;
+        *reinterpret_cast<char4*>(qb->qs + qbyte + 4) = q1;
+        if ((lane_id & 3) == 0) {
+            qb->ds4[(lane_id >> 2) & 3] = make_half2((_Float16)d, (_Float16)sum);
+        }
+#endif
     }
 }
+
+#undef HIPFIRE_RMSNORM_KERNEL

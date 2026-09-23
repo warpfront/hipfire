@@ -6,6 +6,14 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
+#ifndef HIPFIRE_QKVZA_DP4A_KERNEL
+#define HIPFIRE_QKVZA_DP4A_KERNEL fused_qkvza_hfq4g256_wave64_dp4a
+#endif
+
+#ifndef HIPFIRE_QKVZA_DP4A_ROWS_PER_BLOCK
+#define HIPFIRE_QKVZA_DP4A_ROWS_PER_BLOCK 2
+#endif
+
 // dp4a-port of fused_qkvza_hfq4g256_wave64 (4-output deltanet QKV
 // preamble: qkv + z + beta + alpha). Math + lane-mapping invariants
 // match fused_gate_up_hfq4g256_wave64_dp4a.hip; only the row-routing
@@ -19,7 +27,10 @@ struct block_q8_1_mmq {
 };
 static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
-extern "C" __global__ void fused_qkvza_hfq4g256_wave64_dp4a(
+#ifdef HIPFIRE_QKVZA_DP4A_LB10
+__launch_bounds__(64, 10)
+#endif
+extern "C" __global__ void HIPFIRE_QKVZA_DP4A_KERNEL(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,
     const char*  __restrict__ A_beta,
@@ -36,7 +47,7 @@ extern "C" __global__ void fused_qkvza_hfq4g256_wave64_dp4a(
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
 
-    const int gid = blockIdx.x * 2 + warp_id;
+    const int gid = blockIdx.x * HIPFIRE_QKVZA_DP4A_ROWS_PER_BLOCK + warp_id;
     const int total_m = qkv_m + z_m + beta_m + alpha_m;
     if (gid >= total_m) return;
 
@@ -63,15 +74,37 @@ extern "C" __global__ void fused_qkvza_hfq4g256_wave64_dp4a(
 
     float acc = 0.0f;
 
+#ifdef HIPFIRE_QKVZA_DP4A_UNROLL2
+#pragma unroll 2
+#endif
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_ptr + (long long)g * 136;
 
         const float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
         const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        // GFX11/12 expose the mixed unsigned-weight x signed-activation dot
+        // instruction (v_dot4_i32_iu8), not the older signed x signed dot1
+        // instruction used by gfx906. HFQ4 nibbles are naturally unsigned, so
+        // this also removes the artificial -8 pack and +8*scale correction.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || \
+    defined(__gfx1201__)
+        const float zp_eff = zp;
+#else
         const float zp_eff = zp + 8.0f * sc;
+#endif
 
         const unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
 
+#ifdef HIPFIRE_QKVZA_DP4A_PERM_UNPACK
+        // Two v_perm_b32 instructions replace fourteen scalar nibble
+        // extracts/ORs. Selector bytes address src1[0..3], src0[0..3]
+        // as 0..3,4..7 respectively.
+        const unsigned int even = pk & 0x0F0F0F0Fu;
+        const unsigned int odd = (pk >> 4) & 0x0F0F0F0Fu;
+        const int int_a = (int)__builtin_amdgcn_perm(odd, even, 0x05010400u);
+        const int int_b = (int)__builtin_amdgcn_perm(odd, even, 0x07030602u);
+#else
         const unsigned int n0 = (pk >>  0) & 0xFu;
         const unsigned int n1 = (pk >>  4) & 0xFu;
         const unsigned int n2 = (pk >>  8) & 0xFu;
@@ -80,6 +113,12 @@ extern "C" __global__ void fused_qkvza_hfq4g256_wave64_dp4a(
         const unsigned int n5 = (pk >> 20) & 0xFu;
         const unsigned int n6 = (pk >> 24) & 0xFu;
         const unsigned int n7 = (pk >> 28) & 0xFu;
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || \
+    defined(__gfx1201__)
+        const int int_a = (int)(n0 | (n1 << 8) | (n2 << 16) | (n3 << 24));
+        const int int_b = (int)(n4 | (n5 << 8) | (n6 << 16) | (n7 << 24));
+#else
         const int int_a = (int)(((n0 - 8) & 0xFF)
                               | (((n1 - 8) & 0xFF) << 8)
                               | (((n2 - 8) & 0xFF) << 16)
@@ -88,6 +127,8 @@ extern "C" __global__ void fused_qkvza_hfq4g256_wave64_dp4a(
                               | (((n5 - 8) & 0xFF) << 8)
                               | (((n6 - 8) & 0xFF) << 16)
                               | (((n7 - 8) & 0xFF) << 24));
+#endif
+#endif
 
         const int kblock = 2 * g + block_within_group;
         const block_q8_1_mmq* xb = Xq + kblock;
@@ -97,8 +138,15 @@ extern "C" __global__ void fused_qkvza_hfq4g256_wave64_dp4a(
         const int xq_b = xqs[1];
 
         int sumi = 0;
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || \
+    defined(__gfx1201__)
+        sumi = __builtin_amdgcn_sudot4(false, int_a, true, xq_a, sumi, false);
+        sumi = __builtin_amdgcn_sudot4(false, int_b, true, xq_b, sumi, false);
+#else
         sumi = __builtin_amdgcn_sdot4(int_a, xq_a, sumi, false);
         sumi = __builtin_amdgcn_sdot4(int_b, xq_b, sumi, false);
+#endif
 
         const half2 ds = xb->ds4[sub_in_block];
         const float2 dsf = __half22float2(ds);

@@ -983,6 +983,10 @@ pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+pub const GEMV_MQ4G256_ROTATE_Q8_1_SRC: &str = concat!(
+    "#define HIPFIRE_MQ_ROTATE_EMIT_Q81 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256.hip")
+);
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
@@ -991,6 +995,10 @@ pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g2
 pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_Q8_1_SRC: &str = concat!(
+    "#define HIPFIRE_RMSNORM_EMIT_Q81 1\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
 
@@ -1155,12 +1163,11 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 // v5: cache-aggressive — launch_bounds(32,16), 2x unroll, packed loads, factored math
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
-pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
-    );
+pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str =
@@ -1223,6 +1230,36 @@ pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str =
 /// to need — required for hipGraph capture of MoE decode.
 pub const MOE_SOFTMAX_TOPK_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip");
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P2_SRC: &str = concat!(
+    "#define ROUTER_PER_LANE 2\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p2\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P2_LB4_SRC: &str = concat!(
+    "#define ROUTER_PER_LANE 2\n#define ROUTER_MIN_BLOCKS 4\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p2_lb4\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P2_LB16_SRC: &str = concat!(
+    "#define ROUTER_PER_LANE 2\n#define ROUTER_MIN_BLOCKS 16\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p2_lb16\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB16_SRC: &str = concat!(
+    "#define ROUTER_MIN_BLOCKS 16\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p4_lb16\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB2_SRC: &str = concat!(
+    "#define ROUTER_MIN_BLOCKS 2\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p4_lb2\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB4_SRC: &str = concat!(
+    "#define ROUTER_MIN_BLOCKS 4\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p4_lb4\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
+pub const MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_P4_LB12_SRC: &str = concat!(
+    "#define ROUTER_MIN_BLOCKS 12\n#define ROUTER_KERNEL_NAME moe_router_softmax_topk_k8_wave64_p4_lb12\n",
+    include_str!("../../../kernels/src/moe_router_softmax_topk_k8_wave64.hip")
+);
 
 /// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
 /// the regular softmax_f32 kernel; the dispatch site runs softmax_f32
@@ -1244,12 +1281,28 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 /// topk_indices buffer and the per-expert weight base from an
 /// expert-pointers table. hipGraph-capture-safe replacement for the
 /// kernarg-pointer variant.
-pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
+);
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a.hip");
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_R2_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GU_DP4A_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_r2\n",
+    "#define HIPFIRE_MOE_GU_DP4A_ROWS_PER_BLOCK 2\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a.hip")
+);
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_R4_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GU_DP4A_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_r4\n",
+    "#define HIPFIRE_MOE_GU_DP4A_ROWS_PER_BLOCK 4\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a.hip")
+);
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DP4A_UNROLL2_SRC: &str = concat!(
+    "#define HIPFIRE_MOE_GU_DP4A_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_unroll2\n",
+    "#define HIPFIRE_MOE_GU_DP4A_UNROLL2 1\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a.hip")
+);
 
 /// NUM_ROWS register row-tile of the indexed MoE gate_up GEMV (opt-in,
 /// HIPFIRE_MOE_GATE_UP_FUSED=1). Each block owns NUM_ROWS output rows/expert,
@@ -1325,12 +1378,11 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 /// a shared residual row. Pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
 /// Observed lift: 387 → ~900 GiB/s on R9700/gfx1201 (no K_TOP-way atomic
 /// contention per output cell).
-pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
-    );
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
+);
 
 /// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate + residual
 /// add in a single kernel. Replaces the two-launch
@@ -1343,7 +1395,6 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// opt-in via `HIPFIRE_MOE_DOWN_FUSED=1`.
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
-
 
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
@@ -2288,12 +2339,11 @@ pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str =
 // from one source file. See kernel header for VGPR budget details.
 pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
-pub const GEMV_HFQ4G256_MULTIROW_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
-    );
+pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 
@@ -2301,12 +2351,11 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
 // wqkv + wz + w_beta + w_alpha in a single launch. Same 4x-unroll inner
 // loop as gemv_hfq4g256.hip; grid = sum of the four projections' output
 // row counts. Works on every RDNA generation — see the kernel header.
-pub const FUSED_QKVZA_HFQ4G256_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
-    );
+pub const FUSED_QKVZA_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
 
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
@@ -2317,16 +2366,41 @@ pub const FUSED_QKVZA_HFQ4G256_WAVE64_SRC: &str =
 // math derivation and lane-mapping invariants.
 pub const FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str =
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip");
+pub const FUSED_QKVZA_HFQ4G256_DP4A_R1_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_DP4A_KERNEL fused_qkvza_hfq4g256_dp4a_r1\n",
+    "#define HIPFIRE_QKVZA_DP4A_ROWS_PER_BLOCK 1\n",
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip")
+);
+pub const FUSED_QKVZA_HFQ4G256_DP4A_R4_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_DP4A_KERNEL fused_qkvza_hfq4g256_dp4a_r4\n",
+    "#define HIPFIRE_QKVZA_DP4A_ROWS_PER_BLOCK 4\n",
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip")
+);
+pub const FUSED_QKVZA_HFQ4G256_DP4A_LB10_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_DP4A_KERNEL fused_qkvza_hfq4g256_dp4a_lb10\n",
+    "#define HIPFIRE_QKVZA_DP4A_LB10 1\n",
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip")
+);
+pub const FUSED_QKVZA_HFQ4G256_DP4A_UNROLL2_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_DP4A_KERNEL fused_qkvza_hfq4g256_dp4a_unroll2\n",
+    "#define HIPFIRE_QKVZA_DP4A_UNROLL2 1\n",
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip")
+);
+pub const FUSED_QKVZA_HFQ4G256_DP4A_R4_PERM_SRC: &str = concat!(
+    "#define HIPFIRE_QKVZA_DP4A_KERNEL fused_qkvza_hfq4g256_dp4a_r4_perm\n",
+    "#define HIPFIRE_QKVZA_DP4A_ROWS_PER_BLOCK 4\n",
+    "#define HIPFIRE_QKVZA_DP4A_PERM_UNPACK 1\n",
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip")
+);
 
 // 3-way fused HFQ4-G256 projection for Qwen3.5 FullAttention preamble:
 // wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
 // variant; grid = q_m + k_m + v_m. Cross-arch.
-pub const FUSED_QKV_HFQ4G256_SRC: &str =
-    concat!(
-        "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-        include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-        include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
-    );
+pub const FUSED_QKV_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
+);
 
 // CDNA3 (MI300X / gfx94x) wave64-native 3-way fused preamble — 2 rows per
 // block via warp_id, halved grid. Byte-exact with the wave32 base kernel.
@@ -2550,6 +2624,36 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
+pub const RMSNORM_WAVE_REDUCE_SRC: &str = concat!(
+    "#define HIPFIRE_RMSNORM_WAVE_REDUCE 1\n",
+    include_str!("../../../kernels/src/rmsnorm.hip")
+);
+pub const RMSNORM_Q8_1_SRC: &str = concat!(
+    "#define HIPFIRE_RMSNORM_EMIT_Q81 1\n",
+    include_str!("../../../kernels/src/rmsnorm.hip")
+);
+pub const GEMV_HFQ4G256_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_dp4a.hip");
+pub const GEMV_HFQ4G256_DP4A_R2_SRC: &str = concat!(
+    "#define HIPFIRE_LM_DP4A_KERNEL gemv_hfq4g256_dp4a_r2\n",
+    "#define HIPFIRE_LM_DP4A_ROWS_PER_BLOCK 2\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_dp4a.hip")
+);
+pub const GEMV_HFQ4G256_DP4A_R4_SRC: &str = concat!(
+    "#define HIPFIRE_LM_DP4A_KERNEL gemv_hfq4g256_dp4a_r4\n",
+    "#define HIPFIRE_LM_DP4A_ROWS_PER_BLOCK 4\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_dp4a.hip")
+);
+pub const GEMV_HFQ4G256_DP4A_R8_SRC: &str = concat!(
+    "#define HIPFIRE_LM_DP4A_KERNEL gemv_hfq4g256_dp4a_r8\n",
+    "#define HIPFIRE_LM_DP4A_ROWS_PER_BLOCK 8\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_dp4a.hip")
+);
+pub const GEMV_HFQ4G256_DP4A_UNROLL2_SRC: &str = concat!(
+    "#define HIPFIRE_LM_DP4A_KERNEL gemv_hfq4g256_dp4a_unroll2\n",
+    "#define HIPFIRE_LM_DP4A_UNROLL2 1\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256_dp4a.hip")
+);
 
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).

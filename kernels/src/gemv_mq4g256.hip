@@ -4,6 +4,19 @@
 
 #include <hip/hip_runtime.h>
 
+#if HIPFIRE_MQ_ROTATE_EMIT_Q81
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+#define HIPFIRE_MQ_ROTATE_KERNEL mq_rotate_x_q8_1
+struct block_q8_1_mmq {
+    half2 ds4[4];
+    int8_t qs[128];
+};
+static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
+#else
+#define HIPFIRE_MQ_ROTATE_KERNEL mq_rotate_x
+#endif
+
 // MagnumQuant GEMV: FWHT-rotated HFQ4-G256.
 // x_rot is PRE-ROTATED by the caller (one FWHT pass on x, not per-row).
 // The inner loop is identical to standard HFQ4-G256 — zero rotation overhead.
@@ -64,11 +77,14 @@ extern "C" __global__ void gemv_mq4g256(
 // For prefill, batch=N; each block processes one group × one batch row.
 // x_in / x_out are laid out as [batch × K] row-major.
 extern "C" __launch_bounds__(32, 16)
-__global__ void mq_rotate_x(
+__global__ void HIPFIRE_MQ_ROTATE_KERNEL(
     const float* __restrict__ x_in,
     float* __restrict__ x_out,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
+#if HIPFIRE_MQ_ROTATE_EMIT_Q81
+    block_q8_1_mmq* __restrict__ x_q8,
+#endif
     int K
 ) {
     const int group = blockIdx.x;
@@ -128,6 +144,46 @@ __global__ void mq_rotate_x(
     #undef HBFLY
 
     const float s = 0.0625f;
+#if HIPFIRE_MQ_ROTATE_EMIT_Q81
+    float4 out0 = make_float4(v0 * s * signs2[d0],
+                             v1 * s * signs2[d0 + 1],
+                             v2 * s * signs2[d0 + 2],
+                             v3 * s * signs2[d0 + 3]);
+    float4 out1 = make_float4(v4 * s * signs2[d0 + 4],
+                             v5 * s * signs2[d0 + 5],
+                             v6 * s * signs2[d0 + 6],
+                             v7 * s * signs2[d0 + 7]);
+    *reinterpret_cast<float4*>(x_out_b + base) = out0;
+    *reinterpret_cast<float4*>(x_out_b + base + 4) = out1;
+
+    float amax_a = fmaxf(fmaxf(fabsf(out0.x), fabsf(out0.y)), fmaxf(fabsf(out0.z), fabsf(out0.w)));
+    float amax_b = fmaxf(fmaxf(fabsf(out1.x), fabsf(out1.y)), fmaxf(fabsf(out1.z), fabsf(out1.w)));
+    float sum_a = out0.x + out0.y + out0.z + out0.w;
+    float sum_b = out1.x + out1.y + out1.z + out1.w;
+    amax_a = fmaxf(amax_a, __shfl_xor(amax_a, 2, 32));
+    amax_b = fmaxf(amax_b, __shfl_xor(amax_b, 2, 32));
+    sum_a += __shfl_xor(sum_a, 2, 32);
+    sum_b += __shfl_xor(sum_b, 2, 32);
+    amax_a = fmaxf(amax_a, __shfl_xor(amax_a, 1, 32));
+    amax_b = fmaxf(amax_b, __shfl_xor(amax_b, 1, 32));
+    sum_a += __shfl_xor(sum_a, 1, 32);
+    sum_b += __shfl_xor(sum_b, 1, 32);
+    const float amax = fmaxf(amax_a, amax_b);
+    const float sum = sum_a + sum_b;
+    const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+#define Q81(v) ((char)lrintf(fmaxf(-127.0f, fminf(127.0f, (v) * id))))
+    const char4 q0 = make_char4(Q81(out0.x), Q81(out0.y), Q81(out0.z), Q81(out0.w));
+    const char4 q1 = make_char4(Q81(out1.x), Q81(out1.y), Q81(out1.z), Q81(out1.w));
+#undef Q81
+    const int block_in_group = tid >> 4;
+    const int qblock = group * 2 + block_in_group;
+    const int qbyte = (tid & 15) * 8;
+    block_q8_1_mmq* qb = x_q8 + (long long)blockIdx.y * (K / 128) + qblock;
+    *reinterpret_cast<char4*>(qb->qs + qbyte) = q0;
+    *reinterpret_cast<char4*>(qb->qs + qbyte + 4) = q1;
+    if ((tid & 3) == 0) qb->ds4[(tid >> 2) & 3] = make_half2((_Float16)d, (_Float16)sum);
+#else
     x_out_b[base]     = v0 * s * signs2[d0];
     x_out_b[base + 1] = v1 * s * signs2[d0 + 1];
     x_out_b[base + 2] = v2 * s * signs2[d0 + 2];
@@ -136,4 +192,7 @@ __global__ void mq_rotate_x(
     x_out_b[base + 5] = v5 * s * signs2[d0 + 5];
     x_out_b[base + 6] = v6 * s * signs2[d0 + 6];
     x_out_b[base + 7] = v7 * s * signs2[d0 + 7];
+#endif
 }
+
+#undef HIPFIRE_MQ_ROTATE_KERNEL

@@ -29,6 +29,13 @@ pub struct FeatureFlags {
     pub gfx942_lds_gemv_default_on: bool,
     pub gemv_rows_default: u32,
     pub gemv_dp4a: Option<bool>,
+    /// gfx1201-only QKVZA DP4A research selector. Kept separate from the
+    /// legacy HIPFIRE_GEMV_DP4A switch because that switch changes every
+    /// eligible GEMV/GEMM family at once and cannot produce an attributable
+    /// retained-replay experiment.
+    pub gfx1201_qkvza_dp4a: Option<String>,
+    pub gfx1201_moe_gate_up_dp4a: Option<String>,
+    pub gfx1201_lmhead_dp4a: Option<String>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -216,6 +223,15 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            gfx1201_qkvza_dp4a: std::env::var("HIPFIRE_GFX1201_QKVZA_DP4A")
+                .ok()
+                .filter(|value| !value.is_empty() && value != "0" && value != "off"),
+            gfx1201_moe_gate_up_dp4a: std::env::var("HIPFIRE_GFX1201_MOE_GATE_UP_DP4A")
+                .ok()
+                .filter(|value| !value.is_empty() && value != "0" && value != "off"),
+            gfx1201_lmhead_dp4a: std::env::var("HIPFIRE_GFX1201_LMHEAD_DP4A")
+                .ok()
+                .filter(|value| !value.is_empty() && value != "0" && value != "off"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -437,6 +453,9 @@ impl FeatureFlags {
             gemv_rows: None,
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
+            gfx1201_qkvza_dp4a: None,
+            gfx1201_moe_gate_up_dp4a: None,
+            gfx1201_lmhead_dp4a: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

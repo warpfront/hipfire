@@ -14,23 +14,23 @@ use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, LayerProgram, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{GemvInput, Step, execute_steps};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::{DispatchError, RotationPlan};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
-    self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, weight_gemv_prerotated,
-    weight_gemv_swiglu_residual, EmbeddingFormat, ParoRotation, WeightTensor,
+    self, EmbeddingFormat, ParoRotation, WeightTensor, f16_to_f32, fused_rmsnorm_rotate_for_mq,
+    fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
+    rotate_x_mq_batched_for, weight_gemv_prerotated, weight_gemv_swiglu_residual,
 };
-use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
+use hipfire_runtime::model_load::{LoadedWeights, WeightSource, load_weights as rt_load_weights};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::paro::{paro_load_norm, paro_text_prefix};
 use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weight_backend::{
-    dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, resolve_lm_head,
-    reupload_f16_as_f32, HfqBackend, ParoBackend,
+    HfqBackend, ParoBackend, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding,
+    resolve_lm_head, reupload_f16_as_f32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
@@ -2781,11 +2781,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             #[inline]
             fn e2m1(n: u8) -> f32 {
                 let m = E2M1_MAG[(n & 0x7) as usize];
-                if (n & 0x8) != 0 {
-                    -m
-                } else {
-                    m
-                }
+                if (n & 0x8) != 0 { -m } else { m }
             }
             // E4M3 (unsigned scale, bias 7, 3 mantissa) — bit-identical to the
             // quantizer `e4m3_scale_decode` and the gfx942 kernel decode.
@@ -2866,11 +2862,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     e = p7 | lsb;
                 }
                 let c = (e as i32 - 7) as f32;
-                if coset == 1 {
-                    c + 0.5
-                } else {
-                    c
-                }
+                if coset == 1 { c + 0.5 } else { c }
             }
             const QUANT_STEP: f32 = 0.88;
             let row_bytes = 16 + 17 * (n / 32);
@@ -2939,11 +2931,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     e = p7 | lsb;
                 }
                 let c = (e as i32 - 7) as f32;
-                if coset == 1 {
-                    c + 0.5
-                } else {
-                    c
-                }
+                if coset == 1 { c + 0.5 } else { c }
             }
             const QUANT_STEP_SOA: f32 = 0.88;
             // Decode assuming n = k_row; figure out m_rows from total bytes.
@@ -4793,11 +4781,7 @@ impl Qwen35Scratch {
                 _ => {
                     let graph_capable_arch =
                         gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-                    if graph_capable_arch {
-                        2
-                    } else {
-                        1
-                    }
+                    if graph_capable_arch { 2 } else { 1 }
                 }
             },
 
@@ -8496,8 +8480,8 @@ fn forward_prefill_chunk(
                     // kernel-vs-stride corruption mode.
                     debug_assert!(
                         matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
+                            && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
+                            && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
                         "LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
                     );
                     run_fused_qkvza_key(
@@ -10394,8 +10378,8 @@ fn forward_prefill_chunk(
                     // re-introduce Tier-1 stride corruption.
                     debug_assert!(
                         matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-                        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
+                            && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
+                            && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
                         "DNMoe LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
                     );
                     run_fused_qkvza_key(
@@ -12571,9 +12555,30 @@ fn forward_scratch_layers(
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
 
-    // Final norm + logits into scratch.logits
-    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    // Final norm + logits into scratch.logits. The gfx1201 research arm
+    // fuses RMSNorm+MQ rotation+Q8_1 emission and feeds a low-VGPR DP4A
+    // LM-head, removing the standalone MQ rotation dispatch.
+    if gpu.arch == "gfx1201"
+        && gpu.flags.gfx1201_lmhead_dp4a.is_some()
+        && matches!(weights.output.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+        && weights.output.awq_scale.is_none()
     {
+        let xq = gpu.fused_rmsnorm_rotate_mq_q8_1(
+            &s.x,
+            &weights.output_norm,
+            &s.x_rot,
+            weights.output.k,
+            config.norm_eps,
+        )?;
+        gpu.gemv_hfq4g256_dp4a_prequant(
+            &weights.output.buf,
+            xq,
+            &s.logits,
+            weights.output.m,
+            weights.output.k,
+        )?;
+    } else {
+        gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
@@ -12623,6 +12628,30 @@ fn qkvza_via_execute_steps(
     dn_alpha: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
+    if gpu.arch == "gfx1201"
+        && gpu.flags.gfx1201_qkvza_dp4a.is_some()
+        && wqkv.gpu_dtype == DType::MQ4G256
+        && wqkv.awq_scale.is_none()
+    {
+        let xq = gpu.fused_rmsnorm_rotate_mq_q8_1(x, attn_norm, x_rot, wqkv.k, eps)?;
+        return gpu.fused_qkvza_hfq4g256_dp4a_prequant(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            xq,
+            dn_qkv,
+            dn_z,
+            dn_beta,
+            dn_alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+        );
+    }
+
     let rotation = dtype_rotation_plan(wqkv.gpu_dtype);
     if rotation == RotationPlan::Givens {
         // ParoQ4G128: plain rmsnorm, then per-weight Givens rotation inside run_auto.
@@ -13389,8 +13418,8 @@ fn q35_superop(kind: SuperOpKind, code: u32) -> SuperOp {
 /// SEQUENCE mirrors the matching hand arm in `forward_scratch_layers` exactly
 /// (per the decode-forward variant map). Pure → unit-testable.
 fn lower_variant(v: Q35Variant) -> LayerProgram {
-    use q35_op::*;
     use SuperOpKind::{Attend, Moe, Norm, Proj, Recurrent, ResidualGemv};
+    use q35_op::*;
     match v {
         Q35Variant::DeltaNet => vec![
             q35_superop(Proj, PROJ_QKVZA),
@@ -13529,7 +13558,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 _ => {
                     return Err(DispatchError::Hip(
                         "PROJ_QKVZA on non-DeltaNet layer".into(),
-                    ))
+                    ));
                 }
             },
             q35_op::PROJ_GATE_UP => match self.layer {
@@ -13562,7 +13591,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 _ => {
                     return Err(DispatchError::Hip(
                         "PROJ_GATE_UP on MoE/unknown layer".into(),
-                    ))
+                    ));
                 }
             },
             other => return Err(DispatchError::Hip(format!("unknown PROJ opcode {other}"))),
@@ -13632,7 +13661,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             _ => {
                 return Err(DispatchError::Hip(
                     "NORM_GATED on non-DeltaNet layer".into(),
-                ))
+                ));
             }
         };
         gpu.gated_norm_f32(
@@ -13973,8 +14002,27 @@ fn forward_scratch_layers_lowered(
     }
 
     // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
-    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    if gpu.arch == "gfx1201"
+        && gpu.flags.gfx1201_lmhead_dp4a.is_some()
+        && matches!(weights.output.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+        && weights.output.awq_scale.is_none()
     {
+        let xq = gpu.fused_rmsnorm_rotate_mq_q8_1(
+            &s.x,
+            &weights.output_norm,
+            &s.x_rot,
+            weights.output.k,
+            config.norm_eps,
+        )?;
+        gpu.gemv_hfq4g256_dp4a_prequant(
+            &weights.output.buf,
+            xq,
+            &s.logits,
+            weights.output.m,
+            weights.output.k,
+        )?;
+    } else {
+        gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
         let step = Step::Gemv {
@@ -14075,7 +14123,7 @@ pub fn forward_ep(
                 return Err(HipError::new(
                     0,
                     &format!("forward_ep: unsupported embedding format {other:?}"),
-                ))
+                ));
             }
         }
         gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
@@ -14256,11 +14304,11 @@ pub fn forward_prefill_batch_ep(
 
     let ep_timing = std::env::var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
     let ep_skip_ar = std::env::var("HIPFIRE_EP_SKIP_ALLREDUCE").is_ok(); // DIAGNOSTIC ONLY (wrong output)
-                                                                         // Peer-direct all-reduce (bypass RCCL): the routed-partial sum goes through
-                                                                         // Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
-                                                                         // vs RCCL's ~40 ms/call on hiptrx (gfx1201, PCIe). DEFAULT ON; opt back to
-                                                                         // RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
-                                                                         // with TP), lazily sized to the largest count seen.
+    // Peer-direct all-reduce (bypass RCCL): the routed-partial sum goes through
+    // Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
+    // vs RCCL's ~40 ms/call on hiptrx (gfx1201, PCIe). DEFAULT ON; opt back to
+    // RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
+    // with TP), lazily sized to the largest count seen.
     let ep_peer_ar = std::env::var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0");
     let mut t_chunk = 0.0f64;
     let mut t_ar = 0.0f64;

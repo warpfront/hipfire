@@ -5,7 +5,7 @@
 //! Batched GEMM prefill methods for RDNA GPUs.
 
 use crate::dispatch::{
-    DType, Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES,
+    DType, FP8_WMMA_MIN_BATCH, Gpu, GpuTensor, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES,
 };
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
@@ -2629,12 +2629,69 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+        self.fused_qkvza_hfq4g256_dp4a_prequant(
+            a_qkv, a_z, a_beta, a_alpha, xq_ptr, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+            alpha_m, k,
+        )
+    }
 
-        self.ensure_kernel(
-            "fused_qkvza_hfq4g256_wave64_dp4a",
-            kernels::FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC,
-            "fused_qkvza_hfq4g256_wave64_dp4a",
-        )?;
+    /// Launch the QKVZA DP4A consumer against a Q8_1 activation produced by
+    /// the fused RMSNorm/FWHT kernel. The Q8_1 allocation must remain live
+    /// through this launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_hfq4g256_dp4a_prequant(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        xq_ptr: *mut c_void,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+
+        let variant = self.flags.gfx1201_qkvza_dp4a.as_deref().unwrap_or("r2");
+        let (kernel_name, kernel_src, rows_per_block) = match variant {
+            "r1" => (
+                "fused_qkvza_hfq4g256_dp4a_r1",
+                kernels::FUSED_QKVZA_HFQ4G256_DP4A_R1_SRC,
+                1u32,
+            ),
+            "r4" => (
+                "fused_qkvza_hfq4g256_dp4a_r4",
+                kernels::FUSED_QKVZA_HFQ4G256_DP4A_R4_SRC,
+                4u32,
+            ),
+            "lb10" => (
+                "fused_qkvza_hfq4g256_dp4a_lb10",
+                kernels::FUSED_QKVZA_HFQ4G256_DP4A_LB10_SRC,
+                2u32,
+            ),
+            "unroll2" => (
+                "fused_qkvza_hfq4g256_dp4a_unroll2",
+                kernels::FUSED_QKVZA_HFQ4G256_DP4A_UNROLL2_SRC,
+                2u32,
+            ),
+            "r4-perm" => (
+                "fused_qkvza_hfq4g256_dp4a_r4_perm",
+                kernels::FUSED_QKVZA_HFQ4G256_DP4A_R4_PERM_SRC,
+                4u32,
+            ),
+            _ => (
+                "fused_qkvza_hfq4g256_wave64_dp4a",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC,
+                2u32,
+            ),
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
 
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -2676,9 +2733,9 @@ impl Gpu {
             &k_i as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(
-            "fused_qkvza_hfq4g256_wave64_dp4a",
-            [(total + 1) / 2, 1, 1],
-            [64, 1, 1],
+            kernel_name,
+            [(total + rows_per_block - 1) / rows_per_block, 1, 1],
+            [32 * rows_per_block, 1, 1],
             0,
             &mut params,
             || {
@@ -20028,8 +20085,16 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload: M must be a multiple of 64 (got {m})");
-        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload: K must be a multiple of 256 (got {k})");
+        debug_assert_eq!(
+            m % 64,
+            0,
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload: M must be a multiple of 64 (got {m})"
+        );
+        debug_assert_eq!(
+            k % 256,
+            0,
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload: K must be a multiple of 256 (got {k})"
+        );
         let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload";
         let kernel_src = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC;
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
@@ -20101,8 +20166,16 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: M must be a multiple of 64 (got {m})");
-        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: K must be a multiple of 256 (got {k})");
+        debug_assert_eq!(
+            m % 64,
+            0,
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: M must be a multiple of 64 (got {m})"
+        );
+        debug_assert_eq!(
+            k % 256,
+            0,
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: K must be a multiple of 256 (got {k})"
+        );
         let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync";
         let kernel_src = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC;
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
