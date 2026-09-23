@@ -204,11 +204,29 @@ pub(crate) struct QuantizeArgs {
     /// Enable AWQ pre-scaling with an explicit alpha.
     #[arg(long, value_name = "ALPHA")]
     pub awq_alpha: Option<f32>,
+    /// Correct Qwen3.8 linear-attention out_proj imatrix head order before
+    /// fitting AWQ scales. Does not change the alpha or any other tensor.
+    #[arg(long, requires = "imatrix")]
+    pub awq_fix_la_head_order: bool,
 
-    /// Select AWQ alpha per shared activation group using the runtime-exact
-    /// MQ4V2 × A4 block-output error over the fixed alpha grid.
+    /// Reproduce the historical A4-aware alpha search (four A4 candidates,
+    /// asymmetric W surrogate, positive imatrix-RMS activation).
     #[arg(long, conflicts_with = "awq_alpha")]
     pub awq_a4_aware: bool,
+
+    /// Search shared AWQ alpha with the gfx1201 fused c2 A4 recipe and
+    /// symmetric qt44 W writer for every eligible layer. Without captured
+    /// rows, retains the legacy imatrix RMS activation statistic.
+    #[arg(long, requires = "mq4v2_symmetric", conflicts_with = "awq_a4_aware")]
+    pub awq_a4_route_c2: bool,
+    /// Optionally replace the imatrix RMS statistic with signed QAT producer
+    /// rows on captured sites; uncaptured sites still use c2/symmetric objective.
+    #[arg(long, value_name = "CAPTURE_DIR", requires_all = ["awq_a4_route_c2", "awq_a4_source_sha"])]
+    pub awq_a4_signed_capture: Option<PathBuf>,
+
+    /// SHA-256 of the BF16 parent recorded in the signed QAT capture manifest.
+    #[arg(long, value_name = "SHA256", requires = "awq_a4_signed_capture")]
+    pub awq_a4_source_sha: Option<String>,
 
     /// Encode MQ4V2 with a per-128 symmetric grid while retaining the existing
     /// affine header layout. The stored zero is `-8*d`, so code 8 maps to zero.

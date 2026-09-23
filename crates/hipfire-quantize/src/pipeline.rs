@@ -1179,7 +1179,7 @@ pub(crate) fn run() {
             eprintln!("error: --imatrix path not found: {}", path.display());
             std::process::exit(1);
         }
-        let table = load_imatrix(path);
+        let table = load_imatrix(path, args.awq_fix_la_head_order);
         IMATRIX
             .set(table)
             .expect("IMATRIX set twice — should not happen");
@@ -1202,15 +1202,43 @@ pub(crate) fn run() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.awq || args.awq_alpha.is_some() || args.awq_a4_aware;
+    let awq_enabled = args.awq || args.awq_alpha.is_some() || args.awq_a4_aware || args.awq_a4_route_c2;
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
-    if args.awq_a4_aware && !use_mq4v2 {
-        eprintln!("error: --awq-a4-aware currently requires --format mq4v2");
+    if (args.awq_a4_aware || args.awq_a4_route_c2) && !use_mq4v2 {
+        eprintln!("error: A4-aware AWQ currently requires --format mq4v2");
         std::process::exit(1);
     }
     if args.mq4v2_symmetric && !use_mq4v2 {
         eprintln!("error: --mq4v2-symmetric currently requires --format mq4v2");
         std::process::exit(1);
+    }
+    if args.awq_a4_route_c2 {
+        AWQ_A4_ROUTE_C2.set(true).expect("AWQ c2 recipe set twice");
+    }
+    if let Some(capture) = &args.awq_a4_signed_capture {
+        let source_sha = args.awq_a4_source_sha.as_ref().expect("capture requires source SHA");
+        if source_sha.len() != 64 || !source_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            eprintln!("error: --awq-a4-source-sha must be a 64-digit SHA-256");
+            std::process::exit(1);
+        }
+        let manifest: serde_json::Value = serde_json::from_reader(
+            File::open(capture.join("manifest.json")).unwrap_or_else(|error| {
+                eprintln!("error: cannot open AWQ capture manifest: {error}");
+                std::process::exit(1);
+            }),
+        ).unwrap_or_else(|error| {
+            eprintln!("error: invalid AWQ capture manifest: {error}");
+            std::process::exit(1);
+        });
+        if manifest["source"]["sha256"].as_str() != Some(source_sha.as_str())
+            || manifest["source"]["path"].as_str() != args.input.as_deref()
+        {
+            eprintln!("error: AWQ capture source SHA/path does not match --input");
+            std::process::exit(1);
+        }
+        AWQ_A4_SIGNED_CAPTURE.set(capture.clone()).expect("AWQ capture set twice");
+        AWQ_A4_SOURCE_SHA.set(source_sha.clone()).expect("AWQ source SHA set twice");
+        eprintln!("AWQ signed QAT capture: {} (partial-layer c2/symmetric objective)", capture.display());
     }
     MQ4V2_SYMMETRIC
         .set(args.mq4v2_symmetric)
@@ -1235,12 +1263,12 @@ pub(crate) fn run() {
         AWQ_ALPHA
             .set(awq_alpha)
             .expect("AWQ_ALPHA set twice — should not happen");
-        if args.awq_a4_aware {
+        if args.awq_a4_aware || args.awq_a4_route_c2 {
             AWQ_A4_AWARE
                 .set(true)
                 .expect("AWQ_A4_AWARE set twice — should not happen");
         }
-        if args.awq_a4_aware {
+        if args.awq_a4_aware || args.awq_a4_route_c2 {
             eprintln!(
                 "AWQ pre-scaling: ENABLED (A4-aware shared-activation alpha search over {:?})",
                 AWQ_A4_CANDIDATE_ALPHAS
@@ -1714,6 +1742,32 @@ pub(crate) fn run() {
     if args.mq4v2_symmetric {
         metadata["mq4v2.symmetric"] = serde_json::json!(1);
     }
+    if args.awq_fix_la_head_order {
+        metadata["awq_la_out_head_order"] = serde_json::json!("qwen3.8-hf-kmajor-vminor");
+    }
+    if args.awq_a4_route_c2 {
+        metadata["awq_a4_recipe"] = serde_json::json!({
+            "producer": "gfx1201-fused-c2",
+            "weight_grid": "mq4v2-symmetric-qt44",
+            "alpha_grid": AWQ_A4_CANDIDATE_ALPHAS,
+            "fallback_activation": "imatrix-positive-rms",
+        });
+    }
+    if let Some(capture) = &args.awq_a4_signed_capture {
+        let manifest_path = capture.join("manifest.json");
+        let manifest: serde_json::Value = serde_json::from_reader(
+            File::open(&manifest_path).expect("AWQ capture manifest disappeared")
+        ).expect("AWQ capture manifest changed");
+        metadata["awq_a4_capture"] = serde_json::json!({
+            "source_sha256": manifest["source"]["sha256"],
+            "prompt_sha256": manifest["corpus"]["token_stream"]["sha256"],
+            "manifest_sha256": sha256_file_hex(&manifest_path).expect("unable to hash AWQ capture manifest"),
+            "base_alpha": awq_alpha,
+            "captured_candidate_count": 2,
+            "captured_weight_grid": "mq4v2-symmetric-qt44",
+            "uncaptured": "imatrix-positive-rms-c2-symmetric",
+        });
+    }
     // `mut` so the SP4b bake-prune path can patch the routed-expert count down to
     // the kept count before write_hfq (so the baked model loads with the compact
     // count and NO env var). Untouched in every non-prune path.
@@ -1763,7 +1817,7 @@ pub(crate) fn run() {
             all_tensors.push((name, fi));
         }
     }
-    if args.awq_a4_aware {
+    if args.awq_a4_aware || args.awq_a4_route_c2 {
         // Runtime fusion applies one inverse AWQ scale to each shared input.
         // Visit the largest fused projection first so it chooses the alpha
         // cached for its qkvza/gate-up siblings.
@@ -5662,6 +5716,7 @@ fn handle_main_quant(
                                 if awq_eligible(name) {
                                     let m_dim = meta.shape[0];
                                     let selected = compute_awq_scales_for_weight(
+                                        name,
                                         im_weights,
                                         alpha,
                                         &f32_data,
@@ -6319,6 +6374,7 @@ fn handle_main_quant(
                             if awq_eligible(name) {
                                 let m_dim = meta.shape[0];
                                 let selected = compute_awq_scales_for_weight(
+                                    name,
                                     im_weights,
                                     alpha,
                                     &f32_data,

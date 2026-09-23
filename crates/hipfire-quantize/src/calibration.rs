@@ -32,6 +32,13 @@ pub(crate) static AWQ_A4_AWARE: OnceLock<bool> = OnceLock::new();
 pub(crate) const AWQ_A4_CANDIDATE_ALPHAS: [f32; 5] = [0.35, 0.45, 0.55, 0.65, 0.75];
 static AWQ_A4_ALPHA_BY_ACTIVATION: LazyLock<Mutex<HashMap<Vec<u32>, f32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Opt-in QAT producer rows; absent leaves the historical surrogate unchanged.
+pub(crate) static AWQ_A4_SIGNED_CAPTURE: OnceLock<PathBuf> = OnceLock::new();
+pub(crate) static AWQ_A4_ROUTE_C2: OnceLock<bool> = OnceLock::new();
+pub(crate) static AWQ_A4_SOURCE_SHA: OnceLock<String> = OnceLock::new();
+static AWQ_A4_CAPTURE_MANIFEST: OnceLock<serde_json::Value> = OnceLock::new();
+static AWQ_A4_VERIFIED_FILES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub(crate) const MQ4V2_FINAL_CODE_QTYPE: u8 = 44;
 
@@ -782,7 +789,7 @@ pub(crate) fn safetensors_to_ggml_name(name: &str) -> Option<String> {
 ///
 /// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
 /// the BASE tensor name (the ".in_sum2" suffix stripped).
-pub(crate) fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
+pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<String, Vec<f32>> {
     use gguf_input::GgmlType;
     let gguf = gguf_input::GgufFile::open(path).unwrap_or_else(|e| {
         eprintln!("error: failed to open imatrix file {}: {e}", path.display());
@@ -790,6 +797,7 @@ pub(crate) fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
     });
 
     let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut fixed_la_out = 0usize;
     let mut total_entries = 0usize;
     let mut skipped_moe = 0usize;
     for t in &gguf.tensors {
@@ -818,11 +826,30 @@ pub(crate) fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
         let mut values = Vec::with_capacity(k);
         for i in 0..k {
             let off = i * 4;
-            let v = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-            values.push(v);
+            values.push(f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]));
+        }
+        if fix_la_head_order && (name.ends_with(".linear_attn.out_proj.weight")
+            || name.ends_with(".ssm_out.weight"))
+        {
+            assert_eq!(k, 48 * 128, "{name}: Qwen3.8 LA out_proj must have 48 V-heads x 128");
+            let raw = values;
+            values = vec![0.0; k];
+            // llama.cpp stores three V heads per K head (V-major/K-minor);
+            // HF out_proj columns use K-major/V-minor. HF head h reads raw
+            // head (h % 3)*16 + h/3. No reordering of W or runtime sidecar.
+            for h in 0..48 {
+                let raw_h = (h % 3) * 16 + h / 3;
+                values[h * 128..(h + 1) * 128]
+                    .copy_from_slice(&raw[raw_h * 128..(raw_h + 1) * 128]);
+            }
+            fixed_la_out += 1;
         }
         map.insert(name, values);
         total_entries += 1;
+    }
+    if fix_la_head_order {
+        assert_eq!(fixed_la_out, 48, "Qwen3.8 LA imatrix head fix expected 48 out_proj tensors, found {fixed_la_out}");
+        eprintln!("imatrix: corrected V-head order for {fixed_la_out} linear-attention out_proj tensors");
     }
 
     eprintln!(
@@ -1076,13 +1103,15 @@ impl BlockI4_128 {
     }
 }
 
-/// CPU twin of the gfx1201 producer specialization in
-/// `kernels/src/block_i4_128_quant.hip`.
+/// CPU twin of the producer specialization in
+/// `kernels/src/block_i4_128_quant.hip`. `candidates=2` is the fused
+/// gfx1201 c2 route; the historical AWQ objective uses four candidates.
+/// Standalone quantization is an eight-candidate route, not c2.
 ///
-/// Arithmetic order is intentional: four values are accumulated per simulated
-/// wave lane and then reduced with the same XOR 16,8,4,2,1 tree. The four scale
-/// candidates and their pre-rounded constants are the runtime contract.
-pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128]) -> BlockI4_128 {
+/// Four values are accumulated per simulated wave lane, then reduced with
+/// the runtime's XOR 16,8,4,2,1 tree. Scale and error arithmetic order matters.
+pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128], candidates: usize) -> BlockI4_128 {
+    assert!(matches!(candidates, 1 | 2 | 4 | 8));
     let mut lane_amax = [0.0f32; 32];
     for lane in 0..32 {
         let base = lane * 4;
@@ -1103,15 +1132,23 @@ pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128]) -> BlockI4_128 {
     let mut best_d = 1.0f32;
     if amax != 0.0 {
         let candidate_base = (amax / 7.0f32) * 0.5f32;
-        let multipliers = [
-            1.0f32,
-            f32::from_bits(0x3fa4_9249),
-            f32::from_bits(0x3fdb_6db7),
-            2.0f32,
-        ];
+        let multipliers: &[f32] = match candidates {
+            1 => &[],
+            2 => &[f32::from_bits(0x3fdb_6db7), 2.0],
+            4 => &[1.0, f32::from_bits(0x3fa4_9249), f32::from_bits(0x3fdb_6db7), 2.0],
+            8 => &[],
+            _ => unreachable!(),
+        };
+        if candidates == 1 {
+            best_d = amax / 7.0;
+        }
         let mut best_mse = 1.0e30f32;
-        for multiplier in multipliers {
-            let d = candidate_base * multiplier;
+        for index in 0..if candidates == 8 { 8 } else { multipliers.len() } {
+            let d = if candidates == 8 {
+                (amax / 7.0) * 0.5 * (1.0 + index as f32 / 7.0)
+            } else {
+                candidate_base * multipliers[index]
+            };
             let mut lane_mse = [0.0f32; 32];
             for lane in 0..32 {
                 let base = lane * 4;
@@ -1163,6 +1200,113 @@ pub(crate) struct A4AwareAwqResult {
     pub(crate) relative_output_mse: f64,
 }
 
+/// The QAT capture is post-producer, pre-AWQ and signed. Its manifest binds
+/// every tensor to the parent and disjoint prompt stream; uncaptured layers
+/// deliberately remain on the historical objective for a partial-layer screen.
+fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let root = AWQ_A4_SIGNED_CAPTURE.get()?;
+    let manifest = AWQ_A4_CAPTURE_MANIFEST.get_or_init(|| {
+        serde_json::from_reader(File::open(root.join("manifest.json")).expect("AWQ capture manifest missing"))
+            .expect("AWQ capture manifest invalid")
+    });
+    assert_eq!(
+        manifest["schema_version"].as_str(),
+        Some("hipfire.qat.spin_rotation.v1"),
+        "unexpected AWQ capture schema"
+    );
+    assert_eq!(
+        manifest["source"]["sha256"].as_str(),
+        AWQ_A4_SOURCE_SHA.get().map(String::as_str),
+        "AWQ capture parent SHA mismatch"
+    );
+    let prompt = &manifest["corpus"]["token_stream"];
+    let prompt_path = root.join(prompt["file"].as_str().expect("capture token file missing"));
+    {
+        let mut verified = AWQ_A4_VERIFIED_FILES.lock().expect("capture hash cache poisoned");
+        if verified.insert(prompt_path.clone()) {
+            assert_eq!(
+                sha256_file_hex(&prompt_path).expect("unable to hash capture prompt"),
+                prompt["sha256"].as_str().expect("capture prompt SHA missing"),
+                "AWQ capture prompt checksum mismatch"
+            );
+        }
+    }
+    let suffix = name.strip_prefix("model.language_model.layers.")
+        .or_else(|| name.strip_prefix("model.layers."))?;
+    let (block, projection) = suffix.split_once('.')?;
+    let block: usize = block.parse().ok()?;
+    let block_record = manifest["capture"]["blocks"].get(block.to_string())?;
+    let site = if projection == "mlp.down_proj.weight" {
+        "silu_mul_down"
+    } else if projection == "mlp.gate_proj.weight" || projection == "mlp.up_proj.weight" {
+        "post_attention_norm_gate_up"
+    } else if projection == "self_attn.o_proj.weight"
+        || projection == "linear_attn.out_proj.weight"
+    {
+        "mixer_out"
+    } else if projection.starts_with("linear_attn.in_proj_") {
+        "input_norm_qkvza"
+    } else if projection == "self_attn.q_proj.weight"
+        || projection == "self_attn.k_proj.weight"
+        || projection == "self_attn.v_proj.weight"
+    {
+        if block_record["producer_sites"].get("input_norm_qkv").is_some() {
+            "input_norm_qkv"
+        } else {
+            "input_norm_qkvza"
+        }
+    } else {
+        return None;
+    };
+    let record = block_record["producer_sites"].get(site)?;
+    assert_eq!(record["dtype"].as_str(), Some("float32-le"), "{name}: wrong capture dtype");
+    assert_eq!(record["axes"], serde_json::json!(["sample", "channel"]), "{name}: wrong capture axes");
+    let shape = record["shape"].as_array().expect("capture shape missing");
+    let n_rows = shape[0].as_u64().expect("capture rows invalid") as usize;
+    assert_eq!(shape[1].as_u64(), Some(k as u64), "{name}: capture K mismatch");
+    let bytes = n_rows.checked_mul(k).and_then(|v| v.checked_mul(4)).expect("capture size overflow");
+    assert_eq!(record["bytes"].as_u64(), Some(bytes as u64), "{name}: capture byte count mismatch");
+    let indices = record["global_sample_indices"].as_array().expect("capture indices missing");
+    assert_eq!(indices.len(), n_rows, "{name}: capture row count mismatch");
+    let path = root.join(record["file"].as_str().expect("capture file missing"));
+    let file = File::open(&path).expect("capture tensor missing");
+    assert_eq!(file.metadata().expect("capture metadata unavailable").len(), bytes as u64, "{name}: capture file size mismatch");
+    {
+        let mut verified = AWQ_A4_VERIFIED_FILES.lock().expect("capture hash cache poisoned");
+        if verified.insert(path.clone()) {
+            assert_eq!(
+                sha256_file_hex(&path).expect("unable to hash capture tensor"),
+                record["sha256"].as_str().expect("capture SHA missing"),
+                "{name}: capture checksum mismatch"
+            );
+        }
+    }
+    let mmap = unsafe { Mmap::map(&file).expect("unable to map capture tensor") };
+    let train_limit = manifest["corpus"]["train_sequences"].as_u64().expect("train count missing")
+        * manifest["corpus"]["sequence_length"].as_u64().expect("sequence length missing");
+    let split = |train: bool, target: usize| {
+        let eligible: Vec<usize> = indices.iter().enumerate().filter_map(|(i, index)| {
+            ((index.as_u64().expect("sample index invalid") < train_limit) == train).then_some(i)
+        }).collect();
+        assert!(!eligible.is_empty(), "{name}: no {} captured rows", if train { "train" } else { "heldout" });
+        (0..eligible.len().min(target)).map(|i| {
+            let row = eligible[i * eligible.len() / eligible.len().min(target)];
+            mmap[row * k * 4..(row + 1) * k * 4].chunks_exact(4).map(|b| {
+                let value = f32::from_le_bytes(b.try_into().unwrap());
+                assert!(value.is_finite(), "{name}: non-finite captured activation");
+                value
+            }).collect::<Vec<f32>>()
+        }).collect()
+    };
+    let train: Vec<Vec<f32>> = split(true, 8);
+    let heldout: Vec<Vec<f32>> = split(false, 4);
+    assert!(
+        train.iter().flatten().any(|&v| v < 0.0) && train.iter().flatten().any(|&v| v > 0.0),
+        "{name}: capture rows must be signed"
+    );
+    Some((train, heldout))
+}
+
 fn representative_activation(in_sum2: &[f32]) -> Vec<f32> {
     let mut x: Vec<f32> = in_sum2
         .iter()
@@ -1187,6 +1331,8 @@ fn fake_quantize_runtime_activation(
     scales: &[f32],
     signs1: &[f32],
     signs2: &[f32],
+    candidates: usize,
+    round_awq_sidecar: bool,
 ) -> Vec<f32> {
     use crate::quant_fwht::cpu_fwht_256;
 
@@ -1196,13 +1342,18 @@ fn fake_quantize_runtime_activation(
     for group_start in (0..activation.len()).step_by(256) {
         let mut group = [0.0f32; 256];
         for i in 0..256 {
-            group[i] = activation[group_start + i] / scales[group_start + i];
+            let scale = if round_awq_sidecar {
+                f16_to_f32(f32_to_f16(scales[group_start + i]))
+            } else {
+                scales[group_start + i]
+            };
+            group[i] = activation[group_start + i] / scale;
         }
         cpu_fwht_256(&mut group, signs1, signs2);
         for half in 0..2 {
             let mut input = [0.0f32; 128];
             input.copy_from_slice(&group[half * 128..(half + 1) * 128]);
-            let dequantized = fake_quantize_block_i4_128(&input).dequantize();
+            let dequantized = fake_quantize_block_i4_128(&input, candidates).dequantize();
             output[group_start + half * 128..group_start + (half + 1) * 128]
                 .copy_from_slice(&dequantized);
         }
@@ -1210,8 +1361,55 @@ fn fake_quantize_runtime_activation(
     output
 }
 
-fn fake_quantize_mq4v2_weight_group(group: &mut [f32; 256]) {
+fn fake_quantize_mq4v2_weight_group(group: &mut [f32; 256], symmetric: bool) {
     for half in 0..2 {
+        if symmetric {
+            // Keep the same f32/f16/f64 arithmetic order as the qt44 writer.
+            let values = &group[half * 128..(half + 1) * 128];
+            let amax = values.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
+            if amax == 0.0 {
+                group[half * 128..(half + 1) * 128].fill(0.0);
+                continue;
+            }
+            let base = (amax / 7.5) * 0.5;
+            let mut best_mse = f64::INFINITY;
+            let mut best_scale = 0u16;
+            let mut best_zero = 0u16;
+            for multiplier in [
+                1.0f32,
+                f32::from_bits(0x3fa4_9249),
+                f32::from_bits(0x3fdb_6db7),
+                2.0,
+            ] {
+                let scale_bits = f32_to_f16(base * multiplier);
+                let scale = f16_to_f32(scale_bits);
+                if scale == 0.0 {
+                    continue;
+                }
+                let zero_bits = f32_to_f16(-8.0 * scale);
+                let zero = f16_to_f32(zero_bits);
+                let inverse = 1.0 / scale;
+                let mut mse = 0.0f64;
+                for &value in values {
+                    let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                    let error = value - code.mul_add(scale, zero);
+                    mse += (error as f64) * (error as f64);
+                }
+                if mse < best_mse {
+                    best_mse = mse;
+                    best_scale = scale_bits;
+                    best_zero = zero_bits;
+                }
+            }
+            let scale = f16_to_f32(best_scale);
+            let zero = f16_to_f32(best_zero);
+            let inverse = 1.0 / scale;
+            for value in &mut group[half * 128..(half + 1) * 128] {
+                let code = ((*value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                *value = code.mul_add(scale, zero);
+            }
+            continue;
+        }
         let values = &group[half * 128..(half + 1) * 128];
         let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
         let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -1244,11 +1442,13 @@ fn w4a4_relative_output_mse(
     scales: &[f32],
     signs1: &[f32],
     signs2: &[f32],
+    candidates: usize,
+    symmetric: bool,
 ) -> f64 {
     use crate::quant_fwht::cpu_fwht_256;
 
     let quantized_activation =
-        fake_quantize_runtime_activation(activation, scales, signs1, signs2);
+        fake_quantize_runtime_activation(activation, scales, signs1, signs2, candidates, symmetric);
     let mut error2 = 0.0f64;
     let mut signal2 = 0.0f64;
     for (sample, &row) in sampled_rows.iter().enumerate() {
@@ -1260,7 +1460,7 @@ fn w4a4_relative_output_mse(
                 group[i] = row_weights[group_start + i] * scales[group_start + i];
             }
             cpu_fwht_256(&mut group, signs1, signs2);
-            fake_quantize_mq4v2_weight_group(&mut group);
+            fake_quantize_mq4v2_weight_group(&mut group, symmetric);
             for i in 0..256 {
                 output +=
                     (group[i] as f64) * (quantized_activation[group_start + i] as f64);
@@ -1274,11 +1474,12 @@ fn w4a4_relative_output_mse(
     error2 / signal2.max(1e-30)
 }
 
-/// Search the fixed AWQ alpha grid against the actual MQ4V2 × runtime-A4
-/// output objective. The imatrix diagonal supplies a representative per-channel
-/// RMS activation; rows are sampled uniformly to keep the search bounded on
-/// vocab and wide projection matrices.
+/// Search AWQ alpha against the selected A4/W recipe on each eligible tensor.
+/// C2/symmetric runs across the entire model, using the legacy imatrix RMS
+/// statistic where signed QAT producer rows are not captured. The old
+/// c4/asymmetric/RMS search is preserved behind --awq-a4-aware.
 pub(crate) fn compute_a4_aware_awq_scales(
+    name: &str,
     in_sum2: &[f32],
     weights: &[f32],
     m: usize,
@@ -1290,36 +1491,50 @@ pub(crate) fn compute_a4_aware_awq_scales(
     debug_assert_eq!(weights.len(), m * k);
     debug_assert_eq!(k % 256, 0);
 
-    let activation = representative_activation(in_sum2);
-    let sample_count = m.min(128);
+    let captured = signed_awq_rows(name, k);
+    let activations = captured.as_ref().map_or_else(
+        || vec![representative_activation(in_sum2)],
+        |(train, _)| train.clone(),
+    );
+    let sample_count = m.min(if captured.is_some() { 32 } else { 128 });
     let sampled_rows: Vec<usize> = (0..sample_count)
         .map(|sample| sample * m / sample_count)
         .collect();
-    let reference_outputs: Vec<f64> = sampled_rows
+    let reference_outputs: Vec<Vec<f64>> = activations
         .iter()
-        .map(|&row| {
-            weights[row * k..(row + 1) * k]
+        .map(|activation| {
+            sampled_rows
                 .iter()
-                .zip(&activation)
-                .map(|(&w, &x)| (w as f64) * (x as f64))
-                .sum()
+                .map(|&row| {
+                    weights[row * k..(row + 1) * k]
+                        .iter()
+                        .zip(activation)
+                        .map(|(&w, &x)| (w as f64) * (x as f64))
+                        .sum()
+                })
+                .collect()
         })
         .collect();
-
+    let c2_symmetric = AWQ_A4_ROUTE_C2.get().copied().unwrap_or(false);
+    if captured.is_some() {
+        eprintln!("    AWQ capture {}: signed train rows, c2 symmetric", name);
+    } else if c2_symmetric {
+        eprintln!("    AWQ route {}: imatrix RMS statistic, c2 symmetric", name);
+    }
+    let score = |scales: &[f32], rows: &[Vec<f32>], references: &[Vec<f64>]| {
+        rows.iter().zip(references).map(|(activation, reference)| {
+            w4a4_relative_output_mse(
+                weights, m, k, activation, reference, &sampled_rows,
+                scales, signs1, signs2,
+                if c2_symmetric { 2 } else { 4 },
+                c2_symmetric,
+            )
+        }).sum::<f64>() / rows.len() as f64
+    };
     let mut best: Option<A4AwareAwqResult> = None;
     for alpha in AWQ_A4_CANDIDATE_ALPHAS {
         let scales = compute_awq_scales(in_sum2, alpha);
-        let relative_output_mse = w4a4_relative_output_mse(
-            weights,
-            m,
-            k,
-            &activation,
-            &reference_outputs,
-            &sampled_rows,
-            &scales,
-            signs1,
-            signs2,
-        );
+        let relative_output_mse = score(&scales, &activations, &reference_outputs);
         if best
             .as_ref()
             .map_or(true, |current| relative_output_mse < current.relative_output_mse)
@@ -1331,10 +1546,24 @@ pub(crate) fn compute_a4_aware_awq_scales(
             });
         }
     }
-    best.expect("AWQ A4 alpha grid is non-empty")
+    let best = best.expect("AWQ A4 alpha grid is non-empty");
+    if let Some((_, heldout)) = captured {
+        let heldout_reference: Vec<Vec<f64>> = heldout.iter().map(|activation| {
+            sampled_rows.iter().map(|&row| {
+                weights[row * k..(row + 1) * k].iter().zip(activation)
+                    .map(|(&w, &x)| w as f64 * x as f64).sum()
+            }).collect()
+        }).collect();
+        eprintln!(
+            "    AWQ signed heldout {}: alpha={:.2}, relative_output_mse={:.8e}",
+            name, best.alpha, score(&best.scales, &heldout, &heldout_reference)
+        );
+    }
+    best
 }
 
 pub(crate) fn compute_awq_scales_for_weight(
+    name: &str,
     in_sum2: &[f32],
     fallback_alpha: f32,
     weights: &[f32],
@@ -1362,7 +1591,7 @@ pub(crate) fn compute_awq_scales_for_weight(
                 relative_output_mse: f64::NAN,
             };
         }
-        let selected = compute_a4_aware_awq_scales(in_sum2, weights, m, k, signs1, signs2);
+        let selected = compute_a4_aware_awq_scales(name, in_sum2, weights, m, k, signs1, signs2);
         AWQ_A4_ALPHA_BY_ACTIVATION
             .lock()
             .expect("A4 AWQ alpha cache poisoned")
@@ -2227,7 +2456,59 @@ mod block_i4_128_tests {
             0xc8, 0x19, 0xd5, 0x2e, 0x5b, 0x6c, 0xb6, 0xbe, 0x1e, 0x45, 0x63, 0x25, 0x4c,
             0xa6, 0x4a, 0x07, 0xec, 0xa7, 0xec, 0x62,
         ];
-        assert_eq!(fake_quantize_block_i4_128(&input).to_bytes(), expected);
+        assert_eq!(fake_quantize_block_i4_128(&input, 4).to_bytes(), expected);
+        // This block also matched a separate fused c2 gfx1201 kernel dump.
+        assert_eq!(fake_quantize_block_i4_128(&input, 2).to_bytes(), expected);
+    }
+}
+
+#[cfg(test)]
+mod symmetric_awq_writer_tests {
+    use super::fake_quantize_mq4v2_weight_group;
+    use crate::quant_fwht::{cpu_fwht_256, quantize_mq4g256v2_symmetric};
+    use hipfire_quantize::float16::f16_to_f32;
+
+    #[test]
+    fn symmetric_surrogate_decodes_exact_writer_headers_and_codes() {
+        let signs1 = [1.0f32; 256];
+        let signs2 = [1.0f32; 256];
+        for seed in [0u32, 37, 0xffff_ffff] {
+            let mut state = seed;
+            let mut input = [0.0f32; 256];
+            for x in &mut input {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *x = if seed == 0 { 0.0 } else { ((state >> 8) as i32 % 1021) as f32 / 137.0 };
+            }
+            let packed = quantize_mq4g256v2_symmetric(&input, 1, 256, &signs1, &signs2);
+            let mut surrogate = input;
+            cpu_fwht_256(&mut surrogate, &signs1, &signs2);
+            fake_quantize_mq4v2_weight_group(&mut surrogate, true);
+            for (i, &value) in surrogate.iter().enumerate() {
+                let h = i / 128;
+                let scale = f16_to_f32(u16::from_le_bytes(packed[h * 4..h * 4 + 2].try_into().unwrap()));
+                let zero = f16_to_f32(u16::from_le_bytes(packed[h * 4 + 2..h * 4 + 4].try_into().unwrap()));
+                let code_byte = packed[8 + i / 2];
+                let code = if i & 1 == 0 { code_byte & 15 } else { code_byte >> 4 };
+                assert_eq!(value.to_bits(), (code as f32).mul_add(scale, zero).to_bits(),
+                    "writer mismatch seed={seed} index={i}");
+            }
+        }
+    }
+    #[test]
+    fn c2_uses_the_fused_subset_not_the_legacy_four_point_grid() {
+        let mut input = [0.0f32; 128];
+        for (i, value) in input.iter_mut().enumerate() {
+            *value = if i == 0 { 7.0 } else if i & 1 == 0 { 0.53 } else { -0.53 };
+        }
+        let c2 = super::fake_quantize_block_i4_128(&input, 2);
+        let c4 = super::fake_quantize_block_i4_128(&input, 4);
+        assert_ne!(c2.d.to_bits(), c4.d.to_bits(), "c2 must omit the c4-only scales");
+        // Dumped by quantize_block_i4_128_wave<true> on gfx1201 with
+        // IU4_A4_CANDIDATES=2, including the wave-reduced signed sum.
+        let mut expected = [0xf1u8; 72];
+        expected[..8].copy_from_slice(&[0xb7, 0x6d, 0x5b, 0x3f, 0x06, 0, 0, 0]);
+        expected[8] = 0xf7;
+        assert_eq!(c2.to_bytes(), expected);
     }
 }
 
