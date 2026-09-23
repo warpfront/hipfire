@@ -1,3 +1,4 @@
+#define HIPFIRE_FA2_FP8 1
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -102,25 +103,16 @@ typedef float __attribute__((ext_vector_type(2))) fa2_f2_t;
 // (one cvt per byte-pair) then the q8 block scale in f32. KMODE=3 bakes
 // cnorm at fill, so the load is a pure cvt there. One reused f32x2 temp
 // keeps the transient live set small (register budget is the gate).
-//
-// Address construction only: the caller passes key_row_dw = key*64 and an
-// opaque group-local byte coordinate
-//   group_byte = dg*64 + kg*8 + 4*fa2_swiz(ml)
-// established at the start of each executed (dg,sub) group with a
-// dependency on the preceding score state (see QK loop). The byte offset
-//   x = (group_byte + 16*u) & 255
-// reproduces the historical dc*16+kg*8+swizzle expansion (dc = dg*4+u)
-// exactly, including row wrapping, but the two expanded word addresses
-// are rematerialized inside the group and die with it instead of living
-// across the whole KT64 tile. The scale header still uses the original
-// dc = dg*4+u and dc>>1 at the call site.
 __device__ __forceinline__ half8_t fa2_kfrag_fp8(const uint32_t* __restrict__ Kdw8,
-    unsigned key_row_dw, unsigned group_byte, int u, float sf)
+    int key, int dc, int kg, float sf)
 {
-    const unsigned x = (group_byte + 16u * (unsigned)u) & 255u;
-    const unsigned xi = x >> 2;
-    const uint32_t w0 = Kdw8[key_row_dw + xi];
-    const uint32_t w1 = Kdw8[key_row_dw + ((xi + 1u) & 63u)];
+    const int c = key & 15;
+    const int s8 = 32 * (c >> 2) + 4 * (c & 3);
+    const int D = dc * 16 + kg * 8;
+    const int x = (D + s8) & 255;
+    const int w0i = key * 64 + (x >> 2);
+    const uint32_t w0 = Kdw8[w0i];
+    const uint32_t w1 = Kdw8[key * 64 + (((x >> 2) + 1) & 63)];
     half8_t kf;
     // Scheduling barriers between pairs: without them LLVM batches all
     // four decodes ahead of the converts, holding 12 decoded floats live
@@ -549,26 +541,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                         // offset is 32-bit and clamped; OOB fragments get a
                         // zero scale (softmax-masked). Accumulation order
                         // matches the f16 path exactly (u=0..3 into sacc).
-                        // Fully unrolled u=0..3: each step's K addresses
-                        // rematerialize from the group seed above, so only
-                        // one group's addresses are live between steps.
                         const int gk = ktile + key;
                         const bool gkok = gk < seq_len;
                         const unsigned koff = gkok
                             ? (unsigned)gk * (unsigned)row_stride
                             : 0u;
-                        const unsigned key_row_dw = (unsigned)key * 64u;
-                        // Group-local K-address seed: opaque to
-                        // loop-invariant expansion below. The tied asm
-                        // input keeps this group's expanded addresses
-                        // from hoisting above the preceding score state;
-                        // the seed and its addresses die with the group.
-                        unsigned group_byte = (unsigned)dg * 64u
-                            + (unsigned)kg * 8u
-                            + 4u * (unsigned)fa2_swiz(ml);
-                        asm volatile("" : "+v"(group_byte)
-                                         : "v"(sacc0), "v"(sacc1),
-                                           "v"(sacc2), "v"(sacc3));
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
@@ -581,7 +558,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             const float ksf = gkok
                                 ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
                                 : 0.0f;
-                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key, dc, kg, ksf);
                             sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kf, qf, sacc0);
                         }
@@ -620,26 +597,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                         // offset is 32-bit and clamped; OOB fragments get a
                         // zero scale (softmax-masked). Accumulation order
                         // matches the f16 path exactly (u=0..3 into sacc).
-                        // Fully unrolled u=0..3: each step's K addresses
-                        // rematerialize from the group seed above, so only
-                        // one group's addresses are live between steps.
                         const int gk = ktile + key;
                         const bool gkok = gk < seq_len;
                         const unsigned koff = gkok
                             ? (unsigned)gk * (unsigned)row_stride
                             : 0u;
-                        const unsigned key_row_dw = (unsigned)key * 64u;
-                        // Group-local K-address seed: opaque to
-                        // loop-invariant expansion below. The tied asm
-                        // input keeps this group's expanded addresses
-                        // from hoisting above the preceding score state;
-                        // the seed and its addresses die with the group.
-                        unsigned group_byte = (unsigned)dg * 64u
-                            + (unsigned)kg * 8u
-                            + 4u * (unsigned)fa2_swiz(ml);
-                        asm volatile("" : "+v"(group_byte)
-                                         : "v"(sacc0), "v"(sacc1),
-                                           "v"(sacc2), "v"(sacc3));
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
@@ -652,7 +614,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             const float ksf = gkok
                                 ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
                                 : 0.0f;
-                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key, dc, kg, ksf);
                             sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kf, qf, sacc1);
                         }
@@ -691,26 +653,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                         // offset is 32-bit and clamped; OOB fragments get a
                         // zero scale (softmax-masked). Accumulation order
                         // matches the f16 path exactly (u=0..3 into sacc).
-                        // Fully unrolled u=0..3: each step's K addresses
-                        // rematerialize from the group seed above, so only
-                        // one group's addresses are live between steps.
                         const int gk = ktile + key;
                         const bool gkok = gk < seq_len;
                         const unsigned koff = gkok
                             ? (unsigned)gk * (unsigned)row_stride
                             : 0u;
-                        const unsigned key_row_dw = (unsigned)key * 64u;
-                        // Group-local K-address seed: opaque to
-                        // loop-invariant expansion below. The tied asm
-                        // input keeps this group's expanded addresses
-                        // from hoisting above the preceding score state;
-                        // the seed and its addresses die with the group.
-                        unsigned group_byte = (unsigned)dg * 64u
-                            + (unsigned)kg * 8u
-                            + 4u * (unsigned)fa2_swiz(ml);
-                        asm volatile("" : "+v"(group_byte)
-                                         : "v"(sacc0), "v"(sacc1),
-                                           "v"(sacc2), "v"(sacc3));
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
@@ -723,7 +670,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             const float ksf = gkok
                                 ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
                                 : 0.0f;
-                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key, dc, kg, ksf);
                             sacc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kf, qf, sacc2);
                         }
@@ -762,26 +709,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                         // offset is 32-bit and clamped; OOB fragments get a
                         // zero scale (softmax-masked). Accumulation order
                         // matches the f16 path exactly (u=0..3 into sacc).
-                        // Fully unrolled u=0..3: each step's K addresses
-                        // rematerialize from the group seed above, so only
-                        // one group's addresses are live between steps.
                         const int gk = ktile + key;
                         const bool gkok = gk < seq_len;
                         const unsigned koff = gkok
                             ? (unsigned)gk * (unsigned)row_stride
                             : 0u;
-                        const unsigned key_row_dw = (unsigned)key * 64u;
-                        // Group-local K-address seed: opaque to
-                        // loop-invariant expansion below. The tied asm
-                        // input keeps this group's expanded addresses
-                        // from hoisting above the preceding score state;
-                        // the seed and its addresses die with the group.
-                        unsigned group_byte = (unsigned)dg * 64u
-                            + (unsigned)kg * 8u
-                            + 4u * (unsigned)fa2_swiz(ml);
-                        asm volatile("" : "+v"(group_byte)
-                                         : "v"(sacc0), "v"(sacc1),
-                                           "v"(sacc2), "v"(sacc3));
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
@@ -794,7 +726,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             const float ksf = gkok
                                 ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
                                 : 0.0f;
-                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key, dc, kg, ksf);
                             sacc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kf, qf, sacc3);
                         }

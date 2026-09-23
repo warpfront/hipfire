@@ -3553,8 +3553,9 @@ impl Gpu {
     ///
     /// Exact H24/KV4/D256, single-slot Q8 K/V, full causal, eager only.
     /// Grid `[ceil(batch/8), 4, 1]`, block 128 (three 16-row compute waves
-    /// + one helper), dynamic LDS exactly 65,536 B (two swizzled f16
-    /// planes). Production ingress is the opt-in branch in
+    /// + one helper), dynamic LDS exactly 65,536 B f16 (two swizzled f16
+    /// planes), or 32,768 B under the fp8 flag (two e4m3 byte planes).
+    /// Production ingress is the opt-in branch in
     /// [`Self::attention_q8_0_flash_prefill_wmma`]; call this directly
     /// only from the throwaway oracle/bench harness.
     /// `max_ctx_len` is max(positions)+1; the kernel never reads it
@@ -3711,13 +3712,13 @@ impl Gpu {
             batch_size,
             0,
         )?;
-        // U0: keep 65536 dynamic LDS for `_fp8_` too (body plane layout
-        // unchanged). Ua: 32768 once e4m3 planes land.
+        // Ua: e4m3 planes halve LDS to 32768 for `_fp8_` (f16 keeps 65536).
+        let dyn_lds = if use_fp8 { 32768 } else { 65536 };
         let result = self.launch_maybe_blob(
             symbol,
             [grid_x, 4, 1],
             [128, 1, 1],
-            65536, // Ua: 32768
+            dyn_lds,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -3917,12 +3918,13 @@ impl Gpu {
             batch_size,
             1,
         )?;
-        // U0: keep 65536 for `_fp8_` too. Ua: 32768 once e4m3 planes land.
+        // Ua: e4m3 planes halve LDS to 32768 for `_fp8_` (f16 keeps 65536).
+        let dyn_lds = if use_fp8 { 32768 } else { 65536 };
         let result = self.launch_maybe_blob(
             symbol,
             [grid_x, 4, 1],
             [128, 1, 1],
-            65536, // Ua: 32768
+            dyn_lds,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -4390,8 +4392,8 @@ impl Gpu {
     ///
     /// `partials` is caller-owned F32 scratch of at least
     /// `n_splits * batch_size * n_heads * (head_dim + 2)` elements; this
-    /// method never allocates. Partial grid is `[ceil(batch/8), 4,
-    /// n_splits]` (block 128, LDS 65536); merge grid is
+    /// n_splits]` (block 128, LDS 65536, or 32768 under the fp8 flag);
+    /// merge grid is
     /// `[ceil(batch*n_heads/8), 1, 1]` (block 256, LDS 0). No profile
     /// timer: the harness times the whole call with GPU events.
     #[doc(hidden)]
@@ -4541,12 +4543,13 @@ impl Gpu {
             batch_size,
             0,
         )?;
-        // U0: keep 65536 for `_fp8_` partial too. Ua: 32768.
+        // Ua: e4m3 planes halve LDS to 32768 for `_fp8_` (f16 keeps 65536).
+        let dyn_lds = if use_fp8 { 32768 } else { 65536 };
         self.launch_maybe_blob(
             partial,
             [grid_x, 4, n_splits as u32],
             [128, 1, 1],
-            65536, // Ua: 32768
+            dyn_lds,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
