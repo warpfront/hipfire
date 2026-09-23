@@ -1,0 +1,11 @@
+kernel                                                           grid A calls      A ms B calls      B ms
+fused_silu_mul_mq_rotate_awq_i4                             2176x4096     128    120.27       0      0.00
+fused_silu_mul_mq_rotate_awq_i4_hin                         2176x4096       0      0.00     128     66.74
+gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11                   1024x2176       0      0.00     128   1086.58
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11                   1024x1088     256   1071.08       0      0.00
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11                    1024x384      96    146.24      96    147.34
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11                     1024x64      64     18.70      64     18.87
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11                    1024x640      96    244.27      96    247.34
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11                    1024x768      32     97.16      32     97.40
+targeted total (all SET + F1 + producers)                                       1697.72           1664.27  delta -33.45 ms
+kernels A 4492 B 4364; GPU A 3150.77 B 3116.73 ms (delta -34.04); request wall A 3213.85 B 3162.60 ms (delta -51.25)

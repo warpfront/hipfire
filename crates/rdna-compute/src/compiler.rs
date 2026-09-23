@@ -546,7 +546,11 @@ impl KernelCompiler {
         } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
             && matches!(
                 name,
-                "gdn_chunk_prep" | "gdn_chunk_kkt_solve" | "gdn_chunk_scan"
+                "gdn_chunk_prep"
+                    | "gdn_chunk_kkt_solve"
+                    | "gdn_chunk_scan"
+                    | "gdn_chunk_prep_gfx11"
+                    | "gdn_chunk_kkt_solve_gfx1100"
             )
         {
             let mut flags = vec!["-ffp-contract=off".to_owned()];

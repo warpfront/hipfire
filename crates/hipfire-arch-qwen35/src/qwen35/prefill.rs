@@ -63,6 +63,9 @@ fn try_iu4_rmsnorm_prepared(
     emit_f32: bool,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
     if next_linear.gpu_dtype != DType::MQ4G256V2 || !gpu.iu4_producer_sidecar_active(n, k) {
+        // The caller's fallback norms read `x` directly: land any residual
+        // add a folded GEMM left owed to it first.
+        gpu.flush_residual_fold()?;
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
@@ -77,6 +80,53 @@ fn try_iu4_rmsnorm_prepared(
         n,
     )?;
     Ok(Some(prep))
+}
+
+/// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): whether the FFN
+/// norm after an out-projection will take the IU4 RMSNorm route, the fold's
+/// only consumer. When it will, the out-projection arms `pbs.gate_ffn_batch`
+/// as the delta for its residual GEMM: that buffer is dead from the
+/// out-projection until the gate/up GEMM, which runs after the norm.
+fn residual_fold_consumer_ready(
+    gpu: &Gpu,
+    w_gate: &hipfire_runtime::llama::WeightTensor,
+    fusion: DflashFusionCtx,
+    n: usize,
+    dim: usize,
+) -> bool {
+    w_gate.gpu_dtype == DType::MQ4G256V2
+        && gpu.iu4_producer_sidecar_active(n, dim)
+        && !mq_f16_projection_fast_route(gpu, fusion, n, dim)
+}
+
+/// Residual GEMM of an out-projection whose FFN norm follows directly:
+/// offers the fold delta when [`residual_fold_consumer_ready`].
+#[allow(clippy::too_many_arguments)]
+fn out_proj_residual_iu4_prepared(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    w_gate: &hipfire_runtime::llama::WeightTensor,
+    prep: &rdna_compute::Int4MmqPrepared,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> HipResult<()> {
+    let fold = residual_fold_consumer_ready(gpu, w_gate, fusion, n, wo.m);
+    if fold {
+        gpu.arm_residual_fold(&pbs.gate_ffn_batch)?;
+    }
+    let result = gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
+        &wo.buf,
+        prep,
+        &pbs.x_batch,
+        wo.m,
+        wo.k,
+        n,
+    );
+    if fold {
+        gpu.disarm_residual_fold();
+    }
+    result
 }
 
 /// C2: SwiGLU/FWHT IU4 producer for w_down. `None` → incumbent path.
@@ -6722,14 +6772,7 @@ fn batch_chunk_delta_net_output_projection(
         &pbs.dn_normed_batch
     };
     if let Some(prep) = gdn_fused_prep.as_ref().or(iu4_wo_prep.as_ref()) {
-        gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
-            &layer.wo.buf,
-            prep,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
+        out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
     } else if let Some(prep) = &fp8_gdn_prep {
         dispatch_batched_fp8_lloyd_epilogue(
             gpu,
@@ -7209,6 +7252,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
     {
+        gpu.flush_residual_fold()?;
         fused_rmsnorm_rotate_mq_f16_batched_for(
             gpu,
             &pbs.x_batch,
@@ -8551,14 +8595,7 @@ fn batch_chunk_full_attn_output_projection(
         &pbs.fa_attn_out_batch
     };
     if let Some(prep) = &iu4_wo_prep {
-        gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
-            &layer.wo.buf,
-            prep,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
+        out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
     } else if let Some(prep) = &fp8_wo_prep {
         dispatch_batched_fp8_lloyd_epilogue(
             gpu,
@@ -9081,6 +9118,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
     {
+        gpu.flush_residual_fold()?;
         fused_rmsnorm_rotate_mq_f16_batched_for(
             gpu,
             &pbs.x_batch,

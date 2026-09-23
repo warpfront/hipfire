@@ -1,0 +1,7 @@
+Wed Sep 23 08:24:23 AM UTC 2026
+GPU[0]		: dcefclk clock level: 0: (145Mhz)
+GPU[0]		: fclk clock level: 0: (601Mhz)
+GPU[0]		: mclk clock level: 0: (96Mhz)
+GPU[0]		: sclk clock level: 1: (2312Mhz)
+GPU[0]		: socclk clock level: 0: (500Mhz)
+GPU[0]		: pcie clock level: 2 (16.0GT/s x4)

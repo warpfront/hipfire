@@ -1,0 +1,15 @@
+device gfx1151, 20 MPs
+time rev add_k6144  norm:fold       2.875 ms
+time rev add_k6144  norm:base       1.304 ms
+time rev add_k6144  add:prodadd     9.604 ms
+time rev add_k6144  add:prod        9.023 ms
+time rev add_k6144  set:base        6.923 ms
+time rev add_k6144  add:base        9.605 ms
+summary rev add_k6144 add+norm 10.909  set+foldnorm 9.798  fold saves 1.111 ms (10.19%)
+time rev add_k17408 norm:fold       2.885 ms
+time rev add_k17408 norm:base       1.295 ms
+time rev add_k17408 add:prodadd    20.859 ms
+time rev add_k17408 add:prod       20.177 ms
+time rev add_k17408 set:base       19.058 ms
+time rev add_k17408 add:base       20.903 ms
+summary rev add_k17408 add+norm 22.198  set+foldnorm 21.943  fold saves 0.256 ms (1.15%)

@@ -1,0 +1,28 @@
+gpu_ms A 7868.408 B 7761.585 delta -106.823 (-1.36%)
+wall_ms A 7918.923 B 7810.555 delta -108.368 (-1.37%)
+pp8192 t/s (wall) A 1034.5 B 1048.8
+per-symbol (B - A), |delta| >= 0.5 ms:
+  -2007.316 gemm_mq4g256v2_residual_iu4_v2b_add_gfx11            A  128  2007.316  B    0     0.000
+  +1348.660 gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11      A    0     0.000  B   64  1348.660
+   +454.146 gemm_mq4g256v2_residual_iu4_v2b_set_gfx11            A  144  1202.843  B  208  1656.989
+   +173.474 fused_rmsnorm_mq_rotate_awq_i4_fold                  A    0     0.000  B   64   173.474
+    -73.583 fused_rmsnorm_mq_rotate_awq_i4                       A  128   150.125  B   64    76.542
+     -1.706 fused_silu_mul_mq_rotate_awq_i4_hin                  A   64   192.611  B   64   190.905
+     +1.528 gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11            A   64  2601.017  B   64  2602.546
+     -1.463 gated_norm_mq_rotate_awq_i4_gfx11                    A   48   116.751  B   48   115.288
+     -1.404 gdn_chunk_prep                                       A   48   155.911  B   48   154.507
+     +0.974 gdn_chunk_kkt_solve                                  A  768    36.233  B  768    37.207
+     -0.559 deinterleave_q_rmsnorm_f32_batched                   A   16    57.001  B   16    56.441
+V2B / IU4 RMSNorm populations (K17408 ADD > 12 ms):
+  A fused_rmsnorm_mq_rotate_awq_i4                             n=128 sum=  150.125 mean=  1.173
+  A gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11                  n= 64 sum= 2601.017 mean= 40.641
+  A gemm_mq4g256v2_residual_iu4_v2b_add_gfx11 big              n= 64 sum= 1394.867 mean= 21.795
+  A gemm_mq4g256v2_residual_iu4_v2b_add_gfx11 small            n= 64 sum=  612.449 mean=  9.570
+  A gemm_mq4g256v2_residual_iu4_v2b_set_gfx11 big              n= 39 sum=  507.205 mean= 13.005
+  A gemm_mq4g256v2_residual_iu4_v2b_set_gfx11 small            n=105 sum=  695.637 mean=  6.625
+  B fused_rmsnorm_mq_rotate_awq_i4                             n= 64 sum=   76.542 mean=  1.196
+  B fused_rmsnorm_mq_rotate_awq_i4_fold                        n= 64 sum=  173.474 mean=  2.711
+  B gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11                  n= 64 sum= 2602.546 mean= 40.665
+  B gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11 big        n= 64 sum= 1348.660 mean= 21.073
+  B gemm_mq4g256v2_residual_iu4_v2b_set_gfx11 big              n= 52 sum=  667.151 mean= 12.830
+  B gemm_mq4g256v2_residual_iu4_v2b_set_gfx11 small            n=156 sum=  989.838 mean=  6.345

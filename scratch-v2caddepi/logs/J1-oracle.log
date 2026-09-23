@@ -1,0 +1,8 @@
+device gfx1100, 48 MPs
+oracle add_k6144  ADD touchjit outputs 41943040 differing 0
+oracle add_k6144  ADD l64d16   outputs 41943040 differing 0
+oracle add_k6144  FOLD residual outputs 41943040 differing 0; block_i4_128 bytes 23592960 differing 0
+oracle add_k17408 ADD touchjit outputs 41943040 differing 0
+oracle add_k17408 ADD l64d16   outputs 41943040 differing 0
+oracle add_k17408 FOLD residual outputs 41943040 differing 0; block_i4_128 bytes 23592960 differing 0
+oracle total compared 298844160 differing 0 -> PASS

@@ -1,0 +1,286 @@
+{
+  "arch": "gfx1151",
+  "length": "8192-B",
+  "kernel_count": 4593,
+  "warm_count": 4403,
+  "total_trace_count": 9460,
+  "gpu_ms": 7761.585018,
+  "wall_ms": 7810.554783,
+  "warm_ms": 53109.652439,
+  "first_after_start_ms": 13.242102,
+  "last_before_end_ms": 1.410472,
+  "sum_by_symbol": [
+    {
+      "name": "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11",
+      "calls": 64,
+      "ms": 2602.54557,
+      "pct": 33.53110948297803
+    },
+    {
+      "name": "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11",
+      "calls": 208,
+      "ms": 1656.988635,
+      "pct": 21.348585774133177
+    },
+    {
+      "name": "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11",
+      "calls": 64,
+      "ms": 1348.659623,
+      "pct": 17.376085166525968
+    },
+    {
+      "name": "attention_q8_0_fa2_gqa_gfx11",
+      "calls": 256,
+      "ms": 836.175195,
+      "pct": 10.773253054122508
+    },
+    {
+      "name": "gdn_chunk_scan",
+      "calls": 768,
+      "ms": 241.010746,
+      "pct": 3.1051743354104686
+    },
+    {
+      "name": "fused_silu_mul_mq_rotate_awq_i4_hin",
+      "calls": 64,
+      "ms": 190.904899,
+      "pct": 2.45961228998033
+    },
+    {
+      "name": "fused_rmsnorm_mq_rotate_awq_i4_fold",
+      "calls": 64,
+      "ms": 173.473524,
+      "pct": 2.235027041483088
+    },
+    {
+      "name": "gdn_chunk_prep",
+      "calls": 48,
+      "ms": 154.50723,
+      "pct": 1.9906659482783495
+    },
+    {
+      "name": "gated_norm_mq_rotate_awq_i4_gfx11",
+      "calls": 48,
+      "ms": 115.287917,
+      "pct": 1.4853656402994257
+    },
+    {
+      "name": "split_mq4v2_z_betaalpha",
+      "calls": 48,
+      "ms": 97.298722,
+      "pct": 1.2535934577068109
+    },
+    {
+      "name": "fused_rmsnorm_mq_rotate_awq_i4",
+      "calls": 64,
+      "ms": 76.541882,
+      "pct": 0.9861630301348328
+    },
+    {
+      "name": "deinterleave_q_rmsnorm_f32_batched",
+      "calls": 16,
+      "ms": 56.441225,
+      "pct": 0.7271868422378466
+    },
+    {
+      "name": "gdn_chunk_kkt_solve",
+      "calls": 768,
+      "ms": 37.207379,
+      "pct": 0.4793786180749402
+    },
+    {
+      "name": "rope_partial_halfsplit_batched_f32",
+      "calls": 16,
+      "ms": 36.182071,
+      "pct": 0.466168584330258
+    },
+    {
+      "name": "sigmoid_mul_rotate_x_mq_awq_i4_gfx11",
+      "calls": 16,
+      "ms": 30.761527,
+      "pct": 0.3963304779714519
+    },
+    {
+      "name": "fused_gate_up_mq4g256v2",
+      "calls": 64,
+      "ms": 27.627547,
+      "pct": 0.355952385188445
+    },
+    {
+      "name": "attention_fa2_q_preconvert_gfx11",
+      "calls": 256,
+      "ms": 21.050913,
+      "pct": 0.2712192542010496
+    },
+    {
+      "name": "gemv_mq4g256v2_residual_row_serial_gfx1151",
+      "calls": 128,
+      "ms": 18.800502,
+      "pct": 0.24222503465979556
+    },
+    {
+      "name": "fused_qkvza_mq4g256v2",
+      "calls": 48,
+      "ms": 9.718348,
+      "pct": 0.12521086836595932
+    },
+    {
+      "name": "kv_cache_write_q8_0_batched",
+      "calls": 512,
+      "ms": 7.696477,
+      "pct": 0.09916115048860501
+    },
+    {
+      "name": "gemv_mq4g256v2_multirow_r2",
+      "calls": 2,
+      "ms": 6.003555,
+      "pct": 0.07734960044987038
+    },
+    {
+      "name": "rmsnorm_f32",
+      "calls": 50,
+      "ms": 4.850881,
+      "pct": 0.06249858745024701
+    },
+    {
+      "name": "attention_flash_q8_0_tile",
+      "calls": 16,
+      "ms": 2.837628,
+      "pct": 0.03655990359468095
+    },
+    {
+      "name": "fused_qkv_mq4g256v2",
+      "calls": 16,
+      "ms": 2.768622,
+      "pct": 0.03567083261446277
+    },
+    {
+      "name": "gated_delta_net_q8_fast",
+      "calls": 48,
+      "ms": 1.348284,
+      "pct": 0.0173712456524431
+    },
+    {
+      "name": "__amd_rocclr_copyBuffer",
+      "calls": 197,
+      "ms": 1.198237,
+      "pct": 0.015438045157286197
+    },
+    {
+      "name": "fused_rmsnorm_mq_rotate_awq",
+      "calls": 128,
+      "ms": 0.870743,
+      "pct": 0.011218623489669285
+    },
+    {
+      "name": "embedding_q8_batched",
+      "calls": 1,
+      "ms": 0.825706,
+      "pct": 0.010638368298293373
+    },
+    {
+      "name": "__amd_rocclr_fillBufferUnAligned",
+      "calls": 192,
+      "ms": 0.748531,
+      "pct": 0.009644048197166832
+    },
+    {
+      "name": "attention_flash_q8_0_reduce",
+      "calls": 16,
+      "ms": 0.23937,
+      "pct": 0.0030840350191987036
+    },
+    {
+      "name": "fused_silu_mul_mq_rotate_awq",
+      "calls": 64,
+      "ms": 0.164988,
+      "pct": 0.002125699836017695
+    },
+    {
+      "name": "gated_norm_f32",
+      "calls": 48,
+      "ms": 0.144834,
+      "pct": 0.0018660363787050384
+    },
+    {
+      "name": "conv1d_silu_split_qknorm_b256",
+      "calls": 48,
+      "ms": 0.142784,
+      "pct": 0.00183962424773893
+    },
+    {
+      "name": "rotate_x_mq_awq",
+      "calls": 64,
+      "ms": 0.112411,
+      "pct": 0.0014482995385518046
+    },
+    {
+      "name": "fused_sigmoid_alpha_gate_f32",
+      "calls": 48,
+      "ms": 0.08468,
+      "pct": 0.0010910142683951466
+    },
+    {
+      "name": "repeat_interleave_qk_f32",
+      "calls": 48,
+      "ms": 0.075259,
+      "pct": 0.0009696344216479728
+    },
+    {
+      "name": "rope_partial_halfsplit_f32",
+      "calls": 16,
+      "ms": 0.071014,
+      "pct": 0.0009149419845986412
+    },
+    {
+      "name": "sample_topk_partial_fast21",
+      "calls": 2,
+      "ms": 0.060112,
+      "pct": 0.0007744809837242448
+    },
+    {
+      "name": "kv_cache_write_q8_0",
+      "calls": 32,
+      "ms": 0.058826,
+      "pct": 0.0007579122030303836
+    },
+    {
+      "name": "sample_topk_finalize_fast21",
+      "calls": 2,
+      "ms": 0.031338,
+      "pct": 0.00040375773669068375
+    },
+    {
+      "name": "embedding_q8",
+      "calls": 1,
+      "ms": 0.022883,
+      "pct": 0.0002948238014133932
+    },
+    {
+      "name": "deinterleave_f32",
+      "calls": 16,
+      "ms": 0.022801,
+      "pct": 0.0002937673161747489
+    },
+    {
+      "name": "sigmoid_mul_f32",
+      "calls": 16,
+      "ms": 0.018153,
+      "pct": 0.00023388264069647017
+    },
+    {
+      "name": "mq_rotate_x",
+      "calls": 2,
+      "ms": 0.003446,
+      "pct": 4.4398147955711794e-05
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 8192,
+    "completion_tokens": 1,
+    "total_tokens": 8193,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

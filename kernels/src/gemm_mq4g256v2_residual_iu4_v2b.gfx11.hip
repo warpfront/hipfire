@@ -45,6 +45,16 @@
 // entry, and the epilogue stores h = SILU_MUL(g, u) to Y [N][M], spelled as in
 // fused_silu_mul_mq_rotate_awq.hip, so the h-producer
 // (`fused_silu_mul_mq_rotate_awq_i4_hin`) reproduces that producer bit-for-bit.
+//
+// ADD_TOUCH (the `_add_touch` entry): the ADD epilogue's residual read is
+// the Halo limiter (all CTAs of a round hit DRAM together after the K loop).
+// Starting TOUCH_LEAD epochs before the end, each thread loads one dword of
+// one 64-byte line of its tile's residual per epoch (256 tokens x 1 KiB =
+// 4096 lines, eight per thread, so epochs E-16..E-9) ahead of the staging
+// packet; the staging wait retires them and the values are only
+// xor-consumed, so the epilogue reads the residual from the memory-side
+// cache instead of DRAM. Screened on Halo: touching over the last 8 epochs
+// or at kernel start is slower. Output bytes are identical to `_add`.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -137,12 +147,20 @@ static __device__ __forceinline__ void stage_store(const Stage& st, char* slot,
 
 enum { EPI_SET = 0, EPI_ADD = 1, EPI_SILU = 2 };
 
-template <int EPI>
+// Residual touch: one dword per TOUCH_LINE bytes, one line per thread per
+// epoch, starting TOUCH_LEAD epochs before the end of the K loop.
+constexpr int TOUCH_LEAD = 16;
+constexpr int TOUCH_LINE = 64;
+constexpr int TOUCH_LINES = TN * TM * 4 / TOUCH_LINE / NT;  // per thread
+static_assert(TOUCH_LINES == 8 && TOUCH_LINES <= TOUCH_LEAD, "touch schedule");
+
+template <int EPI, bool TOUCH = false>
 static __device__ __forceinline__ void body(
     const char* __restrict__ A, const char* __restrict__ U, const char* __restrict__ Xq,
     float* __restrict__ Y, int M, int K, int N) {
     constexpr bool IS_ADD = EPI == EPI_ADD;
     constexpr bool SILU = EPI == EPI_SILU;
+    static_assert(IS_ADD || !TOUCH, "touch is an ADD epilogue lever");
     extern __shared__ __attribute__((aligned(16))) char lds[];
     const int lane = threadIdx.x;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.y);
@@ -209,6 +227,9 @@ static __device__ __forceinline__ void body(
 #pragma unroll
             for (int j = 0; j < 8; ++j) sum[a][c][j] = 0;
 
+    // Residual touch accumulator (TOUCH only).
+    uint32_t touch_acc = 0;
+
     Stage st;
     stage_load(st, gS + a_epoch(0), gX, a_off, x_off);
     stage_store(st, lds, lds_off);
@@ -237,6 +258,19 @@ static __device__ __forceinline__ void body(
         for (int c = 0; c < NC; ++c)
             dc[c] = *at<float>(xs_e, lxs + (uint32_t)(16 * c * XBLK_BYTES));
         IU4_V2B_FENCE();  // metadata requests precede the staging packet
+        // Touch loads ride ahead of the staging packet, whose wait retires
+        // them (in-order vmcnt); consumed only after that wait.
+        uint32_t touch_v = 0;
+        if constexpr (TOUCH) {
+            const int touch_i = e - (E - TOUCH_LEAD);
+            if (touch_i >= 0 && touch_i < TOUCH_LINES) {
+                // Line l = tid + NT*i of the tile's residual; 16 lines per
+                // 1 KiB token row.
+                const uint32_t l = (uint32_t)(wave * 32 + lane) + (uint32_t)NT * (uint32_t)touch_i;
+                touch_v = *(const uint32_t*)((const char*)(Y + (size_t)col0 * M + row0) +
+                                             ((size_t)(l >> 4) * M * 4 + (l & 15) * TOUCH_LINE));
+            }
+        }
         if constexpr (nxt) {
             const int en = e + 1;
             stage_load(st, gS + a_epoch(en), gX + (size_t)en * x_epoch, a_off, x_off);
@@ -307,6 +341,7 @@ static __device__ __forceinline__ void body(
             IU4_V2B_FENCE();
         }
         if constexpr (nxt) stage_store(st, lds + ((e + 1) & 1) * SLOT_BYTES, lds_off);
+        if constexpr (TOUCH) touch_acc ^= touch_v;
         __syncthreads();
     };
     for (int e = 0; e + 1 < E; ++e) epoch(std::true_type{}, e);
@@ -376,18 +411,20 @@ static __device__ __forceinline__ void body(
             }
         }
     }
+    if constexpr (TOUCH) asm volatile("" ::"v"(touch_acc));
 }
 
 }  // namespace iu4_v2b
 
-#define IU4_V2B_ENTRY(name, epi)                                              \
+#define IU4_V2B_ENTRY(name, epi, touch)                                       \
     extern "C" __global__ __launch_bounds__(iu4_v2b::NT, 1) void name(        \
         const char* __restrict__ A, const char* __restrict__ Xq,              \
         float* __restrict__ Y, int M, int K, int N) {                         \
-        iu4_v2b::body<epi>(A, nullptr, Xq, Y, M, K, N);                       \
+        iu4_v2b::body<epi, touch>(A, nullptr, Xq, Y, M, K, N);                \
     }
-IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_set_gfx11, iu4_v2b::EPI_SET)
-IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_add_gfx11, iu4_v2b::EPI_ADD)
+IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_set_gfx11, iu4_v2b::EPI_SET, false)
+IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_add_gfx11, iu4_v2b::EPI_ADD, false)
+IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11, iu4_v2b::EPI_ADD, true)
 #undef IU4_V2B_ENTRY
 // F1-lite: G/U = gate/up MQ4V2 rows (M each), Y = h [N][M]; grid (N/256, 2M/256).
 extern "C" __global__ __launch_bounds__(iu4_v2b::NT, 1) void

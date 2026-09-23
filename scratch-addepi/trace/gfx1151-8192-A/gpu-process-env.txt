@@ -1,0 +1,2 @@
+parent pid=2096162 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-addepi-stack/scratch-addepi/trace/gfx1151-8192-A/home
+daemon pid=2096183 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0

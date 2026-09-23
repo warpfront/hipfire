@@ -633,6 +633,24 @@ pub struct MmqScreenState {
     pub threshold: f32,
 }
 
+/// Delta buffer offered to the next residual GEMM by [`Gpu::arm_residual_fold`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidualFoldArm {
+    pub delta: *mut c_void,
+    /// Capacity of `delta` in f32 elements.
+    pub len: usize,
+}
+
+/// A residual add deferred by the gfx1151 V2B GEMM: `y[n][m] += delta[n][m]`
+/// is owed, and the next IU4 RMSNorm over `y` performs it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidualFold {
+    pub y: *mut c_void,
+    pub delta: *mut c_void,
+    pub m: usize,
+    pub n: usize,
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 ///
 /// Tape completeness invariant: for any body executed via `Gpu`,
@@ -676,6 +694,12 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
+    /// armed by the caller for the next residual GEMM, and the deferred add
+    /// that GEMM left for the following IU4 RMSNorm. See
+    /// [`Gpu::arm_residual_fold`].
+    pub(crate) residual_fold_arm: Option<ResidualFoldArm>,
+    pub(crate) residual_fold_pending: Option<ResidualFold>,
 
     /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
     /// individual attention families still decide whether a capability cell is
@@ -1388,6 +1412,8 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            residual_fold_arm: None,
+            residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]
