@@ -161,6 +161,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | gfx1201 batched-prefill GDN preamble fusion (sigmoid+conv+qknorm 3→1, byte-exact) — default ON on exact gfx1201 (`kernel.gfx12_gdn_pre_fused`); `=0` restores the 3-launch sequence |
 | `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default ON on exact gfx1201 (`kernel.gfx12_fp8_stream`); `=0` opts out; other arches off |
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung) |
+| `HIPFIRE_PREFILL_COMMIT_ROWS` | Developer override for widened-prefill DeltaNet state and KV-write commit stride (`prefill.commit_rows`; default 512). Must be a power-of-two multiple of 128 in `[128, effective chunk rows]`; invalid values refuse widening. Chunk rungs are `stride × 2^k` up to the chunk ceiling. |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -884,6 +885,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PREFILL_BLOCK` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-runtime/examples/ep_decode_parity.rs |
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_PREFILL_COMMIT_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_PREFILL_COMPRESSION` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_DRAFTER` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_KEEP_RATIO` | crates/hipfire-arch-qwen35/src/pflash.rs |

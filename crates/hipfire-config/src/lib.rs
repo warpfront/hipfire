@@ -1921,6 +1921,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PREFILL_CHUNK_ROWS",
         "Widened ordinary-prefill chunk ceiling in rows (default 4096 on exact gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH stays the explicit override; per-device VRAM admission may still select a smaller rung)."
     ),
+    process_field!(
+        "prefill.commit_rows",
+        "prefill_commit_rows",
+        Kernel,
+        DefaultValue::Integer(512),
+        ValueRule::Integer { min: 128, max: 1048576 },
+        true,
+        "HIPFIRE_PREFILL_COMMIT_ROWS",
+        "Developer override for widened-prefill DeltaNet state and KV-write commit rows; runtime requires a power-of-two multiple of 128 no larger than the effective chunk ceiling."
+    ),
     process_bool_field!(
         "speculation.draft_f16",
         "draft_f16",
