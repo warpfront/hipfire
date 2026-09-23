@@ -1,0 +1,35 @@
+# Slice 3 results
+
+- T512 scan+Q8+EF median: 163.161 us
+- T512 scan+Q8+EF p10: 154.641 us
+- T512 scan+Q8+EF p90: 164.082 us
+- CPU-f64 output NRMSE: 0.0102289195
+- CPU-f64 output max |delta|: 1.19640002e-05
+- CPU-f64 state NRMSE: 0.0110477216
+- CPU-f64 state max |delta|: 8.41148035e-05
+- output nonfinite: 0
+- state nonfinite: 0
+- maximum real-fixture C64 gate span: 4.16899347
+- isolated Q8 code byte mismatches: 0
+- isolated scale byte mismatches: 0
+- isolated EF byte mismatches: 0
+- Q8-edge versus F32-edge output bit mismatches: 0
+- LDS: 60928 B
+- VGPR: 189
+- SGPR: 59
+- scratch: 0 B/lane
+- VGPR spills: 0
+- SGPR spills: 0
+- block: 256 threads
+- workgroup processor mode: CU
+- T129 output NRMSE: 0.0103237202
+- T129 output max |delta|: 1.60406422e-05
+- T129 state NRMSE: 0.00829515801
+- T129 state max |delta|: 6.25202091e-05
+- T129 output nonfinite: 0
+- T129 state nonfinite: 0
+- T129 isolated Q8 code/scale/EF byte mismatches: 0/0/0
+- T129 Q8-edge versus F32-edge output bit mismatches: 0
+- T129 scan+Q8+EF median: 64.801 us
+
+- Main override: accepted BF16 operand error and 163.161 us scan; proceed to host integration and KLD.

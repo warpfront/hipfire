@@ -1,0 +1,9 @@
+lds_bytes=0
+private_segment_bytes=0
+vgpr=70
+sgpr=34
+vgpr_spills=0
+sgpr_spills=0
+block_threads=256
+wavefront=32
+workgroup_processor_mode=1

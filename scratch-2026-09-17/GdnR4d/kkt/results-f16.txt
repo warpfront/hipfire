@@ -1,0 +1,5 @@
+A_nrmse=5.36163358e-05 A_max_abs=0.000202981221 inverse_residual_inf=0.000207708103 A_nonfinite=0 padded_identity_bad=0
+scan_output_nrmse=3.38515006e-05 scan_output_max_abs=4.86337962e-08 scan_output_nonfinite=0
+scan_state_nrmse=6.44754241e-05 scan_state_max_abs=3.94835471e-07 scan_state_nonfinite=0
+kkt_median_us=24.680 kkt_p10_us=24.520 kkt_p90_us=26.360
+T129_padded_identity_bad=0 T129_nonfinite=0

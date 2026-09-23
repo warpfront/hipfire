@@ -1,0 +1,15 @@
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "gpu_arch": "gfx1201",
+  "kv_mode": "fp8",
+  "runs": 3,
+  "recovered_from_completed_stdout_after_initial_tee_path_error": true,
+  "prefill": [
+    {"tokens": 512, "median": 2386.8, "samples": [2379.3, 2387.5, 2386.8]},
+    {"tokens": 2048, "median": 2477.1, "samples": [2468.9, 2477.1, 2479.7]},
+    {"tokens": 8192, "median": 2408.1, "samples": [2407.3, 2408.9, 2408.1]},
+    {"tokens": 32768, "median": 2068.3, "samples": [2070.5, 2068.3, 2068.3]}
+  ],
+  "decode": [{"context": 128, "tokens": 64, "median": 36.44401735042494, "samples": [36.44401735042494, 36.442642335028914, 36.44787942421872]}]
+}

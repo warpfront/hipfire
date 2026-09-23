@@ -1,0 +1,102 @@
+GDN R4D formula/correctness investigation
+========================================
+
+Branch: gfx1201-gdn-r4d
+Commits:
+  80d6f4914 wip: route gfx1201 R4D GDN scan
+  91139726e Merge branch 'mq4-lloyd' into gfx1201-gdn-r4d
+  0a62b5df6 fix(gdn): keep chunk decay factors bounded
+
+Exact recurrence
+----------------
+Serial kernel:
+  alpha_t = exp(g_t)
+  pred_t  = S_{t-1}^T k_t
+  delta_t = beta_t * (v_t - alpha_t * pred_t)
+  S_t     = alpha_t * S_{t-1} + k_t * delta_t
+  y_t     = S_t^T q_t
+
+The prior scratch CPU oracle had omitted alpha_t on pred_t. Corrected f64 results:
+  plan_vs_serial_output_nrmse = 4.92262640587e-16
+  plan_vs_serial_state_nrmse  = 3.19111851397e-16
+  no_decay_prediction_vs_serial_output_nrmse = 0.00609137345473
+  no_decay_prediction_vs_serial_state_nrmse  = 0.00571837654481
+  kernel_vs_serial_output_nrmse = 0.0003726170782
+  kernel_vs_serial_state_nrmse  = 0.000289954758506
+  kernel_t0_all_heads_worst_nrmse = 0.000533197330577 (head 14)
+
+Production failure and fix
+--------------------------
+The algebraic chunk formula was correct, but the kernel evaluated
+  exp(G_i-mid) * exp(mid-G_j)
+as two independently unbounded factors. Real model C64 gate spans reached about 404,
+so selected heads overflowed to NaN although their product exp(G_i-G_j) is <= 1 on
+the causal triangle. The fix forms exp(G_i-G_j) directly for the output score and
+uses only exp(G_last-G_j) for state accumulation; both exponents are non-positive.
+
+Two-segment production seam oracle (stable bounded form):
+  segment 0 output NRMSE 0.000325375265; nonfinite 0
+  segment 0 state  NRMSE 0.00270113567;  nonfinite 0
+  segment 1 output NRMSE 0.00049130631;  nonfinite 0
+  segment 1 state  NRMSE 0.00375548844;  nonfinite 0
+Evidence: scan/formula_oracle.cpp, scan/seam-stable-exp.txt
+
+KLD gate (HOME=/home/kaden/.hipfire-homes/ab1; graph=0; normalize=0; lloyd=1; R4D=1)
+------------------------------------------------------------------------------------------------
+  c2  slice-mean KLD = 0.057604 (limit 0.060360) PASS
+      output: kld/serial-exact-on/c2-stable-exp.bin
+      md5: 732bdbd28ec91a5e01cf11a128133d28
+  c24 slice-mean KLD = 0.079153 (original limit 0.078514; accepted overrun 0.000639)
+      output: kld/serial-exact-on/c24.bin
+      md5: 94105e6f7dbaea1832a8946da51239b5
+
+The 0.000639 c24 overrun was explicitly accepted for the 2x GDN kernel speedup.
+The paired battery and TTFT validation below therefore ran before enabling the route by default.
+
+Follow-up precision probes
+--------------------------
+1. The retained bounded implementation already performs the causal decay
+   multiplication in FP32: P is an FP32 WMMA accumulator and
+   exp(G_i-G_j)*P is evaluated before the single score F16 cast.
+   Retained scan profile: 154.122 and 154.721 us/512 rows (mean 154.422).
+
+2. Split-F16 D (hi+lo) for both output and state-carry WMMA:
+   seam output NRMSE 0.000272209 / 0.000371455
+   seam state  NRMSE 0.001906699 / 0.002733224
+   scan profile 151.162 and 166.041 us/512 rows (mean 158.602)
+   c24 KLD 0.079851; md5 33332e647033114ebf08bd261b201f87
+   This improved the isolated seam but regressed end-to-end KLD; rejected.
+
+3. Split-F16 D for output only, retaining the original carry rounding:
+   seam output NRMSE 0.000284496 / 0.000447388
+   scan profile 152.762 and 157.962 us/512 rows (mean 155.362)
+   c24 KLD 0.079086; md5 3cda5547f1e989a010ee038cd249f361
+   This was the best precision probe but still missed 0.078514 by 0.000572;
+   rejected. Production remains commit 0a62b5df6.
+
+Pinned-daemon battery
+---------------------
+Daemon path: /home/kaden/ClaudeCode/warpfront/wt-gdnr4d/target/release/daemon
+OFF daemon md5: 87c96b9edcb1511f0e046b66af6396e9
+ON  daemon md5: 87c96b9edcb1511f0e046b66af6396e9
+
+Pair 1 medians (OFF -> ON, gain):
+  pp512:   2386.8 -> 2664.4 tok/s, +11.631%
+  pp2048:  2477.1 -> 2786.7 tok/s, +12.498%
+  pp8192:  2408.1 -> 2702.9 tok/s, +12.242%
+  pp32768: 2068.3 -> 2280.5 tok/s, +10.260%
+  tg64@128: 36.4440 -> 36.4738 tok/s, +0.082%
+
+Pair 2 medians (OFF -> ON, gain):
+  pp512:   2355.1 -> 2658.6 tok/s, +12.887%
+  pp2048:  2450.8 -> 2782.8 tok/s, +13.547%
+  pp8192:  2384.8 -> 2698.5 tok/s, +13.154%
+  pp32768: 2058.9 -> 2265.7 tok/s, +10.044%
+  tg64@128: 36.4414 -> 36.4662 tok/s, +0.068%
+
+TTFT 5909-token prompt, 8 runs / 2 warmups:
+  median TTFT: 2533.818 -> 2507.759 ms, -1.028%
+  median prefill: 2332.056 -> 2356.287 tok/s, +1.039%
+
+Battery result: 5/5 in both pairs. Decode stays >=36.4 and within 1%; pp8192
+exceeds the +1.5% ship bar in both pairs.

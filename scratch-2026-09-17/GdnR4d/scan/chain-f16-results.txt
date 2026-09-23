@@ -1,0 +1,4 @@
+f64_output_nrmse=0.00992747781 f64_output_max_abs=1.23106878e-05 f64_output_nonfinite=0
+f64_state_nrmse=0.0108503338 f64_state_max_abs=8.74402809e-05 f64_state_nonfinite=0
+max_midpoint_span=4.16899347 edge_output_nonfinite=0 edge_state_nonfinite=0
+commit_code_bad=2 commit_scale_bad=1 commit_ef_bad=112 q8_vs_edge_output_bit_bad=4012

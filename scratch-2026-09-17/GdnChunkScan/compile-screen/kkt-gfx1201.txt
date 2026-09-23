@@ -1,0 +1,11 @@
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark: Function Name: gdn_chunk_kkt_solve [-Rpass-analysis=kernel-resource-usage]
+  122 |     int T) {
+      | ^
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     TotalSGPRs: 27 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     VGPRs: 101 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     Occupancy [waves/SIMD]: 11 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip:122:1: remark:     LDS Size [bytes/block]: 11520 [-Rpass-analysis=kernel-resource-usage]

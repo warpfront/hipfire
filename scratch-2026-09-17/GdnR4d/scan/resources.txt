@@ -1,0 +1,10 @@
+lds_bytes=60928
+private_segment_bytes=0
+vgpr=189
+sgpr=59
+vgpr_spills=0
+sgpr_spills=0
+block_threads=256
+wavefront=32
+workgroup_processor_mode=0
+intentional_one_resident_geometry=1

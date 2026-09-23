@@ -1,0 +1,15 @@
+T512_A_nrmse=0.000427765459
+T512_A_max_abs=0.00135327773
+T512_inverse_residual_inf=0.00136170857
+T512_A_nonfinite=0
+T512_scan_output_nrmse=0.000260690645
+T512_scan_output_max_abs=3.35451172e-07
+T512_scan_output_nonfinite=0
+T512_scan_state_nrmse=0.000444959427
+T512_scan_state_max_abs=2.65687607e-06
+T512_scan_state_nonfinite=0
+T512_kkt_median_us=29.880
+T512_kkt_p10_us=29.641
+T512_kkt_p90_us=30.520
+T129_padded_identity_bad=0
+T129_nonfinite=0
