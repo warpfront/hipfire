@@ -1,0 +1,12 @@
+Vfill gate-3 fill census (static disassembly, KMODE8+FP8 route-N direct kernel
+attention_fp8_e4m3_fa2_gqa_gfx1201; base = f376b528f, new = wt-vfill):
+- base V fill (rolled 16x/lane): 8x global_load_u8 (u8+d16 variants: 11+2+2
+  static incl. edge path) + 1x ds_store_b64 per fragment.
+- new V fill (rolled 16x/lane): 1x global_load_b64 + 1x ds_store_b64 per
+  fragment (u8-family static 11+2+2 -> 5+1+1, b64 4 -> 5).
+- Dynamic per lane per KT64 tile: 16 fragments x (8+1 mem + ~35 addr/math)
+  ~= 730 packets (given baseline) -> 16 x (1+1 mem + ~6 addr/math) ~= 130
+  worst case, ~110 steady-state (fast path straight-line, edge predicated).
+  Target V <= ~120: MET (fast path; edge tiles add the predicated byte loop).
+- Whole-kernel: 1348 -> 1279 insns (-69); VGPR 190/191 unchanged, 0 spill.
+- K fill untouched (1x b128 + 2x ds b64 per pair, identical both).

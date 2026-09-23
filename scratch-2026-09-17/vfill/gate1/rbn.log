@@ -1,0 +1,33 @@
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark: Function Name: attention_q8_0_kv_batched [-Rpass-analysis=kernel-resource-usage]
+   62 | ) {
+      | ^
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     TotalSGPRs: 44 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     VGPRs: 30 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:62:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark: Function Name: attention_q8_0_kv_independent_masked_windowed [-Rpass-analysis=kernel-resource-usage]
+  245 | ) {
+      | ^
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     TotalSGPRs: 40 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     VGPRs: 28 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:245:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark: Function Name: attention_fp8_e4m3_kv_batched [-Rpass-analysis=kernel-resource-usage]
+  399 | ) {
+      | ^
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     TotalSGPRs: 48 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     VGPRs: 17 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/attention_q8_0_kv_batched.hip:399:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

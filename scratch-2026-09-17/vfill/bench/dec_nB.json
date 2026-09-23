@@ -1,0 +1,101 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 17516,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32550,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 24,
+  "prompt_md5": "d94d3115a3001f08a654d91461d6bdc4",
+  "prompt_chars": 57,
+  "warnings": [
+    "prompt is 24 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 35.8,
+    "mean": 35.82,
+    "min": 35.8,
+    "max": 35.9,
+    "stdev": 0.04000000000000057
+  },
+  "prefill_tok_s": {
+    "median": 424.6,
+    "mean": 424.6,
+    "min": 423.6,
+    "max": 425.9,
+    "stdev": 0.8461678320522353
+  },
+  "wall_tok_s": {
+    "median": 35.3,
+    "mean": 35.279999999999994,
+    "min": 35.2,
+    "max": 35.3,
+    "stdev": 0.039999999999997725
+  },
+  "ttft_ms": {
+    "median": 56.5,
+    "mean": 56.52,
+    "min": 56.3,
+    "max": 56.7,
+    "stdev": 0.13266499161421788
+  },
+  "samples": {
+    "decode": [
+      35.8,
+      35.9,
+      35.8,
+      35.8,
+      35.8
+    ],
+    "prefill": [
+      424.6,
+      425.9,
+      425.1,
+      423.6,
+      423.8
+    ],
+    "wall": [
+      35.3,
+      35.3,
+      35.3,
+      35.3,
+      35.2
+    ],
+    "ttft_ms": [
+      56.5,
+      56.3,
+      56.5,
+      56.7,
+      56.6
+    ]
+  }
+}

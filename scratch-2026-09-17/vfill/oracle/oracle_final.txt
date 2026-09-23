@@ -1,0 +1,29 @@
+match    placement+scales (80tok x 4hd x 256d)
+match    single-vs-batched V writer (132096 bytes)
+match    single-decode seq=19 (24576 bytes)
+match    single-decode seq=64 (24576 bytes)
+match    batched-decode B=20 (491520 bytes)
+match    batched-decode B=64 (1572864 bytes)
+match    flash-tile seq=20 partials
+match    flash-tile seq=64 partials
+match    flash-batched B=20 partials
+match    flash-batched B=64 partials
+MISMATCH fa2-q0-f16 B=79: 364032/485376 words differ
+  first diff r=0 h=6 d=0 old=0x1.0b8p-1 new=-nan
+  first diff r=1 h=6 d=0 old=-0x1.a9ed5ap-3 new=-nan
+  first diff r=2 h=6 d=0 old=0x1.222b5ep-1 new=-nan
+  first diff r=3 h=6 d=0 old=-0x1.5b03aep-1 new=-nan
+  first diff r=4 h=6 d=0 old=-0x1.127abp-1 new=-nan
+  first diff r=5 h=6 d=0 old=0x1.0ca7a8p-2 new=-nan
+  q0 B=79 badrows=79/79
+MISMATCH fa2-q0-f16 B=80: 368640/491520 words differ
+  first diff r=0 h=6 d=0 old=0x1.0b8p-1 new=-nan
+  first diff r=1 h=6 d=0 old=-0x1.a9ed5ap-3 new=-nan
+  first diff r=2 h=6 d=0 old=0x1.222b5ep-1 new=-nan
+  first diff r=3 h=6 d=0 old=-0x1.5b03aep-1 new=-nan
+  first diff r=4 h=6 d=0 old=-0x1.127abp-1 new=-nan
+  first diff r=5 h=6 d=0 old=0x1.0ca7a8p-2 new=-nan
+  q0 B=80 badrows=80/80
+match    fa2-routeN B=79 (1941504 bytes)
+match    fa2-routeN B=80 (1966080 bytes)
+ORACLE FAIL: 2 checks

@@ -1,0 +1,241 @@
+
+fa2_orig.k0.o:	file format elf64-x86-64
+
+Disassembly of section .text:
+
+0000000000000000 <__device_stub__attention_q8_0_fa2_gqa_gfx1201>:
+       0: 48 81 ec b8 00 00 00         	subq	$0xb8, %rsp
+       7: 48 89 7c 24 58               	movq	%rdi, 0x58(%rsp)
+       c: 48 89 74 24 50               	movq	%rsi, 0x50(%rsp)
+      11: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+      16: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+      1b: 4c 89 44 24 38               	movq	%r8, 0x38(%rsp)
+      20: 44 89 4c 24 04               	movl	%r9d, 0x4(%rsp)
+      25: f3 0f 11 04 24               	movss	%xmm0, (%rsp)
+      2a: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+      2f: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+      34: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+      39: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+      3e: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+      43: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+      48: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+      4d: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+      52: 48 8d 44 24 38               	leaq	0x38(%rsp), %rax
+      57: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+      5f: 48 8d 44 24 04               	leaq	0x4(%rsp), %rax
+      64: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+      6c: 48 8d 84 24 c0 00 00 00      	leaq	0xc0(%rsp), %rax
+      74: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+      7c: 48 8d 84 24 c8 00 00 00      	leaq	0xc8(%rsp), %rax
+      84: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+      8c: 48 8d 84 24 d0 00 00 00      	leaq	0xd0(%rsp), %rax
+      94: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+      9c: 48 89 e0                     	movq	%rsp, %rax
+      9f: 48 89 84 24 a8 00 00 00      	movq	%rax, 0xa8(%rsp)
+      a7: 48 8d 7c 24 28               	leaq	0x28(%rsp), %rdi
+      ac: 48 8d 74 24 18               	leaq	0x18(%rsp), %rsi
+      b1: 48 8d 54 24 10               	leaq	0x10(%rsp), %rdx
+      b6: 48 8d 4c 24 08               	leaq	0x8(%rsp), %rcx
+      bb: e8 00 00 00 00               	callq	0xc0 <__device_stub__attention_q8_0_fa2_gqa_gfx1201+0xc0>
+      c0: 48 8b 74 24 28               	movq	0x28(%rsp), %rsi
+      c5: 8b 54 24 30                  	movl	0x30(%rsp), %edx
+      c9: 48 8b 4c 24 18               	movq	0x18(%rsp), %rcx
+      ce: 44 8b 44 24 20               	movl	0x20(%rsp), %r8d
+      d3: 48 8b 3d 00 00 00 00         	movq	(%rip), %rdi            # 0xda <__device_stub__attention_q8_0_fa2_gqa_gfx1201+0xda>
+      da: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+      df: ff 74 24 08                  	pushq	0x8(%rsp)
+      e3: ff 74 24 18                  	pushq	0x18(%rsp)
+      e7: e8 00 00 00 00               	callq	0xec <__device_stub__attention_q8_0_fa2_gqa_gfx1201+0xec>
+      ec: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+      f3: c3                           	retq
+      f4: 66 66 66 2e 0f 1f 84 00 00 00 00 00  	nopw	%cs:(%rax,%rax)
+
+0000000000000100 <__device_stub__attention_fa2_q_preconvert_gfx1201>:
+     100: 48 81 ec 98 00 00 00         	subq	$0x98, %rsp
+     107: 48 89 7c 24 58               	movq	%rdi, 0x58(%rsp)
+     10c: 48 89 74 24 50               	movq	%rsi, 0x50(%rsp)
+     111: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     116: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     11b: 44 89 44 24 0c               	movl	%r8d, 0xc(%rsp)
+     120: 44 89 4c 24 08               	movl	%r9d, 0x8(%rsp)
+     125: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     12a: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     12f: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     134: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     139: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     13e: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     143: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     148: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     14d: 48 8d 44 24 0c               	leaq	0xc(%rsp), %rax
+     152: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     15a: 48 8d 44 24 08               	leaq	0x8(%rsp), %rax
+     15f: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     167: 48 8d 7c 24 30               	leaq	0x30(%rsp), %rdi
+     16c: 48 8d 74 24 20               	leaq	0x20(%rsp), %rsi
+     171: 48 8d 54 24 18               	leaq	0x18(%rsp), %rdx
+     176: 48 8d 4c 24 10               	leaq	0x10(%rsp), %rcx
+     17b: e8 00 00 00 00               	callq	0x180 <__device_stub__attention_fa2_q_preconvert_gfx1201+0x80>
+     180: 48 8b 74 24 30               	movq	0x30(%rsp), %rsi
+     185: 8b 54 24 38                  	movl	0x38(%rsp), %edx
+     189: 48 8b 4c 24 20               	movq	0x20(%rsp), %rcx
+     18e: 44 8b 44 24 28               	movl	0x28(%rsp), %r8d
+     193: 48 8b 3d 00 00 00 00         	movq	(%rip), %rdi            # 0x19a <__device_stub__attention_fa2_q_preconvert_gfx1201+0x9a>
+     19a: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     19f: ff 74 24 10                  	pushq	0x10(%rsp)
+     1a3: ff 74 24 20                  	pushq	0x20(%rsp)
+     1a7: e8 00 00 00 00               	callq	0x1ac <__device_stub__attention_fa2_q_preconvert_gfx1201+0xac>
+     1ac: 48 81 c4 a8 00 00 00         	addq	$0xa8, %rsp
+     1b3: c3                           	retq
+     1b4: 66 66 66 2e 0f 1f 84 00 00 00 00 00  	nopw	%cs:(%rax,%rax)
+
+00000000000001c0 <__device_stub__attention_q8_0_fa2_gqa_partial_gfx1201>:
+     1c0: 48 81 ec b8 00 00 00         	subq	$0xb8, %rsp
+     1c7: 48 89 7c 24 58               	movq	%rdi, 0x58(%rsp)
+     1cc: 48 89 74 24 50               	movq	%rsi, 0x50(%rsp)
+     1d1: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     1d6: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     1db: 4c 89 44 24 38               	movq	%r8, 0x38(%rsp)
+     1e0: 44 89 4c 24 04               	movl	%r9d, 0x4(%rsp)
+     1e5: f3 0f 11 04 24               	movss	%xmm0, (%rsp)
+     1ea: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     1ef: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     1f4: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     1f9: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     1fe: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     203: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     208: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     20d: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     212: 48 8d 44 24 38               	leaq	0x38(%rsp), %rax
+     217: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     21f: 48 8d 44 24 04               	leaq	0x4(%rsp), %rax
+     224: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     22c: 48 8d 84 24 c0 00 00 00      	leaq	0xc0(%rsp), %rax
+     234: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     23c: 48 8d 84 24 c8 00 00 00      	leaq	0xc8(%rsp), %rax
+     244: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     24c: 48 8d 84 24 d0 00 00 00      	leaq	0xd0(%rsp), %rax
+     254: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     25c: 48 89 e0                     	movq	%rsp, %rax
+     25f: 48 89 84 24 a8 00 00 00      	movq	%rax, 0xa8(%rsp)
+     267: 48 8d 84 24 d8 00 00 00      	leaq	0xd8(%rsp), %rax
+     26f: 48 89 84 24 b0 00 00 00      	movq	%rax, 0xb0(%rsp)
+     277: 48 8d 7c 24 28               	leaq	0x28(%rsp), %rdi
+     27c: 48 8d 74 24 18               	leaq	0x18(%rsp), %rsi
+     281: 48 8d 54 24 10               	leaq	0x10(%rsp), %rdx
+     286: 48 8d 4c 24 08               	leaq	0x8(%rsp), %rcx
+     28b: e8 00 00 00 00               	callq	0x290 <__device_stub__attention_q8_0_fa2_gqa_partial_gfx1201+0xd0>
+     290: 48 8b 74 24 28               	movq	0x28(%rsp), %rsi
+     295: 8b 54 24 30                  	movl	0x30(%rsp), %edx
+     299: 48 8b 4c 24 18               	movq	0x18(%rsp), %rcx
+     29e: 44 8b 44 24 20               	movl	0x20(%rsp), %r8d
+     2a3: 48 8b 3d 00 00 00 00         	movq	(%rip), %rdi            # 0x2aa <__device_stub__attention_q8_0_fa2_gqa_partial_gfx1201+0xea>
+     2aa: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     2af: ff 74 24 08                  	pushq	0x8(%rsp)
+     2b3: ff 74 24 18                  	pushq	0x18(%rsp)
+     2b7: e8 00 00 00 00               	callq	0x2bc <__device_stub__attention_q8_0_fa2_gqa_partial_gfx1201+0xfc>
+     2bc: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     2c3: c3                           	retq
+     2c4: 66 66 66 2e 0f 1f 84 00 00 00 00 00  	nopw	%cs:(%rax,%rax)
+
+00000000000002d0 <__device_stub__attention_q8_0_fa2_gqa_merge_gfx1201>:
+     2d0: 48 81 ec 88 00 00 00         	subq	$0x88, %rsp
+     2d7: 48 89 7c 24 48               	movq	%rdi, 0x48(%rsp)
+     2dc: 48 89 74 24 40               	movq	%rsi, 0x40(%rsp)
+     2e1: 89 54 24 0c                  	movl	%edx, 0xc(%rsp)
+     2e5: 89 4c 24 08                  	movl	%ecx, 0x8(%rsp)
+     2e9: 44 89 44 24 04               	movl	%r8d, 0x4(%rsp)
+     2ee: 44 89 0c 24                  	movl	%r9d, (%rsp)
+     2f2: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     2f7: 48 89 44 24 50               	movq	%rax, 0x50(%rsp)
+     2fc: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     301: 48 89 44 24 58               	movq	%rax, 0x58(%rsp)
+     306: 48 8d 44 24 0c               	leaq	0xc(%rsp), %rax
+     30b: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     310: 48 8d 44 24 08               	leaq	0x8(%rsp), %rax
+     315: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     31a: 48 8d 44 24 04               	leaq	0x4(%rsp), %rax
+     31f: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     324: 48 89 e0                     	movq	%rsp, %rax
+     327: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     32c: 48 8d 7c 24 30               	leaq	0x30(%rsp), %rdi
+     331: 48 8d 74 24 20               	leaq	0x20(%rsp), %rsi
+     336: 48 8d 54 24 18               	leaq	0x18(%rsp), %rdx
+     33b: 48 8d 4c 24 10               	leaq	0x10(%rsp), %rcx
+     340: e8 00 00 00 00               	callq	0x345 <__device_stub__attention_q8_0_fa2_gqa_merge_gfx1201+0x75>
+     345: 48 8b 74 24 30               	movq	0x30(%rsp), %rsi
+     34a: 8b 54 24 38                  	movl	0x38(%rsp), %edx
+     34e: 48 8b 4c 24 20               	movq	0x20(%rsp), %rcx
+     353: 44 8b 44 24 28               	movl	0x28(%rsp), %r8d
+     358: 48 8b 3d 00 00 00 00         	movq	(%rip), %rdi            # 0x35f <__device_stub__attention_q8_0_fa2_gqa_merge_gfx1201+0x8f>
+     35f: 4c 8d 4c 24 50               	leaq	0x50(%rsp), %r9
+     364: ff 74 24 10                  	pushq	0x10(%rsp)
+     368: ff 74 24 20                  	pushq	0x20(%rsp)
+     36c: e8 00 00 00 00               	callq	0x371 <__device_stub__attention_q8_0_fa2_gqa_merge_gfx1201+0xa1>
+     371: 48 81 c4 98 00 00 00         	addq	$0x98, %rsp
+     378: c3                           	retq
+     379: 0f 1f 80 00 00 00 00         	nopl	(%rax)
+
+0000000000000380 <__hip_module_ctor>:
+     380: 53                           	pushq	%rbx
+     381: 48 83 ec 20                  	subq	$0x20, %rsp
+     385: 48 8b 1d 00 00 00 00         	movq	(%rip), %rbx            # 0x38c <__hip_module_ctor+0xc>
+     38c: 48 85 db                     	testq	%rbx, %rbx
+     38f: 75 16                        	jne	0x3a7 <__hip_module_ctor+0x27>
+     391: 48 8d 3d 00 00 00 00         	leaq	(%rip), %rdi            # 0x398 <__hip_module_ctor+0x18>
+     398: e8 00 00 00 00               	callq	0x39d <__hip_module_ctor+0x1d>
+     39d: 48 89 c3                     	movq	%rax, %rbx
+     3a0: 48 89 05 00 00 00 00         	movq	%rax, (%rip)            # 0x3a7 <__hip_module_ctor+0x27>
+     3a7: 0f 57 c0                     	xorps	%xmm0, %xmm0
+     3aa: 0f 11 44 24 10               	movups	%xmm0, 0x10(%rsp)
+     3af: 0f 11 04 24                  	movups	%xmm0, (%rsp)
+     3b3: 48 8b 35 00 00 00 00         	movq	(%rip), %rsi            # 0x3ba <__hip_module_ctor+0x3a>
+     3ba: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x3c1 <__hip_module_ctor+0x41>
+     3c1: 48 89 df                     	movq	%rbx, %rdi
+     3c4: 48 89 ca                     	movq	%rcx, %rdx
+     3c7: 41 b8 ff ff ff ff            	movl	$0xffffffff, %r8d       # imm = 0xFFFFFFFF
+     3cd: 45 31 c9                     	xorl	%r9d, %r9d
+     3d0: e8 00 00 00 00               	callq	0x3d5 <__hip_module_ctor+0x55>
+     3d5: 0f 57 c0                     	xorps	%xmm0, %xmm0
+     3d8: 0f 11 44 24 10               	movups	%xmm0, 0x10(%rsp)
+     3dd: 0f 11 04 24                  	movups	%xmm0, (%rsp)
+     3e1: 48 8b 35 00 00 00 00         	movq	(%rip), %rsi            # 0x3e8 <__hip_module_ctor+0x68>
+     3e8: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x3ef <__hip_module_ctor+0x6f>
+     3ef: 48 89 df                     	movq	%rbx, %rdi
+     3f2: 48 89 ca                     	movq	%rcx, %rdx
+     3f5: 41 b8 ff ff ff ff            	movl	$0xffffffff, %r8d       # imm = 0xFFFFFFFF
+     3fb: 45 31 c9                     	xorl	%r9d, %r9d
+     3fe: e8 00 00 00 00               	callq	0x403 <__hip_module_ctor+0x83>
+     403: 0f 57 c0                     	xorps	%xmm0, %xmm0
+     406: 0f 11 44 24 10               	movups	%xmm0, 0x10(%rsp)
+     40b: 0f 11 04 24                  	movups	%xmm0, (%rsp)
+     40f: 48 8b 35 00 00 00 00         	movq	(%rip), %rsi            # 0x416 <__hip_module_ctor+0x96>
+     416: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x41d <__hip_module_ctor+0x9d>
+     41d: 48 89 df                     	movq	%rbx, %rdi
+     420: 48 89 ca                     	movq	%rcx, %rdx
+     423: 41 b8 ff ff ff ff            	movl	$0xffffffff, %r8d       # imm = 0xFFFFFFFF
+     429: 45 31 c9                     	xorl	%r9d, %r9d
+     42c: e8 00 00 00 00               	callq	0x431 <__hip_module_ctor+0xb1>
+     431: 0f 57 c0                     	xorps	%xmm0, %xmm0
+     434: 0f 11 44 24 10               	movups	%xmm0, 0x10(%rsp)
+     439: 0f 11 04 24                  	movups	%xmm0, (%rsp)
+     43d: 48 8b 35 00 00 00 00         	movq	(%rip), %rsi            # 0x444 <__hip_module_ctor+0xc4>
+     444: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x44b <__hip_module_ctor+0xcb>
+     44b: 48 89 df                     	movq	%rbx, %rdi
+     44e: 48 89 ca                     	movq	%rcx, %rdx
+     451: 41 b8 ff ff ff ff            	movl	$0xffffffff, %r8d       # imm = 0xFFFFFFFF
+     457: 45 31 c9                     	xorl	%r9d, %r9d
+     45a: e8 00 00 00 00               	callq	0x45f <__hip_module_ctor+0xdf>
+     45f: 48 8d 3d 0a 00 00 00         	leaq	0xa(%rip), %rdi         # 0x470 <__hip_module_dtor>
+     466: 48 83 c4 20                  	addq	$0x20, %rsp
+     46a: 5b                           	popq	%rbx
+     46b: e9 00 00 00 00               	jmp	0x470 <__hip_module_dtor>
+
+0000000000000470 <__hip_module_dtor>:
+     470: 48 8b 3d 00 00 00 00         	movq	(%rip), %rdi            # 0x477 <__hip_module_dtor+0x7>
+     477: 48 85 ff                     	testq	%rdi, %rdi
+     47a: 74 15                        	je	0x491 <__hip_module_dtor+0x21>
+     47c: 50                           	pushq	%rax
+     47d: e8 00 00 00 00               	callq	0x482 <__hip_module_dtor+0x12>
+     482: 48 c7 05 00 00 00 00 00 00 00 00     	movq	$0x0, (%rip)    # 0x48d <__hip_module_dtor+0x1d>
+     48d: 48 83 c4 08                  	addq	$0x8, %rsp
+     491: c3                           	retq

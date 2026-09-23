@@ -1,0 +1,101 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 17516,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32550,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 24,
+  "prompt_md5": "d94d3115a3001f08a654d91461d6bdc4",
+  "prompt_chars": 57,
+  "warnings": [
+    "prompt is 24 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 28.2,
+    "mean": 28.24,
+    "min": 28.2,
+    "max": 28.3,
+    "stdev": 0.04898979485566426
+  },
+  "prefill_tok_s": {
+    "median": 349.9,
+    "mean": 349.94,
+    "min": 347.8,
+    "max": 351.8,
+    "stdev": 1.5499677415998065
+  },
+  "wall_tok_s": {
+    "median": 27.8,
+    "mean": 27.78,
+    "min": 27.7,
+    "max": 27.8,
+    "stdev": 0.04000000000000057
+  },
+  "ttft_ms": {
+    "median": 68.6,
+    "mean": 68.58,
+    "min": 68.2,
+    "max": 69.0,
+    "stdev": 0.2993325909419146
+  },
+  "samples": {
+    "decode": [
+      28.3,
+      28.2,
+      28.3,
+      28.2,
+      28.2
+    ],
+    "prefill": [
+      351.8,
+      349.9,
+      351.5,
+      348.7,
+      347.8
+    ],
+    "wall": [
+      27.8,
+      27.8,
+      27.8,
+      27.8,
+      27.7
+    ],
+    "ttft_ms": [
+      68.2,
+      68.6,
+      68.3,
+      68.8,
+      69.0
+    ]
+  }
+}
