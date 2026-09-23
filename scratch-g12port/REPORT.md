@@ -112,3 +112,14 @@ Below Main's ≥1% tg128 bar: dropped (not committed).
   (`deltas.txt`), `ab/`.
 - Binaries: `bin-base` (2afc4a294-equivalent on gfx1201), `bin-cand` (F1+fold), `bin-cand2`
   (F1+fold+grid), `bin-f1` (F1 commit; also `target/release` for the card-B guard). Binaries, modules and raw rocprof CSVs are git-ignored.
+
+## Card-B guard (`scripts/guard_gfx1201_baseline.py`, floor 3,620, decode ±1% of 36.5)
+
+Binaries: `target/release` built from `94d4032fc` (= `bin-f1`). Card-B `GPU-e475645fe0200397`, private
+home `g12port-guard`.
+- Run 1 (`guard-run1/`): pp8192 medians 3,728.7 / 3,717.5 / 3,714.5, decode 36.44 / 36.48 / **28.74** →
+  FAIL on the decode check only. The 28.7 tok/s state is the card-level bimodal decode seen on every
+  card today in both arms of every A/B (G12Prof card-C at `2afc4a294`; card-E nogrid/grid and
+  nofold/fold arms alike); F1-lite does not run in decode (prefill, n ≥ 64 only).
+- Run 2 (`guard/`): pp8192 medians **3,725.4 / 3,717.6 / 3,724.0**, decode 36.44 / 36.48 / 36.50 →
+  **PASS**. Post-run `rocm-smi --showpids`: no G12Port process on any card.
