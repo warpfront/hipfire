@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 // gfx11: swap C64 grid axes to keep adjacent rows co-resident; preserve
-// incumbent arithmetic and FP32 prefix order. C32 uses the same preamble
-// with the prefix reset at row 32 (module compiled with GDN_PREP_C32).
+// incumbent arithmetic and FP32 prefix order.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
@@ -57,20 +56,11 @@ __global__ void gdn_chunk_prep_gfx11(
                 b[off] = 1.0f / (1.0f + expf(-b[off]));
             }
             float pair = g0 + g1;
-#ifdef GDN_PREP_C32
-            // C32 scan: the inclusive prefix restarts every 32 rows (16 lanes).
-#pragma unroll
-            for (int d = 1; d < 16; d <<= 1) {
-                const float other = __shfl_up(pair, d, 16);
-                if ((lane & 15) >= d) pair += other;
-            }
-#else
 #pragma unroll
             for (int d = 1; d < 32; d <<= 1) {
                 const float other = __shfl_up(pair, d, 32);
                 if (lane >= d) pair += other;
             }
-#endif
             const float before = pair - g0 - g1;
             if (r0 < rows) a[(long long)(chunk0 + r0) * GDN_CHUNK_HV + h] = before + g0;
             if (r1 < rows) a[(long long)(chunk0 + r1) * GDN_CHUNK_HV + h] = before + g0 + g1;
