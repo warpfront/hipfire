@@ -5821,10 +5821,39 @@ impl Gpu {
             // Token-id exact vs base (per-row math unchanged). Grid divisor here
             // MUST match the kernel's MOE_GATE_UP_NUM_ROWS.
             use std::sync::OnceLock;
+            // Research lever (opt-in HIPFIRE_GFX1201_MOE_PREFETCH ∈ {1,2,3,4},
+            // gfx12/RDNA4 only): swap in an S_PREFETCH_DATA variant of this
+            // decode-hot GEMV. Byte-identical math (prefetch is a pure hint), so
+            // token-id EXACT is required. Same grid/block as the base kernel.
+            static MOE_PREFETCH: OnceLock<u32> = OnceLock::new();
+            let pf = *MOE_PREFETCH.get_or_init(|| {
+                let v = std::env::var("HIPFIRE_GFX1201_MOE_PREFETCH")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                if (1..=4).contains(&v) {
+                    eprintln!("  MoE gate_up S_PREFETCH variant: pf{v}");
+                }
+                v
+            });
+            let pf_gfx12 = (1..=4).contains(&pf) && self.arch_caps.arch().starts_with("gfx12");
             static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
             let fused = *GATE_UP_FUSED
                 .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
-            if fused {
+            if pf_gfx12 {
+                let func = match pf {
+                    1 => "gemv_hfq4g256_moe_gate_up_k8_indexed_pf1",
+                    2 => "gemv_hfq4g256_moe_gate_up_k8_indexed_pf2",
+                    3 => "gemv_hfq4g256_moe_gate_up_k8_indexed_pf3",
+                    _ => "gemv_hfq4g256_moe_gate_up_k8_indexed_pf0",
+                };
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_prefetch",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_PREFETCH_SRC,
+                    func,
+                )?;
+                (func, [32u32, 1, 1], m as u32)
+            } else if fused {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_rowtile",
                     kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC,

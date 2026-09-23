@@ -1,0 +1,518 @@
+warning: field `fn_comm_init_all` is never read
+  --> crates/hip-bridge/src/rccl.rs:78:5
+   |
+74 | pub struct RcclComms {
+   |            --------- field in this struct
+...
+78 |     fn_comm_init_all: unsafe extern "C" fn(*mut NcclComm, c_int, *const c_int) -> u32,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `SolutionIndex` is never constructed
+  --> crates/hip-bridge/src/rocblas.rs:64:5
+   |
+62 | pub enum RocblasGemmAlgo {
+   |          --------------- variant in this enum
+63 |     Standard = 160,
+64 |     SolutionIndex = 161,
+   |     ^^^^^^^^^^^^^
+   |
+   = note: `RocblasGemmAlgo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `hip-bridge` (lib) generated 2 warnings
+   Compiling rdna-compute v0.2.1 (/home/kaden/hipfire-sprefetch/crates/rdna-compute)
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/attention.rs:5622:13
+     |
+5622 |         let func = &self.functions["kv_cache_write"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `head_dim`
+    --> crates/rdna-compute/src/dispatch.rs:1856:9
+     |
+1856 |         head_dim: usize,
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_head_dim`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:362:5
+    |
+362 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:379:5
+    |
+379 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:444:9
+    |
+444 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:469:9
+    |
+469 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:494:9
+    |
+494 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:513:9
+    |
+513 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:786:9
+    |
+786 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:813:9
+    |
+813 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:840:9
+    |
+840 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:860:9
+    |
+860 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `func`
+   --> crates/rdna-compute/src/norm.rs:591:13
+    |
+591 |         let func = &self.functions["rope_f32"];
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:3502:13
+     |
+3502 |         let func = &self.functions["bias_add_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: trait `ActivationCapture` is never used
+   --> crates/rdna-compute/src/dispatch.rs:363:11
+    |
+363 | pub trait ActivationCapture: Send + Sync {
+    |           ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `GEMV_MQ5G256_SRC` is never used
+   --> crates/rdna-compute/src/kernels.rs:991:11
+    |
+991 | pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
+    |           ^^^^^^^^^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:482:5
+    |
+480 | struct RawKernelMeta {
+    |        ------------- field in this struct
+481 |     pgm_rsrc1: u32,
+482 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+   Compiling hipfire-dispatch v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-dispatch)
+warning: unused variable: `mu`
+   --> crates/hipfire-dispatch/src/families/fused_qkv.rs:566:22
+    |
+566 |             let [mg, mu] =
+    |                      ^^ help: if this is intentional, prefix it with an underscore: `_mu`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `DISPATCHED_KV_WRITE_KEYS` is never used
+    --> crates/hipfire-dispatch/src/families/attention.rs:1289:18
+     |
+1289 | pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `DISPATCHED_ATTEND_KEYS` is never used
+    --> crates/hipfire-dispatch/src/families/attention.rs:1315:18
+     |
+1315 | pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
+     |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `DISPATCHED_FULL_ATTENTION_KEYS` is never used
+    --> crates/hipfire-dispatch/src/families/attention.rs:1348:7
+     |
+1348 | const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_moe_decode_mixed` is never used
+   --> crates/hipfire-dispatch/src/pipeline/mod.rs:897:4
+    |
+897 | fn run_moe_decode_mixed(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_contiguous_permutation` is never used
+    --> crates/hipfire-dispatch/src/pipeline/mod.rs:1196:4
+     |
+1196 | fn build_contiguous_permutation(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dtype_name` is never used
+    --> crates/hipfire-dispatch/src/pipeline/mod.rs:1215:4
+     |
+1215 | fn dtype_name(d: DType) -> &'static str {
+     |    ^^^^^^^^^^
+
+   Compiling hipfire-runtime v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-runtime)
+warning: unused import: `std::path::Path`
+  --> crates/hipfire-runtime/src/llama.rs:13:5
+   |
+13 | use std::path::Path;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hipfire-dispatch` (lib) generated 7 warnings (run `cargo fix --lib -p hipfire-dispatch` to apply 1 suggestion)
+warning: unused variable: `qd`
+    --> crates/hipfire-runtime/src/dflash.rs:1145:9
+     |
+1145 |     let qd = cfg.q_dim();
+     |         ^^ help: if this is intentional, prefix it with an underscore: `_qd`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `index_start`
+   --> crates/hipfire-runtime/src/hfq.rs:229:13
+    |
+229 |         let index_start = metadata_offset;
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_index_start`
+
+warning: unused variable: `name`
+   --> crates/hipfire-runtime/src/hfq.rs:804:27
+    |
+804 |     fn tensor_data(&self, name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+    |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `name`
+   --> crates/hipfire-runtime/src/hfq.rs:813:27
+    |
+813 |     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
+    |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `i`
+    --> crates/hipfire-runtime/src/llama.rs:1560:13
+     |
+1560 |         for i in 0..batch {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/llama.rs:4538:9
+     |
+4538 |     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/llama.rs:4741:9
+     |
+4741 |     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+
+warning: field `header_size` is never read
+  --> crates/hipfire-runtime/src/safetensors_source.rs:17:5
+   |
+14 | struct SafetensorsFile {
+   |        --------------- field in this struct
+...
+17 |     header_size: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `append_assistant_turn_tokens` is never used
+   --> crates/hipfire-runtime/src/prompt_frame.rs:306:8
+    |
+250 | impl<'a> ChatScaffold<'a> {
+    | ------------------------- method in this implementation
+...
+306 |     fn append_assistant_turn_tokens(&self, out: &mut Vec<u32>, body: &[u32]) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+   Compiling hipfire-reap v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-reap)
+   Compiling hipfire-arch-qwen2 v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-qwen2)
+   Compiling hipfire-arch-cohere2moe v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-cohere2moe)
+   Compiling hipfire-arch-llama v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-llama)
+   Compiling hipfire-arch-qwen35-vl v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-qwen35-vl)
+   Compiling hipfire-arch-deepseek4 v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-deepseek4)
+   Compiling hipfire-arch-qwen35 v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-qwen35)
+   Compiling hipfire-arch-lfm2moe v0.1.0 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-lfm2moe)
+   Compiling hipfire-arch-minimax v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-minimax)
+warning: unused import: `WeightSlot`
+  --> crates/hipfire-arch-minimax/src/forward.rs:33:71
+   |
+33 |     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
+   |                                                                       ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `json`
+  --> crates/hipfire-arch-deepseek4/src/dsml.rs:34:18
+   |
+34 | use serde_json::{json, Value};
+   |                  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling hipfire-arch-dots-ocr v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-arch-dots-ocr)
+warning: unnecessary parentheses around type
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:3229:18
+     |
+3229 |     source: &mut (impl WeightSource<Layer = LayerWeights>),
+     |                  ^                                       ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+3229 -     source: &mut (impl WeightSource<Layer = LayerWeights>),
+3229 +     source: &mut impl WeightSource<Layer = LayerWeights>,
+     |
+
+warning: unused macro definition: `givens_cos_view`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8126:18
+     |
+8126 |     macro_rules! givens_cos_view {
+     |                  ^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_macros)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused macro definition: `givens_sin_view`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8132:18
+     |
+8132 |     macro_rules! givens_sin_view {
+     |                  ^^^^^^^^^^^^^^^
+
+warning: unused macro definition: `probe`
+    --> crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1439:18
+     |
+1439 |     macro_rules! probe {
+     |                  ^^^^^
+     |
+     = note: `#[warn(unused_macros)]` (part of `#[warn(unused)]`) on by default
+
+warning: structure field `conv_L_cache` should have a snake case name
+  --> crates/hipfire-arch-lfm2moe/src/config.rs:86:5
+   |
+86 |     conv_L_cache: usize,
+   |     ^^^^^^^^^^^^ help: convert the identifier to snake case: `conv_l_cache`
+   |
+   = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: `hipfire-arch-minimax` (lib) generated 1 warning (run `cargo fix --lib -p hipfire-arch-minimax` to apply 1 suggestion)
+warning: `hipfire-arch-dots-ocr` (lib) generated 1 warning
+warning: `hipfire-arch-lfm2moe` (lib) generated 1 warning
+warning: unused variable: `ctx`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8100:9
+     |
+8100 |     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `q_dim`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:9311:21
+     |
+9311 |                 let q_dim = config.n_heads * config.head_dim;
+     |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_q_dim`
+
+warning: unused variable: `fused_fa3_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:11486:9
+      |
+11486 |     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+      |         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_fa3_lloyd_mq4`
+
+warning: unused variable: `kv_dim`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:11585:9
+      |
+11585 |     let kv_dim = config.n_kv_heads * config.head_dim;
+      |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_kv_dim`
+
+warning: variable `kv_layer_idx` is assigned to, but never used
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:11974:9
+      |
+11974 |     let mut kv_layer_idx = 0usize;
+      |         ^^^^^^^^^^^^^^^^
+      |
+      = note: consider using `_kv_layer_idx` instead
+
+warning: value assigned to `kv_layer_idx` is never read
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:12264:17
+      |
+12264 |                 kv_layer_idx += 1;
+      |                 ^^^^^^^^^^^^^^^^^
+      |
+      = help: maybe it is overwritten before being read?
+      = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `kv_layer_idx` is never read
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:12527:17
+      |
+12527 |                 kv_layer_idx += 1;
+      |                 ^^^^^^^^^^^^^^^^^
+      |
+      = help: maybe it is overwritten before being read?
+
+warning: unused variable: `fused_la4_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:14437:25
+      |
+14437 |                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_la4_lloyd_mq4`
+
+warning: unused variable: `fused_gu_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:14606:25
+      |
+14606 |                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_gu_lloyd_mq4`
+
+warning: unused variable: `fused_fa3_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:14668:25
+      |
+14668 |                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_fa3_lloyd_mq4`
+
+warning: unused variable: `fused_gu_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:15041:25
+      |
+15041 |                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_gu_lloyd_mq4`
+
+warning: unused variable: `fused_la4_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:15104:25
+      |
+15104 |                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_la4_lloyd_mq4`
+
+warning: unused variable: `fused_fa3_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:15292:25
+      |
+15292 |                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_fa3_lloyd_mq4`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-arch-qwen35/src/speculative.rs:3022:9
+     |
+3022 |     let mut t_phase = t_spec_start;
+     |         ----^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `repack_awq_to_hfq4g128` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:1775:4
+     |
+1775 | fn repack_awq_to_hfq4g128(
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `load_paroquant_weight` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:1857:4
+     |
+1857 | fn load_paroquant_weight(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `load_fp16_weight_from_source` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:1938:4
+     |
+1938 | fn load_fp16_weight_from_source(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `paro_repack_moe_projection` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:1973:4
+     |
+1973 | fn paro_repack_moe_projection(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `paro_load_moe_shared_sidecars` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:2003:4
+     |
+2003 | fn paro_load_moe_shared_sidecars(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `alias_paro_rotation` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:2039:4
+     |
+2039 | fn alias_paro_rotation(
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `paro_load_moe_ffn` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:2069:4
+     |
+2069 | fn paro_load_moe_ffn(
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `load_any_as_f32` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:2241:4
+     |
+2241 | fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `load_raw_f32` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:3137:4
+     |
+3137 | fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+     |    ^^^^^^^^^^^^
+
+warning: function `moe_ffn_decode` is never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:4047:4
+     |
+4047 | fn moe_ffn_decode(
+     |    ^^^^^^^^^^^^^^
+
+warning: fields `givens_cos` and `givens_sin` are never read
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:7987:9
+     |
+7975 | pub(crate) struct PrefillBandCtx<'a> {
+     |                   -------------- fields in this struct
+...
+7987 |     pub givens_cos: Option<&'a GpuTensor>,
+     |         ^^^^^^^^^^
+7988 |     pub givens_sin: Option<&'a GpuTensor>,
+     |         ^^^^^^^^^^
+
+   Compiling hipfire-loader v0.2.1 (/home/kaden/hipfire-sprefetch/crates/hipfire-loader)
+warning: `hipfire-runtime` (lib) generated 10 warnings (run `cargo fix --lib -p hipfire-runtime` to apply 8 suggestions)
+warning: `rdna-compute` (lib) generated 17 warnings (run `cargo fix --lib -p rdna-compute` to apply 14 suggestions)
+warning: `hipfire-arch-deepseek4` (lib) generated 1 warning (run `cargo fix --lib -p hipfire-arch-deepseek4` to apply 1 suggestion)
+warning: `hipfire-arch-qwen35` (lib) generated 28 warnings (run `cargo fix --lib -p hipfire-arch-qwen35` to apply 12 suggestions)
+warning: value assigned to `tool_calls_parsed_count` is never read
+     --> crates/hipfire-runtime/examples/daemon.rs:10567:46
+      |
+10567 |     let mut tool_calls_parsed_count: usize = 0;
+      |                                              ^
+      |
+      = help: maybe it is overwritten before being read?
+      = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hipfire-runtime` (example "daemon") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 11.11s

@@ -1249,6 +1249,16 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip");
 
+/// S_PREFETCH_DATA sweep variants of the indexed MoE gate_up GEMV (gfx12/RDNA4
+/// only, opt-in HIPFIRE_GFX1201_MOE_PREFETCH ∈ {1,2,3,4}). Byte-identical math;
+/// the only change is a wave-uniform scalar `s_prefetch_data` of a future
+/// quad's gate/up weight block. One module, four selectable functions
+/// (_pf1/_pf2/_pf3/_pf0 = next-quad-len5 / 2quad-len5 / next-quad-len2 /
+/// next-quad-len0). Research lever: does scalar prefetch overlap the exposed
+/// weight-load latency of the (vector-load-bound) decode GEMV?
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_PREFETCH_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_prefetch.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV. Same
 /// device-side expert-pointer table + topk_indices contract as the
 /// HFQ4G256 sibling; closes the residual hipGraph-capture gap for

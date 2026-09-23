@@ -1,0 +1,9 @@
+[gpu-lock] acquired by sprefetch-baseline
+=== baseline  (HIPFIRE_GFX1201_MOE_PREFETCH=unset) 08:18:14 ===
+run 1: decode=148.9 tok/s  prefill=2784.4
+run 2: decode=149.0 tok/s  prefill=2764.7
+run 3: decode=148.7 tok/s  prefill=2759.7
+run 4: decode=149.1 tok/s  prefill=2767.2
+run 5: decode=148.9 tok/s  prefill=2772.9
+MEDIAN baseline: decode=148.9 tok/s  prefill=2767.2
+[gpu-lock] released
