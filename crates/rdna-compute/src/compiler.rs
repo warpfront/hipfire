@@ -101,6 +101,9 @@ pub struct KernelCompiler {
     /// Resolved device-compiler binary. Bare "hipcc" when PATH provides it;
     /// otherwise an absolute path discovered under a resolved ROCm root.
     hipcc_bin: std::path::PathBuf,
+    /// ROCM_PATH handed to the spawned compiler so it can find its own LLVM.
+    /// None when the environment already sets it.
+    rocm_env_root: Option<std::path::PathBuf>,
 }
 
 impl KernelCompiler {
@@ -209,7 +212,17 @@ impl KernelCompiler {
         } else {
             hipfire_config::rocm::tool("hipcc").unwrap_or_else(|| "hipcc".into())
         };
-        let hipcc_out = Command::new(&hipcc_bin).arg("--version").output().ok();
+        // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
+        // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
+        // still succeeds while every real compile fails, so hand the child the
+        // resolved root unless the operator already set one.
+        let rocm_env_root = hipfire_config::rocm::compiler_env_root();
+        let mut probe = Command::new(&hipcc_bin);
+        probe.arg("--version");
+        if let Some(ref root) = rocm_env_root {
+            probe.env("ROCM_PATH", root);
+        }
+        let hipcc_out = probe.output().ok();
         let has_hipcc = hipcc_out
             .as_ref()
             .map(|o| o.status.success())
@@ -250,6 +263,7 @@ impl KernelCompiler {
             precompiled_dir,
             has_hipcc,
             hipcc_bin,
+            rocm_env_root,
             extra_flags,
             gfx1151_cumode_modules,
             toolchain_id,
@@ -349,6 +363,7 @@ impl KernelCompiler {
         if !cache_valid {
             Self::hipcc_compile(
                 &self.hipcc_bin,
+            self.rocm_env_root.as_deref(),
                 &self.arch,
                 &src_path,
                 &obj_path,
@@ -468,6 +483,7 @@ impl KernelCompiler {
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(
         hipcc_bin: &Path,
+        rocm_env_root: Option<&Path>,
         arch: &str,
         src_path: &Path,
         obj_path: &Path,
@@ -531,8 +547,12 @@ impl KernelCompiler {
         args.push(obj_path.to_str().unwrap().into());
         args.push(src_path.to_str().unwrap().into());
 
-        let output = Command::new(hipcc_bin)
-            .args(&args)
+        let mut cmd = Command::new(hipcc_bin);
+        cmd.args(&args);
+        if let Some(root) = rocm_env_root {
+            cmd.env("ROCM_PATH", root);
+        }
+        let output = cmd
             .output()
             .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
 
@@ -635,6 +655,7 @@ impl KernelCompiler {
         let arch = self.arch.clone();
         let precompiled_dir = self.precompiled_dir.clone();
         let hipcc_bin = self.hipcc_bin.clone();
+        let rocm_env_root = self.rocm_env_root.clone();
 
         // Shared counter so parallel threads can report "[i/N] name" as each one
         // completes. Ordering follows completion (not launch) — matches the pace
@@ -649,11 +670,13 @@ impl KernelCompiler {
                     let arch = arch.clone();
                     let precompiled_dir = precompiled_dir.clone();
                     let hipcc_bin = hipcc_bin.clone();
+                    let rocm_env_root = rocm_env_root.clone();
                     let extra_flags = self.extra_flags.clone();
                     let done = std::sync::Arc::clone(&done);
                     let handle = thread::spawn(move || {
                         let result = Self::hipcc_compile(
                             &hipcc_bin,
+                            rocm_env_root.as_deref(),
                             &arch,
                             &src_path,
                             &obj_path,
@@ -716,6 +739,7 @@ mod tests {
             gfx1151_cumode_modules: HashSet::new(),
             toolchain_id: toolchain_id.to_string(),
             hipcc_bin: PathBuf::from("hipcc"),
+            rocm_env_root: None,
         }
     }
 

@@ -1419,6 +1419,80 @@ impl QueueSet {
     }
 }
 
+
+/// Find a device-local coarse-grained global pool on the GPU agent that permits
+/// runtime allocation. Returns (pool, granule, alignment).
+///
+/// Used only for the retained indirect buffer under
+/// HIPFIRE_REDLINE_IB_DEVICE_LOCAL=1. Building the IB requires CPU writes, so
+/// this is only usable where VRAM is CPU-visible (resizable BAR).
+fn discover_device_local_pool(device: &GpuDevice) -> Option<(abi::MemoryPool, usize, usize)> {
+    unsafe extern "C" fn collect(pool: abi::MemoryPool, data: *mut c_void) -> abi::Status {
+        // SAFETY: context is a live vector for synchronous iteration.
+        unsafe { &mut *data.cast::<Vec<abi::MemoryPool>>() }.push(pool);
+        abi::STATUS_SUCCESS
+    }
+    let mut pools: Vec<abi::MemoryPool> = Vec::new();
+    // SAFETY: callback and context satisfy the iteration contract.
+    let status = unsafe {
+        (device.runtime.symbols.agent_iterate_memory_pools)(
+            device.gpu_agent(),
+            Some(collect),
+            (&mut pools as *mut Vec<abi::MemoryPool>).cast(),
+        )
+    };
+    if status != abi::STATUS_SUCCESS {
+        return None;
+    }
+    for pool in pools {
+        let mut segment = 0_u32;
+        let mut flags = 0_u32;
+        let mut allowed = false;
+        let mut granule = 0_usize;
+        let mut alignment = 0_usize;
+        if query_pool(
+            &device.runtime.symbols,
+            pool,
+            abi::AMD_MEMORY_POOL_INFO_SEGMENT,
+            (&mut segment as *mut u32).cast(),
+        )
+        .is_err()
+            || segment != abi::AMD_SEGMENT_GLOBAL
+        {
+            continue;
+        }
+        for (attr, out) in [
+            (abi::AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, (&mut flags as *mut u32).cast::<c_void>()),
+            (
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED,
+                (&mut allowed as *mut bool).cast::<c_void>(),
+            ),
+            (
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE,
+                (&mut granule as *mut usize).cast::<c_void>(),
+            ),
+            (
+                abi::AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT,
+                (&mut alignment as *mut usize).cast::<c_void>(),
+            ),
+        ] {
+            if query_pool(&device.runtime.symbols, pool, attr, out).is_err() {
+                allowed = false;
+                break;
+            }
+        }
+        if !allowed
+            || granule == 0
+            || !alignment.is_power_of_two()
+            || flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED == 0
+        {
+            continue;
+        }
+        return Some((pool, granule, alignment));
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct KernargPool {
     inner: Arc<KernargPoolInner>,
@@ -1430,6 +1504,17 @@ struct KernargPoolInner {
     gpu: abi::Agent,
     granule: usize,
     alignment: usize,
+    /// Device-local coarse-grained pool, when the GPU agent exposes one that
+    /// permits runtime allocation. Used for the retained indirect buffer under
+    /// HIPFIRE_REDLINE_IB_DEVICE_LOCAL=1.
+    ///
+    /// The retained IB is otherwise host-resident (see discover()), so the
+    /// command processor re-fetches every dword across the host interface on
+    /// each replay. A buffer that is written once and then read back
+    /// identically thousands of times is a poor fit for host memory. Placing it
+    /// in VRAM requires a CPU-visible aperture (resizable BAR) to build it.
+    device_pool: Option<(abi::MemoryPool, usize, usize)>,
+    cpu: abi::Agent,
 }
 
 impl KernargPool {
@@ -1503,6 +1588,47 @@ impl KernargPool {
             if granule == 0 || !alignment.is_power_of_two() {
                 continue;
             }
+            // The retained PM4 indirect buffer is allocated from THIS pool
+            // (SingleQueuePm4Ib::indirect is a KernargBuffer), so the command
+            // processor re-fetches the whole IB from host-agent memory on every
+            // replay. Ordinary HIP dispatch does not do that, which makes the
+            // retained path far more sensitive to host-memory and PCIe
+            // behaviour than the HIP arm — and that behaviour is an amdgpu
+            // decision. Set HIPFIRE_REDLINE_POOL_DEBUG=1 to report exactly
+            // which pool a machine selected, so two boxes reporting different
+            // retained throughput can be compared on placement rather than
+            // guessed at.
+            if std::env::var_os("HIPFIRE_REDLINE_POOL_DEBUG")
+                .is_some_and(|v| v != "0" && !v.is_empty())
+            {
+                let mut size = 0_usize;
+                let _ = query_pool(
+                    &device.runtime.symbols,
+                    pool,
+                    abi::AMD_MEMORY_POOL_INFO_SIZE,
+                    (&mut size as *mut usize).cast(),
+                );
+                let kind = if flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED != 0 {
+                    "fine-grained"
+                } else if flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED != 0 {
+                    "coarse-grained"
+                } else {
+                    "unflagged"
+                };
+                eprintln!(
+                    "[redline] retained-IB pool: handle=0x{:x} owner=CPU-agent segment=global \
+                     kind={kind} kernarg_init={} flags=0x{flags:08x} size={size} \
+                     granule={granule} alignment={alignment}",
+                    pool.0,
+                    flags & abi::AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT != 0,
+                );
+                eprintln!(
+                    "[redline] the retained indirect buffer lives in this pool, so the command \
+                     processor fetches it over the host interface on every replay"
+                );
+            }
+
+            let device_pool = discover_device_local_pool(device);
             return Ok(Self {
                 inner: Arc::new(KernargPoolInner {
                     runtime: device.runtime.clone(),
@@ -1510,6 +1636,8 @@ impl KernargPool {
                     gpu: device.gpu_agent(),
                     granule,
                     alignment,
+                    device_pool,
+                    cpu: cpu.handle,
                 }),
             });
         }
@@ -1529,8 +1657,125 @@ impl KernargPool {
     /// Allocate CPU-writable, GPU-accessible command memory. The executable
     /// flag is required for MEC indirect-buffer fetches even though the PM4
     /// words are data rather than shader ISA.
+    ///
+    /// With HIPFIRE_REDLINE_IB_DEVICE_LOCAL=1 this prefers a device-local
+    /// coarse-grained pool so the command processor reads the retained IB from
+    /// VRAM instead of across the host interface. Requires a CPU-visible VRAM
+    /// aperture to build the buffer; falls back to the host pool when the GPU
+    /// exposes no runtime-allocatable device pool.
     pub fn allocate_executable_bytes(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
+        let device_local = std::env::var_os("HIPFIRE_REDLINE_IB_DEVICE_LOCAL")
+            .is_some_and(|v| v != "0" && !v.is_empty());
+        if device_local {
+            if let Some((pool, granule, alignment)) = self.inner.device_pool {
+                return self.allocate_from(
+                    pool,
+                    granule,
+                    alignment,
+                    self.inner.cpu,
+                    length,
+                    16,
+                    abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG,
+                );
+            }
+            eprintln!(
+                "[redline] HIPFIRE_REDLINE_IB_DEVICE_LOCAL set but no runtime-allocatable \
+                 device-local pool was found; retained IB stays host-resident"
+            );
+        }
         self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
+    }
+
+    /// Allocate from an explicit pool, granting access to `grant`.
+    /// Mirrors allocate_bytes; used for the device-local retained-IB experiment
+    /// so the default host-pool path stays byte-for-byte unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_from(
+        &self,
+        pool: abi::MemoryPool,
+        granule: usize,
+        pool_alignment: usize,
+        grant: abi::Agent,
+        length: usize,
+        required_alignment: usize,
+        flags: u32,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        if !required_alignment.is_power_of_two() {
+            return Err(RuntimeError::InvalidKernargAlignment(required_alignment));
+        }
+        if length == 0 {
+            return Ok(KernargBuffer {
+                pool: self.inner.clone(),
+                pointer: None,
+                length: 0,
+                allocation_size: 0,
+            });
+        }
+        let allocation_size = length
+            .checked_add(granule - 1)
+            .map(|value| value / granule * granule)
+            .ok_or(RuntimeError::KernargSizeOverflow(length))?;
+        let mut pointer = ptr::null_mut();
+        // SAFETY: pool permits runtime allocation and the output pointer is valid.
+        let status = unsafe {
+            (self.inner.runtime.symbols.memory_pool_allocate)(
+                pool,
+                allocation_size,
+                flags,
+                &mut pointer,
+            )
+        };
+        check_status(
+            &self.inner.runtime.symbols,
+            "hsa_amd_memory_pool_allocate(device-local)",
+            status,
+        )?;
+        let pointer = NonNull::new(pointer.cast::<u8>()).ok_or(
+            RuntimeError::InvalidRuntimeObject("device-local allocation returned null"),
+        )?;
+        if pointer.as_ptr() as usize % required_alignment.max(pool_alignment) != 0 {
+            // SAFETY: pointer came from the matching allocation function.
+            let _ =
+                unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            return Err(RuntimeError::KernargAlignmentNotMet {
+                required: required_alignment.max(pool_alignment),
+                address: pointer.as_ptr() as usize,
+            });
+        }
+        // Grant the requested agent access. For a device-local pool the GPU
+        // already owns it; the CPU needs access to build the IB.
+        // SAFETY: allocation came from this pool; flags are reserved (null).
+        let status = unsafe {
+            (self.inner.runtime.symbols.agents_allow_access)(
+                1,
+                &grant,
+                ptr::null(),
+                pointer.as_ptr().cast(),
+            )
+        };
+        if let Err(error) = check_status(
+            &self.inner.runtime.symbols,
+            "hsa_amd_agents_allow_access(device-local)",
+            status,
+        ) {
+            // SAFETY: pointer came from the matching allocation function.
+            let _ =
+                unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            return Err(error);
+        }
+        // SAFETY: pointer owns allocation_size writable bytes (CPU-visible via
+        // the resizable-BAR aperture when device-local).
+        unsafe { ptr::write_bytes(pointer.as_ptr(), 0, allocation_size) };
+        eprintln!(
+            "[redline] retained IB placed DEVICE-LOCAL: {allocation_size} bytes at {:p}",
+            pointer.as_ptr()
+        );
+        Ok(KernargBuffer {
+            pool: self.inner.clone(),
+            pointer: Some(pointer),
+            length,
+            allocation_size,
+        })
     }
 
     fn allocate_bytes(
