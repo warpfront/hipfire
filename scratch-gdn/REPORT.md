@@ -13,6 +13,19 @@
 
 The nonzero differences from landed WT2 come from the upstream beta/alpha fold in this combined stack, not these byte-exact GDN changes. Reproduction: `scratch-gdn/run_wt2.py <gfx1100|gfx1151> <baseline|default>` on hipx. Output/logs: `/home/kaden/hipfire-gdnstack/scratch-gdn/quality/<card>/<tag>/`.
 
+## Integrated pp8192 ROCprof trace
+
+Fresh Q8 VMM serve process per route, warm request then one uncached 8192-token request, one card at a time, both exact levers off versus default on. Both prompt-token counts were 8192 and cached counts were zero, with device and Q8 VMM assertions in each serve log. Times in the kernel columns sum the warm and traced request, so compare paired rows rather than reading them as single-request latency.
+
+| Card | Route | Request wall ms | All GPU kernels ms | GDN prep ms | GDN KKT ms | GDN scan ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| gfx1100 | baseline | 3183.626 | 6268.068 | 79.728 | 48.302 | 161.476 |
+| gfx1100 | default | 3160.997 | 6259.640 | 73.333 | 30.497 | 161.107 |
+| gfx1151 | baseline | 7790.814 | 15545.545 | 311.341 | 73.976 | 482.159 |
+| gfx1151 | default | 7748.976 | 15501.310 | 269.390 | 78.379 | 480.559 |
+
+Wall improved 22.629 ms on gfx1100 and 41.838 ms on gfx1151 in these single pairs; gfx1100 targeted prep+KKT kernel sums improved 24.200 ms, Halo prep improved 41.951 ms. The unchanged Halo KKT fluctuation is not a claimed benefit. Full traces and process/arch/KV assertions: `/home/kaden/hipfire-gdnstack/scratch-gdn/trace/<card>-8192-{baseline,default}/`. These are not ABBA throughput gates; Stacker runs those after merging.
+
 ## Production prefill trace on the isolated lever branch
 
 Uncached pp8192 on Qwen3.8-27B MQ4V2 XT QAT with fresh Q8 VMM daemon and ROCprof, one warm request before the trace request, single stream. On the pre-stack branch, gfx1100 both exact levers off vs both on: request wall 3215.874 → 3192.966 ms; total warm+trace GPU kernel time 6388.84 → 6363.12 ms. The GDN prep kernel sum fell 72.060 → 69.728 ms and KKT fell 48.487 → 31.162 ms; scan changed 161.637 → 160.754 ms. On gfx1151, exact prep off vs exact C64 prep on (C32 forced off): request wall 8269.532 → 8198.379 ms; warm+trace GPU kernel time 16544.88 → 16410.85 ms; prep fell 307.420 → 267.312 ms; KKT 75.010 → 73.200 ms; scan 481.402 → 480.228 ms. ROCprof CSVs, serve logs, request token counts, arch/KV assertions, and pre/post process snapshots are in `/home/kaden/hipfire-gdnprefill/scratch-gdn/trace/{gfx1100-8192,gfx1151-8192}-{baseline,default}/` (Halo exact trace is named `gfx1151-8192-default` on the original C32 opt-in commit). These timings do not assert the integrated stack's ABBA result; Stacker owns that gate.
