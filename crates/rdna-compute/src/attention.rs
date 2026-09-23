@@ -5615,6 +5615,8 @@ impl Gpu {
             ));
         }
         let module = "attention_q8_0_fa2_gqa_gfx11";
+        // The 16-query screen passed on these two exact cards only.
+        let q16_tile = matches!(self.arch.as_str(), "gfx1100" | "gfx1151");
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
         // archs for both K modes; the KT64 path was removed.
@@ -5624,7 +5626,8 @@ impl Gpu {
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx11";
         if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
+                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n{}",
+                u8::from(q16_tile),
                 kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;
@@ -5658,7 +5661,7 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = batch_size.div_ceil(if q16_tile { 16 } else { 8 }) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -5710,7 +5713,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [if q16_tile { 256 } else { 128 }, 1, 1],
             32768,
             &mut params,
             || {
