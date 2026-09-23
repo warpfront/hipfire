@@ -1,0 +1,20 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+scan leg: wmma CS=16 tol=1.0e-2
+   T  CS      out_max      out_p99    dev_ser   dev_scan      cond  notes
+  gated_delta_net_q8_fast: pre-compiled blob has no hash file, recompiling
+ 512  16     8.308e-5     3.157e-5   3.725e-8   8.307e-5     1.325  OK
+      det_max=0.000e0 codes_diff=0.0084 sc_max=3.456e-7 ef_diff=0.9884 commit=ok
+ 100  16     7.974e-5     3.342e-5   3.027e-8   7.972e-5     1.304  OK
+      det_max=0.000e0 codes_diff=0.0079 sc_max=2.775e-7 ef_diff=0.9886 commit=ok
+  64  16     8.018e-5     3.756e-5   4.470e-8   8.014e-5     1.313  OK
+      det_max=0.000e0 codes_diff=0.0093 sc_max=3.349e-7 ef_diff=0.9892 commit=ok
+onehot T=8 CS=16 max_abs=0.000e0 OK
+   serial traj[1]: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+   scan   traj[1]: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+onehot T=64 CS=16 max_abs=0.000e0 OK
+   serial traj[1]: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+   scan   traj[1]: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+info-only warm medians us/launch H=48 T=512: serial=473.3 scan_wmma=4123.9
+Q8 SCAN ORACLE PASS

@@ -1,0 +1,15 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+   T  CS      out_max      out_p99    dev_ser   dev_wmma   dev_valu      cond  notes
+  gated_delta_net_q8_fast: pre-compiled blob has no hash file, recompiling
+ 512  32      1.007e0     4.666e-1   4.470e-8    1.007e0    1.007e0     1.450  FAIL
+      valu_max=1.007e0 det_max=5.969e-2 codes_diff=0.9734 codes_diff_v=0.9733 sc_max=2.468e-3 ef_diff=0.9989 commit=ok
+ 512  16      1.041e0     4.607e-1   3.725e-8    1.041e0    1.041e0     1.325  FAIL
+      valu_max=1.041e0 det_max=6.052e-2 codes_diff=0.9755 codes_diff_v=0.9755 sc_max=1.533e-3 ef_diff=0.9989 commit=ok
+ 100  32     9.236e-1     4.366e-1   2.980e-8   9.236e-1   9.236e-1     1.505  FAIL
+      valu_max=9.236e-1 det_max=0.000e0 codes_diff=0.9918 codes_diff_v=0.9918 sc_max=2.454e-3 ef_diff=0.9998 commit=ok
+  64  16     9.080e-1     4.407e-1   4.470e-8   9.080e-1   9.080e-1     1.313  FAIL
+      valu_max=9.080e-1 det_max=0.000e0 codes_diff=0.9668 codes_diff_v=0.9668 sc_max=2.204e-3 ef_diff=0.9984 commit=ok
+
+info-only warm medians us/launch H=48 T=512: serial=498.1 scan_wmma=5776.5 scan_valu=5740.4
+Q8 SCAN ORACLE FAILED
