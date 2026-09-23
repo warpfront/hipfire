@@ -1,0 +1,25 @@
+2970	gpusentry   	0     	0        	0        	UNKNOWN     	
+device: AMD Radeon 8060S Graphics (gfx1151) CUs=20 schedule=halo launches=16 reps=5
+prod_gfx1151.hsaco                 thr=256 lds= 32768  median    50.537 ms  min    50.054  max    50.764  x1.0000  mismatches=0 nonfinite=0
+v0_gfx1151.hsaco                   thr=256 lds= 32768  median    50.100 ms  min    50.039  max    50.162  x1.0087  mismatches=0 nonfinite=0
+v0u_gfx1151.hsaco                  thr=256 lds= 32768  median    49.982 ms  min    49.489  max    50.372  x1.0111  mismatches=0 nonfinite=0
+abl_noq_gfx1151.hsaco              thr=256 lds= 32768  median    48.888 ms  min    47.836  max    49.574  x1.0337  mismatches=50277014 nonfinite=0
+abl_nofill_gfx1151.hsaco           thr=256 lds= 32768  median    38.230 ms  min    37.928  max    38.370  x1.3219  mismatches=50108114 nonfinite=0
+qres2_gfx1151.hsaco                thr=256 lds= 32768  median    53.002 ms  min    52.266  max    53.552  x0.9535  mismatches=0 nonfinite=0
+qres4_gfx1151.hsaco                thr=256 lds= 32768  median    59.029 ms  min    58.797  max    60.189  x0.8561  mismatches=0 nonfinite=0
+qresx4_gfx1151.hsaco               thr=256 lds= 32768  median    51.307 ms  min    50.896  max    51.873  x0.9850  mismatches=0 nonfinite=0
+qresx8_gfx1151.hsaco               thr=256 lds= 32768  median    58.339 ms  min    57.955  max    58.818  x0.8663  mismatches=0 nonfinite=0
+qpipe1_gfx1151.hsaco               thr=256 lds= 32768  median    52.469 ms  min    52.420  max    52.755  x0.9632  mismatches=0 nonfinite=0
+qpipe2_gfx1151.hsaco               thr=256 lds= 32768  median    54.368 ms  min    54.089  max    54.674  x0.9295  mismatches=0 nonfinite=0
+qpipe1w_gfx1151.hsaco              thr=256 lds= 32768  median    52.832 ms  min    52.560  max    53.409  x0.9566  mismatches=0 nonfinite=0
+vpipe_gfx1151.hsaco                thr=256 lds= 32768  median    61.567 ms  min    61.368  max    62.198  x0.8208  mismatches=0 nonfinite=0
+vpf_gfx1151.hsaco                  thr=256 lds= 32768  median    60.826 ms  min    60.061  max    61.534  x0.8309  mismatches=0 nonfinite=0
+qp1vp_gfx1151.hsaco                thr=256 lds= 32768  median    52.815 ms  min    52.063  max    53.312  x0.9569  mismatches=0 nonfinite=0
+qresx4qp1_gfx1151.hsaco            thr=256 lds= 32768  median    59.856 ms  min    58.990  max    60.358  x0.8443  mismatches=0 nonfinite=0
+codesk_gfx1151.hsaco               thr=256 lds= 25088  median    54.404 ms  min    54.046  max    55.054  x0.9289  mismatches=0 nonfinite=0
+codesv_gfx1151.hsaco               thr=256 lds= 25088  median    67.390 ms  min    67.082  max    68.485  x0.7499  mismatches=0 nonfinite=0
+codeskv_gfx1151.hsaco              thr=256 lds= 17408  median    71.370 ms  min    69.952  max    71.993  x0.7081  mismatches=0 nonfinite=0
+nohelp_gfx1151.hsaco               thr=192 lds= 32768  median    56.639 ms  min    55.726  max    57.608  x0.8923  mismatches=0 nonfinite=0
+nohelpqp1_gfx1151.hsaco            thr=192 lds= 32768  median    61.722 ms  min    60.678  max    62.922  x0.8188  mismatches=0 nonfinite=0
+nohelpcodeskv_gfx1151.hsaco        thr=192 lds= 17408  median    66.536 ms  min    66.107  max    67.498  x0.7595  mismatches=0 nonfinite=0
+2970	gpusentry   	0     	0        	0        	UNKNOWN     	

@@ -1,0 +1,34 @@
+device: AMD Radeon RX 7900 XTX (gfx1100) CUs=48 schedule=odd launches=5 reps=3
+prod_gfx1100.hsaco                 thr=256 lds= 32768  median     6.089 ms  min     5.861  max     6.299  x1.0000  mismatches=0 nonfinite=0
+v0_gfx1100.hsaco                   thr=256 lds= 32768  median     6.011 ms  min     5.763  max     6.178  x1.0129  mismatches=0 nonfinite=0
+v0u_gfx1100.hsaco                  thr=256 lds= 32768  median     5.954 ms  min     5.875  max     6.241  x1.0227  mismatches=0 nonfinite=0
+qpipe1_gfx1100.hsaco               thr=256 lds= 32768  median     5.975 ms  min     5.829  max     6.154  x1.0191  mismatches=0 nonfinite=0
+codeskv_gfx1100.hsaco              thr=256 lds= 17408  median     7.736 ms  min     7.655  max     7.905  x0.7870  mismatches=0 nonfinite=0
+abl_noq_gfx1100.hsaco              thr=256 lds= 32768  median     5.457 ms  min     5.248  max     5.677  x1.1158  mismatches=10896969 nonfinite=0
+device: AMD Radeon RX 7900 XTX (gfx1100) CUs=48 schedule=xtx launches=1 reps=7
+prod_gfx1100.hsaco                 thr=256 lds= 32768  median    20.846 ms  min    19.800  max    22.151  x1.0000  mismatches=0 nonfinite=0
+v0_gfx1100.hsaco                   thr=256 lds= 32768  median    21.186 ms  min    20.317  max    22.319  x0.9839  mismatches=0 nonfinite=0
+v0u_gfx1100.hsaco                  thr=256 lds= 32768  median    20.967 ms  min    19.687  max    21.727  x0.9942  mismatches=0 nonfinite=0
+abl_noq_gfx1100.hsaco              thr=256 lds= 32768  median    18.584 ms  min    17.939  max    19.224  x1.1217  mismatches=50277014 nonfinite=0
+abl_nofill_gfx1100.hsaco           thr=256 lds= 32768  median    14.723 ms  min    14.169  max    15.232  x1.4159  mismatches=50108114 nonfinite=0
+qres2_gfx1100.hsaco                thr=256 lds= 32768  median    20.942 ms  min    20.509  max    21.938  x0.9954  mismatches=0 nonfinite=0
+qres4_gfx1100.hsaco                thr=256 lds= 32768  median    23.831 ms  min    22.238  max    26.216  x0.8747  mismatches=0 nonfinite=0
+qresx4_gfx1100.hsaco               thr=256 lds= 32768  median    20.996 ms  min    20.214  max    21.542  x0.9929  mismatches=0 nonfinite=0
+qresx8_gfx1100.hsaco               thr=256 lds= 32768  median    22.879 ms  min    21.565  max    25.697  x0.9111  mismatches=0 nonfinite=0
+qpipe1_gfx1100.hsaco               thr=256 lds= 32768  median    21.710 ms  min    20.451  max    22.248  x0.9602  mismatches=0 nonfinite=0
+qpipe2_gfx1100.hsaco               thr=256 lds= 32768  median    22.245 ms  min    21.945  max    22.442  x0.9371  mismatches=0 nonfinite=0
+qpipe1w_gfx1100.hsaco              thr=256 lds= 32768  median    21.567 ms  min    21.071  max    22.141  x0.9666  mismatches=0 nonfinite=0
+vpipe_gfx1100.hsaco                thr=256 lds= 32768  median    23.818 ms  min    23.142  max    27.015  x0.8752  mismatches=0 nonfinite=0
+vpf_gfx1100.hsaco                  thr=256 lds= 32768  median    23.952 ms  min    23.608  max    25.198  x0.8703  mismatches=0 nonfinite=0
+qp1vp_gfx1100.hsaco                thr=256 lds= 32768  median    20.846 ms  min    20.269  max    21.397  x1.0000  mismatches=0 nonfinite=0
+qp1vpf_gfx1100.hsaco               thr=256 lds= 32768  median    23.423 ms  min    23.118  max    23.954  x0.8900  mismatches=0 nonfinite=0
+qp1wvpf_gfx1100.hsaco              thr=256 lds= 32768  median    23.738 ms  min    23.212  max    24.084  x0.8782  mismatches=0 nonfinite=0
+qresx4qp1_gfx1100.hsaco            thr=256 lds= 32768  median    22.561 ms  min    21.691  max    25.674  x0.9240  mismatches=0 nonfinite=0
+codesk_gfx1100.hsaco               thr=256 lds= 25088  median    22.366 ms  min    21.560  max    23.384  x0.9320  mismatches=0 nonfinite=0
+codesv_gfx1100.hsaco               thr=256 lds= 25088  median    26.247 ms  min    25.352  max    29.119  x0.7942  mismatches=0 nonfinite=0
+codeskv_gfx1100.hsaco              thr=256 lds= 17408  median    28.482 ms  min    26.621  max    30.479  x0.7319  mismatches=0 nonfinite=0
+codeskvqp1_gfx1100.hsaco           thr=256 lds= 17408  median    28.180 ms  min    25.457  max    29.480  x0.7397  mismatches=0 nonfinite=0
+nohelp_gfx1100.hsaco               thr=192 lds= 32768  median    21.810 ms  min    21.632  max    23.235  x0.9558  mismatches=0 nonfinite=0
+nohelpqp1_gfx1100.hsaco            thr=192 lds= 32768  median    23.528 ms  min    23.259  max    24.189  x0.8860  mismatches=0 nonfinite=0
+nohelpqp1vp_gfx1100.hsaco          thr=192 lds= 32768  median    24.837 ms  min    23.651  max    26.278  x0.8393  mismatches=0 nonfinite=0
+nohelpcodeskv_gfx1100.hsaco        thr=192 lds= 17408  median    26.026 ms  min    24.629  max    26.228  x0.8010  mismatches=0 nonfinite=0
