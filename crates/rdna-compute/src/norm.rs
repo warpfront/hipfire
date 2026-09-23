@@ -4804,10 +4804,11 @@ impl Gpu {
             && hipfire_config::developer_var("HIPFIRE_GDN_PREP_GFX11").as_deref() != Ok("0")
     }
 
+    /// Halo C32 GDN scan; disable for exact C64 A/B via `HIPFIRE_GDN_C32=0`.
     #[cfg(feature = "deltanet")]
     fn gdn_chunk_c32_gfx1151(&self) -> bool {
         self.arch == "gfx1151"
-            && hipfire_config::developer_var("HIPFIRE_GDN_C32").as_deref() == Ok("1")
+            && hipfire_config::developer_var("HIPFIRE_GDN_C32").as_deref() != Ok("0")
     }
 
     #[cfg(feature = "deltanet")]

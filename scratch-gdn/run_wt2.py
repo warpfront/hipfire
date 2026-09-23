@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WT2 c24 Q8/Q8 for exact gfx11 GDN and optional Halo C32."""
+"""WT2 c24 Q8/Q8 for gfx11 GDN exact C64 and Halo C32 routes."""
 import hashlib
 import os
 from pathlib import Path
@@ -9,8 +9,8 @@ import sys
 
 arch, tag = sys.argv[1:3]
 assert arch in ('gfx1100', 'gfx1151')
-assert tag in ('baseline', 'default', 'c32')
-assert tag != 'c32' or arch == 'gfx1151'
+assert tag in ('baseline', 'default', 'c32', 'c64')
+assert arch == 'gfx1151' or tag not in ('c32', 'c64')
 root = Path('/home/kaden/hipfire-gdnprefill')
 out = root / 'scratch-gdn' / 'quality' / arch / tag
 out.mkdir(parents=True, exist_ok=True)
@@ -23,6 +23,8 @@ env.update(HOME=str(out/'home'), XDG_CONFIG_HOME=str(out/'home'/'.config'),
            HIPFIRE_GRAPH='0', HIPFIRE_NORMALIZE_PROMPT='0')
 if tag == 'baseline':
     env.update(HIPFIRE_GDN_PREP_GFX11='0', HIPFIRE_GDN_KKT_GFX1100='0', HIPFIRE_GDN_C32='0')
+if tag == 'c64':
+    env['HIPFIRE_GDN_C32'] = '0'
 if tag == 'c32':
     env['HIPFIRE_GDN_C32'] = '1'
 Path(env['HOME']).mkdir(parents=True, exist_ok=True)
@@ -46,7 +48,7 @@ digest = hashlib.sha256((out/'score.kldseq').read_bytes()).hexdigest()
 print(f'{arch} {tag} WT2 c24 score={score:.6f} baseline={reference:.6f} delta={score-reference:+.6f} sha256={digest}', flush=True)
 if score > reference + 0.0005:
     raise RuntimeError(f'{tag} WT2 exceeded tolerance')
-if tag != 'c32':
+if tag in ('baseline', 'c64') or arch == 'gfx1100':
     pinned = Path('/home/kaden/hipfire-v2bhalo/scratch-v2bhalo') / arch / 'wt2' / 'land042-B.kldseq'
     if pinned.exists() and pinned.read_bytes() != (out/'score.kldseq').read_bytes():
         raise RuntimeError(f'{tag} exact WT2 sequence differs from pinned baseline')
