@@ -1,0 +1,44 @@
+off-after-edit.hip:135:1: remark: Function Name: quantize_int4_mmq_ds128 [-Rpass-analysis=kernel-resource-usage]
+  135 | ) {
+      | ^
+off-after-edit.hip:135:1: remark:     TotalSGPRs: 14 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     VGPRs: 36 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:135:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4 [-Rpass-analysis=kernel-resource-usage]
+  843 | ) {
+      | ^
+off-after-edit.hip:843:1: remark:     TotalSGPRs: 43 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     VGPRs: 202 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:843:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_add [-Rpass-analysis=kernel-resource-usage]
+  857 | ) {
+      | ^
+off-after-edit.hip:857:1: remark:     TotalSGPRs: 40 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     VGPRs: 202 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:857:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_set [-Rpass-analysis=kernel-resource-usage]
+  867 | ) {
+      | ^
+off-after-edit.hip:867:1: remark:     TotalSGPRs: 40 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     VGPRs: 202 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+off-after-edit.hip:867:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

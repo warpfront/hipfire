@@ -1,0 +1,117 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_add
+CACHE_PATH /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201
+  cached: tmp_iu4_gfx12_oracle.e2ce9dad44ab78ea.hip
+  cached: tmp_iu4_gfx12_oracle.2e97be91cd66ae43.hsaco
+  cached: tmp_iu4_gfx12_oracle.b40e1fbeafd59715.hash
+  cached: tmp_iu4_gfx12_oracle.df3fa3b73fbf4483.hash
+  cached: tmp_iu4_gfx12_oracle.5566004015a26501.hash
+  cached: tmp_iu4_gfx12_oracle.1e8f2b383d383a99.hsaco
+  cached: tmp_iu4_gfx12_oracle.df3fa3b73fbf4483.hip
+  cached: tmp_iu4_gfx12_oracle.b40e1fbeafd59715.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.e2ce9dad44ab78ea.hsaco
+  cached: tmp_iu4_gfx12_oracle.7b162fa5de5a1b18.hip
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.hip
+  cached: tmp_iu4_gfx12_oracle.da65561a5aefe394.hash
+  cached: tmp_iu4_gfx12_oracle.7b162fa5de5a1b18.hsaco
+  cached: tmp_iu4_gfx12_oracle.8fc289c7afbaad31.hash
+  cached: tmp_iu4_gfx12_oracle.2e97be91cd66ae43.hash
+  cached: tmp_iu4_gfx12_oracle.81a1417e6ae305cd.hip
+  cached: tmp_iu4_gfx12_oracle.64b4b473872c924b.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.3271eb5c00362293.hsaco
+  cached: tmp_iu4_gfx12_oracle.e2ce9dad44ab78ea.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.b673e70b0ffc2258.hash
+  cached: tmp_iu4_gfx12_oracle.da65561a5aefe394.hsaco
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.hsaco
+  cached: tmp_iu4_gfx12_oracle.b40e1fbeafd59715.hsaco
+  cached: tmp_iu4_gfx12_oracle.e9175e1eb2e29f4f.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.b625704a171ef159.hash
+  cached: tmp_iu4_gfx12_oracle.ead0c3949d7becd4.hip
+  cached: tmp_iu4_gfx12_oracle.198237a0e227e3cb.hsaco
+  cached: tmp_iu4_gfx12_oracle.8fc289c7afbaad31.hsaco
+  cached: tmp_iu4_gfx12_oracle.fd681b01e9883ece.hash
+  cached: tmp_iu4_gfx12_oracle.236e0f18350a84a0.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.81a1417e6ae305cd.hash
+  cached: tmp_iu4_gfx12_oracle.81a1417e6ae305cd.hsaco
+  cached: tmp_iu4_gfx12_oracle.2e97be91cd66ae43.hip
+  cached: tmp_iu4_gfx12_oracle.e9175e1eb2e29f4f.hash
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.db007664d8b86cd0.hash
+  cached: tmp_iu4_gfx12_oracle.e9175e1eb2e29f4f.hsaco
+  cached: tmp_iu4_gfx12_oracle.0ce5f91e6673f86e.hip
+  cached: tmp_iu4_gfx12_oracle.b625704a171ef159.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.fd681b01e9883ece.hip
+  cached: tmp_iu4_gfx12_oracle.9dd9f4ab5328016f.hash
+  cached: tmp_iu4_gfx12_oracle.236e0f18350a84a0.hash
+  cached: tmp_iu4_gfx12_oracle.3271eb5c00362293.hip
+  cached: tmp_iu4_gfx12_oracle.64b4b473872c924b.hsaco
+  cached: tmp_iu4_gfx12_oracle.c2389589fa0b15e7.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.db007664d8b86cd0.hip
+  cached: tmp_iu4_gfx12_oracle.0ce5f91e6673f86e.hash
+  cached: tmp_iu4_gfx12_oracle.64b4b473872c924b.hash
+  cached: tmp_iu4_gfx12_oracle.81a1417e6ae305cd.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.198237a0e227e3cb.hash
+  cached: tmp_iu4_gfx12_oracle.da65561a5aefe394.hip
+  cached: tmp_iu4_gfx12_oracle.9dd9f4ab5328016f.hsaco
+  cached: tmp_iu4_gfx12_oracle.c2389589fa0b15e7.hsaco
+  cached: tmp_iu4_gfx12_oracle.ead0c3949d7becd4.hash
+  cached: tmp_iu4_gfx12_oracle.64b4b473872c924b.hip
+  cached: tmp_iu4_gfx12_oracle.ead0c3949d7becd4.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.hsaco
+  cached: tmp_iu4_gfx12_oracle.e9175e1eb2e29f4f.hip
+  cached: tmp_iu4_gfx12_oracle.2e97be91cd66ae43.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.5566004015a26501.hip
+  cached: tmp_iu4_gfx12_oracle.5566004015a26501.hsaco
+  cached: tmp_iu4_gfx12_oracle.5566004015a26501.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.8fc289c7afbaad31.hip
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.hip
+  cached: tmp_iu4_gfx12_oracle.b40e1fbeafd59715.hip
+  cached: tmp_iu4_gfx12_oracle.3271eb5c00362293.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.1e8f2b383d383a99.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.c2389589fa0b15e7.hip
+  cached: tmp_iu4_gfx12_oracle.b673e70b0ffc2258.hip
+  cached: tmp_iu4_gfx12_oracle.3271eb5c00362293.hash
+  cached: tmp_iu4_gfx12_oracle.0ce5f91e6673f86e.hsaco
+  cached: tmp_iu4_gfx12_oracle.df3fa3b73fbf4483.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.hash
+  cached: tmp_iu4_gfx12_oracle.b625704a171ef159.hsaco
+  cached: tmp_iu4_gfx12_oracle.198237a0e227e3cb.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.0ce5f91e6673f86e.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.9dd9f4ab5328016f.hip
+  cached: tmp_iu4_gfx12_oracle.1e8f2b383d383a99.hip
+  cached: tmp_iu4_gfx12_oracle.1e8f2b383d383a99.hash
+  cached: tmp_iu4_gfx12_oracle.b625704a171ef159.hip
+  cached: tmp_iu4_gfx12_oracle.c2389589fa0b15e7.hash
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.9dd9f4ab5328016f.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.fd681b01e9883ece.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.fd681b01e9883ece.hsaco
+  cached: tmp_iu4_gfx12_oracle.da65561a5aefe394.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.7b162fa5de5a1b18.hash
+  cached: tmp_iu4_gfx12_oracle.8fc289c7afbaad31.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.ead0c3949d7becd4.hsaco
+  cached: tmp_iu4_gfx12_oracle.b673e70b0ffc2258.hsaco
+  cached: tmp_iu4_gfx12_oracle.e2ce9dad44ab78ea.hash
+  cached: tmp_iu4_gfx12_oracle.db007664d8b86cd0.hsaco
+  cached: tmp_iu4_gfx12_oracle.b673e70b0ffc2258.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.db007664d8b86cd0.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.df3fa3b73fbf4483.hsaco
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.hash
+  cached: tmp_iu4_gfx12_oracle.236e0f18350a84a0.hip
+  cached: tmp_iu4_gfx12_oracle.7b162fa5de5a1b18.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.236e0f18350a84a0.hsaco
+  cached: tmp_iu4_gfx12_oracle.198237a0e227e3cb.hip
+loaded gate_proj 17408x5120  down_proj 5120x17408
+gate/set: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=3.6962e-1 mean_abs=2.5582e-2 p99.9=1.2760e-1 max_rel=1.5106e-1] PASS
+gate/add: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=3.8478e-1 mean_abs=2.5581e-2 p99.9=1.2765e-1 max_rel=1.3630e-1] PASS
+down/set: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=3.1350e0 mean_abs=5.3300e-2 p99.9=2.6006e-1 max_rel=6.3647e-1] PASS
+down/add: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=3.9325e0 mean_abs=5.3359e-2 p99.9=2.6191e-1 max_rel=8.0395e-1] PASS
+m48tail/set: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=2.4701e0 mean_abs=4.0315e-1 p99.9=1.9584e0 max_rel=7.4082e-2] PASS
+n80cols/set: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[n/a] PASS
+k256/set: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=1.3023e0 mean_abs=1.9182e-1 p99.9=9.2531e-1 max_rel=5.1106e-2] PASS
+k256/add: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[max_abs=1.3148e0 mean_abs=1.9351e-1 p99.9=9.3193e-1 max_rel=7.0922e-2] PASS
+m100n100/set: cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) fp8[n/a] PASS
+GFX12-IU4 ORACLE PASS

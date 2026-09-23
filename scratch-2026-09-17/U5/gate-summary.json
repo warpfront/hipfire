@@ -1,0 +1,179 @@
+{
+  "unit": "U5",
+  "baseline_resource": {
+    "vgpr": 202,
+    "waves_per_simd": 7,
+    "vgpr_spills": 0,
+    "scratch_bytes_per_lane": 0
+  },
+  "banners": {
+    "kv_cache": "Fp8",
+    "prefill_chunk_requested": 4096
+  },
+  "binary_md5": {
+    "target/release/hipfire": "a5bd367c5a8a2f5dfcb729816ef3822a",
+    "target/release/daemon": "c74f3d63a6dfd2025f1b281d87b7697b"
+  },
+  "baseline_raw_json": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/baseline_rebuilt.json",
+  "variants": {
+    "waves8": {
+      "verdict": "KILL_COMPILE",
+      "resource": {
+        "vgpr": 202,
+        "waves_per_simd": 7,
+        "vgpr_spills": 0,
+        "scratch_bytes_per_lane": 0
+      },
+      "reason": "attribute did not reduce 202 VGPR or increase 7-wave occupancy",
+      "build_log": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/waves8.build.log"
+    },
+    "sched_max_ilp": {
+      "verdict": "KILL_COMPILE",
+      "resource": {
+        "vgpr": 256,
+        "waves_per_simd": 5,
+        "vgpr_spills": 29,
+        "scratch_bytes_per_lane": 112
+      },
+      "reason": "full_set/add spills and scratch; generic entry 64 VGPR spills/132 B scratch",
+      "build_log": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/sched-ilp-baseline.build.log"
+    },
+    "sched_max_memory_clause": {
+      "verdict": "KILL",
+      "resource": {
+        "vgpr": 202,
+        "waves_per_simd": 7,
+        "vgpr_spills": 0,
+        "scratch_bytes_per_lane": 0
+      },
+      "oracle": {
+        "result": "PASS",
+        "rows_passed": 9,
+        "rows_total": 9,
+        "path": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/oracle-sched-memory.log"
+      },
+      "row": {
+        "prefill_tok_s": {
+          "512": 2245.2,
+          "2048": 2315.4,
+          "8192": 2230.2,
+          "32768": 1881.0
+        },
+        "decode_tok_s": 36.76035429516891
+      },
+      "comparison": {
+        "baseline": "baseline_u2",
+        "candidate": "sched_memory",
+        "prefill_delta_pct": {
+          "512": -1.2360885056965754,
+          "2048": -1.2074924265050857,
+          "8192": -1.1436170212765995,
+          "32768": -0.9582982308340426
+        },
+        "decode_delta_pct": 0.7366266099597008,
+        "decode_abs_delta_pct": 0.7366266099597008,
+        "pair_decode_within_1pct": true
+      },
+      "reason": "all pp rows slower; pp512/2048/8192 exceed 1% regression cap",
+      "raw_json": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/sched_memory.json",
+      "raw_log": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/timed-sched-memory.log",
+      "build_log": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/sched-memory-baseline.build.log"
+    },
+    "weight_prefetch": {
+      "verdict": "KILL",
+      "resource": {
+        "vgpr": 202,
+        "waves_per_simd": 7,
+        "vgpr_spills": 0,
+        "scratch_bytes_per_lane": 0
+      },
+      "isa": "one s_prefetch_data immediate=1 per specialized entry; wait counts unchanged",
+      "oracle": {
+        "result": "PASS",
+        "rows_passed": 9,
+        "rows_total": 9,
+        "path": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/oracle-prefetch-rebuilt.log"
+      },
+      "warmed_paired_ab1": {
+        "pair_1": {
+          "baseline_prefill_tok_s": [2291.5, 2368.2, 2276.0, 1908.9],
+          "candidate_prefill_tok_s": [2283.8, 2355.3, 2266.4, 1906.4],
+          "prefill_delta_pct": [-0.3360244381409472, -0.5447175069673071, -0.4217926186291687, -0.13096547750013343],
+          "baseline_decode_tok_s": 36.5401992917428,
+          "candidate_decode_tok_s": 36.5257136352696,
+          "decode_delta_pct": -0.039643069151185095,
+          "decode_within_1pct": true
+        },
+        "pair_2": {
+          "baseline_prefill_tok_s": [2295.3, 2370.8, 2281.3, 1908.6],
+          "candidate_prefill_tok_s": [2279.9, 2353.0, 2264.6, 1905.3],
+          "prefill_delta_pct": [-0.6709362610551994, -0.7508014172431299, -0.7320387498356284, -0.17290160326941528],
+          "baseline_decode_tok_s": 36.5533055469764,
+          "candidate_decode_tok_s": 36.53507095653097,
+          "decode_delta_pct": -0.04988492879799411,
+          "decode_within_1pct": true
+        }
+      },
+      "reason": "both warmed ordinal-1 pairs regress pp8192 and remain below the +1.5% ship threshold",
+      "paired_summary": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/ab1-warmed-paired-summary.json",
+      "invalidated_prior_timing": {
+        "path": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/timed-prefetch-rebuilt.log",
+        "status": "INVALID_COLD_ROUTE"
+      }
+    },
+    "weight_cpol20": {
+      "verdict": "INVALID_DECODE_PAIR",
+      "resource": {
+        "vgpr": 204,
+        "waves_per_simd": 7,
+        "vgpr_spills": 0,
+        "scratch_bytes_per_lane": 0
+      },
+      "isa": "weight-only buffer_load_b32/b64 encode TH_LOAD_NT_RT SCOPE_DEV",
+      "oracle": {
+        "result": "PASS",
+        "rows_passed": 9,
+        "rows_total": 9,
+        "path": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/oracle-cpol20.log"
+      },
+      "warmed_paired_ab1": {
+        "pair_1": {
+          "baseline_prefill_tok_s": [2294.0, 2364.0, 2277.3, 1909.4],
+          "candidate_prefill_tok_s": [1515.3, 1622.6, 1590.8, 1401.4],
+          "prefill_delta_pct": [-33.94507410636442, -31.362098138747886, -30.145347560707858, -26.605216298313607],
+          "baseline_decode_tok_s": 36.51524310936837,
+          "candidate_decode_tok_s": 35.48188544328112,
+          "decode_delta_pct": -2.829935057510624,
+          "decode_within_1pct": false
+        },
+        "pair_2": {
+          "baseline_prefill_tok_s": [2294.2, 2367.7, 2281.0, 1909.8],
+          "candidate_prefill_tok_s": [1514.9, 1621.9, 1589.9, 1401.4],
+          "prefill_delta_pct": [-33.96826780577107, -31.49892300544832, -30.29811486190267, -26.620588543302958],
+          "baseline_decode_tok_s": 36.5311264724574,
+          "candidate_decode_tok_s": 35.51835899356439,
+          "decode_delta_pct": -2.772341224288788,
+          "decode_within_1pct": false
+        }
+      },
+      "reason": "both warmed ordinal-1 pairs fail the required 1% decode pairing gate; no performance verdict is valid",
+      "paired_summary": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/ab1-warmed-paired-summary.json",
+      "invalidated_prior_timing": {
+        "path": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/timed-cpol20-rebuilt.log",
+        "status": "INVALID_COLD_ROUTE"
+      }
+    }
+  },
+  "isa_census": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/isa-census.json",
+  "compile_screen": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/compile-screen.json",
+  "baseline_row": {
+    "prefill_tok_s": {
+      "512": 2276.4,
+      "2048": 2340.9,
+      "8192": 2233.5,
+      "32768": 1896.0
+    },
+    "decode_tok_s": 36.42094548702781
+  },
+  "note": "Authoritative prefetch timing is the warmed ordinal-1 B/P/B/P sequence. CPOL20 remains invalid because neither warmed ordinal-1 B/C pair satisfies the 1% decode pairing gate. Earlier rebuilt rows are explicitly invalidated as cold-route measurements."
+}

@@ -1,0 +1,70 @@
+{
+  "unit": "U2",
+  "variant": "HIPFIRE_IU4_SCHED_GROUPS=1",
+  "verdict": "KILL",
+  "reason": "pp8192 failed +1.5% ship threshold",
+  "resources": {
+    "baseline": {
+      "vgpr": 202,
+      "waves_per_simd": 7,
+      "vgpr_spills": 0,
+      "scratch_bytes_per_lane": 0
+    },
+    "groups": {
+      "vgpr": 202,
+      "waves_per_simd": 7,
+      "vgpr_spills": 0,
+      "scratch_bytes_per_lane": 0
+    }
+  },
+  "exact_oracle": {
+    "result": "PASS",
+    "rows_passed": 9,
+    "rows_total": 9,
+    "path": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/oracle-groups.log"
+  },
+  "baseline": {
+    "prefill_tok_s": {
+      "512": 2273.3,
+      "2048": 2343.7,
+      "8192": 2256.0,
+      "32768": 1899.2
+    },
+    "decode_tok_s": 36.49154784336848
+  },
+  "groups": {
+    "prefill_tok_s": {
+      "512": 2261.1,
+      "2048": 2338.1,
+      "8192": 2250.3,
+      "32768": 1896.2
+    },
+    "decode_tok_s": 36.429092405250294
+  },
+  "prefill_delta_pct": {
+    "512": -0.5366647604803654,
+    "2048": -0.23893843068651943,
+    "8192": -0.25265957446807263,
+    "32768": -0.1579612468407765
+  },
+  "decode_delta_pct": -0.17115042197239916,
+  "decode_abs_delta_pct": 0.17115042197239916,
+  "pair_decode_within_1pct": true,
+  "banners": {
+    "kv_cache": "Fp8",
+    "prefill_chunk_requested": 4096
+  },
+  "binary_md5": {
+    "target/release/hipfire": "2440bd5a69be071983e2bdacd677d16c",
+    "target/release/daemon": "4d78093f77ba45d99b46af1a5d069b98"
+  },
+  "raw_json": {
+    "baseline": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/timed-baseline.json",
+    "groups": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/timed-groups.json"
+  },
+  "raw_logs": {
+    "baseline": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/timed-baseline.log",
+    "groups": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/timed-groups.log"
+  },
+  "isa_census": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U2/isa-census.json"
+}

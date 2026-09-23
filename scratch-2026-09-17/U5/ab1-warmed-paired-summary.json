@@ -1,0 +1,54 @@
+{
+  "ordinal": 1,
+  "home": "/home/kaden/.hipfire-homes/ab1",
+  "warmup_routes": {
+    "baseline": "warm-baseline-ab1.log",
+    "cpol20": "warm-cpol20-ab1.log",
+    "prefetch": "warm-prefetch-ab1.log"
+  },
+  "cpol20": {
+    "verdict": "INVALID_DECODE_PAIR",
+    "pair_1": {
+      "baseline": {"prefill_tok_s": [2294.0, 2364.0, 2277.3, 1909.4], "decode_tok_s": 36.51524310936837},
+      "candidate": {"prefill_tok_s": [1515.3, 1622.6, 1590.8, 1401.4], "decode_tok_s": 35.48188544328112},
+      "prefill_delta_pct": [-33.94507410636442, -31.362098138747886, -30.145347560707858, -26.605216298313607],
+      "decode_delta_pct": -2.829935057510624,
+      "decode_within_1pct": false
+    },
+    "pair_2": {
+      "baseline": {"prefill_tok_s": [2294.2, 2367.7, 2281.0, 1909.8], "decode_tok_s": 36.5311264724574},
+      "candidate": {"prefill_tok_s": [1514.9, 1621.9, 1589.9, 1401.4], "decode_tok_s": 35.51835899356439},
+      "prefill_delta_pct": [-33.96826780577107, -31.49892300544832, -30.29811486190267, -26.620588543302958],
+      "decode_delta_pct": -2.772341224288788,
+      "decode_within_1pct": false
+    },
+    "logs": ["ab1-cpol-baseline-1.log", "ab1-cpol-candidate-1.log", "ab1-cpol-baseline-2.log", "ab1-cpol-candidate-2.log"]
+  },
+  "prefetch": {
+    "verdict": "KILL",
+    "pair_1": {
+      "baseline": {"prefill_tok_s": [2291.5, 2368.2, 2276.0, 1908.9], "decode_tok_s": 36.5401992917428},
+      "candidate": {"prefill_tok_s": [2283.8, 2355.3, 2266.4, 1906.4], "decode_tok_s": 36.5257136352696},
+      "prefill_delta_pct": [-0.3360244381409472, -0.5447175069673071, -0.4217926186291687, -0.13096547750013343],
+      "decode_delta_pct": -0.039643069151185095,
+      "decode_within_1pct": true
+    },
+    "pair_2": {
+      "baseline": {"prefill_tok_s": [2295.3, 2370.8, 2281.3, 1908.6], "decode_tok_s": 36.5533055469764},
+      "candidate": {"prefill_tok_s": [2279.9, 2353.0, 2264.6, 1905.3], "decode_tok_s": 36.53507095653097},
+      "prefill_delta_pct": [-0.6709362610551994, -0.7508014172431299, -0.7320387498356284, -0.17290160326941528],
+      "decode_delta_pct": -0.04988492879799411,
+      "decode_within_1pct": true
+    },
+    "average": {
+      "baseline_prefill_tok_s": [2293.4, 2369.5, 2278.65, 1908.75],
+      "candidate_prefill_tok_s": [2281.85, 2354.15, 2265.5, 1905.85],
+      "prefill_delta_pct": [-0.503619080840656, -0.647815994935641, -0.5770960875957298, -0.15193189259987694],
+      "baseline_decode_tok_s": 36.5467524193596,
+      "candidate_decode_tok_s": 36.530392295900285,
+      "decode_delta_pct": -0.0447649171986253
+    },
+    "logs": ["ab1-prefetch-baseline-1.log", "ab1-prefetch-candidate-1.log", "ab1-prefetch-baseline-2.log", "ab1-prefetch-candidate-2.log"]
+  },
+  "invalidated_prior_rows": ["timed-prefetch-rebuilt.log", "timed-cpol20-rebuilt.log"]
+}

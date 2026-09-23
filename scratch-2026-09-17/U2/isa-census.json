@@ -1,0 +1,200 @@
+{
+  "default_off_function_bodies_identical": {
+    "gemm_mq4g256v2_residual_mmq_iu4": true,
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": true,
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": true
+  },
+  "baseline": {
+    "gemm_mq4g256v2_residual_mmq_iu4": {
+      "ds_load_2addr_b64": 10,
+      "iu4_wmma": 64,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 74,
+      "wait_dscnt_nonzero": 8
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 5,
+      "wait_dscnt_nonzero": 4
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 69,
+      "wait_dscnt_nonzero": 4
+    }
+  },
+  "u2_groups": {
+    "gemm_mq4g256v2_residual_mmq_iu4": {
+      "ds_load_2addr_b64": 24,
+      "iu4_wmma": 64,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 68,
+      "wait_dscnt_nonzero": 2
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": {
+      "ds_load_2addr_b64": 12,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 2,
+      "wait_dscnt_nonzero": 1
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": {
+      "ds_load_2addr_b64": 12,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 66,
+      "wait_dscnt_nonzero": 1
+    }
+  },
+  "u5_prefetch": {
+    "gemm_mq4g256v2_residual_mmq_iu4": {
+      "ds_load_2addr_b64": 10,
+      "iu4_wmma": 64,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 2,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 74,
+      "wait_dscnt_nonzero": 8
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 1,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 5,
+      "wait_dscnt_nonzero": 4
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 1,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 69,
+      "wait_dscnt_nonzero": 4
+    }
+  },
+  "u5_cpol20": {
+    "gemm_mq4g256v2_residual_mmq_iu4": {
+      "ds_load_2addr_b64": 10,
+      "iu4_wmma": 64,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 16,
+      "wait_dscnt_0": 74,
+      "wait_dscnt_nonzero": 8
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 8,
+      "wait_dscnt_0": 5,
+      "wait_dscnt_nonzero": 4
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 8,
+      "wait_dscnt_0": 69,
+      "wait_dscnt_nonzero": 4
+    }
+  },
+  "u5_sched_memory": {
+    "gemm_mq4g256v2_residual_mmq_iu4": {
+      "ds_load_2addr_b64": 24,
+      "iu4_wmma": 64,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 66,
+      "wait_dscnt_nonzero": 5
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": {
+      "ds_load_2addr_b64": 12,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 1,
+      "wait_dscnt_nonzero": 3
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": {
+      "ds_load_2addr_b64": 12,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 65,
+      "wait_dscnt_nonzero": 3
+    }
+  },
+  "u5_sched_memory_clean": {
+    "gemm_mq4g256v2_residual_mmq_iu4": {
+      "ds_load_2addr_b64": 10,
+      "iu4_wmma": 64,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 74,
+      "wait_dscnt_nonzero": 8
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 5,
+      "wait_dscnt_nonzero": 4
+    },
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set": {
+      "ds_load_2addr_b64": 5,
+      "iu4_wmma": 32,
+      "sched_group_barrier": 0,
+      "sched_barrier": 0,
+      "prefetch_data": 0,
+      "cpol_nt_rt_loads": 0,
+      "wait_dscnt_0": 69,
+      "wait_dscnt_nonzero": 4
+    }
+  },
+  "u5_sched_memory_with_failed_u2_groups_note": "superseded; retained only as experimental artifact"
+}

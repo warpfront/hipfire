@@ -1,0 +1,61 @@
+{
+  "binaries_md5": {
+    "target/release/hipfire": "2440bd5a69be071983e2bdacd677d16c",
+    "target/release/daemon": "4d78093f77ba45d99b46af1a5d069b98"
+  },
+  "baseline": {
+    "vgpr": 202,
+    "waves_per_simd": 7,
+    "scratch_bytes_per_lane": 0,
+    "vgpr_spills": 0
+  },
+  "u2_groups": {
+    "vgpr": 202,
+    "waves_per_simd": 7,
+    "scratch_bytes_per_lane": 0,
+    "vgpr_spills": 0,
+    "screen": "PASS"
+  },
+  "u5_waves8": {
+    "vgpr": 202,
+    "waves_per_simd": 7,
+    "scratch_bytes_per_lane": 0,
+    "vgpr_spills": 0,
+    "screen": "KILL",
+    "reason": "attribute failed to lower VGPR count or raise occupancy"
+  },
+  "u5_sched_max_memory_clause": {
+    "vgpr": 202,
+    "waves_per_simd": 7,
+    "scratch_bytes_per_lane": 0,
+    "vgpr_spills": 0,
+    "screen": "PASS_TO_TIMING",
+    "reason": "intended scheduling changed without spill/scratch; corrected clean-baseline screen",
+    "build_log": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/sched-memory-baseline.build.log"
+  },
+  "u5_sched_max_ilp": {
+    "vgpr": 256,
+    "waves_per_simd": 5,
+    "scratch_bytes_per_lane": 112,
+    "vgpr_spills": 29,
+    "screen": "KILL",
+    "reason": "full_set/add spill and scratch regression; generic entry 132B scratch/64 spills",
+    "build_log": "/home/kaden/ClaudeCode/warpfront/wt-iu4sched/scratch-2026-09-17/U5/sched-ilp-baseline.build.log"
+  },
+  "u5_weight_prefetch": {
+    "vgpr": 202,
+    "waves_per_simd": 7,
+    "scratch_bytes_per_lane": 0,
+    "vgpr_spills": 0,
+    "screen": "PASS_TO_TIMING",
+    "isa": "one s_prefetch_data per specialized kernel body, hint immediate=1; wait counts unchanged"
+  },
+  "u5_cpol20": {
+    "vgpr": 204,
+    "waves_per_simd": 7,
+    "scratch_bytes_per_lane": 0,
+    "vgpr_spills": 0,
+    "screen": "PASS_TO_TIMING",
+    "isa": "weight buffer_load_b32/b64 encode TH_LOAD_NT_RT SCOPE_DEV"
+  }
+}
