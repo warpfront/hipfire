@@ -748,6 +748,7 @@ fn attn_mixer_block(
         block_cols: 0,
         output_gate: None,
         output: &state.fa_attn_out,
+    partition_limit: None,
     };
     hipfire_dispatch::pipeline::execute_steps(
         gpu,

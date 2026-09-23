@@ -2,11 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched flash attention reduce for asym KV modes (asym4 / asym3 / asym2).
-// V is in NORMAL (un-rotated) space — no inverse rotation needed.
-// Shared across all asym bit-widths because partials layout is dim-indexed
-// (slot n holds the accumulated value for dim n regardless of which tid
-// produced it).
+// Batched flash attention reduce for asym KV modes and Q8_0. Tile kernels
+// emit one partial per partition when partitioned, or one per KV tile in
+// legacy mode. V is in NORMAL (un-rotated) space — no inverse rotation.
 //
 // Grid: [n_heads, sub_batch_size, 1]. Block: [32, 1, 1]. Zero LDS.
 #include <hip/hip_runtime.h>
@@ -27,7 +25,8 @@ __global__ void attention_flash_asym_reduce_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when block_cols == 0
-    int block_cols                             // 0 = legacy causal, >0 = tree mode
+    int block_cols,                            // 0 = legacy causal, >0 = tree mode
+    int partitioned                            // 1 = max_tiles bounded partitions, 0 = row-local tiles
 ) {
     const int h = blockIdx.x;
     const int local_bid = blockIdx.y;
@@ -47,6 +46,7 @@ __global__ void attention_flash_asym_reduce_batched(
     const int seq_len = (block_cols > 0) ? (eff_block_start + block_cols)
                                           : (positions[global_bid] + 1);
     const int n_tiles = (seq_len + tile_size - 1) / tile_size;
+    const int n_partials = partitioned ? max_tiles : n_tiles;
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
@@ -59,17 +59,17 @@ __global__ void attention_flash_asym_reduce_batched(
 
     // Pass 1: global max
     float global_max = -1e30f;
-    for (int tile = 0; tile < n_tiles; tile++) {
+    for (int tile = 0; tile < n_partials; tile++) {
         const float* p = my_partials + tile * stride;
         if (p[1] > 0.0f)
             global_max = fmaxf(global_max, p[0]);
     }
 
-    // Pass 2: accumulate 8 dims per thread
+    // Pass 2: accumulate dpt dims per thread
     float global_sum = 0.0f;
     float g[16] = { 0.0f };
 
-    for (int tile = 0; tile < n_tiles; tile++) {
+    for (int tile = 0; tile < n_partials; tile++) {
         const float* p = my_partials + tile * stride;
         float tile_max = p[0];
         float tile_sum = p[1];

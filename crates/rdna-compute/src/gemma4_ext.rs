@@ -537,6 +537,6 @@ impl Gpu {
 
     pub fn attention_flash_asym3_batched_window(&mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor, out: &GpuTensor, positions: &GpuTensor, cos_theta: &GpuTensor, sin_theta: &GpuTensor, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize, max_ctx_len: usize, n_batch: usize, partials: &GpuTensor, window_size: u32, cache_capacity: u32) -> HipResult<()> {
         let _ = (window_size, cache_capacity);
-        self.attention_flash_asym3_batched(q, k_cache, v_cache, out, positions, cos_theta, sin_theta, n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, n_batch, partials)
+        self.attention_flash_asym3_batched(q, k_cache, v_cache, out, positions, cos_theta, sin_theta, n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, n_batch, partials, None)
     }
 }

@@ -659,15 +659,32 @@ impl Carrier for Qwen35Carrier {
                         return Err(note);
                     }
                 };
-                let scratch = match hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
-                    ctx.gpu,
-                    &config,
-                    2048,
-                    ctx.max_seq,
-                ) {
+                let scratch = match ctx.kv_backend {
+                    KvBackend::Vmm => {
+                        hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max_vmm(
+                            ctx.gpu,
+                            &config,
+                            2048,
+                            ctx.max_seq,
+                        )
+                    }
+                    KvBackend::Contiguous => {
+                        hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
+                            ctx.gpu,
+                            &config,
+                            2048,
+                            ctx.max_seq,
+                        )
+                    }
+                };
+                let scratch = match scratch {
                     Ok(s) => s,
                     Err(e) => {
-                        let mut note = format!("Qwen35Scratch::new_with_kv_max: {e:?}");
+                        let ctor = match ctx.kv_backend {
+                            KvBackend::Vmm => "Qwen35Scratch::new_with_kv_max_vmm",
+                            KvBackend::Contiguous => "Qwen35Scratch::new_with_kv_max",
+                        };
+                        let mut note = format!("{ctor}: {e:?}");
                         if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
                             note = format!("{note}; cleanup also failed: {fe}");
                         }

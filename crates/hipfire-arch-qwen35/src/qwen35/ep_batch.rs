@@ -1164,12 +1164,15 @@ impl Qwen35DecodeBatchEpState {
                 Err(e) => return Err(guard.rollback(gpus, e)),
             };
             guard.set_seed_partial(rank, spartial);
-            let scratch =
-                match Qwen35Scratch::new(&mut gpus.devices[rank], config, load_cfg.repeat_capacity)
-                {
-                    Ok(s) => s,
-                    Err(e) => return Err(guard.rollback(gpus, e)),
-                };
+            let scratch = match Qwen35Scratch::new_with_kv_max(
+                &mut gpus.devices[rank],
+                config,
+                load_cfg.repeat_capacity,
+                load_cfg.lane_capacity,
+            ) {
+                Ok(s) => s,
+                Err(e) => return Err(guard.rollback(gpus, e)),
+            };
             guard.set_scratch(rank, scratch);
         }
         let (ranks, decode_partials, seed_pbs, seed_partials, scratches, lease_opt) =

@@ -178,13 +178,13 @@ fn main() {
         if window == 0 {
             g.attention_flash_q8_0_batched_masked(
                 &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
-                None, 0, 0,
+                None, 0, 0, None,
             )
             .expect("non-windowed batched");
         } else {
             g.attention_flash_q8_0_batched_masked_windowed(
                 &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
-                None, 0, 0, window,
+                None, 0, 0, window, None,
             )
             .expect("windowed batched");
         }
@@ -495,6 +495,7 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
             0,
             Some(&d_descs),
             Some(&d_row_slot),
+            None,
         )
         .expect("batched slots");
     });
@@ -538,7 +539,7 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
     let sequential = time_ms(gpu, warmups, iters, &|g: &mut Gpu| {
         for (slab_k, slab_v, p, sl) in &slabs {
             g.attention_flash_q8_0_batched_masked(
-                &q, slab_k, slab_v, &out, p, nh, nkv, hd, *sl, *sl, 1, &partials, None, 0, 0,
+                &q, slab_k, slab_v, &out, p, nh, nkv, hd, *sl, *sl, 1, &partials, None, 0, 0, None,
             )
             .expect("sequential");
         }

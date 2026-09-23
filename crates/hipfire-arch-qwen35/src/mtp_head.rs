@@ -1659,6 +1659,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         block_cols: 0,
         output_gate: None,
         output: &scratch.attn_out,
+    partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
     };
     hipfire_dispatch::pipeline::execute_steps(
         gpu,

@@ -963,7 +963,12 @@ impl ModelSlot {
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
-        let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;
+        let scratch = Qwen35Scratch::new_with_kv_max(
+            gpu,
+            &config,
+            slot_config.repeat_window,
+            slot_config.max_seq,
+        )?;
 
         Ok(Self {
             name,
@@ -2599,6 +2604,11 @@ fn verify_dflash_block_inner(
     target
         .kv_cache
         .ensure_mapped_capacity(gpu, required_tokens)?;
+    // Verify replay bypasses ordinary qwen35 forward wrappers that preflight
+    // flash_partials; grow VMM-backed partials before capture/replay decisions.
+    target
+        .scratch
+        .ensure_flash_partials_capacity(gpu, required_tokens, b)?;
 
     assert!(
         b <= verify_scratch.max_n,
@@ -2906,8 +2916,7 @@ fn verify_dflash_block_inner(
                             .stream_synchronize(gpu.active_stream.as_ref().unwrap())
                     });
                 if let Err(err) = first_launch {
-                    gpu.graphs
-                        .verify_graph_destroy_all(&gpu.hip, gpu.device_id);
+                    gpu.graphs.verify_graph_destroy_all(&gpu.hip, gpu.device_id);
                     return Err(err);
                 }
                 if capture_lmhead_argmax {
@@ -7589,9 +7598,7 @@ mod tests {
             DType::MQ5G256V2,
             DType::MQ6G256V2,
         ] {
-            assert!(!dflash_verify_graph_env_eligible(
-                "gfx1100", dtype, None
-            ));
+            assert!(!dflash_verify_graph_env_eligible("gfx1100", dtype, None));
             assert!(!dflash_verify_graph_env_eligible(
                 "gfx1100",
                 dtype,

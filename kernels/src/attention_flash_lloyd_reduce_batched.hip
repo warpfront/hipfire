@@ -36,7 +36,8 @@ __global__ void attention_flash_lloyd_reduce_batched(
     int block_start,                           // ignored when block_cols == 0
     int block_cols,                            // 0 = legacy causal, >0 = tree mode
     const float* signs1,                       // FWHT sign vectors (same as tile launch)
-    const float* signs2
+    const float* signs2,
+    int partitioned                            // 1 = max_tiles bounded partitions, 0 = row-local tiles
 ) {
     const int h = blockIdx.x;
     const int local_bid = blockIdx.y;
@@ -56,6 +57,7 @@ __global__ void attention_flash_lloyd_reduce_batched(
     const int seq_len = (block_cols > 0) ? (eff_block_start + block_cols)
                                           : (positions[global_bid] + 1);
     const int n_tiles = (seq_len + tile_size - 1) / tile_size;
+    const int n_partials = partitioned ? max_tiles : n_tiles;
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
@@ -65,7 +67,7 @@ __global__ void attention_flash_lloyd_reduce_batched(
 
     // Pass 1: global max
     float global_max = -1e30f;
-    for (int tile = 0; tile < n_tiles; tile++) {
+    for (int tile = 0; tile < n_partials; tile++) {
         const float* p = my_partials + tile * stride;
         if (p[1] > 0.0f)
             global_max = fmaxf(global_max, p[0]);
@@ -75,7 +77,7 @@ __global__ void attention_flash_lloyd_reduce_batched(
     float global_sum = 0.0f;
     float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
-    for (int tile = 0; tile < n_tiles; tile++) {
+    for (int tile = 0; tile < n_partials; tile++) {
         const float* p = my_partials + tile * stride;
         float tile_max = p[0];
         float tile_sum = p[1];

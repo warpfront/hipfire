@@ -2839,6 +2839,7 @@ fn forward_prefill_chunk(
                 tree_bias,
                 tree_block_start,
                 tree_block_cols,
+                None,
             )?;
         } else if kv_cache.quant_asym3 {
             let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -2861,6 +2862,7 @@ fn forward_prefill_chunk(
                 tree_bias,
                 tree_block_start,
                 tree_block_cols,
+                None,
             )?;
         } else if kv_cache.quant_asym2 {
             assert!(
@@ -2885,6 +2887,7 @@ fn forward_prefill_chunk(
                 max_ctx_len,
                 n,
                 &pbs.flash_partials,
+                None,
             )?;
         } else if q8_family_eligible {
             debug_assert!(kv_cache.quant_q8);
@@ -2924,6 +2927,7 @@ fn forward_prefill_chunk(
                 block_cols: 0,
                 output_gate: None,
                 output: &pbs.fa_attn_out_batch,
+            partition_limit: None,
             };
             attention_family()
                 .run_attention(q8_attn_ctx.as_ref().unwrap(), gpu, &plan, &io)
@@ -2959,6 +2963,7 @@ fn forward_prefill_chunk(
                 None,
                 0,
                 0,
+                None,
             )?;
         } else {
             gpu.attention_q8_0_kv_batched_masked(
@@ -3839,6 +3844,7 @@ fn llama_kv_write_attend(
             block_cols: 0,
             output_gate: None,
             output: &scratch.attn_out,
+        partition_limit: None,
         };
         attention_family()
             .run_attention(&ctx, gpu, &plan, &io)
@@ -4222,6 +4228,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             block_cols: 0,
             output_gate: None,
             output: &s.attn_out,
+        partition_limit: None,
         };
         Ok(Some((plan, io)))
     }
@@ -4358,6 +4365,7 @@ pub fn forward_scratch_layers(
                 block_cols: 0,
                 output_gate: None,
                 output: &scratch.attn_out,
+            partition_limit: None,
             };
             attention_family()
                 .run_attention(&ctx, gpu, &plan, &io)
@@ -4949,6 +4957,7 @@ pub fn forward_scratch_compute_capture(
                 block_cols: 0,
                 output_gate: None,
                 output: &scratch.attn_out,
+            partition_limit: None,
             };
             attention_family()
                 .run_attention(&ctx, gpu, &plan, &io)

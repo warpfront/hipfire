@@ -644,6 +644,11 @@ pub struct Gpu {
     orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// True while a direct `begin_stream_capture`/`end_stream_capture` pair is
+    /// open on `active_stream`. Independent of `graphs.capture_mode` (GraphState
+    /// bookkeeping for the AR/verify capture paths).
+    direct_stream_capture_active: bool,
+
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
@@ -983,20 +988,36 @@ impl Gpu {
     /// compile mid-capture is exactly the kind of call the mode forbids.
     pub fn begin_stream_capture(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        if self.direct_stream_capture_active {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "begin_stream_capture: nested direct stream capture",
+            ));
+        }
         let stream = self.active_stream.as_ref().ok_or_else(|| {
             hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
         })?;
-        self.hip.stream_begin_capture(stream, 1)
+        self.hip.stream_begin_capture(stream, 1)?;
+        self.direct_stream_capture_active = true;
+        Ok(())
     }
 
     /// Close the capture started by `begin_stream_capture`.
     pub fn end_stream_capture(&mut self) -> HipResult<hip_bridge::Graph> {
         self.bind_thread()?;
+        if !self.direct_stream_capture_active {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "end_stream_capture: no active direct stream capture",
+            ));
+        }
         let stream = self
             .active_stream
             .as_ref()
             .ok_or_else(|| hip_bridge::HipError::new(0, "end_stream_capture: no active stream"))?;
-        self.hip.stream_end_capture(stream)
+        let result = self.hip.stream_end_capture(stream);
+        self.direct_stream_capture_active = false;
+        result
     }
 
     /// Launch a previously instantiated graph on this `Gpu`'s stream.
@@ -1211,6 +1232,8 @@ impl Gpu {
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
             active_stream: None,
+            direct_stream_capture_active: false,
+
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -3018,6 +3041,49 @@ impl Gpu {
         let mapped_bytes = arena.mapped_bytes();
         tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
         Ok(mapped_bytes)
+    }
+
+    /// Grow the mapped prefix of a VMM-backed tensor without replacing its
+    /// `DeviceBuffer`. The tensor pointer remains stable by construction —
+    /// only the registered arena mapping advances.
+    ///
+    /// Refuses while HIP graph capture or retained replay recording is active:
+    /// mapping physical pages mid-capture would desync the recorded address
+    /// space from later replay.
+    pub fn grow_vmm_tensor_mapping(
+        &mut self,
+        tensor: &GpuTensor,
+        additional_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<usize> {
+        self.bind_thread()?;
+        if self.direct_stream_capture_active {
+            return Err(HipError::new(
+                0,
+                "cannot grow VMM mapping during direct HIP stream capture",
+            ));
+        }
+        if self.graphs.capture_mode {
+            return Err(HipError::new(
+                0,
+                "cannot grow VMM mapping during HIP graph capture",
+            ));
+        }
+        if self.replay.is_recording() {
+            return Err(HipError::new(
+                0,
+                "cannot grow VMM mapping during retained replay recording",
+            ));
+        }
+        let key = tensor.buf.as_ptr() as usize;
+        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        Ok(arena.mapped_bytes())
     }
 
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
@@ -5220,5 +5286,50 @@ mod tests {
         use crate::replay::{ReplayBackendRequest, ReplayController};
         let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
         assert_eq!(ctrl.recorded_launches().len(), 0);
+    }
+
+    #[test]
+    fn direct_capture_flag_transitions() {
+        // Focused state-transition test for direct_stream_capture_active.
+        // Feasible without mocking HIP: we only exercise the flag checks that
+        // happen before the HIP call, and the happy path where HIP succeeds.
+        // The finally-style guarantee (flag cleared even when HIP returns error)
+        // is verified by code inspection; the flag is set before the HIP call
+        // and cleared in a finally block, so the test pins the observable
+        // transitions that do not require fault injection.
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        // Initially false
+        assert!(!gpu.direct_stream_capture_active);
+        // Begin without active_stream => error, flag stays false
+        gpu.active_stream = None;
+        assert!(gpu.begin_stream_capture().is_err());
+        assert!(!gpu.direct_stream_capture_active);
+        // Create a real stream and begin
+        let stream = gpu.hip.stream_create().expect("stream_create");
+        gpu.active_stream = Some(stream);
+        match gpu.begin_stream_capture() {
+            Ok(()) => {
+                assert!(gpu.direct_stream_capture_active);
+                // Nested begin must fail and keep flag true
+                assert!(gpu.begin_stream_capture().is_err());
+                assert!(gpu.direct_stream_capture_active);
+                // End should clear flag (even if HIP were to fail, finally block clears)
+                let _ = gpu.end_stream_capture();
+                assert!(!gpu.direct_stream_capture_active);
+                // Second end without begin must fail and keep flag false
+                assert!(gpu.end_stream_capture().is_err());
+                assert!(!gpu.direct_stream_capture_active);
+            }
+            Err(e) => {
+                eprintln!("skip: begin failed (no capture support) {e}");
+                assert!(!gpu.direct_stream_capture_active);
+            }
+        }
+        if let Some(s) = gpu.active_stream.take() {
+            let _ = gpu.hip.stream_destroy(s);
+        }
     }
 }

@@ -92,7 +92,7 @@ fn main() {
         let v = gpu.upload_raw(kv, &[kv.len()]).expect("v");
         let out = gpu.zeros(&[NH * HD], DType::F32).expect("out");
         gpu.attention_flash_q8_0_batched_masked_windowed(
-            &q, &k, &v, &out, &positions, NH, NKV, HD, S, S, 1, &partials, None, 0, 0, window,
+            &q, &k, &v, &out, &positions, NH, NKV, HD, S, S, 1, &partials, None, 0, 0, window, None,
         )
         .expect("windowed attn launch");
         gpu.download_f32(&out).expect("download")

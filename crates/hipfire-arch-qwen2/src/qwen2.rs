@@ -2169,6 +2169,7 @@ impl DenseArch for Qwen2Dense<'_> {
             block_cols: 0,
             output_gate: None,
             output: &st.attn_out,
+        partition_limit: None,
         };
         Ok(Some((plan, io)))
     }

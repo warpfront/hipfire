@@ -1565,6 +1565,7 @@ fn q8_attend_slots(
             0,
             Some(descs_dev),
             Some(row_slot_dev),
+            Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
         )
     }
 }
@@ -2519,6 +2520,11 @@ pub fn forward_batch_slots_graphed(
         max_layer: None,
     };
 
+    // Map flash-partials for the graph bucket before warm/capture/replay.
+    // Bucket changes already force a new key, so replay always sees capacity
+    // preflighted for ctx_bucket × n_rows.
+    s.ensure_flash_partials_capacity(gpu, ctx_bucket, key.n_rows)?;
+
     // The per-step inputs always go up outside the graph: their host source
     // buffers are temporaries, and a captured memcpy node bakes its source
     // pointer. The captured kernels read the device buffers these fill, so
@@ -2842,6 +2848,10 @@ pub fn forward_batch_slots_opts(
             .min(physical_cap)
             .max(1),
     );
+    // Direct path: grow flash partials for the live physical context before
+    // any attention body. Graphed callers preflight the bucket above; this
+    // covers non-graph steps and warm-up (ensure is a no-op when already mapped).
+    s.ensure_flash_partials_capacity(gpu, max_ctx_len, n)?;
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
 
     // Exactly one active slot this step? (Always true for n_slots == 1;

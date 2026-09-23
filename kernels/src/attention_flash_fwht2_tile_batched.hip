@@ -3,9 +3,11 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Batched flash attention tile for fwht2: K at FWHT-rotated 2-bit, V at Q8_0.
-// Processes sub_batch_size positions via blockIdx.z. 2-pass for hd=256.
-//
-// Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
+// Partitioned stage-1: max_tiles is the active partition count P.
+// Each partition merges a balanced contiguous range of context tiles into
+// one (m,l,N) partial via online softmax. Neutral inactive partitions
+// write m=-1e30,l=0.
+// Partials layout: [sub_batch × n_heads × P × (2+head_dim)].
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 
@@ -32,25 +34,33 @@ __global__ void attention_flash_fwht2_tile_batched(
     int v_mode                                 // 8 = Q8_0 V (only mode for fwht2; lloyd2 is Task 6)
 ) {
     const int h = blockIdx.x;
-    const int tile_id = blockIdx.y;
+    const int partition_id = blockIdx.y;
     const int local_bid = blockIdx.z;
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
 
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
-    // hipGraph-safe block_start: under captured tree-verify replay the
-    // `block_start` scalar kernarg is baked at capture time and goes stale as
-    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
-    // cycle and the linearized tree root sits at positions[0] == start_pos ==
-    // block_start, so derive it from the device buffer instead of the scalar.
-    // Eager (non-capture) value is identical, so this is a no-op off-graph.
     const int eff_block_start = tree_mode ? positions[0] : block_start;
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
-    const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
-    const int tile_len = tile_end - tile_start;
+
+    const int n_context_tiles = (seq_len + tile_size - 1) / tile_size;
+    const int P = max_tiles;
+    const int base_tiles = (P > 0) ? n_context_tiles / P : 0;
+    const int extra_tiles = (P > 0) ? n_context_tiles % P : 0;
+    const int partition_tiles = base_tiles + (partition_id < extra_tiles ? 1 : 0);
+    const int first_tile = partition_id * base_tiles + (partition_id < extra_tiles ? partition_id : extra_tiles);
+    const int last_tile = first_tile + partition_tiles;
+    const int stride = 2 + head_dim;
+    float* p = partials + ((long long)local_bid * n_heads + h) * P * stride
+                        + partition_id * stride;
+    if (partition_tiles == 0) {
+        if (tid == 0) {
+            p[0] = -1e30f;
+            p[1] = 0.0f;
+        }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -84,75 +94,122 @@ __global__ void attention_flash_fwht2_tile_batched(
         mq[half * 4 + 3] = d;
     }
 
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
-        float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            unsigned char packed = kb[4 + half * 32 + tid];
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C2[(packed >> 4) & 0x3])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C2[(packed >> 6) & 0x3]);
+    float partition_max = -1e30f;
+    float partition_sum = 0.0f;
+    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+
+    for (int tile = first_tile; tile < last_tile; tile++) {
+        const int tile_start = tile * tile_size;
+        const int tile_end = min(tile_start + tile_size, seq_len);
+        const int tile_len = tile_end - tile_start;
+
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            int t = tile_start + t_local;
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            float partial = 0.0f;
+            for (int half = 0; half < n_halves; half++) {
+                unsigned char packed = kb[4 + half * 32 + tid];
+                partial += mq[half * 4 + 0] * (cnorm * TURBO_C2[(packed)      & 0x3])
+                         + mq[half * 4 + 1] * (cnorm * TURBO_C2[(packed >> 2) & 0x3])
+                         + mq[half * 4 + 2] * (cnorm * TURBO_C2[(packed >> 4) & 0x3])
+                         + mq[half * 4 + 3] * (cnorm * TURBO_C2[(packed >> 6) & 0x3]);
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_xor(partial, off);
+            if (tid == 0) {
+                float s = partial * scale_attn;
+                if (tree_mode && t >= eff_block_start) {
+                    s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
+                }
+                scores[t_local] = s;
+            }
+        }
+        __syncthreads();
+
+        float local_max = -1e30f;
+        for (int i = tid; i < tile_len; i += 32)
+            local_max = fmaxf(local_max, scores[i]);
+        for (int off = 16; off > 0; off >>= 1)
+            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+        float tile_max = local_max;
+
+        float local_sum = 0.0f;
+        for (int i = tid; i < tile_len; i += 32) {
+            float e = expf(scores[i] - tile_max);
+            scores[i] = e;
+            local_sum += e;
         }
         for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_xor(partial, off);
-        if (tid == 0) {
-            float s = partial * scale_attn;
-            if (tree_mode && t >= eff_block_start) {
-                s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
+            local_sum += __shfl_xor(local_sum, off);
+        float tile_sum = local_sum;
+        __syncthreads();
+
+        const float merged_max = fmaxf(partition_max, tile_max);
+        const float previous_corr = (partition_sum > 0.0f) ? expf(partition_max - merged_max) : 0.0f;
+        const float tile_corr = expf(tile_max - merged_max);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) out_vec[i] *= previous_corr;
+
+        if (v_mode == 8) {
+            // ── Legacy Q8_0 V (normal space, per-half layout) ──
+            for (int t_local = 0; t_local < tile_len; t_local++) {
+                float w = scores[t_local] * tile_corr;
+                int t = tile_start + t_local;
+                const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+                for (int half = 0; half < n_halves; half++) {
+                    const int d_base = half * 128 + tid * 4;
+                    const int v_bi       = d_base / 32;
+                    const int v_bj_base  = d_base % 32;
+                    const int v_blk_off  = (v_kv_head_blk + v_bi) * 34;
+                    const unsigned char* vbh = vb + v_blk_off;
+                    float vs = (float)*((const _Float16*)vbh);
+                    out_vec[half * 4 + 0] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 0]));
+                    out_vec[half * 4 + 1] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 1]));
+                    out_vec[half * 4 + 2] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 2]));
+                    out_vec[half * 4 + 3] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 3]));
+                }
             }
-            scores[t_local] = s;
+        } else {
+            // ── 256-wide lloyd2/3/4 V: FWHT-rotated centroid (head_dim==256 only).
+            const int d0 = tid * 8;
+            const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
+            const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+            const int v_head_off       = kv_h * v_bytes_per_head;
+            for (int t_local = 0; t_local < tile_len; t_local++) {
+                float w = scores[t_local] * tile_corr;
+                int t = tile_start + t_local;
+                const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
+                float cnorm = *(const float*)vb;
+                const unsigned char* base = vb + 4 + tid * v_mode;
+                unsigned int packed = (unsigned int)base[0];
+                if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
+                if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
+                if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float c;
+                    if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
+                    else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
+                    else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
+                    out_vec[i] += w * (cnorm * c);
+                }
+            }
+            // Keep out_vec in rotated space; inverse FWHT deferred to reduce kernel.
+            (void)d0;
         }
+
+        partition_sum = partition_sum * previous_corr + tile_sum * tile_corr;
+        partition_max = merged_max;
+        __syncthreads();
     }
-    __syncthreads();
 
-    float local_max = -1e30f;
-    for (int i = tid; i < tile_len; i += 32)
-        local_max = fmaxf(local_max, scores[i]);
-    for (int off = 16; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-    float tile_max = local_max;
-
-    float local_sum = 0.0f;
-    for (int i = tid; i < tile_len; i += 32) {
-        float e = expf(scores[i] - tile_max);
-        scores[i] = e;
-        local_sum += e;
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        local_sum += __shfl_xor(local_sum, off);
-    float tile_sum = local_sum;
-    __syncthreads();
-
-    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
-                        + tile_id * (2 + head_dim);
     if (tid == 0) {
-        p[0] = tile_max;
-        p[1] = tile_sum;
+        p[0] = partition_max;
+        p[1] = partition_sum;
     }
 
     if (v_mode == 8) {
-        // ── Legacy Q8_0 V (normal space, per-half layout) — unchanged ──
-        float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-            for (int half = 0; half < n_halves; half++) {
-                const int d_base = half * 128 + tid * 4;
-                const int v_bi       = d_base / 32;
-                const int v_bj_base  = d_base % 32;
-                const int v_blk_off  = (v_kv_head_blk + v_bi) * 34;
-                const unsigned char* vbh = vb + v_blk_off;
-                float vs = (float)*((const _Float16*)vbh);
-                out_vec[half * 4 + 0] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 0]));
-                out_vec[half * 4 + 1] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 1]));
-                out_vec[half * 4 + 2] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 2]));
-                out_vec[half * 4 + 3] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 3]));
-            }
-        }
         for (int half = 0; half < n_halves; half++) {
             const int d_base = half * 128 + tid * 4;
             p[2 + d_base + 0] = out_vec[half * 4 + 0];
@@ -161,37 +218,8 @@ __global__ void attention_flash_fwht2_tile_batched(
             p[2 + d_base + 3] = out_vec[half * 4 + 3];
         }
     } else {
-        // ── 256-wide lloyd2/3/4 V: FWHT-rotated centroid (head_dim==256 only).
-        // Own tid*8 contiguous layout — required by fwht_shfl_inverse_256.
         const int d0 = tid * 8;
-        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-        const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
-        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
-        const int v_head_off       = kv_h * v_bytes_per_head;
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
-            float cnorm = *(const float*)vb;
-            const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
-            unsigned int packed = (unsigned int)base[0];
-            if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
-            if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
-            if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                float c;
-                if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
-                else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
-                else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
-                ov[i] += w * (cnorm * c);
-            }
-        }
-        // V accumulated in ROTATED space (ov ≈ H·Σw·v). The inverse FWHT is
-        // deferred to the dedicated lloyd reduce kernel, which applies it once
-        // after the cross-tile combine (inverse is linear, so it commutes with
-        // the weighted-sum + scalar normalize the reduce performs).
         #pragma unroll
-        for (int i = 0; i < 8; i++) p[2 + d0 + i] = ov[i];
+        for (int i = 0; i < 8; i++) p[2 + d0 + i] = out_vec[i];
     }
 }

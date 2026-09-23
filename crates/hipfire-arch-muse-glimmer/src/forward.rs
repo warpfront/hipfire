@@ -808,6 +808,7 @@ fn glimmer_layer_decode(
             0,
             0,
             window as i32,
+            None,
         )
         .map_err(|e| format!("glimmer L{layer_idx}: flash decode: {e:?}"))?;
     } else {
@@ -3492,6 +3493,7 @@ fn prefill_chunk_batched(
                         0,
                         0,
                         window as i32,
+                        None,
                     )
                     .map_err(|e| format!("glimmer prefill L{layer_idx} flash windowed: {e:?}"))?;
                 }

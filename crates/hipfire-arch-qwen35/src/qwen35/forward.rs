@@ -911,6 +911,10 @@ pub struct Qwen35Scratch {
     // Flash attention partials buffer for tile+reduce 2-kernel path.
     // Size: n_heads * max_tiles * (2 + head_dim) floats.
     pub flash_partials: GpuTensor,
+    /// Demand-map plan for VMM-backed `flash_partials`. `None` on contiguous
+    /// scratch — `ensure`/`require_flash_partials_capacity` are then no-ops.
+    flash_vmm_plan: Option<FlashPartialsVmmPlan>,
+
     // Flash attention tri-state (applies to Q8 path; asym modes are flash-only):
     //   0 = never      force non-flash at all contexts (except >15K sanity)
     //   1 = auto       (default) flash kicks in at ctx >= 2048
@@ -955,6 +959,116 @@ fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
     dim.max(hidden_dim).max(v_dim)
 }
 
+/// Geometry used to size and demand-map VMM-backed flash attention partials.
+/// Contiguous scratch never stores a plan.
+#[derive(Clone, Copy, Debug)]
+struct FlashPartialsVmmPlan {
+    max_seq: usize,
+    tile_size: usize,
+    batch_mult: usize,
+    n_heads: usize,
+    head_dim: usize,
+    /// `Some(P)` for bounded batched flash split-K. The same shared buffer
+    /// must also retain one uncapped B1 per-tile row for scalar AR decode.
+    /// `None` preserves the per-tile asym/FWHT/WMMA layout (never used by Qwen35).
+    partition_limit: Option<usize>,
+}
+
+impl FlashPartialsVmmPlan {
+    /// Checked byte footprint for `batch_rows` query positions over
+    /// `context_tokens` KV tokens. Clamps context to `max_seq` and rows to
+    /// `batch_mult`.
+    fn required_bytes(&self, context_tokens: usize, batch_rows: usize) -> HipResult<usize> {
+        if self.tile_size == 0 {
+            return Err(HipError::new(
+                0,
+                "flash partials tile_size must be non-zero",
+            ));
+        }
+        let context = context_tokens.min(self.max_seq);
+        let rows = batch_rows.min(self.batch_mult);
+        let context_tiles = context
+            .checked_add(self.tile_size - 1)
+            .map(|n| n / self.tile_size)
+            .ok_or_else(|| HipError::new(0, "flash partials tile count overflowed"))?;
+        let partials = self
+            .partition_limit
+            .map_or(context_tiles, |limit| context_tiles.min(limit));
+        let stride = 2usize
+            .checked_add(self.head_dim)
+            .ok_or_else(|| HipError::new(0, "flash partials stride overflowed"))?;
+        let per_row_per_partial = self
+            .n_heads
+            .checked_mul(stride)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| HipError::new(0, "flash partials row stride overflowed"))?;
+        let batched = rows
+            .checked_mul(partials)
+            .and_then(|v| v.checked_mul(per_row_per_partial))
+            .ok_or_else(|| HipError::new(0, "flash partials required bytes overflowed"))?;
+        if self.partition_limit.is_some() {
+            // Ordinary AR decode shares this tensor but still emits one
+            // partial per tile. Keep its B1 footprint alongside bounded B16.
+            let scalar = context_tiles
+                .checked_mul(per_row_per_partial)
+                .ok_or_else(|| HipError::new(0, "scalar flash partials bytes overflowed"))?;
+            Ok(batched.max(scalar))
+        } else {
+            Ok(batched)
+        }
+    }
+}
+
+/// Round `value` up to a non-zero VMM mapping alignment with checked arithmetic.
+fn checked_vmm_round_up(value: usize, alignment: usize) -> HipResult<usize> {
+    if alignment == 0 {
+        return Err(HipError::new(0, "VMM alignment must be greater than zero"));
+    }
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or_else(|| HipError::new(0, "VMM map size overflowed during alignment"))
+    }
+}
+
+/// Shared layout plan and allocation size for contiguous and VMM partials.
+fn flash_partials_geometry(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    kv_max_seq: usize,
+) -> HipResult<(FlashPartialsVmmPlan, usize)> {
+    let tile_size = rdna_compute::attention::q8_flash_tile_size(
+        &gpu.arch,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_max_seq,
+    )
+    .min(128)
+    // See llama.rs: also floor against the batched-attention tile,
+    // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
+    // would undersize this same buffer.
+    .min(gpu.attn_tile_size());
+    let batch_mult = hipfire_runtime::config::get()
+        .flash_partials_batch
+        .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
+        .unwrap_or(16);
+    let plan = FlashPartialsVmmPlan {
+        max_seq: kv_max_seq,
+        tile_size,
+        batch_mult,
+        n_heads: config.n_heads,
+        head_dim: config.head_dim,
+        partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
+    };
+    let logical_bytes = plan.required_bytes(kv_max_seq, batch_mult)?;
+    debug_assert_eq!(logical_bytes % 4, 0);
+    Ok((plan, logical_bytes / 4))
+}
+
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
         // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
@@ -966,6 +1080,28 @@ impl Qwen35Scratch {
         config: &Qwen35Config,
         repeat_window: usize,
         kv_max_seq: usize,
+    ) -> HipResult<Self> {
+        Self::new_with_kv_max_inner(gpu, config, repeat_window, kv_max_seq, false)
+    }
+
+    /// Like [`Self::new_with_kv_max`], but reserves full logical `flash_partials`
+    /// via VMM and demand-maps a short initial prefix. Production single-GPU
+    /// path when the KV backend is also VMM.
+    pub fn new_with_kv_max_vmm(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        repeat_window: usize,
+        kv_max_seq: usize,
+    ) -> HipResult<Self> {
+        Self::new_with_kv_max_inner(gpu, config, repeat_window, kv_max_seq, true)
+    }
+
+    fn new_with_kv_max_inner(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        repeat_window: usize,
+        kv_max_seq: usize,
+        use_vmm: bool,
     ) -> HipResult<Self> {
         let dim = config.dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -979,6 +1115,12 @@ impl Qwen35Scratch {
         if config.num_experts > 0 {
             gpu.ensure_mq_signs()?;
         }
+
+        // Validate the complete flash-partials geometry before the first
+        // scratch allocation. Device handles below are not owning on Drop, so
+        // an arithmetic error after allocation would leak the transaction.
+        let (flash_plan, flash_logical_elems) =
+            flash_partials_geometry(gpu, config, kv_max_seq)?;
 
         // GpuTensor and DeviceBuffer do not free device memory on Drop. Track
         // non-owning aliases for every allocation made below so any later
@@ -1102,29 +1244,15 @@ impl Qwen35Scratch {
             //
             // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
             // two preferred (matches FA dispatcher chunking).
-            flash_partials: {
-                let tile_size = rdna_compute::attention::q8_flash_tile_size(
-                    &gpu.arch,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    kv_max_seq,
-                )
-                .min(128)
-                // See llama.rs: also floor against the batched-attention tile,
-                // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
-                // would undersize this same buffer.
-                .min(gpu.attn_tile_size());
-                let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                let batch_mult = hipfire_runtime::config::get()
-                    .flash_partials_batch
-                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
-                    .unwrap_or(16);
-                tracked_tensor!(gpu.alloc_tensor(
-                    &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
-                    DType::F32,
-                ))
+            // Contiguous: full physical alloc. VMM: tiny tracked placeholder
+            // replaced by a stable-VA owner after every other fallible scratch
+            // allocation succeeds (avoids leaking a VMM arena on mid-ctor fail).
+            flash_partials: if use_vmm {
+                tracked_tensor!(gpu.alloc_tensor(&[1], DType::F32))
+            } else {
+                tracked_tensor!(gpu.alloc_tensor(&[flash_logical_elems], DType::F32))
             },
+            flash_vmm_plan: None,
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
             //   HIPFIRE_ATTN_FLASH=never|0|off    → non-flash at all contexts
@@ -1246,8 +1374,109 @@ impl Qwen35Scratch {
                     }
                 };
             }
+            if use_vmm {
+                let plan = flash_plan;
+                let logical_elems = flash_logical_elems;
+                let install = (|| -> HipResult<()> {
+                    let initial_ctx = 8192usize.min(kv_max_seq);
+                    let initial_needed = plan.required_bytes(initial_ctx, plan.batch_mult)?;
+                    let gran = gpu.vmm_recommended_granularity()?;
+                    let initial_mapped = checked_vmm_round_up(initial_needed, gran)?;
+                    // SAFETY: callers demand-map via ensure_flash_partials_capacity
+                    // before any flash kernel reads past the mapped prefix; VA is
+                    // stable for graph pointer capture.
+                    let vmm = unsafe {
+                        gpu.alloc_vmm_tensor(
+                            &[logical_elems],
+                            DType::F32,
+                            initial_mapped,
+                            &[gpu.device_id],
+                        )?
+                    };
+                    let placeholder = std::mem::replace(&mut s.flash_partials, vmm);
+                    gpu.free_tensor(placeholder)?;
+                    s.flash_vmm_plan = Some(plan);
+                    Ok(())
+                })();
+                if let Err(error) = install {
+                    // VMM owner (if any) lives in s.flash_partials; free whole
+                    // completed scratch. Ledger aliases are non-owning.
+                    let _ = s.free_gpu(gpu);
+                    return Err(error);
+                }
+            }
             Ok(s)
         })
+    }
+
+    /// Ensure VMM-backed `flash_partials` maps enough bytes for
+    /// `context_tokens` × `batch_rows`. No-op on contiguous scratch.
+    ///
+    /// Call before graph capture / retained replay so growth cannot run while
+    /// a capture is active. Growth uses [`Gpu::grow_vmm_tensor_mapping`], which
+    /// keeps the tensor base pointer stable.
+    pub fn ensure_flash_partials_capacity(
+        &self,
+        gpu: &mut Gpu,
+        context_tokens: usize,
+        batch_rows: usize,
+    ) -> HipResult<()> {
+        let Some(plan) = self.flash_vmm_plan.as_ref() else {
+            return Ok(());
+        };
+        let logical_bytes = self.flash_partials.byte_size();
+        // Physical mapped may exceed logical after granularity round-up.
+        let physical_mapped = gpu.vmm_mapped_bytes(&self.flash_partials).unwrap_or(0);
+        let needed = plan.required_bytes(context_tokens, batch_rows)?;
+        if needed > logical_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "flash partials require {needed} bytes but logical reserve is {logical_bytes}"
+                ),
+            ));
+        }
+        let usable = physical_mapped.min(logical_bytes);
+        if needed > usable {
+            let gran = gpu
+                .vmm_granularity(&self.flash_partials)
+                .ok_or_else(|| HipError::new(0, "flash_partials is not a registered VMM owner"))?;
+            let aligned_target = checked_vmm_round_up(needed, gran)?;
+            if aligned_target > physical_mapped {
+                let additional = aligned_target - physical_mapped;
+                gpu.grow_vmm_tensor_mapping(&self.flash_partials, additional, &[gpu.device_id])?;
+            }
+        }
+        self.require_flash_partials_capacity(gpu, context_tokens, batch_rows)
+    }
+
+    /// Verify the already-mapped flash_partials prefix covers the request.
+    /// No-op on contiguous scratch. Does not grow (safe under capture).
+    pub(crate) fn require_flash_partials_capacity(
+        &self,
+        gpu: &Gpu,
+        context_tokens: usize,
+        batch_rows: usize,
+    ) -> HipResult<()> {
+        let Some(plan) = self.flash_vmm_plan.as_ref() else {
+            return Ok(());
+        };
+        let logical_bytes = self.flash_partials.byte_size();
+        let physical_mapped = gpu
+            .vmm_mapped_bytes(&self.flash_partials)
+            .unwrap_or(logical_bytes);
+        // Logical usable capacity never exceeds the tensor's byte footprint.
+        let mapped = physical_mapped.min(logical_bytes);
+        let needed = plan.required_bytes(context_tokens, batch_rows)?;
+        if needed > mapped {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM flash_partials mapped prefix holds {mapped} bytes but the operation requires {needed}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Free all GPU tensors. Call before drop to return VRAM. Checked — reports first free failure.
@@ -1347,13 +1576,21 @@ impl Qwen35ScratchSet {
     ) -> HipResult<Self> {
         let mut per_device = Vec::with_capacity(gpus.devices.len());
         for dev_idx in 0..gpus.devices.len() {
-            let g = &mut gpus.devices[dev_idx];
-            per_device.push(Qwen35Scratch::new_with_kv_max(
-                g,
+            let scratch = Qwen35Scratch::new_with_kv_max(
+                &mut gpus.devices[dev_idx],
                 config,
                 repeat_window,
                 kv_max_seq,
-            )?);
+            );
+            match scratch {
+                Ok(scratch) => per_device.push(scratch),
+                Err(error) => {
+                    for (allocated_dev, scratch) in per_device.into_iter().enumerate() {
+                        let _ = scratch.free_gpu(&mut gpus.devices[allocated_dev]);
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(Self { per_device })
     }
@@ -1411,6 +1648,7 @@ pub fn forward_scratch(
     // Grow before any possible AR graph capture/replay. Stable virtual
     // addresses keep existing graph pointer arguments valid.
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    scratch.ensure_flash_partials_capacity(gpu, required_tokens, 1)?;
     let dim = config.dim;
     // hipGraph capture for MoE was previously gated off-by-default behind
     // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
@@ -1733,6 +1971,7 @@ pub fn forward_scratch_with_hidden(
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    scratch.ensure_flash_partials_capacity(gpu, required_tokens, 1)?;
     let dim = config.dim;
     let pos_i32 = pos as i32;
     gpu.hip
@@ -1782,6 +2021,7 @@ pub fn forward_scratch_embed(
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed")?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    scratch.ensure_flash_partials_capacity(gpu, required_tokens, 1)?;
     let pos_i32 = pos as i32;
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
@@ -1871,6 +2111,8 @@ pub fn forward_scratch_mrope(
         );
     };
     mark_mrope_forward_ineligible(gpu);
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_mrope")?;
+    scratch.ensure_flash_partials_capacity(gpu, required_tokens, 1)?;
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by
     // the KV write and flash attention, which want the PHYSICAL slot).
     prepare_scratch_inputs(gpu, weights, config, token, pos, scratch)?;
@@ -1915,6 +2157,8 @@ pub fn forward_scratch_embed_mrope(
         );
     };
     mark_mrope_forward_ineligible(gpu);
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed_mrope")?;
+    scratch.ensure_flash_partials_capacity(gpu, required_tokens, 1)?;
     let pos_i32 = pos as i32;
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
@@ -3382,6 +3626,7 @@ pub(crate) fn kv_cache_attention_dispatch(
         block_cols: 0,
         output_gate: fused_epilogue.then_some(&s.fa_gate),
         output: &s.fa_attn_out,
+        partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -6045,6 +6290,74 @@ mod tests {
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
+    }
+
+    #[test]
+    fn qwen38_flash_partials_vmm_geometry() {
+        // Qwen3.8 FA geometry: batch_mult=16, tile=32, heads=24, head_dim=256.
+        let plan = FlashPartialsVmmPlan {
+            max_seq: 262_144,
+            tile_size: 32,
+            batch_mult: 16,
+            n_heads: 24,
+            head_dim: 256,
+            partition_limit: None,
+        };
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        // Full logical reserve at max_seq.
+        assert_eq!(
+            plan.required_bytes(262_144, 16).unwrap(),
+            3096 * 1024 * 1024
+        );
+        assert_eq!(mib(plan.required_bytes(262_144, 16).unwrap()), 3096.0);
+        // Demand-map footprints at long-context decode/prefill horizons.
+        assert_eq!(plan.required_bytes(38_000, 16).unwrap(), 470_790_144);
+        assert_eq!(mib(plan.required_bytes(38_000, 16).unwrap()), 448.98046875);
+        assert_eq!(plan.required_bytes(65_536, 16).unwrap(), 774 * 1024 * 1024);
+        assert_eq!(mib(plan.required_bytes(65_536, 16).unwrap()), 774.0);
+        // Clamps: context to max_seq, rows to batch_mult.
+        assert_eq!(
+            plan.required_bytes(usize::MAX, 64).unwrap(),
+            plan.required_bytes(262_144, 16).unwrap()
+        );
+
+        // Granularity round-up: 8193 tokens crosses one extra 32-token tile
+        // vs 8192, and a 2 MiB physical page rounds the payload up.
+        let gran = 2 * 1024 * 1024;
+        let at_8192 = plan.required_bytes(8192, 16).unwrap();
+        let at_8193 = plan.required_bytes(8193, 16).unwrap();
+        assert_eq!(at_8192, 16 * 24 * 256 * (2 + 256) * 4);
+        assert_eq!(at_8193, 16 * 24 * 257 * (2 + 256) * 4);
+        assert!(at_8193 > at_8192);
+        assert_eq!(checked_vmm_round_up(0, gran).unwrap(), 0);
+        assert_eq!(checked_vmm_round_up(gran, gran).unwrap(), gran);
+        assert_eq!(checked_vmm_round_up(gran + 1, gran).unwrap(), 2 * gran);
+        let aligned_8193 = checked_vmm_round_up(at_8193, gran).unwrap();
+        assert!(aligned_8193 >= at_8193);
+        assert_eq!(aligned_8193 % gran, 0);
+        assert!(checked_vmm_round_up(1, 0).is_err());
+
+        let bounded = FlashPartialsVmmPlan {
+            partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
+            ..plan
+        };
+        assert_eq!(bounded.required_bytes(1_024, 16).unwrap(), 12_681_216);
+        assert_eq!(mib(bounded.required_bytes(1_024, 16).unwrap()), 12.09375);
+        assert_eq!(bounded.required_bytes(2_048, 16).unwrap(), 25_362_432);
+        // Bounded B16 stays at 24.1875 MiB, but the shared tensor also serves
+        // scalar AR decode, whose uncapped B1 row becomes larger after 32K.
+        assert_eq!(mib(bounded.required_bytes(65_536, 16).unwrap()), 48.375);
+        assert_eq!(mib(bounded.required_bytes(262_144, 16).unwrap()), 193.5);
+        assert!(checked_vmm_round_up(usize::MAX, gran).is_err());
+        let overflow = FlashPartialsVmmPlan {
+            max_seq: usize::MAX,
+            tile_size: 1,
+            batch_mult: 16,
+            n_heads: usize::MAX,
+            head_dim: usize::MAX,
+            partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
+        };
+        assert!(overflow.required_bytes(usize::MAX, 16).is_err());
     }
 
     #[test]

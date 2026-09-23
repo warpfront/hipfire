@@ -63,6 +63,9 @@ pub struct AttnParams<'a> {
     /// `None`.
     pub output_gate: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
+    /// Bounded partition count for Qwen flash. `Some(64)` for Qwen35/38,
+    /// `None` preserves per-tile scheduling for other models.
+    pub partition_limit: Option<usize>,
 }
 
 impl<'a> AttnParams<'a> {
@@ -737,6 +740,7 @@ fn dispatch_attend(
                 io.tree_bias,
                 io.block_start,
                 io.block_cols,
+                io.partition_limit,
             ))
         }
         TileImpl::Asym4WmmaTileGfx12 => {
@@ -762,6 +766,7 @@ fn dispatch_attend(
                 io.tree_bias,
                 io.block_start,
                 io.block_cols,
+                io.partition_limit,
             ))
         }
         TileImpl::None => match key {
@@ -1152,6 +1157,7 @@ fn dispatch_attend(
                     io.tree_bias,
                     io.block_start,
                     io.block_cols,
+                    io.partition_limit,
                 ))
             }
             KernelKey::AttnFlashAsym4FwhtBatchedMasked => {
@@ -1177,6 +1183,7 @@ fn dispatch_attend(
                     io.block_start,
                     io.block_cols,
                     plan.v_mode_bits,
+                    io.partition_limit,
                 ))
             }
             KernelKey::AttnFlashAsym3BatchedMasked => {
@@ -1233,6 +1240,7 @@ fn dispatch_attend(
                     io.tree_bias,
                     io.block_start,
                     io.block_cols,
+                    io.partition_limit,
                 ))
             }
             KernelKey::AttnFlashAsym3FwhtBatchedMasked => {
@@ -1290,6 +1298,7 @@ fn dispatch_attend(
                     io.block_start,
                     io.block_cols,
                     plan.v_mode_bits,
+                    io.partition_limit,
                 ))
             }
             // 2-bit: _batched only (no _masked — tree-verify gap)
@@ -1316,6 +1325,7 @@ fn dispatch_attend(
                     io.max_ctx_len,
                     io.batch_size,
                     fp,
+                    io.partition_limit,
                 ))
             }
             KernelKey::AttnFlashAsym2FwhtBatched => {
@@ -1342,6 +1352,7 @@ fn dispatch_attend(
                     io.batch_size,
                     fp,
                     plan.v_mode_bits,
+                    io.partition_limit,
                 ))
             }
             // Q8_0 batched: single-launch LDS-backed kernel for short ctx, tiled
@@ -1566,6 +1577,7 @@ fn dispatch_attend(
                         io.tree_bias,
                         io.block_start,
                         io.block_cols,
+                        io.partition_limit,
                     ))
                 }
             }
@@ -1590,6 +1602,7 @@ fn dispatch_attend(
                     io.block_start,
                     io.block_cols,
                     plan.window,
+                    io.partition_limit,
                 ))
             }
 

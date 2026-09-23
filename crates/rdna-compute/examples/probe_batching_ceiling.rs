@@ -99,7 +99,7 @@ fn main() {
             for _ in 0..layers {
                 g.attention_flash_q8_0_batched_masked(
                     &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, 1, &partials,
-                    None, 0, 0,
+                    None, 0, 0, None,
                 )
                 .expect("attn");
             }

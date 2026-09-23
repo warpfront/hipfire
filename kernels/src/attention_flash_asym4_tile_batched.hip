@@ -40,25 +40,29 @@ __global__ void attention_flash_asym4_tile_batched(
     int v_mode                                 // 8 = Q8_0 V (only mode for asym4)
 ) {
     const int h = blockIdx.x;
-    const int tile_id = blockIdx.y;
+    const int partition_id = blockIdx.y;
     const int local_bid = blockIdx.z;
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
 
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
-    // hipGraph-safe block_start: under captured tree-verify replay the
-    // `block_start` scalar kernarg is baked at capture time and goes stale as
-    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
-    // cycle and the linearized tree root sits at positions[0] == start_pos ==
-    // block_start, so derive it from the device buffer instead of the scalar.
-    // Eager (non-capture) value is identical, so this is a no-op off-graph.
     const int eff_block_start = tree_mode ? positions[0] : block_start;
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
-    const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
-    const int tile_len = tile_end - tile_start;
+
+    const int n_context_tiles = (seq_len + tile_size - 1) / tile_size;
+    const int base_tiles = (max_tiles > 0) ? (n_context_tiles / max_tiles) : 0;
+    const int extra_tiles = (max_tiles > 0) ? (n_context_tiles % max_tiles) : 0;
+    const int partition_tiles = base_tiles + (partition_id < extra_tiles ? 1 : 0);
+    const int first_tile = partition_id * base_tiles + min(partition_id, extra_tiles);
+    const int last_tile = first_tile + partition_tiles;
+    const int stride = 2 + head_dim;
+    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride
+                        + partition_id * stride;
+    if (partition_tiles == 0) {
+        if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -94,74 +98,89 @@ __global__ void attention_flash_asym4_tile_batched(
         mq[half * 4 + 3] = d;
     }
 
-    // Phase A: Q·K (4-bit K)
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
-        float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+    float partition_max = -1e30f;
+    float partition_sum = 0.0f;
+    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+
+    for (int tile = first_tile; tile < last_tile; tile++) {
+        const int tile_start = tile * tile_size;
+        const int tile_end = min(tile_start + tile_size, seq_len);
+        const int tile_len = tile_end - tile_start;
+
+        // Phase A: Q·K (4-bit K)
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            int t = tile_start + t_local;
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            float partial = 0.0f;
+            for (int half = 0; half < n_halves; half++) {
+                unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
+                partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
+                         + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
+                         + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
+                         + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_xor(partial, off);
+            if (tid == 0) {
+                float s = partial * scale_attn;
+                if (tree_mode && t >= eff_block_start) {
+                    s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
+                }
+                scores[t_local] = s;
+            }
+        }
+        __syncthreads();
+
+        float local_max = -1e30f;
+        for (int i = tid; i < tile_len; i += 32)
+            local_max = fmaxf(local_max, scores[i]);
+        for (int off = 16; off > 0; off >>= 1)
+            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+        float tile_max = local_max;
+
+        float local_sum = 0.0f;
+        for (int i = tid; i < tile_len; i += 32) {
+            float e = expf(scores[i] - tile_max);
+            scores[i] = e;
+            local_sum += e;
         }
         for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_xor(partial, off);
-        if (tid == 0) {
-            float s = partial * scale_attn;
-            if (tree_mode && t >= eff_block_start) {
-                s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
+            local_sum += __shfl_xor(local_sum, off);
+        float tile_sum = local_sum;
+        __syncthreads();
+
+        const float merged_max = fmaxf(partition_max, tile_max);
+        const float prev_corr = (partition_sum > 0.0f) ? expf(partition_max - merged_max) : 0.0f;
+        const float tile_corr = expf(tile_max - merged_max);
+        for (int i = 0; i < 8; i++) out_vec[i] *= prev_corr;
+
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local] * tile_corr;
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+            for (int half = 0; half < n_halves; half++) {
+                const int d_base = half * 128 + tid * 4;
+                const int v_bi       = d_base / 32;
+                const int v_bj_base  = d_base % 32;
+                const int v_blk_off  = (v_kv_head_blk + v_bi) * 34;
+                const unsigned char* vbh = vb + v_blk_off;
+                float vs = (float)*((const _Float16*)vbh);
+                out_vec[half * 4 + 0] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 0]));
+                out_vec[half * 4 + 1] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 1]));
+                out_vec[half * 4 + 2] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 2]));
+                out_vec[half * 4 + 3] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 3]));
             }
-            scores[t_local] = s;
         }
-    }
-    __syncthreads();
 
-    float local_max = -1e30f;
-    for (int i = tid; i < tile_len; i += 32)
-        local_max = fmaxf(local_max, scores[i]);
-    for (int off = 16; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-    float tile_max = local_max;
-
-    float local_sum = 0.0f;
-    for (int i = tid; i < tile_len; i += 32) {
-        float e = expf(scores[i] - tile_max);
-        scores[i] = e;
-        local_sum += e;
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        local_sum += __shfl_xor(local_sum, off);
-    float tile_sum = local_sum;
-    __syncthreads();
-
-    // Phase D: V (Q8_0 normal space, 2 halves for hd=256)
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        float w = scores[t_local];
-        int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-        for (int half = 0; half < n_halves; half++) {
-            const int d_base = half * 128 + tid * 4;
-            const int v_bi       = d_base / 32;
-            const int v_bj_base  = d_base % 32;
-            const int v_blk_off  = (v_kv_head_blk + v_bi) * 34;
-            const unsigned char* vbh = vb + v_blk_off;
-            float vs = (float)*((const _Float16*)vbh);
-            out_vec[half * 4 + 0] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 0]));
-            out_vec[half * 4 + 1] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 1]));
-            out_vec[half * 4 + 2] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 2]));
-            out_vec[half * 4 + 3] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 3]));
-        }
+        partition_sum = partition_sum * prev_corr + tile_sum * tile_corr;
+        partition_max = merged_max;
+        __syncthreads();
     }
 
-    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
-                        + tile_id * (2 + head_dim);
     if (tid == 0) {
-        p[0] = tile_max;
-        p[1] = tile_sum;
+        p[0] = partition_max;
+        p[1] = partition_sum;
     }
     for (int half = 0; half < n_halves; half++) {
         const int d_base = half * 128 + tid * 4;

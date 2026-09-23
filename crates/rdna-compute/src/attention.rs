@@ -108,6 +108,17 @@ pub fn q8_flash_tile_size(
         .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq))
 }
 
+/// Maximum split-K partitions emitted per query/head by the batched
+/// flash-attention kernels. Below this limit it retains one partition per
+/// KV tile; above it, each partition scans a balanced contiguous tile range.
+pub const FLASH_MAX_PARTITIONS: usize = 64;
+
+#[inline]
+pub fn flash_partition_count(context_tokens: usize, tile_size: usize) -> usize {
+    assert!(tile_size > 0, "flash tile size must be positive");
+    context_tokens.div_ceil(tile_size).min(FLASH_MAX_PARTITIONS)
+}
+
 const V_MODE_Q8: i32 = 8;
 
 fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
@@ -137,6 +148,32 @@ fn replay_stable_tile_count(
         max_tiles
     } else {
         actual_tiles
+    }
+}
+
+/// Batched flash partials capacity in bytes: VMM tensors use the registered
+/// mapped prefix (capped by logical size); ordinary tensors keep full logical
+/// numel bytes.
+#[inline]
+fn flash_partials_capacity_bytes(logical_bytes: usize, mapped_bytes: Option<usize>) -> usize {
+    mapped_bytes.unwrap_or(logical_bytes).min(logical_bytes)
+}
+
+/// Pure chunk-planning helper for WMMA: when `use_wmma_grid` round down to a
+/// positive multiple of 16. Asserts raw >=16 (bounded scratch guarantees it);
+/// raw=1 must panic/refuse, not be promoted to 16.
+#[inline]
+pub(crate) fn wmma_sub_batch(raw_sub_batch: usize, batch_size: usize, use_wmma_grid: bool) -> usize {
+    const WMMA_BLOCK_M: usize = 16;
+    if use_wmma_grid {
+        assert!(
+            raw_sub_batch >= WMMA_BLOCK_M,
+            "WMMA requires raw capacity >=16, got {raw_sub_batch}"
+        );
+        let rounded = (raw_sub_batch / WMMA_BLOCK_M) * WMMA_BLOCK_M;
+        rounded.min(batch_size)
+    } else {
+        raw_sub_batch
     }
 }
 
@@ -3461,6 +3498,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -3489,6 +3527,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -3519,6 +3558,7 @@ impl Gpu {
         block_cols: usize,
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -3547,6 +3587,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             slot_descs,
             row_slot,
+            partition_limit,
         )
     }
 
@@ -3574,6 +3615,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
         window: i32,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -3602,6 +3644,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -4905,12 +4948,6 @@ impl Gpu {
         )
     }
 
-    /// Shared helper: launch a batched asym flash tile + the shared asym reduce.
-    ///
-    /// `tree_bias` / `block_start` / `block_cols` activate DDTree tree-attention
-    /// mode (bias added to in-block qk scores; seq_len extends to full cache
-    /// including the tree block). When `tree_bias` is None and `block_cols` is
-    /// 0, behavior is byte-identical to the legacy causal path.
     #[allow(clippy::too_many_arguments)]
     fn launch_asym_flash_batched(
         &mut self,
@@ -4969,6 +5006,7 @@ impl Gpu {
         // kernarg bytes, the same way they already ignore `window`.
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         assert_eq!(
             slot_descs.is_some(),
@@ -4996,23 +5034,22 @@ impl Gpu {
         // logic caused).
         let tile_size: usize = self.attn_tile_size();
         const WMMA_BLOCK_M: usize = 16;
-        let max_tiles = (max_ctx_len + tile_size - 1) / tile_size;
+        let context_tiles = max_ctx_len.div_ceil(tile_size);
+        let partitioned = partition_limit.is_some();
+        let max_tiles = partition_limit.map_or(context_tiles, |limit| context_tiles.min(limit));
         let stride = 2 + head_dim;
         // Bytes of `partials` consumed per query row (n_heads * max_tiles *
-        // (2+head_dim) floats) — drives how many rows fit in one sub-batch
-        // chunk. Distinct from the `.hip`-side `per_pos_bytes`, which means
-        // KV bytes per cached position (n_kv_heads * head_dim/32 * 34); the
-        // two are unrelated quantities that happened to share a name.
         let partials_bytes_per_row = n_heads * max_tiles * stride * 4;
-        let partials_capacity = partials.numel() * 4;
-        let sub_batch = if partials_bytes_per_row > 0 {
+        let logical_partials_bytes = partials.numel() * 4;
+        let partials_capacity =
+            flash_partials_capacity_bytes(logical_partials_bytes, self.vmm_mapped_bytes(partials));
+        let raw_sub_batch = if partials_bytes_per_row > 0 {
             (partials_capacity / partials_bytes_per_row)
                 .max(1)
                 .min(batch_size)
         } else {
             batch_size
         };
-
         let wmma_fa_kernel = if self.arch_caps.has_wmma_w32_gfx12() {
             Some((
                 "attention_flash_asym4_wmma_tile_batched_gfx12",
@@ -5036,11 +5073,12 @@ impl Gpu {
             && tile_func_name == "attention_flash_asym4_tile_batched"
             && batch_size >= wmma_fa_min_batch()
             && batch_size % WMMA_BLOCK_M == 0
-            && sub_batch % WMMA_BLOCK_M == 0;
+            && raw_sub_batch % WMMA_BLOCK_M == 0;
         // `use_wmma_grid` controls grid shape, LDS, and kernarg layout.
         // True when either the inline env-gated ladder fires (scalar→WMMA
         // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
         let use_wmma_grid = wmma_ok || force_wmma_grid;
+        let sub_batch = wmma_sub_batch(raw_sub_batch, batch_size, use_wmma_grid);
         assert!(
             !(use_wmma_grid && (slot_descs.is_some() || row_slot.is_some())),
             "multi-slot descriptors are not supported on the WMMA tile grid; \
@@ -5193,6 +5231,7 @@ impl Gpu {
                 let bo = offset as i32;
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
+                let pq = i32::from(partitioned);
                 if v_mode_bits != V_MODE_Q8 {
                     let s1_ptr = cos_theta.buf.as_ptr();
                     let s2_ptr = sin_theta.buf.as_ptr();
@@ -5209,6 +5248,7 @@ impl Gpu {
                         &bc as *const _ as *mut c_void,
                         &s1_ptr as *const _ as *mut c_void,
                         &s2_ptr as *const _ as *mut c_void,
+                        &pq as *const _ as *mut c_void,
                     ];
                     self.launch_maybe_blob(
                         "attention_flash_lloyd_reduce_batched",
@@ -5230,6 +5270,7 @@ impl Gpu {
                             b.push_i32(bc);
                             b.push_ptr(s1_ptr);
                             b.push_ptr(s2_ptr);
+                            b.push_i32(pq);
                             b
                         },
                     )?;
@@ -5245,6 +5286,7 @@ impl Gpu {
                         &bo as *const _ as *mut c_void,
                         &bs as *const _ as *mut c_void,
                         &bc as *const _ as *mut c_void,
+                        &pq as *const _ as *mut c_void,
                     ];
                     self.launch_maybe_blob(
                         "attention_flash_asym_reduce_batched",
@@ -5264,6 +5306,7 @@ impl Gpu {
                             b.push_i32(bo);
                             b.push_i32(bs);
                             b.push_i32(bc);
+                            b.push_i32(pq);
                             b
                         },
                     )?;
@@ -5440,6 +5483,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.attention_flash_asym4_batched_masked(
@@ -5460,6 +5504,7 @@ impl Gpu {
             None,
             0,
             0,
+            partition_limit,
         )
     }
 
@@ -5487,6 +5532,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -5515,6 +5561,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -5542,8 +5589,32 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        const WMMA_BLOCK_M: usize = 16;
+        if batch_size % WMMA_BLOCK_M != 0 {
+            return self.attention_flash_asym4_batched_masked(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                cos_theta,
+                sin_theta,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_start,
+                block_cols,
+                partition_limit,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_asym4_wmma_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
@@ -5570,6 +5641,7 @@ impl Gpu {
             /*force_wmma_grid=*/ true,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -5594,8 +5666,32 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        const WMMA_BLOCK_M: usize = 16;
+        if batch_size % WMMA_BLOCK_M != 0 {
+            return self.attention_flash_asym4_batched_masked(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                cos_theta,
+                sin_theta,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_start,
+                block_cols,
+                partition_limit,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_asym4_wmma_tile_batched_gfx12",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC,
@@ -5622,6 +5718,7 @@ impl Gpu {
             /*force_wmma_grid=*/ true,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -5645,6 +5742,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.attention_flash_fwht4_batched_masked(
@@ -5666,6 +5764,7 @@ impl Gpu {
             0,
             0,
             V_MODE_Q8,
+            partition_limit,
         )
     }
 
@@ -5692,6 +5791,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
         v_mode_bits: i32,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -5720,6 +5820,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -5741,6 +5842,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -5769,6 +5871,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -5791,6 +5894,7 @@ impl Gpu {
         batch_size: usize,
         partials: &GpuTensor,
         v_mode_bits: i32,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -5819,6 +5923,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -5940,6 +6045,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.attention_flash_asym3_batched_masked(
@@ -5960,6 +6066,7 @@ impl Gpu {
             None,
             0,
             0,
+            partition_limit,
         )
     }
 
@@ -5986,6 +6093,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.attention_flash_asym3_batched_masked_slots(
             q,
@@ -6007,6 +6115,7 @@ impl Gpu {
             block_cols,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -6044,6 +6153,7 @@ impl Gpu {
         block_cols: usize,
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -6072,6 +6182,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             slot_descs,
             row_slot,
+            partition_limit,
         )
     }
 
@@ -6093,6 +6204,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.attention_flash_fwht3_batched_masked(
@@ -6114,6 +6226,7 @@ impl Gpu {
             0,
             0,
             V_MODE_Q8,
+            partition_limit,
         )
     }
 
@@ -6139,6 +6252,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
         v_mode_bits: i32,
+        partition_limit: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -6167,6 +6281,7 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+            partition_limit,
         )
     }
 
@@ -14899,7 +15014,10 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::{q8_flash_default_tile_size, replay_stable_tile_count};
+    use super::{
+        flash_partials_capacity_bytes, flash_partition_count, q8_flash_default_tile_size,
+        replay_stable_tile_count, wmma_sub_batch,
+    };
 
     #[test]
     fn q8_flash_gfx12_small_dense_shape_uses_tile16_only() {
@@ -14926,9 +15044,54 @@ mod tests {
     }
 
     #[test]
+    fn flash_partitions_cap_after_two_k_tokens_at_tile32() {
+        assert_eq!(flash_partition_count(1_024, 32), 32);
+        assert_eq!(flash_partition_count(2_048, 32), 64);
+        assert_eq!(flash_partition_count(2_049, 32), 64);
+        assert_eq!(flash_partition_count(262_144, 32), 64);
+    }
+
+    #[test]
     fn q8_flash_uses_max_tiles_for_both_capture_backends() {
         assert_eq!(replay_stable_tile_count(2, 64, false, false), 2);
         assert_eq!(replay_stable_tile_count(2, 64, true, false), 64);
         assert_eq!(replay_stable_tile_count(2, 64, false, true), 64);
+    }
+    #[test]
+    fn flash_partials_capacity_prefers_mapped_prefix_capped_by_logical() {
+        // Ordinary tensor: no mapped prefix → full logical bytes.
+        assert_eq!(flash_partials_capacity_bytes(4096, None), 4096);
+        // VMM fully mapped: mapped == logical.
+        assert_eq!(flash_partials_capacity_bytes(4096, Some(4096)), 4096);
+        // VMM partially mapped: use mapped prefix.
+        assert_eq!(flash_partials_capacity_bytes(4096, Some(1024)), 1024);
+        // Mapped never exceeds logical (defensive min).
+        assert_eq!(flash_partials_capacity_bytes(4096, Some(8192)), 4096);
+        // Zero logical stays zero.
+        assert_eq!(flash_partials_capacity_bytes(0, Some(1024)), 0);
+        assert_eq!(flash_partials_capacity_bytes(0, None), 0);
+    }
+
+    #[test]
+    fn wmma_chunk_planning_regression() {
+        // P=33 (max_tiles) with raw capacity 31 rows, batch 256 => chunk 16
+        // Bounded scratch guarantees raw >=16, but raw 31 is not a multiple of 16.
+        assert_eq!(wmma_sub_batch(31, 256, true), 16);
+        assert_eq!(wmma_sub_batch(31, 256, false), 31);
+        // Raw already multiple stays unchanged
+        assert_eq!(wmma_sub_batch(32, 256, true), 32);
+        assert_eq!(wmma_sub_batch(16, 16, true), 16);
+        // Raw <16 must panic/refuse, not be promoted to 16 (capacity-safe)
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wmma_sub_batch(
+            1, 256, true
+        )))
+        .is_err());
+        // Non-divisible total batch must fallback to scalar, not launch WMMA tail
+        // The forced wrappers check batch %16 !=0 and fallback; the chunk helper
+        // would still compute 16, but the wrapper must not use it.
+        let batch = 17;
+        assert_eq!(wmma_sub_batch(31, batch, true), 16);
+        // Correct fallback is scalar, which uses raw 31
+        assert_eq!(wmma_sub_batch(31, batch, false), 31);
     }
 }

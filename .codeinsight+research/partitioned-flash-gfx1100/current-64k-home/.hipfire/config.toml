@@ -1,0 +1,23 @@
+[serve]
+host = "127.0.0.1"
+port = 11865
+default_model = "/home/kaden/qcal/ladder-v2-gfx1100/artifacts/qwen3.8-27b.mq5v2.base.hfq"
+
+[hardware]
+deepseek4_compute_placement = "single"
+
+[memory]
+max_seq = 65536
+kv_cache = "q8"
+
+[speculation]
+mode = "dflash"
+dflash = "on"
+mtp = "off"
+ngram = "off"
+
+[generation]
+max_tokens = 32
+
+[reasoning]
+budget = "off"

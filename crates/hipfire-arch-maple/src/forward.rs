@@ -208,6 +208,7 @@ fn decode_step_body(
             block_cols: 0,
             output_gate: None,
             output: &state.fa_attn_out,
+        partition_limit: None,
         };
         hipfire_dispatch::pipeline::execute_steps(
             gpu,
@@ -1268,6 +1269,7 @@ fn batched_attend(
         block_cols: 0,
         output_gate: None,
         output: &state.b_attn_out,
+    partition_limit: None,
     };
     hipfire_dispatch::pipeline::execute_steps(
         gpu,

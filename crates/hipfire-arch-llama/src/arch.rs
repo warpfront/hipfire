@@ -279,6 +279,7 @@ impl Llama {
                     block_cols: 0,
                     output_gate: None,
                     output: &scratch.attn_out,
+                partition_limit: None,
                 };
                 family
                     .run_attention(&ctx, gpu, &plan, &io)

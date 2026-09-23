@@ -1,0 +1,28 @@
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+[hipfire] native serve listening on http://127.0.0.1:11866
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+[hipfire] pre-warm failed: daemon error: [internal retryable=false rolled_back=false attempt=0] load failed: qwen35: load_weights failed: HipError { code: 2, message: "hipMalloc: out of memory" }. GPU: gfx1100 (684 MB free / 24560 MB total); serving lazily
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+[hipfire] native serve listening on http://127.0.0.1:11866
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+[hipfire] pre-warm failed: daemon error: [internal retryable=false rolled_back=false attempt=0] load failed: qwen35: load_weights failed: HipError { code: 2, message: "hipMalloc: out of memory" }. GPU: gfx1100 (684 MB free / 24560 MB total); serving lazily
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+[hipfire] native serve listening on http://127.0.0.1:11866
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+[hipfire] pre-warm failed: daemon error: [internal retryable=false rolled_back=false attempt=0] load failed: qwen35: load_weights failed: HipError { code: 2, message: "hipMalloc: out of memory" }. GPU: gfx1100 (684 MB free / 24560 MB total); serving lazily
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+[hipfire] native serve listening on http://127.0.0.1:11866
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+[hipfire] pre-warm failed: daemon error: [internal retryable=false rolled_back=false attempt=0] load failed: qwen35: load_weights failed: HipError { code: 2, message: "hipMalloc: out of memory" }. GPU: gfx1100 (684 MB free / 24560 MB total); serving lazily

@@ -3076,6 +3076,7 @@ fn sliding_layer_decode_impl(
             block_cols: 0,
             output_gate: None,
             output: &scratch.attn_out,
+        partition_limit: None,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -3487,6 +3488,7 @@ fn full_layer_decode_impl(
             block_cols: 0,
             output_gate: None,
             output: &scratch.attn_out,
+        partition_limit: None,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -4282,6 +4284,7 @@ fn forward_prefill_batch_v2(
                         block_cols: 0,
                         output_gate: None,
                         output: &scratch.attn_out,
+                    partition_limit: None,
                     };
                     let ctx = DispatchCtx::new(gpu);
                     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -4614,6 +4617,7 @@ fn forward_prefill_batch_v2(
                     block_cols: 0,
                     output_gate: None,
                     output: &scratch.pb_attn_q,
+                partition_limit: None,
                 };
                 let ctx = DispatchCtx::new(gpu);
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -4693,6 +4697,7 @@ fn forward_prefill_batch_v2(
                             block_cols: 0,
                             output_gate: None,
                             output: &scratch.attn_out,
+                        partition_limit: None,
                         };
                         let c1 = DispatchCtx::new(gpu);
                         execute_steps(gpu, &c1, &[Step::Attend { plan: p1, io: io1 }])
@@ -5600,6 +5605,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     block_cols: 0,
                     output_gate: None,
                     output: &s.attn_out,
+                partition_limit: None,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
@@ -5715,6 +5721,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     block_cols: 0,
                     output_gate: None,
                     output: &s.attn_out,
+                partition_limit: None,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))

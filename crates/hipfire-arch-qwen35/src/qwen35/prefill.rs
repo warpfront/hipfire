@@ -576,6 +576,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     // This entry may already be inside graph capture, so it must only validate
     // capacity preflighted by its caller.
     kv_cache.require_mapped_capacity(required_tokens)?;
+    scratch.require_flash_partials_capacity(gpu, required_tokens, n)?;
 
     // Defense-in-depth: this entry point bypasses the eligibility check
     // in `forward_prefill_batch_with_pbs`, so the caller is responsible
@@ -1012,6 +1013,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     }
     let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_batch")?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    // Chunk ceiling for flash partials: plan clamps rows to batch_mult.
+    scratch.ensure_flash_partials_capacity(gpu, required_tokens, n.min(max_batch))?;
 
     // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
     // layer (attention OR FFN), mirroring the captured-path guard at
@@ -5311,6 +5314,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         block_cols,
         output_gate: None,
         output: &pbs.fa_attn_out_batch,
+    partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
     };
     if let BatchSemantics::Independent {
         lane_capacity,
@@ -6817,6 +6821,7 @@ fn batch_chunk_full_attn_moe(
         block_cols,
         output_gate: None,
         output: &pbs.fa_attn_out_batch,
+    partition_limit: Some(rdna_compute::attention::FLASH_MAX_PARTITIONS),
     };
     if let BatchSemantics::Independent {
         lane_capacity,
@@ -7104,8 +7109,25 @@ pub(crate) fn forward_batch_chunk_impl(
         gdn_tape.is_some(),
         tree_verify.is_some(),
     );
-    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
-    kv_cache.require_mapped_capacity(required_tokens)?;
+    // Derive required context from BatchSemantics once; independent batches
+    // use max(position)+1, not start_pos+n.
+    let logical_max_ctx = match batch_semantics {
+        BatchSemantics::Sequential => checked_kv_end(start_pos, n, "forward_prefill_chunk")?,
+        BatchSemantics::Independent { positions, .. } => positions
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                HipError::new(
+                    0,
+                    "forward_prefill_chunk: independent max position + 1 overflowed",
+                )
+            })?,
+    };
+    kv_cache.require_mapped_capacity(logical_max_ctx)?;
+    s.ensure_flash_partials_capacity(gpu, logical_max_ctx, n)?;
     debug_assert!(
         routed_out.is_none()
             || band
@@ -7178,12 +7200,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 }
                 _ => true,
             });
-    let logical_max_ctx = match batch_semantics {
-        BatchSemantics::Sequential => start_pos + n,
-        BatchSemantics::Independent { positions, .. } => {
-            positions.iter().copied().max().unwrap_or(0) + 1
-        }
-    };
+    // logical_max_ctx computed at preflight above.
     if batch_semantics.is_independent() && !fa_batched_ok {
         return Err(HipError::new(
             0,

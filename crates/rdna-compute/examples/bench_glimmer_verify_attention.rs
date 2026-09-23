@@ -391,6 +391,7 @@ impl Scratch {
                     None,
                     0,
                     0,
+                    None,
                 )
                 .expect("scalar_full");
             }
@@ -484,6 +485,7 @@ impl Scratch {
             0,
             0,
             WINDOW as i32,
+            None,
         )
         .expect("scalar window reference");
     }

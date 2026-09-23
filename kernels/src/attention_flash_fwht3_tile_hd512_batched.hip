@@ -3,22 +3,24 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Batched flash attention tile — fwht3 KV, head_dim=512 (Gemma 4 full-attention layers).
-//
+// Partitioned stage-1: max_tiles is the active partition count P.
+// Each partition merges a balanced contiguous range of context tiles.
+
 // Combines the hd=512 per-thread 16-dim Q/K/V handling from
 // attention_flash_fwht3_tile_hd512.hip with the batched scheme from
 // attention_flash_fwht3_tile_batched.hip: blockIdx.z is the batch slot,
 // positions[] holds per-batch absolute positions, and partials are laid out
-// as [sub_batch × n_heads × max_tiles × (2 + head_dim)].
-//
+// as [sub_batch × n_heads × P × (2 + head_dim)].
+
 // K byte geometry (matches single-token variant):
 //   bytes_per_head = 4 + (512*3)/8 = 196
 //   lane tid: 6 bytes at offset 4 + tid*6 (contiguous-per-lane)
 //   packed0 = idx[0..7]  (24 bits); packed1 = idx[8..15] (24 bits)
-//
+
 // V side: Q8_0 normal space (v_mode=8). Reuses attention_flash_q8_0_reduce
 // unchanged (n_halves=4, stride 514).
-//
-// Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
+
+// Grid: [n_heads, P, sub_batch_size]. Block: [32, 1, 1].
 // LDS: tile_size * 4 bytes.
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
@@ -50,7 +52,7 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
     if (head_dim != 512) return;
 
     const int h = blockIdx.x;
-    const int tile_id = blockIdx.y;
+    const int partition_id = blockIdx.y;
     const int local_bid = blockIdx.z;
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
@@ -58,22 +60,21 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
     const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
-    const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
-    const int tile_len = tile_end - tile_start;
     const bool sliding = (window_size > 0) && !tree_mode;
     const int t_lo = sliding ? max(0, seq_len - window_size) : 0;
 
-    // Out-of-window early exit: zero this tile's partials.
-    if (sliding && tile_end <= t_lo) {
-        float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
-                            + tile_id * (2 + head_dim);
+    const int n_context_tiles = (seq_len + tile_size - 1) / tile_size;
+    const int P = max_tiles;
+    const int base_tiles = (P > 0) ? n_context_tiles / P : 0;
+    const int extra_tiles = (P > 0) ? n_context_tiles % P : 0;
+    const int partition_tiles = base_tiles + (partition_id < extra_tiles ? 1 : 0);
+    const int first_tile = partition_id * base_tiles + (partition_id < extra_tiles ? partition_id : extra_tiles);
+    const int last_tile = first_tile + partition_tiles;
+    const int stride = 2 + head_dim;
+    float* p = partials + ((long long)local_bid * n_heads + h) * P * stride
+                        + partition_id * stride;
+    if (partition_tiles == 0) {
         if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
-        const int d0z = tid * 16;
-        #pragma unroll
-        for (int i = 0; i < 16; i++)
-            p[2 + d0z + i] = 0.0f;
         return;
     }
 
@@ -113,104 +114,121 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
         mq8,  mq9,  mq10, mq11, mq12, mq13, mq14, mq15,
         signs1, signs2, tid);
 
-    // Phase A: Q·K (3-bit K, two 24-bit packed words per lane).
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        int t = tile_start + t_local;
-        const bool out_of_window = sliding && (t < t_lo);
-        float partial = 0.0f;
-        if (!out_of_window) {
-            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
-            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
-            float cnorm = *(const float*)kb;
-            // Lane tid: 6 bytes at offset 4 + tid*6 (contiguous-per-lane layout).
-            const unsigned char* base = kb + 4 + tid * 6;
-            unsigned int packed0 = (unsigned int)base[0]
-                                 | ((unsigned int)base[1] << 8)
-                                 | ((unsigned int)base[2] << 16);
-            unsigned int packed1 = (unsigned int)base[3]
-                                 | ((unsigned int)base[4] << 8)
-                                 | ((unsigned int)base[5] << 16);
-            partial  = mq0  * (cnorm * TURBO_C3_512[ packed0        & 7])
-                     + mq1  * (cnorm * TURBO_C3_512[(packed0 >>  3) & 7])
-                     + mq2  * (cnorm * TURBO_C3_512[(packed0 >>  6) & 7])
-                     + mq3  * (cnorm * TURBO_C3_512[(packed0 >>  9) & 7])
-                     + mq4  * (cnorm * TURBO_C3_512[(packed0 >> 12) & 7])
-                     + mq5  * (cnorm * TURBO_C3_512[(packed0 >> 15) & 7])
-                     + mq6  * (cnorm * TURBO_C3_512[(packed0 >> 18) & 7])
-                     + mq7  * (cnorm * TURBO_C3_512[(packed0 >> 21) & 7])
-                     + mq8  * (cnorm * TURBO_C3_512[ packed1        & 7])
-                     + mq9  * (cnorm * TURBO_C3_512[(packed1 >>  3) & 7])
-                     + mq10 * (cnorm * TURBO_C3_512[(packed1 >>  6) & 7])
-                     + mq11 * (cnorm * TURBO_C3_512[(packed1 >>  9) & 7])
-                     + mq12 * (cnorm * TURBO_C3_512[(packed1 >> 12) & 7])
-                     + mq13 * (cnorm * TURBO_C3_512[(packed1 >> 15) & 7])
-                     + mq14 * (cnorm * TURBO_C3_512[(packed1 >> 18) & 7])
-                     + mq15 * (cnorm * TURBO_C3_512[(packed1 >> 21) & 7]);
-        }
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_xor(partial, off);
-        if (tid == 0) {
-            float s = out_of_window ? -1e30f : (partial * scale_attn);
-            if (tree_mode && t >= block_start) {
-                s += tree_bias[global_bid * block_cols + (t - block_start)];
-            }
-            scores[t_local] = s;
-        }
-    }
-    __syncthreads();
-
-    // Phase B: tile max
-    float local_max = -1e30f;
-    for (int i = tid; i < tile_len; i += 32)
-        local_max = fmaxf(local_max, scores[i]);
-    for (int off = 16; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-    float tile_max = local_max;
-
-    // Phase C: exp + sum
-    float local_sum = 0.0f;
-    for (int i = tid; i < tile_len; i += 32) {
-        float e = expf(scores[i] - tile_max);
-        scores[i] = e;
-        local_sum += e;
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        local_sum += __shfl_xor(local_sum, off);
-    float tile_sum = local_sum;
-    __syncthreads();
-
-    // Phase D: V — 16 output dims per thread (contiguous d0..d0+15).
+    float partition_max = -1e30f;
+    float partition_sum = 0.0f;
     float out_vec[16] = {
         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
     };
-    if (v_mode == 8) {
-        // Q8_0 V (normal space) — same logic as asym3_hd512_batched but with
-        // contiguous d0 = tid*16 map instead of the two-chunk d0_lo/d0_hi split.
+
+    for (int tile = first_tile; tile < last_tile; tile++) {
+        const int tile_start = tile * tile_size;
+        const int tile_end = min(tile_start + tile_size, seq_len);
+        const int tile_len = tile_end - tile_start;
+
+        if (sliding && tile_end <= t_lo) continue;
+
+        // Phase A: Q·K (3-bit K, two 24-bit packed words per lane).
         for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
             int t = tile_start + t_local;
-            const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
-            const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
-            #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                const int d = d0 + i;
-                const int bi = d / 32;
-                const int bj = d & 31;
-                const unsigned char* vbh = vb + (v_kv_head_blk + bi) * 34;
-                float vs = (float)*((const _Float16*)vbh);
-                out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+            const bool out_of_window = sliding && (t < t_lo);
+            float partial = 0.0f;
+            if (!out_of_window) {
+                const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+                const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
+                float cnorm = *(const float*)kb;
+                // Lane tid: 6 bytes at offset 4 + tid*6 (contiguous-per-lane layout).
+                const unsigned char* base = kb + 4 + tid * 6;
+                unsigned int packed0 = (unsigned int)base[0]
+                                     | ((unsigned int)base[1] << 8)
+                                     | ((unsigned int)base[2] << 16);
+                unsigned int packed1 = (unsigned int)base[3]
+                                     | ((unsigned int)base[4] << 8)
+                                     | ((unsigned int)base[5] << 16);
+                partial  = mq0  * (cnorm * TURBO_C3_512[ packed0        & 7])
+                         + mq1  * (cnorm * TURBO_C3_512[(packed0 >>  3) & 7])
+                         + mq2  * (cnorm * TURBO_C3_512[(packed0 >>  6) & 7])
+                         + mq3  * (cnorm * TURBO_C3_512[(packed0 >>  9) & 7])
+                         + mq4  * (cnorm * TURBO_C3_512[(packed0 >> 12) & 7])
+                         + mq5  * (cnorm * TURBO_C3_512[(packed0 >> 15) & 7])
+                         + mq6  * (cnorm * TURBO_C3_512[(packed0 >> 18) & 7])
+                         + mq7  * (cnorm * TURBO_C3_512[(packed0 >> 21) & 7])
+                         + mq8  * (cnorm * TURBO_C3_512[ packed1        & 7])
+                         + mq9  * (cnorm * TURBO_C3_512[(packed1 >>  3) & 7])
+                         + mq10 * (cnorm * TURBO_C3_512[(packed1 >>  6) & 7])
+                         + mq11 * (cnorm * TURBO_C3_512[(packed1 >>  9) & 7])
+                         + mq12 * (cnorm * TURBO_C3_512[(packed1 >> 12) & 7])
+                         + mq13 * (cnorm * TURBO_C3_512[(packed1 >> 15) & 7])
+                         + mq14 * (cnorm * TURBO_C3_512[(packed1 >> 18) & 7])
+                         + mq15 * (cnorm * TURBO_C3_512[(packed1 >> 21) & 7]);
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_xor(partial, off);
+            if (tid == 0) {
+                float s = out_of_window ? -1e30f : (partial * scale_attn);
+                if (tree_mode && t >= block_start) {
+                    s += tree_bias[global_bid * block_cols + (t - block_start)];
+                }
+                scores[t_local] = s;
             }
         }
-    }
-    // v_mode==3 (lloyd3 rotated-V) deferred per spec §2.4.
+        __syncthreads();
 
-    // Write partials — batched layout: [sub_batch × n_heads × max_tiles × stride].
-    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
-                        + tile_id * (2 + head_dim);
+        // Phase B: tile max
+        float local_max = -1e30f;
+        for (int i = tid; i < tile_len; i += 32)
+            local_max = fmaxf(local_max, scores[i]);
+        for (int off = 16; off > 0; off >>= 1)
+            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+        float tile_max = local_max;
+
+        // Phase C: exp + sum
+        float local_sum = 0.0f;
+        for (int i = tid; i < tile_len; i += 32) {
+            float e = expf(scores[i] - tile_max);
+            scores[i] = e;
+            local_sum += e;
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            local_sum += __shfl_xor(local_sum, off);
+        float tile_sum = local_sum;
+        __syncthreads();
+
+        const float merged_max = fmaxf(partition_max, tile_max);
+        const float previous_corr = (partition_sum > 0.0f) ? expf(partition_max - merged_max) : 0.0f;
+        const float tile_corr = expf(tile_max - merged_max);
+        #pragma unroll
+        for (int i = 0; i < 16; i++) out_vec[i] *= previous_corr;
+
+        // Phase D: V — 16 output dims per thread (contiguous d0..d0+15).
+        if (v_mode == 8) {
+            for (int t_local = 0; t_local < tile_len; t_local++) {
+                float w = scores[t_local] * tile_corr;
+                int t = tile_start + t_local;
+                const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+                const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    const int d = d0 + i;
+                    const int bi = d / 32;
+                    const int bj = d & 31;
+                    const unsigned char* vbh = vb + (v_kv_head_blk + bi) * 34;
+                    float vs = (float)*((const _Float16*)vbh);
+                    out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+                }
+            }
+        }
+        // v_mode==3 (lloyd3 rotated-V) deferred per spec §2.4.
+
+        partition_sum = partition_sum * previous_corr + tile_sum * tile_corr;
+        partition_max = merged_max;
+        __syncthreads();
+    }
+
+    // Write partials — batched layout: [sub_batch × n_heads × P × stride].
     if (tid == 0) {
-        p[0] = tile_max;
-        p[1] = tile_sum;
+        p[0] = partition_max;
+        p[1] = partition_sum;
     }
     #pragma unroll
     for (int i = 0; i < 16; i++) {

@@ -2327,6 +2327,7 @@ fn batch_attn_block(
             0,
             0,
             cfg.sliding_window as i32,
+            None,
         )
         .map_err(|e| format!("gemma4 batch sliding flash attn: {e:?}"))?;
     } else if a.seq_len > 8_192 {
@@ -2346,6 +2347,7 @@ fn batch_attn_block(
             None,
             0,
             0,
+            None,
         )
         .map_err(|e| format!("gemma4 batch flash attn masked: {e:?}"))?;
     } else {
