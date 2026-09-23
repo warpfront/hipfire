@@ -993,6 +993,48 @@
       "arch_id": 5,
       "quant": "mq4"
     },
+    "qwen3.8:27b-mq4-xts": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4-xts",
+      "size_gb": 14.99,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2 XT, symmetric, QAT r7s200. Test SKU for the mq4-lloyd gfx11 prefill work (X5 staging, V2C on gfx1100, V2B on gfx1151). WT2 c24 q8/q8: 0.076879 gfx1100, 0.076901 gfx1151. qwen3.8:27b-mq4-xt is unchanged.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq",
+        "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+        "size_bytes": 1209603072
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      },
+      "sha256": "de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5",
+      "size_bytes": 14987185152,
+      "arch_id": 5,
+      "quant": "mq4"
+    },
     "qwen3.8:27b": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq4",
