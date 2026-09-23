@@ -1,0 +1,2357 @@
+{
+  "started_at_utc": "2026-07-28T04:41:45.698853+00:00",
+  "host": "hipx",
+  "git_commit": "8a60b38b65642bca705962741462e79395969ebf",
+  "model": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r",
+  "model_bytes": 18700048128,
+  "model_sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
+  "daemon": "/home/kaden/hipfire-silver-gate-maxilp/target/release/examples/daemon",
+  "daemon_sha256": "0b32a99a6ae7e8012726df0e91cae97726d322d44f03747ca74730119764495a",
+  "cli": "/home/kaden/hipfire-silver-gate-maxilp/target/release/hipfire",
+  "cli_sha256": "bf922b808e1f0af52a2ca876d4005a371ceab90d69062bed691f8e59b2d1e5fb",
+  "device_visibility": {
+    "HIP_VISIBLE_DEVICES": null,
+    "ROCR_VISIBLE_DEVICES": null
+  },
+  "automatic_clocks": true,
+  "context": 128,
+  "iterations": 128,
+  "warmups": 3,
+  "warmup_iterations": 32,
+  "stationarity": {
+    "window": 5,
+    "min_runs": 5,
+    "confirmation_runs": 5,
+    "max_slope_pct": 0.05,
+    "max_spread_pct": 1.0,
+    "max_median_drift_pct": 0.5,
+    "max_runs": 30
+  },
+  "dpm_warmup_secs": 0.0,
+  "runs": 5,
+  "transport": "pm4",
+  "pm4_policy": {
+    "HIPFIRE_REPLAY_PM4_QUEUES": "1",
+    "HIPFIRE_REPLAY_PM4_STATEFUL": "static",
+    "HIPFIRE_REPLAY_PM4_WAIT_POLICY": "resource",
+    "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY": "required-only",
+    "HIPFIRE_REPLAY_PM4_GCR_TRIM": "1",
+    "HIPFIRE_REPLAY_PM4_NATIVE_PHASES": "0",
+    "HIPFIRE_REPLAY_PM4_DYNAMIC_GRID": "0"
+  },
+  "kv_mode": "q8",
+  "pm4_preflight": {
+    "seconds": 19.55224728398025,
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "smoke": {
+      "type": "decode_result",
+      "context_tokens": 128,
+      "iterations": 3,
+      "ms": 40.459467,
+      "us_per_token": 13486.489,
+      "tok_s": 74.14828277396734,
+      "redline_route": {
+        "requested_backend": "auto",
+        "transport": "pm4",
+        "state": "ready",
+        "fallback_reason": null,
+        "execution_mode": "plain_ar",
+        "prepared": {
+          "dispatches": 604,
+          "packets": 1,
+          "queue_id": 2,
+          "command_dwords": 16762,
+          "queues": 1,
+          "phases": 1
+        },
+        "sequence": {
+          "launches": 604,
+          "unique_kernels": 22,
+          "hash": "43754a60ca25f47c"
+        },
+        "observed": {
+          "count_before": 0,
+          "count_after": 2,
+          "count_delta": 2,
+          "first_position": 129,
+          "last_position": 130
+        },
+        "retained_replay_observed": true
+      }
+    },
+    "redline_route": {
+      "requested_backend": "auto",
+      "transport": "pm4",
+      "state": "ready",
+      "fallback_reason": null,
+      "execution_mode": "plain_ar",
+      "prepared": {
+        "dispatches": 604,
+        "packets": 1,
+        "queue_id": 2,
+        "command_dwords": 16762,
+        "queues": 1,
+        "phases": 1
+      },
+      "sequence": {
+        "launches": 604,
+        "unique_kernels": 22,
+        "hash": "43754a60ca25f47c"
+      },
+      "observed": {
+        "count_before": 0,
+        "count_after": 2,
+        "count_delta": 2,
+        "first_position": 129,
+        "last_position": 130
+      },
+      "retained_replay_observed": true
+    },
+    "route_proof": {
+      "valid": true,
+      "backend": "auto",
+      "transport": "pm4",
+      "rows": 1,
+      "require_complete_replay": false,
+      "retained_rows": 1,
+      "observed_positions": [
+        129,
+        130
+      ],
+      "prepared_identities": [
+        [
+          604,
+          1,
+          2,
+          16762,
+          1,
+          1
+        ]
+      ],
+      "sequences": [
+        [
+          604,
+          22,
+          "43754a60ca25f47c"
+        ]
+      ],
+      "errors": []
+    }
+  },
+  "coherence": {
+    "hip": {
+      "backend": "hip",
+      "seconds": 33.56719591701403,
+      "valid": true,
+      "errors": [],
+      "speed_checked": false,
+      "prompt": "What is the origin of Flagstaff, Arizona's name?",
+      "config": {
+        "backend": "hip",
+        "configured_backend": "hip",
+        "transport": "pm4",
+        "thinking": "low",
+        "thinking_cap_tokens": 512,
+        "max_tokens": 1024,
+        "seed": 1,
+        "sampling": "registry",
+        "mode": "battery",
+        "mtp": "off",
+        "kv_mode": "q8",
+        "max_seq": 2048,
+        "prompt": "What is the origin of Flagstaff, Arizona's name?",
+        "port": 35563,
+        "smoke_dir": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f",
+        "home": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f/home",
+        "serve_log": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f/serve.log",
+        "serve_pid_file": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f/serve-hip.pid",
+        "daemon_basename": "daemon-product-hip-coherence-3050389",
+        "cli": "/home/kaden/hipfire-silver-gate-maxilp/target/release/hipfire",
+        "replay_route_proof_log": true,
+        "diagnostic_replay_route_proof_log": "diagnostic.replay.route_proof_log"
+      },
+      "row": {
+        "ctx": 22,
+        "cached": 0,
+        "gen": 926,
+        "finish": "stop",
+        "think_words": 312,
+        "ans_words": 280,
+        "prefill_ms": 47.5,
+        "prefill_tok_s": 463.2,
+        "decode_tok_s": 209.7,
+        "decode_estimated": false,
+        "tau": null,
+        "ttft_s": 0.223,
+        "wall_s": 4.467,
+        "attractor": false,
+        "empty": false,
+        "runaway": false,
+        "ans_preview": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect",
+        "assistant_content": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erected by members of the **U.S. Pacific Railroad Survey** in **1858**.\n\nHere are the key historical details behind the name:\n\n\ud83d\udd0d **Key Facts:**\n- In the fall of 1858, a team of topographic engineers led by **Lieut. Amiel Wentworth Whipple** was surveying potential routes for the transcontinental railroad.\n- While camped near the base of the San Francisco Peaks, they erected a tall wooden pole with an American flag at its summit to mark their location and serve as a visible landmark.\n- The expedition members began referring to the site as **\"Flagstaff Camp\"** or simply **\"Flagstaff.\"**\n- Initially, there were two nearby settlements\u2014the one on the high ground near the peak became known as \"New Flagstaff,\" while a lower-elevation settlement downwind was called \"Old Flagstaff.\" Over time, only \"Flagstaff\" remained.\n\n\ud83d\udcc5 **Official Recognition:**\n- The name gradually shifted from a military/exploration camp designation to a permanent civilian settlement.\n- The town was officially incorporated in **1886**, by which time the flagpole had long disappeared, but the name stuck due to its strong historical association with the area's early exploration and railroad development.\n\n\ud83d\udca1 **Bonus Note:** \nThe highest point of the San Francisco Peaks (4,209 m / 13,825 ft) was originally called **Mount Washington** by later settlers (named after the U.S. President), but many early pioneers and maps simply referred to it as \"Flagstaff Peak\" or \"Flagstaff Mountain\" because of this landmark. The original wooden flagpole has been replaced over time by a modern steel pole topped with a flag on the summit today.\n\nIf you'd like sources or more details about the 1858 expedition, I can provide those!"
+      },
+      "rows": [
+        {
+          "ctx": 22,
+          "cached": 0,
+          "gen": 926,
+          "finish": "stop",
+          "think_words": 312,
+          "ans_words": 280,
+          "prefill_ms": 47.5,
+          "prefill_tok_s": 463.2,
+          "decode_tok_s": 209.7,
+          "decode_estimated": false,
+          "tau": null,
+          "ttft_s": 0.223,
+          "wall_s": 4.467,
+          "attractor": false,
+          "empty": false,
+          "runaway": false,
+          "ans_preview": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect",
+          "assistant_content": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erected by members of the **U.S. Pacific Railroad Survey** in **1858**.\n\nHere are the key historical details behind the name:\n\n\ud83d\udd0d **Key Facts:**\n- In the fall of 1858, a team of topographic engineers led by **Lieut. Amiel Wentworth Whipple** was surveying potential routes for the transcontinental railroad.\n- While camped near the base of the San Francisco Peaks, they erected a tall wooden pole with an American flag at its summit to mark their location and serve as a visible landmark.\n- The expedition members began referring to the site as **\"Flagstaff Camp\"** or simply **\"Flagstaff.\"**\n- Initially, there were two nearby settlements\u2014the one on the high ground near the peak became known as \"New Flagstaff,\" while a lower-elevation settlement downwind was called \"Old Flagstaff.\" Over time, only \"Flagstaff\" remained.\n\n\ud83d\udcc5 **Official Recognition:**\n- The name gradually shifted from a military/exploration camp designation to a permanent civilian settlement.\n- The town was officially incorporated in **1886**, by which time the flagpole had long disappeared, but the name stuck due to its strong historical association with the area's early exploration and railroad development.\n\n\ud83d\udca1 **Bonus Note:** \nThe highest point of the San Francisco Peaks (4,209 m / 13,825 ft) was originally called **Mount Washington** by later settlers (named after the U.S. President), but many early pioneers and maps simply referred to it as \"Flagstaff Peak\" or \"Flagstaff Mountain\" because of this landmark. The original wooden flagpole has been replaced over time by a modern steel pole topped with a flag on the summit today.\n\nIf you'd like sources or more details about the 1858 expedition, I can provide those!"
+        }
+      ],
+      "returncode": 0,
+      "stdout": "==================== serve_harness pre-flight (CONFIRM before run) ====================\n  model         : /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r\n  registry tag  : qwen3.6:35b-a3b\n  kv_mode       : q8   mtp_mode: off   mode: battery\n  seed          : 1   prompts_file: /home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f/prompts.json\n  thinking_budget: low -> 512 tok (CONCRETE cap)\n  max_tokens     : 1024  (> think cap 512 \u2014 model can answer)\n  sampling (what IS set):\n      temperature       = 1.0      [registry(qwen3.6:35b-a3b)]\n      top_p             = 0.95     [registry(qwen3.6:35b-a3b)]\n      top_k             = 20       [registry(qwen3.6:35b-a3b)]\n      min_p             = 0.0      [registry(qwen3.6:35b-a3b)]\n      presence_penalty  = 1.5      [registry(qwen3.6:35b-a3b)]\n      repeat_penalty    = 1.0      [registry(qwen3.6:35b-a3b)]\n  sampling (NOT set, serve/daemon default applies): reasoning_effort\n=======================================================================================\n  [serve warm; MTP head loaded lines=0]\n### RUN qwen3.6-35b-a3b.mq4r|off|battery  kv=q8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 1.5, 'repeat_penalty': 1.0} seed=1 ###\n  [factual]t1  finish=stop   ctx=22     cached=0      gen=926  (think 312/ans 280w) prefill=47.5ms decode=209.7 tau=None | 'The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect'\n[qwen3.6-35b-a3b.mq4r|off|battery DONE] turns=1 runaway=0 empty=0 attractor=0 avg_decode=209.7tok/s\n",
+      "stderr": "",
+      "out_path": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f/harness.json",
+      "serve_log": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f/serve.log",
+      "smoke_dir": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-hip-coherence-3050389-wth5a_w6-bff2795f",
+      "port": 35563,
+      "daemon_basename": "daemon-product-hip-coherence-3050389",
+      "route_evidence": {
+        "required": false,
+        "observed": false,
+        "transport": null,
+        "position": null,
+        "marker": null,
+        "lines": []
+      }
+    },
+    "auto": {
+      "backend": "auto",
+      "seconds": 33.35362850211095,
+      "valid": true,
+      "errors": [],
+      "speed_checked": false,
+      "prompt": "What is the origin of Flagstaff, Arizona's name?",
+      "config": {
+        "backend": "auto",
+        "configured_backend": "redline",
+        "transport": "pm4",
+        "thinking": "low",
+        "thinking_cap_tokens": 512,
+        "max_tokens": 1024,
+        "seed": 1,
+        "sampling": "registry",
+        "mode": "battery",
+        "mtp": "off",
+        "kv_mode": "q8",
+        "max_seq": 2048,
+        "prompt": "What is the origin of Flagstaff, Arizona's name?",
+        "port": 49541,
+        "smoke_dir": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0",
+        "home": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0/home",
+        "serve_log": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0/serve.log",
+        "serve_pid_file": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0/serve-auto.pid",
+        "daemon_basename": "daemon-product-auto-coherence-3050389",
+        "cli": "/home/kaden/hipfire-silver-gate-maxilp/target/release/hipfire",
+        "replay_route_proof_log": true,
+        "diagnostic_replay_route_proof_log": "diagnostic.replay.route_proof_log"
+      },
+      "row": {
+        "ctx": 22,
+        "cached": 0,
+        "gen": 926,
+        "finish": "stop",
+        "think_words": 312,
+        "ans_words": 280,
+        "prefill_ms": 47.1,
+        "prefill_tok_s": 467.5,
+        "decode_tok_s": 220.6,
+        "decode_estimated": false,
+        "tau": null,
+        "ttft_s": 0.236,
+        "wall_s": 4.251,
+        "attractor": false,
+        "empty": false,
+        "runaway": false,
+        "ans_preview": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect",
+        "assistant_content": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erected by members of the **U.S. Pacific Railroad Survey** in **1858**.\n\nHere are the key historical details behind the name:\n\n\ud83d\udd0d **Key Facts:**\n- In the fall of 1858, a team of topographic engineers led by **Lieut. Amiel Wentworth Whipple** was surveying potential routes for the transcontinental railroad.\n- While camped near the base of the San Francisco Peaks, they erected a tall wooden pole with an American flag at its summit to mark their location and serve as a visible landmark.\n- The expedition members began referring to the site as **\"Flagstaff Camp\"** or simply **\"Flagstaff.\"**\n- Initially, there were two nearby settlements\u2014the one on the high ground near the peak became known as \"New Flagstaff,\" while a lower-elevation settlement downwind was called \"Old Flagstaff.\" Over time, only \"Flagstaff\" remained.\n\n\ud83d\udcc5 **Official Recognition:**\n- The name gradually shifted from a military/exploration camp designation to a permanent civilian settlement.\n- The town was officially incorporated in **1886**, by which time the flagpole had long disappeared, but the name stuck due to its strong historical association with the area's early exploration and railroad development.\n\n\ud83d\udca1 **Bonus Note:** \nThe highest point of the San Francisco Peaks (4,209 m / 13,825 ft) was originally called **Mount Washington** by later settlers (named after the U.S. President), but many early pioneers and maps simply referred to it as \"Flagstaff Peak\" or \"Flagstaff Mountain\" because of this landmark. The original wooden flagpole has been replaced over time by a modern steel pole topped with a flag on the summit today.\n\nIf you'd like sources or more details about the 1858 expedition, I can provide those!"
+      },
+      "rows": [
+        {
+          "ctx": 22,
+          "cached": 0,
+          "gen": 926,
+          "finish": "stop",
+          "think_words": 312,
+          "ans_words": 280,
+          "prefill_ms": 47.1,
+          "prefill_tok_s": 467.5,
+          "decode_tok_s": 220.6,
+          "decode_estimated": false,
+          "tau": null,
+          "ttft_s": 0.236,
+          "wall_s": 4.251,
+          "attractor": false,
+          "empty": false,
+          "runaway": false,
+          "ans_preview": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect",
+          "assistant_content": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erected by members of the **U.S. Pacific Railroad Survey** in **1858**.\n\nHere are the key historical details behind the name:\n\n\ud83d\udd0d **Key Facts:**\n- In the fall of 1858, a team of topographic engineers led by **Lieut. Amiel Wentworth Whipple** was surveying potential routes for the transcontinental railroad.\n- While camped near the base of the San Francisco Peaks, they erected a tall wooden pole with an American flag at its summit to mark their location and serve as a visible landmark.\n- The expedition members began referring to the site as **\"Flagstaff Camp\"** or simply **\"Flagstaff.\"**\n- Initially, there were two nearby settlements\u2014the one on the high ground near the peak became known as \"New Flagstaff,\" while a lower-elevation settlement downwind was called \"Old Flagstaff.\" Over time, only \"Flagstaff\" remained.\n\n\ud83d\udcc5 **Official Recognition:**\n- The name gradually shifted from a military/exploration camp designation to a permanent civilian settlement.\n- The town was officially incorporated in **1886**, by which time the flagpole had long disappeared, but the name stuck due to its strong historical association with the area's early exploration and railroad development.\n\n\ud83d\udca1 **Bonus Note:** \nThe highest point of the San Francisco Peaks (4,209 m / 13,825 ft) was originally called **Mount Washington** by later settlers (named after the U.S. President), but many early pioneers and maps simply referred to it as \"Flagstaff Peak\" or \"Flagstaff Mountain\" because of this landmark. The original wooden flagpole has been replaced over time by a modern steel pole topped with a flag on the summit today.\n\nIf you'd like sources or more details about the 1858 expedition, I can provide those!"
+        }
+      ],
+      "returncode": 0,
+      "stdout": "==================== serve_harness pre-flight (CONFIRM before run) ====================\n  model         : /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r\n  registry tag  : qwen3.6:35b-a3b\n  kv_mode       : q8   mtp_mode: off   mode: battery\n  seed          : 1   prompts_file: /home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0/prompts.json\n  thinking_budget: low -> 512 tok (CONCRETE cap)\n  max_tokens     : 1024  (> think cap 512 \u2014 model can answer)\n  sampling (what IS set):\n      temperature       = 1.0      [registry(qwen3.6:35b-a3b)]\n      top_p             = 0.95     [registry(qwen3.6:35b-a3b)]\n      top_k             = 20       [registry(qwen3.6:35b-a3b)]\n      min_p             = 0.0      [registry(qwen3.6:35b-a3b)]\n      presence_penalty  = 1.5      [registry(qwen3.6:35b-a3b)]\n      repeat_penalty    = 1.0      [registry(qwen3.6:35b-a3b)]\n  sampling (NOT set, serve/daemon default applies): reasoning_effort\n=======================================================================================\n  [serve warm; MTP head loaded lines=0]\n### RUN qwen3.6-35b-a3b.mq4r|off|battery  kv=q8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 1.5, 'repeat_penalty': 1.0} seed=1 ###\n  [factual]t1  finish=stop   ctx=22     cached=0      gen=926  (think 312/ans 280w) prefill=47.1ms decode=220.6 tau=None | 'The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect'\n[qwen3.6-35b-a3b.mq4r|off|battery DONE] turns=1 runaway=0 empty=0 attractor=0 avg_decode=220.6tok/s\n",
+      "stderr": "",
+      "out_path": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0/harness.json",
+      "serve_log": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0/serve.log",
+      "smoke_dir": "/home/kaden/hipfire-silver-gate-maxilp/gate-maxilp-work/product-auto-coherence-3050389-raq09w64-42f468f0",
+      "port": 49541,
+      "daemon_basename": "daemon-product-auto-coherence-3050389",
+      "route_evidence": {
+        "required": true,
+        "observed": true,
+        "transport": "pm4",
+        "position": 23,
+        "marker": "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=23",
+        "lines": [
+          "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 position=23"
+        ]
+      }
+    },
+    "multiturn": null
+  },
+  "hip": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 155.712289,
+        "us_per_token": 4866.00903125,
+        "tok_s": 205.50722236187792,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 149.333268,
+        "us_per_token": 4666.664624999999,
+        "tok_s": 214.2858080357553,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 148.171202,
+        "us_per_token": 4630.3500625,
+        "tok_s": 215.96639271374744,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      }
+    ],
+    "warmup_seconds": 0.6475118809612468,
+    "settling": {
+      "rows": [
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.153401,
+          "us_per_token": 4649.635945312501,
+          "tok_s": 215.07060160444246,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.186363,
+          "us_per_token": 4649.8934609375,
+          "tok_s": 215.0586907852255,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.5554149999999,
+          "us_per_token": 4652.776679687499,
+          "tok_s": 214.92542385833232,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.550205,
+          "us_per_token": 4652.7359765625,
+          "tok_s": 214.9273040717029,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.5910610000001,
+          "us_per_token": 4653.0551640625,
+          "tok_s": 214.91256061682228,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.5222620000001,
+          "us_per_token": 4652.517671875,
+          "tok_s": 214.93738885617006,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.64412,
+          "us_per_token": 4653.4696875,
+          "tok_s": 214.8934165588674,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.674036,
+          "us_per_token": 4653.70340625,
+          "tok_s": 214.8826241605736,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.59019,
+          "us_per_token": 4653.0483593750005,
+          "tok_s": 214.9128749081646,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 595.806875,
+          "us_per_token": 4654.7412109375,
+          "tok_s": 214.83471468837953,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        }
+      ],
+      "seconds": 6.552451789029874,
+      "decision": {
+        "stationary": true,
+        "candidate": {
+          "at_row": 5,
+          "window": {
+            "window": 5,
+            "first_row": 1,
+            "last_row": 5,
+            "min": 214.91256061682228,
+            "median": 214.9273040717029,
+            "max": 215.07060160444246,
+            "slope_pct_per_row": -0.02081953666592706,
+            "spread_pct": 0.07353229888718928,
+            "stable": true
+          }
+        },
+        "confirmed_at_row": 10,
+        "confirmed_window": {
+          "window": 5,
+          "first_row": 6,
+          "last_row": 10,
+          "min": 214.83471468837953,
+          "median": 214.8934165588674,
+          "max": 214.93738885617006,
+          "slope_pct_per_row": -0.008650334163815738,
+          "spread_pct": 0.04777911275024968,
+          "stable": true
+        },
+        "median_drift_pct": 0.01576696501260466,
+        "rejections": []
+      }
+    },
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 596.049028,
+        "us_per_token": 4656.63303125,
+        "tok_s": 214.74743517239656,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 595.769826,
+        "us_per_token": 4654.451765625,
+        "tok_s": 214.84807456495793,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 596.081038,
+        "us_per_token": 4656.8831093750005,
+        "tok_s": 214.73590307363543,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 595.648368,
+        "us_per_token": 4653.502875,
+        "tok_s": 214.89188399824508,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 596.2152590000001,
+        "us_per_token": 4657.931710937501,
+        "tok_s": 214.68756135944517,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 214.68756135944517,
+      "median": 214.74743517239656,
+      "max": 214.89188399824508
+    },
+    "measurement_validation": {
+      "valid": true,
+      "enough_rows": true,
+      "median_drift_from_settlement_pct": 0.06793199568811946,
+      "window": {
+        "window": 5,
+        "first_row": 1,
+        "last_row": 5,
+        "min": 214.68756135944517,
+        "median": 214.74743517239656,
+        "max": 214.89188399824508,
+        "slope_pct_per_row": -0.0035361629606740453,
+        "spread_pct": 0.09514555488678166,
+        "stable": true
+      }
+    },
+    "lifecycle_route_proof": {
+      "valid": true,
+      "backend": "hip",
+      "transport": "pm4",
+      "rows": 18,
+      "require_complete_replay": false,
+      "retained_rows": 0,
+      "observed_positions": [],
+      "prepared_identities": [],
+      "sequences": [],
+      "errors": []
+    },
+    "route_proof": {
+      "valid": true,
+      "backend": "hip",
+      "transport": "pm4",
+      "rows": 5,
+      "require_complete_replay": false,
+      "retained_rows": 0,
+      "observed_positions": [],
+      "prepared_identities": [],
+      "sequences": [],
+      "errors": []
+    }
+  },
+  "auto": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 166.802469,
+        "us_per_token": 5212.57715625,
+        "tok_s": 191.84368308121384,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 31,
+            "count_delta": 31,
+            "first_position": 129,
+            "last_position": 159
+          },
+          "retained_replay_observed": true
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 141.22964900000002,
+        "us_per_token": 4413.42653125,
+        "tok_s": 226.58131792142314,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 32,
+            "count_delta": 32,
+            "first_position": 128,
+            "last_position": 159
+          },
+          "retained_replay_observed": true
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 140.678957,
+        "us_per_token": 4396.21740625,
+        "tok_s": 227.46827729181985,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 32,
+            "count_delta": 32,
+            "first_position": 128,
+            "last_position": 159
+          },
+          "retained_replay_observed": true
+        }
+      }
+    ],
+    "warmup_seconds": 0.6437724720453843,
+    "settling": {
+      "rows": [
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 540.8710199999999,
+          "us_per_token": 4225.55484375,
+          "tok_s": 236.6553120187508,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 527.047103,
+          "us_per_token": 4117.5554921875,
+          "tok_s": 242.86254354006002,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 524.774369,
+          "us_per_token": 4099.7997578125,
+          "tok_s": 243.914351693499,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 524.5797239999999,
+          "us_per_token": 4098.279093749999,
+          "tok_s": 244.0048559711393,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 524.002313,
+          "us_per_token": 4093.7680703125,
+          "tok_s": 244.27373090622217,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 523.825242,
+          "us_per_token": 4092.384703125,
+          "tok_s": 244.3563038529556,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 523.542503,
+          "us_per_token": 4090.1758046875,
+          "tok_s": 244.48826841476134,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.7120090000001,
+          "us_per_token": 4083.6875703125,
+          "tok_s": 244.87671566007583,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.470085,
+          "us_per_token": 4081.7975390625,
+          "tok_s": 244.99010311757849,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.366581,
+          "us_per_token": 4080.9889140625,
+          "tok_s": 245.03864652857646,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.2656420000001,
+          "us_per_token": 4080.2003281250004,
+          "tok_s": 245.08600548530816,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.5547740000001,
+          "us_per_token": 4082.4591718750003,
+          "tok_s": 244.9503982524136,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.719062,
+          "us_per_token": 4083.742671875,
+          "tok_s": 244.8734115611801,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.6652710000001,
+          "us_per_token": 4083.3224296875005,
+          "tok_s": 244.89861313169206,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 522.510661,
+          "us_per_token": 4082.1145390624997,
+          "tok_s": 244.97107820734016,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 521.164051,
+          "us_per_token": 4071.5941484375,
+          "tok_s": 245.6040468531856,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 521.665088,
+          "us_per_token": 4075.5085,
+          "tok_s": 245.3681546732144,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.8526380000001,
+          "us_per_token": 4069.1612343750003,
+          "tok_s": 245.75089125304572,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.587621,
+          "us_per_token": 4067.0907890625,
+          "tok_s": 245.87599634836496,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 519.2527729999999,
+          "us_per_token": 4056.6622890624994,
+          "tok_s": 246.50807209073878,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.05782,
+          "us_per_token": 4062.95171875,
+          "tok_s": 246.12647878268612,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 519.868065,
+          "us_per_token": 4061.4692578125005,
+          "tok_s": 246.21631644174948,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.2444389999999,
+          "us_per_token": 4064.4096796874996,
+          "tok_s": 246.0381897517986,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.2322969999999,
+          "us_per_token": 4064.3148203124997,
+          "tok_s": 246.04393217824384,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 519.821898,
+          "us_per_token": 4061.108578125,
+          "tok_s": 246.2381836788261,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.014348,
+          "us_per_token": 4062.61209375,
+          "tok_s": 246.1470543885839,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 520.0630590000001,
+          "us_per_token": 4062.9926484375005,
+          "tok_s": 246.1239993590854,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "ready",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": {
+              "dispatches": 604,
+              "packets": 1,
+              "queue_id": 2,
+              "command_dwords": 16762,
+              "queues": 1,
+              "phases": 1
+            },
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 22,
+              "hash": "43754a60ca25f47c"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 128,
+              "count_delta": 128,
+              "first_position": 128,
+              "last_position": 255
+            },
+            "retained_replay_observed": true
+          }
+        }
+      ],
+      "seconds": 15.76283220096957,
+      "decision": {
+        "stationary": true,
+        "candidate": {
+          "at_row": 22,
+          "window": {
+            "window": 5,
+            "first_row": 18,
+            "last_row": 22,
+            "min": 245.75089125304572,
+            "median": 246.12647878268612,
+            "max": 246.50807209073878,
+            "slope_pct_per_row": 0.04799698177828811,
+            "spread_pct": 0.30763891859095677,
+            "stable": true
+          }
+        },
+        "confirmed_at_row": 27,
+        "confirmed_window": {
+          "window": 5,
+          "first_row": 23,
+          "last_row": 27,
+          "min": 246.0381897517986,
+          "median": 246.1239993590854,
+          "max": 246.2381836788261,
+          "slope_pct_per_row": 0.011162723896454313,
+          "spread_pct": 0.08125738552448467,
+          "stable": true
+        },
+        "median_drift_pct": 0.0010073778380104974,
+        "rejections": [
+          {
+            "candidate_row": 12,
+            "rejected_at_row": 16,
+            "reason": "confirmation_window_unstable",
+            "median_drift_pct": 0.016206722091881072
+          }
+        ]
+      }
+    },
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 519.734805,
+        "us_per_token": 4060.4281640625,
+        "tok_s": 246.27944630338928,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 128,
+            "count_delta": 128,
+            "first_position": 128,
+            "last_position": 255
+          },
+          "retained_replay_observed": true
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 520.624681,
+        "us_per_token": 4067.3803203125003,
+        "tok_s": 245.85849398100277,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 128,
+            "count_delta": 128,
+            "first_position": 128,
+            "last_position": 255
+          },
+          "retained_replay_observed": true
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 520.351008,
+        "us_per_token": 4065.2422500000002,
+        "tok_s": 245.98780060401074,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 128,
+            "count_delta": 128,
+            "first_position": 128,
+            "last_position": 255
+          },
+          "retained_replay_observed": true
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 520.270137,
+        "us_per_token": 4064.6104453125004,
+        "tok_s": 246.02603704698123,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 128,
+            "count_delta": 128,
+            "first_position": 128,
+            "last_position": 255
+          },
+          "retained_replay_observed": true
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 519.962151,
+        "us_per_token": 4062.2043046875,
+        "tok_s": 246.1717641444252,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "ready",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": {
+            "dispatches": 604,
+            "packets": 1,
+            "queue_id": 2,
+            "command_dwords": 16762,
+            "queues": 1,
+            "phases": 1
+          },
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 22,
+            "hash": "43754a60ca25f47c"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 128,
+            "count_delta": 128,
+            "first_position": 128,
+            "last_position": 255
+          },
+          "retained_replay_observed": true
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 245.85849398100277,
+      "median": 246.02603704698123,
+      "max": 246.27944630338928
+    },
+    "measurement_validation": {
+      "valid": true,
+      "enough_rows": true,
+      "median_drift_from_settlement_pct": 0.039802015390313555,
+      "window": {
+        "window": 5,
+        "first_row": 1,
+        "last_row": 5,
+        "min": 245.85849398100277,
+        "median": 246.02603704698123,
+        "max": 246.27944630338928,
+        "slope_pct_per_row": -0.0019437476018266822,
+        "spread_pct": 0.17110072065507712,
+        "stable": true
+      }
+    },
+    "lifecycle_route_proof": {
+      "valid": true,
+      "backend": "auto",
+      "transport": "pm4",
+      "rows": 35,
+      "require_complete_replay": false,
+      "retained_rows": 35,
+      "observed_positions": [
+        128,
+        129,
+        159,
+        255
+      ],
+      "prepared_identities": [
+        [
+          604,
+          1,
+          2,
+          16762,
+          1,
+          1
+        ]
+      ],
+      "sequences": [
+        [
+          604,
+          22,
+          "43754a60ca25f47c"
+        ]
+      ],
+      "errors": []
+    },
+    "route_proof": {
+      "valid": true,
+      "backend": "auto",
+      "transport": "pm4",
+      "rows": 5,
+      "require_complete_replay": true,
+      "retained_rows": 5,
+      "observed_positions": [
+        128,
+        255
+      ],
+      "prepared_identities": [
+        [
+          604,
+          1,
+          2,
+          16762,
+          1,
+          1
+        ]
+      ],
+      "sequences": [
+        [
+          604,
+          22,
+          "43754a60ca25f47c"
+        ]
+      ],
+      "errors": []
+    }
+  },
+  "speedup": 1.1456529706605092,
+  "valid": true
+}

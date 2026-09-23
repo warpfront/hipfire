@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 926,
+"finish": "stop",
+"think_words": 312,
+"ans_words": 280,
+"prefill_ms": 47.5,
+"prefill_tok_s": 463.2,
+"decode_tok_s": 209.7,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.223,
+"wall_s": 4.467,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect",
+"assistant_content": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erected by members of the **U.S. Pacific Railroad Survey** in **1858**.\n\nHere are the key historical details behind the name:\n\n\ud83d\udd0d **Key Facts:**\n- In the fall of 1858, a team of topographic engineers led by **Lieut. Amiel Wentworth Whipple** was surveying potential routes for the transcontinental railroad.\n- While camped near the base of the San Francisco Peaks, they erected a tall wooden pole with an American flag at its summit to mark their location and serve as a visible landmark.\n- The expedition members began referring to the site as **\"Flagstaff Camp\"** or simply **\"Flagstaff.\"**\n- Initially, there were two nearby settlements\u2014the one on the high ground near the peak became known as \"New Flagstaff,\" while a lower-elevation settlement downwind was called \"Old Flagstaff.\" Over time, only \"Flagstaff\" remained.\n\n\ud83d\udcc5 **Official Recognition:**\n- The name gradually shifted from a military/exploration camp designation to a permanent civilian settlement.\n- The town was officially incorporated in **1886**, by which time the flagpole had long disappeared, but the name stuck due to its strong historical association with the area's early exploration and railroad development.\n\n\ud83d\udca1 **Bonus Note:** \nThe highest point of the San Francisco Peaks (4,209 m / 13,825 ft) was originally called **Mount Washington** by later settlers (named after the U.S. President), but many early pioneers and maps simply referred to it as \"Flagstaff Peak\" or \"Flagstaff Mountain\" because of this landmark. The original wooden flagpole has been replaced over time by a modern steel pole topped with a flag on the summit today.\n\nIf you'd like sources or more details about the 1858 expedition, I can provide those!"
+}
+]
