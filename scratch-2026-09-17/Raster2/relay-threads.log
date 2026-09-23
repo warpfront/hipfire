@@ -1,0 +1,19 @@
+Timeout (0:00:25)!
+Thread 0x00007e0adddca6c0 [Thread-2 (pump)] (most recent call first):
+  File "/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/tee-relay.py", line 21 in pump
+  File "/usr/lib/python3.14/threading.py", line 1024 in run
+  File "/usr/lib/python3.14/threading.py", line 1082 in _bootstrap_inner
+  File "/usr/lib/python3.14/threading.py", line 1044 in _bootstrap
+
+Thread 0x00007e0ade5cb6c0 [Thread-1 (pump)] (most recent call first):
+  File "/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/tee-relay.py", line 21 in pump
+  File "/usr/lib/python3.14/threading.py", line 1024 in run
+  File "/usr/lib/python3.14/threading.py", line 1082 in _bootstrap_inner
+  File "/usr/lib/python3.14/threading.py", line 1044 in _bootstrap
+
+Thread 0x00007e0adf6b0200 [python3] (most recent call first):
+  File "/usr/lib/python3.14/subprocess.py", line 2042 in _try_wait
+  File "/usr/lib/python3.14/subprocess.py", line 2084 in _wait
+  File "/usr/lib/python3.14/subprocess.py", line 1279 in wait
+  File "/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/tee-relay.py", line 56 in main
+  File "/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/tee-relay.py", line 59 in <module>

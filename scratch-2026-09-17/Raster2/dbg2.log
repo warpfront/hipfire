@@ -1,0 +1,6 @@
+W0919 21:26:35.334682 3938534 agent.cpp:157] Attempt to enable hip visibility for agent-1 which is not visible to HSA (ROCR)
+W0919 21:26:36.908681 3938534 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000416 sec
+W0919 21:26:36.908829 3938534 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/daemon-base' ::     0.000000 sec
+W0919 21:27:24.648735 3938534 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/daemon-base' ::    47.739905 sec
+W0919 21:27:24.649495 3938534 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000587 sec
+W0919 21:27:24.649514 3938534 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000718 sec

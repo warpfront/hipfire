@@ -1,0 +1,51 @@
+diff --git a/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip b/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip
+index b6e778a6b..80447b8c7 100644
+--- a/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip
++++ b/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip
+@@ -142,6 +142,18 @@
+ #ifndef IU4_WAVES
+ #define IU4_WAVES 8
+ #endif
++// Rasterization swizzle G8T0 (serving-shape probe): grouped blockIdx remap.
++// G consecutive row-tiles share one token-tile window: bid = y*gx + x maps to
++// n = (bid / G) % num_n, m = (bid / (G*num_n)) * G + (bid % G), so each
++// window of G consecutive blocks reuses one activation (A) slab. Bit-identical:
++// only which workgroup computes which tile changes. Ported from
++// wt-raster kernel_tested_base0.hip (G8T0: gate rig 6647->5952 us, -10.7%).
++#ifndef IU4_SWIZZLE_G
++#define IU4_SWIZZLE_G 8
++#endif
++#ifndef IU4_SWIZZLE_T
++#define IU4_SWIZZLE_T 0
++#endif
+ #define IU4_NTHREADS (IU4_WAVES * 32)
+ // Fragment-order slab: each 64-K slab (IU4_BK nibbles/row) holds 8 row/token
+ // groups of 16 x 2 K32 steps = 16 fragments of 256 contiguous bytes
+@@ -280,8 +292,25 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
+     const int tid = threadIdx.x;
+     const int wave = tid >> 5;
+     const int lane = tid & 31;
+-    const int rs = blockIdx.x * IU4_BN;
+-    const int bs = blockIdx.y * IU4_BM;
++    int rs = blockIdx.x * IU4_BN;
++    int bs = blockIdx.y * IU4_BM;
++#if IU4_SWIZZLE_G != 0
++    {
++        const int num_m = (M + IU4_BN - 1) / IU4_BN;
++        const int num_n = (N + IU4_BM - 1) / IU4_BM;
++        // The grouped map is bijective only when the grouped dimension
++        // divides evenly (T=0: row tiles % G). Otherwise keep the direct map
++        // (uniform branch: kernel-uniform, no divergence). Bit-identical.
++        const bool use_swz = (num_m % IU4_SWIZZLE_G) == 0;
++        if (use_swz) {
++            const int bid = blockIdx.y * gridDim.x + blockIdx.x;
++            const int n_t = (bid / IU4_SWIZZLE_G) % num_n;
++            const int m_t = (bid / (IU4_SWIZZLE_G * num_n)) * IU4_SWIZZLE_G + (bid % IU4_SWIZZLE_G);
++            rs = m_t * IU4_BN;
++            bs = n_t * IU4_BM;
++        }
++    }
++#endif
+ 
+     if (rs >= M || bs >= N) return;
+ 

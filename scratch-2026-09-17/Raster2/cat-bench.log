@@ -1,0 +1,5 @@
+W0919 21:30:32.902166 3941900 agent.cpp:157] Attempt to enable hip visibility for agent-1 which is not visible to HSA (ROCR)
+W0919 21:30:34.475552 3941900 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000308 sec
+W0919 21:30:34.475703 3941900 simple_timer.cpp:55] [rocprofv3] '/bin/cat' ::     0.000000 sec
+W0919 21:31:02.200877 3941900 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000565 sec
+W0919 21:31:02.200920 3941900 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000686 sec

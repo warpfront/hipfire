@@ -1,0 +1,7 @@
+3941898/MainThread main popen
+3941898/MainThread main spawned
+3941898/Thread-1 (pump) C2D start
+3941898/MainThread main wait
+3941898/Thread-2 (pump) D2C start
+3941898/Thread-1 (pump) C2D read.enter
+3941898/Thread-2 (pump) D2C read.enter

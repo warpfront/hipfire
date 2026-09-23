@@ -1,0 +1,2 @@
+#!/bin/sh
+exec strace -f -o /home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/strace-relay.log -e trace=%desc,read,write,openat,close /usr/bin/python3 /home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/tee-relay.py /home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/tee-capture2.bin /home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/daemon-base "$@"

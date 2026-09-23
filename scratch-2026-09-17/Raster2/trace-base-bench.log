@@ -1,0 +1,14 @@
+W0919 21:11:07.047939 3918479 agent.cpp:157] Attempt to enable hip visibility for agent-1 which is not visible to HSA (ROCR)
+W0919 21:11:07.070757 3918479 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000285 sec
+W0919 21:11:07.070894 3918479 simple_timer.cpp:55] [rocprofv3] '/home/kaden/ClaudeCode/warpfront/wt-raster2/scratch-2026-09-17/Raster2/bin/daemon-base' ::     0.000000 sec
+W0919 21:13:33.468731 3918479 tool.cpp:3348] HSA version 1.21.0 initialized (instance=0)
+W0919 21:13:33.469639 3918479 tool.cpp:4136] [PPID=1][PID=3918479][TID=3918479][rocprofv3_error_signal_handler] rocprofv3 caught signal 15...
+W0919 21:13:33.469668 3918479 tool.cpp:4159] [PPID=1][PID=3918479][TID=3918479][rocprofv3_error_signal_handler] rocprofv3 will wait for 0 children to exit
+W0919 21:13:33.469670 3918479 tool.cpp:4174] [PPID=1][PID=3918479][TID=3918479][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 15...
+W0919 21:13:33.470251 3918479 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000497 sec
+W0919 21:13:33.470271 3918479 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000589 sec
+W0919 21:13:33.470364 3918479 tool.cpp:4216] [PPID=1][PID=3918479][TID=3918479][rocprofv3_error_signal_handler] rocprofv3 found chained signal handler for 15... executing chained sigaction (SIGINFO)
+*** SIGTERM received at time=1789852413 on cpu 49 ***
+PC: @     0x7b9c6ad32a7d  (unknown)  ioctl
+W0919 21:13:33.499340 3918479 tool.cpp:4136] [PPID=1][PID=3918479][TID=3918479][rocprofv3_error_signal_handler] rocprofv3 caught signal 15...
+W0919 21:13:36.470456 3918479 tool.cpp:4136] [PPID=1][PID=3918479][TID=3918479][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
