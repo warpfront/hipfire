@@ -286,11 +286,12 @@ model's contract still accepts the named-cap route):
 
 ### Mode, K, and V
 
-`memory.kv_cache` / `--kv-mode` is the whole-cache preset. It supplies the
-initial *(K, V)* pair. Typed `memory.kv_k` / `memory.kv_v` (CLI `--kv-k` /
-`--kv-v`) are **Qwen-only** orthogonal axis overrides: empty by default and
-omitted from IPC when unset. After the mode pair is chosen, a K override
-replaces only K and a V override replaces only V.
+`memory.kv_cache` / `--kv-mode` is the whole-cache preset: quantized modes
+seed a split *(K, V)* pair, while native `fp8`/`bf16` are one K+V layout
+without an independent V axis. Typed `memory.kv_k` / `memory.kv_v` (CLI
+`--kv-k` / `--kv-v`) are **Qwen-only** axis overrides, empty by default and
+omitted from IPC when unset. They replace their respective axis of a split
+pair; see the native override refusal below.
 
 **Qwen K names** (shared table for `--kv-mode` preset K and `--kv-k`):
 
@@ -343,9 +344,10 @@ non-Qwen families.
 CLI flag **>** one-shot env **>** per-model TOML **>** global TOML **>**
 registry preset / arch default.
 
-Mode supplies the initial pair; axis overrides then apply regardless of
-which layer authored the mode. Effective resolution logs
-`requested mode=…, effective K=…, effective V=…` with sources.
+Mode supplies the initial layout; axis overrides apply to split modes
+regardless of which layer authored the mode. Effective resolution logs
+`requested mode=…, effective K=…, effective V=…` for split layouts or
+`requested mode=…, effective KV=fp8` (respectively `bf16`) for native.
 
 `kv_adaptive` is opt-in and is a *changing tier* path (starts FWHT4/Q8,
 downshifts toward FWHT/Lloyd floors), not a fixed static pair. With

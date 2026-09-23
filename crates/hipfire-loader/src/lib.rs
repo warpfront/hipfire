@@ -3592,9 +3592,13 @@ fn load_model_ep_qwen35(
     let state_quant_resolved = parse_state_quant(state_quant)?;
     let config_mode = hipfire_runtime::config::get();
     let kv_raw = kv_mode.unwrap_or(config_mode.kv_mode.as_str());
-    let (kv_mode_resolved, v_mode) = kv_mode::resolve_kv_pair(
+    let pair = kv_mode::resolve_kv_pair(
         kv_raw, kv_k, kv_v, &kv_mode::QWEN35_TP_POLICY, "multi-gpu", qwen_default_q8
     ).map_err(|e| format!("Qwen EP KV: {e}"))?;
+    let kv_mode_resolved = pair.k();
+    let Some(v_mode) = pair.v() else {
+        return Err("Qwen native KV has no multi-GPU constructor".into());
+    };
     if v_mode != llama::VMode::Q8 {
         return Err("Qwen EP has no multi-GPU Lloyd-V constructor; use --kv-v q8".into());
     }
@@ -3832,9 +3836,13 @@ fn load_model_tp_qwen35_dense(
     let kv_backend_resolved: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let config_mode = hipfire_runtime::config::get();
     let kv_raw = kv_mode.unwrap_or(config_mode.kv_mode.as_str());
-    let (kv_mode_resolved, v_mode) = kv_mode::resolve_kv_pair(
+    let pair = kv_mode::resolve_kv_pair(
         kv_raw, kv_k, kv_v, &kv_mode::QWEN35_TP_POLICY, "multi-gpu", qwen_default_q8
     ).map_err(|e| format!("Qwen dense TP KV: {e}"))?;
+    let kv_mode_resolved = pair.k();
+    let Some(v_mode) = pair.v() else {
+        return Err("Qwen native KV has no multi-GPU constructor".into());
+    };
     if v_mode != llama::VMode::Q8 {
         return Err("Qwen dense TP has no multi-GPU Lloyd-V constructor; use --kv-v q8".into());
     }

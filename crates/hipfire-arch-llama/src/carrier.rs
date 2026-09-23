@@ -621,7 +621,7 @@ fn resolve_llama_family_kv_mode(
     ctx: &LoadCtx,
     dir_source: bool,
 ) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
-    use hipfire_runtime::kv_mode::{self, KvMode, VMode};
+    use hipfire_runtime::kv_mode::{self, KvMode, KvPair, VMode};
     use hipfire_runtime::llama::ModelArch;
 
     let mode_raw = ctx
@@ -633,7 +633,7 @@ fn resolve_llama_family_kv_mode(
     let v_raw = ctx.kv_v_override.filter(|s| !s.is_empty());
 
     if config.arch == ModelArch::Qwen3 {
-        let (mode, v) = kv_mode::resolve_kv_pair(
+        let pair = kv_mode::resolve_kv_pair(
             &mode_raw,
             k_raw,
             v_raw,
@@ -642,8 +642,10 @@ fn resolve_llama_family_kv_mode(
             ctx.qwen_default_q8,
         )
         .map_err(|e| e.to_string())?;
-        // Flat constructors have no Lloyd-V arm; pair path already refuses
-        // Lloyd with legacy-Asym K, but keep an explicit Q8-V gate.
+        let KvPair::Split(mode, v) = pair else {
+            return Err("llama/qwen3: flat constructor has no native KV owner".into());
+        };
+        // Flat constructors have no Lloyd-V arm.
         if !matches!(v, VMode::Q8) {
             return Err(format!(
                 "llama/qwen3: V={} unsupported on flat dir-safetensors constructor (need V=q8)",

@@ -470,7 +470,9 @@ def show_config(cfg):
     else:
         _kv_disp = _kv_req_disp
         _kv_src = cfg.get("kv_backend_source", "unknown")
-    print(f"  kv_mode       : {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]"
+    _mode = cfg.get("kv_mode_effective") or cfg["kv"]
+    _mode_src = "observed(loaded)" if cfg.get("kv_mode_effective") else cfg.get("kv_source", "unknown")
+    print(f"  kv_mode       : {_mode} [{_mode_src}]"
           f"   kv_backend: {_kv_disp}"
           f" [{_kv_src}]"
           f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
@@ -852,8 +854,8 @@ def parse_loaded_kv_backend_ack(txt):
     """Extract the latest type=loaded ACK kv backend fields from serve log text.
 
     Preferred source over log-line heuristics. Returns a dict with keys
-    kv_backend, kv_backend_request, kv_backend_reason, kv_backend_legacy,
-    kv_backend_warning — or None when no usable loaded ACK is present.
+    kv_backend_warning and effective kv_mode — or None when no usable loaded
+    ACK is present.
     """
     if not txt:
         return None
@@ -897,6 +899,7 @@ def parse_loaded_kv_backend_ack(txt):
         "kv_backend_reason": reason,
         "kv_backend_legacy": legacy,
         "kv_backend_warning": warning,
+        "kv_mode": ack.get("kv_mode"),
     }
 
 
@@ -1005,6 +1008,9 @@ def apply_observed_kv_backend(cfg, txt):
         cfg["kv_backend_legacy"] = bool(ack.get("kv_backend_legacy"))
         cfg["kv_backend_warning"] = ack.get("kv_backend_warning")
         cfg["kv_backend_request_observed"] = ack.get("kv_backend_request")
+        cfg["kv_mode_effective"] = (
+            ack.get("kv_mode") if isinstance(ack.get("kv_mode"), str) else None
+        )
     else:
         eff, eff_reason = observe_effective_kv_backend(txt)
         if eff is not None:
@@ -1074,6 +1080,7 @@ def stamp_kv_backend_out_fields(rows, cfg):
         "kv_backend_legacy": bool(cfg.get("kv_backend_legacy", False)),
         "kv_backend_warning": cfg.get("kv_backend_warning"),
         "kv_backend_reason": cfg.get("kv_backend_reason"),
+        "kv_mode": cfg.get("kv_mode_effective"),
     }
     for row in rows or []:
         if isinstance(row, dict):
@@ -1683,6 +1690,17 @@ def _self_test_load_defaults():
             show_config(cfg_obs)
         obs = buf.getvalue()
         assert "kv_backend: vmm [observed(log-marker)]" in obs, obs
+        # Loaded native layout supersedes the requested auto preset in console and rows.
+        cfg_fp8 = build_config(_ns())
+        apply_observed_kv_backend(
+            cfg_fp8,
+            '{"type":"loaded","kv_backend":"vmm","kv_mode":"fp8"}\n',
+        )
+        buf = StringIO()
+        with redirect_stdout(buf):
+            show_config(cfg_fp8)
+        assert "kv_mode       : fp8 [observed(loaded)]" in buf.getvalue()
+        assert stamp_kv_backend_out_fields([{}], cfg_fp8)[0]["kv_mode"] == "fp8"
 
         # Once-per-load legacy warning + --out row metadata (list shape preserved).
         cfg_leg = build_config(_ns(kv_backend="legacy"))

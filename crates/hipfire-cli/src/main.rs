@@ -3119,7 +3119,7 @@ pub(crate) fn apply_kv_axis_overrides(
     Ok(())
 }
 
-/// Copy validated `loaded` ACK backend fields onto a bench JSON report root.
+/// Copy effective KV mode and backend fields from the validated loaded ACK.
 fn with_loaded_kv_backend_fields(
     mut report: serde_json::Value,
     loaded: &serde_json::Value,
@@ -3133,6 +3133,7 @@ fn with_loaded_kv_backend_fields(
         "kv_backend_reason",
         "kv_backend_legacy",
         "kv_backend_warning",
+        "kv_mode",
     ] {
         object.insert(
             key.to_owned(),
