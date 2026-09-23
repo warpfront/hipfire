@@ -1,0 +1,40 @@
+Q384 named-barrier correctness trials on Card-A (gfx1201), HIP 7.15 clang 23
+
+Common design:
+- 768-thread Q384/KT48 body split into three independent eight-wave groups.
+- Each group has a disjoint K/V/scale LDS plane.
+- Group waves signal IDs 1/2/3 after staging; consumers wait on their group's ID.
+- Candidate metadata: 216 VGPR, 0 VGPR spills, private segment 0, num_named_barrier 3.
+
+Control:
+- Grouped three-plane staging with a full-workgroup __syncthreads after each subtile:
+  SUMMARY cases=921 failed=1
+  Only b=512,c=1,mode=0 failed; all other cases passed.
+  Raw output: artifact://23072
+
+Named-barrier variants:
+1. init count 8; join each subtile; wait builtin default/0:
+   SUMMARY cases=921 failed=15
+2. init count 256; join each subtile; wait builtin default/0:
+   SUMMARY cases=921 failed=15
+   Raw output: artifact://23076
+3. init count 8; join each subtile; explicit wait IDs 1/2/3:
+   SUMMARY cases=921 failed=15
+   Raw output: artifact://23082
+4. init count 8; persistent join once; wait builtin default/0:
+   SUMMARY cases=921 failed=15
+   Raw output: artifact://23085
+5. init count 8; persistent join once; explicit wait IDs 1/2/3:
+   SUMMARY cases=921 failed=15
+   Raw output: artifact://23086 and artifact://23087
+6. init count 256; persistent join once; explicit wait IDs 1/2/3:
+   SUMMARY cases=921 failed=15 input_diffs(Q/K/V/P)=[0, 0, 0, 0] elapsed_s=9.684
+   Raw output: artifact://23088 and artifact://23089
+
+All 15 failures in every named-barrier variant are the direct b=512 wide cases with modes 0/1/2. The five mode-3 wide cases pass because their masking removes the affected values. Failure counts are catastrophic (roughly 0.48M to 3.14M output differences), while all 906 narrow/non-direct cases pass. This is not a tolerance issue.
+
+Known-correct restored Q384/tail prototype before named-barrier changes:
+  SUMMARY cases=921 failed=0 input_diffs(Q/K/V/P)=[0, 0, 0, 0]
+  Raw output: artifact://23062
+
+The named-barrier candidate source was removed after failing the correctness gate; no performance gate was run.
