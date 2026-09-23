@@ -1,0 +1,295 @@
+{
+  "method": "Numeric Dispatch_Id order; third of four embeddings starts final PP8192 pass; chunk4096. Warmup excluded.",
+  "first_dispatch_id": "4546",
+  "rows": 3661,
+  "gemm_us_per_token": 371.8013527832032,
+  "pack_us_per_token": 21.502653930664067,
+  "kernels": {
+    "embedding_q8_batched": {
+      "calls": 2,
+      "total_us": 268.443,
+      "resources": [
+        [
+          "0",
+          "0",
+          "8",
+          "256"
+        ]
+      ],
+      "us_per_token": 0.0327689208984375
+    },
+    "__amd_rocclr_copyBuffer": {
+      "calls": 5,
+      "total_us": 19.96,
+      "resources": [
+        [
+          "0",
+          "0",
+          "16",
+          "512"
+        ]
+      ],
+      "us_per_token": 0.0024365234375
+    },
+    "fused_rmsnorm_mq_rotate_awq": {
+      "calls": 256,
+      "total_us": 69532.62599999999,
+      "resources": [
+        [
+          "0",
+          "0",
+          "88",
+          "256"
+        ]
+      ],
+      "us_per_token": 8.487869384765624
+    },
+    "pack_f32_to_fp8_mq4v2_gfx12": {
+      "calls": 512,
+      "total_us": 176149.74100000004,
+      "resources": [
+        [
+          "512",
+          "0",
+          "24",
+          "256"
+        ]
+      ],
+      "us_per_token": 21.502653930664067
+    },
+    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201": {
+      "calls": 96,
+      "total_us": 483891.6239999998,
+      "resources": [
+        [
+          "0",
+          "0",
+          "216",
+          "256"
+        ]
+      ],
+      "us_per_token": 59.06880175781247
+    },
+    "gdn_pre_batched_gfx1201": {
+      "calls": 96,
+      "total_us": 125667.42500000002,
+      "resources": [
+        [
+          "33280",
+          "0",
+          "224",
+          "256"
+        ]
+      ],
+      "us_per_token": 15.340261840820315
+    },
+    "gated_delta_net_q8_fast": {
+      "calls": 768,
+      "total_us": 429954.5530000003,
+      "resources": [
+        [
+          "2048",
+          "0",
+          "64",
+          "32"
+        ]
+      ],
+      "us_per_token": 52.48468664550785
+    },
+    "gated_norm_f32": {
+      "calls": 96,
+      "total_us": 46810.094000000005,
+      "resources": [
+        [
+          "0",
+          "0",
+          "24",
+          "32"
+        ]
+      ],
+      "us_per_token": 5.714122802734376
+    },
+    "rotate_x_mq_awq": {
+      "calls": 128,
+      "total_us": 38623.26500000002,
+      "resources": [
+        [
+          "0",
+          "0",
+          "80",
+          "32"
+        ]
+      ],
+      "us_per_token": 4.714754028320315
+    },
+    "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201": {
+      "calls": 256,
+      "total_us": 1021320.5530000003,
+      "resources": [
+        [
+          "0",
+          "0",
+          "200",
+          "256"
+        ]
+      ],
+      "us_per_token": 124.67291906738285
+    },
+    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201": {
+      "calls": 128,
+      "total_us": 1392768.2560000005,
+      "resources": [
+        [
+          "0",
+          "0",
+          "192",
+          "256"
+        ]
+      ],
+      "us_per_token": 170.01565625000006
+    },
+    "fused_silu_mul_mq_rotate_awq": {
+      "calls": 128,
+      "total_us": 180697.80400000003,
+      "resources": [
+        [
+          "0",
+          "0",
+          "56",
+          "32"
+        ]
+      ],
+      "us_per_token": 22.057837402343754
+    },
+    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201": {
+      "calls": 32,
+      "total_us": 147816.24899999998,
+      "resources": [
+        [
+          "0",
+          "0",
+          "216",
+          "256"
+        ]
+      ],
+      "us_per_token": 18.04397570800781
+    },
+    "deinterleave_q_rmsnorm_f32_batched": {
+      "calls": 32,
+      "total_us": 22035.894,
+      "resources": [
+        [
+          "0",
+          "0",
+          "24",
+          "256"
+        ]
+      ],
+      "us_per_token": 2.689928466796875
+    },
+    "rmsnorm_f32": {
+      "calls": 34,
+      "total_us": 3176.232,
+      "resources": [
+        [
+          "0",
+          "0",
+          "16",
+          "256"
+        ]
+      ],
+      "us_per_token": 0.3877236328125
+    },
+    "rope_partial_halfsplit_batched_f32": {
+      "calls": 32,
+      "total_us": 5058.493,
+      "resources": [
+        [
+          "0",
+          "0",
+          "16",
+          "32"
+        ]
+      ],
+      "us_per_token": 0.6174918212890625
+    },
+    "kv_cache_write_q8_0_batched": {
+      "calls": 512,
+      "total_us": 7397.152999999996,
+      "resources": [
+        [
+          "0",
+          "0",
+          "8",
+          "32"
+        ]
+      ],
+      "us_per_token": 0.902972778320312
+    },
+    "attention_fa2_q_preconvert_gfx1201": {
+      "calls": 256,
+      "total_us": 7840.879000000001,
+      "resources": [
+        [
+          "0",
+          "0",
+          "16",
+          "128"
+        ]
+      ],
+      "us_per_token": 0.9571385498046876
+    },
+    "attention_q8_0_fa2_gqa_gfx1201": {
+      "calls": 256,
+      "total_us": 615289.5739999998,
+      "resources": [
+        [
+          "0",
+          "0",
+          "240",
+          "128"
+        ]
+      ],
+      "us_per_token": 75.10859057617185
+    },
+    "sigmoid_mul_f32": {
+      "calls": 32,
+      "total_us": 15496.874000000002,
+      "resources": [
+        [
+          "0",
+          "0",
+          "16",
+          "256"
+        ]
+      ],
+      "us_per_token": 1.8917082519531252
+    },
+    "mq_rotate_x": {
+      "calls": 2,
+      "total_us": 5.16,
+      "resources": [
+        [
+          "0",
+          "0",
+          "32",
+          "32"
+        ]
+      ],
+      "us_per_token": 0.0006298828125
+    },
+    "gemv_mq4g256v2_multirow_r2": {
+      "calls": 2,
+      "total_us": 2161.181,
+      "resources": [
+        [
+          "0",
+          "0",
+          "96",
+          "32"
+        ]
+      ],
+      "us_per_token": 0.2638160400390625
+    }
+  }
+}

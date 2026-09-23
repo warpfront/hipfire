@@ -1,0 +1,21 @@
+N=512 round=0
+gu_full median_us=1306.891 min_us=1250.451 max_us=1382.893 regs=189 local=0 hash=f74416e537122325
+re_full median_us=766.847 min_us=747.607 max_us=789.768 regs=198 local=0 hash=59528cc48bb22325
+gu_rawpref median_us=1274.372 min_us=1252.852 max_us=1327.173 regs=192 local=0 hash=f74416e537122325
+re_rawpref median_us=722.568 min_us=707.407 max_us=745.128 regs=204 local=0 hash=59528cc48bb22325
+gu_full median_us=1326.493 min_us=1309.094 max_us=1367.975 regs=189 local=0 hash=f74416e537122325
+re_full median_us=757.007 min_us=743.527 max_us=787.408 regs=198 local=0 hash=59528cc48bb22325
+N=512 round=1
+gu_full median_us=1314.533 min_us=1308.893 max_us=1331.253 regs=189 local=0 hash=f74416e537122325
+re_full median_us=763.128 min_us=748.527 max_us=787.568 regs=198 local=0 hash=59528cc48bb22325
+gu_rawpref median_us=1259.053 min_us=1252.092 max_us=1294.652 regs=192 local=0 hash=f74416e537122325
+re_rawpref median_us=723.088 min_us=706.087 max_us=746.728 regs=204 local=0 hash=59528cc48bb22325
+gu_full median_us=1320.774 min_us=1309.533 max_us=1367.694 regs=189 local=0 hash=f74416e537122325
+re_full median_us=755.687 min_us=743.568 max_us=781.528 regs=198 local=0 hash=59528cc48bb22325
+N=512 round=2
+gu_full median_us=1320.213 min_us=1309.813 max_us=1370.614 regs=189 local=0 hash=f74416e537122325
+re_full median_us=751.727 min_us=742.127 max_us=775.408 regs=198 local=0 hash=59528cc48bb22325
+gu_rawpref median_us=1259.133 min_us=1251.453 max_us=1288.333 regs=192 local=0 hash=f74416e537122325
+re_rawpref median_us=715.607 min_us=699.247 max_us=740.968 regs=204 local=0 hash=59528cc48bb22325
+gu_full median_us=1316.453 min_us=1309.173 max_us=1344.254 regs=189 local=0 hash=f74416e537122325
+re_full median_us=754.447 min_us=744.087 max_us=779.208 regs=198 local=0 hash=59528cc48bb22325

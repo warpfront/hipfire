@@ -1,0 +1,4 @@
+COMMAND ['/opt/rocm/core/bin/hipcc', '-O3', '--offload-arch=gfx1201', '-Rpass-analysis=kernel-resource-usage', '--save-temps', '/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/floor.hip', '-o', '/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/floor']
+clang++: error: no such file or directory: '/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/floor.hip'
+clang++: error: no input files
+failed to execute:/opt/rocm/core-10.0/lib/llvm/bin/clang++  --offload-arch=gfx1201 --driver-mode=g++ --hip-link  -O3 -Rpass-analysis=kernel-resource-usage --save-temps -x hip /home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/floor.hip -o "/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/floor"

@@ -1,0 +1,107 @@
+{
+  "prologue": {
+    "range": [
+      218,
+      386
+    ],
+    "wmma": 0,
+    "valu_packets": 99,
+    "vopd": 0,
+    "scalar_packets": 54,
+    "fma_operations": 0,
+    "ds": {
+      "ds_store_b32": 2,
+      "ds_store_2addr_b64": 4
+    },
+    "global": {
+      "global_load_b32": 2,
+      "global_load_b128": 2,
+      "global_load_b64": 2,
+      "global_inv": 1
+    }
+  },
+  "prefetch": {
+    "range": [
+      397,
+      426
+    ],
+    "wmma": 0,
+    "valu_packets": 12,
+    "vopd": 0,
+    "scalar_packets": 10,
+    "fma_operations": 0,
+    "ds": {},
+    "global": {
+      "global_load_b128": 2,
+      "global_load_b64": 2
+    }
+  },
+  "operand_compute": {
+    "range": [
+      427,
+      564
+    ],
+    "wmma": 64,
+    "valu_packets": 3,
+    "vopd": 0,
+    "scalar_packets": 34,
+    "fma_operations": 0,
+    "ds": {
+      "ds_load_2addr_b64": 23
+    },
+    "global": {}
+  },
+  "publish": {
+    "range": [
+      565,
+      663
+    ],
+    "wmma": 0,
+    "valu_packets": 68,
+    "vopd": 0,
+    "scalar_packets": 25,
+    "fma_operations": 0,
+    "ds": {
+      "ds_store_2addr_b64": 4
+    },
+    "global": {
+      "global_inv": 1
+    }
+  },
+  "fold": {
+    "range": [
+      664,
+      838
+    ],
+    "wmma": 0,
+    "valu_packets": 132,
+    "vopd": 13,
+    "scalar_packets": 24,
+    "fma_operations": 128,
+    "ds": {
+      "ds_load_2addr_b32": 18
+    },
+    "global": {}
+  },
+  "store": {
+    "range": [
+      877,
+      2977
+    ],
+    "wmma": 0,
+    "valu_packets": 853,
+    "vopd": 31,
+    "scalar_packets": 871,
+    "fma_operations": 0,
+    "ds": {
+      "ds_store_2addr_b32": 16,
+      "ds_store_b32": 32,
+      "ds_load_b32": 64
+    },
+    "global": {
+      "global_inv": 8,
+      "global_load_b32": 64,
+      "global_store_b32": 64
+    }
+  }
+}

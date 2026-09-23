@@ -1,0 +1,59 @@
+{
+  "base": "2c093bd4a",
+  "worktree": "/home/kaden/ClaudeCode/warpfront/wt-gemmstage",
+  "binary": "/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/cargo-target/release/examples/profile_prefill_qwen35",
+  "binary_sha256": "1a74ece9217ed00ccd904379f3127084aa0121ec8acad3349e2dcab14d844ae2",
+  "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+  "build": [
+    "cargo",
+    "build",
+    "--release",
+    "-p",
+    "saddle-lab",
+    "--features",
+    "deltanet,arch-qwen35",
+    "--example",
+    "profile_prefill_qwen35"
+  ],
+  "build_environment": {
+    "CARGO_TARGET_DIR": "/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/cargo-target"
+  },
+  "command": [
+    "/opt/rocm/bin/rocprofv3",
+    "--kernel-trace",
+    "--stats",
+    "-f",
+    "csv",
+    "-d",
+    "/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/profile-default",
+    "-o",
+    "default",
+    "--",
+    "/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/cargo-target/release/examples/profile_prefill_qwen35",
+    "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "--prefill",
+    "8192",
+    "--warmup",
+    "1",
+    "--kv-mode",
+    "q8"
+  ],
+  "environment": {
+    "HOME": "/home/kaden/.hipfire-homes/ab0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "HIPFIRE_MODELS_DIR": "/home/kaden/.hipfire/models",
+    "HIPFIRE_KERNEL_CACHE": "/home/kaden/.hipfire-homes/ab0/.hipfire_kernels",
+    "HIPFIRE_GRAPH": "0",
+    "HIPFIRE_PREFILL_CHUNK_ROWS": "4096"
+  },
+  "observed_chunk": {
+    "requested": 4096,
+    "admitted": 4096,
+    "commit_stride": 512
+  },
+  "rejected_receipt": "profile-stale-binary: inherited prebuilt binary selected s2bt8/chunk512; excluded",
+  "aggregation_command": [
+    "python3",
+    "/home/kaden/ClaudeCode/warpfront/wt-gemmstage/scratch-2026-09-17/GemmStagePlan/aggregate_profile.py"
+  ]
+}

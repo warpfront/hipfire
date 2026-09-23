@@ -1,0 +1,19 @@
+MP=32 warp=32 maxThreadsMP=2048 sharedMP=65536 regsMP=196608 arch=gfx1201
+gu_full lds=19968 vgpr=189 blocks=3 error=0
+gu_full lds=38400 vgpr=189 blocks=1 error=0
+gu_full lds=56832 vgpr=189 blocks=1 error=0
+gu_rawpref lds=19968 vgpr=192 blocks=3 error=0
+gu_rawpref lds=38400 vgpr=192 blocks=1 error=0
+gu_rawpref lds=56832 vgpr=192 blocks=1 error=0
+re_full lds=19968 vgpr=198 blocks=3 error=0
+re_full lds=38400 vgpr=198 blocks=1 error=0
+re_full lds=56832 vgpr=198 blocks=1 error=0
+re_rawpref lds=19968 vgpr=204 blocks=3 error=0
+re_rawpref lds=38400 vgpr=204 blocks=1 error=0
+re_rawpref lds=56832 vgpr=204 blocks=1 error=0
+qkv_full lds=19968 vgpr=211 blocks=3 error=0
+qkv_full lds=38400 vgpr=211 blocks=1 error=0
+qkv_full lds=56832 vgpr=211 blocks=1 error=0
+qkvza_full lds=19968 vgpr=213 blocks=3 error=0
+qkvza_full lds=38400 vgpr=213 blocks=1 error=0
+qkvza_full lds=56832 vgpr=213 blocks=1 error=0

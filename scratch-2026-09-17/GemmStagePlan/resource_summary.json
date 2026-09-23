@@ -1,0 +1,30 @@
+{
+  "gu": {
+    "baseline_vgpr": 189,
+    "baseline_sgpr": 40,
+    "text_bytes": 16672,
+    "raw_prefetch_vgpr": 192,
+    "lds_bytes": 19968
+  },
+  "re": {
+    "baseline_vgpr": 198,
+    "baseline_sgpr": 34,
+    "text_bytes": 16996,
+    "raw_prefetch_vgpr": 204,
+    "lds_bytes": 19968
+  },
+  "qkv": {
+    "baseline_vgpr": 211,
+    "baseline_sgpr": 42,
+    "text_bytes": 23208,
+    "raw_prefetch_vgpr": 212,
+    "lds_bytes": 19968
+  },
+  "qkvza": {
+    "baseline_vgpr": 213,
+    "baseline_sgpr": 42,
+    "text_bytes": 26252,
+    "raw_prefetch_vgpr": 213,
+    "lds_bytes": 19968
+  }
+}

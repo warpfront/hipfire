@@ -1,0 +1,21 @@
+N=8192 round=0
+gu_full median_us=20859.797 min_us=19596.861 max_us=21026.889 regs=189 local=0 hash=120e7cefb3222325
+re_full median_us=10461.781 min_us=10157.858 max_us=10837.185 regs=198 local=0 hash=02fe5ae4fd222325
+gu_nofold median_us=18324.619 min_us=17429.973 max_us=18706.502 regs=190 local=0 hash=ea3e7db6b6222325
+re_nofold median_us=8365.802 min_us=8118.640 max_us=8509.524 regs=191 local=0 hash=dfbf84a9de222325
+gu_noscale median_us=20444.160 min_us=19310.709 max_us=20696.123 regs=189 local=0 hash=935c68ee76222325
+re_noscale median_us=10507.424 min_us=10130.300 max_us=10843.707 regs=198 local=0 hash=9433eb0529222325
+gu_noexpand median_us=19437.113 min_us=18495.104 max_us=19832.957 regs=189 local=0 hash=7a78a7f15c222325
+re_noexpand median_us=9625.295 min_us=9257.732 max_us=9849.259 regs=198 local=0 hash=e2da50b65c222325
+gu_latepref median_us=20793.328 min_us=19726.598 max_us=21048.887 regs=189 local=0 hash=120e7cefb3222325
+re_latepref median_us=10440.264 min_us=10088.062 max_us=10755.788 regs=198 local=0 hash=02fe5ae4fd222325
+gu_nostage median_us=18755.867 min_us=17923.059 max_us=19175.990 regs=169 local=0 hash=120e7cefb3222325
+re_nostage median_us=8524.846 min_us=8208.763 max_us=8659.087 regs=176 local=0 hash=02fe5ae4fd222325
+gu_nostage_nb median_us=17603.416 min_us=16840.611 max_us=18126.305 regs=169 local=0 hash=ff50d639e6256836
+re_nostage_nb median_us=8764.929 min_us=8539.526 max_us=8940.812 regs=176 local=0 hash=92d292925fc31536
+gu_frag median_us=22841.352 min_us=21653.939 max_us=23001.951 regs=198 local=0 hash=120e7cefb3222325
+re_frag median_us=10573.308 min_us=10217.784 max_us=10908.592 regs=198 local=0 hash=02fe5ae4fd222325
+gu_nocompute median_us=13227.175 min_us=13076.333 max_us=13512.458 regs=115 local=0 hash=107bd32eb3222325
+re_nocompute median_us=7470.717 min_us=7239.874 max_us=8128.084 regs=115 local=0 hash=288501081a222325
+gu_nocompute_nb median_us=12413.327 min_us=12365.407 max_us=12574.009 regs=115 local=0 hash=03a4905c82e7bc8d
+re_nocompute_nb median_us=14456.390 min_us=13519.220 max_us=14765.433 regs=115 local=0 hash=c3abadb94df6b18d

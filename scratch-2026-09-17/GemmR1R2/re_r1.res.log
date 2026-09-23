@@ -1,0 +1,13 @@
+clang++: warning: argument unused during compilation: '-Llib' [-Wunused-command-line-argument]
+clang++: warning: argument unused during compilation: '--hip-link' [-Wunused-command-line-argument]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark: Function Name: re_r1 [-Rpass-analysis=kernel-resource-usage]
+  354 | ) {
+      | ^
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     TotalSGPRs: 34 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     VGPRs: 204 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:354:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

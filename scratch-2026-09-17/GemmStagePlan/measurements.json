@@ -1,0 +1,66 @@
+{
+  "N512": {
+    "gu_full": 1328.693,
+    "re_full": 762.728,
+    "gu_nofold": 1192.291,
+    "re_nofold": 698.167,
+    "gu_noscale": 1300.973,
+    "re_noscale": 758.847,
+    "gu_noexpand": 1263.692,
+    "re_noexpand": 687.086,
+    "gu_latepref": 1325.613,
+    "re_latepref": 755.927,
+    "gu_nostage": 1220.572,
+    "re_nostage": 639.086,
+    "gu_nostage_nb": 1130.051,
+    "re_nostage_nb": 586.805,
+    "gu_frag": 1491.294,
+    "re_frag": 759.887,
+    "gu_nocompute": 892.489,
+    "re_nocompute": 420.084,
+    "gu_nocompute_nb": 827.288,
+    "re_nocompute_nb": 392.483
+  },
+  "N8192": {
+    "gu_full": 20859.797,
+    "re_full": 10461.781,
+    "gu_nofold": 18324.619,
+    "re_nofold": 8365.802,
+    "gu_noscale": 20444.16,
+    "re_noscale": 10507.424,
+    "gu_noexpand": 19437.113,
+    "re_noexpand": 9625.295,
+    "gu_latepref": 20793.328,
+    "re_latepref": 10440.264,
+    "gu_nostage": 18755.867,
+    "re_nostage": 8524.846,
+    "gu_nostage_nb": 17603.416,
+    "re_nostage_nb": 8764.929,
+    "gu_frag": 22841.352,
+    "re_frag": 10573.308,
+    "gu_nocompute": 13227.175,
+    "re_nocompute": 7470.717,
+    "gu_nocompute_nb": 12413.327,
+    "re_nocompute_nb": 14456.39
+  },
+  "rawN512": {
+    "gu_full": 1318.333,
+    "re_full": 756.347,
+    "gu_rawpref": 1259.133,
+    "re_rawpref": 722.568
+  },
+  "rawN8192": {
+    "gu_full": 20817.591,
+    "re_full": 10565.125,
+    "gu_rawpref": 20035.322500000002,
+    "re_rawpref": 10107.582
+  },
+  "raw_ratio512": {
+    "gu": 0.9550948053337055,
+    "re": 0.9553392821019981
+  },
+  "raw_ratio8192": {
+    "gu": 0.9624227174027966,
+    "re": 0.9566930821925912
+  }
+}

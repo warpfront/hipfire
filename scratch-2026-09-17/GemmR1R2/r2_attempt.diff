@@ -1,0 +1,816 @@
+diff --git a/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip b/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip
+index 8b5e17362..738b99aee 100644
+--- a/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip
++++ b/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip
+@@ -562,281 +562,599 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
+         T[nb][1] = zc;
+     }
+ 
++    // R2 cross-half depth-two raw ring. Linear slab q covers K[64q,64q+64):
++    // g = q>>2, h = (q>>1)&1, in-half slab = q&1; nslabs = 4*gpr. Two
++    // statically indexed raw slots hold future slabs by parity (slot[q&1]);
++    // S_md/SZ_md carry the next half's raw metadata. Prime stages LDS q0
++    // (+half-0 S/SZ) and raw q1; each of the four phases per group
++    // prefetches q+2 while computing q, then publishes q+1:
++    //   p0: compute 4g (P reset),   prefetch 4g+2 (slot 0 + meta), publish 4g+1 (slot 1)
++    //   p1: compute 4g+1 (accum),   prefetch 4g+3 (slot 1),        publish 4g+2 (slot 0) + meta
++    //   p2: compute 4g+2 (P reset), prefetch 4g+4 (slot 0 + meta, next group), publish 4g+3 (slot 1)
++    //   p3: compute 4g+3 (accum),   prefetch 4g+5 (slot 1, next group), publish 4g+4 (slot 0) + meta
++    // Prefetch/masks stay raw until publication behind an opaque register
++    // pin, so no loadcnt wait sits between future loads and current WMMAs.
++    // The fold runs before publication (it reads the old half's S/SZ, still
++    // intact there; the carried metadata publishes after it), so every phase
++    // keeps exactly two workgroup barriers. P still resets at each even q,
++    // accumulates eight K16 steps in order, and folds once per half; the T
++    // recurrence, addresses, masks and expansion are unchanged from R1.
++    v2i_t A_ring[2][HIPFIRE_FP8_V2_A_ROUNDS * 2];
++    unsigned int Wpk_ring[2][HIPFIRE_FP8_V2_W_ROUNDS * 2];
++    float S_md;
++    unsigned int SZ_md[HIPFIRE_FP8_V2_SZITER];
++    const int nslabs = gpr * 4;
++    // Prime (first half only): stage slab q0 fully (S/SZ + A + W) and fetch
++    // raw q1 into slot 1. Values identical to the old per-half prologue at
++    // (g,h) = (0,0); later halves publish carried state instead of
++    // re-issuing these loads. Every lane active every round; OOB clamps to
++    // the last valid index with a branch-free zero-select.
++    if (gpr > 0) {
++        {
++            const unsigned int s_idx = st_soff;
++            const float s_ld = X_half_sums[s_idx];
++            *(float*)(lds_S + st_slds) = st_sok ? s_ld : 0.0f;
++        }
++        {
++            #pragma unroll
++            for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                const unsigned int hw = *(const unsigned int*)(st_szbase[e]);
++                const unsigned short h16 = (unsigned short)(st_szword[e] ? (hw >> 16) : (hw & 0xFFFFu));
++                const float f = __half2float(__ushort_as_half(h16));
++                *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
++            }
++        }
++        {
++            const unsigned char* xbase = X_fp8;
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                const unsigned char* asrc = xbase + st_agoff[r];
++                const v2i_t v0l = *(const v2i_t*)asrc;
++                const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
++                const v2i_t v0 = st_aok[r] ? v0l : st_z64;
++                const v2i_t v1 = st_aok[r] ? v1l : st_z64;
++                char* adst = lds_A +
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                    st_ab0[r];
++                *(v2i_t*)adst = v0;
++                *(v2i_t*)(adst + 128u) = v1;
++#else
++                    st_aldsoff[r];
++                *(v2i_t*)adst = v0;
++                *(v2i_t*)(adst + 8u) = v1;
++#endif
++            }
++        }
++        {
++            const unsigned int pack_base = 8u;
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
++                #pragma unroll
++                for (int pp = 0; pp < 2; pp++) {
++                    const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
++                    const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? pk : 0u);
++                    *(v2i_t*)(lds_W +
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                        st_wslot[r][pp]) = e8;
++#else
++                        st_wldsoff[r][pp]) = e8;
++#endif
++                }
++            }
++        }
++        if (nslabs > 1) {
++            {
++                const unsigned char* xbase = X_fp8 + (unsigned int)HIPFIRE_FP8_V2_BK;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    const unsigned char* asrc = xbase + st_agoff[r];
++                    A_ring[1][r * 2] = *(const v2i_t*)asrc;
++                    A_ring[1][r * 2 + 1] = *(const v2i_t*)(asrc + 8u);
++                }
++            }
++            {
++                const unsigned int pack_base = 8u + (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
++                    #pragma unroll
++                    for (int pp = 0; pp < 2; pp++) {
++                        Wpk_ring[1][r * 2 + pp] = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
++                    }
++                }
++            }
++        }
++    }
++    __syncthreads();
+     #pragma nounroll
+     for (int g = 0; g < gpr; g++) {
+-        #pragma nounroll
+-        for (int h = 0; h < 2; h++) {
+-            // Raw prefetch (R1): prologue stages slab 0, then each iteration
+-            // issues slab s+1's global loads into registers BEFORE slab s's
+-            // compute, and they stay RAW there: the OOB zero-selects consume
+-            // A_pf/Wpk_pf only at publication after compute, behind an opaque
+-            // register pin, so no loadcnt wait sits between the future loads
+-            // and the current slab's first WMMA. Expand + LDS publish of s+1
+-            // still follow compute (single buffer); only latency, not
+-            // execution, is hidden. A_pf holds the lane's raw b64 chunk pairs
+-            // (A_ROUNDS*2 v2i_t); Wpk_pf holds raw packs (mask + expand at
+-            // publish, identical values).
+-            v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
+-            unsigned int Wpk_pf[HIPFIRE_FP8_V2_W_ROUNDS * 2];
+-            // Prologue: stage slab 0 fully (S/SZ + A + W). Every lane is
+-            // active on every round; OOB clamps to the last valid index with
+-            // a branch-free zero-select (exact old ternary semantics).
++        // Phase 0: compute slab 4g+0 (P reset). Prefetch raw 4g+2 into slot 0
++        // with half (g,1)'s metadata carry (always in range: 4g+2 < 4gpr).
++        // Publish 4g+1 from slot 1.
++        {
+             {
+-                // S: one f32 per lane.
+-                {
+-                    const unsigned int s_idx = st_soff + (unsigned int)g * 2u + (unsigned int)h;
+-                    // Unconditional load from the clamped address; the select
+-                    // on the value is a cndmask, never an EXEC predicate.
+-                    const float s_ld = X_half_sums[s_idx];
+-                    const float s_v = st_sok ? s_ld : 0.0f;
+-                    *(float*)(lds_S + st_slds) = s_v;
++                const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + 128u;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    const unsigned char* asrc = xbase + st_agoff[r];
++                    A_ring[0][r * 2] = *(const v2i_t*)asrc;
++                    A_ring[0][r * 2 + 1] = *(const v2i_t*)(asrc + 8u);
+                 }
+-                // SZ: SZITER f32 words per lane.
+-                {
+-                    const unsigned int hwoff = (unsigned int)g * 136u + (unsigned int)h * 4u;
++            }
++            {
++                const unsigned int pack_base = (unsigned int)g * 136u + 8u + 64u;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                     #pragma unroll
+-                    for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
+-                        const unsigned int hw = *(const unsigned int*)(st_szbase[e] + hwoff);
+-                        const unsigned short h16 = (unsigned short)(st_szword[e] ? (hw >> 16) : (hw & 0xFFFFu));
+-                        const float f = __half2float(__ushort_as_half(h16));
+-                        *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
++                    for (int pp = 0; pp < 2; pp++) {
++                        Wpk_ring[0][r * 2 + pp] = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                     }
+                 }
+-                // A: one b64 chunk pair per round (even-chunk 16 B alignment
+-                // lets the compiler fuse each pair's loads to one b128).
+-                {
+-                    const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + (unsigned int)h * 128u;
+-                    #pragma unroll
+-                    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+-                        const unsigned char* asrc = xbase + st_agoff[r];
+-                        const v2i_t v0l = *(const v2i_t*)asrc;
+-                        const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
+-                        const v2i_t v0 = st_aok[r] ? v0l : st_z64;
+-                        const v2i_t v1 = st_aok[r] ? v1l : st_z64;
+-                        char* adst = lds_A +
++            }
++            {
++                const unsigned int s_idx = st_soff + (unsigned int)g * 2u + 1u;
++                S_md = X_half_sums[s_idx];
++                const unsigned int hwoff = (unsigned int)g * 136u + 4u;
++                #pragma unroll
++                for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                    SZ_md[e] = *(const unsigned int*)(st_szbase[e] + hwoff);
++                }
++            }
++            // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
++            {
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                            st_ab0[r];
+-                        *(v2i_t*)adst = v0;
+-                        *(v2i_t*)(adst + 128u) = v1;
++                // Frag immediates off a_fptr/w_fptr; no address VALU.
++                const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, 0));
++                const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, 0));
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, 0));
+ #else
+-                            st_aldsoff[r];
+-                        *(v2i_t*)adst = v0;
+-                        *(v2i_t*)(adst + 8u) = v1;
++                const int off = kg * 8;
++                const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+ #endif
+-                    }
++                    P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, zc);
++                    P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, zc);
+                 }
+-                // W: two raw packs per round; expand immediately (bit-exact).
+-                {
+-                    const unsigned int pack_base = (unsigned int)g * 136u + 8u
+-                        + (unsigned int)h * 64u;
++                __builtin_amdgcn_sched_barrier(0);
++            }
++            #pragma unroll
++            for (int kstep = 1; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
++                const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
++#else
++                const int off = kstep * 16 + kg * 8;
++                const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++#endif
++                    P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
++                    P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
++                }
++                __builtin_amdgcn_sched_barrier(0);
++            }
++            // Pin: opaque register-only identity; the zero-selects below
++            // consume raw slot 1 only here, after compute.
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(A_ring[1][r][0]), "+v"(A_ring[1][r][1]));
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(Wpk_ring[1][r]));
++            }
++            // Publish 4g+1 (buffer free: compute done). The barrier is
++            // REQUIRED: without it fast waves overwrite slab 4g while
++            // stragglers still read it (K2 race found).
++            __syncthreads();
++            {
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    char* adst = lds_A +
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                        st_ab0[r];
++                    *(v2i_t*)adst = st_aok[r] ? A_ring[1][r * 2] : st_z64;
++                    *(v2i_t*)(adst + 128u) = st_aok[r] ? A_ring[1][r * 2 + 1] : st_z64;
++#else
++                        st_aldsoff[r];
++                    *(v2i_t*)adst = st_aok[r] ? A_ring[1][r * 2] : st_z64;
++                    *(v2i_t*)(adst + 8u) = st_aok[r] ? A_ring[1][r * 2 + 1] : st_z64;
++#endif
++                }
++            }
++            {
++                const unsigned int pack_base = (unsigned int)g * 136u + 8u + (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                     #pragma unroll
+-                    for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+-                        #pragma unroll
+-                        for (int pp = 0; pp < 2; pp++) {
+-                            const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+-                            const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? pk : 0u);
+-                            *(v2i_t*)(lds_W +
++                    for (int pp = 0; pp < 2; pp++) {
++                        // Raw Wpk zero-selected here at publication;
++                        // expand(0) is all-zero E4M3 (bit-identical).
++                        const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? Wpk_ring[1][r * 2 + pp] : 0u);
++                        *(v2i_t*)(lds_W +
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                                st_wslot[r][pp]) = e8;
++                            st_wslot[r][pp]) = e8;
+ #else
+-                                st_wldsoff[r][pp]) = e8;
++                            st_wldsoff[r][pp]) = e8;
+ #endif
+-                        }
+                     }
+                 }
+             }
+             __syncthreads();
+-            #pragma nounroll
+-            for (int slab = 0; slab < HIPFIRE_FP8_V2_NSLABS; slab++) {
+-                // Prefetch slab s+1 globals before compute s.
+-                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+-                    {
+-                        const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + (unsigned int)h * 128u
+-                            + (unsigned int)(slab + 1) * (unsigned int)HIPFIRE_FP8_V2_BK;
+-                        #pragma unroll
+-                        for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+-                            const unsigned char* asrc = xbase + st_agoff[r];
+-                            const v2i_t v0l = *(const v2i_t*)asrc;
+-                            const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
+-                            A_pf[r * 2] = v0l;
+-                            A_pf[r * 2 + 1] = v1l;
+-                        }
+-                    }
+-                    {
+-                        const unsigned int pack_base = (unsigned int)g * 136u + 8u
+-                            + (unsigned int)h * 64u
+-                            + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+-                        #pragma unroll
+-                        for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+-                            #pragma unroll
+-                            for (int pp = 0; pp < 2; pp++) {
+-                                const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+-                                // Raw bits only (R1): zero-select moves to publication.
+-                                Wpk_pf[r * 2 + pp] = pk;
+-                            }
+-                        }
++        }
++        // Phase 1: compute slab 4g+1 (accumulate). Prefetch raw 4g+3 into
++        // slot 1 (always in range). Publish 4g+2 from slot 0, then fold half
++        // (g,0), then publish its carried metadata for half (g,1).
++        {
++            {
++                const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + 128u + (unsigned int)HIPFIRE_FP8_V2_BK;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    const unsigned char* asrc = xbase + st_agoff[r];
++                    A_ring[1][r * 2] = *(const v2i_t*)asrc;
++                    A_ring[1][r * 2 + 1] = *(const v2i_t*)(asrc + 8u);
++                }
++            }
++            {
++                const unsigned int pack_base = (unsigned int)g * 136u + 8u + 64u + (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
++                    #pragma unroll
++                    for (int pp = 0; pp < 2; pp++) {
++                        Wpk_ring[1][r * 2 + pp] = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                     }
+-                    // No sched pin here (iu4fold v0): the previous trip's fold
+-                    // VALU must be free to sink among this trip's WMMAs, and
+-                    // the prefetch loads hoist for latency on their own. True
+-                    // deps (A_pf/Wpk_pf publish after compute) still order
+-                    // what must be ordered.
+                 }
+-
+-                // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
+-                if (slab == 0) {
+-                    {
++            }
++            #pragma unroll
++            for (int kstep = 0; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                        // Frag immediates off a_fptr/w_fptr; no address VALU.
+-                        const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, 0));
+-                        const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, 0));
+-                        #pragma unroll
+-                        for (int nb = 0; nb < 4; nb++) {
+-                            const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, 0));
++                const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
++                const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
+ #else
+-                        const int off = kg * 8;
+-                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+-                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const int off = kstep * 16 + kg * 8;
++                const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++#endif
++                    P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
++                    P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
++                }
++                __builtin_amdgcn_sched_barrier(0);
++            }
++            // Fold at the 128-K half boundary (moved before publication: it
++            // reads half (g,0)'s S/SZ, still intact here). Stream s/z; S per
++            // token frag.
++            {
++                float Sh[4];
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    Sh[nb] = *(const float*)(lds_S + (unsigned int)(wave_tok + nb * 16 + ml) * 4u);
++                }
++                #pragma unroll
++                for (int wf = 0; wf < 2; wf++) {
++                    #pragma unroll
++                    for (int j = 0; j < 8; j++) {
++                        const int grow = wave_wt + wf * 16 + 8 * kg + j;
++                        const float* szp = (const float*)(lds_SZ + (unsigned int)grow * 8u);
++                        const float s_h = szp[0];
++                        const float z_h = szp[1];
+                         #pragma unroll
+                         for (int nb = 0; nb < 4; nb++) {
+-                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+-#endif
+-                            P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, zc);
+-                            P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, zc);
++                            T[nb][wf][j] = fmaf(s_h, P[nb][wf][j], T[nb][wf][j]);
++                            T[nb][wf][j] = fmaf(z_h, Sh[nb], T[nb][wf][j]);
+                         }
+-                        __builtin_amdgcn_sched_barrier(0);
+                     }
++                }
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(A_ring[0][r][0]), "+v"(A_ring[0][r][1]));
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(Wpk_ring[0][r]));
++            }
++            asm volatile("" : "+v"(S_md));
++            #pragma unroll
++            for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                asm volatile("" : "+v"(SZ_md[e]));
++            }
++            __syncthreads();
++            {
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    char* adst = lds_A +
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                        st_ab0[r];
++                    *(v2i_t*)adst = st_aok[r] ? A_ring[0][r * 2] : st_z64;
++                    *(v2i_t*)(adst + 128u) = st_aok[r] ? A_ring[0][r * 2 + 1] : st_z64;
++#else
++                        st_aldsoff[r];
++                    *(v2i_t*)adst = st_aok[r] ? A_ring[0][r * 2] : st_z64;
++                    *(v2i_t*)(adst + 8u) = st_aok[r] ? A_ring[0][r * 2 + 1] : st_z64;
++#endif
++                }
++            }
++            {
++                const unsigned int pack_base = (unsigned int)g * 136u + 8u + 64u;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                     #pragma unroll
+-                    for (int kstep = 1; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
++                    for (int pp = 0; pp < 2; pp++) {
++                        const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? Wpk_ring[0][r * 2 + pp] : 0u);
++                        *(v2i_t*)(lds_W +
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                        const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
+-                        const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
+-                        #pragma unroll
+-                        for (int nb = 0; nb < 4; nb++) {
+-                            const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
++                            st_wslot[r][pp]) = e8;
+ #else
+-                        const int off = kstep * 16 + kg * 8;
+-                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+-                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+-                        #pragma unroll
+-                        for (int nb = 0; nb < 4; nb++) {
+-                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                            st_wldsoff[r][pp]) = e8;
+ #endif
+-                            P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
+-                            P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
+-                        }
+-                        __builtin_amdgcn_sched_barrier(0);
+                     }
+-                } else {
++                }
++            }
++            // Publish carried metadata for half (g,1) (its fold already ran).
++            *(float*)(lds_S + st_slds) = st_sok ? S_md : 0.0f;
++            #pragma unroll
++            for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                const unsigned short h16 = (unsigned short)(st_szword[e] ? (SZ_md[e] >> 16) : (SZ_md[e] & 0xFFFFu));
++                const float f = __half2float(__ushort_as_half(h16));
++                *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
++            }
++            __syncthreads();
++        }
++        // Phase 2: compute slab 4g+2 (P reset). Prefetch raw 4g+4 into slot 0
++        // with half (g+1,0)'s metadata carry, guarded to group g+1 < gpr: do
++        // not clamp an out-of-range K prefetch and consume it. Publish 4g+3
++        // from slot 1.
++        {
++            if (g + 1 < gpr) {
++                const unsigned char* xbase = X_fp8 + (unsigned int)(g + 1) * 256u;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    const unsigned char* asrc = xbase + st_agoff[r];
++                    A_ring[0][r * 2] = *(const v2i_t*)asrc;
++                    A_ring[0][r * 2 + 1] = *(const v2i_t*)(asrc + 8u);
++                }
++            }
++            if (g + 1 < gpr) {
++                const unsigned int pack_base = (unsigned int)(g + 1) * 136u + 8u;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                     #pragma unroll
+-                    for (int kstep = 0; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
++                    for (int pp = 0; pp < 2; pp++) {
++                        Wpk_ring[0][r * 2 + pp] = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
++                    }
++                }
++            }
++            if (g + 1 < gpr) {
++                const unsigned int s_idx = st_soff + (unsigned int)(g + 1) * 2u;
++                S_md = X_half_sums[s_idx];
++                const unsigned int hwoff = (unsigned int)(g + 1) * 136u;
++                #pragma unroll
++                for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                    SZ_md[e] = *(const unsigned int*)(st_szbase[e] + hwoff);
++                }
++            }
++            // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
++            {
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                        const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
+-                        const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
+-                        #pragma unroll
+-                        for (int nb = 0; nb < 4; nb++) {
+-                            const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
++                // Frag immediates off a_fptr/w_fptr; no address VALU.
++                const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, 0));
++                const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, 0));
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, 0));
+ #else
+-                        const int off = kstep * 16 + kg * 8;
+-                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+-                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+-                        #pragma unroll
+-                        for (int nb = 0; nb < 4; nb++) {
+-                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const int off = kg * 8;
++                const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+ #endif
+-                            P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
+-                            P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
+-                        }
+-                        __builtin_amdgcn_sched_barrier(0);
+-                    }
++                    P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, zc);
++                    P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, zc);
++                }
++                __builtin_amdgcn_sched_barrier(0);
++            }
++            #pragma unroll
++            for (int kstep = 1; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
++                const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
++#else
++                const int off = kstep * 16 + kg * 8;
++                const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++#endif
++                    P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
++                    P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
+                 }
+-                // R1 pin: opaque register-only identity on the raw future
+-                // slab. The zero-selects below must consume A_pf/Wpk_pf only
+-                // here, after current-slab compute; without this the compiler
+-                // hoists the cndmasks (and their loadcnt waits) above the
+-                // current slab's first WMMA. No memory effect, no fence.
+-                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
++                __builtin_amdgcn_sched_barrier(0);
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(A_ring[1][r][0]), "+v"(A_ring[1][r][1]));
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(Wpk_ring[1][r]));
++            }
++            __syncthreads();
++            {
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    char* adst = lds_A +
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                        st_ab0[r];
++                    *(v2i_t*)adst = st_aok[r] ? A_ring[1][r * 2] : st_z64;
++                    *(v2i_t*)(adst + 128u) = st_aok[r] ? A_ring[1][r * 2 + 1] : st_z64;
++#else
++                        st_aldsoff[r];
++                    *(v2i_t*)adst = st_aok[r] ? A_ring[1][r * 2] : st_z64;
++                    *(v2i_t*)(adst + 8u) = st_aok[r] ? A_ring[1][r * 2 + 1] : st_z64;
++#endif
++                }
++            }
++            {
++                const unsigned int pack_base = (unsigned int)g * 136u + 8u + 64u + (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                     #pragma unroll
+-                    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS * 2; r++) {
+-                        asm volatile("" : "+v"(A_pf[r][0]), "+v"(A_pf[r][1]));
++                    for (int pp = 0; pp < 2; pp++) {
++                        const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? Wpk_ring[1][r * 2 + pp] : 0u);
++                        *(v2i_t*)(lds_W +
++#if HIPFIRE_FP8_V2_FRAG_ORDER
++                            st_wslot[r][pp]) = e8;
++#else
++                            st_wldsoff[r][pp]) = e8;
++#endif
+                     }
++                }
++            }
++            __syncthreads();
++        }
++        // Phase 3: compute slab 4g+3 (accumulate). Prefetch raw 4g+5 into
++        // slot 1, guarded to group g+1 < gpr. Publish 4g+4 from slot 0
++        // (guarded), then fold half (g,1), then publish its carried metadata
++        // for half (g+1,0).
++        {
++            if (g + 1 < gpr) {
++                const unsigned char* xbase = X_fp8 + (unsigned int)(g + 1) * 256u + (unsigned int)HIPFIRE_FP8_V2_BK;
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
++                    const unsigned char* asrc = xbase + st_agoff[r];
++                    A_ring[1][r * 2] = *(const v2i_t*)asrc;
++                    A_ring[1][r * 2 + 1] = *(const v2i_t*)(asrc + 8u);
++                }
++            }
++            if (g + 1 < gpr) {
++                const unsigned int pack_base = (unsigned int)(g + 1) * 136u + 8u + (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
++                #pragma unroll
++                for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                     #pragma unroll
+-                    for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS * 2; r++) {
+-                        asm volatile("" : "+v"(Wpk_pf[r]));
++                    for (int pp = 0; pp < 2; pp++) {
++                        Wpk_ring[1][r * 2 + pp] = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                     }
+                 }
+-                // Publish prefetched slab s+1 (buffer free: compute s done).
+-                // The barrier is REQUIRED: without it fast waves overwrite
+-                // slab s while stragglers still read it (K2 race found).
+-                // Single buffer: slab selects the GLOBAL source only; the LDS
++            }
++            #pragma unroll
++            for (int kstep = 0; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                // address is the same frag slot the prologue used.
++                const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
++                const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
+ #else
+-                // address is the same slab slot the prologue used.
++                const int off = kstep * 16 + kg * 8;
++                const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+ #endif
+-                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+-                    __syncthreads();
++                    P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
++                    P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
++                }
++                __builtin_amdgcn_sched_barrier(0);
++            }
++            {
++                float Sh[4];
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    Sh[nb] = *(const float*)(lds_S + (unsigned int)(wave_tok + nb * 16 + ml) * 4u);
++                }
++                #pragma unroll
++                for (int wf = 0; wf < 2; wf++) {
++                    #pragma unroll
++                    for (int j = 0; j < 8; j++) {
++                        const int grow = wave_wt + wf * 16 + 8 * kg + j;
++                        const float* szp = (const float*)(lds_SZ + (unsigned int)grow * 8u);
++                        const float s_h = szp[0];
++                        const float z_h = szp[1];
++                        #pragma unroll
++                        for (int nb = 0; nb < 4; nb++) {
++                            T[nb][wf][j] = fmaf(s_h, P[nb][wf][j], T[nb][wf][j]);
++                            T[nb][wf][j] = fmaf(z_h, Sh[nb], T[nb][wf][j]);
++                        }
++                    }
++                }
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(A_ring[0][r][0]), "+v"(A_ring[0][r][1]));
++            }
++            #pragma unroll
++            for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS * 2; r++) {
++                asm volatile("" : "+v"(Wpk_ring[0][r]));
++            }
++            asm volatile("" : "+v"(S_md));
++            #pragma unroll
++            for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                asm volatile("" : "+v"(SZ_md[e]));
++            }
++            if (g + 1 < gpr) {
++                __syncthreads();
++                {
+                     #pragma unroll
+                     for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+                         char* adst = lds_A +
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+                             st_ab0[r];
+-                        *(v2i_t*)adst = st_aok[r] ? A_pf[r * 2] : st_z64;
+-                        *(v2i_t*)(adst + 128u) = st_aok[r] ? A_pf[r * 2 + 1] : st_z64;
++                        *(v2i_t*)adst = st_aok[r] ? A_ring[0][r * 2] : st_z64;
++                        *(v2i_t*)(adst + 128u) = st_aok[r] ? A_ring[0][r * 2 + 1] : st_z64;
+ #else
+                             st_aldsoff[r];
+-                        *(v2i_t*)adst = st_aok[r] ? A_pf[r * 2] : st_z64;
+-                        *(v2i_t*)(adst + 8u) = st_aok[r] ? A_pf[r * 2 + 1] : st_z64;
++                        *(v2i_t*)adst = st_aok[r] ? A_ring[0][r * 2] : st_z64;
++                        *(v2i_t*)(adst + 8u) = st_aok[r] ? A_ring[0][r * 2 + 1] : st_z64;
+ #endif
+                     }
+-                    {
+-                        const unsigned int pack_base = (unsigned int)g * 136u + 8u
+-                            + (unsigned int)h * 64u
+-                            + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
++                }
++                {
++                    const unsigned int pack_base = (unsigned int)(g + 1) * 136u + 8u;
++                    #pragma unroll
++                    for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                         #pragma unroll
+-                        for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+-                            #pragma unroll
+-                            for (int pp = 0; pp < 2; pp++) {
+-                                // Raw Wpk zero-selected here at publication;
+-                                // expand(0) is all-zero E4M3 (bit-identical).
+-                                const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? Wpk_pf[r * 2 + pp] : 0u);
+-                                *(v2i_t*)(lds_W +
++                        for (int pp = 0; pp < 2; pp++) {
++                            const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? Wpk_ring[0][r * 2 + pp] : 0u);
++                            *(v2i_t*)(lds_W +
+ #if HIPFIRE_FP8_V2_FRAG_ORDER
+-                                    st_wslot[r][pp]) = e8;
++                                st_wslot[r][pp]) = e8;
+ #else
+-                                    st_wldsoff[r][pp]) = e8;
++                                st_wldsoff[r][pp]) = e8;
+ #endif
+-                            }
+                         }
+                     }
+                 }
+-
+-                if (slab == HIPFIRE_FP8_V2_NSLABS - 1) {
+-                    // Fold at the 128-K half boundary. Stream s/z; S per token frag.
+-                    float Sh[4];
+-                    #pragma unroll
+-                    for (int nb = 0; nb < 4; nb++) {
+-                        Sh[nb] = *(const float*)(lds_S + (unsigned int)(wave_tok + nb * 16 + ml) * 4u);
+-                    }
+-                    #pragma unroll
+-                    for (int wf = 0; wf < 2; wf++) {
+-                        #pragma unroll
+-                        for (int j = 0; j < 8; j++) {
+-                            const int grow = wave_wt + wf * 16 + 8 * kg + j;
+-                            const float* szp = (const float*)(lds_SZ + (unsigned int)grow * 8u);
+-                            const float s_h = szp[0];
+-                            const float z_h = szp[1];
+-                            #pragma unroll
+-                            for (int nb = 0; nb < 4; nb++) {
+-                                T[nb][wf][j] = fmaf(s_h, P[nb][wf][j], T[nb][wf][j]);
+-                                T[nb][wf][j] = fmaf(z_h, Sh[nb], T[nb][wf][j]);
+-                            }
+-                        }
+-                    }
++                *(float*)(lds_S + st_slds) = st_sok ? S_md : 0.0f;
++                #pragma unroll
++                for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
++                    const unsigned short h16 = (unsigned short)(st_szword[e] ? (SZ_md[e] >> 16) : (SZ_md[e] & 0xFFFFu));
++                    const float f = __half2float(__ushort_as_half(h16));
++                    *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
+                 }
+-
+-                __syncthreads();
+             }
++            __syncthreads();
+         }
+     }
+ 

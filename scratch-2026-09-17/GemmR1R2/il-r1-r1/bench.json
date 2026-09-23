@@ -1,0 +1,80 @@
+{
+  "route": "s2bt8",
+  "v2_geometry": {
+    "BM": 256,
+    "BN": 64,
+    "BK": 64,
+    "waves": 8
+  },
+  "timed_repeats": 11,
+  "families": [
+    {
+      "family": "gate_up",
+      "n": 512,
+      "k": 5120,
+      "m_total": 34816,
+      "hash": "2adf7620c1d722e1",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 1411.0039472579956,
+      "gemm_n": 11,
+      "pack_median_us": 52.319999784231186,
+      "kernels": [
+        "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+        "pack_f32_to_fp8_mq4v2_gfx12",
+        "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201"
+      ]
+    },
+    {
+      "family": "qkv",
+      "n": 512,
+      "k": 5120,
+      "m_total": 14336,
+      "hash": "09726b10ba1eb1b2",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 600.3220081329346,
+      "gemm_n": 11,
+      "pack_median_us": 29.039999470114708,
+      "kernels": [
+        "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+        "pack_f32_to_fp8_mq4v2_gfx12",
+        "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201"
+      ]
+    },
+    {
+      "family": "qkvza",
+      "n": 512,
+      "k": 5120,
+      "m_total": 16480,
+      "hash": "082a7b24def26f75",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 686.2019896507263,
+      "gemm_n": 11,
+      "pack_median_us": 29.479999095201492,
+      "kernels": [
+        "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+        "pack_f32_to_fp8_mq4v2_gfx12",
+        "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201"
+      ]
+    },
+    {
+      "family": "residual",
+      "n": 512,
+      "k": 17408,
+      "m_total": 5120,
+      "hash": "373cb087fb519b9e",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 763.8429999351501,
+      "gemm_n": 11,
+      "pack_median_us": 77.67999917268753,
+      "kernels": [
+        "gemm_mq4g256v2_residual_wmma_fp8_gfx12_s2bt8",
+        "pack_f32_to_fp8_mq4v2_gfx12",
+        "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201"
+      ]
+    }
+  ]
+}

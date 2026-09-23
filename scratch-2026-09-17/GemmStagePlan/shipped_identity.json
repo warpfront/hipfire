@@ -1,0 +1,29 @@
+{
+  "source_sha256": "29be6cec07098598679595be061bee5379eb14a8047fe71633e113c5c8102aab",
+  "families": [
+    {
+      "family": "gu",
+      "compile_exit": 0,
+      "device_body_identical": true,
+      "sha256_normalized_body": "85741ada00541a506301e6c2a7f4961b064628323a5806d8d153f452f8960dd8"
+    },
+    {
+      "family": "re",
+      "compile_exit": 0,
+      "device_body_identical": true,
+      "sha256_normalized_body": "d2c1de0d5e6367e9848abc68409b92603d41fdd472cad4483909189ce34a6146"
+    },
+    {
+      "family": "qkv",
+      "compile_exit": 0,
+      "device_body_identical": true,
+      "sha256_normalized_body": "4294098c708ccf049baba9f73264748eed7dde5837ab5e38c79fa3412116c5f2"
+    },
+    {
+      "family": "qkvza",
+      "compile_exit": 0,
+      "device_body_identical": true,
+      "sha256_normalized_body": "cd16b7d46421eb8975381aed7b675da1abac5f49a4b17606170b1800b4b6c47f"
+    }
+  ]
+}

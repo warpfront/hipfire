@@ -1,0 +1,14 @@
+N=8192 round=0
+gu_full median_us=20806.459 min_us=19546.850 max_us=21024.863 regs=189 local=0 hash=120e7cefb3222325
+re_full median_us=10545.104 min_us=10086.778 max_us=10900.749 regs=198 local=0 hash=02fe5ae4fd222325
+gu_rawpref median_us=20085.520 min_us=19006.107 max_us=20455.963 regs=192 local=0 hash=120e7cefb3222325
+re_rawpref median_us=10071.421 min_us=9709.337 max_us=10361.385 regs=204 local=0 hash=02fe5ae4fd222325
+gu_full median_us=20810.809 min_us=19724.119 max_us=21097.893 regs=189 local=0 hash=120e7cefb3222325
+re_full median_us=10585.146 min_us=10148.022 max_us=10864.670 regs=198 local=0 hash=02fe5ae4fd222325
+N=8192 round=1
+gu_full median_us=20837.291 min_us=19731.881 max_us=21089.812 regs=189 local=0 hash=120e7cefb3222325
+re_full median_us=10599.268 min_us=10235.903 max_us=10917.511 regs=198 local=0 hash=02fe5ae4fd222325
+gu_rawpref median_us=19985.125 min_us=18992.354 max_us=20425.488 regs=192 local=0 hash=120e7cefb3222325
+re_rawpref median_us=10143.743 min_us=9783.741 max_us=10446.707 regs=204 local=0 hash=02fe5ae4fd222325
+gu_full median_us=20824.373 min_us=19729.924 max_us=21189.258 regs=189 local=0 hash=120e7cefb3222325
+re_full median_us=10521.589 min_us=10195.905 max_us=10835.592 regs=198 local=0 hash=02fe5ae4fd222325

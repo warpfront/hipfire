@@ -1,0 +1,6 @@
+round=0 mode=pure us=3197.234 TF=343.895 regs=83 local=0 shared=0
+round=0 mode=fold us=4155.679 TF=264.580 regs=92 local=0 shared=0
+round=1 mode=pure us=2952.228 TF=372.435 regs=83 local=0 shared=0
+round=1 mode=fold us=3857.398 TF=285.040 regs=92 local=0 shared=0
+round=2 mode=pure us=2907.228 TF=378.199 regs=83 local=0 shared=0
+round=2 mode=fold us=3956.558 TF=277.896 regs=92 local=0 shared=0

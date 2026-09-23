@@ -1,0 +1,1 @@
+  [warn] registry has no recommended_settings for tag None — falling back to recipe(general). Pass --tag <registry-tag> or --sampling explicitly to pin it.
