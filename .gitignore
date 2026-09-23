@@ -1,0 +1,92 @@
+# Build output (not binaries shipped in releases)
+/target
+*.o
+*.so
+*.dll
+
+# Editor
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Dev / dist
+/dev/
+/dist/
+
+# Models (large binaries)
+/models/
+*.gguf
+*.safetensors
+*.hfq
+
+# JIT-compiled kernel cache
+kernels/compiled/
+.hipfire_kernels/
+
+# Agent / tool state
+.serena/
+.remember/
+.codex
+docs/superpowers/
+.worktrees/
+.dflash-reference/
+.dflash-ref-hf/
+.dflash-ref-hf-4b/
+dflash-papers/
+kv_research/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs / temp
+*.log
+/tmp/
+
+# Local Claude agent state
+.claude/
+# Personal CLI instructions
+cli/CLAUDE.md
+.pr_body_0_1_7_alpha.md
+.bench_0_1_7_alpha/
+
+# Training artifacts (draft ckpts, converted hfq, prompt files, logs)
+.dflash-runs/
+artifacts/
+.codeinsight
+.codeinsight+research/
+.local-bench-scratch/
+.gm/rs-learn.db
+findings/
+.plugkit-browser-profile/
+.plugkit-browser-profile-*/
+.plugkit-agent-worktree/
+.code-search/
+*.stackdump
+
+# Cached external research pages (re-fetchable, large, not source)
+.research-cache/
+research/
+.hipfire_kernels.prerebsave/
+
+# Local agent state (gm planning / learning bookkeeping; varies per session)
+.gm/git-block-counter.json
+.gm/rslearn-counter.json
+.gm/turn-state.json
+.gm/needs-gm
+.gm/lastskill
+.gm/no-memorize-this-turn
+.gm/learning-state.md
+.gm/prd-state.json
+.gm/prd.paused.yml
+.gm/trajectory-drafts/
+.gm/ingest-drafts/
+
+# Scratch research bundles (raw PR diffs, model-conversion test artifacts)
+.codeinsight+research/
+
+bench/coherence-results/

@@ -1,0 +1,531 @@
+//! ChatML prompt framing — single source of truth for assembling
+//! the token sequence that gets fed to the model. Replaces the three
+//! near-copies that lived in daemon.rs (AR, PFlash, DFlash paths).
+//!
+//! The canonical layout for a single turn is:
+//!
+//! ```text
+//! [<|im_start|> system \n <system content> <|im_end|> \n]?  ← optional
+//!  <|im_start|> user \n <user content> <|im_end|> \n
+//!  <|im_start|> assistant \n [<think> \n]?
+//! ```
+//!
+//! All three daemon copies converge to this exact byte sequence. The
+//! AR path's whitespace conventions are canonical because it is the
+//! most-exercised and the path against which the locked speed/coherence
+//! baselines were captured.
+//!
+//! Multi-turn extends the same pattern by repeating
+//! `<|im_start|> {user|assistant} \n <content> <|im_end|> \n`
+//! for each prior turn before appending the new turn + assistant prefix.
+//!
+//! # Per-call-site policy
+//!
+//! Whether to *include* a system message on a given call (e.g. only on
+//! `seq_pos == 0`) is the **caller's** decision. `ChatFrame` simply
+//! emits a system block iff `system` is `Some`. The daemon is
+//! responsible for passing `Some(_)` only on the appropriate turn.
+//!
+//! # Raw bypass
+//!
+//! `raw: true` skips ChatML scaffolding entirely and returns the
+//! tokenization of `user` alone. This supports completion-style use
+//! against a base model where any `<|im_start|>` token would be
+//! out-of-distribution.
+
+use crate::tokenizer::Tokenizer;
+
+/// Chooses what goes after the assistant role-and-newline opener.
+#[derive(Debug, Clone, Copy)]
+pub enum AssistantPrefix {
+    /// Plain assistant turn opener: `<|im_start|>assistant\n`.
+    Plain,
+    /// Assistant turn with `<think>` opener for thinking-mode models:
+    /// `<|im_start|>assistant\n<think>\n`.
+    ///
+    /// Use only when the tokenizer recognizes `<think>` as a single
+    /// special token. If `<think>` is absent from the vocab, the
+    /// builder falls back to `Plain` (no opener emitted) rather than
+    /// silently inserting raw text bytes that would tokenize
+    /// differently from the special-token path.
+    OpenThink,
+}
+
+/// Direction of a multi-turn history entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// ChatML frame builder. Holds borrowed references to the tokenizer
+/// and the textual content; the builder methods produce owned
+/// `Vec<u32>` token sequences.
+///
+/// Not `#[derive(Debug)]` because `Tokenizer` doesn't implement
+/// `Debug`. Callers that need a printable struct should format the
+/// non-tokenizer fields manually.
+#[derive(Clone)]
+pub struct ChatFrame<'a> {
+    pub tokenizer: &'a Tokenizer,
+    pub system: Option<&'a str>,
+    pub user: &'a str,
+    pub assistant_prefix: AssistantPrefix,
+    /// If true, bypass ChatML entirely and just encode `user` as raw
+    /// tokens. For completion-style use against a base model.
+    pub raw: bool,
+}
+
+impl<'a> ChatFrame<'a> {
+    /// Build the prompt token sequence for a single-turn request.
+    pub fn build(&self) -> Vec<u32> {
+        if self.raw {
+            return self.tokenizer.encode(self.user);
+        }
+        let scaffold = ChatScaffold::for_tokenizer(self.tokenizer);
+        let mut out: Vec<u32> = Vec::new();
+        if let Some(sys) = self.system {
+            scaffold.append_system(&mut out, sys);
+        }
+        scaffold.append_user_turn(&mut out, self.user);
+        scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
+        out
+    }
+
+    /// Build the prompt token sequence for a single-turn request,
+    /// substituting `user_tokens` for the encoding of `self.user`.
+    /// Used by the daemon's AR/PFlash path where the user content has
+    /// already been tokenized (and possibly compressed) upstream. The
+    /// `self.user` field is ignored by this method when not in `raw`
+    /// mode.
+    ///
+    /// In `raw` mode, returns `user_tokens` verbatim (system + ChatML
+    /// scaffolding still bypassed, matching `build()`'s `raw` semantics).
+    pub fn build_with_user_tokens(&self, user_tokens: &[u32]) -> Vec<u32> {
+        if self.raw {
+            return user_tokens.to_vec();
+        }
+        let scaffold = ChatScaffold::for_tokenizer(self.tokenizer);
+        let mut out: Vec<u32> = Vec::new();
+        if let Some(sys) = self.system {
+            scaffold.append_system(&mut out, sys);
+        }
+        scaffold.append_user_turn_tokens(&mut out, user_tokens);
+        scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
+        out
+    }
+
+    /// Build the prompt token sequence for a multi-turn request.
+    /// `history` is prior turns in chronological order (oldest first);
+    /// the final turn is appended from `self.user` +
+    /// `self.assistant_prefix`. The system message (if any) is emitted
+    /// once, before the first history turn.
+    ///
+    /// In `raw` mode, history is concatenated as plain text encodings
+    /// joined by newlines, then `user` is appended on its own line.
+    /// This is best-effort — completion-style use against a base model
+    /// rarely needs multi-turn.
+    pub fn build_multi_turn(&self, history: &[(Role, &str)]) -> Vec<u32> {
+        if self.raw {
+            let mut out: Vec<u32> = Vec::new();
+            for (i, (_role, content)) in history.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(&self.tokenizer.encode("\n"));
+                }
+                out.extend_from_slice(&self.tokenizer.encode(content));
+            }
+            if !history.is_empty() {
+                out.extend_from_slice(&self.tokenizer.encode("\n"));
+            }
+            out.extend_from_slice(&self.tokenizer.encode(self.user));
+            return out;
+        }
+        let scaffold = ChatScaffold::for_tokenizer(self.tokenizer);
+        let mut out: Vec<u32> = Vec::new();
+        if let Some(sys) = self.system {
+            scaffold.append_system(&mut out, sys);
+        }
+        for (role, content) in history {
+            match role {
+                Role::User => scaffold.append_user_turn(&mut out, content),
+                Role::Assistant => scaffold.append_assistant_turn(&mut out, content),
+            }
+        }
+        scaffold.append_user_turn(&mut out, self.user);
+        scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
+        out
+    }
+}
+
+/// Pre-encoded ChatML scaffolding plus a borrowed tokenizer reference.
+/// The fixed structural tokens (`<|im_start|>`, role names, `\n`,
+/// `<|im_end|>`) are encoded once up front; per-turn content gets
+/// encoded inside the append helpers as it's appended.
+struct ChatScaffold<'a> {
+    tokenizer: &'a Tokenizer,
+    im_start: Vec<u32>,
+    im_end: Vec<u32>,
+    nl: Vec<u32>,
+    system_role: Vec<u32>,
+    user_role: Vec<u32>,
+    assistant_role: Vec<u32>,
+    /// `<think>` opener (if the tokenizer recognizes it as a single
+    /// special token). When `None`, `OpenThink` falls back to `Plain`
+    /// — see `append_assistant_prefix`.
+    think_open: Option<u32>,
+}
+
+impl<'a> ChatScaffold<'a> {
+    fn for_tokenizer(t: &'a Tokenizer) -> Self {
+        Self {
+            tokenizer: t,
+            im_start: t.encode("<|im_start|>"),
+            im_end: t.encode("<|im_end|>"),
+            nl: t.encode("\n"),
+            system_role: t.encode("system"),
+            user_role: t.encode("user"),
+            assistant_role: t.encode("assistant"),
+            think_open: t.special_token_id("<think>"),
+        }
+    }
+
+    fn append_system(&self, out: &mut Vec<u32>, content: &str) {
+        let body = self.tokenizer.encode(content);
+        out.extend_from_slice(&self.im_start);
+        out.extend_from_slice(&self.system_role);
+        out.extend_from_slice(&self.nl);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&self.im_end);
+        out.extend_from_slice(&self.nl);
+    }
+
+    fn append_user_turn(&self, out: &mut Vec<u32>, content: &str) {
+        let body = self.tokenizer.encode(content);
+        self.append_user_turn_tokens(out, &body);
+    }
+
+    /// Like `append_user_turn` but the body is already tokenized.
+    fn append_user_turn_tokens(&self, out: &mut Vec<u32>, body: &[u32]) {
+        out.extend_from_slice(&self.im_start);
+        out.extend_from_slice(&self.user_role);
+        out.extend_from_slice(&self.nl);
+        out.extend_from_slice(body);
+        out.extend_from_slice(&self.im_end);
+        out.extend_from_slice(&self.nl);
+    }
+
+    fn append_assistant_turn(&self, out: &mut Vec<u32>, content: &str) {
+        let body = self.tokenizer.encode(content);
+        out.extend_from_slice(&self.im_start);
+        out.extend_from_slice(&self.assistant_role);
+        out.extend_from_slice(&self.nl);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&self.im_end);
+        out.extend_from_slice(&self.nl);
+    }
+
+    fn append_assistant_prefix(&self, out: &mut Vec<u32>, prefix: AssistantPrefix) {
+        out.extend_from_slice(&self.im_start);
+        out.extend_from_slice(&self.assistant_role);
+        out.extend_from_slice(&self.nl);
+        if matches!(prefix, AssistantPrefix::OpenThink) {
+            // Only emit `<think>\n` when the tokenizer registers
+            // `<think>` as a single special token. Otherwise the
+            // string would tokenize as ordinary BPE pieces and behave
+            // differently from the special-token path the model was
+            // trained on. Falling back to `Plain` in that case is
+            // safer than silently emitting wrong-shaped tokens.
+            if let Some(think_id) = self.think_open {
+                out.push(think_id);
+                out.extend_from_slice(&self.nl);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a hermetic test tokenizer. Uses the `from_hf_json` path
+    /// with a minimal vocabulary that is sufficient to round-trip the
+    /// ChatML special tokens and a few simple ASCII strings. The test
+    /// does NOT depend on any GGUF fixture.
+    ///
+    /// Strategy: GPT-2-BPE flavor (triggered by adding `Ġ` to the
+    /// vocab). The byte-level fallback in `encode_gpt2_bpe` will
+    /// convert any unmapped string into per-byte token IDs without
+    /// the SentencePiece `▁`-prepending quirk that complicates
+    /// equality checks.
+    ///
+    /// IMPORTANT: the tests below build their *expected* byte
+    /// sequences using the same `tokenizer.encode()` call that
+    /// `ChatFrame::build` uses internally, so any quirks of the
+    /// encoder cancel out. The tests verify *structural* properties
+    /// (system block precedes user turn; assistant prefix appears at
+    /// end; raw bypasses scaffolding; multi-turn concatenates
+    /// turns), not exact-byte oracles against a hand-rolled string.
+    fn make_tokenizer() -> Tokenizer {
+        // Vocab includes:
+        // - chatml special tokens
+        // - role names ("system", "user", "assistant")
+        // - common ascii bytes for short strings ("hello", "hi", "world", etc.)
+        // - the `Ġ` trigger that puts the tokenizer in GPT-2 BPE mode
+        // - all 256 single bytes (mapped via byte_to_gpt2_char) for
+        //   robust fallback on arbitrary content
+        let mut entries: Vec<String> = Vec::new();
+        entries.push(r#""<|im_start|>": 0"#.to_string());
+        entries.push(r#""<|im_end|>": 1"#.to_string());
+        entries.push(r#""<think>": 2"#.to_string());
+        entries.push(r#""</think>": 3"#.to_string());
+        entries.push(r#""system": 4"#.to_string());
+        entries.push(r#""user": 5"#.to_string());
+        entries.push(r#""assistant": 6"#.to_string());
+        entries.push(r#""\n": 7"#.to_string());
+        entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
+        // All 256 GPT-2-byte characters get unique ids 100..356 so
+        // any short string round-trips byte-by-byte.
+        for b in 0u32..=255u32 {
+            // Use rust escape; the encoder will look up the GPT-2 char
+            // form of each byte directly.
+            let ch = byte_to_gpt2_char_test(b as u8);
+            // JSON-escape the char carefully — only `\`, `"`, control
+            // chars need it; the GPT-2 byte mapping uses non-ASCII
+            // unicode chars for the printable byte range.
+            let escaped = json_escape(&ch.to_string());
+            entries.push(format!(r#""{}": {}"#, escaped, 100 + b));
+        }
+        let vocab_block = entries.join(", ");
+        let json = format!(
+            r#"{{
+                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
+                "added_tokens": [
+                    {{"id": 0, "content": "<|im_start|>", "special": true}},
+                    {{"id": 1, "content": "<|im_end|>", "special": true}},
+                    {{"id": 2, "content": "<think>", "special": true}},
+                    {{"id": 3, "content": "</think>", "special": true}}
+                ]
+            }}"#,
+            vocab = vocab_block,
+        );
+        Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    }
+
+    /// Mirror of `byte_to_gpt2_char` from tokenizer.rs (private). The
+    /// GPT-2 byte-to-char mapping leaves printable ASCII (33..127, 161..173,
+    /// 174..256) untouched and renumbers the rest above 256.
+    fn byte_to_gpt2_char_test(b: u8) -> char {
+        // Standard GPT-2 byte_to_unicode table. We only need it stable
+        // across the test tokenizer + the production tokenizer; the
+        // production code reuses the same canonical table.
+        let mut bs: Vec<u32> = Vec::new();
+        bs.extend((b'!' as u32)..=(b'~' as u32));
+        bs.extend((0xA1u32)..=(0xACu32));
+        bs.extend((0xAEu32)..=(0xFFu32));
+        let mut cs: Vec<u32> = bs.clone();
+        let mut n: u32 = 0;
+        for byte in 0u32..=255u32 {
+            if !bs.contains(&byte) {
+                bs.push(byte);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        let idx = bs.iter().position(|&x| x == b as u32).expect("byte in table");
+        char::from_u32(cs[idx]).expect("valid char")
+    }
+
+    fn json_escape(s: &str) -> String {
+        // Only escape what JSON requires: backslash, quote, control.
+        let mut out = String::new();
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn plain_assistant_prefix_layout() {
+        let t = make_tokenizer();
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hello",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let got = frame.build();
+
+        // Build expected using the same encoder, mirroring daemon's
+        // canonical AR-path framing exactly:
+        //   <|im_start|> user \n <user content> <|im_end|> \n
+        //   <|im_start|> assistant \n
+        let mut expected: Vec<u32> = Vec::new();
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("user"));
+        expected.extend_from_slice(&t.encode("\n"));
+        expected.extend_from_slice(&t.encode("hello"));
+        expected.extend_from_slice(&t.encode("<|im_end|>"));
+        expected.extend_from_slice(&t.encode("\n"));
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("assistant"));
+        expected.extend_from_slice(&t.encode("\n"));
+        assert_eq!(got, expected, "Plain assistant prefix layout mismatch");
+    }
+
+    #[test]
+    fn open_think_appends_think_newline_when_special_present() {
+        let t = make_tokenizer();
+        let plain = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+        let opened = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::OpenThink,
+            raw: false,
+        }
+        .build();
+        // The test tokenizer always registers `<think>` as a special
+        // token, so OpenThink must append exactly `<think>\n`.
+        let think_id = t.special_token_id("<think>")
+            .expect("test tokenizer registers <think> as special");
+        let mut expected = plain.clone();
+        expected.push(think_id);
+        expected.extend_from_slice(&t.encode("\n"));
+        assert_eq!(opened, expected, "OpenThink should append <think>\\n after the assistant prefix");
+        assert!(opened.len() > plain.len(), "OpenThink output must be strictly longer than Plain");
+    }
+
+    #[test]
+    fn raw_bypasses_chatml() {
+        let t = make_tokenizer();
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: Some("ignored when raw"),
+            user: "completion text",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: true,
+        };
+        let got = frame.build();
+        let expected = t.encode("completion text");
+        assert_eq!(got, expected, "raw=true should bypass ChatML scaffolding");
+    }
+
+    #[test]
+    fn build_multi_turn_two_turn_history() {
+        let t = make_tokenizer();
+        let history: [(Role, &str); 2] =
+            [(Role::User, "hello"), (Role::Assistant, "hi")];
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "world",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let got = frame.build_multi_turn(&history);
+
+        // Expected: history[user] history[assistant] new[user] new[assistant_prefix]
+        let mut expected: Vec<u32> = Vec::new();
+        // Prior user turn
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("user"));
+        expected.extend_from_slice(&t.encode("\n"));
+        expected.extend_from_slice(&t.encode("hello"));
+        expected.extend_from_slice(&t.encode("<|im_end|>"));
+        expected.extend_from_slice(&t.encode("\n"));
+        // Prior assistant turn
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("assistant"));
+        expected.extend_from_slice(&t.encode("\n"));
+        expected.extend_from_slice(&t.encode("hi"));
+        expected.extend_from_slice(&t.encode("<|im_end|>"));
+        expected.extend_from_slice(&t.encode("\n"));
+        // New user turn
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("user"));
+        expected.extend_from_slice(&t.encode("\n"));
+        expected.extend_from_slice(&t.encode("world"));
+        expected.extend_from_slice(&t.encode("<|im_end|>"));
+        expected.extend_from_slice(&t.encode("\n"));
+        // Assistant prefix (Plain)
+        expected.extend_from_slice(&t.encode("<|im_start|>"));
+        expected.extend_from_slice(&t.encode("assistant"));
+        expected.extend_from_slice(&t.encode("\n"));
+
+        assert_eq!(got, expected, "multi-turn token sequence mismatch");
+    }
+
+    #[test]
+    fn build_with_user_tokens_matches_build_when_tokens_match_string() {
+        // The pre-tokenized variant must produce byte-identical output
+        // to `build()` when the supplied tokens equal `tokenizer.encode(self.user)`.
+        // This is the daemon AR-path no-PFlash case.
+        let t = make_tokenizer();
+        let user_text = "hello";
+        let frame = ChatFrame {
+            tokenizer: &t,
+            system: Some("sysprompt"),
+            user: user_text,
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let via_string = frame.build();
+        let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
+        assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+    }
+
+    #[test]
+    fn system_message_precedes_first_user_turn() {
+        let t = make_tokenizer();
+        let with_sys = ChatFrame {
+            tokenizer: &t,
+            system: Some("sysprompt"),
+            user: "hello",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+        let without_sys = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hello",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+
+        // The "with system" output must equal a system block followed
+        // by the "without system" output. This is the canonical
+        // daemon AR-path invariant.
+        let mut sys_block: Vec<u32> = Vec::new();
+        sys_block.extend_from_slice(&t.encode("<|im_start|>"));
+        sys_block.extend_from_slice(&t.encode("system"));
+        sys_block.extend_from_slice(&t.encode("\n"));
+        sys_block.extend_from_slice(&t.encode("sysprompt"));
+        sys_block.extend_from_slice(&t.encode("<|im_end|>"));
+        sys_block.extend_from_slice(&t.encode("\n"));
+
+        let mut expected = sys_block;
+        expected.extend_from_slice(&without_sys);
+        assert_eq!(
+            with_sys, expected,
+            "system message should be a prefix of the rest of the frame"
+        );
+    }
+}

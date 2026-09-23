@@ -1,0 +1,12 @@
+{
+  "name": "hipfire-diag",
+  "version": "0.0.1",
+  "description": "Run hipfire GPU diagnostics, interpret results, and suggest fixes. Works with any AI agent framework.",
+  "triggers": ["test hipfire", "diagnose hipfire", "what's wrong", "run tests", "check gpu", "hipfire not working"],
+  "entry": "./run-diagnostics.sh",
+  "interpret": "./interpret.md",
+  "requires": {
+    "gpu": "AMD (ROCm/HIP)",
+    "binary": "target/release/examples/test_kernels OR test_kernelsQA"
+  }
+}

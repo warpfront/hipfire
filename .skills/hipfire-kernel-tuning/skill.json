@@ -1,0 +1,38 @@
+{
+  "name": "hipfire-kernel-tuning",
+  "version": "0.1.0",
+  "description": "Optimize hipfire HIP/compute kernels — pick a tuning lever (multi-row, K-tile depth, prefetch, wave-size port, WMMA/MFMA, fused projections, ISA flags) and validate the win across the supported RDNA arch matrix. Codifies the empirical methodology from this repo's actual perf history: wave64 CDNA3 port (4105035, +2× decode), nontemporal-load fake-win revert (34eb024, −13% caught only by clean-baseline bisect), gfx12 WMMA contributor-port (PR #56), gfx11 WMMA silent-corruption fix (b7ac66a). Use when you have a hot kernel identified by the profiler and need to pick the right lever + validate the win without regressing other archs.",
+  "triggers": [
+    "tune kernel",
+    "optimize gemv",
+    "optimize gemm",
+    "make kernel faster",
+    "perf regression",
+    "kernel slow",
+    "kernel runs slow at low batch",
+    "should I add a multi-row variant",
+    "kernel optimization",
+    "K-tile depth",
+    "wave64 port",
+    "wmma performance",
+    "rdna kernel tuning"
+  ],
+  "entry": "./playbook.md",
+  "interpret": "./playbook.md",
+  "references": {
+    "playbook": "./playbook.md",
+    "levers": "./levers.md",
+    "cross-arch": "./cross-arch.md",
+    "case-studies": "./case-studies.md"
+  },
+  "requires": {
+    "rocm": "6.0+",
+    "hipfire-tree": "checkout of https://github.com/Kaden-Schutt/hipfire",
+    "hardware": "the target GPU arch (perf claims must be validated on the same arch as the speed-baseline)"
+  },
+  "related": [
+    "hipfire-arch-port",
+    "hipfire-tester",
+    "hipfire-autoheal"
+  ]
+}

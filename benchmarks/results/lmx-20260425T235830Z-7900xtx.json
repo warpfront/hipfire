@@ -1,0 +1,212 @@
+[
+  {
+    "tag": "qwen3.5:9b",
+    "hfid": "Qwen/Qwen3.5-9B",
+    "mode": "off",
+    "rc": 0,
+    "dt_s": 32.17889857292175,
+    "parsed": {
+      "decode_tokS": 122.3,
+      "wall_tokS": 114.6,
+      "ttft_ms": 71.5,
+      "prefill_user_tokS": 334.7,
+      "pp128_tokS": 602.7,
+      "pp512_tokS": 591.7,
+      "pp1024_tokS": 587.9,
+      "pp2048_tokS": 580.1,
+      "vram_loaded_mb": 5798,
+      "max_seq": 4096,
+      "dflash_disabled": true,
+      "raw_output_tail": "arAttention)...\n  loading layer 2/32 (LinearAttention)...\n  loading layer 3/32 (FullAttention)...\n  loading layer 4/32 (LinearAttention)...\n  loading layer 5/32 (LinearAttention)...\n  loading layer 6/32 (LinearAttention)...\n  loading layer 7/32 (FullAttention)...\n  loading layer 8/32 (LinearAttention)...\n  loading layer 9/32 (LinearAttention)...\n  loading layer 10/32 (LinearAttention)...\n  loading layer 11/32 (FullAttention)...\n  loading layer 12/32 (LinearAttention)...\n  loading layer 13/32 (LinearAttention)...\n  loading layer 14/32 (LinearAttention)...\n  loading layer 15/32 (FullAttention)...\n  loading layer 16/32 (LinearAttention)...\n  loading layer 17/32 (LinearAttention)...\n  loading layer 18/32 (LinearAttention)...\n  loading layer 19/32 (FullAttention)...\n  loading layer 20/32 (LinearAttention)...\n  loading layer 21/32 (LinearAttention)...\n  loading layer 22/32 (LinearAttention)...\n  loading layer 23/32 (FullAttention)...\n  loading layer 24/32 (LinearAttention)...\n  loading layer 25/32 (LinearAttention)...\n  loading layer 26/32 (LinearAttention)...\n  loading layer 27/32 (FullAttention)...\n  loading layer 28/32 (LinearAttention)...\n  loading layer 29/32 (LinearAttention)...\n  loading layer 30/32 (LinearAttention)...\n  loading layer 31/32 (FullAttention)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\nhipfire bench\n  model:     qwen3.5-9b.mq4  [qwen3_5]\n  arch:      dim=4096, layers=32, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      5798 MB loaded  (18726/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up... done\n\n  prefill: pp128=603 pp512=592 pp1024=588 pp2048=580 \n  run 1/3 pp 169 tok/s | TTFT 119 ms | decode 122.2 tok/s (128 tok)\n  run 2/3 pp 416 tok/s | TTFT 48 ms | decode 122.5 tok/s (128 tok)\n  run 3/3 pp 420 tok/s | TTFT 48 ms | decode 122.2 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.5:9b",
+    "hfid": "Qwen/Qwen3.5-9B",
+    "mode": "on",
+    "rc": 0,
+    "dt_s": 34.625765800476074,
+    "parsed": {
+      "decode_tokS": 66.8,
+      "wall_tokS": 65.2,
+      "ttft_ms": 47.9,
+      "prefill_user_tokS": 417.3,
+      "pp128_tokS": 595.3,
+      "pp512_tokS": 587.7,
+      "pp1024_tokS": 583.7,
+      "pp2048_tokS": 576.8,
+      "vram_loaded_mb": 7710,
+      "max_seq": 4096,
+      "dflash_disabled": false,
+      "raw_output_tail": " 8/32 (LinearAttention)...\n  loading layer 9/32 (LinearAttention)...\n  loading layer 10/32 (LinearAttention)...\n  loading layer 11/32 (FullAttention)...\n  loading layer 12/32 (LinearAttention)...\n  loading layer 13/32 (LinearAttention)...\n  loading layer 14/32 (LinearAttention)...\n  loading layer 15/32 (FullAttention)...\n  loading layer 16/32 (LinearAttention)...\n  loading layer 17/32 (LinearAttention)...\n  loading layer 18/32 (LinearAttention)...\n  loading layer 19/32 (FullAttention)...\n  loading layer 20/32 (LinearAttention)...\n  loading layer 21/32 (LinearAttention)...\n  loading layer 22/32 (LinearAttention)...\n  loading layer 23/32 (FullAttention)...\n  loading layer 24/32 (LinearAttention)...\n  loading layer 25/32 (LinearAttention)...\n  loading layer 26/32 (LinearAttention)...\n  loading layer 27/32 (FullAttention)...\n  loading layer 28/32 (LinearAttention)...\n  loading layer 29/32 (LinearAttention)...\n  loading layer 30/32 (LinearAttention)...\n  loading layer 31/32 (FullAttention)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\n  DFlash draft loaded: /home/kaden/ClaudeCode/autorocm/hipfire/.worktrees/dflash/models/qwen35-9b-dflash-mq4.hfq (layers=5, hidden=4096, block=16)\nhipfire bench\n  model:     qwen3.5-9b.mq4  [qwen3_5]\n  arch:      dim=4096, layers=32, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      7710 MB loaded  (16814/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up...[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 3962 blobs (cache size: 1)\n done\n\n  prefill: pp128=595 pp512=588 pp1024=584 pp2048=577 \n  run 1/3 pp 414 tok/s | TTFT 48 ms | decode 68.6 tok/s (128 tok)\n  run 2/3 pp 419 tok/s | TTFT 48 ms | decode 67.3 tok/s (128 tok)\n  run 3/3 pp 420 tok/s | TTFT 48 ms | decode 64.5 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.5:27b",
+    "hfid": "Qwen/Qwen3.5-27B",
+    "mode": "off",
+    "rc": 0,
+    "dt_s": 83.81578922271729,
+    "parsed": {
+      "decode_tokS": 43.5,
+      "wall_tokS": 41.8,
+      "ttft_ms": 117.8,
+      "prefill_user_tokS": 169.8,
+      "pp128_tokS": 222.8,
+      "pp512_tokS": 215.1,
+      "pp1024_tokS": 213.4,
+      "pp2048_tokS": 210.9,
+      "vram_loaded_mb": 15468,
+      "max_seq": 4096,
+      "dflash_disabled": true,
+      "raw_output_tail": "ion)...\n  loading layer 34/64 (LinearAttention)...\n  loading layer 35/64 (FullAttention)...\n  loading layer 36/64 (LinearAttention)...\n  loading layer 37/64 (LinearAttention)...\n  loading layer 38/64 (LinearAttention)...\n  loading layer 39/64 (FullAttention)...\n  loading layer 40/64 (LinearAttention)...\n  loading layer 41/64 (LinearAttention)...\n  loading layer 42/64 (LinearAttention)...\n  loading layer 43/64 (FullAttention)...\n  loading layer 44/64 (LinearAttention)...\n  loading layer 45/64 (LinearAttention)...\n  loading layer 46/64 (LinearAttention)...\n  loading layer 47/64 (FullAttention)...\n  loading layer 48/64 (LinearAttention)...\n  loading layer 49/64 (LinearAttention)...\n  loading layer 50/64 (LinearAttention)...\n  loading layer 51/64 (FullAttention)...\n  loading layer 52/64 (LinearAttention)...\n  loading layer 53/64 (LinearAttention)...\n  loading layer 54/64 (LinearAttention)...\n  loading layer 55/64 (FullAttention)...\n  loading layer 56/64 (LinearAttention)...\n  loading layer 57/64 (LinearAttention)...\n  loading layer 58/64 (LinearAttention)...\n  loading layer 59/64 (FullAttention)...\n  loading layer 60/64 (LinearAttention)...\n  loading layer 61/64 (LinearAttention)...\n  loading layer 62/64 (LinearAttention)...\n  loading layer 63/64 (FullAttention)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\nhipfire bench\n  model:     qwen3.5-27b.mq4  [qwen3_5]\n  arch:      dim=5120, layers=64, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      15468 MB loaded  (9056/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up... done\n\n  prefill: pp128=223 pp512=215 pp1024=213 pp2048=211 \n  run 1/3 pp 169 tok/s | TTFT 118 ms | decode 43.5 tok/s (128 tok)\n  run 2/3 pp 170 tok/s | TTFT 118 ms | decode 43.5 tok/s (128 tok)\n  run 3/3 pp 171 tok/s | TTFT 117 ms | decode 43.5 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.5:27b",
+    "hfid": "Qwen/Qwen3.5-27B",
+    "mode": "on",
+    "rc": 0,
+    "dt_s": 86.43848252296448,
+    "parsed": {
+      "decode_tokS": 34.2,
+      "wall_tokS": 33.1,
+      "ttft_ms": 118.5,
+      "prefill_user_tokS": 168.8,
+      "pp128_tokS": 221.6,
+      "pp512_tokS": 214.8,
+      "pp1024_tokS": 212.6,
+      "pp2048_tokS": 210.4,
+      "vram_loaded_mb": 18052,
+      "max_seq": 4096,
+      "dflash_disabled": false,
+      "raw_output_tail": "(LinearAttention)...\n  loading layer 41/64 (LinearAttention)...\n  loading layer 42/64 (LinearAttention)...\n  loading layer 43/64 (FullAttention)...\n  loading layer 44/64 (LinearAttention)...\n  loading layer 45/64 (LinearAttention)...\n  loading layer 46/64 (LinearAttention)...\n  loading layer 47/64 (FullAttention)...\n  loading layer 48/64 (LinearAttention)...\n  loading layer 49/64 (LinearAttention)...\n  loading layer 50/64 (LinearAttention)...\n  loading layer 51/64 (FullAttention)...\n  loading layer 52/64 (LinearAttention)...\n  loading layer 53/64 (LinearAttention)...\n  loading layer 54/64 (LinearAttention)...\n  loading layer 55/64 (FullAttention)...\n  loading layer 56/64 (LinearAttention)...\n  loading layer 57/64 (LinearAttention)...\n  loading layer 58/64 (LinearAttention)...\n  loading layer 59/64 (FullAttention)...\n  loading layer 60/64 (LinearAttention)...\n  loading layer 61/64 (LinearAttention)...\n  loading layer 62/64 (LinearAttention)...\n  loading layer 63/64 (FullAttention)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\n  DFlash draft loaded: /home/kaden/ClaudeCode/autorocm/hipfire/.worktrees/dflash/models/qwen35-27b-dflash-mq4.hfq (layers=5, hidden=5120, block=16)\nhipfire bench\n  model:     qwen3.5-27b.mq4  [qwen3_5]\n  arch:      dim=5120, layers=64, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      18052 MB loaded  (6472/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up...[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 7922 blobs (cache size: 1)\n done\n\n  prefill: pp128=222 pp512=215 pp1024=213 pp2048=210 \n  run 1/3 pp 168 tok/s | TTFT 119 ms | decode 33.6 tok/s (128 tok)\n  run 2/3 pp 169 tok/s | TTFT 118 ms | decode 33.6 tok/s (128 tok)\n  run 3/3 pp 169 tok/s | TTFT 118 ms | decode 35.3 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.5:35b-a3b",
+    "hfid": "Qwen/Qwen3.5-35B-A3B",
+    "mode": "off",
+    "rc": 0,
+    "dt_s": 76.275803565979,
+    "parsed": {
+      "decode_tokS": 135.8,
+      "wall_tokS": 125.7,
+      "ttft_ms": 75.7,
+      "prefill_user_tokS": 264.3,
+      "pp128_tokS": 324.5,
+      "pp512_tokS": 321.2,
+      "pp1024_tokS": 319.4,
+      "pp2048_tokS": 316.4,
+      "vram_loaded_mb": 22660,
+      "max_seq": 4096,
+      "dflash_disabled": true,
+      "raw_output_tail": "ion + MoE)...\n  loading layer 14/40 (LinearAttention + MoE)...\n  loading layer 15/40 (FullAttention + MoE)...\n  loading layer 16/40 (LinearAttention + MoE)...\n  loading layer 17/40 (LinearAttention + MoE)...\n  loading layer 18/40 (LinearAttention + MoE)...\n  loading layer 19/40 (FullAttention + MoE)...\n  loading layer 20/40 (LinearAttention + MoE)...\n  loading layer 21/40 (LinearAttention + MoE)...\n  loading layer 22/40 (LinearAttention + MoE)...\n  loading layer 23/40 (FullAttention + MoE)...\n  loading layer 24/40 (LinearAttention + MoE)...\n  loading layer 25/40 (LinearAttention + MoE)...\n  loading layer 26/40 (LinearAttention + MoE)...\n  loading layer 27/40 (FullAttention + MoE)...\n  loading layer 28/40 (LinearAttention + MoE)...\n  loading layer 29/40 (LinearAttention + MoE)...\n  loading layer 30/40 (LinearAttention + MoE)...\n  loading layer 31/40 (FullAttention + MoE)...\n  loading layer 32/40 (LinearAttention + MoE)...\n  loading layer 33/40 (LinearAttention + MoE)...\n  loading layer 34/40 (LinearAttention + MoE)...\n  loading layer 35/40 (FullAttention + MoE)...\n  loading layer 36/40 (LinearAttention + MoE)...\n  loading layer 37/40 (LinearAttention + MoE)...\n  loading layer 38/40 (LinearAttention + MoE)...\n  loading layer 39/40 (FullAttention + MoE)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\nhipfire bench\n  model:     qwen3.5-35b-a3b.mq4  [qwen3_5_moe]\n  arch:      dim=2048, layers=40, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      22660 MB loaded  (1864/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up... done\n\n  prefill: pp128=324 pp512=321 pp1024=319 pp2048=316 \n  run 1/3 pp 265 tok/s | TTFT 76 ms | decode 135.9 tok/s (128 tok)\n  run 2/3 pp 263 tok/s | TTFT 76 ms | decode 135.8 tok/s (128 tok)\n  run 3/3 pp 266 tok/s | TTFT 75 ms | decode 135.7 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.5:35b-a3b",
+    "hfid": "Qwen/Qwen3.5-35B-A3B",
+    "mode": "on",
+    "rc": 0,
+    "dt_s": 67.98120450973511,
+    "parsed": {
+      "decode_tokS": 34.8,
+      "wall_tokS": 34.1,
+      "ttft_ms": 75.4,
+      "prefill_user_tokS": 265.4,
+      "pp128_tokS": 324.7,
+      "pp512_tokS": 320.9,
+      "pp1024_tokS": 319.6,
+      "pp2048_tokS": 316.4,
+      "vram_loaded_mb": 23722,
+      "max_seq": 4096,
+      "dflash_disabled": false,
+      "raw_output_tail": " MoE)...\n  loading layer 19/40 (FullAttention + MoE)...\n  loading layer 20/40 (LinearAttention + MoE)...\n  loading layer 21/40 (LinearAttention + MoE)...\n  loading layer 22/40 (LinearAttention + MoE)...\n  loading layer 23/40 (FullAttention + MoE)...\n  loading layer 24/40 (LinearAttention + MoE)...\n  loading layer 25/40 (LinearAttention + MoE)...\n  loading layer 26/40 (LinearAttention + MoE)...\n  loading layer 27/40 (FullAttention + MoE)...\n  loading layer 28/40 (LinearAttention + MoE)...\n  loading layer 29/40 (LinearAttention + MoE)...\n  loading layer 30/40 (LinearAttention + MoE)...\n  loading layer 31/40 (FullAttention + MoE)...\n  loading layer 32/40 (LinearAttention + MoE)...\n  loading layer 33/40 (LinearAttention + MoE)...\n  loading layer 34/40 (LinearAttention + MoE)...\n  loading layer 35/40 (FullAttention + MoE)...\n  loading layer 36/40 (LinearAttention + MoE)...\n  loading layer 37/40 (LinearAttention + MoE)...\n  loading layer 38/40 (LinearAttention + MoE)...\n  loading layer 39/40 (FullAttention + MoE)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\n  DFlash draft loaded: /home/kaden/.hipfire/models/qwen35-35b-a3b-dflash-mq4.hfq (layers=8, hidden=2048, block=16)\nhipfire bench\n  model:     qwen3.5-35b-a3b.mq4  [qwen3_5_moe]\n  arch:      dim=2048, layers=40, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      23722 MB loaded  (802/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up...[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 10232 blobs (cache size: 1)\n done\n\n  prefill: pp128=325 pp512=321 pp1024=320 pp2048=316 \n  run 1/3 pp 266 tok/s | TTFT 75 ms | decode 35.1 tok/s (128 tok)\n  run 2/3 pp 264 tok/s | TTFT 76 ms | decode 35.3 tok/s (128 tok)\n  run 3/3 pp 267 tok/s | TTFT 75 ms | decode 34.0 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.6:27b",
+    "hfid": "Qwen/Qwen3.6-27B",
+    "mode": "off",
+    "rc": 0,
+    "dt_s": 86.23653793334961,
+    "parsed": {
+      "decode_tokS": 43.5,
+      "wall_tokS": 41.8,
+      "ttft_ms": 118.3,
+      "prefill_user_tokS": 169.1,
+      "pp128_tokS": 222.3,
+      "pp512_tokS": 214.2,
+      "pp1024_tokS": 212.7,
+      "pp2048_tokS": 209.7,
+      "vram_loaded_mb": 15468,
+      "max_seq": 4096,
+      "dflash_disabled": true,
+      "raw_output_tail": "ion)...\n  loading layer 34/64 (LinearAttention)...\n  loading layer 35/64 (FullAttention)...\n  loading layer 36/64 (LinearAttention)...\n  loading layer 37/64 (LinearAttention)...\n  loading layer 38/64 (LinearAttention)...\n  loading layer 39/64 (FullAttention)...\n  loading layer 40/64 (LinearAttention)...\n  loading layer 41/64 (LinearAttention)...\n  loading layer 42/64 (LinearAttention)...\n  loading layer 43/64 (FullAttention)...\n  loading layer 44/64 (LinearAttention)...\n  loading layer 45/64 (LinearAttention)...\n  loading layer 46/64 (LinearAttention)...\n  loading layer 47/64 (FullAttention)...\n  loading layer 48/64 (LinearAttention)...\n  loading layer 49/64 (LinearAttention)...\n  loading layer 50/64 (LinearAttention)...\n  loading layer 51/64 (FullAttention)...\n  loading layer 52/64 (LinearAttention)...\n  loading layer 53/64 (LinearAttention)...\n  loading layer 54/64 (LinearAttention)...\n  loading layer 55/64 (FullAttention)...\n  loading layer 56/64 (LinearAttention)...\n  loading layer 57/64 (LinearAttention)...\n  loading layer 58/64 (LinearAttention)...\n  loading layer 59/64 (FullAttention)...\n  loading layer 60/64 (LinearAttention)...\n  loading layer 61/64 (LinearAttention)...\n  loading layer 62/64 (LinearAttention)...\n  loading layer 63/64 (FullAttention)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\nhipfire bench\n  model:     qwen3.6-27b.mq4  [qwen3_5]\n  arch:      dim=5120, layers=64, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      15468 MB loaded  (9056/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up... done\n\n  prefill: pp128=222 pp512=214 pp1024=213 pp2048=210 \n  run 1/3 pp 170 tok/s | TTFT 118 ms | decode 43.5 tok/s (128 tok)\n  run 2/3 pp 169 tok/s | TTFT 119 ms | decode 43.5 tok/s (128 tok)\n  run 3/3 pp 169 tok/s | TTFT 118 ms | decode 43.5 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.6:27b",
+    "hfid": "Qwen/Qwen3.6-27B",
+    "mode": "on",
+    "rc": 0,
+    "dt_s": 83.91490960121155,
+    "parsed": {
+      "decode_tokS": 47.2,
+      "wall_tokS": 45.2,
+      "ttft_ms": 119.3,
+      "prefill_user_tokS": 167.6,
+      "pp128_tokS": 221.7,
+      "pp512_tokS": 212.6,
+      "pp1024_tokS": 211.7,
+      "pp2048_tokS": 208.8,
+      "vram_loaded_mb": 18052,
+      "max_seq": 4096,
+      "dflash_disabled": false,
+      "raw_output_tail": "lAttention)...\n  loading layer 40/64 (LinearAttention)...\n  loading layer 41/64 (LinearAttention)...\n  loading layer 42/64 (LinearAttention)...\n  loading layer 43/64 (FullAttention)...\n  loading layer 44/64 (LinearAttention)...\n  loading layer 45/64 (LinearAttention)...\n  loading layer 46/64 (LinearAttention)...\n  loading layer 47/64 (FullAttention)...\n  loading layer 48/64 (LinearAttention)...\n  loading layer 49/64 (LinearAttention)...\n  loading layer 50/64 (LinearAttention)...\n  loading layer 51/64 (FullAttention)...\n  loading layer 52/64 (LinearAttention)...\n  loading layer 53/64 (LinearAttention)...\n  loading layer 54/64 (LinearAttention)...\n  loading layer 55/64 (FullAttention)...\n  loading layer 56/64 (LinearAttention)...\n  loading layer 57/64 (LinearAttention)...\n  loading layer 58/64 (LinearAttention)...\n  loading layer 59/64 (FullAttention)...\n  loading layer 60/64 (LinearAttention)...\n  loading layer 61/64 (LinearAttention)...\n  loading layer 62/64 (LinearAttention)...\n  loading layer 63/64 (FullAttention)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\n  DFlash draft loaded: /home/kaden/.hipfire/models/qwen36-27b-dflash-mq4.hfq (layers=5, hidden=5120, block=16)\nhipfire bench\n  model:     qwen3.6-27b.mq4  [qwen3_5]\n  arch:      dim=5120, layers=64, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      18052 MB loaded  (6472/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up...[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 7922 blobs (cache size: 1)\n done\n\n  prefill: pp128=222 pp512=213 pp1024=212 pp2048=209 \n  run 1/3 pp 167 tok/s | TTFT 120 ms | decode 47.9 tok/s (128 tok)\n  run 2/3 pp 168 tok/s | TTFT 119 ms | decode 42.3 tok/s (128 tok)\n  run 3/3 pp 168 tok/s | TTFT 119 ms | decode 51.4 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.6:35b-a3b",
+    "hfid": "Qwen/Qwen3.6-35B-A3B",
+    "mode": "off",
+    "rc": 0,
+    "dt_s": 76.38986682891846,
+    "parsed": {
+      "decode_tokS": 133.9,
+      "wall_tokS": 124.1,
+      "ttft_ms": 75.8,
+      "prefill_user_tokS": 263.9,
+      "pp128_tokS": 323.8,
+      "pp512_tokS": 319.8,
+      "pp1024_tokS": 318.6,
+      "pp2048_tokS": 315.1,
+      "vram_loaded_mb": 22660,
+      "max_seq": 4096,
+      "dflash_disabled": true,
+      "raw_output_tail": "ion + MoE)...\n  loading layer 14/40 (LinearAttention + MoE)...\n  loading layer 15/40 (FullAttention + MoE)...\n  loading layer 16/40 (LinearAttention + MoE)...\n  loading layer 17/40 (LinearAttention + MoE)...\n  loading layer 18/40 (LinearAttention + MoE)...\n  loading layer 19/40 (FullAttention + MoE)...\n  loading layer 20/40 (LinearAttention + MoE)...\n  loading layer 21/40 (LinearAttention + MoE)...\n  loading layer 22/40 (LinearAttention + MoE)...\n  loading layer 23/40 (FullAttention + MoE)...\n  loading layer 24/40 (LinearAttention + MoE)...\n  loading layer 25/40 (LinearAttention + MoE)...\n  loading layer 26/40 (LinearAttention + MoE)...\n  loading layer 27/40 (FullAttention + MoE)...\n  loading layer 28/40 (LinearAttention + MoE)...\n  loading layer 29/40 (LinearAttention + MoE)...\n  loading layer 30/40 (LinearAttention + MoE)...\n  loading layer 31/40 (FullAttention + MoE)...\n  loading layer 32/40 (LinearAttention + MoE)...\n  loading layer 33/40 (LinearAttention + MoE)...\n  loading layer 34/40 (LinearAttention + MoE)...\n  loading layer 35/40 (FullAttention + MoE)...\n  loading layer 36/40 (LinearAttention + MoE)...\n  loading layer 37/40 (LinearAttention + MoE)...\n  loading layer 38/40 (LinearAttention + MoE)...\n  loading layer 39/40 (FullAttention + MoE)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\nhipfire bench\n  model:     qwen3.6-35b-a3b.mq4  [qwen3_5_moe]\n  arch:      dim=2048, layers=40, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      22660 MB loaded  (1864/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up... done\n\n  prefill: pp128=324 pp512=320 pp1024=319 pp2048=315 \n  run 1/3 pp 265 tok/s | TTFT 76 ms | decode 133.7 tok/s (128 tok)\n  run 2/3 pp 263 tok/s | TTFT 76 ms | decode 134.0 tok/s (128 tok)\n  run 3/3 pp 263 tok/s | TTFT 76 ms | decode 133.9 tok/s (128 tok)\n"
+    }
+  },
+  {
+    "tag": "qwen3.6:35b-a3b",
+    "hfid": "Qwen/Qwen3.6-35B-A3B",
+    "mode": "on",
+    "rc": 0,
+    "dt_s": 68.56482672691345,
+    "parsed": {
+      "decode_tokS": 29.0,
+      "wall_tokS": null,
+      "ttft_ms": 76.1,
+      "prefill_user_tokS": 262.8,
+      "pp128_tokS": 322.7,
+      "pp512_tokS": 319.9,
+      "pp1024_tokS": 318.0,
+      "pp2048_tokS": 315.2,
+      "vram_loaded_mb": 23722,
+      "max_seq": 4096,
+      "dflash_disabled": false,
+      "raw_output_tail": " MoE)...\n  loading layer 19/40 (FullAttention + MoE)...\n  loading layer 20/40 (LinearAttention + MoE)...\n  loading layer 21/40 (LinearAttention + MoE)...\n  loading layer 22/40 (LinearAttention + MoE)...\n  loading layer 23/40 (FullAttention + MoE)...\n  loading layer 24/40 (LinearAttention + MoE)...\n  loading layer 25/40 (LinearAttention + MoE)...\n  loading layer 26/40 (LinearAttention + MoE)...\n  loading layer 27/40 (FullAttention + MoE)...\n  loading layer 28/40 (LinearAttention + MoE)...\n  loading layer 29/40 (LinearAttention + MoE)...\n  loading layer 30/40 (LinearAttention + MoE)...\n  loading layer 31/40 (FullAttention + MoE)...\n  loading layer 32/40 (LinearAttention + MoE)...\n  loading layer 33/40 (LinearAttention + MoE)...\n  loading layer 34/40 (LinearAttention + MoE)...\n  loading layer 35/40 (FullAttention + MoE)...\n  loading layer 36/40 (LinearAttention + MoE)...\n  loading layer 37/40 (LinearAttention + MoE)...\n  loading layer 38/40 (LinearAttention + MoE)...\n  loading layer 39/40 (FullAttention + MoE)...\nKV cache: asym3 (K rotated-3b 100B + V Q8 272B = 372 B/head, 5.5x vs fp32, physical_cap=4096 / max_seq=4096)\n  DFlash draft loaded: /home/kaden/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq (layers=8, hidden=2048, block=16)\nhipfire bench\n  model:     qwen3.6-35b-a3b.mq4  [qwen3_5_moe]\n  arch:      dim=2048, layers=40, vocab=248320\n  gpu:       gfx1100  (HIP 7.2)\n  kv_cache:  asym3\n  max_seq:   4096\n  vram:      23722 MB loaded  (802/24560 MB free)\n  runs:      3\n  prompt:    \"Explain the theory of general relativity in simple terms.\"\n  mode:      standard\n\n  warming up...[verify-graph] warmup for B=16 complete \u2014 capture next cycle at this B\n[verify-graph] captured for B=16 with 10232 blobs (cache size: 1)\n done\n\n  prefill: pp128=323 pp512=320 pp1024=318 pp2048=315 \n  run 1/3 pp 257 tok/s | TTFT 78 ms | decode 32.3 tok/s (128 tok)\n  run 2/3 pp 266 tok/s | TTFT 75 ms | decode 31.6 tok/s (128 tok)\n  run 3/3 pp 266 tok/s | TTFT 75 ms | decode 23.2 tok/s (128 tok)\n"
+    }
+  }
+]

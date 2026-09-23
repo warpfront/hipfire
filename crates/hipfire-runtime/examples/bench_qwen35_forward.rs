@@ -1,0 +1,106 @@
+//! Deterministic forward-pass benchmark for Qwen3.5. Warms up and measures
+//! N forward_scratch calls at a fixed KV position, removing sampling variance.
+//!
+//! Usage: bench_qwen35_forward <model.hfq> [iters] [--sample] [--extract]
+//!   --sample   also run CPU top-p sampling after each forward
+//!   --extract  also extract 5 target hidden states per step (Phase 3 overhead check)
+
+#[cfg(not(feature = "deltanet"))]
+fn main() { eprintln!("Build with --features deltanet"); }
+
+#[cfg(feature = "deltanet")]
+fn main() {
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::llama;
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use std::path::Path;
+    use std::time::Instant;
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: bench_qwen35_forward <model.hfq> [iters] [--sample]");
+        std::process::exit(1);
+    }
+    let model_path = &args[1];
+    let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
+    let with_sample = args.iter().any(|a| a == "--sample");
+    let with_extract = args.iter().any(|a| a == "--extract");
+
+    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    eprintln!("Loading {}...", model_path);
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let config = qwen35::config_from_hfq(&hfq).expect("config");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
+    eprintln!("Loaded: {} layers, dim={}", config.n_layers, config.dim);
+
+    let max_seq = 2048;
+    let mut kv_cache = llama::KvCache::new_gpu_q8(
+        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq,
+    ).unwrap();
+    let mut dn_state = DeltaNetState::new_with_quant(
+        &mut gpu, &config, qwen35::StateQuant::Q8,
+    ).unwrap();
+    let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
+    let sc = llama::SamplingConfig::text_thinking();
+
+    // Optional hidden-state ring buffer for Phase 3 overhead measurement.
+    let mut hidden_rb = if with_extract {
+        Some(hipfire_arch_qwen35::speculative::HiddenStateRingBuffer::new(
+            &mut gpu, config.n_layers, 5, config.dim, 32, 32,
+        ).unwrap())
+    } else {
+        None
+    };
+    if let Some(ref rb) = hidden_rb {
+        eprintln!("Hidden extraction: layers {:?} (n_layers={})",
+            rb.extract_layers, config.n_layers);
+    }
+
+    // Warmup: 16 forwards at positions 0..16 (fills some KV).
+    let warmup_tok: u32 = 1;
+    for pos in 0..16 {
+        if let Some(ref mut rb) = hidden_rb {
+            qwen35::forward_scratch_with_hidden(&mut gpu, &weights, &config, warmup_tok, pos,
+                &mut kv_cache, &mut dn_state, &scratch, rb).unwrap();
+        } else {
+            qwen35::forward_scratch(&mut gpu, &weights, &config, warmup_tok, pos,
+                &mut kv_cache, &mut dn_state, &scratch).unwrap();
+        }
+    }
+    gpu.hip.device_synchronize().unwrap();
+
+    // Measure: `iters` forwards at consecutive positions, synchronized.
+    let start = Instant::now();
+    let rng_state: u32 = 0xDEAD_BEEFu32;
+    let mut history: Vec<u32> = Vec::with_capacity(iters + 16);
+    for _ in 0..16 { history.push(warmup_tok); }
+    for i in 0..iters {
+        if let Some(ref mut rb) = hidden_rb {
+            qwen35::forward_scratch_with_hidden(&mut gpu, &weights, &config, warmup_tok, 16 + i,
+                &mut kv_cache, &mut dn_state, &scratch, rb).unwrap();
+        } else {
+            qwen35::forward_scratch(&mut gpu, &weights, &config, warmup_tok, 16 + i,
+                &mut kv_cache, &mut dn_state, &scratch).unwrap();
+        }
+        if with_sample {
+            let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+            llama::apply_repeat_penalty(&mut logits, &history, sc.repeat_window, sc.repeat_penalty);
+            let _tok = llama::sample_top_p(&logits, sc.answer_temp, sc.top_p);
+            let _ = rng_state;
+            history.push(warmup_tok);
+        }
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let elapsed = start.elapsed();
+    let ms_per_tok = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+    let tok_per_s = iters as f64 / elapsed.as_secs_f64();
+
+    let tag = match (with_sample, with_extract) {
+        (true, true)  => "forwards+sample+extract",
+        (true, false) => "forwards+sample",
+        (false, true) => "forwards+extract",
+        (false, false) => "forwards",
+    };
+    println!("{iters} {tag}: {:.1}ms total, {ms_per_tok:.2}ms/tok, {tok_per_s:.1} tok/s",
+        elapsed.as_millis());
+}

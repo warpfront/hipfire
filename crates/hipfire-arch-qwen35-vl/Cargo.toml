@@ -1,0 +1,26 @@
+[package]
+name = "hipfire-arch-qwen35-vl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.5-VL (vision-language) architecture for hipfire"
+
+[features]
+# Vision tower depends on the GPU compute primitives (gemm_f16, layernorm,
+# vit_attention, gelu_tanh, transpose). Those are wired through the
+# `deltanet` feature on `rdna-compute` / `hipfire-runtime` today; gating the
+# vl crate with the same flag keeps `--no-default-features` builds working
+# (vision is a no-op stub when deltanet is off).
+default = ["deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# image preprocessing (PNG/JPEG decode + resize) for the vision encoder
+# input pipeline lives in this crate (`crate::image`). Same default-feature
+# gating as runtime had pre-PR-9.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

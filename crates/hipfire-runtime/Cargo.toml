@@ -1,0 +1,256 @@
+[package]
+name = "hipfire-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inference orchestrator for RDNA GPUs"
+
+[features]
+# Cargo features for selective architecture inclusion (Phase 2 PR 12).
+#
+# Default keeps today's full-featured behavior: `cargo build --release`
+# produces the same daemon + example surface as before this PR.
+# Downstream library consumers may opt out of any subset of arches, e.g.
+#
+#   [dependencies]
+#   hipfire-runtime = { version = "...", default-features = false,
+#                       features = ["deltanet", "arch-qwen35"] }
+#
+# This trims the resolved dep graph to just the qwen35 arch crate plus
+# the deltanet runtime feature, with all other arch crates absent.
+#
+# Internal example builds:
+# Each arch crate already lists `hipfire-runtime` in its
+# `[dependencies]`; promoting these to `[dependencies]` here would form
+# a package-level cycle, which cargo rejects. To keep the cycle
+# avoidance, the arch crates are listed as plain (non-optional)
+# `[dev-dependencies]` of this crate. cargo's resolver excludes the
+# dev-dep edge from the cycle check.
+#
+# Side-effect: when a workspace example is built (via
+# `cargo build --example daemon` etc.), cargo's resolver follows the
+# dev-dep edge in both directions, which activates the `default`
+# feature on `hipfire-runtime` from the dev-dep activation path. That
+# in turn re-activates all `arch-*` features, undoing any
+# `--no-default-features` the user passed for an example build. This
+# is a workspace-internal limitation only; it does NOT affect
+# downstream library consumers, who never enter the dev-dep cycle.
+#
+# Example-target gating uses `required-features` (per `[[example]]`
+# block below) which serves both as documentation of which features
+# each example needs and as the gate for downstream library consumers
+# who attempt to build examples through their own build script.
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "deltanet"]
+deltanet = ["rdna-compute/deltanet"]
+arch-qwen35 = []
+arch-qwen35-vl = []
+arch-llama = []
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+memmap2 = "0.9"
+byteorder = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+rayon = "1"
+
+# Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
+# consume the arch crates. These are dev-dependencies — cargo refuses
+# optional dev-dependencies AND its cycle checker excludes the dev-dep
+# edge, which is what allows hipfire-runtime to list arch crates here
+# despite each arch crate already depending on hipfire-runtime.
+# Per-arch granularity for downstream consumers comes from the cargo
+# features above and `required-features` on each `[[example]]` block
+# below.
+[dev-dependencies]
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-detect = { path = "../hipfire-detect" }
+
+# Each example below carries `required-features` listing the cargo
+# features its `use hipfire_arch_*` imports depend on. This documents
+# the per-example arch dependency and gates the example for downstream
+# library consumers (who do not enter the dev-dep cycle and so respect
+# the `--no-default-features` flag faithfully).
+#
+# Examples NOT listed here (bench_q8, probe_wmma, dump_meta, …) do not
+# touch arch crates and build under any feature combination.
+
+[[example]]
+name = "daemon"
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama"]
+
+[[example]]
+name = "coherence_probe"
+required-features = []
+
+[[example]]
+name = "gpus_smoke"
+required-features = []
+
+[[example]]
+name = "infer_qwen35"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "infer_qwen3"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "infer_vl"
+required-features = ["arch-qwen35-vl", "arch-qwen35"]
+
+[[example]]
+name = "infer"
+required-features = ["arch-qwen35", "arch-qwen35-vl"]
+
+[[example]]
+name = "infer_hfq"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "run"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "a3b_load_check"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "a3b_multiturn_oneshot"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "a3b_smoke_forward"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "bench_qwen35_forward"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "bench_qwen35_mq4"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "channel_test_mmq"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dflash_spec_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dump_logits_qwen35"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "greedy_dump"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "greedy_dump_top5"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "logit_dump"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pflash_compress_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pflash_load_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "perplexity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pflash_niah_bench"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "probe_argmax_agreement"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_attention_phases"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_bandwidth_fwd"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_deltanet"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_host_vs_gpu"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_qwen35_mq4"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_inference"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_inferenceQA"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_long_ctx"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_qwen35_load"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_qwen35_loadQA"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_accuracy_sweep"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_decode_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_infer"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_longctx_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_periodic_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_validate"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pp_parity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp_parity_chatml"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp2_vram_probe"
+required-features = ["arch-qwen35", "deltanet"]
