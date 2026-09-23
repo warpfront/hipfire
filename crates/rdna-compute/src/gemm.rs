@@ -29515,6 +29515,41 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a, xq, y, m, k, batch_size)
     }
 
+    /// Exact symmetric MQ4V2 producer/consumer route. Only a complete IU4
+    /// column tile may omit the otherwise necessary F32 rotated X.
+    pub fn mq4v2_fold_betaalpha_active(
+        &self,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && self.iu4_producer_sidecar_active(n, k)
+            && self.mq4v2_symmetric
+            && self.flags.gfx11_iu4_symfold
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() == Ok("1")
+            && qkv_m > 0
+            && qkv_m % 128 == 0
+            && z_m > 0
+            && z_m % 128 == 0
+            && beta_m == 48
+            && alpha_m == 48
+            && k == 5120
+            && n >= 128
+            && n % 128 == 0
+    }
+    /// Z's expanded M must be a complete tile of whichever SET kernel the
+    /// architecture selects (M128 for V2C/X5, M256 for Halo v2b).
+    pub fn mq4v2_fold_betaalpha_padded_m(&self, z_m: usize) -> usize {
+        let tile = if self.arch == "gfx1151" { 256 } else { 128 };
+        (z_m + 96).div_ceil(tile) * tile
+    }
+
+
     /// MQ4 v2 (qt 44) — gfx11 (RDNA3/3.5) qkvza WMMA.
     /// Sister of `gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2` but with gfx11
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
@@ -29748,6 +29783,82 @@ impl Gpu {
             )?;
         }
         Ok(())
+    }
+
+    /// Append beta/alpha as ordinary Z weight rows. The SET selector is the
+    /// same one used for QKV and Z elsewhere (V2C, X5 or future Halo v2b);
+    /// the only fold-specific GPU work is deinterleaving its output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_wmma_iu4_fold_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z_fold: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        let folded_m = self.mq4v2_fold_betaalpha_padded_m(z_m);
+        if !self.mq4v2_fold_betaalpha_active(qkv_m, z_m, 48, 48, k, n)
+            || a_z_fold.byte_size() != folded_m * row_bytes
+            || y_z_fold.byte_size() < n * folded_m * 4
+        {
+            return Err(hip_bridge::HipError::new(1, "invalid MQ4V2 Z beta/alpha fold layout"));
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+            a_z_fold, xq, y_z_fold, folded_m, k, n,
+        )?;
+        self.ensure_kernel(
+            "split_mq4v2_z_betaalpha",
+            kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
+            "split_mq4v2_z_betaalpha",
+        )?;
+        let mut src = y_z_fold.buf.as_ptr();
+        let mut z = y_z.buf.as_ptr();
+        let mut beta = y_beta.buf.as_ptr();
+        let mut alpha = y_alpha.buf.as_ptr();
+        let mut zm = z_m as i32;
+        let mut fm = folded_m as i32;
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut src as *mut _ as *mut c_void,
+            &mut z as *mut _ as *mut c_void,
+            &mut beta as *mut _ as *mut c_void,
+            &mut alpha as *mut _ as *mut c_void,
+            &mut zm as *mut _ as *mut c_void,
+            &mut fm as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "split_mq4v2_z_betaalpha", n * (folded_m + z_m + 96) * 4,
+        );
+        let result = self.launch_maybe_blob(
+            "split_mq4v2_z_betaalpha", [n as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src);
+                b.push_ptr(z);
+                b.push_ptr(beta);
+                b.push_ptr(alpha);
+                b.push_i32(zm);
+                b.push_i32(fm);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// MQ4V2 gfx1100 qkvza batch-tile (BT4 / BT12).

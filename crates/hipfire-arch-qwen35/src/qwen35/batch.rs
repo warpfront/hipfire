@@ -52,6 +52,9 @@ pub struct PrefillBatchScratch {
     // LA-layer projection outputs
     pub dn_qkv_batch: GpuTensor,      // [N × qkv_dim]
     pub dn_z_batch: GpuTensor,        // [N × v_dim]
+    /// Z plus up to 256 appended beta/alpha/padding rows, used only by the
+    /// symmetric IU4 fold; output is deinterleaved before GDN consumes it.
+    pub dn_z_fold_batch: GpuTensor,
     pub dn_alpha_batch: GpuTensor,    // [N × n_v_heads]
     pub dn_beta_batch: GpuTensor,     // [N × n_v_heads]
     pub dn_q_raw_batch: GpuTensor,    // [N × k_dim] (pre repeat-interleave)
@@ -275,6 +278,7 @@ impl PrefillBatchScratch {
         let i_x_norm_batch = alloc!(&[fallback_rows * dim], DType::F32);
         let i_dn_qkv_batch = alloc!(&[max_batch * qkv_dim], DType::F32);
         let i_dn_z_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_z_fold_batch = alloc!(&[max_batch * (v_dim + 256)], DType::F32);
         let i_dn_alpha_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
         let i_dn_beta_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
         // dn_q_raw_batch doubles as the GDN chunk scan's A workspace, which is
@@ -481,6 +485,7 @@ impl PrefillBatchScratch {
             x_norm_batch: take!(i_x_norm_batch),
             dn_qkv_batch: take!(i_dn_qkv_batch),
             dn_z_batch: take!(i_dn_z_batch),
+            dn_z_fold_batch: take!(i_dn_z_fold_batch),
             dn_alpha_batch: take!(i_dn_alpha_batch),
             dn_beta_batch: take!(i_dn_beta_batch),
             dn_q_raw_batch: take!(i_dn_q_raw_batch),
@@ -549,6 +554,7 @@ impl PrefillBatchScratch {
             self.x_norm_batch,
             self.dn_qkv_batch,
             self.dn_z_batch,
+            self.dn_z_fold_batch,
             self.dn_alpha_batch,
             self.dn_beta_batch,
             self.dn_q_raw_batch,

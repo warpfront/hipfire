@@ -5764,10 +5764,22 @@ fn batch_chunk_delta_net_input_projection(
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
     // we reuse x_rot_batch as the "normed, unrotated" output
     // so the subsequent GEMM can read it the same way.
+    // MQ4V2 beta/alpha can be appended to Z at load time. The producer
+    // emits IU4 only when its SET consumes all three projections; the F32 X
+    // is otherwise still required by the small-M MW4 tail.
+    let fold_betaalpha = [layer.wqkv.gpu_dtype, layer.wz.gpu_dtype,
+        layer.w_beta.gpu_dtype, layer.w_alpha.gpu_dtype] == [DType::MQ4G256V2; 4]
+        && layer.wz.buf.byte_size()
+            == gpu.mq4v2_fold_betaalpha_padded_m(layer.wz.m)
+                * (layer.wz.k / 256) * rdna_compute::MQ4V2_GROUP_BYTES
+        && gpu.mq4v2_fold_betaalpha_active(
+            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+            layer.wqkv.k, n,
+        );
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if is_mq {
-        // C2: MQ4V2 IU4 producer sidecar (emit_f32=true for beta/alpha tails).
+        // Folded Z no longer needs the F32 sidecar for MW4 or its f16 convert.
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
             &pbs.x_batch,
@@ -5777,7 +5789,7 @@ fn batch_chunk_delta_net_input_projection(
             dim,
             config.norm_eps,
             n,
-            true,
+            !fold_betaalpha,
         )?;
         if iu4_prep.is_none() {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
@@ -5834,24 +5846,33 @@ fn batch_chunk_delta_net_input_projection(
 
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
     if let Some(prep) = &iu4_prep {
-        gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
-            &layer.wqkv.buf,
-            &layer.wz.buf,
-            &layer.w_beta.buf,
-            &layer.w_alpha.buf,
-            &pbs.x_rot_batch,
-            prep,
-            &pbs.dn_qkv_batch,
-            &pbs.dn_z_batch,
-            &pbs.dn_beta_batch,
-            &pbs.dn_alpha_batch,
-            layer.wqkv.m,
-            layer.wz.m,
-            layer.w_beta.m,
-            layer.w_alpha.m,
-            layer.wqkv.k,
-            n,
-        )?;
+        if fold_betaalpha {
+            gpu.gemm_qkvza_mq4g256v2_wmma_iu4_fold_prepared(
+                &layer.wqkv.buf, &layer.wz.buf, prep,
+                &pbs.dn_qkv_batch, &pbs.dn_z_fold_batch, &pbs.dn_z_batch,
+                &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                layer.wqkv.m, layer.wz.m, layer.wqkv.k, n,
+            )?;
+        } else {
+            gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                &pbs.x_rot_batch,
+                prep,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+            )?;
+        }
     } else if is_6bit {
         run_fused_qkvza_key(
             gpu,
