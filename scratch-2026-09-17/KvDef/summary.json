@@ -1,0 +1,38 @@
+{
+  "commit": "4d44f056df9fd07a623452dba5629dd55104536a",
+  "binary_md5": {
+    "target/release/hipfire": "7f5c28630943977b742c14cdb6d5abd3",
+    "target/release/daemon": "02b9a1a5d5b9a401ca362f38e7d9e893"
+  },
+  "environment": {
+    "HOME": "/home/kaden/.hipfire-homes/ab1",
+    "ROCR_VISIBLE_DEVICES": "1",
+    "HIPFIRE_MODELS_DIR": "/home/kaden/.hipfire/models",
+    "HIPFIRE_KERNEL_CACHE": "/home/kaden/.hipfire-homes/ab1/.hipfire_kernels",
+    "HIPFIRE_GRAPH": "1",
+    "HIPFIRE_LLOYD_GFX12": "1",
+    "HIPFIRE_KV_MODE": null,
+    "HIPFIRE_PREFILL_CHUNK_ROWS": null
+  },
+  "flag_free": {
+    "banner": "KV cache: Fp8 vmm (16/64 layers carry KV; K/V 1032B/row; mapped_prefix=2032 / physical_cap=32768 / max_seq=32768)",
+    "prefill_chunk": "requested=4096 admitted=4096 commit_stride=512",
+    "pp8192_median_tok_s": 1853.6,
+    "decode_tg64_ctx128_median_tok_s": 36.473442563771165,
+    "stdout": "flagfree.stdout.json",
+    "stderr": "flagfree.stderr.log"
+  },
+  "explicit_q8": {
+    "banner": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=32768 / max_seq=32768)",
+    "prefill_chunk": "requested=4096 admitted=4096 commit_stride=512",
+    "pp8192_median_tok_s": 1724.4,
+    "decode_tg64_ctx128_median_tok_s": 36.5393456478944,
+    "stdout": "explicit-q8.stdout.json",
+    "stderr": "explicit-q8.stderr.log"
+  },
+  "validation": {
+    "cargo_build_release": "passed",
+    "cargo_test_p_hipfire_registry": "34 passed",
+    "cargo_test_p_hipfire_runtime_kv_mode": "9 passed"
+  }
+}
