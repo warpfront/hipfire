@@ -105,6 +105,18 @@ fn try_iu4_silu_prepared(
     )?;
     Ok(Some(prep))
 }
+
+fn reserve_gfx12_iu4(
+    gpu: &mut Gpu,
+    k: usize,
+    n: usize,
+) -> HipResult<rdna_compute::Int4MmqReservation> {
+    if gpu.iu4_atiled_active(n, k) {
+        gpu.reserve_int4_mmq_atiled(k, n)
+    } else {
+        gpu.reserve_int4_mmq(k, n)
+    }
+}
 /// gfx1201 slice-1: SwiGLU/FWHT + in-register `block_i4_128` producer for
 /// w_down. `None` → caller keeps the incumbent silu + standalone-quantizer
 /// path. Same contract as [`try_iu4_silu_prepared`] (uniform MQ4G256V2 only,
@@ -125,7 +137,7 @@ fn try_gfx12_silu_quant_fused_prepared(
     if w_down.gpu_dtype != DType::MQ4G256V2 || !gpu.iu4_silu_quant_fused_active(n, k) {
         return Ok(None);
     }
-    let res = gpu.reserve_int4_mmq(k, n)?;
+    let res = reserve_gfx12_iu4(gpu, k, n)?;
     let prep = gpu.fused_silu_mul_rotate_mq_i4_gfx12_batched(
         gate,
         up,
@@ -160,7 +172,7 @@ fn try_gfx12_rmsnorm_quant_fused_prepared(
     {
         return Ok(None);
     }
-    let res = gpu.reserve_int4_mmq(k, n)?;
+    let res = reserve_gfx12_iu4(gpu, k, n)?;
     let prep = gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(
         x,
         norm_weight,
@@ -231,7 +243,7 @@ fn try_gfx12_rotate_quant_fused_prepared(
     {
         return Ok(None);
     }
-    let res = gpu.reserve_int4_mmq(k, n)?;
+    let res = reserve_gfx12_iu4(gpu, k, n)?;
     let prep = gpu.rotate_x_mq_i4_gfx12_batched(
         x,
         wo.awq_scale.as_ref(),
@@ -265,7 +277,7 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     {
         return Ok(None);
     }
-    let res = gpu.reserve_int4_mmq(k, n)?;
+    let res = reserve_gfx12_iu4(gpu, k, n)?;
     let prep = gpu.sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
         attn, gate, awq, None, res, k, n,
     )?;
@@ -337,7 +349,7 @@ fn try_gfx12_gdn_quant_fused_prepared(
     {
         return Ok(None);
     }
-    let res = gpu.reserve_int4_mmq(k, n)?;
+    let res = reserve_gfx12_iu4(gpu, k, n)?;
     let prep = gpu.gated_norm_rotate_mq_i4_gfx12_batched(
         x,
         z,

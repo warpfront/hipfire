@@ -2186,6 +2186,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.gfx12_iu4_atiled",
+        "gfx12_iu4_atiled",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_IU4_ATILED",
+        "Enable producer-emitted fragment-tiled IU4 activations and the gfx1201 register-direct-A GEMM (default off; set true or HIPFIRE_GFX12_IU4_ATILED=1 to opt in; exact layout bijection, 12 KiB GEMM LDS)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fp8_stream",
         "gfx12_fp8_stream",
         Kernel,

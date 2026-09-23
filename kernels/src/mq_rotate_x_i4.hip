@@ -188,7 +188,7 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     // IU4 sidecar: remap this wave's 8-floats/lane into the standalone
     // quant ownership and emit two block_i4_128 rows for this 256-group.
     // token = batch; N is the batch extent for the [K/128, N] layout.
-    emit_iu4_sidecar_from_producer8(
+    emit_iu4_from_producer8(
         f0, f1, f2, f3, f4, f5, f6, f7,
-        x_i4, group, batch, N, tid);
+        x_i4, group, batch, K, N, tid);
 }

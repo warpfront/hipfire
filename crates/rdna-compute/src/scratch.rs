@@ -32,6 +32,12 @@ pub struct Mq4v2Fp8Prepared {
     pub scale_mode: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Int4MmqLayout {
+    Block,
+    ATiled,
+}
+
 /// Opaque reservation of the shared `int4_mmq_x_scratch` buffer for a
 /// producer-emitted IU4 sidecar (C2). Obtained from
 /// [`ScratchState::reserve_int4_mmq`] / [`crate::Gpu::reserve_int4_mmq`].
@@ -43,6 +49,7 @@ pub struct Int4MmqReservation {
     k: usize,
     n: usize,
     generation: u64,
+    layout: Int4MmqLayout,
 }
 
 impl Int4MmqReservation {
@@ -65,6 +72,11 @@ impl Int4MmqReservation {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    #[inline]
+    pub(crate) fn is_atiled(&self) -> bool {
+        self.layout == Int4MmqLayout::ATiled
+    }
 }
 
 /// Frozen producer-emitted IU4 handle. Fields are intentionally private so
@@ -77,6 +89,7 @@ pub struct Int4MmqPrepared {
     k: usize,
     n: usize,
     generation: u64,
+    layout: Int4MmqLayout,
 }
 
 impl Int4MmqPrepared {
@@ -88,6 +101,7 @@ impl Int4MmqPrepared {
             k: res.k,
             n: res.n,
             generation: res.generation,
+            layout: res.layout,
         }
     }
 
@@ -115,6 +129,11 @@ impl Int4MmqPrepared {
             ));
         }
         Ok(self.ptr)
+    }
+
+    #[inline]
+    pub(crate) fn is_atiled(&self) -> bool {
+        self.layout == Int4MmqLayout::ATiled
     }
 
     #[inline]
@@ -585,6 +604,23 @@ pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
 pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     let blocks_k = k / 128;
     blocks_k * n * 72
+}
+
+/// Byte size of producer-tiled IU4 `At + Ds`: one 4 KiB fragment slab per
+/// 64 K-values and padded 128-token tile, followed by one 8-byte `{d,s}` per
+/// 128 K-values and real token.
+#[inline]
+pub(crate) fn int4_mmq_atiled_needed(k: usize, n: usize) -> usize {
+    let token_tiles = n.div_ceil(128);
+    let at_bytes = (k / 64)
+        .checked_mul(token_tiles)
+        .and_then(|v| v.checked_mul(4096))
+        .expect("iu4 At extent overflow");
+    let ds_bytes = (k / 128)
+        .checked_mul(n)
+        .and_then(|v| v.checked_mul(8))
+        .expect("iu4 Ds extent overflow");
+    at_bytes.checked_add(ds_bytes).expect("iu4 At+Ds extent overflow")
 }
 
 /// Byte sizes of the three MQ4v2 FP8 pre-pass buffers `(x_fp8, half_sums,
@@ -1580,14 +1616,12 @@ impl ScratchState {
         Ok(self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
-    /// Grow `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar and bump
-    /// the generation. Does **not** launch `quantize_int4_mmq_ds128` — the
-    /// RMSNorm/FWHT or SwiGLU/FWHT producer writes the 72-byte blocks.
-    pub fn reserve_int4_mmq(
+    fn reserve_int4_mmq_layout(
         &mut self,
         hip: &HipRuntime,
         k: usize,
         n: usize,
+        layout: Int4MmqLayout,
     ) -> HipResult<Int4MmqReservation> {
         if k == 0 || n == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
@@ -1595,7 +1629,10 @@ impl ScratchState {
                 "reserve_int4_mmq: need k%256==0 and n>0",
             ));
         }
-        let needed = int4_mmq_reserve_needed(k, n);
+        let needed = match layout {
+            Int4MmqLayout::Block => int4_mmq_reserve_needed(k, n),
+            Int4MmqLayout::ATiled => int4_mmq_atiled_needed(k, n),
+        };
         grow_scratch_buffer(
             hip,
             &mut self.int4_mmq_x_scratch,
@@ -1609,7 +1646,28 @@ impl ScratchState {
             k,
             n,
             generation: self.int4_mmq_generation,
+            layout,
         })
+    }
+
+    /// Grow `int4_mmq_x_scratch` for the row-major producer sidecar.
+    pub fn reserve_int4_mmq(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int4MmqReservation> {
+        self.reserve_int4_mmq_layout(hip, k, n, Int4MmqLayout::Block)
+    }
+
+    /// Grow `int4_mmq_x_scratch` for producer-tiled `At + Ds`.
+    pub fn reserve_int4_mmq_atiled(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int4MmqReservation> {
+        self.reserve_int4_mmq_layout(hip, k, n, Int4MmqLayout::ATiled)
     }
     /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
     /// stream and return their device pointers `(x_fp8, half_sums,

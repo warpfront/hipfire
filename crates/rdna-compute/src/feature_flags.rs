@@ -259,6 +259,11 @@ pub struct FeatureFlags {
     /// each admitted site. Bit-identical vs the producer+quantizer chain;
     /// any byte difference kills it.
     pub gfx11_producer_quant_fused: bool,
+    /// Producer-emitted fragment-tiled IU4 activations plus direct-global-A
+    /// gfx1201 GEMM (`HIPFIRE_GFX12_IU4_ATILED`,
+    /// `kernel.gfx12_iu4_atiled`). Default OFF until the measured route is
+    /// promoted; exact gfx1201 and the base IU4/producer gates remain required.
+    pub gfx12_iu4_atiled: bool,
     /// gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion
     /// (`HIPFIRE_GFX12_FP8_STREAM`, `kernel.gfx12_fp8_stream`). Default OFF;
     /// `=1` opts in on exact gfx1201. The `_mq4v2_fp8_gfx12` producer twins
@@ -655,6 +660,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
+            gfx12_iu4_atiled: parse_bool("HIPFIRE_GFX12_IU4_ATILED").unwrap_or(false),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
@@ -833,6 +839,10 @@ impl FeatureFlags {
     pub fn gfx11_producer_quant_fused_enabled(&self) -> bool {
         self.gfx11_producer_quant_fused && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
+    /// True only on exact gfx1201 with the experimental At+Ds route enabled.
+    pub fn gfx12_iu4_atiled_enabled(&self) -> bool {
+        self.gfx12_iu4_atiled && self.arch == "gfx1201"
+    }
     /// True only on exact gfx1201 with the opt-in set. The `_mq4v2_fp8_gfx12`
     /// RMSNorm/rotate producers emit byte-identical standalone-pack outputs,
     /// so the fused route is exact on finite rows.
@@ -982,6 +992,7 @@ impl FeatureFlags {
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
             gfx11_producer_quant_fused: false,
+            gfx12_iu4_atiled: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,

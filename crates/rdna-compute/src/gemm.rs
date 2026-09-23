@@ -19577,6 +19577,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         add: bool,
+        atiled: bool,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
@@ -19595,12 +19596,16 @@ impl Gpu {
         }
         self.bind_thread()?;
         if self.arch.as_str() == "gfx1201" {
-            // gfx12 K32 v2 staged tile: 128-row x 128-col workgroups
-            // (8 waves; each wave covers 2 16-row groups x 4 16-col blocks).
-            // A + W slabs and DS/SZ metadata staged in LDS once per WG per
-            // 128-K block; partial M/N handled natively (zero-filled slab /
-            // guarded writeback). Block [256,1,1].
-            let kernel_name = if add {
+            // gfx12 K32 v2 staged tile: 128-row x 128-col workgroups.
+            // ATILED keeps W/DS/SZ staging but loads producer-emitted A
+            // fragments directly from global and therefore launches at 12 KiB.
+            let kernel_name = if atiled {
+                if add {
+                    "gemm_mq4g256v2_residual_mmq_iu4_atiled_add"
+                } else {
+                    "gemm_mq4g256v2_residual_mmq_iu4_atiled_set"
+                }
+            } else if add {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add"
             } else {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set"
@@ -19632,9 +19637,8 @@ impl Gpu {
             let batch_tiles = batch_size.div_ceil(128);
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-            // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
-            // slots overlap).
-            let lds_bytes: u32 = 20480;
+            // Producer-tiled A removes both 4 KiB LDS activation slots.
+            let lds_bytes: u32 = if atiled { 12288 } else { 20480 };
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
@@ -19758,7 +19762,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false, false)
     }
 
     pub fn gemm_mq4g256v2_mmq_add_prequant_iu4(
@@ -19770,7 +19774,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true, false)
     }
 
 
@@ -29306,11 +29310,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
+        let atiled = prepared.is_atiled();
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_qkv, xq, y_qkv, qkv_m, k, batch_size, false, atiled,
+        )?;
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_z, xq, y_z, z_m, k, batch_size, false, atiled,
+        )?;
         if self.arch == "gfx1201" {
-            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, batch_size)?;
-            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_prequant_iu4(
+                a_beta, xq, y_beta, beta_m, k, batch_size, false, atiled,
+            )?;
+            self.gemm_mq4g256v2_mmq_prequant_iu4(
+                a_alpha, xq, y_alpha, alpha_m, k, batch_size, false, atiled,
+            )?;
             return Ok(());
         }
         if beta_m < 128 {
@@ -29865,9 +29878,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_v, xq, y_v, v_m, k, batch_size)?;
+        let atiled = prepared.is_atiled();
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size, false, atiled)?;
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size, false, atiled)?;
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_v, xq, y_v, v_m, k, batch_size, false, atiled)?;
         Ok(())
     }
 
@@ -31064,10 +31078,13 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-            a_gate, xq, y_gate, gate_m, k, batch_size,
+        let atiled = prepared.is_atiled();
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_gate, xq, y_gate, gate_m, k, batch_size, false, atiled,
         )?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_up, xq, y_up, up_m, k, batch_size, false, atiled,
+        )?;
         Ok(())
     }
 
@@ -32655,7 +32672,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
-        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_raw, xq, y, m, k, batch_size, true, prepared.is_atiled(),
+        )
     }
 
     /// MQ4V2 gfx1100 residual batch-tile (BT4/6/8).

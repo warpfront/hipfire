@@ -1,0 +1,11 @@
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark: Function Name: compile_atiled_rotate_awq [-Rpass-analysis=kernel-resource-usage]
+  351 | ) {
+      | ^
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     TotalSGPRs: 27 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     VGPRs: 76 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/ATiledProducers/atiled-producer-rotate_awq.hip:351:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

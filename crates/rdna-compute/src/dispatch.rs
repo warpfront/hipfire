@@ -3021,6 +3021,25 @@ impl Gpu {
         self.scratch.reserve_int4_mmq(&self.hip, k, n)
     }
 
+    /// Reserve the shared IU4 scratch slot for fragment-tiled `At + Ds`.
+    pub fn reserve_int4_mmq_atiled(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        if k != 0 && n != 0 && k % 256 == 0 {
+            let needed = crate::scratch::int4_mmq_atiled_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int4_mmq_x_scratch_bytes,
+                self.scratch.int4_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int4_mmq_atiled(&self.hip, k, n)
+    }
+
     /// True when the portable producer-sidecar route is live for this call:
     /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
     /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
@@ -3076,6 +3095,21 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
+
+    /// Shared producer/consumer admission for the fragment-tiled IU4 route.
+    /// The 512-token M gate avoids small-prefill padding/scatter overhead and
+    /// matches the first isolated performance shape; producer and GEMM always
+    /// derive their layout decision from the sealed reservation.
+    pub fn iu4_atiled_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_iu4_atiled_enabled()
+            && self.flags.iu4_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 512
+            && batch % 128 == 0
             && k > 0
             && k % 256 == 0
     }

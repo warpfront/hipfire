@@ -1,0 +1,23 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_add
+JIT OK: quantize_int4_mmq_ds128_atiled
+CACHE_PATH /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hash
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hsaco
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hip
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.radiowave.json
+PRODUCER BYTES PASS rotate K=5120 N=512 bytes=1474560
+loaded gate_proj 17408x5120  down_proj 5120x17408
+OCC gemm_mq4g256v2_residual_mmq_iu4_full_set: max_active_blocks_per_CU=3 (block 256, lds 20480)
+OCC gemm_mq4g256v2_residual_mmq_iu4_full_add: max_active_blocks_per_CU=3 (block 256, lds 20480)
+OCC gemm_mq4g256v2_residual_mmq_iu4_atiled_set: max_active_blocks_per_CU=3 (block 256, lds 12288)
+OCC gemm_mq4g256v2_residual_mmq_iu4_atiled_add: max_active_blocks_per_CU=3 (block 256, lds 12288)
+OCC gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_set: max_active_blocks_per_CU=3 (block 256, lds 12288)
+OCC gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_add: max_active_blocks_per_CU=3 (block 256, lds 12288)

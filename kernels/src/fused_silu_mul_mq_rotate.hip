@@ -210,9 +210,9 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
         x_rot_b[base + 6] = f6;
         x_rot_b[base + 7] = f7;
     }
-    emit_iu4_sidecar_from_producer8(
+    emit_iu4_from_producer8(
         f0, f1, f2, f3, f4, f5, f6, f7,
-        x_i4, group, (int)blockIdx.y, N, tid);
+        x_i4, group, (int)blockIdx.y, K, N, tid);
 #else
     x_rot_b[base]     = f0;
     x_rot_b[base + 1] = f1;

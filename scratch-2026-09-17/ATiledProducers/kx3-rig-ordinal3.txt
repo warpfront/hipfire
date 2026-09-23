@@ -1,0 +1,21 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_add
+JIT OK: quantize_int4_mmq_ds128_atiled
+CACHE_PATH /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hash
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hsaco
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hip
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.radiowave.json
+PRODUCER BYTES PASS rotate K=5120 N=512 bytes=1474560
+loaded gate_proj 17408x5120  down_proj 5120x17408
+RIG gate_up-batch4096-M34816-K5120-set: A1=7313.761us B=8428.837us A2=7806.222us speedup_vs_A1=-13.229% speedup_vs_A2=-7.387%
+NTRIG gate_up-batch4096-M34816-K5120-set: A1=8419.113us B=8942.656us A2=8440.101us speedup_vs_A1=-5.854% speedup_vs_A2=-5.620%
+RIG residual-batch4096-M5120-K17408-add: A1=3521.793us B=3766.439us A2=3675.486us speedup_vs_A1=-6.495% speedup_vs_A2=-2.415%
+NTRIG residual-batch4096-M5120-K17408-add: A1=3928.406us B=3951.764us A2=3942.685us speedup_vs_A1=-0.591% speedup_vs_A2=-0.230%

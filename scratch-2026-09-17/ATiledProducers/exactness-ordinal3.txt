@@ -1,0 +1,27 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_add
+JIT OK: quantize_int4_mmq_ds128_atiled
+CACHE_PATH /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hash
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hsaco
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hip
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.radiowave.json
+PRODUCER BYTES PASS rotate K=5120 N=512 bytes=1474560
+loaded gate_proj 17408x5120  down_proj 5120x17408
+gate/set: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=3.6962e-1 mean_abs=2.5582e-2 p99.9=1.2760e-1 max_rel=1.5106e-1] PASS
+gate/add: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=3.8478e-1 mean_abs=2.5581e-2 p99.9=1.2765e-1 max_rel=1.3630e-1] PASS
+down/set: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=3.1350e0 mean_abs=5.3300e-2 p99.9=2.6006e-1 max_rel=6.3647e-1] PASS
+down/add: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=3.9325e0 mean_abs=5.3359e-2 p99.9=2.6191e-1 max_rel=8.0395e-1] PASS
+m48tail/set: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=2.4701e0 mean_abs=4.0315e-1 p99.9=1.9584e0 max_rel=7.4082e-2] PASS
+n80cols/set: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[n/a] PASS
+k256/set: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=1.3023e0 mean_abs=1.9182e-1 p99.9=9.2531e-1 max_rel=5.1106e-2] PASS
+k256/add: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[max_abs=1.3148e0 mean_abs=1.9351e-1 p99.9=9.3193e-1 max_rel=7.0922e-2] PASS
+m100n100/set: blocks_identical=OK shipped_bitwise=OK (mism=0) cpu_bitwise=OK (mism=0) repeat_identical=OK (mism=0) nt_identical=OK (mism=0) fp8[n/a] PASS
+GFX12-IU4 ORACLE PASS

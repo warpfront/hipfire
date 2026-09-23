@@ -1130,6 +1130,23 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 FP8-stream producer: RMSNorm/FWHT + in-register whole-row scale +
 /// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
 /// cannot alias any other fusion. Emits byte-identical
@@ -1199,6 +1216,21 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx11\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+pub const MQ_ROTATE_X_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const MQ_ROTATE_X_AWQ_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 /// gfx1201 FA out-proj IU4 producer: exact `sigmoid_mul_f32` formation +
 /// AWQ/FWHT rotate + in-register `block_i4_128`. The attention input is
 /// intentionally left unmodified; the prepared residual GEMM is its only
@@ -1209,6 +1241,15 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
     "#define HIPFIRE_ROTATE_AWQ 1\n",
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_atiled_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
 
@@ -1339,6 +1380,21 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx11\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
+pub const GATED_NORM_MQ_ROTATE_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
@@ -1376,6 +1432,22 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4_atiled_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_ATILED_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_ATILED 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_atiled_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =

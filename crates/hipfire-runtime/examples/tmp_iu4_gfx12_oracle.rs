@@ -30,6 +30,11 @@ const IU4_GFX12_SRC: &str = concat!(
 const MODULE: &str = "tmp_iu4_gfx12_oracle";
 const SET_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set";
 const ADD_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add";
+const AT_SET_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_atiled_set";
+const AT_ADD_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_atiled_add";
+const AT_NT_SET_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_set";
+const AT_NT_ADD_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_add";
+const AT_QUANT_SYM: &str = "quantize_int4_mmq_ds128_atiled";
 
 const QT_MQ4V2: u8 = 44;
 const GATE_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
@@ -166,6 +171,95 @@ fn dtoh_raw(gpu: &Gpu, ptr: *mut std::ffi::c_void, len: usize) -> Vec<u8> {
     host
 }
 
+fn atiled_len(k: usize, n: usize) -> usize {
+    (k / 64) * n.div_ceil(128) * 4096 + (k / 128) * n * 8
+}
+
+fn tile_blocks_for_oracle(blocks: &[u8], k: usize, n: usize) -> Vec<u8> {
+    assert_eq!(blocks.len(), (k / 128) * n * 72);
+    let tiles = n.div_ceil(128);
+    let at_bytes = (k / 64) * tiles * 4096;
+    let mut at = vec![0u8; atiled_len(k, n)];
+    for kb in 0..k / 128 {
+        for token in 0..n {
+            let src = (kb * n + token) * 72;
+            let ds = at_bytes + (kb * n + token) * 8;
+            at[ds..ds + 8].copy_from_slice(&blocks[src..src + 8]);
+            let tile = token / 128;
+            let r = token & 127;
+            for slab in 0..2 {
+                for quad in 0..4 {
+                    let frag = (r / 16) * 2 + quad / 2;
+                    let frag_lane = (r & 15) + (quad & 1) * 16;
+                    let dst = ((2 * kb + slab) * tiles + tile) * 4096
+                        + frag * 256 + frag_lane * 8;
+                    let qsrc = src + 8 + slab * 32 + quad * 8;
+                    at[dst..dst + 8].copy_from_slice(&blocks[qsrc..qsrc + 8]);
+                }
+            }
+        }
+    }
+    at
+}
+
+fn detile_at_to_blocks(at: &[u8], k: usize, n: usize) -> Vec<u8> {
+    let tiles = n.div_ceil(128);
+    let at_bytes = (k / 64) * tiles * 4096;
+    assert_eq!(at.len(), atiled_len(k, n));
+    let mut blocks = vec![0u8; (k / 128) * n * 72];
+    for kb in 0..k / 128 {
+        for token in 0..n {
+            let dst = (kb * n + token) * 72;
+            let ds = at_bytes + (kb * n + token) * 8;
+            blocks[dst..dst + 8].copy_from_slice(&at[ds..ds + 8]);
+            let tile = token / 128;
+            let r = token & 127;
+            for slab in 0..2 {
+                for quad in 0..4 {
+                    let frag = (r / 16) * 2 + quad / 2;
+                    let frag_lane = (r & 15) + (quad & 1) * 16;
+                    let src = ((2 * kb + slab) * tiles + tile) * 4096
+                        + frag * 256 + frag_lane * 8;
+                    let qdst = dst + 8 + slab * 32 + quad * 8;
+                    blocks[qdst..qdst + 8].copy_from_slice(&at[src..src + 8]);
+                }
+            }
+        }
+    }
+    blocks
+}
+
+fn cpu_layout_oracle() {
+    let k = 5120usize;
+    for n in [128usize, 512, 640] {
+        let len = (k / 128) * n * 72;
+        let blocks: Vec<u8> = (0..len)
+            .map(|i| prng_u32(i as u64, 0xA71E_D00D) as u8)
+            .collect();
+        let at = tile_blocks_for_oracle(&blocks, k, n);
+        let got = detile_at_to_blocks(&at, k, n);
+        assert_eq!(got, blocks, "At/Ds bijection failed at N={n}");
+        eprintln!("CPU LAYOUT PASS K={k} N={n} aos={} atds={}", blocks.len(), at.len());
+    }
+}
+
+fn launch_atiled_quant(gpu: &mut Gpu, x: &rdna_compute::GpuTensor, out: &rdna_compute::GpuTensor, k: usize, n: usize) {
+    let mut b = KernargBlob::new();
+    b.push_ptr(x.buf.as_ptr());
+    b.push_ptr(out.buf.as_ptr());
+    b.push_i32(k as i32);
+    b.push_i32(n as i32);
+    let mut blob = b.into_vec();
+    gpu.launch_kernel_blob(
+        AT_QUANT_SYM,
+        [k.div_ceil(1024) as u32, n as u32, 1],
+        [256, 1, 1],
+        0,
+        &mut blob,
+    )
+    .unwrap_or_else(|e| panic!("launch {AT_QUANT_SYM}: {e}"));
+}
+
 fn launch_iu4(
     gpu: &mut Gpu,
     sym: &str,
@@ -186,11 +280,10 @@ fn launch_iu4(
     b.push_i32(n as i32);
     b.push_i32(i32::from(add));
     let mut blob = b.into_vec();
-    // v2 staged tile: WG = 128 rows x 128 cols (8 waves). LDS varies by
-    // variant (IU4_LDS override): v2 12288, A-full 24576, A3 19456, two-slot 20480 (default).
-    // (W double-buffered + ping-pong DS/SZ, A single; store slots overlap).
+    // Staged reference uses 20 KiB; producer-tiled direct-A uses 12 KiB.
     let grid = [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
-    let lds: u32 = std::env::var("IU4_LDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20480);
+    let default_lds = if sym.contains("_atiled_") { 12288 } else { 20480 };
+    let lds: u32 = std::env::var("IU4_LDS").ok().and_then(|s| s.parse().ok()).unwrap_or(default_lds);
     gpu.launch_kernel_blob(sym, grid, [256, 1, 1], lds, &mut blob)
         .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
 }
@@ -276,6 +369,54 @@ fn bitwise_eq(a: &[f32], b: &[f32], rows: Option<&[usize]>, m: usize) -> (bool, 
     (mism == 0, mism)
 }
 
+fn producer_byte_oracle(gpu: &mut Gpu) -> bool {
+    let k = 5120usize;
+    let n = 512usize;
+    let x: Vec<f32> = (0..n * k).map(|i| prng_f32(i, 0xA71E_B17E)).collect();
+    let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload producer X");
+    let d_rot = gpu
+        .upload_f32(&vec![0.0f32; n * k], &[n, k])
+        .expect("alloc producer rotation output");
+    let at_len = atiled_len(k, n);
+    let reservation = gpu.reserve_int4_mmq_atiled(k, n).expect("reserve producer At");
+    let at_ptr = reservation.ptr();
+    let _prepared = gpu
+        .rotate_x_mq_i4_gfx12_batched(&d_x, None, Some(&d_rot), reservation, k, n)
+        .expect("launch real ATiled rotate producer");
+    gpu.hip.device_synchronize().expect("sync real ATiled producer");
+    let at = dtoh_raw(gpu, at_ptr, at_len);
+    let produced = detile_at_to_blocks(&at, k, n);
+
+    // Compare the tiled emitter against the same real gfx1201 producer in its
+    // row-major sidecar mode. Both use the upstream four-candidate quantizer;
+    // the standalone quantizer deliberately retains the eight-candidate
+    // reference recipe and is therefore not a producer-layout oracle.
+    let aos_reservation = gpu.reserve_int4_mmq(k, n).expect("reserve producer AoS");
+    let aos_ptr = aos_reservation.ptr();
+    let _aos_prepared = gpu
+        .rotate_x_mq_i4_gfx12_batched(&d_x, None, Some(&d_rot), aos_reservation, k, n)
+        .expect("launch real AoS rotate producer");
+    gpu.hip.device_synchronize().expect("sync real AoS producer");
+    let expected = dtoh_raw(gpu, aos_ptr, (k / 128) * n * 72);
+    let ok = produced == expected;
+    if ok {
+        eprintln!("PRODUCER BYTES PASS rotate K={k} N={n} bytes={}", expected.len());
+    } else {
+        let first = produced
+            .iter()
+            .zip(expected.iter())
+            .position(|(a, b)| a != b)
+            .unwrap();
+        eprintln!(
+            "PRODUCER BYTES FAIL rotate K={k} N={n} byte={first} tiled={} aos={}",
+            produced[first], expected[first]
+        );
+    }
+    let _ = gpu.free_tensor(d_x);
+    let _ = gpu.free_tensor(d_rot);
+    ok
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_case(
     gpu: &mut Gpu,
@@ -290,7 +431,11 @@ fn run_case(
 ) -> bool {
     assert_eq!(k % 256, 0, "{label}: K={k} not multiple of 256");
     let sym = if add { ADD_SYM } else { SET_SYM };
-    for s in [SET_SYM, ADD_SYM] {
+    let at_sym = if add { AT_ADD_SYM } else { AT_SET_SYM };
+    for s in [
+        SET_SYM, ADD_SYM, AT_SET_SYM, AT_ADD_SYM, AT_NT_SET_SYM, AT_NT_ADD_SYM,
+        AT_QUANT_SYM,
+    ] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
     }
@@ -308,6 +453,17 @@ fn run_case(
         gpu.ensure_int4_mmq_x(&d_x, n, k).expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
     let xq_len = (k / 128) * n * 72;
     let xq = dtoh_raw(gpu, xq_ptr, xq_len);
+    let at_len = atiled_len(k, n);
+    let d_at = gpu.upload_raw(&vec![0u8; at_len], &[at_len]).expect("alloc At+Ds");
+    launch_atiled_quant(gpu, &d_x, &d_at, k, n);
+    gpu.hip.device_synchronize().expect("sync tiled quant");
+    let at = dtoh_raw(gpu, d_at.buf.as_ptr(), at_len);
+    let detiled = detile_at_to_blocks(&at, k, n);
+    let blocks_identical = detiled == xq;
+    if !blocks_identical {
+        let first = detiled.iter().zip(xq.iter()).position(|(a, b)| a != b).unwrap();
+        eprintln!("{label}: At/Ds byte mismatch at block byte {first}: tiled={} aos={}", detiled[first], xq[first]);
+    }
 
     let d_a = gpu.upload_raw(a_bytes, &[a_bytes.len()]).expect("upload A");
     let a_ptr = d_a.buf.as_ptr() as *const std::ffi::c_void;
@@ -320,21 +476,29 @@ fn run_case(
     } else {
         vec![0.0f32; y_elems]
     };
-    let d_y1 = gpu.upload_f32(&y0, &[n, m]).expect("upload Y1");
-    let d_y2 = gpu.upload_f32(&y0, &[n, m]).expect("upload Y2");
+    let d_y1 = gpu.upload_f32(&y0, &[n, m]).expect("upload staged Y");
+    let d_y2 = gpu.upload_f32(&y0, &[n, m]).expect("upload atiled Y");
+    let d_y3 = gpu.upload_f32(&y0, &[n, m]).expect("upload atiled repeat Y");
+    let d_y4 = gpu.upload_f32(&y0, &[n, m]).expect("upload atiled NT Y");
     let y1_ptr = d_y1.buf.as_ptr() as *const std::ffi::c_void;
     let y2_ptr = d_y2.buf.as_ptr() as *const std::ffi::c_void;
+    let y3_ptr = d_y3.buf.as_ptr() as *const std::ffi::c_void;
+    let y4_ptr = d_y4.buf.as_ptr() as *const std::ffi::c_void;
 
     launch_iu4(gpu, sym, a_ptr, xq_ptr as *const _, y1_ptr, m, k, n, add);
-    launch_iu4(gpu, sym, a_ptr, xq_ptr as *const _, y2_ptr, m, k, n, add);
-    gpu.hip.device_synchronize().expect("sync");
-    let y1 = gpu.download_f32(&d_y1).expect("dl y1");
-    let y2 = gpu.download_f32(&d_y2).expect("dl y2");
-    assert!(y1.iter().all(|v| v.is_finite()), "{label}: non-finite gpu output");
+    launch_iu4(gpu, at_sym, a_ptr, d_at.buf.as_ptr(), y2_ptr, m, k, n, add);
+    launch_iu4(gpu, at_sym, a_ptr, d_at.buf.as_ptr(), y3_ptr, m, k, n, add);
+    let at_nt_sym = if add { AT_NT_ADD_SYM } else { AT_NT_SET_SYM };
+    launch_iu4(gpu, at_nt_sym, a_ptr, d_at.buf.as_ptr(), y4_ptr, m, k, n, add);
+    let y1 = gpu.download_f32(&d_y1).expect("dl staged");
+    let y2 = gpu.download_f32(&d_y2).expect("dl atiled");
+    let y3 = gpu.download_f32(&d_y3).expect("dl atiled repeat");
+    let y4 = gpu.download_f32(&d_y4).expect("dl atiled NT");
+    assert!(y2.iter().all(|v| v.is_finite()), "{label}: non-finite gpu output");
 
-    // 2. repeat bit-identical (full).
-    let (eq_rep, mism_rep) = bitwise_eq(&y1, &y2, None, m);
-
+    let (eq_shipped, mism_shipped) = bitwise_eq(&y2, &y1, None, m);
+    let (eq_rep, mism_rep) = bitwise_eq(&y2, &y3, None, m);
+    let (eq_nt, mism_nt) = bitwise_eq(&y2, &y4, None, m);
     // 1. vs CPU reference (full for small, edge stripes for big).
     let rows: Option<Vec<usize>> = if full_cpu {
         None
@@ -347,7 +511,7 @@ fn run_case(
         Some(rs)
     };
     let y_ref = cpu_ref(a_bytes, &xq, &y0, m, k, n, rows.as_deref());
-    let (eq_cpu, mism_cpu) = bitwise_eq(&y1, &y_ref, rows.as_deref(), m);
+    let (eq_cpu, mism_cpu) = bitwise_eq(&y2, &y_ref, rows.as_deref(), m);
 
     // 3. vs shipped fp8 route (N%64 only).
     let mut fp8_stat = String::from("n/a");
@@ -366,7 +530,7 @@ fn run_case(
         gpu.hip.device_synchronize().expect("sync fp8");
         let yf = gpu.download_f32(&d_yf).expect("dl yf");
         // For add mode the fp8 route also accumulates onto y0: compare deltas.
-        let mut absv: Vec<f32> = y1.iter().zip(yf.iter()).map(|(a, b)| (a - b).abs()).collect();
+        let mut absv: Vec<f32> = y2.iter().zip(yf.iter()).map(|(a, b)| (a - b).abs()).collect();
         absv.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let max = absv[absv.len() - 1];
         let mean = absv.iter().sum::<f32>() / absv.len() as f32;
@@ -376,17 +540,23 @@ fn run_case(
         let _ = gpu.free_tensor(d_yf);
     }
 
-    let ok = eq_cpu && eq_rep;
+    let ok = blocks_identical && eq_shipped && eq_cpu && eq_rep && eq_nt;
     eprintln!(
-        "{label}: cpu_bitwise={} (mism={mism_cpu}) repeat_identical={} (mism={mism_rep}) fp8[{fp8_stat}] {}",
+        "{label}: blocks_identical={} shipped_bitwise={} (mism={mism_shipped}) cpu_bitwise={} (mism={mism_cpu}) repeat_identical={} (mism={mism_rep}) nt_identical={} (mism={mism_nt}) fp8[{fp8_stat}] {}",
+        if blocks_identical { "OK" } else { "FAIL" },
+        if eq_shipped { "OK" } else { "FAIL" },
         if eq_cpu { "OK" } else { "FAIL" },
         if eq_rep { "OK" } else { "FAIL" },
+        if eq_nt { "OK" } else { "FAIL" },
         if ok { "PASS" } else { "FAIL" },
     );
     let _ = gpu.free_tensor(d_x);
     let _ = gpu.free_tensor(d_a);
     let _ = gpu.free_tensor(d_y1);
     let _ = gpu.free_tensor(d_y2);
+    let _ = gpu.free_tensor(d_y3);
+    let _ = gpu.free_tensor(d_y4);
+    let _ = gpu.free_tensor(d_at);
     ok
 }
 
@@ -441,12 +611,98 @@ fn time_case(
     let _ = gpu.free_tensor(d_a);
     let _ = gpu.free_tensor(d_y);
 }
+fn measure_arm(
+    gpu: &mut Gpu,
+    sym: &str,
+    a_ptr: *const std::ffi::c_void,
+    xq_ptr: *const std::ffi::c_void,
+    y_ptr: *const std::ffi::c_void,
+    m: usize,
+    k: usize,
+    n: usize,
+    add: bool,
+) -> f64 {
+    for _ in 0..5 {
+        launch_iu4(gpu, sym, a_ptr, xq_ptr, y_ptr, m, k, n, add);
+    }
+    gpu.hip.device_synchronize().expect("sync rig warmup");
+    let t0 = std::time::Instant::now();
+    for _ in 0..20 {
+        launch_iu4(gpu, sym, a_ptr, xq_ptr, y_ptr, m, k, n, add);
+    }
+    gpu.hip.device_synchronize().expect("sync rig arm");
+    t0.elapsed().as_secs_f64() * 1e6 / 20.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_atiled_pair(
+    gpu: &mut Gpu,
+    label: &str,
+    a_bytes: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    add: bool,
+) {
+    let base = if add { ADD_SYM } else { SET_SYM };
+    let tiled = if add { AT_ADD_SYM } else { AT_SET_SYM };
+    let tiled_nt = if add { AT_NT_ADD_SYM } else { AT_NT_SET_SYM };
+    for s in [base, tiled, tiled_nt, AT_QUANT_SYM] {
+        gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
+            .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
+    }
+
+    let x: Vec<f32> = (0..n * k).map(|i| prng_f32(i, 0xA71E_71E0)).collect();
+    let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload rig X");
+    let xq_ptr =
+        gpu.ensure_int4_mmq_x(&d_x, n, k).expect("quantize rig X") as *mut std::ffi::c_void;
+    let at_len = atiled_len(k, n);
+    let d_at = gpu.upload_raw(&vec![0u8; at_len], &[at_len]).expect("alloc rig At");
+    launch_atiled_quant(gpu, &d_x, &d_at, k, n);
+    gpu.hip.device_synchronize().expect("sync rig tiled quant");
+
+    let d_a = gpu.upload_raw(a_bytes, &[a_bytes.len()]).expect("upload rig A");
+    let d_y = gpu.upload_f32(&vec![0.0f32; n * m], &[n, m]).expect("alloc rig Y");
+    let a_ptr = d_a.buf.as_ptr() as *const std::ffi::c_void;
+    let y_ptr = d_y.buf.as_ptr() as *const std::ffi::c_void;
+    // Each newly JIT-built arm is explicitly warmed before any timed arm.
+    launch_iu4(gpu, base, a_ptr, xq_ptr as *const _, y_ptr, m, k, n, add);
+    launch_iu4(gpu, tiled, a_ptr, d_at.buf.as_ptr(), y_ptr, m, k, n, add);
+    launch_iu4(gpu, tiled_nt, a_ptr, d_at.buf.as_ptr(), y_ptr, m, k, n, add);
+    gpu.hip.device_synchronize().expect("sync rig build warm");
+
+    let a1 = measure_arm(gpu, base, a_ptr, xq_ptr as *const _, y_ptr, m, k, n, add);
+    let b = measure_arm(gpu, tiled, a_ptr, d_at.buf.as_ptr(), y_ptr, m, k, n, add);
+    let a2 = measure_arm(gpu, base, a_ptr, xq_ptr as *const _, y_ptr, m, k, n, add);
+    eprintln!(
+        "RIG {label}: A1={a1:.3}us B={b:.3}us A2={a2:.3}us speedup_vs_A1={:.3}% speedup_vs_A2={:.3}%",
+        (a1 / b - 1.0) * 100.0,
+        (a2 / b - 1.0) * 100.0,
+    );
+    let nt_a1 = measure_arm(gpu, tiled, a_ptr, d_at.buf.as_ptr(), y_ptr, m, k, n, add);
+    let nt_b = measure_arm(gpu, tiled_nt, a_ptr, d_at.buf.as_ptr(), y_ptr, m, k, n, add);
+    let nt_a2 = measure_arm(gpu, tiled, a_ptr, d_at.buf.as_ptr(), y_ptr, m, k, n, add);
+    eprintln!(
+        "NTRIG {label}: A1={nt_a1:.3}us B={nt_b:.3}us A2={nt_a2:.3}us speedup_vs_A1={:.3}% speedup_vs_A2={:.3}%",
+        (nt_a1 / nt_b - 1.0) * 100.0,
+        (nt_a2 / nt_b - 1.0) * 100.0,
+    );
+
+    let _ = gpu.free_tensor(d_x);
+    let _ = gpu.free_tensor(d_at);
+    let _ = gpu.free_tensor(d_a);
+    let _ = gpu.free_tensor(d_y);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let compile_only = args.iter().any(|a| a == "--compile-only");
+    if args.iter().any(|a| a == "--cpu-layout") {
+        cpu_layout_oracle();
+        return;
+    }
     let model = args.iter().find(|a| !a.starts_with('-')).cloned().unwrap_or_else(|| {
-        eprintln!("usage: tmp_iu4_gfx12_oracle <model.mq4-xt> [--compile-only]");
+        eprintln!("usage: tmp_iu4_gfx12_oracle <model.mq4-xt> [--compile-only|--cpu-layout]");
         std::process::exit(2);
     });
 
@@ -460,7 +716,10 @@ fn main() {
     eprintln!("tmp_iu4_gfx12_oracle on {}", gpu.arch);
     assert_eq!(gpu.arch, "gfx1201", "this oracle targets gfx1201");
 
-    for s in [SET_SYM, ADD_SYM] {
+    for s in [
+        SET_SYM, ADD_SYM, AT_SET_SYM, AT_ADD_SYM, AT_NT_SET_SYM, AT_NT_ADD_SYM,
+        AT_QUANT_SYM,
+    ] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
         eprintln!("JIT OK: {s}");
@@ -478,11 +737,40 @@ fn main() {
     if compile_only {
         return;
     }
+    let producer_ok = producer_byte_oracle(&mut gpu);
 
     let hfq = HfqFile::open(Path::new(&model)).expect("open HFQ");
     let (gate_m, gate_k, gate) = load_mq4v2(&hfq, GATE_NAME);
     let (down_m, down_k, down) = load_mq4v2(&hfq, DOWN_NAME);
     eprintln!("loaded gate_proj {gate_m}x{gate_k}  down_proj {down_m}x{down_k}");
+    // RIG=1: isolated KX3 shapes, shipped A / producer-tiled B / shipped A.
+    if std::env::var("RIG").ok().as_deref() == Some("1") {
+        assert_eq!((gate_m, gate_k), (17408, 5120));
+        assert_eq!((down_m, down_k), (5120, 17408));
+        let mut gate_up = Vec::with_capacity(gate.len() * 2);
+        gate_up.extend_from_slice(&gate);
+        gate_up.extend_from_slice(&gate);
+        time_atiled_pair(
+            &mut gpu,
+            "gate_up-batch4096-M34816-K5120-set",
+            &gate_up,
+            34816,
+            5120,
+            4096,
+            false,
+        );
+        drop(gate_up);
+        time_atiled_pair(
+            &mut gpu,
+            "residual-batch4096-M5120-K17408-add",
+            &down,
+            5120,
+            17408,
+            4096,
+            true,
+        );
+        return;
+    }
     // TIME=1: per-kernel us/call table on the 4 profile shapes (N=512),
     // then return (no correctness checks).
     if std::env::var("TIME").ok().as_deref() == Some("1") {
@@ -499,12 +787,20 @@ fn main() {
         time_case(&mut gpu, "qkv-M14336-K5120-N512/set", &aqkv, 14336, 5120, 512, false);
         return;
     }
-    // OCC=1: occupancy probe (block 256, IU4_LDS) for gate 2, then return.
+    // OCC=1: actual launch occupancy for incumbent, ATiled, and NT-output twin.
     if std::env::var("OCC").ok().as_deref() == Some("1") {
-        for s in [SET_SYM, ADD_SYM] {
-            let ol: u32 = std::env::var("IU4_LDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20480);
-            match gpu.occupancy_max_active_blocks(s, [256, 1, 1], ol) {
-                Ok(n) => eprintln!("OCC {s}: max_active_blocks_per_CU={n} (block 256, lds {ol})"),
+        for (s, lds) in [
+            (SET_SYM, 20480u32),
+            (ADD_SYM, 20480),
+            (AT_SET_SYM, 12288),
+            (AT_ADD_SYM, 12288),
+            (AT_NT_SET_SYM, 12288),
+            (AT_NT_ADD_SYM, 12288),
+        ] {
+            match gpu.occupancy_max_active_blocks(s, [256, 1, 1], lds) {
+                Ok(n) => eprintln!(
+                    "OCC {s}: max_active_blocks_per_CU={n} (block 256, lds {lds})"
+                ),
                 Err(e) => eprintln!("OCC {s}: ERROR {e}"),
             }
         }
@@ -512,7 +808,7 @@ fn main() {
     }
     drop(hfq);
 
-    let mut ok = true;
+    let mut ok = producer_ok;
     ok &= run_case(&mut gpu, "gate/set", &gate, gate_m, gate_k, 512, false, 0xC0DE_0001, false);
     ok &= run_case(&mut gpu, "gate/add", &gate, gate_m, gate_k, 512, true, 0xC0DE_0002, false);
     ok &= run_case(&mut gpu, "down/set", &down, down_m, down_k, 512, false, 0xC0DE_0003, false);

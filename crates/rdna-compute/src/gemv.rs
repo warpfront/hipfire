@@ -3300,13 +3300,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let atiled = reservation.is_atiled();
+        let (module, source, kernel) = match (awq.is_some(), atiled) {
+            (true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_atiled_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_ATILED_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_atiled_gfx12",
+            ),
+            (false, true) => (
+                "fused_rmsnorm_mq_rotate_i4_atiled_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_ATILED_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_i4_atiled_gfx12",
+            ),
+            (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
@@ -3716,13 +3727,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let atiled = reservation.is_atiled();
+        let (module, source, kernel) = match (awq.is_some(), atiled) {
+            (true, true) => (
+                "fused_silu_mul_mq_rotate_awq_i4_atiled_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_ATILED_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_atiled_gfx12",
+            ),
+            (false, true) => (
+                "fused_silu_mul_mq_rotate_i4_atiled_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_ATILED_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_i4_atiled_gfx12",
+            ),
+            (true, false) => (
                 "fused_silu_mul_mq_rotate_awq_i4_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_silu_mul_mq_rotate_i4_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_i4_gfx12",
@@ -4137,13 +4159,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let atiled = reservation.is_atiled();
+        let (module, source, kernel) = match (awq.is_some(), atiled) {
+            (true, true) => (
+                "gated_norm_mq_rotate_awq_i4_atiled_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_ATILED_GFX12_SRC,
+                "gated_norm_mq_rotate_awq_i4_atiled_gfx12",
+            ),
+            (false, true) => (
+                "gated_norm_mq_rotate_i4_atiled_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_I4_ATILED_GFX12_SRC,
+                "gated_norm_mq_rotate_i4_atiled_gfx12",
+            ),
+            (true, false) => (
                 "gated_norm_mq_rotate_awq_i4_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "gated_norm_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "gated_norm_mq_rotate_i4_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC,
                 "gated_norm_mq_rotate_i4_gfx12",
@@ -4654,13 +4687,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let atiled = reservation.is_atiled();
+        let (module, source, kernel) = match (awq.is_some(), atiled) {
+            (true, true) => (
+                "mq_rotate_x_awq_i4_atiled_gfx12",
+                kernels::MQ_ROTATE_X_AWQ_I4_ATILED_GFX12_SRC,
+                "rotate_x_mq_awq_i4_atiled_gfx12",
+            ),
+            (false, true) => (
+                "mq_rotate_x_i4_atiled_gfx12",
+                kernels::MQ_ROTATE_X_I4_ATILED_GFX12_SRC,
+                "mq_rotate_x_i4_atiled_gfx12",
+            ),
+            (true, false) => (
                 "mq_rotate_x_awq_i4_gfx12",
                 kernels::MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
                 "rotate_x_mq_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "mq_rotate_x_i4_gfx12",
                 kernels::MQ_ROTATE_X_I4_GFX12_SRC,
                 "mq_rotate_x_i4_gfx12",
@@ -4765,13 +4809,21 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        const MODULE: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
-        const KERNEL: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
-        self.ensure_kernel(
-            MODULE,
-            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
-            KERNEL,
-        )?;
+        let atiled = reservation.is_atiled();
+        let (module, source, kernel) = if atiled {
+            (
+                "sigmoid_mul_rotate_x_mq_awq_i4_atiled_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_ATILED_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_atiled_gfx12",
+            )
+        } else {
+            (
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
+            )
+        };
+        self.ensure_kernel(module, source, kernel)?;
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
@@ -4801,7 +4853,7 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [((k / 256) * batch_size) as u32, 1, 1],
             [32, 1, 1],
             0,

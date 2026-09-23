@@ -1,0 +1,15 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_add
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_atiled_nt_add
+JIT OK: quantize_int4_mmq_ds128_atiled
+CACHE_PATH /home/kaden/.hipfire-homes/ab3/.hipfire_kernels/gfx1201
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hash
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hsaco
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.hip
+  cached: tmp_iu4_gfx12_oracle.e9b641623817d689.radiowave.json
