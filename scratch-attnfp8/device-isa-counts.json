@@ -1,0 +1,14 @@
+{
+  "qk8": {
+    "fp8_wmma": 8,
+    "f16_wmma": 32,
+    "cvt_pk_fp8": 4,
+    "scratch_refs": 0
+  },
+  "pv8": {
+    "fp8_wmma": 32,
+    "f16_wmma": 128,
+    "cvt_pk_fp8": 8,
+    "scratch_refs": 0
+  }
+}

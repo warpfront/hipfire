@@ -1,0 +1,2 @@
+CASE 0000 b=1 c=1 mode=0 direct=0/0/0/0/0 s1rec=0/0/0/0/0 s1merge=0/0/0/0/0 s8rec=0/0/0/0/0 s8merge=0/0/0/0/0 PASS
+SUMMARY cases=1 failed=0 input_diffs(Q/K/V/P)=[0, 0, 0, 0] elapsed_s=3.932

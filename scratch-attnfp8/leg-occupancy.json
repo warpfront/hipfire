@@ -1,0 +1,8 @@
+{
+  "qk8_blocks_per_multiprocessor": 2,
+  "qk8_block_threads": 128,
+  "qk8_dynamic_lds_bytes": 32768,
+  "pv8_blocks_per_multiprocessor": 1,
+  "pv8_block_threads": 128,
+  "pv8_dynamic_lds_bytes": 49152
+}
