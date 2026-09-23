@@ -3690,6 +3690,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_X5_SYMFOLD_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+/// gfx11 GEMM v2 "V2C" symmetric IU4 prefill tile (M128xN128, 8 waves, two
+/// K128 LDS slots, 2 CTAs/WGP). Reads the production MQ4V2 weights and
+/// `block_i4_128` activations and permutes them at the LDS store; SET/ADD are
+/// separate entries with a 6-argument ABI (no `add` flag).
+pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
 // gfx12 (RDNA4) iu4-direct MMQ sister: weight nibbles feed
 // wmma_i32_16x16x32_iu4_w32_gfx12 directly (K=32/call, int32x2/lane,
 // k_grp=tid>>4 lane split, contiguous-row C — same conventions as the gfx12

@@ -1,0 +1,40 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq
+  registry tag  : qwen3.8:27b
+  kv_mode       : q8 [registry(qwen3.8:27b)]   kv_backend: automatic [automatic]   mtp_mode: off   mode: battery
+  max_seq       : (model/card automatic) [automatic(model/card)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [explicit(--max-think-tokens)]
+  reasoning_effort: xhigh  (parent prompt semantics; independent of cap)
+  max_tokens     : 512 [explicit(--max-tokens)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 1.0      [registry(qwen3.8:27b)]
+      top_p             = 0.95     [registry(qwen3.8:27b)]
+      top_k             = 20       [registry(qwen3.8:27b)]
+      min_p             = 0.0      [registry(qwen3.8:27b)]
+      presence_penalty  = 0.0      [registry(qwen3.8:27b)]
+      repeat_penalty    = 1.0      [registry(qwen3.8:27b)]
+      reasoning_effort  = xhigh    [registry(qwen3.8:27b)]
+  sampling (NOT set, serve/daemon default applies): (none)
+=======================================================================================
+### RUN qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq|off|battery  kv=q8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 0.0, 'repeat_penalty': 1.0, 'reasoning_effort': 'xhigh'} seed=None ###
+  [code]t1  finish=stop   ctx=44     cached=0      gen=114  (think 0/ans 47w) prefill=10883.6ms/4.0tok/s decode=15.6tok/s tau=None | '```python\ndef merge_sorted(a, b):\n    """Merge two sorted lists into a single sorted list.'
+  [reason]t2  finish=stop   ctx=55     cached=0      gen=331  (think 0/ans 164w) prefill=117.9ms/466.4tok/s decode=48.9tok/s tau=None | 'To find the total distance traveled by the train, we need to calculate the distance covere'
+  [factual]t3  finish=stop   ctx=25     cached=0      gen=65   (think 0/ans 55w) prefill=67.4ms/370.8tok/s decode=49.7tok/s tau=None | "The seasons are primarily caused by the tilt of Earth's axis relative to its orbital plane"
+  [prose]t4  finish=stop   ctx=33     cached=0      gen=126  (think 0/ans 102w) prefill=89.2ms/369.9tok/s decode=49.2tok/s tau=None | 'Elias wiped the salt spray from his goggles, expecting another day of monotonous rotation '
+  [instruct]t5  finish=stop   ctx=31     cached=0      gen=76   (think 0/ans 59w) prefill=69.2ms/447.9tok/s decode=49.5tok/s tau=None | '1. Write descriptive variable and function names that clearly indicate their purpose.\n2. K'
+[qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq|off|battery DONE] turns=5 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=331.8tok/s avg_decode=42.6tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=ca89adb1fba2e67e682b6c089ca85236 step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=58fb2e172e0179d60399aa3986f2e224 step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=307be9c2c52cb18d306b995f8383df9e step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=f2f0e3dd2dd52bc02325c9019091adb7 step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=0c8468078b99f943b50b56b4c3bb6c9a step=
+  daemon_binary_md5=17cbef0525e6f4ccf2ec993f64a7f72f path=/home/kaden/hipfire-gemmv2/target/release/daemon
