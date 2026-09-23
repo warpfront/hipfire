@@ -1,0 +1,1065 @@
+{
+  "started_at_utc": "2026-07-28T02:08:56.120683+00:00",
+  "host": "hipx",
+  "git_commit": "76f2a5748959a75c3a9cb484564fe467b6d184d8",
+  "model": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r",
+  "model_bytes": 18700048128,
+  "daemon": "/home/kaden/target-chatcache-76f2a5748/release/examples/daemon",
+  "daemon_sha256": "ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27",
+  "device_visibility": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "ROCR_VISIBLE_DEVICES": "1"
+  },
+  "automatic_clocks": true,
+  "context": 128,
+  "iterations": 128,
+  "warmups": 3,
+  "warmup_iterations": 32,
+  "stationarity": {
+    "window": 3,
+    "min_runs": 3,
+    "confirmation_runs": 2,
+    "max_slope_pct": 5.0,
+    "max_spread_pct": 10.0,
+    "max_median_drift_pct": 5.0,
+    "max_runs": 5
+  },
+  "dpm_warmup_secs": 0.0,
+  "runs": 5,
+  "transport": "pm4",
+  "kv_mode": "q8",
+  "hip": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 328.362758,
+        "us_per_token": 10261.3361875,
+        "tok_s": 97.45319534683651,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 317.986993,
+        "us_per_token": 9937.09353125,
+        "tok_s": 100.63304696239572,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 317.930166,
+        "us_per_token": 9935.3176875,
+        "tok_s": 100.65103416452781,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      }
+    ],
+    "warmup_seconds": 1.3425785480067134,
+    "settling": {
+      "rows": [
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1272.2891619999998,
+          "us_per_token": 9939.759078124998,
+          "tok_s": 100.60606018115244,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1272.1511329999998,
+          "us_per_token": 9938.6807265625,
+          "tok_s": 100.61697598629581,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1272.452838,
+          "us_per_token": 9941.037796875,
+          "tok_s": 100.59311919268163,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1272.7440219999999,
+          "us_per_token": 9943.312671874999,
+          "tok_s": 100.5701050544789,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1272.0804,
+          "us_per_token": 9938.128125000001,
+          "tok_s": 100.62257071172544,
+          "redline_route": {
+            "requested_backend": "hip",
+            "transport": "pm4",
+            "state": "hip",
+            "fallback_reason": null,
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 0,
+              "unique_kernels": 0,
+              "hash": "cbf29ce484222325"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        }
+      ],
+      "seconds": 6.974119562015403,
+      "decision": {
+        "stationary": true,
+        "candidate": {
+          "at_row": 3,
+          "window": {
+            "window": 3,
+            "first_row": 1,
+            "last_row": 3,
+            "min": 100.59311919268163,
+            "median": 100.60606018115244,
+            "max": 100.61697598629581,
+            "slope_pct_per_row": -0.006431515381635565,
+            "spread_pct": 0.023713078090156225,
+            "stable": true
+          }
+        },
+        "confirmed_at_row": 5,
+        "confirmed_window": {
+          "window": 3,
+          "first_row": 3,
+          "last_row": 5,
+          "min": 100.5701050544789,
+          "median": 100.59311919268163,
+          "max": 100.62257071172544,
+          "slope_pct_per_row": 0.01463893319949873,
+          "spread_pct": 0.052156308172577444,
+          "stable": true
+        },
+        "median_drift_pct": 0.01286303076327113,
+        "rejections": []
+      }
+    },
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1272.2187090000002,
+        "us_per_token": 9939.2086640625,
+        "tok_s": 100.61163154927317,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1272.287959,
+        "us_per_token": 9939.7496796875,
+        "tok_s": 100.60615530827326,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1272.125304,
+        "us_per_token": 9938.4789375,
+        "tok_s": 100.61901889501287,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1272.5686640000001,
+        "us_per_token": 9941.9426875,
+        "tok_s": 100.58396345990805,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1272.303047,
+        "us_per_token": 9939.8675546875,
+        "tok_s": 100.60496223900027,
+        "redline_route": {
+          "requested_backend": "hip",
+          "transport": "pm4",
+          "state": "hip",
+          "fallback_reason": null,
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 0,
+            "unique_kernels": 0,
+            "hash": "cbf29ce484222325"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 100.58396345990805,
+      "median": 100.60615530827326,
+      "max": 100.61901889501287
+    },
+    "measurement_validation": {
+      "valid": true,
+      "enough_rows": true,
+      "median_drift_from_settlement_pct": 0.012959251782084392,
+      "window": {
+        "window": 3,
+        "first_row": 3,
+        "last_row": 5,
+        "min": 100.58396345990805,
+        "median": 100.60496223900027,
+        "max": 100.61901889501287,
+        "slope_pct_per_row": -0.006986064951351778,
+        "spread_pct": 0.03484463820138845,
+        "stable": true
+      }
+    },
+    "lifecycle_route_proof": {
+      "valid": true,
+      "backend": "hip",
+      "transport": "pm4",
+      "rows": 13,
+      "require_complete_replay": false,
+      "retained_rows": 0,
+      "observed_positions": [],
+      "prepared_identities": [],
+      "sequences": [],
+      "errors": []
+    },
+    "route_proof": {
+      "valid": true,
+      "backend": "hip",
+      "transport": "pm4",
+      "rows": 5,
+      "require_complete_replay": false,
+      "retained_rows": 0,
+      "observed_positions": [],
+      "prepared_identities": [],
+      "sequences": [],
+      "errors": []
+    }
+  },
+  "auto": {
+    "loaded": {
+      "type": "loaded",
+      "arch": "qwen3_5_moe",
+      "dim": 2048,
+      "layers": 40,
+      "vocab": 248320,
+      "vl": false,
+      "cache_capable": true
+    },
+    "warmups": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 379.028927,
+        "us_per_token": 11844.65396875,
+        "tok_s": 84.42627388172934,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 317.348809,
+        "us_per_token": 9917.15028125,
+        "tok_s": 100.8354186071642,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 32,
+        "ms": 317.443836,
+        "us_per_token": 9920.119874999999,
+        "tok_s": 100.80523346498371,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      }
+    ],
+    "warmup_seconds": 1.3896236090222374,
+    "settling": {
+      "rows": [
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1269.663346,
+          "us_per_token": 9919.244890625,
+          "tok_s": 100.81412557372512,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "fallback",
+            "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 23,
+              "hash": "42f566b752920679"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1269.215116,
+          "us_per_token": 9915.74309375,
+          "tok_s": 100.84972861290757,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "fallback",
+            "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 23,
+              "hash": "42f566b752920679"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1270.449317,
+          "us_per_token": 9925.3852890625,
+          "tok_s": 100.75175631740687,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "fallback",
+            "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 23,
+              "hash": "42f566b752920679"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1268.90159,
+          "us_per_token": 9913.293671875,
+          "tok_s": 100.87464702443945,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "fallback",
+            "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 23,
+              "hash": "42f566b752920679"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        },
+        {
+          "type": "decode_result",
+          "context_tokens": 128,
+          "iterations": 128,
+          "ms": 1270.0692359999998,
+          "us_per_token": 9922.415906249998,
+          "tok_s": 100.78190729438313,
+          "redline_route": {
+            "requested_backend": "auto",
+            "transport": "pm4",
+            "state": "fallback",
+            "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+            "execution_mode": "plain_ar",
+            "prepared": null,
+            "sequence": {
+              "launches": 604,
+              "unique_kernels": 23,
+              "hash": "42f566b752920679"
+            },
+            "observed": {
+              "count_before": 0,
+              "count_after": 0,
+              "count_delta": 0,
+              "first_position": null,
+              "last_position": null
+            },
+            "retained_replay_observed": false
+          }
+        }
+      ],
+      "seconds": 6.960180939000566,
+      "decision": {
+        "stationary": true,
+        "candidate": {
+          "at_row": 3,
+          "window": {
+            "window": 3,
+            "first_row": 1,
+            "last_row": 3,
+            "min": 100.75175631740687,
+            "median": 100.81412557372512,
+            "max": 100.84972861290757,
+            "slope_pct_per_row": -0.030932796353343492,
+            "spread_pct": 0.09718111915680844,
+            "stable": true
+          }
+        },
+        "confirmed_at_row": 5,
+        "confirmed_window": {
+          "window": 3,
+          "first_row": 3,
+          "last_row": 5,
+          "min": 100.75175631740687,
+          "median": 100.78190729438313,
+          "max": 100.87464702443945,
+          "slope_pct_per_row": 0.014958526676910442,
+          "spread_pct": 0.12193727061903979,
+          "stable": true
+        },
+        "median_drift_pct": 0.03195810027477617,
+        "rejections": []
+      }
+    },
+    "rows": [
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1270.477981,
+        "us_per_token": 9925.6092265625,
+        "tok_s": 100.74948319785166,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1269.721665,
+        "us_per_token": 9919.7005078125,
+        "tok_s": 100.8094951266347,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1269.6601300000002,
+        "us_per_token": 9919.219765625001,
+        "tok_s": 100.81438093200579,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1269.830278,
+        "us_per_token": 9920.549046875,
+        "tok_s": 100.80087253991277,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      },
+      {
+        "type": "decode_result",
+        "context_tokens": 128,
+        "iterations": 128,
+        "ms": 1270.062322,
+        "us_per_token": 9922.361890625,
+        "tok_s": 100.78245593368607,
+        "redline_route": {
+          "requested_backend": "auto",
+          "transport": "pm4",
+          "state": "fallback",
+          "fallback_reason": "Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)",
+          "execution_mode": "plain_ar",
+          "prepared": null,
+          "sequence": {
+            "launches": 604,
+            "unique_kernels": 23,
+            "hash": "42f566b752920679"
+          },
+          "observed": {
+            "count_before": 0,
+            "count_after": 0,
+            "count_delta": 0,
+            "first_position": null,
+            "last_position": null
+          },
+          "retained_replay_observed": false
+        }
+      }
+    ],
+    "tok_s": {
+      "min": 100.74948319785166,
+      "median": 100.80087253991277,
+      "max": 100.81438093200579
+    },
+    "measurement_validation": {
+      "valid": true,
+      "enough_rows": true,
+      "median_drift_from_settlement_pct": 0.018818105390926158,
+      "window": {
+        "window": 3,
+        "first_row": 3,
+        "last_row": 5,
+        "min": 100.78245593368607,
+        "median": 100.80087253991277,
+        "max": 100.81438093200579,
+        "slope_pct_per_row": -0.015835675582611116,
+        "spread_pct": 0.03167135116522223,
+        "stable": true
+      }
+    },
+    "lifecycle_route_proof": {
+      "valid": false,
+      "backend": "auto",
+      "transport": "pm4",
+      "rows": 13,
+      "require_complete_replay": false,
+      "retained_rows": 0,
+      "observed_positions": [],
+      "prepared_identities": [],
+      "sequences": [],
+      "errors": [
+        "row 0: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 0: automatic route state='fallback'",
+        "row 0: automatic route has no prepared identity",
+        "row 1: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 1: automatic route state='fallback'",
+        "row 1: automatic route has no prepared identity",
+        "row 2: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 2: automatic route state='fallback'",
+        "row 2: automatic route has no prepared identity",
+        "row 3: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 3: automatic route state='fallback'",
+        "row 3: automatic route has no prepared identity",
+        "row 4: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 4: automatic route state='fallback'",
+        "row 4: automatic route has no prepared identity",
+        "row 5: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 5: automatic route state='fallback'",
+        "row 5: automatic route has no prepared identity",
+        "row 6: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 6: automatic route state='fallback'",
+        "row 6: automatic route has no prepared identity",
+        "row 7: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 7: automatic route state='fallback'",
+        "row 7: automatic route has no prepared identity",
+        "row 8: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 8: automatic route state='fallback'",
+        "row 8: automatic route has no prepared identity",
+        "row 9: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 9: automatic route state='fallback'",
+        "row 9: automatic route has no prepared identity",
+        "row 10: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 10: automatic route state='fallback'",
+        "row 10: automatic route has no prepared identity",
+        "row 11: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 11: automatic route state='fallback'",
+        "row 11: automatic route has no prepared identity",
+        "row 12: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 12: automatic route state='fallback'",
+        "row 12: automatic route has no prepared identity",
+        "automatic arm observed no successful retained replay",
+        "automatic arm did not observe multiple replay positions",
+        "prepared identity changed across rows: []",
+        "sequence identity changed across rows: []"
+      ]
+    },
+    "route_proof": {
+      "valid": false,
+      "backend": "auto",
+      "transport": "pm4",
+      "rows": 5,
+      "require_complete_replay": true,
+      "retained_rows": 0,
+      "observed_positions": [],
+      "prepared_identities": [],
+      "sequences": [],
+      "errors": [
+        "row 0: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 0: automatic route state='fallback'",
+        "row 0: timed row observed no retained replay",
+        "row 0: observed 0 retained replays for 128 timed iterations",
+        "row 0: first replay position None != 128",
+        "row 0: last replay position None != 255",
+        "row 0: automatic route has no prepared identity",
+        "row 1: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 1: automatic route state='fallback'",
+        "row 1: timed row observed no retained replay",
+        "row 1: observed 0 retained replays for 128 timed iterations",
+        "row 1: first replay position None != 128",
+        "row 1: last replay position None != 255",
+        "row 1: automatic route has no prepared identity",
+        "row 2: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 2: automatic route state='fallback'",
+        "row 2: timed row observed no retained replay",
+        "row 2: observed 0 retained replays for 128 timed iterations",
+        "row 2: first replay position None != 128",
+        "row 2: last replay position None != 255",
+        "row 2: automatic route has no prepared identity",
+        "row 3: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 3: automatic route state='fallback'",
+        "row 3: timed row observed no retained replay",
+        "row 3: observed 0 retained replays for 128 timed iterations",
+        "row 3: first replay position None != 128",
+        "row 3: last replay position None != 255",
+        "row 3: automatic route has no prepared identity",
+        "row 4: fallback='Redline prepare after warmup failed: gemv_hfq4g256_moe_gate_up_k8_indexed: GFX10/GFX11 PM4 dispatch does not yet support scratch (private=20, dynamic_callstack=false)'",
+        "row 4: automatic route state='fallback'",
+        "row 4: timed row observed no retained replay",
+        "row 4: observed 0 retained replays for 128 timed iterations",
+        "row 4: first replay position None != 128",
+        "row 4: last replay position None != 255",
+        "row 4: automatic route has no prepared identity",
+        "automatic arm observed no successful retained replay",
+        "automatic arm did not observe multiple replay positions",
+        "prepared identity changed across rows: []",
+        "sequence identity changed across rows: []"
+      ]
+    }
+  },
+  "speedup": 1.0019354405408185,
+  "valid": false
+}

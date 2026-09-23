@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, json, os, re, shutil, signal, subprocess, sys, time, urllib.request
+import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
@@ -39,7 +39,7 @@ RECIPES = {
     "nothink": {"temperature": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5,
                 "reasoning_effort": "none"},
 }
-SAMPLE_KEYS = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "reasoning_effort"]
+SAMPLE_KEYS = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty", "reasoning_effort"]
 
 GENRE_BATTERY = [
     ("code",     "Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists "
@@ -56,7 +56,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def resolve_sampling(spec, tag, registry_path):
-    """Return (values_dict, source_dict). spec: 'registry'|'greedy'|'recipe:NAME'|json string."""
+    """Return (values_dict, source_dict). spec: 'registry'|'registry:<mode>'|'greedy'|'recipe:NAME'|json string."""
     src = {}
     if spec == "greedy":
         return {"temperature": 0.0}, {"temperature": "explicit(greedy)"}
@@ -68,22 +68,39 @@ def resolve_sampling(spec, tag, registry_path):
     if spec.startswith("json:"):
         v = json.loads(spec[5:])
         return v, {k: "explicit" for k in v}
-    if spec == "registry":
+    if spec == "registry" or spec.startswith("registry:"):
         # production behavior: the serve applies the model's recommended_settings.
         # We resolve them HERE so they are explicit + visible (and reproducible).
+        # `registry` = the default profile (recommended_settings). `registry:<mode>`
+        # (general|coding|instruct) selects a named per-mode sampling profile;
+        # `general` falls back to recommended_settings when no profile map is set.
+        profile = spec.split(":", 1)[1] if ":" in spec else None
         rec = {}
         try:
             reg = json.load(open(registry_path))["models"]
             entry = reg.get(tag, {})
-            rec = entry.get("recommended_settings", {}) or {}
+            if profile is None:
+                rec = entry.get("recommended_settings", {}) or {}
+            else:
+                profiles = entry.get("sampling_profiles") or {}
+                if profile == "general":
+                    rec = profiles.get("general") or entry.get("recommended_settings", {}) or {}
+                else:
+                    rec = profiles.get(profile, {}) or {}
         except Exception as e:
             print(f"  [warn] could not read registry {registry_path}: {e}", file=sys.stderr)
+        label = f"registry({tag}:{profile})" if profile else f"registry({tag})"
         vals, source = {}, {}
-        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty"]:
+        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
             if k in rec:
-                vals[k] = rec[k]; source[k] = f"registry({tag})"
+                vals[k] = rec[k]; source[k] = label
+        # The instruct profile is the non-thinking mode: drive reasoning_effort=none
+        # through the existing budget machinery (no daemon request-JSON change).
+        if profile == "instruct":
+            vals["reasoning_effort"] = "none"; source["reasoning_effort"] = label
         if not vals:
-            sys.exit(f"  registry has no recommended_settings for tag {tag!r} — refusing to fall back to a "
+            what = f"sampling_profiles.{profile}" if profile else "recommended_settings"
+            sys.exit(f"  registry has no {what} for tag {tag!r} — refusing to fall back to a "
                      f"naive default. Pass --tag <registry-tag> or --sampling recipe:coding explicitly.")
         return vals, source
     sys.exit(f"bad --sampling {spec!r}")
@@ -129,7 +146,11 @@ def show_config(cfg):
     print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
-    print(f"  max_tokens     : {cfg['max_tokens']}  ({'>cap, model can answer' if cfg['max_tokens'] > cfg['thinking_cap_tokens'] or cfg['thinking_cap_tokens']==0 else 'WARNING: <= think cap -> empty/think-only risk'})")
+    _cap = cfg['thinking_cap_tokens']
+    _note = ('uncapped think budget' if _cap == 0
+             else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
+             else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
+    print(f"  max_tokens     : {cfg['max_tokens']}  ({_note})")
     print("  sampling (what IS set):")
     for k in SAMPLE_KEYS:
         if k in cfg["sampling"]:
@@ -140,21 +161,82 @@ def show_config(cfg):
 
 
 # ---------- serve spawn (robust, self-contained) ----------
+# Popen(start_new_session=True) makes the CLI leader PID also the session PGID.
+# Retain that known PGID so cleanup can killpg even after the leader exits
+# (os.getpgid(leader) then returns ESRCH while descendants may still live).
 _serve_proc = None
+_serve_pgid = None
+
+
+def _pid_file_path():
+    """Optional cross-process PID path for the active CLI process-group leader."""
+    path = os.environ.get("HIPFIRE_SERVE_HARNESS_PID_FILE")
+    return path if path else None
+
+
+def _clear_pid_file():
+    path = _pid_file_path()
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _write_pid_file(pid):
+    """Atomically publish the CLI process-group leader PID for a parent observer."""
+    path = _pid_file_path()
+    if not path:
+        return
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".serve_harness_pid.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(f"{int(pid)}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
 
 def _kill_serve():
     """Kill ONLY this harness's own native serve tree (the Rust CLI + its child daemon),
     scoped by process group — NOT a broad `pkill -x daemon`, which would execute
     the parallel autoresearch daemons pinned to OTHER GPUs. spawn_serve starts the
-    serve in its own session (start_new_session) so this group kill is exact."""
-    global _serve_proc
-    if _serve_proc is not None:
+    serve in its own session (start_new_session) so this group kill is exact.
+
+    Always killpg the retained session PGID (equal to the CLI Popen PID). Do not
+    gate on os.getpgid(leader): after the leader exits getpgid returns ESRCH even
+    when the process group still has descendants. ESRCH from killpg is benign."""
+    global _serve_proc, _serve_pgid
+    pgid = _serve_pgid
+    if pgid is None and _serve_proc is not None:
+        pgid = _serve_proc.pid
+    if pgid is not None:
         try:
-            os.killpg(os.getpgid(_serve_proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try: _serve_proc.kill()
-            except Exception: pass
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            # ESRCH: group already gone (benign race). Other errors: last-ditch
+            # kill the Popen handle if it is still around.
+            if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
+                try:
+                    _serve_proc.kill()
+                except Exception:
+                    pass
     _serve_proc = None
+    _serve_pgid = None
+    _clear_pid_file()
 
 
 def _native_cli():
@@ -198,20 +280,43 @@ budget = {json.dumps(cfg["thinking_budget"])}
         handle.write(text)
 
 
-def _native_service_warm(port):
+def _native_service_warm(port, expected_model=None, proc=None):
+    """True only when health is ready for *this* spawn.
+
+    Rejects an unrelated warm service after the newly spawned leader has already
+    exited: require ``proc`` still alive when provided, and when
+    ``expected_model`` is set require health reports that same model path.
+    """
+    if proc is not None and proc.poll() is not None:
+        return False
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
             health = json.load(response)
-        return bool(health.get("model")) and not health.get("loading_model")
     except Exception:
         return False
+    if not bool(health.get("model")) or health.get("loading_model"):
+        return False
+    if expected_model is not None:
+        reported = health.get("model")
+        if not isinstance(reported, str):
+            return False
+        # Compare resolved paths so relative vs absolute forms still match.
+        try:
+            if os.path.realpath(reported) != os.path.realpath(expected_model):
+                return False
+        except OSError:
+            if reported != expected_model:
+                return False
+    if proc is not None and proc.poll() is not None:
+        return False
+    return True
 
 
 def spawn_serve(cfg, home, log):
     """Spawn native `hipfire serve` with the resolved serve config; retry on the flaky
     daemon-spawn; return when warm. The per-request sampling is sent by the driver, so
     one serve handles all recipes/modes."""
-    global _serve_proc
+    global _serve_proc, _serve_pgid
     os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
     models = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
     for ln in ("models", "templates"):
@@ -235,13 +340,18 @@ def spawn_serve(cfg, home, log):
     for attempt in range(1, 5):
         _kill_serve(); time.sleep(3)
         open(log, "w").close()
+        # Drop any stale observer PID before the next CLI process-group leader exists.
+        _clear_pid_file()
         _serve_proc = subprocess.Popen(
             [cli, "serve", "127.0.0.1", str(cfg["port"])],
             cwd=REPO, env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT,
             start_new_session=True)   # own process group so _kill_serve's group-kill is exact + scoped
+        # Leader PID == PGID under start_new_session; retain it for dead-leader cleanup.
+        _serve_pgid = _serve_proc.pid
+        _write_pid_file(_serve_pgid)
         for _ in range(90):
             txt = open(log).read() if os.path.exists(log) else ""
-            if _native_service_warm(cfg["port"]):
+            if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return True
             if re.search(r"out of memory|error loading|panic", txt, re.I):
                 break
@@ -383,7 +493,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",
-                    help="registry | greedy | recipe:general|coding|nothink | json:{...}")
+                    help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
     ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
     ap.add_argument("--port", type=int, default=11520)
@@ -403,6 +513,14 @@ def main():
     show_config(cfg)
     if args.show_config:
         return
+    if cfg['thinking_cap_tokens'] and args.max_tokens <= cfg['thinking_cap_tokens']:
+        sys.exit(
+            f"serve_harness: max_tokens ({args.max_tokens}) <= thinking budget "
+            f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "
+            f"think-only output with zero visible answer. Raise --max-tokens above "
+            f"{cfg['thinking_cap_tokens']}, lower --thinking (low={THINKING_BUDGET['low']}), "
+            f"or use --thinking uncapped."
+        )
     if not args.no_spawn:
         if not spawn_serve(cfg, args.home, args.serve_log):
             sys.exit("serve_harness: serve failed to warm after retries")
