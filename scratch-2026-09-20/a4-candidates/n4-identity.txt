@@ -1,0 +1,6 @@
+N=4 default byte-identity check on the same real layer-0 SiLU/AWQ/FWHT producer activations.
+Compared 1,253,376 output bytes (17,408 block_i4_128 records) from base 5729b526f and candidate 95b633455bf54fcf5bc56ba7a62fdb53be5b8036.
+cmp exit: 0
+base sha256:      478dd602b1fba2166eb979005a34a377173258360b295048e51114a3eb429f46
+candidate sha256: 478dd602b1fba2166eb979005a34a377173258360b295048e51114a3eb429f46
+Raw rig logs: /tmp/a4hist4.log and /tmp/a4n4identity.log.

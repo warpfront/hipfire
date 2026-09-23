@@ -1,0 +1,5 @@
+Real activation source: qwen3.8-27b.mq4-xt layer-0 down-projection SiLU/AWQ/FWHT producer, N=128 tokens, K=17408.
+Incumbent candidate indices j=[0,2,5,7], 17,408 nonzero block_i4_128 inputs.
+Selection counts: j0=0, j2=360, j5=16,322, j7=726; zero blocks=0.
+Selected N=2 subset: j={5,7}, preserving original ascending candidate order.
+Raw rig log: /tmp/a4hist4.log, line containing IU4_A4_HIST.

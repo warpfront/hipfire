@@ -1,0 +1,20 @@
+KLD evaluator: HIPFIRE_GRAPH=0 HIPFIRE_NORMALIZE_PROMPT=0 --kv-mode fp8 --kv-v q8 --scoring-mode prefill
+Reference sha256: 8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a
+Shipped artifact sha256: 80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3
+L1 artifact sha256: ec18b107bc0cfb07aa7714245962ea26c14140012b1a4b2ffa1aeb875494a8cc
+
+N artifact route c2 c24
+4 shipped iu4 - 0.080883
+4 shipped fp8v2 - 0.049236
+4 l1 iu4 - 0.075233
+4 l1 fp8v2 - 0.046290
+2 shipped iu4 0.057846 0.077801
+2 shipped fp8v2 0.037689 0.049236
+2 l1 iu4 0.060302 0.076639
+2 l1 fp8v2 0.035014 0.046290
+1 shipped iu4 0.066052 0.087765
+1 shipped fp8v2 0.037689 0.049236
+1 l1 iu4 0.061269 0.083482
+1 l1 fp8v2 0.035014 0.046290
+
+Raw per-arm logs and output caches: scratch-2026-09-20/a4-candidates/kld/

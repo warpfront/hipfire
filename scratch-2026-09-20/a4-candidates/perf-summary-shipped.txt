@@ -1,0 +1,11 @@
+Paired daemon gates on shipped qwen3.8:27b-mq4-xt, graph on, fp8 KV.
+Protocol: matrix --pp 512,8192 --ctx 128 --tg 128 --spec off --runs 3 --warmups 1; TTFT ttft_5900.txt --runs 8 --warmups 2.
+Daemon sha256: 8004e86f60f8806cbbb9ed54a679ecf1160519f27e1eab96402ca80d9fc92be1
+
+Candidate pair pp512(base,cand,delta) pp8192(base,cand,delta) decode_delta TTFT_ms(base,cand,delta)
+N2 p1 2932.2 2981.6 +1.685% 2980.9 3041.1 +2.020% +1.212% 2047.572 1992.624 -2.684%
+N2 p2 2895.1 2956.7 +2.128% 2953.9 3032.1 +2.647% -0.031% 2051.414 1995.547 -2.723%
+N1 p1 2885.8 3030.1 +5.000% 2946.2 3100.2 +5.227% +0.073% 2046.880 1956.289 -4.426%
+N1 p2 2881.8 3044.8 +5.656% 2957.1 3099.6 +4.819% -0.024% 2049.906 1958.752 -4.447%
+
+Raw JSON/stderr: scratch-2026-09-20/a4-candidates/perf/
