@@ -1416,6 +1416,18 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
 
+/// gfx11 (RDNA3, incl. gfx1151/RDNA3.5) sister of
+/// GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC. Composes the gfx11 grouped-WMMA
+/// structure from GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC (half16 operands,
+/// RDNA3 `_w32` WMMA intrinsic, C-mapping `2*j+(tid>>4)`, 2× K-tile pipeline)
+/// with the HFQ6-G256 200 B/group 6-bit dequant. Unblocks fast AWQ/MQ6 A3B
+/// prefill on gfx11/gfx1151 (was falling back to the slow `*_indexed` GEMV,
+/// ~22× slower). Dtype-agnostic between HFQ6 and MQ6 (FWHT applied to X by
+/// the caller). **gfx11 (RDNA3/3.5) only** — the gfx12 sister above uses the
+/// _gfx12 WMMA intrinsic + half8 operand split.
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_k2.hip");
+
 /// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
 /// K-substep 2 A-dequants + 1 B-load → 2 WMMAs (vs 1+1+1 in v1). Halves X-gather

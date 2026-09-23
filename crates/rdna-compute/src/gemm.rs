@@ -11212,30 +11212,34 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_rdna4() {
-            panic!(
-                "gemm_hfq6g256_moe_grouped_wmma: gfx12-only kernel (current arch = {}). \
-                 The gfx11 sister is not yet implemented; add a _k2 variant if needed.",
-                self.arch
-            );
-        }
-        // v2 lever (M-direction 2×1 reg-block, env-gated). Defaults off;
-        // promotes when `HIPFIRE_MOE_HFQ6_V2=1`. Each warp covers 32 rows
-        // × 16 slots (vs 16×16); B-load halved per output. Compatible with
-        // existing BLOCK_M=16 scatter — only the M (row) dimension is
-        // restrided. The slot tile stride stays at 16 so expert-boundary
-        // safety is unchanged from v1.
-        let use_v2 = self.flags.moe_hfq6_v2;
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        // v2 lever (M-direction 2×1 reg-block, env-gated, gfx12-only).
+        // Defaults off; promotes when `HIPFIRE_MOE_HFQ6_V2=1`. Each warp
+        // covers 32 rows × 16 slots (vs 16×16); B-load halved per output.
+        // The slot tile stride stays at 16 so expert-boundary safety is
+        // unchanged from v1.
+        let use_v2 = is_gfx12 && self.flags.moe_hfq6_v2;
         let (kernel_name, kernel_src, row_tile_stride) = if use_v2 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_v2_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC,
                 32usize,
             )
-        } else {
+        } else if is_gfx12 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC,
+                16usize,
+            )
+        } else {
+            // gfx11 (RDNA3, incl. gfx1151/RDNA3.5): half16 `_w32` WMMA k2
+            // sister. Same kernarg + 16-row × 16-slot tile geometry; the
+            // RDNA3 WMMA intrinsic + C-mapping live in the kernel. Unblocks
+            // AWQ/MQ6 A3B prefill on gfx11/gfx1151 (was falling back to the
+            // ~22× slower `*_indexed` GEMV).
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_k2",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_SRC,
                 16usize,
             )
         };

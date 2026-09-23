@@ -7059,7 +7059,12 @@ fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
     match value {
         Some("0") | Some("off") | Some("false") => false,
         Some("1") | Some("on") | Some("true") => true,
-        _ => arch.starts_with("gfx12"),
+        // gfx12 (RDNA4) and gfx11 (RDNA3/3.5, incl. gfx1151) both now have a
+        // grouped-WMMA MQ6 MoE prefill kernel (gemm_hfq6g256_moe_grouped_wmma
+        // _gfx12 / _k2). Before the gfx11 _k2 kernel existed this defaulted
+        // gfx12-only, forcing MQ6 experts onto the ~22× slower `*_indexed`
+        // GEMV fallback on gfx1151 (the AWQ A3B dense-misroute bug).
+        _ => arch.starts_with("gfx12") || arch.starts_with("gfx11"),
     }
 }
 
@@ -15305,12 +15310,16 @@ mod tests {
     }
 
     #[test]
-    fn mq6_batched_admit_defaults_to_gfx12_only() {
+    fn mq6_batched_admit_defaults_to_gfx11_and_gfx12() {
+        // gfx12 (RDNA4) and gfx11 (RDNA3/3.5) both have a grouped-WMMA MQ6
+        // MoE prefill kernel now, so both default-admit.
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1201"));
         assert!(mq6_batched_admit_enabled_from_env(None, "gfx1200"));
-        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1100"));
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1151"));
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1100"));
+        // CDNA (gfx9xx) has no grouped-WMMA MQ6 kernel — stays opt-in.
         assert!(!mq6_batched_admit_enabled_from_env(None, "gfx942"));
-        assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1100"));
+        assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx942"));
         assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1201"));
     }
 
