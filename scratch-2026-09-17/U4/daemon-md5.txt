@@ -1,0 +1,2 @@
+56462d2e844d33241fa103d7db8dadb7  target/release/daemon-baseline
+42a8d3537ba491f6f0c105fe9fdf1d13  target/release/daemon-candidate

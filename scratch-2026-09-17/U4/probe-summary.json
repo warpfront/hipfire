@@ -1,0 +1,27 @@
+{
+  "harness": "crates/saddle-lab/examples/kx3_foldfree_probe.rs",
+  "warning": "Zero-filled synthetic device buffers; timing is indicative only.",
+  "lds_bytes": 20480,
+  "samples_per_row": 20,
+  "warmups_per_row": 5,
+  "gate_M4096_K5120_N34816_us": {
+    "baseline_A1": 6803.105,
+    "candidate_B": 6625.905,
+    "baseline_A2": 6816.367,
+    "baseline_mean": 6809.736,
+    "candidate_time_delta_pct": -2.699532,
+    "candidate_throughput_delta_pct": 2.774429
+  },
+  "residual_M4096_K17408_N5120_us": {
+    "baseline_A1": 2988.959,
+    "candidate_B": 2985.721,
+    "baseline_A2": 2989.541,
+    "baseline_mean": 2989.250,
+    "candidate_time_delta_pct": -0.118056,
+    "candidate_throughput_delta_pct": 0.118196
+  },
+  "occupancy": {
+    "baseline_blocks_per_cu": 3,
+    "candidate_blocks_per_cu": 3
+  }
+}

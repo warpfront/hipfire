@@ -1,0 +1,62 @@
+{
+  "baseline": {
+    "assembly": "baseline.s",
+    "full_add_epilogue_path": "lines 7011-9006",
+    "packets": 1867,
+    "stores": 64,
+    "loads": 64,
+    "address_valu": {
+      "total": 448,
+      "per_store": 7.0,
+      "classes": [
+        "v_mad_co_i64_i32",
+        "v_lshlrev_b64_e32",
+        "v_add_co_u32",
+        "v_add_co_ci_u32_e64"
+      ]
+    },
+    "bounds_vector_compares": {
+      "total": 16,
+      "per_store": 0.25
+    },
+    "v_cndmask": 0
+  },
+  "candidate_full_tile": {
+    "assembly": "candidate-final.s",
+    "full_add_epilogue_path": "common lines 7744-7767 plus full-tile branch lines 8813-9287",
+    "packets": 496,
+    "stores": 64,
+    "loads": 64,
+    "address_valu": {
+      "total": 2,
+      "per_store": 0.03125,
+      "classes": [
+        "v_mul_lo_u32",
+        "v_add_lshl_u32"
+      ]
+    },
+    "bounds_vector_compares": {
+      "total": 0,
+      "per_store": 0.0
+    },
+    "bounds_scalar_compares_per_tile": 2,
+    "v_cndmask": 0,
+    "note": "Two scalar comparisons select full vs partial tile once. Partial-tile source path preserves the old bounds and pointer arithmetic."
+  },
+  "candidate_resources": {
+    "full_add": {
+      "vgpr": 202,
+      "sgpr": 40,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "scratch_bytes": 0
+    },
+    "full_set": {
+      "vgpr": 202,
+      "sgpr": 40,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "scratch_bytes": 0
+    }
+  }
+}
