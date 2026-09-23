@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 825,
+"finish": "stop",
+"think_words": 328,
+"ans_words": 209,
+"prefill_ms": 42.1,
+"prefill_tok_s": 522.3,
+"decode_tok_s": 219.1,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.225,
+"wall_s": 3.811,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The name **Flagstaff, Arizona** originates from a literal **flagpole (or flagstaff)** that",
+"assistant_content": "The name **Flagstaff, Arizona** originates from a literal **flagpole (or flagstaff)** that marked the site where the **Overland Telegraph Line** first reached western Arizona in **June 1863**. \n\nHere are the key historical details:\n\n- **Telegraph Landmark**: When Union Pacific engineers completed the eastern section of the transcontinental telegraph line, they sent crews westward. On June 12, 1863, construction teams from both coasts met at the site and joined the final wire, completing the first transcontinental telegraph connection. A tall wooden pole flying a flag was erected as a signaling post and landmark to mark this location.\n- **Camp Flagstaff**: Travelers, surveyors, and workers began referring to the area as \"Flagstaff Camp\" because of the prominent flag that waved there. The name gradually shortened to simply \"Flagstaff.\"\n- **Official Naming**: As settlements grew and railroad surveys moved into the region in the late 1860s\u20131870s, the community retained the name. It was officially incorporated as the city of Flagstaff in **1886**.\n\nWhile the land had been inhabited for millennia by Indigenous peoples (including the Navajo, Hopi, and Puebloans), who used various local names for the region, the English-language name \"Flagstaff\" directly honors that early telegraph-era signal pole. Today, the site is commemorated with a historical marker and replica flagpole near downtown."
+}
+]
