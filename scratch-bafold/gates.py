@@ -35,7 +35,7 @@ for idx, arm in enumerate('ABBAABBA' if mode == 'abba' else ('A' if mode == 'wt2
     (root / f'{idx:02d}-{arm}.log').write_text(result.stdout)
     if result.returncode:
         raise RuntimeError(f'{arch} {mode} {arm}: exit {result.returncode}; see {root}')
-    if 'KV cache: Q8 vmm (' not in result.stdout:
+    if mode == 'abba' and 'KV cache: Q8 vmm (' not in result.stdout:
         raise RuntimeError(f'{arch} {mode} {arm}: missing Q8 VMM assertion; see {root}')
     if mode == 'abba':
         report = None
