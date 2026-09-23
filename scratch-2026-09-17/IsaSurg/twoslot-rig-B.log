@@ -1,0 +1,15 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201
+RESOURCE_OCC,kx3_fp8_gate_shipped,blocks_per_cu=3
+RESOURCE_OCC,kx3_fp8_gate_foldfree,blocks_per_cu=3
+RESOURCE_OCC,kx3_fp8_residual_shipped,blocks_per_cu=3
+RESOURCE_OCC,kx3_fp8_residual_foldfree,blocks_per_cu=3
+  WARNING: kx3_iu4_shipped_mod: Radiowave could not certify existing cache artifact: no HIP offload bundle target containing gfx1201 was found in /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201/kx3_iu4_shipped_mod.62be8413199d7e5c.hsaco
+RESOURCE_OCC,gemm_mq4g256v2_residual_mmq_iu4_full_set,blocks_per_cu=3
+RESOURCE_OCC,gemm_mq4g256v2_residual_mmq_iu4_full_add,blocks_per_cu=3
+RESULT,fp8v2_as_shipped,gate_up_M4096_K5120_N34816,9415.293,155.098
+RESULT,fp8v2_foldfree_proxy,gate_up_M4096_K5120_N34816,8488.763,172.026
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6827.988,213.868
+RESULT,fp8v2_as_shipped,residual_M4096_K17408_N5120,4753.348,153.606
+RESULT,fp8v2_foldfree_proxy,residual_M4096_K17408_N5120,3819.638,191.155
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,3001.710,243.243

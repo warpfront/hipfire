@@ -1,0 +1,12 @@
+RULE1 gemm_mq4g256v2_residual_mmq_iu4 line 1186: move loadcnt(0) across barrier; packet uses [3, 4] -> counts [2, 1]
+RULE1 gemm_mq4g256v2_residual_mmq_iu4 line 3042: move loadcnt(0) across barrier; packet uses [3, 4] -> counts [2, 1]
+RULE1 gemm_mq4g256v2_residual_mmq_iu4_full_add line 6816: move loadcnt(0) across barrier; packet uses [3, 4] -> counts [2, 1]
+RULE1 gemm_mq4g256v2_residual_mmq_iu4_full_set line 9704: move loadcnt(0) across barrier; packet uses [3, 4] -> counts [2, 1]
+RULE2 gemm_mq4g256v2_residual_mmq_iu4 line 1195: mixed(0) -> dscnt(0) after DS publication
+RULE2 gemm_mq4g256v2_residual_mmq_iu4 line 3051: mixed(0) -> dscnt(0) after DS publication
+RULE2 gemm_mq4g256v2_residual_mmq_iu4_full_add line 6825: mixed(0) -> dscnt(0) after DS publication
+RULE2 gemm_mq4g256v2_residual_mmq_iu4_full_set line 9713: mixed(0) -> dscnt(0) after DS publication
+RULE3 gemm_mq4g256v2_residual_mmq_iu4 line 1311: split mixed(0); first post-barrier packet(s) [6]/6 -> loadcnt(1)
+RULE3 gemm_mq4g256v2_residual_mmq_iu4 line 3166: split mixed(0); first post-barrier packet(s) [6]/6 -> loadcnt(1)
+RULE3 gemm_mq4g256v2_residual_mmq_iu4_full_add line 6940: split mixed(0); first post-barrier packet(s) [6]/6 -> loadcnt(1)
+RULE3 gemm_mq4g256v2_residual_mmq_iu4_full_set line 9828: split mixed(0); first post-barrier packet(s) [6]/6 -> loadcnt(1)

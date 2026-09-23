@@ -1,0 +1,4 @@
+RULE_SPLIT gemm_mq4g256v2_residual_mmq_iu4 line 1071: move pre-signal loadcnt(0) through signal/wait+fold to pre-branch loadcnt(1); six packets, one younger GLOBAL_INV_ACCESS
+RULE_SPLIT gemm_mq4g256v2_residual_mmq_iu4 line 2942: move pre-signal loadcnt(0) through signal/wait+fold to pre-branch loadcnt(1); six packets, one younger GLOBAL_INV_ACCESS
+RULE_SPLIT gemm_mq4g256v2_residual_mmq_iu4_full_add line 6721: move pre-signal loadcnt(0) through signal/wait+fold to pre-branch loadcnt(1); six packets, one younger GLOBAL_INV_ACCESS
+RULE_SPLIT gemm_mq4g256v2_residual_mmq_iu4_full_set line 9624: move pre-signal loadcnt(0) through signal/wait+fold to pre-branch loadcnt(1); six packets, one younger GLOBAL_INV_ACCESS

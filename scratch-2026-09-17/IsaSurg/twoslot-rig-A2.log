@@ -1,0 +1,14 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201
+RESOURCE_OCC,kx3_fp8_gate_shipped,blocks_per_cu=3
+RESOURCE_OCC,kx3_fp8_gate_foldfree,blocks_per_cu=3
+RESOURCE_OCC,kx3_fp8_residual_shipped,blocks_per_cu=3
+RESOURCE_OCC,kx3_fp8_residual_foldfree,blocks_per_cu=3
+RESOURCE_OCC,gemm_mq4g256v2_residual_mmq_iu4_full_set,blocks_per_cu=3
+RESOURCE_OCC,gemm_mq4g256v2_residual_mmq_iu4_full_add,blocks_per_cu=3
+RESULT,fp8v2_as_shipped,gate_up_M4096_K5120_N34816,9407.675,155.223
+RESULT,fp8v2_foldfree_proxy,gate_up_M4096_K5120_N34816,8487.425,172.053
+RESULT,iu4_as_shipped,gate_up_M4096_K5120_N34816,6831.030,213.773
+RESULT,fp8v2_as_shipped,residual_M4096_K17408_N5120,4758.369,153.444
+RESULT,fp8v2_foldfree_proxy,residual_M4096_K17408_N5120,3828.480,190.714
+RESULT,iu4_as_shipped,residual_M4096_K17408_N5120,3001.631,243.249
