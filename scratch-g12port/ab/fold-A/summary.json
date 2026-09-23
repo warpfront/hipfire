@@ -1,0 +1,111 @@
+{
+  "label": "fold-A",
+  "card": "A",
+  "arms": {
+    "base": {
+      "bindir": "/home/kaden/ClaudeCode/warpfront/wt-g12port/scratch-g12port/bin-base",
+      "env": {}
+    },
+    "fold": {
+      "bindir": "/home/kaden/ClaudeCode/warpfront/wt-g12port/scratch-g12port/bin-cand",
+      "env": {
+        "HIPFIRE_F1LITE": "0"
+      }
+    }
+  },
+  "rows": [
+    {
+      "tag": "p0-base",
+      "arm": "base",
+      "pp8192_samples": [
+        3617.2,
+        3616.9,
+        3615.9
+      ],
+      "pp8192_median": 3616.9,
+      "tg128_samples": [
+        36.44993910190497,
+        35.42413451587117,
+        36.446734379604194
+      ],
+      "tg128_median": 36.446734379604194
+    },
+    {
+      "tag": "p1-fold",
+      "arm": "fold",
+      "pp8192_samples": [
+        3623.9,
+        3624.1,
+        3625.3
+      ],
+      "pp8192_median": 3624.1,
+      "tg128_samples": [
+        36.4640398071906,
+        36.45979048470269,
+        36.46637355440038
+      ],
+      "tg128_median": 36.4640398071906
+    },
+    {
+      "tag": "p2-fold",
+      "arm": "fold",
+      "pp8192_samples": [
+        3623.4,
+        3626.1,
+        3624.1
+      ],
+      "pp8192_median": 3624.1,
+      "tg128_samples": [
+        36.47570581436839,
+        36.474087017790374,
+        36.469254869056805
+      ],
+      "tg128_median": 36.474087017790374
+    },
+    {
+      "tag": "p3-base",
+      "arm": "base",
+      "pp8192_samples": [
+        3619.4,
+        3621.2,
+        3621.2
+      ],
+      "pp8192_median": 3621.2,
+      "tg128_samples": [
+        36.453776362092334,
+        36.45763801247789,
+        36.46379969697802
+      ],
+      "tg128_median": 36.45763801247789
+    }
+  ],
+  "base_pp8192": {
+    "process_medians": [
+      3616.9,
+      3621.2
+    ],
+    "mean": 3619.05
+  },
+  "base_tg128": {
+    "process_medians": [
+      36.446734379604194,
+      36.45763801247789
+    ],
+    "mean": 36.45218619604104
+  },
+  "fold_pp8192": {
+    "process_medians": [
+      3624.1,
+      3624.1
+    ],
+    "mean": 3624.1
+  },
+  "fold_tg128": {
+    "process_medians": [
+      36.4640398071906,
+      36.474087017790374
+    ],
+    "mean": 36.469063412490485
+  },
+  "delta_pct": 0.13953938188198123
+}

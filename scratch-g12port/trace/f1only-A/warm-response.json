@@ -1,0 +1,34 @@
+{
+  "start_monotonic_ns": 179804853402846,
+  "end_monotonic_ns": 179807093889115,
+  "wall_ms": 2240.486269,
+  "usage": {
+    "prompt_tokens": 8192,
+    "completion_tokens": 1,
+    "total_tokens": 8193,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "ttft_ms": 2184.8,
+    "prefill_ms": 2184.8,
+    "prefill_tok_s": 3749.6,
+    "decode_tok_s": 26.9,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "mtp_window_timings": null
+  },
+  "text": "The"
+}
