@@ -1,0 +1,23 @@
+[00:48:15] gate2 start
+[00:48:15] A1 start
+[00:48:46] A1 exit 0
+[00:48:46] A1 start
+[00:49:01] A1 exit 0
+[00:49:01] A1 start
+[00:49:18] A1 exit 0
+[00:49:38] B2 start
+[00:49:54] B2 exit 0
+[00:49:54] B1 start
+[00:50:10] B1 exit 0
+[00:50:10] B1 start
+[00:50:25] B1 exit 0
+[00:50:25] example start
+[00:50:27] example exit 0
+[00:50:27] rocprof-off start
+[00:50:43] rocprof-off exit 0
+[00:50:43] rocprof-on start
+[00:50:58] rocprof-on exit 0
+[00:50:58] graph-smoke start
+[00:51:14] graph-smoke exit 0
+[00:51:14] gate2 DONE
+DONE
