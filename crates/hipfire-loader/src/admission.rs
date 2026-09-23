@@ -443,7 +443,7 @@ fn resolve_sequence(
     gpu_arch: &str,
     hints: KvBackendHints<'_>,
 ) -> Result<SequenceResolution, String> {
-    use hipfire_runtime::kv_mode::{self, KvMode};
+    use hipfire_runtime::kv_mode;
     let ModelSource::Hfq(hfq) = source else {
         return Err("automatic Qwen VMM context sizing requires an HFQ weight manifest".into());
     };
@@ -451,11 +451,19 @@ fn resolve_sequence(
     let model_ctx = trained_context(source)
         .ok_or("Qwen checkpoint has no config.text_config.max_position_embeddings")?;
     let raw_mode = hints.kv_mode.unwrap_or(hipfire_runtime::config::get().kv_mode.as_str());
-    let raw_mode = kv_mode::qwen35_auto_for_arch(raw_mode, gpu_arch);
-    let mode = kv_mode::resolve(raw_mode, &kv_mode::QWEN35_HFQ_POLICY).mode;
     let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
+    let native_eligible = kv_mode::qwen35_native_eligible(
+        gpu_arch, config.n_heads, config.n_kv_heads, config.head_dim, 1,
+        adaptive, hints.cask.is_some_and(|c| c.sidecar.is_some()),
+    );
+    let policy = kv_mode::qwen35_policy_for_native(
+        &kv_mode::QWEN35_HFQ_POLICY, raw_mode, native_eligible,
+    );
+    let pair = kv_mode::resolve_kv_pair(
+        raw_mode, hints.kv_k, hints.kv_v, &policy, gpu_arch, hints.qwen_default_q8,
+    ).map_err(|e| format!("Qwen KV sequence: {e}"))?;
     let bytes_per_token = hipfire_arch_qwen35::qwen35::prefill::vmm_kv_token_bytes(
-        &config, mode, adaptive,
+        &config, pair, adaptive,
     ).ok_or("Qwen KV token stride overflow or no full-attention layers")?;
     let free = hints.free_vram_bytes.ok_or("cannot query free VRAM for automatic VMM context")?;
     let file_bytes = usize::try_from(
@@ -479,12 +487,7 @@ fn resolve_sequence(
     } else {
         (model_ctx, "pending")
     };
-    let kv_mode = match mode {
-        KvMode::Fp8 => "fp8", KvMode::Bf16 => "bf16", KvMode::Q8 => "q8",
-        KvMode::Asym2 => "asym2", KvMode::Asym3 => "asym3",
-        KvMode::Asym4 => "asym4", KvMode::Fwht2 => "fwht2",
-        KvMode::Fwht3 => "fwht3", KvMode::Fwht4 => "fwht4",
-    };
+    let kv_mode = kv_mode::qwen_k_display_name(pair.k());
     Ok(SequenceResolution { max_seq, bound, model_ctx, card_cap: 0, kv_mode })
 }
 
@@ -713,10 +716,10 @@ pub fn admit_source(
     } else if gpu_arch != "gfx1201"
         && !(matches!(gpu_arch, "gfx1100" | "gfx1151")
             && matches!(arch_id, 5 | 6)
-            && hipfire_runtime::kv_mode::qwen35_auto_for_arch(
-                hints.kv_mode.unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()),
-                gpu_arch,
-            ) == "q8")
+            && matches!(
+                hints.kv_mode.unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()).trim(),
+                "" | "auto" | "q8"
+            ))
     {
         Some(format!("device {gpu_arch} has no certified VMM KV path for the selected mode"))
     } else if pp > 1 {
@@ -870,11 +873,12 @@ pub fn admit_source(
         if adaptive && (k_axis.is_some() || v_axis.is_some()) {
             return Err("adaptive Qwen KV cannot combine with fixed --kv-k/--kv-v; disable kv_adaptive or omit both axes".into());
         }
-        let (k, v) = kv_mode::resolve_kv_pair(
+        let pair = kv_mode::resolve_kv_pair(
             &mode, k_axis, v_axis, &policy, gpu_arch, hints.qwen_default_q8,
         )
         .map_err(|e| format!("Qwen KV admission: {e}"))?;
-        if (pp > 1 || tp > 1) && v != kv_mode::VMode::Q8 {
+        let k = pair.k();
+        if (pp > 1 || tp > 1) && pair.v().is_some_and(|v| v != kv_mode::VMode::Q8) {
             return Err(format!(
                 "Qwen {} has no multi-GPU Lloyd-V constructor; use --kv-v q8",
                 policy.site
@@ -916,7 +920,7 @@ pub fn admit_source(
         }
         if !adaptive && hints.cask.is_some_and(|c| c.sidecar.is_some())
             && (matches!(k, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
-                || v != kv_mode::VMode::Q8)
+                || pair.v().is_some_and(|v| v != kv_mode::VMode::Q8))
         {
             return Err("static CASK requires q8 or legacy-asym K with q8 V; use --kv-k legacy-asym3 --kv-v q8 or disable CASK".into());
         }

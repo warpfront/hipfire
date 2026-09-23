@@ -96,6 +96,28 @@ impl std::fmt::Display for KvPairError {
 impl std::error::Error for KvPairError {}
 
 use KvMode::*;
+/// Native K+V encodings have no independently selectable V axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvPair {
+    Native(KvMode),
+    Split(KvMode, VMode),
+}
+
+impl KvPair {
+    pub fn k(self) -> KvMode {
+        match self {
+            Self::Native(k) | Self::Split(k, _) => k,
+        }
+    }
+
+    pub fn v(self) -> Option<VMode> {
+        match self {
+            Self::Native(_) => None,
+            Self::Split(_, v) => Some(v),
+        }
+    }
+}
+
 
 /// Shared Qwen K-name table (site-independent). Explicit K / `--kv-mode` preset
 /// K only — `auto` / `""` are **not** K formats (see [`resolve_kv_pair`]).
@@ -168,42 +190,27 @@ fn is_fwht_k(k: KvMode) -> bool {
     matches!(k, Fwht2 | Fwht3 | Fwht4)
 }
 
-fn is_native_k(k: KvMode) -> bool {
-    matches!(k, Fp8 | Bf16)
-}
 
 /// Qwen `""`|`auto` pair before axis overrides.
 ///
-/// - `qwen_default_q8 == true` (shipped): Q8/Q8 everywhere except exact
-///   `gfx1201` when `policy.accepted` contains `Fp8` → FP8/FP8.
-/// - `qwen_default_q8 == false` (kill switch): restore prior HFQ/PaRo
-///   distinctions — HFQ unset/auto → FWHT3/Q8 off gfx1201; PaRo raw unset
-///   → Q8/Q8, PaRo `"auto"` → FWHT3/Q8; PP/Dir stay Q8/Q8. Eligible gfx1201
-///   FP8 still wins when accepted.
+/// Shipped default is Q8/Q8 except eligible exact gfx1201, which uses native
+/// FP8. The kill switch restores historical HFQ/PaRo FWHT3/Q8 selection.
 fn qwen_auto_default_pair(
     mode_raw: &str,
     policy: &KvModePolicy,
     arch: &str,
     qwen_default_q8: bool,
-) -> (KvMode, VMode) {
+) -> KvPair {
     if arch == "gfx1201" && policy.accepted.contains(&Fp8) {
-        return (Fp8, VMode::Q8);
+        return KvPair::Native(Fp8);
     }
     if qwen_default_q8 {
-        return (Q8, VMode::Q8);
+        return KvPair::Split(Q8, VMode::Q8);
     }
-    // Kill switch: historical HFQ/PaRo auto ladder (named aliases unchanged).
     match policy.site {
-        "qwen35-hfq" => (Fwht3, VMode::Q8),
-        "qwen35-paro" => {
-            if mode_raw.trim().is_empty() {
-                (Q8, VMode::Q8)
-            } else {
-                // "auto" (and any other auto-shaped input routed here)
-                (Fwht3, VMode::Q8)
-            }
-        }
-        _ => (Q8, VMode::Q8),
+        "qwen35-hfq" => KvPair::Split(Fwht3, VMode::Q8),
+        "qwen35-paro" if !mode_raw.trim().is_empty() => KvPair::Split(Fwht3, VMode::Q8),
+        _ => KvPair::Split(Q8, VMode::Q8),
     }
 }
 
@@ -231,16 +238,9 @@ fn ensure_lloyd_fwht(k: KvMode, v: VMode) -> Result<(), KvPairError> {
     }
 }
 
-/// Resolve a Qwen-family `(K, V)` pair.
-///
-/// - `mode_raw` `""`|`auto`: arch-aware default (see [`qwen_auto_default_pair`]).
-/// - Explicit mode supplies initial K with V=Q8 (native fp8/bf16 are an
-///   indivisible pair represented as `(Fp8|Bf16, VMode::Q8)`).
-/// - `k_raw` / `v_raw` override only their axis when present and non-empty.
-/// - Authored `--kv-mode fp8|bf16` plus any axis override → error.
-/// - Auto-selected native FP8: both axes together may replace the pair; a
-///   single axis refuses (never FP8-K/Q8-V hybrid).
-/// - Unsupported site/name combinations → [`KvPairError`] (no silent fallback).
+/// Resolve a Qwen-family K+V encoding. Native fp8/bf16 have no V axis.
+/// Auto-native accepts either no overrides or both axes replacing the pair.
+/// An authored native preset refuses every axis override.
 pub fn resolve_kv_pair(
     mode_raw: &str,
     k_raw: Option<&str>,
@@ -248,93 +248,51 @@ pub fn resolve_kv_pair(
     policy: &KvModePolicy,
     arch: &str,
     qwen_default_q8: bool,
-) -> Result<(KvMode, VMode), KvPairError> {
+) -> Result<KvPair, KvPairError> {
     let mode_trim = mode_raw.trim();
     let is_auto = mode_trim.is_empty() || mode_trim == "auto";
     let k_axis = authored_axis(k_raw);
     let v_axis = authored_axis(v_raw);
-
-    let (mut k, mut v, auto_native) = if is_auto {
-        let (k, v) = qwen_auto_default_pair(mode_trim, policy, arch, qwen_default_q8);
-        let native = is_native_k(k);
-        (k, v, native)
+    let initial = if is_auto {
+        qwen_auto_default_pair(mode_trim, policy, arch, qwen_default_q8)
     } else {
-        let k = match mode_trim {
-            "fp8" => Fp8,
-            "bf16" => Bf16,
-            _ => parse_qwen_k_name(mode_trim)?,
-        };
-        (k, VMode::Q8, false)
+        match mode_trim {
+            "fp8" => KvPair::Native(Fp8),
+            "bf16" => KvPair::Native(Bf16),
+            _ => KvPair::Split(parse_qwen_k_name(mode_trim)?, VMode::Q8),
+        }
     };
-
-    let authored_native = !is_auto && is_native_k(k);
-    if authored_native && (k_axis.is_some() || v_axis.is_some()) {
-        return Err(KvPairError::new(format!(
-            "authored --kv-mode {mode_trim} is an indivisible native K/V pair; \
-             refuse axis overrides (got k={k_raw:?} v={v_raw:?}). Use a non-native \
-             --kv-mode or omit --kv-k/--kv-v"
-        )));
-    }
-
-    if auto_native {
-        match (k_axis, v_axis) {
-            (None, None) => {}
-            (Some(kr), Some(vr)) => {
-                // Both axes replace the auto-native pair wholesale.
-                k = parse_qwen_k_name(kr)?;
-                v = parse_qwen_v_name(vr)?;
-                if is_native_k(k) {
-                    return Err(KvPairError::new(
-                        "replacing auto-native FP8/BF16 with another native tier \
-                         via axis overrides is not supported; set --kv-mode explicitly"
-                            .to_string(),
-                    ));
-                }
-            }
-            _ => {
-                return Err(KvPairError::new(
-                    "auto selected native FP8/BF16 on eligible gfx1201; a single \
-                     --kv-k/--kv-v axis cannot split the pair. Pass both axes, or \
-                     --kv-mode q8 (or another non-native preset)"
-                        .to_string(),
-                ));
-            }
+    let pair = match (initial, k_axis, v_axis) {
+        (KvPair::Native(_), Some(_), _) | (KvPair::Native(_), _, Some(_)) if !is_auto => {
+            return Err(KvPairError::new(format!(
+                "authored --kv-mode {mode_trim} is an indivisible native K/V pair; \
+                 refuse axis overrides (got k={k_raw:?} v={v_raw:?}). Use a non-native \
+                 --kv-mode or omit --kv-k/--kv-v"
+            )));
         }
-    } else {
-        if let Some(kr) = k_axis {
-            k = parse_qwen_k_name(kr)?;
+        (KvPair::Native(k), None, None) => KvPair::Native(k),
+        (KvPair::Native(_), Some(kr), Some(vr)) => {
+            KvPair::Split(parse_qwen_k_name(kr)?, parse_qwen_v_name(vr)?)
         }
-        if let Some(vr) = v_axis {
-            v = parse_qwen_v_name(vr)?;
+        (KvPair::Native(_), _, _) => {
+            return Err(KvPairError::new(
+                "auto selected native FP8/BF16 on eligible gfx1201; a single \
+                 --kv-k/--kv-v axis cannot split the pair. Pass both axes, or \
+                 --kv-mode q8 (or another non-native preset)",
+            ));
         }
+        (KvPair::Split(k, v), kr, vr) => KvPair::Split(
+            kr.map(parse_qwen_k_name).transpose()?.unwrap_or(k),
+            vr.map(parse_qwen_v_name).transpose()?.unwrap_or(v),
+        ),
+    };
+    if let KvPair::Split(k, v) = pair {
+        ensure_lloyd_fwht(k, v)?;
     }
-
-    if is_native_k(k) && !matches!(v, VMode::Q8) {
-        return Err(KvPairError::new(format!(
-            "native {k:?} K/V pair is indivisible; V must be q8 sentinel, got {v:?}"
-        )));
-    }
-
-    ensure_lloyd_fwht(k, v)?;
-    ensure_accepted(k, policy)?;
-    Ok((k, v))
+    ensure_accepted(pair.k(), policy)?;
+    Ok(pair)
 }
 
-/// Single-GPU Qwen automatic KV string rewrite (legacy helper).
-/// Exact gfx1201 → `"fp8"`; every other arch → `"q8"`. Explicit modes untouched.
-/// Prefer [`resolve_kv_pair`] for new call sites.
-pub fn qwen35_auto_for_arch<'a>(raw: &'a str, arch: &str) -> &'a str {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "auto" {
-        if arch == "gfx1201" {
-            "fp8"
-        } else {
-            "q8"
-        }
-    } else {
-        raw
-    }
-}
 
 const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Fp8, Bf16];
 
@@ -491,8 +449,8 @@ mod tests {
         policy: &KvModePolicy,
         arch: &str,
         q8_default: bool,
-    ) -> Result<(KvMode, VMode), KvPairError> {
-        resolve_kv_pair(mode, k, v, policy, arch, q8_default)
+    ) -> Result<(KvMode, Option<VMode>), KvPairError> {
+        resolve_kv_pair(mode, k, v, policy, arch, q8_default).map(|pair| (pair.k(), pair.v()))
     }
 
     #[test]
@@ -542,7 +500,7 @@ mod tests {
                 // shipped default: Q8 everywhere without native FP8 admit
                 for arch in ["gfx1100", "gfx1200", "gfx942", "gfx1151"] {
                     let (k, v) = pair(raw, None, None, p, arch, true).unwrap();
-                    assert_eq!((k, v), (Q8, VMode::Q8), "site={} arch={} raw={raw}", p.site, arch);
+                    assert_eq!((k, v), (Q8, Some(VMode::Q8)), "site={} arch={} raw={raw}", p.site, arch);
                 }
             }
         }
@@ -550,13 +508,17 @@ mod tests {
         for p in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
             for raw in ["", "auto"] {
                 let (k, v) = pair(raw, None, None, p, "gfx1201", true).unwrap();
-                assert_eq!((k, v), (Fp8, VMode::Q8), "site={} raw={raw}", p.site);
+                assert_eq!((k, v), (Fp8, None), "site={} raw={raw}", p.site);
+                assert_eq!(
+                    resolve_kv_pair(raw, None, None, p, "gfx1201", true).unwrap(),
+                    KvPair::Native(Fp8),
+                );
             }
         }
         // PP/Dir lack Fp8 in accepted → stay Q8 even on gfx1201
         for p in [&QWEN35_PP_POLICY, &DIR_SAFETENSORS_POLICY] {
             let (k, v) = pair("auto", None, None, p, "gfx1201", true).unwrap();
-            assert_eq!((k, v), (Q8, VMode::Q8), "site={}", p.site);
+            assert_eq!((k, v), (Q8, Some(VMode::Q8)), "site={}", p.site);
         }
     }
 
@@ -583,21 +545,21 @@ mod tests {
         // HFQ: both "" and auto → Fwht3 off gfx1201 when kill switch off
         for raw in ["", "auto"] {
             let (k, v) = pair(raw, None, None, &QWEN35_HFQ_POLICY, "gfx1100", false).unwrap();
-            assert_eq!((k, v), (Fwht3, VMode::Q8), "hfq raw={raw}");
+            assert_eq!((k, v), (Fwht3, Some(VMode::Q8)), "hfq raw={raw}");
         }
         // PaRo: raw unset Q8; auto FWHT3
         let (k, v) = pair("", None, None, &QWEN35_PARO_POLICY, "gfx1100", false).unwrap();
-        assert_eq!((k, v), (Q8, VMode::Q8));
+        assert_eq!((k, v), (Q8, Some(VMode::Q8)));
         let (k, v) = pair("auto", None, None, &QWEN35_PARO_POLICY, "gfx1100", false).unwrap();
-        assert_eq!((k, v), (Fwht3, VMode::Q8));
+        assert_eq!((k, v), (Fwht3, Some(VMode::Q8)));
         // PP/Dir stay Q8 under kill switch
         for p in [&QWEN35_PP_POLICY, &DIR_SAFETENSORS_POLICY] {
             let (k, v) = pair("auto", None, None, p, "gfx1100", false).unwrap();
-            assert_eq!((k, v), (Q8, VMode::Q8), "site={}", p.site);
+            assert_eq!((k, v), (Q8, Some(VMode::Q8)), "site={}", p.site);
         }
         // gfx1201 eligible still FP8 under kill switch
         let (k, v) = pair("auto", None, None, &QWEN35_HFQ_POLICY, "gfx1201", false).unwrap();
-        assert_eq!((k, v), (Fp8, VMode::Q8));
+        assert_eq!((k, v), (Fp8, None));
     }
 
     #[test]
@@ -629,7 +591,7 @@ mod tests {
                 if p.accepted.contains(&want_k) {
                     let (k, v) = r.unwrap_or_else(|e| panic!("{} {} ok: {e}", p.site, name));
                     assert_eq!(k, want_k, "site={} name={name}", p.site);
-                    assert_eq!(v, VMode::Q8);
+                    assert_eq!(v, Some(VMode::Q8));
                 } else {
                     assert!(r.is_err(), "site={} name={name} must error", p.site);
                 }
@@ -677,9 +639,9 @@ mod tests {
     #[test]
     fn lloyd_v_requires_fwht_k() {
         let (k, v) = pair("fwht3", None, Some("lloyd3"), &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
-        assert_eq!((k, v), (Fwht3, VMode::Lloyd3));
+        assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd3)));
         let (k, v) = pair("asym3", None, Some("lloyd3"), &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
-        assert_eq!((k, v), (Fwht3, VMode::Lloyd3));
+        assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd3)));
         // q8 + lloyd fails
         assert!(pair("q8", None, Some("lloyd3"), &QWEN35_HFQ_POLICY, "gfx1100", true).is_err());
         // legacy-asym + lloyd fails
@@ -702,7 +664,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!((k, v), (Fwht3, VMode::Lloyd3));
+        assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd3)));
     }
 
     #[test]
@@ -710,12 +672,16 @@ mod tests {
         // authored native + any axis → error
         assert!(pair("fp8", Some("q8"), None, &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
         assert!(pair("fp8", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
+        assert!(resolve_kv_pair("fp8", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true)
+            .unwrap_err().to_string().contains("indivisible"));
         assert!(pair("bf16", Some("fwht3"), Some("q8"), &QWEN35_HFQ_POLICY, "gfx1100", true).is_err());
+        // An FP8 K axis with a Q8 V axis is not a supported native preset.
+        assert!(pair("auto", Some("fp8"), Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
         // explicit native alone ok when accepted
         let (k, v) = pair("fp8", None, None, &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
-        assert_eq!((k, v), (Fp8, VMode::Q8));
+        assert_eq!((k, v), (Fp8, None));
         let (k, v) = pair("bf16", None, None, &QWEN35_PARO_POLICY, "gfx1100", true).unwrap();
-        assert_eq!((k, v), (Bf16, VMode::Q8));
+        assert_eq!((k, v), (Bf16, None));
         // explicit native on PP (no Fp8/Bf16 accepted) → error
         assert!(pair("fp8", None, None, &QWEN35_PP_POLICY, "gfx1201", true).is_err());
         assert!(pair("bf16", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).is_err());
@@ -725,7 +691,7 @@ mod tests {
     fn auto_native_single_axis_refuses_both_axes_replace() {
         // auto FP8 on eligible gfx1201
         let (k, v) = pair("auto", None, None, &QWEN35_HFQ_POLICY, "gfx1201", true).unwrap();
-        assert_eq!((k, v), (Fp8, VMode::Q8));
+        assert_eq!((k, v), (Fp8, None));
         // single axis refuses
         assert!(pair("auto", Some("q8"), None, &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
         assert!(pair("auto", None, Some("q8"), &QWEN35_HFQ_POLICY, "gfx1201", true).is_err());
@@ -739,7 +705,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!((k, v), (Asym3, VMode::Q8));
+        assert_eq!((k, v), (Asym3, Some(VMode::Q8)));
     }
 
     #[test]
@@ -754,7 +720,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!((k, v), (Fwht2, VMode::Q8));
+        assert_eq!((k, v), (Fwht2, Some(VMode::Q8)));
         let (k, v) = pair(
             "fwht3",
             None,
@@ -764,10 +730,10 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!((k, v), (Fwht3, VMode::Lloyd2));
+        assert_eq!((k, v), (Fwht3, Some(VMode::Lloyd2)));
         // explicit kv-k q8 against non-native mode → Q8/Q8
         let (k, v) = pair("fwht3", Some("q8"), None, &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
-        assert_eq!((k, v), (Q8, VMode::Q8));
+        assert_eq!((k, v), (Q8, Some(VMode::Q8)));
     }
 
     #[test]
@@ -830,20 +796,6 @@ mod tests {
         assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
     }
 
-    #[test]
-    fn qwen35_auto_for_arch_helper() {
-        for raw in ["", "auto"] {
-            assert_eq!(qwen35_auto_for_arch(raw, "gfx1201"), "fp8");
-            for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx906"] {
-                assert_eq!(qwen35_auto_for_arch(raw, arch), "q8", "arch={arch}");
-            }
-        }
-        for raw in ["q8", "fwht3", "fp8", "bf16", "turbo", "garbage"] {
-            for arch in ["gfx1201", "gfx1100", "gfx942"] {
-                assert_eq!(qwen35_auto_for_arch(raw, arch), raw, "raw={raw} arch={arch}");
-            }
-        }
-    }
 
     #[test]
     fn resolve_qwen_legacy_path_uses_shared_names() {

@@ -215,25 +215,26 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
 fn resolve_qwen_kv_pair(
     ctx: &LoadCtx,
     policy: &hipfire_runtime::kv_mode::KvModePolicy,
-) -> Result<(hipfire_runtime::kv_mode::KvMode, hipfire_runtime::llama::VMode), String> {
+) -> Result<hipfire_runtime::kv_mode::KvPair, String> {
+    use hipfire_runtime::kv_mode::{self, KvPair};
     let mode_raw = kv_mode_from_ctx(ctx);
-    let (mode, v_mode) = hipfire_runtime::kv_mode::resolve_kv_pair(
-        &mode_raw,
-        ctx.kv_k_override,
-        ctx.kv_v_override,
-        policy,
-        ctx.gpu.arch.as_str(),
-        ctx.qwen_default_q8,
-    )
-    .map_err(|e| e.to_string())?;
-    let k_name = hipfire_runtime::kv_mode::qwen_k_display_name(mode);
-    let v_name = hipfire_runtime::kv_mode::qwen_v_display_name(v_mode);
-    eprintln!(
-        "  KV cache: requested mode={mode_raw}, effective K={k_name} V={v_name} (site {})",
-        policy.site
-    );
-    eprintln!("  K={k_name} V={v_name}");
-    Ok((mode, v_mode))
+    let pair = kv_mode::resolve_kv_pair(
+        &mode_raw, ctx.kv_k_override, ctx.kv_v_override, policy,
+        ctx.gpu.arch.as_str(), ctx.qwen_default_q8,
+    ).map_err(|e| e.to_string())?;
+    match pair {
+        KvPair::Native(k) => eprintln!(
+            "  KV cache: requested mode={mode_raw}, effective KV={} (site {})",
+            kv_mode::qwen_k_display_name(k), policy.site
+        ),
+        KvPair::Split(k, v) => {
+            let k_name = kv_mode::qwen_k_display_name(k);
+            let v_name = kv_mode::qwen_v_display_name(v);
+            eprintln!("  KV cache: requested mode={mode_raw}, effective K={k_name} V={v_name} (site {})", policy.site);
+            eprintln!("  K={k_name} V={v_name}");
+        }
+    }
+    Ok(pair)
 }
 
 fn arch_default_template(arch_id: u32) -> Option<String> {
@@ -304,11 +305,12 @@ fn load_qwen35_pp(
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let (mode, v_mode) = resolve_qwen_kv_pair(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY)?;
-    if !matches!(v_mode, hipfire_runtime::llama::VMode::Q8) {
+    let pair = resolve_qwen_kv_pair(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY)?;
+    let mode = pair.k();
+    if pair.v().is_some_and(|v| v != hipfire_runtime::llama::VMode::Q8) {
         return Err(format!(
             "qwen35: V={} requires pp=1 (site {}); multi-GPU has no lloyd-V constructor",
-            hipfire_runtime::kv_mode::qwen_v_display_name(v_mode),
+            hipfire_runtime::kv_mode::qwen_v_display_name(pair.v().expect("PP split pair")),
             hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
         ));
     }
@@ -685,8 +687,8 @@ impl Carrier for Qwen35Carrier {
                     &kv_mode_from_ctx(ctx),
                     native_eligible,
                 );
-                let (mode, v_mode) =
-                    resolve_qwen_kv_pair(ctx, &policy)?;
+                let pair = resolve_qwen_kv_pair(ctx, &policy)?;
+                let mode = pair.k();
                 // Same native-tier admission as the HFQ carrier site: exact
                 // gfx1201/dense/legacy-or-VMM. The Dir path still honors
                 // resolved VMode below; adaptive/CASK stay HFQ-only.
@@ -720,31 +722,19 @@ impl Carrier for Qwen35Carrier {
                 // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
                 // Propagate resolved VMode: VMM takes it in-constructor; legacy
                 // Q8 uses from_mode; legacy Lloyd-V post-alloc reallocs.
-                let kv_cache = match (ctx.kv_backend, v_mode) {
-                    (KvBackend::Vmm, vm)
-                        if matches!(
-                            mode,
-                            hipfire_runtime::kv_mode::KvMode::Fp8
-                                | hipfire_runtime::kv_mode::KvMode::Bf16
-                        ) =>
-                    {
+                let kv_cache = match (ctx.kv_backend, pair) {
+                    (KvBackend::Vmm, hipfire_runtime::kv_mode::KvPair::Native(_)) => {
                         match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
-                            mode,
-                            KvBackend::Vmm,
-                            hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
-                            &dims,
+                            mode, KvBackend::Vmm, hipfire_runtime::llama::KvTarget::Single(ctx.gpu), &dims,
                         ) {
-                            Ok(k) => {
-                                let _ = vm; // native pair is indivisible
-                                k
-                            }
+                            Ok(k) => k,
                             Err(e) => {
                                 weights.free_gpu(ctx.gpu);
                                 return Err(format!("KvCache: {e}"));
                             }
                         }
                     }
-                    (KvBackend::Vmm, vm) => {
+                    (KvBackend::Vmm, hipfire_runtime::kv_mode::KvPair::Split(_, vm)) => {
                         match hipfire_runtime::llama::KvCache::new_gpu_vmm_capped_filtered(
                             ctx.gpu,
                             &is_kv_layer,
@@ -762,7 +752,8 @@ impl Carrier for Qwen35Carrier {
                             }
                         }
                     }
-                    (KvBackend::Legacy, hipfire_runtime::llama::VMode::Q8) => {
+                    (KvBackend::Legacy, hipfire_runtime::kv_mode::KvPair::Native(_))
+                    | (KvBackend::Legacy, hipfire_runtime::kv_mode::KvPair::Split(_, hipfire_runtime::llama::VMode::Q8)) => {
                         match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
                             mode,
                             KvBackend::Legacy,
@@ -776,7 +767,7 @@ impl Carrier for Qwen35Carrier {
                             }
                         }
                     }
-                    (KvBackend::Legacy, vm) => {
+                    (KvBackend::Legacy, hipfire_runtime::kv_mode::KvPair::Split(_, vm)) => {
                         let mut kv = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
                             mode,
                             KvBackend::Legacy,

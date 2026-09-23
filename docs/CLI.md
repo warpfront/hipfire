@@ -77,13 +77,13 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | Flag | Values / default | Notes |
 |---|---|---|
 | `--kv-backend` | `legacy` \| `vmm`; **default automatic prefer VMM** | Accepts only those two spellings. Old `contiguous` is rejected with a migration error that names `legacy` (e.g. use `--kv-backend legacy` or `memory.kv_backend = "legacy"`). Selecting legacy (explicit or automatic fallback) prints one stderr warning containing the stable token `HIPFIRE_KV_BACKEND=legacy`. Explicit `vmm` on an unsupported combination fails closed before teardown. |
-| `--kv-mode` | `auto` (default when unset), `q8`, `fwht2`/`3`/`4`, `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`, `fp8`, `bf16`, … | Whole-cache preset that seeds *(K, V)*. |
+| `--kv-mode` | `auto` (default when unset), `q8`, `fwht2`/`3`/`4`, `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`, `fp8`, `bf16`, … | Whole-cache preset. Native `fp8`/`bf16` encode K and V together, without a separate V mode. |
 | `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the old Givens asym K. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
 | `--max-seq` | int when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. Explicit CLI/config override wins. |
 
-**Qwen `auto` / unset mode:** `q8`/`q8` on every arch **except** exact `gfx1201`, where eligible single-GPU Qwen routes default to native `fp8`/`fp8`. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
+**Qwen `auto` / unset mode:** `q8`/`q8` on every arch **except** exact `gfx1201`, where eligible single-GPU Qwen routes default to native `fp8` (both K and V). Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
 
-**K/V precedence** (each key independently): CLI flag **>** per-model config **>** global config **>** registry / arch default. Mode supplies the initial pair; an authored `--kv-k` overrides only K and `--kv-v` only V. Full refusal rules (authored `fp8`/`bf16` + axis, adaptive + fixed axis, unsupported topology): [CONFIG.md](CONFIG.md#kv-cache).
+**K/V precedence** (split modes only): CLI flag **>** per-model config **>** global config **>** registry / arch default. Mode seeds the pair; `--kv-k` overrides K and `--kv-v` overrides V. An authored `--kv-mode fp8`/`bf16` refuses every axis override, including `--kv-v q8`; an auto-selected native pair can be replaced only when both axes are supplied. Full refusal rules: [CONFIG.md](CONFIG.md#kv-cache).
 
 **Backend precedence** (forced choices): CLI `--kv-backend` **>** per-model `memory.kv_backend` **>** global `memory.kv_backend`. Omitted backend stays automatic VMM-preferring policy, not an authored pin.
 
@@ -171,7 +171,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | Command | Purpose |
 |---|---|
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead). |
-| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`; `--json` surfaces loaded backend fields. |
+| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`; `--json` surfaces the effective loaded `kv_mode` and backend fields. |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |

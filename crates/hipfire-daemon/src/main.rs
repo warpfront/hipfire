@@ -486,6 +486,7 @@ struct ResidentKvDiag {
     reason: Option<String>,
     legacy: bool,
     warning: Option<String>,
+    mode: Option<String>,
 }
 
 impl ResidentKvDiag {
@@ -524,6 +525,7 @@ impl ResidentKvDiag {
             reason,
             legacy,
             warning,
+            mode: None,
         }
     }
 
@@ -1260,7 +1262,10 @@ fn main() {
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
-                            resident_kv = Some(slot_kv_diag.clone());
+                            resident_kv = Some(ResidentKvDiag {
+                                mode: Some("q8".to_owned()),
+                                ..slot_kv_diag.clone()
+                            });
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
                             let ack = serde_json::json!({
                                 "type": "loaded",
@@ -1281,6 +1286,7 @@ fn main() {
                                 "kv_backend_reason": slot_kv_diag.reason,
                                 "kv_backend_legacy": slot_kv_diag.legacy,
                                 "kv_backend_warning": slot_kv_diag.warning,
+                                "kv_mode": "q8",
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -2322,7 +2328,10 @@ fn main() {
                             serde_json::to_string(&pending_kv_diag.warning)
                                 .expect("backend warning is serializable");
                         // Publish resident KV metadata with the loaded ACK.
-                        resident_kv = Some(pending_kv_diag.clone());
+                        resident_kv = Some(ResidentKvDiag {
+                            mode: Some(seq_kv.to_owned()),
+                            ..pending_kv_diag.clone()
+                        });
                         // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
                             let _ = writeln!(
@@ -4254,9 +4263,11 @@ fn main() {
                 let kv_legacy = kv.map(|k| k.legacy).unwrap_or(false);
                 let kv_warning_json = serde_json::to_string(&kv.and_then(|k| k.warning.as_deref()))
                     .expect("kv_backend_warning serializable");
+                let kv_mode_json = serde_json::to_string(&kv.and_then(|k| k.mode.as_deref()))
+                    .expect("kv_mode serializable");
                 let _ = writeln!(
                     stdout,
-                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{},"kv_backend":{},"kv_backend_request":{},"kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{}}}"#,
+                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{},"kv_backend":{},"kv_backend_request":{},"kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"kv_mode":{}}}"#,
                     gpu.arch,
                     hip_ver.0,
                     hip_ver.1,
@@ -4271,6 +4282,7 @@ fn main() {
                     kv_reason_json,
                     kv_legacy,
                     kv_warning_json,
+                    kv_mode_json,
                 );
                 let _ = stdout.flush();
             }

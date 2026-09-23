@@ -1336,27 +1336,27 @@ fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
 /// full-attention layers own KV; DeltaNet layers carry no token rows.
 pub fn vmm_kv_token_bytes(
     config: &Qwen35Config,
-    mode: hipfire_runtime::kv_mode::KvMode,
+    pair: hipfire_runtime::kv_mode::KvPair,
     adaptive: bool,
 ) -> Option<usize> {
-    use hipfire_runtime::kv_mode::KvMode;
+    use hipfire_runtime::kv_mode::{KvMode, KvPair, VMode};
     let head = config.head_dim;
     let k_head = if adaptive {
         head / 2 + 4 // FWHT4 start, not a future adaptive floor
     } else {
-        match mode {
+        match pair.k() {
             KvMode::Fp8 => head + 2,
-            KvMode::Bf16 => head * 2,
+            KvMode::Bf16 => head.checked_mul(2)?,
             KvMode::Q8 => head / 32 * 34,
             KvMode::Asym2 | KvMode::Fwht2 => head / 4 + 4,
             KvMode::Asym3 | KvMode::Fwht3 => head * 3 / 8 + 4,
             KvMode::Asym4 | KvMode::Fwht4 => head / 2 + 4,
         }
     };
-    let v_head = if matches!(mode, KvMode::Fp8 | KvMode::Bf16) && !adaptive {
-        k_head
-    } else {
-        head / 32 * 34
+    let v_head = match pair {
+        KvPair::Native(_) => k_head,
+        KvPair::Split(_, VMode::Q8) => head / 32 * 34,
+        KvPair::Split(_, v) => 4 + head.checked_mul(v.bits() as usize)? / 8,
     };
     config.layer_types.iter()
         .filter(|layer| **layer == LayerType::FullAttention)
@@ -14485,6 +14485,15 @@ mod tests {
             vram_budget_bytes: u64::MAX,
             reap_keep: None,
         }
+    }
+
+    #[test]
+    fn vmm_stride_uses_resolved_native_or_split_layout() {
+        use hipfire_runtime::kv_mode::{KvMode, KvPair, VMode};
+        let config = widened_test_config();
+        assert_eq!(vmm_kv_token_bytes(&config, KvPair::Native(KvMode::Fp8), false), Some(33_024));
+        assert_eq!(vmm_kv_token_bytes(&config, KvPair::Split(KvMode::Q8, VMode::Q8), false), Some(34_816));
+        assert_eq!(vmm_kv_token_bytes(&config, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3), false), Some(12_800));
     }
 
     #[test]
