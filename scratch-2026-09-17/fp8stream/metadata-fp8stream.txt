@@ -1,0 +1,16 @@
+== plain fused
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     TotalSGPRs: 33 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     VGPRs: 45 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-plain.hip:227:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+== awq fused
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     TotalSGPRs: 38 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     VGPRs: 89 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8stream/scratch-2026-09-17/fp8stream/tu-fp8-awq.hip:228:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

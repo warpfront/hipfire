@@ -1,0 +1,29 @@
+
+rnk  category   kernel                                              calls     total_us     avg_us    total_MiB     GiB/s
+----------------------------------------------------------------------------------------------------------------------
+1    gemm       gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201       64    87795.2us   1371.80us    14815.0 MiB    164.8  (32.4%)
+2    gemm       gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201      128    69522.3us    543.14us     7214.2 MiB    101.3  (25.7%)
+3    gemm       gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201       48    32146.6us    669.72us     3720.9 MiB    113.0  (11.9%)
+4    deltanet   gated_delta_net_q8_batch_seq                           48    25626.3us    533.88us     2387.2 MiB     91.0  (9.5%)
+5    fused      fused_silu_mul_mq_rotate_awq_batched                   64    11740.0us    183.44us     8768.0 MiB    729.3  (4.3%)
+6    gemm       pack_f32_to_fp8_mq4v2_gfx12                           256    10468.7us     40.89us     5313.5 MiB    495.7  (3.9%)
+7    gemm       gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201        16     9385.7us    586.61us     1084.2 MiB    112.8  (3.5%)
+8    deltanet   gdn_pre_batched_gfx1201                                48     7817.1us    162.86us     3090.0 MiB    386.0  (2.9%)
+9    fused      fused_rmsnorm_mq_rotate_awq_batched                   128     4043.3us     31.59us     5248.0 MiB   1267.5  (1.5%)
+10   attention  attention_q8_0_fa2_gqa_gfx1201                         16     3808.8us    238.05us     4544.0 MiB   1165.1  (1.4%)
+11   rmsnorm    gated_norm_f32_batched                                 48     2866.4us     59.72us     2304.0 MiB    785.0  (1.1%)
+12   fwht       rotate_x_mq_awq_batched                                64     1491.7us     23.31us     2368.0 MiB   1550.2  (0.6%)
+13   fused      deinterleave_q_rmsnorm_f32_batched                     16     1437.5us     89.84us      768.0 MiB    521.8  (0.5%)
+14   gemv       gemv_mq4g256v2                                          1     1379.1us   1379.10us      645.1 MiB    456.8  (0.5%)
+15   fused      sigmoid_mul_f32                                        16      598.6us     37.41us     1152.0 MiB   1879.5  (0.2%)
+16   rope       rope_partial_halfsplit_batched_f32                     16      354.9us     22.18us      448.0 MiB   1232.7  (0.1%)
+17   rmsnorm    rmsnorm_batched                                        16      326.1us     20.38us       96.0 MiB    287.5  (0.1%)
+18   rmsnorm    rmsnorm_f32                                             1       19.4us     19.40us        0.1 MiB      2.9  (0.0%)
+19   fwht       mq_rotate_x                                             1       11.1us     11.08us        0.0 MiB      3.6  (0.0%)
+----------------------------------------------------------------------------------------------------------------------
+     TOTAL                                                            995   270838.8us              63966.3 MiB    230.6
+
+=== fused-projection MMQ attribution (gfx906 §6.1 probe) ===
+mmq_set_gfx906: NOT SEEN (dispatcher took fallback path) — re-run with longer prompt or check should_use_mmq gating
+
+(prefill batch_size = 512; for arch gfx906, MMQ enables at batch_size >= 8 by default)

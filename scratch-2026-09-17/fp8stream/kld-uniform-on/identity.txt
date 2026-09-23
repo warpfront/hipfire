@@ -1,0 +1,1 @@
+d9c60bd1ae2657d39ac3130e92cc6ae0  /home/kaden/ClaudeCode/warpfront/wt-fp8stream/target/release/examples/eval_hipfire

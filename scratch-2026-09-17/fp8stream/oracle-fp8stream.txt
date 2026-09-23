@@ -1,0 +1,30 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab2/.hipfire_kernels/gfx1201
+GPU: gfx1201
+  fused_rmsnorm_mq_rotate: pre-compiled blob has no hash file, recompiling
+  N=64 K=256 awq=false: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  fused_rmsnorm_mq_rotate_awq: pre-compiled blob has no hash file, recompiling
+  N=64 K=256 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=128 K=256 awq=false: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=128 K=256 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=512 K=256 awq=false: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=512 K=256 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=64 K=2048 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=64 K=2048 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=128 K=2048 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=128 K=2048 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=512 K=2048 awq=false: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=512 K=2048 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=64 K=4096 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=64 K=4096 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=128 K=4096 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=128 K=4096 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=512 K=4096 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=512 K=4096 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=64 K=5120 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=64 K=5120 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=128 K=5120 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=128 K=5120 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+  N=512 K=5120 awq=false: mismatched_bytes=0 scales_min=0.015625 scales_max=1
+  N=512 K=5120 awq=true: mismatched_bytes=0 scales_min=0.0078125 scales_max=1
+ORACLE PASS: all producer-emitted fp8 planes byte-identical

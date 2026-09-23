@@ -1,0 +1,3 @@
+e526da31b748e8167a6feb7204892c50  /home/kaden/ClaudeCode/warpfront/wt-fp8stream/target/release/hipfire
+d6faf1bab0e5aab2efee586c164eb0c6  /home/kaden/ClaudeCode/warpfront/wt-fp8stream/target/release/daemon
+6a6fe789f9905767c58a07cb817a6a521c7256a8
