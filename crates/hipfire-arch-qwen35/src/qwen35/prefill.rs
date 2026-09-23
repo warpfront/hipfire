@@ -105,6 +105,56 @@ fn try_iu4_silu_prepared(
     )?;
     Ok(Some(prep))
 }
+
+/// F1-lite: true when this FFN may fold SwiGLU into the gate/up GEMM, i.e.
+/// the down projection would take the AWQ IU4 SwiGLU producer
+/// ([`try_iu4_silu_prepared`] with an AWQ scale: uniform MQ4G256V2, `Residual`
+/// epilogue, no S4 f16 route, portable gfx11 sidecar live) and gate/up are
+/// MQ4G256V2 of equal shape. Decided once per FFN, before gate/up; the gate/up
+/// hook then reports whether it actually emitted h
+/// (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` adds the GEMM v2 tile
+/// rule and `HIPFIRE_F1LITE`).
+#[allow(clippy::too_many_arguments)]
+fn f1lite_ffn_eligible(
+    gpu: &Gpu,
+    w_gate: &hipfire_runtime::llama::WeightTensor,
+    w_up: &hipfire_runtime::llama::WeightTensor,
+    w_down: &hipfire_runtime::llama::WeightTensor,
+    epilogue: &BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+    hidden_dim: usize,
+    n: usize,
+) -> bool {
+    w_gate.gpu_dtype == DType::MQ4G256V2
+        && w_up.gpu_dtype == DType::MQ4G256V2
+        && w_gate.m == hidden_dim
+        && w_up.m == hidden_dim
+        && w_gate.k == w_up.k
+        && w_down.gpu_dtype == DType::MQ4G256V2
+        && w_down.awq_scale.is_some()
+        && w_down.k == hidden_dim
+        && matches!(epilogue, BatchEpilogue::Residual)
+        && !s4_residual_fast(gpu, fusion, w_down.gpu_dtype, epilogue, n)
+        && gpu.iu4_producer_sidecar_active(n, hidden_dim)
+}
+
+/// F1-lite: AWQ IU4 producer for w_down reading h = silu(gate)*up, already
+/// formed by the gate/up GEMM epilogue in `h`. Byte-identical sidecar to
+/// [`try_iu4_silu_prepared`]'s.
+fn iu4_hin_prepared(
+    gpu: &mut Gpu,
+    w_down: &hipfire_runtime::llama::WeightTensor,
+    h: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<rdna_compute::Int4MmqPrepared> {
+    let awq = w_down
+        .awq_scale
+        .as_ref()
+        .expect("F1-lite h requires the w_down AWQ scale (f1lite_ffn_eligible)");
+    let res = gpu.reserve_int4_mmq(k, n)?;
+    gpu.fused_silu_hin_rotate_mq_i4_batched(h, awq, res, k, n)
+}
 /// gfx1201 slice-1: SwiGLU/FWHT + in-register `block_i4_128` producer for
 /// w_down. `None` → caller keeps the incumbent silu + standalone-quantizer
 /// path. Same contract as [`try_iu4_silu_prepared`] (uniform MQ4G256V2 only,
@@ -7114,6 +7164,10 @@ pub(crate) fn batch_chunk_delta_net_attn(
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
+///
+/// F1-lite: with `f1lite` (see [`f1lite_ffn_eligible`]) the IU4 gate/up pair
+/// may instead emit h = silu(gate)*up into `gate_ffn_batch`; returns whether
+/// it did, i.e. whether the down hook must read h.
 fn batch_chunk_delta_net_ffn_gate_up(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
@@ -7123,7 +7177,8 @@ fn batch_chunk_delta_net_ffn_gate_up(
     dim: usize,
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
-) -> HipResult<()> {
+    f1lite: bool,
+) -> HipResult<bool> {
     let _ = fusion;
     // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
     // gate/up share the pre-rotation input, so both must be MQ4G256V2.
@@ -7141,17 +7196,19 @@ fn batch_chunk_delta_net_ffn_gate_up(
             config.norm_eps,
             n,
         )?;
-        return gpu.gemm_gate_up_mq4g256v2_wmma_f16(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &pbs.x_rot_f16_batch,
-            &pbs.gate_ffn_batch,
-            &pbs.up_batch,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-            n,
-        );
+        return gpu
+            .gemm_gate_up_mq4g256v2_wmma_f16(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_f16_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )
+            .map(|()| false);
     }
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
@@ -7259,6 +7316,21 @@ fn batch_chunk_delta_net_ffn_gate_up(
     // split is folded into the FusedGateUpHfq3G256 run-arm, which
     // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
     if let Some(prep) = &iu4_prep {
+        // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
+        if f1lite
+            && gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                prep,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?
+        {
+            return Ok(true);
+        }
         gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
             &layer.w_gate.buf,
             &layer.w_up.buf,
@@ -7460,7 +7532,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
             n,
         )?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7469,6 +7541,9 @@ fn batch_chunk_delta_net_ffn_gate_up(
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
+///
+/// `h_ready`: the gate/up hook emitted h = silu(gate)*up into
+/// `gate_ffn_batch` (F1-lite); only ever set on the AWQ IU4 producer route.
 fn batch_chunk_delta_net_ffn_down(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
@@ -7479,6 +7554,7 @@ fn batch_chunk_delta_net_ffn_down(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    h_ready: bool,
 ) -> HipResult<()> {
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
@@ -7535,16 +7611,20 @@ fn batch_chunk_delta_net_ffn_down(
         // C2: SwiGLU/FWHT IU4 producer for w_down (emit_f32=false). Residual only —
         // Partial TP epilogue still needs the f32 rotated buffer.
         if matches!(&epilogue, BatchEpilogue::Residual) {
-            iu4_prep = try_iu4_silu_prepared(
-                gpu,
-                &layer.w_down,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                &pbs.ffn_hidden_batch,
-                hidden_dim,
-                n,
-                false,
-            )?;
+            iu4_prep = if h_ready {
+                Some(iu4_hin_prepared(gpu, &layer.w_down, &pbs.gate_ffn_batch, hidden_dim, n)?)
+            } else {
+                try_iu4_silu_prepared(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.gate_ffn_batch,
+                    &pbs.up_batch,
+                    &pbs.ffn_hidden_batch,
+                    hidden_dim,
+                    n,
+                    false,
+                )?
+            };
             if iu4_prep.is_none() {
                 // gfx1201 slice-1: fused silu+quant producer (bit-identical).
                 iu4_prep = try_gfx12_silu_quant_fused_prepared(
@@ -7632,7 +7712,27 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    batch_chunk_delta_net_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+    let f1lite = f1lite_ffn_eligible(
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.w_down,
+        &epilogue,
+        fusion,
+        hidden_dim,
+        n,
+    );
+    let h_ready = batch_chunk_delta_net_ffn_gate_up(
+        gpu,
+        layer,
+        config,
+        pbs,
+        n,
+        dim,
+        q8_wmma_arch,
+        fusion,
+        f1lite,
+    )?;
 
     batch_chunk_delta_net_ffn_down(
         gpu,
@@ -7644,6 +7744,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         arch_has_wmma,
         epilogue,
         fusion,
+        h_ready,
     )?;
 
     Ok(())
@@ -8860,6 +8961,10 @@ pub(crate) fn batch_chunk_full_attn_attn(
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
+///
+/// F1-lite: with `f1lite` (see [`f1lite_ffn_eligible`]) the IU4 gate/up pair
+/// may instead emit h = silu(gate)*up into `gate_ffn_batch`; returns whether
+/// it did, i.e. whether the down hook must read h.
 fn batch_chunk_full_attn_ffn_gate_up(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
@@ -8869,7 +8974,8 @@ fn batch_chunk_full_attn_ffn_gate_up(
     dim: usize,
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
-) -> HipResult<()> {
+    f1lite: bool,
+) -> HipResult<bool> {
     let _ = fusion;
     // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
@@ -8886,17 +8992,19 @@ fn batch_chunk_full_attn_ffn_gate_up(
             config.norm_eps,
             n,
         )?;
-        return gpu.gemm_gate_up_mq4g256v2_wmma_f16(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &pbs.x_rot_f16_batch,
-            &pbs.gate_ffn_batch,
-            &pbs.up_batch,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-            n,
-        );
+        return gpu
+            .gemm_gate_up_mq4g256v2_wmma_f16(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_f16_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )
+            .map(|()| false);
     }
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
@@ -9000,6 +9108,21 @@ fn batch_chunk_full_attn_ffn_gate_up(
     // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
     // is folded into the FusedGateUpHfq3G256 run-arm.
     if let Some(prep) = &iu4_prep {
+        // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
+        if f1lite
+            && gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                prep,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?
+        {
+            return Ok(true);
+        }
         gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
             &layer.w_gate.buf,
             &layer.w_up.buf,
@@ -9201,7 +9324,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
             n,
         )?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9210,6 +9333,9 @@ fn batch_chunk_full_attn_ffn_gate_up(
 /// Same statements, same order, same launches as the inlined block.
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
+///
+/// `h_ready`: the gate/up hook emitted h = silu(gate)*up into
+/// `gate_ffn_batch` (F1-lite); only ever set on the AWQ IU4 producer route.
 fn batch_chunk_full_attn_ffn_down(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
@@ -9220,6 +9346,7 @@ fn batch_chunk_full_attn_ffn_down(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    h_ready: bool,
 ) -> HipResult<()> {
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
@@ -9268,16 +9395,20 @@ fn batch_chunk_full_attn_ffn_down(
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_w_down_is_mq {
         if matches!(&epilogue, BatchEpilogue::Residual) {
-            iu4_prep = try_iu4_silu_prepared(
-                gpu,
-                &layer.w_down,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                &pbs.ffn_hidden_batch,
-                hidden_dim,
-                n,
-                false,
-            )?;
+            iu4_prep = if h_ready {
+                Some(iu4_hin_prepared(gpu, &layer.w_down, &pbs.gate_ffn_batch, hidden_dim, n)?)
+            } else {
+                try_iu4_silu_prepared(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.gate_ffn_batch,
+                    &pbs.up_batch,
+                    &pbs.ffn_hidden_batch,
+                    hidden_dim,
+                    n,
+                    false,
+                )?
+            };
             if iu4_prep.is_none() {
                 // gfx1201 slice-1: fused silu+quant producer (bit-identical).
                 iu4_prep = try_gfx12_silu_quant_fused_prepared(
@@ -9363,7 +9494,27 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    batch_chunk_full_attn_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+    let f1lite = f1lite_ffn_eligible(
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.w_down,
+        &epilogue,
+        fusion,
+        hidden_dim,
+        n,
+    );
+    let h_ready = batch_chunk_full_attn_ffn_gate_up(
+        gpu,
+        layer,
+        config,
+        pbs,
+        n,
+        dim,
+        q8_wmma_arch,
+        fusion,
+        f1lite,
+    )?;
     batch_chunk_full_attn_ffn_down(
         gpu,
         layer,
@@ -9374,6 +9525,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         arch_has_wmma,
         epilogue,
         fusion,
+        h_ready,
     )?;
 
     Ok(())

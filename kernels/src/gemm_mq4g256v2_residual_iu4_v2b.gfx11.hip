@@ -36,6 +36,15 @@
 // result VGPR j of lane (hi, lr) is output (row 8*hi + j, token lr): each lane
 // owns 8 contiguous rows (two b128 Y accesses per fragment). Y is token-major
 // [N][M].
+//
+// F1-lite gate/up SwiGLU entry (`gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11`):
+// A = W_gate and U = W_up, both M rows; the CTA grid covers 2M virtual rows
+// in which tile fragment 2p is gate rows 16p..16p+15 of the tile's M/2-row
+// window and fragment 2p+1 the same up rows (a load-time address interleave;
+// the weights are not moved). Every g and u is folded exactly as by the SET
+// entry, and the epilogue stores h = SILU_MUL(g, u) to Y [N][M], spelled as in
+// fused_silu_mul_mq_rotate_awq.hip, so the h-producer
+// (`fused_silu_mul_mq_rotate_awq_i4_hin`) reproduces that producer bit-for-bit.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -124,10 +133,16 @@ static __device__ __forceinline__ void stage_store(const Stage& st, char* slot,
     for (int i = 0; i < SX; ++i) *(v2i*)(slot + A_BYTES + lds_off + i * 256) = st.x[i];
 }
 
-template <bool IS_ADD>
+#define IU4_V2B_SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
+
+enum { EPI_SET = 0, EPI_ADD = 1, EPI_SILU = 2 };
+
+template <int EPI>
 static __device__ __forceinline__ void body(
-    const char* __restrict__ A, const char* __restrict__ Xq,
+    const char* __restrict__ A, const char* __restrict__ U, const char* __restrict__ Xq,
     float* __restrict__ Y, int M, int K, int N) {
+    constexpr bool IS_ADD = EPI == EPI_ADD;
+    constexpr bool SILU = EPI == EPI_SILU;
     extern __shared__ __attribute__((aligned(16))) char lds[];
     const int lane = threadIdx.x;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.y);
@@ -143,9 +158,16 @@ static __device__ __forceinline__ void body(
     const size_t x_epoch = (size_t)N * XBLK_BYTES;
     const char* gA = A + (size_t)row0 * row_bytes;
     const char* gX = Xq + (size_t)col0 * XBLK_BYTES;
-    // Staging ownership (tile-relative 32-bit offsets).
+    // Staging ownership (tile-relative 32-bit offsets). F1: staging wave w
+    // owns tile fragment w = gate (w even) / up (w odd) rows
+    // row0/2 + 16*(w/2) + 0..15.
     const int sr = 16 * wave + lr;
-    const uint32_t a_off = (uint32_t)sr * row_bytes + 8u + 8u * (uint32_t)hi;
+    const char* gS = gA;
+    uint32_t a_off = (uint32_t)sr * row_bytes + 8u + 8u * (uint32_t)hi;
+    if constexpr (SILU) {
+        gS = ((wave & 1) ? U : A) + (size_t)((row0 >> 1) + 16 * (wave >> 1)) * row_bytes;
+        a_off = (uint32_t)lr * row_bytes + 8u + 8u * (uint32_t)hi;
+    }
     const uint32_t x_off = (uint32_t)sr * XBLK_BYTES + 8u + 8u * (uint32_t)hi;
     const uint32_t lds_off = (uint32_t)(wave * 1024 + hi * 128 + lr * 8);
     // Consumer offsets.
@@ -154,12 +176,20 @@ static __device__ __forceinline__ void body(
     const uint32_t xoff = (uint32_t)(A_BYTES + wc * 4 * 1024 + lr * 8);
     // Scale word u of lane (hi, lr) is the scale of row 8*hi + (lr&7) of
     // fragment 2u + (lr>>3), so DPP row_share:(8(a&1)+j) on word a>>1 hands
-    // every lane of half hi row 16a+8hi+j.
+    // every lane of half hi row 16a+8hi+j. F1: fragment 2u + (lr>>3) is gate
+    // (lr>>3 == 0) / up rows row0/2 + 32*wr + 16u + 8hi + (lr&7).
+    const char* gW = gA;
     uint32_t lws[NWS];
 #pragma unroll
     for (int u = 0; u < NWS; ++u)
         lws[u] = (uint32_t)(wr * WAVE_ROWS + 32 * u + 16 * (lr >> 3) + 8 * hi + (lr & 7)) *
                  row_bytes;
+    if constexpr (SILU) {
+        gW = ((lr & 8) ? U : A) +
+             (size_t)((row0 >> 1) + wr * (WAVE_ROWS / 2) + 8 * hi + (lr & 7)) * row_bytes;
+#pragma unroll
+        for (int u = 0; u < NWS; ++u) lws[u] = (uint32_t)(16 * u) * row_bytes;
+    }
     // Byte offset of K128 half e's payload inside a row (a_off adds the +8
     // header skip).
     auto a_epoch = [](int e) -> size_t {
@@ -180,7 +210,7 @@ static __device__ __forceinline__ void body(
             for (int j = 0; j < 8; ++j) sum[a][c][j] = 0;
 
     Stage st;
-    stage_load(st, gA + a_epoch(0), gX, a_off, x_off);
+    stage_load(st, gS + a_epoch(0), gX, a_off, x_off);
     stage_store(st, lds, lds_off);
     __syncthreads();
 
@@ -193,7 +223,7 @@ static __device__ __forceinline__ void body(
         if (even) {
 #pragma unroll
             for (int u = 0; u < NWS; ++u) {
-                const v2i h = *at<v2i>(gA + (size_t)(e >> 1) * GROUP_BYTES, lws[u]);
+                const v2i h = *at<v2i>(gW + (size_t)(e >> 1) * GROUP_BYTES, lws[u]);
                 wpk[u] = ((uint32_t)h.x & 0xffffu) | ((uint32_t)h.y << 16);
             }
         }
@@ -209,7 +239,7 @@ static __device__ __forceinline__ void body(
         IU4_V2B_FENCE();  // metadata requests precede the staging packet
         if constexpr (nxt) {
             const int en = e + 1;
-            stage_load(st, gA + a_epoch(en), gX + (size_t)en * x_epoch, a_off, x_off);
+            stage_load(st, gS + a_epoch(en), gX + (size_t)en * x_epoch, a_off, x_off);
         }
         IU4_V2B_FENCE();
 
@@ -282,6 +312,29 @@ static __device__ __forceinline__ void body(
     for (int e = 0; e + 1 < E; ++e) epoch(std::true_type{}, e);
     epoch(std::false_type{}, E - 1);
 
+    if constexpr (SILU) {
+        // Lane owns rows 8*hi..8*hi+7 of gate fragment 2p and of up fragment
+        // 2p+1, i.e. h rows row0/2 + 16*(wr*NA/2 + p) + 8hi + 0..7, one token.
+        static_assert(NA % 2 == 0, "gate/up fragment pairs");
+        float* htile = Y + (size_t)col0 * M + (row0 >> 1);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const uint32_t hoff = ((uint32_t)(wc * 64 + 16 * c + lr) * (uint32_t)M +
+                                   (uint32_t)(wr * (WAVE_ROWS / 2) + 8 * hi)) * 4u;
+#pragma unroll
+            for (int p = 0; p < NA / 2; ++p)
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    v4f h;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                        h[k] = IU4_V2B_SILU_MUL(sum[2 * p][c][4 * q + k],
+                                                sum[2 * p + 1][c][4 * q + k]);
+                    *(v4f*)((char*)htile + hoff + (uint32_t)(16 * p + 4 * q) * 4u) = h;
+                }
+        }
+        return;
+    }
     // Epilogue: lane owns rows 8*hi..8*hi+7 of each fragment for one token.
     float* ytile = Y + (size_t)col0 * M + row0;
     uint32_t yoff[NC];
@@ -327,15 +380,23 @@ static __device__ __forceinline__ void body(
 
 }  // namespace iu4_v2b
 
-#define IU4_V2B_ENTRY(name, is_add)                                           \
+#define IU4_V2B_ENTRY(name, epi)                                              \
     extern "C" __global__ __launch_bounds__(iu4_v2b::NT, 1) void name(        \
         const char* __restrict__ A, const char* __restrict__ Xq,              \
         float* __restrict__ Y, int M, int K, int N) {                         \
-        iu4_v2b::body<is_add>(A, Xq, Y, M, K, N);                             \
+        iu4_v2b::body<epi>(A, nullptr, Xq, Y, M, K, N);                       \
     }
-IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_set_gfx11, false)
-IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_add_gfx11, true)
+IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_set_gfx11, iu4_v2b::EPI_SET)
+IU4_V2B_ENTRY(gemm_mq4g256v2_residual_iu4_v2b_add_gfx11, iu4_v2b::EPI_ADD)
 #undef IU4_V2B_ENTRY
+// F1-lite: G/U = gate/up MQ4V2 rows (M each), Y = h [N][M]; grid (N/256, 2M/256).
+extern "C" __global__ __launch_bounds__(iu4_v2b::NT, 1) void
+gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11(
+    const char* __restrict__ G, const char* __restrict__ U, const char* __restrict__ Xq,
+    float* __restrict__ Y, int M, int K, int N) {
+    iu4_v2b::body<iu4_v2b::EPI_SILU>(G, U, Xq, Y, M, K, N);
+}
+#undef IU4_V2B_SILU_MUL
 #undef IU4_V2B_FENCE
 
 #endif
