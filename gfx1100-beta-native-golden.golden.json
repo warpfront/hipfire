@@ -1,0 +1,78 @@
+{
+  "schema": "hipfire.redline.golden-reproduction.v1",
+  "created_at_utc": "2026-07-28T06:14:06.466282+00:00",
+  "fixture_registry": "/home/kaden/hipfire-gfx1100-golden/registry/redline-golden-v1.json",
+  "fixture_registry_sha256": "ca5963ac3663bd3fa0ab3907c0e06bb390ef7cf19c5110f3263146f8c335f01d",
+  "fixture": {
+    "id": "qwen36-a3b-mq4r-gfx1100-tg128-q8-pm4",
+    "architecture": "gfx1100",
+    "reference": {
+      "created_at_utc": "2026-07-22",
+      "source_commit": "76f2a5748959a75c3a9cb484564fe467b6d184d8",
+      "daemon_sha256": "ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27",
+      "report_sha256": "fdacd6f75e7012c96009c3b89063d353947cad8c29a7f290ea2d7dcc856505d3",
+      "hip_median_tok_s": 219.64853355149975,
+      "pm4_min_tok_s": 251.430915438179,
+      "pm4_median_tok_s": 251.79776150956877,
+      "pm4_max_tok_s": 252.00764796747671,
+      "speedup": 1.146366686079109,
+      "historical_headline": {
+        "route_proof_status": "route-unspecified historical measurement",
+        "min_tok_s": 253.04,
+        "median_tok_s": 253.31,
+        "max_tok_s": 253.48
+      }
+    },
+    "acceptance": {
+      "minimum_pm4_tok_s": 245.0,
+      "minimum_speedup": 1.08
+    },
+    "benchmark": {
+      "context": 128,
+      "iterations": 128,
+      "warmups": 10,
+      "warmup_iterations": 32,
+      "runs": 10,
+      "transport": "pm4",
+      "kv_mode": "q8",
+      "max_seq": 2048,
+      "settle_window": 10,
+      "settle_min_runs": 10,
+      "settle_confirmation_runs": 10,
+      "settle_max_runs": 120,
+      "settle_max_slope_pct": 0.05,
+      "settle_max_spread_pct": 1.0,
+      "settle_max_median_drift_pct": 0.5
+    },
+    "route": {
+      "dispatches": 604,
+      "packets": 1,
+      "phases": 2,
+      "command_dwords": 16832,
+      "unique_kernels": 22,
+      "sequence_hash": "43754a60ca25f47c",
+      "observed_positions": [
+        128,
+        255
+      ]
+    }
+  },
+  "product_report": "/home/kaden/hipfire-gfx1100-golden/gfx1100-beta-native-golden.json",
+  "product_report_sha256": "cc72de04055de51614a38635a0e98efa6a3b9e701b3a6d5f33637b0313df39e1",
+  "validation": {
+    "valid": false,
+    "classification": "failed",
+    "fixture_id": "qwen36-a3b-mq4r-gfx1100-tg128-q8-pm4",
+    "architecture": "gfx1100",
+    "hip_median_tok_s": 216.23578398074665,
+    "pm4_median_tok_s": 245.37931440544594,
+    "speedup": 1.1347766308063711,
+    "errors": [
+      "prepared identity [[604, 1, 2, 16762]] does not contain [604, 1, 2, 16832]"
+    ],
+    "warnings": [
+      "source commit 87c9321cf95b982b69de0f35e073b61ea49e08b2 differs from reference 76f2a5748959a75c3a9cb484564fe467b6d184d8",
+      "daemon sha256 28fa8a741df7562c5820e379422b8a7c8250ef74d63e5bc362fbcdbca9f13292 differs from reference ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27"
+    ]
+  }
+}
