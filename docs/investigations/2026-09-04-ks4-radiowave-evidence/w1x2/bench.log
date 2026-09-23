@@ -1,0 +1,83 @@
+model: /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.hfq
+tensors in index: 851
+layers: 64 (48 linear_attention, 16 full_attention)
+bench layers: L0 (LA) + L3 (FA)
+
+            projection   qt      M      K      w_bytes  M*K/256*136  tensor
+        L0 in_proj_qkv   44  10240   5120     27852800     27852800  model.language_model.layers.0.linear_attn.in_proj_qkv.weight 
+          L0 in_proj_z   44   6144   5120     16711680     16711680  model.language_model.layers.0.linear_attn.in_proj_z.weight 
+          L0 in_proj_a   44     48   5120       130560       130560  model.language_model.layers.0.linear_attn.in_proj_a.weight 
+          L0 in_proj_b   44     48   5120       130560       130560  model.language_model.layers.0.linear_attn.in_proj_b.weight 
+           L0 out_proj   44   5120   6144     16711680     16711680  model.language_model.layers.0.linear_attn.out_proj.weight 
+          L0 gate_proj   44  17408   5120     47349760     47349760  model.language_model.layers.0.mlp.gate_proj.weight 
+            L0 up_proj   44  17408   5120     47349760     47349760  model.language_model.layers.0.mlp.up_proj.weight 
+          L0 down_proj   44   5120  17408     47349760     47349760  model.language_model.layers.0.mlp.down_proj.weight 
+             L3 q_proj   44  12288   5120     33423360     33423360  model.language_model.layers.3.self_attn.q_proj.weight 
+             L3 k_proj   44   1024   5120      2785280      2785280  model.language_model.layers.3.self_attn.k_proj.weight 
+             L3 v_proj   44   1024   5120      2785280      2785280  model.language_model.layers.3.self_attn.v_proj.weight 
+             L3 o_proj   44   5120   6144     16711680     16711680  model.language_model.layers.3.self_attn.o_proj.weight 
+          L3 gate_proj   44  17408   5120     47349760     47349760  model.language_model.layers.3.mlp.gate_proj.weight 
+            L3 up_proj   44  17408   5120     47349760     47349760  model.language_model.layers.3.mlp.up_proj.weight 
+          L3 down_proj   44   5120  17408     47349760     47349760  model.language_model.layers.3.mlp.down_proj.weight 
+NOTE: file dense-projection quants seen on benched tensors: {44} (expected 44 per ticket; file holds v1 qt=13 — same 136 B/group stride, sizes asserted equal)
+
+arch: gfx1100 (device 0, roofline 960 GB/s)
+
+kernel symbols (one profiled launch per arm, N=16):
+    L0 qkvza (fused qkv+z+a+b)  gpu.gemm_qkvza_hfq4g256_mq4v2  ->  gemm_qkvza_mq4g256v2_wmma
+        L0 out_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)  ->  gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds
+            L0 gate+up (fused)  gpu.gemm_gate_up_hfq4g256_mq4v2  ->  gemm_gate_up_mq4g256v2_wmma
+       L0 down_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)  ->  gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds
+          L3 qkv (fused q+k+v)  gpu.gemm_qkv_hfq4g256_mq4v2  ->  gemm_qkv_mq4g256v2_wmma
+          L3 o_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)  ->  gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds
+            L3 gate+up (fused)  gpu.gemm_gate_up_hfq4g256_mq4v2  ->  gemm_gate_up_mq4g256v2_wmma
+       L3 down_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed)  ->  gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds
+
+N=rows: warmup=32, launches/sample=200, samples=3 interleaved arm-by-arm
+                         arm   N     min_us     med_us        bytes      GB/s   %roof   floor_us
+  L0 qkvza (fused qkv+z+a+b)   1       93.3       93.6     44967680     480.2   50.0%       46.8
+  L0 qkvza (fused qkv+z+a+b)   8       95.4       95.7     45962240     480.2   50.0%       47.9
+  L0 qkvza (fused qkv+z+a+b)  16       98.9       99.3     47098880     474.4   49.4%       49.1
+      L0 out_proj (residual)   1      161.6      161.6     16764928     103.7   10.8%       17.5
+      L0 out_proj (residual)   8      203.9      203.9     17137664      84.0    8.8%       17.9
+      L0 out_proj (residual)  16      255.1      255.2     17563648      68.8    7.2%       18.3
+          L0 gate+up (fused)   1      174.7      175.3     94988288     541.9   56.4%       98.9
+          L0 gate+up (fused)   8      180.5      186.7     97009664     519.5   54.1%      101.1
+          L0 gate+up (fused)  16      183.7      198.1     99319808     501.4   52.2%      103.5
+     L0 down_proj (residual)   1      430.9      439.2     47425536     108.0   11.2%       49.4
+     L0 down_proj (residual)   8      564.1      564.7     47955968      84.9    8.8%       50.0
+     L0 down_proj (residual)  16      710.7      711.2     48562176      68.3    7.1%       50.6
+        L3 qkv (fused q+k+v)   1       92.7       92.8     39118848     421.4   43.9%       40.7
+        L3 qkv (fused q+k+v)   8       91.9       91.9     39993344     435.0   45.3%       41.7
+        L3 qkv (fused q+k+v)  16       95.5       95.8     40992768     428.1   44.6%       42.7
+        L3 o_proj (residual)   1      159.5      159.7     16764928     105.0   10.9%       17.5
+        L3 o_proj (residual)   8      203.8      203.8     17137664      84.1    8.8%       17.9
+        L3 o_proj (residual)  16      255.2      255.4     17563648      68.8    7.2%       18.3
+          L3 gate+up (fused)   1      172.6      173.6     94988288     547.1   57.0%       98.9
+          L3 gate+up (fused)   8      183.3      185.1     97009664     524.0   54.6%      101.1
+          L3 gate+up (fused)  16      193.1      193.9     99319808     512.3   53.4%      103.5
+     L3 down_proj (residual)   1      437.6      439.8     47425536     107.8   11.2%       49.4
+     L3 down_proj (residual)   8      564.1      564.6     47955968      84.9    8.8%       50.0
+     L3 down_proj (residual)  16      711.0      711.4     48562176      68.3    7.1%       50.6
+
+LAYER SUM N=16 (median): LA L0: today 1263.8 us, roofline 221.4 us, 5.71x over roofline
+LAYER SUM N=16 (median): FA L3: today 1256.4 us, roofline 215.0 us, 5.84x over roofline
+64-LAYER EXTRAPOLATION (48 LA + 16 FA) N=16: today 80.76 ms, roofline 14.07 ms, ceiling speedup 5.74x
+
+entry points (= fused-family batched run-arm callees, batch_size=Some(N); no DispatchCtx needed):
+    L0 qkvza (fused qkv+z+a+b)  gpu.gemm_qkvza_hfq4g256_mq4v2 [gemm_qkvza_mq4g256v2_wmma]
+        L0 out_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed) [gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds]
+            L0 gate+up (fused)  gpu.gemm_gate_up_hfq4g256_mq4v2 [gemm_gate_up_mq4g256v2_wmma]
+       L0 down_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed) [gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds]
+          L3 qkv (fused q+k+v)  gpu.gemm_qkv_hfq4g256_mq4v2 [gemm_qkv_mq4g256v2_wmma]
+          L3 o_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed) [gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds]
+            L3 gate+up (fused)  gpu.gemm_gate_up_hfq4g256_mq4v2 [gemm_gate_up_mq4g256v2_wmma]
+       L3 down_proj (residual)  gpu.gemm_hfq4g256_residual_mq4v2 (arch-routed) [gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds]
+dispatch tier at N=16 (by policy, gemm.rs mqv2_prefill_batch_tile/mqv2_mw_waves):
+  all BT/policy arms require batch >= 96 (residual/gateup/qkv/qkvza BT4/6/8/12) or
+  MW waves >= 384; N=16 matches none, so every projection fires the BASE BT1
+  WMMA kernel (gemm_mq4g256v2_residual_wmma base, gemm_gate_up/qkv/qkvza_mq4g256v2_wmma
+  base). Symbols above assert this — no _bt4/_bt6/_bt8/_bt12/_mw suffix expected.
+saved /home/kaden/dflash-m0/verify-shapes.txt
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: .hipfire_kernels/gfx1100

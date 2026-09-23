@@ -1,0 +1,47 @@
+      proj   N   kw   r(ks,base)       maxAbs  finite  r(base,f64)    r(ks,f64)   mx(ks,f64)       rmsRef   fr>1e-3     min_us     med_us
+  out_proj   1    2     8.301e-6     2.193e-4    true     1.230e-4     1.228e-4     1.289e-3      1.043e0    0.00e0       48.3       51.7 [OK]
+  out_proj   1    4     1.101e-5     3.109e-4    true     1.230e-4     1.229e-4     1.380e-3      1.043e0    0.00e0       37.9       40.6 [OK]
+  out_proj   1    8     1.189e-5     2.708e-4    true     1.230e-4     1.228e-4     1.340e-3      1.043e0    0.00e0       39.3       41.2 [OK]
+  out_proj   1  lds     1.154e-5     2.728e-4    true     1.230e-4     1.228e-4     1.342e-3      1.043e0    0.00e0       38.4       47.1 [OK]
+  out_proj   8    2     8.362e-6     4.196e-4    true     1.259e-4     1.254e-4     2.881e-3      1.047e0    0.00e0       53.1       53.6 [OK]
+  out_proj   8    4     1.084e-5     4.253e-4    true     1.259e-4     1.253e-4     2.790e-3      1.047e0    0.00e0       39.6       40.8 [OK]
+  out_proj   8    8     1.207e-5     4.721e-4    true     1.259e-4     1.252e-4     2.733e-3      1.047e0    0.00e0       36.5       40.0 [OK]
+  out_proj   8  lds     1.162e-5     4.416e-4    true     1.259e-4     1.252e-4     2.769e-3      1.047e0    0.00e0       40.4       41.1 [OK]
+  out_proj  16    2     8.151e-6     4.196e-4    true     1.263e-4     1.258e-4     2.882e-3      1.044e0    0.00e0       53.6       55.1 [OK]
+  out_proj  16    4     1.062e-5     4.253e-4    true     1.263e-4     1.257e-4     2.914e-3      1.044e0    0.00e0       41.7       41.8 [OK]
+  out_proj  16    8     1.184e-5     4.721e-4    true     1.263e-4     1.257e-4     2.961e-3      1.044e0    0.00e0       37.4       40.4 [OK]
+  out_proj  16  lds     1.143e-5     4.416e-4    true     1.263e-4     1.257e-4     2.948e-3      1.044e0    0.00e0       41.2       41.7 [OK]
+ down_proj   1    8  SKIP (K/256=68 not divisible by kw=8)
+ down_proj   1    2     2.435e-5     1.717e-4    true     1.502e-4     1.460e-4     9.905e-4      1.098e0    0.00e0      132.9      135.5 [OK]
+ down_proj   1    4     3.202e-5     2.651e-4    true     1.502e-4     1.448e-4     8.971e-4      1.098e0    0.00e0      110.6      112.9 [OK]
+ down_proj   1  lds     3.454e-5     3.080e-4    true     1.502e-4     1.444e-4     8.542e-4      1.098e0    0.00e0      102.5      104.4 [OK]
+ down_proj   8    8  SKIP (K/256=68 not divisible by kw=8)
+ down_proj   8    2     2.428e-5     3.853e-4    true     1.483e-4     1.443e-4     2.539e-3      1.109e0    0.00e0      135.4      138.5 [OK]
+ down_proj   8    4     3.207e-5     3.958e-4    true     1.483e-4     1.433e-4     2.592e-3      1.109e0    0.00e0      112.4      114.9 [OK]
+ down_proj   8  lds     3.464e-5     4.482e-4    true     1.483e-4     1.431e-4     2.561e-3      1.109e0    0.00e0      104.9      107.1 [OK]
+ down_proj  16    8  SKIP (K/256=68 not divisible by kw=8)
+ down_proj  16    2     2.432e-5     5.407e-4    true     1.488e-4     1.446e-4     2.816e-3      1.112e0    0.00e0      138.1      139.7 [OK]
+ down_proj  16    4     3.216e-5     8.278e-4    true     1.488e-4     1.435e-4     2.620e-3      1.112e0    0.00e0      112.9      114.6 [OK]
+ down_proj  16  lds     3.471e-5     9.289e-4    true     1.488e-4     1.433e-4     2.669e-3      1.112e0    0.00e0      105.3      107.8 [OK]
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.15)
+  pre-compiled kernels: .hipfire_kernels/gfx1100
+arch gfx1100 confirmed exact gfx1100 — running residual ksplit parity (Y+=W@X)
+model: /home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq4v2.xt.hfq
+out_proj: model.language_model.layers.0.linear_attn.out_proj.weight M=5120 K=6144 bytes=16711680
+  gemm_mq4g256v2_residual_wmma: pre-compiled blob has no hash file, recompiling
+  gemm_mq4g256v2_residual_wmma: per-kernel flags: -mllvm -misched=gcn-iterative-ilp
+  convert_f32_to_f16: pre-compiled blob has no hash file, recompiling
+  convert_f32_to_f16: per-kernel flags: -mllvm -misched=gcn-iterative-ilp
+  f64 truth out_proj N=1: relL2(base,f64)=1.230e-4 maxAbs(base,f64)=1.069e-3 rmsRef=1.043e0 (21 ms host)
+  gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: pre-compiled blob has no hash file, recompiling
+  gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: per-kernel flags: -mllvm -misched=gcn-iterative-ilp
+  gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage: pre-compiled blob has no hash file, recompiling
+  gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage: per-kernel flags: -mllvm -misched=gcn-iterative-ilp
+  f64 truth out_proj N=8: relL2(base,f64)=1.259e-4 maxAbs(base,f64)=2.987e-3 rmsRef=1.047e0 (87 ms host)
+  f64 truth out_proj N=16: relL2(base,f64)=1.263e-4 maxAbs(base,f64)=2.986e-3 rmsRef=1.044e0 (163 ms host)
+down_proj: model.language_model.layers.0.mlp.down_proj.weight M=5120 K=17408 bytes=47349760
+  f64 truth down_proj N=1: relL2(base,f64)=1.502e-4 maxAbs(base,f64)=1.162e-3 rmsRef=1.098e0 (56 ms host)
+  f64 truth down_proj N=8: relL2(base,f64)=1.483e-4 maxAbs(base,f64)=2.611e-3 rmsRef=1.109e0 (247 ms host)
+  f64 truth down_proj N=16: relL2(base,f64)=1.488e-4 maxAbs(base,f64)=3.149e-3 rmsRef=1.112e0 (475 ms host)
+
+PASS: every runnable (proj, N, kw) relL2(ks,base)<=5e-5, ldsstage relL2(lds,base)<=5e-5, all finite, Y+=W@X preserved
