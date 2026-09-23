@@ -1,0 +1,20 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+arch=gfx1201 flags.wide=false
+arming wide knob in-process for the oracle (serving gates use typed config)
+warm done
+B=512: capture ok, blobs=2
+capture,B=512,rep=0,mismatch=0,canary_same=true,inputs_same=true,PASS
+capture,B=512,rep=1,mismatch=0,canary_same=true,inputs_same=true,PASS
+capture,B=512,rep=2,mismatch=0,canary_same=true,inputs_same=true,PASS
+graph_alive_after_512_capture,alive=true,PASS
+growth_invalidation,graph_alive=false,blobs=0,PASS
+B=8192: capture ok, blobs=2
+capture,B=8192,rep=0,mismatch=0,canary_same=true,inputs_same=true,PASS
+capture,B=8192,rep=1,mismatch=0,canary_same=true,inputs_same=true,PASS
+capture,B=8192,rep=2,mismatch=0,canary_same=true,inputs_same=true,PASS
+ingress_capture_mode,route=attention_q8_0_fa2_gqa_gfx1201,mismatch=0,PASS
+retained: begin_capture ok, recording=true
+retained: finish ok launches=2 unique=2
+retained,B=512,mismatch=0,PASS
+ORACLE PASS (capture)

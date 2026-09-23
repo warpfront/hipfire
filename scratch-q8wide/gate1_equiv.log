@@ -1,0 +1,24 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+arch=gfx1201 flags.wide=false
+arming wide knob in-process for the oracle (serving gates use typed config)
+warm done
+equiv,B=64,start=0,segs=2,wide_hash=89b916857a2e76a1,seg_hash=89b916857a2e76a1,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=65,start=0,segs=2,wide_hash=b1fe54d2b711e7eb,seg_hash=b1fe54d2b711e7eb,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=127,start=0,segs=2,wide_hash=2167e0d059993391,seg_hash=2167e0d059993391,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=511,start=0,segs=2,wide_hash=dc9206bea91cdcde,seg_hash=dc9206bea91cdcde,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=512,start=0,segs=2,wide_hash=2baee91ded5ef9c4,seg_hash=2baee91ded5ef9c4,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=1024,start=0,segs=2,wide_hash=a250026a164ac622,seg_hash=a250026a164ac622,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=8192,start=0,segs=16,wide_hash=a35a2f31dc6c557a,seg_hash=a35a2f31dc6c557a,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=32768,start=0,segs=64,wide_hash=12d9f2ec16bbe9c5,seg_hash=12d9f2ec16bbe9c5,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=1,start=0,segs=1,wide_hash=a4418b029f2d8325,seg_hash=a4418b029f2d8325,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=7,start=0,segs=1,wide_hash=8aafbf5b6b95ab31,seg_hash=8aafbf5b6b95ab31,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=8,start=0,segs=1,wide_hash=094043bc0241a471,seg_hash=094043bc0241a471,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=9,start=0,segs=2,wide_hash=fd333d5264b30898,seg_hash=fd333d5264b30898,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=15,start=0,segs=2,wide_hash=b7d1e7ea485323ea,seg_hash=b7d1e7ea485323ea,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=16,start=0,segs=2,wide_hash=b0d033a3a7b17c8a,seg_hash=b0d033a3a7b17c8a,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=17,start=0,segs=2,wide_hash=37385d1cd8f14b2d,seg_hash=37385d1cd8f14b2d,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=1024,start=1000,segs=2,wide_hash=b730f5b27fae5ff1,seg_hash=b730f5b27fae5ff1,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=65,start=7,segs=2,wide_hash=a171c80b192507de,seg_hash=a171c80b192507de,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+equiv,B=8192,start=256,segs=16,wide_hash=72e11a8372e7b303,seg_hash=72e11a8372e7b303,mismatch=0,nonfinite=0,cache_unchanged=true,PASS
+ORACLE PASS (equiv)
