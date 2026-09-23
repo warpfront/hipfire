@@ -7034,15 +7034,43 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
 pub const GDN_CHUNK_PREP_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_prep.gfx1201.hip");
 
+/// gfx1100/gfx1151 GDN chunk-scan preparation: `gdn_chunk_prep` arithmetic on a
+/// row-major (channel group, C64 row chunk) grid with 16-byte x loads.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_PREP_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_prep.gfx11.hip");
+
+/// gfx1151 C32 prep resets the G prefix at each 32-row boundary.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_PREP_C32_GFX1151_SRC: &str = concat!(
+    "#define GDN_PREP_C32 1\n",
+    include_str!("../../../kernels/src/gdn_chunk_prep.gfx11.hip")
+);
+
 /// Shared-Gram KKT solve for the GDN chunk scan on gfx1100/gfx1151/gfx1201.
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_KKT_SOLVE_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip");
 
+/// gfx1100 KKT solve: one value head per workgroup, 48-way parallel.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_KKT_SOLVE_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_kkt_solve.gfx11.hip");
+
+/// gfx1151 C32 KKT inverse for the 32-row scan.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_KKT_SOLVE_C32_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_kkt_solve_c32.gfx1151.hip");
+
 /// Fused GDN chunk scan and Q8+EF state commit on gfx1100/gfx1151/gfx1201.
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_SCAN_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
+
+/// gfx1151 C32 split scan and Q8+EF state commit.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_C32_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan_c32.gfx1151.hip");
 
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K

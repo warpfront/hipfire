@@ -4796,26 +4796,73 @@ impl Gpu {
         result
     }
 
+    /// Row-major GDN preparation is exact on gfx11. Disable for A/B via
+    /// `HIPFIRE_GDN_PREP_GFX11=0`.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_gfx11(&self) -> bool {
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_GFX11").as_deref() != Ok("0")
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_c32_gfx1151(&self) -> bool {
+        self.arch == "gfx1151"
+            && hipfire_config::developer_var("HIPFIRE_GDN_C32").as_deref() == Ok("1")
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_kkt_gfx1100(&self) -> bool {
+        self.arch == "gfx1100"
+            && hipfire_config::developer_var("HIPFIRE_GDN_KKT_GFX1100").as_deref() != Ok("0")
+    }
+
     /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
     /// admitted route mutates its input scratch or persistent convolution state.
     #[cfg(feature = "deltanet")]
     pub fn gdn_chunk_prepare(&mut self) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gdn_chunk_prep",
-            kernels::GDN_CHUNK_PREP_SRC,
-            "gdn_chunk_prep",
-        )?;
-        self.ensure_kernel(
-            "gdn_chunk_kkt_solve",
-            kernels::GDN_CHUNK_KKT_SOLVE_SRC,
-            "gdn_chunk_kkt_solve",
-        )?;
-        self.ensure_kernel(
-            "gdn_chunk_scan",
-            kernels::GDN_CHUNK_SCAN_SRC,
-            "gdn_chunk_scan",
-        )
+        if self.gdn_chunk_c32_gfx1151() {
+            self.ensure_kernel(
+                "gdn_chunk_prep_c32_gfx1151",
+                kernels::GDN_CHUNK_PREP_C32_GFX1151_SRC,
+                "gdn_chunk_prep_gfx11",
+            )?;
+        } else if self.gdn_chunk_prep_gfx11() {
+            self.ensure_kernel(
+                "gdn_chunk_prep_gfx11",
+                kernels::GDN_CHUNK_PREP_GFX11_SRC,
+                "gdn_chunk_prep_gfx11",
+            )?;
+        } else {
+            self.ensure_kernel("gdn_chunk_prep", kernels::GDN_CHUNK_PREP_SRC, "gdn_chunk_prep")?;
+        }
+        if self.gdn_chunk_c32_gfx1151() {
+            self.ensure_kernel(
+                "gdn_chunk_kkt_solve_c32_gfx1151",
+                kernels::GDN_CHUNK_KKT_SOLVE_C32_GFX1151_SRC,
+                "gdn_chunk_kkt_solve_c32",
+            )?;
+            self.ensure_kernel(
+                "gdn_chunk_scan_c32_gfx1151",
+                kernels::GDN_CHUNK_SCAN_C32_GFX1151_SRC,
+                "gdn_chunk_scan_c32",
+            )
+        } else {
+            if self.gdn_chunk_kkt_gfx1100() {
+                self.ensure_kernel(
+                    "gdn_chunk_kkt_solve_gfx1100",
+                    kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                    "gdn_chunk_kkt_solve_gfx1100",
+                )?;
+            } else {
+                self.ensure_kernel(
+                    "gdn_chunk_kkt_solve",
+                    kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                    "gdn_chunk_kkt_solve",
+                )?;
+            }
+            self.ensure_kernel("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, "gdn_chunk_scan")
+        }
     }
     /// GDN chunk scan preamble for gfx1100/gfx1151/gfx1201. The compact Q/K/V
     /// buffers are BF16 byte views borrowed from the ordinary prefill scratch.
@@ -4838,7 +4885,17 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.gdn_chunk_prepare()?;
-        const PREP_MODULE: &str = "gdn_chunk_prep";
+        let c32 = self.gdn_chunk_c32_gfx1151();
+        let gfx11 = self.gdn_chunk_prep_gfx11();
+        let prep_module = if c32 {
+            "gdn_chunk_prep_c32_gfx1151"
+        } else if gfx11 {
+            "gdn_chunk_prep_gfx11"
+        } else {
+            "gdn_chunk_prep"
+        };
+        let chunks = ((n_tokens + 63) / 64) as u32;
+        let grid = if c32 || gfx11 { [10, chunks, 1] } else { [chunks, 10, 1] };
 
         let xp = input.buf.as_ptr();
         let wp = conv_weight.buf.as_ptr();
@@ -4869,8 +4926,8 @@ impl Gpu {
             &ep as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            PREP_MODULE,
-            [((n_tokens + 63) / 64) as u32, 10, 1],
+            prep_module,
+            grid,
             [256, 1, 1],
             0,
             &mut params,
@@ -4915,18 +4972,46 @@ impl Gpu {
         n_tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const KKT_MODULE: &str = "gdn_chunk_kkt_solve";
-        const SCAN_MODULE: &str = "gdn_chunk_scan";
-        self.ensure_kernel(
-            KKT_MODULE,
-            kernels::GDN_CHUNK_KKT_SOLVE_SRC,
-            KKT_MODULE,
-        )?;
-        self.ensure_kernel(
-            SCAN_MODULE,
-            kernels::GDN_CHUNK_SCAN_SRC,
-            SCAN_MODULE,
-        )?;
+        let c32 = self.gdn_chunk_c32_gfx1151();
+        let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) = if c32 {
+            (
+                "gdn_chunk_kkt_solve_c32_gfx1151",
+                kernels::GDN_CHUNK_KKT_SOLVE_C32_GFX1151_SRC,
+                "gdn_chunk_kkt_solve_c32",
+                32,
+                48,
+                64,
+            )
+        } else if self.gdn_chunk_kkt_gfx1100() {
+            (
+                "gdn_chunk_kkt_solve_gfx1100",
+                kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                "gdn_chunk_kkt_solve_gfx1100",
+                64,
+                48,
+                128,
+            )
+        } else {
+            (
+                "gdn_chunk_kkt_solve",
+                kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                "gdn_chunk_kkt_solve",
+                64,
+                16,
+                128,
+            )
+        };
+        let (scan_module, scan_source, scan_symbol) = if c32 {
+            (
+                "gdn_chunk_scan_c32_gfx1151",
+                kernels::GDN_CHUNK_SCAN_C32_GFX1151_SRC,
+                "gdn_chunk_scan_c32",
+            )
+        } else {
+            ("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, "gdn_chunk_scan")
+        };
+        self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
+        self.ensure_kernel(scan_module, scan_source, scan_symbol)?;
 
         let kp = k.buf.as_ptr();
         let gp = g.buf.as_ptr();
@@ -4943,9 +5028,9 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            KKT_MODULE,
-            [((n_tokens + 63) / 64) as u32, 16, 1],
-            [128, 1, 1],
+            kkt_module,
+            [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
+            [kkt_block, 1, 1],
             0,
             &mut kkt_params,
             || {
@@ -4984,9 +5069,9 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            SCAN_MODULE,
-            [1, 48, 1],
-            [512, 1, 1],
+            scan_module,
+            [if c32 { 2 } else { 1 }, 48, 1],
+            [if c32 { 256 } else { 512 }, 1, 1],
             0,
             &mut scan_params,
             || {
