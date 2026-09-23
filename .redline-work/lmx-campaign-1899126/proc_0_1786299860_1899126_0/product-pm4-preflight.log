@@ -1,0 +1,2 @@
+GPU dev 0: gfx1100 (25.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1100

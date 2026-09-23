@@ -1,0 +1,2 @@
+GPU dev 0: gfx1010 (8.6 GB VRAM, HIP 7.14)
+  pre-compiled kernels: .hipfire_kernels/gfx1010
