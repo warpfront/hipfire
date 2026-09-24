@@ -12,6 +12,29 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// `HIPFIRE_QWEN4_MOE_GATEUP_WMMA=1` routes the Qwen4 grouped gate/up GEMM to
+/// the WMMA arm on gfx1151. Default off.
+///
+/// `gemm_mq4g256v2_moe_grouped_wmma_k2` is gfx11 code — it uses
+/// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` and carries no arch guard — but
+/// `gemm_mq4g256v2_moe_grouped_top10` returns a gfx1151 SIMT arm before ever
+/// reaching the WMMA tail call, so gfx1151 could not select it. This flag lets
+/// that fall-through happen; the launcher already converts X to F16 internally,
+/// so the kernarg contract is unchanged.
+///
+/// NOT bit-exact: the grouped WMMA GEMM dequantizes in fp16, which is why
+/// `examples/mq4v2_moe_parity` gives the grouped check a 2e-2 tolerance against
+/// 1e-5 elsewhere. Default-off until an accuracy gate exists (see the commit
+/// message for what has and has not been measured).
+///
+/// Read once — this sits on a per-layer launch path (48 launches per forward).
+fn qwen4_moe_gateup_wmma() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var_os("HIPFIRE_QWEN4_MOE_GATEUP_WMMA").as_deref() == Some("1".as_ref())
+    })
+}
+
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
 ///
@@ -38809,7 +38832,9 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
             ));
         }
-        if self.arch_caps.is_gfx1151() {
+        // Opting into WMMA skips the gfx1151 SIMT arms so the WMMA tail call at
+        // the end of this function becomes reachable on this arch.
+        if self.arch_caps.is_gfx1151() && !qwen4_moe_gateup_wmma() {
             if m == 1280 && k == 2560 {
                 return self.gemm_mq4g256v2_moe_grouped_top10_o4_r4_gfx1151(
                     expert_weight_ptrs,
