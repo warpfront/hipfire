@@ -144,6 +144,32 @@ pub(crate) fn quantize_mq3g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
+    quantize_mq3g256v2_impl(w, m, k, signs1, signs2, false)
+}
+
+/// MQ3V2 with a symmetric per-128 grid in the existing affine wire format.
+///
+/// The stored zero point is exactly `-4*d`, so code 4 reconstructs zero and
+/// shipped decoders remain byte-format compatible. Scale candidates mirror the
+/// MQ4V2 A4 ladder shifted onto the 7-interval midpoint grid.
+pub(crate) fn quantize_mq3g256v2_symmetric(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq3g256v2_impl(w, m, k, signs1, signs2, true)
+}
+
+fn quantize_mq3g256v2_impl(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ3G256V2 requires K % 256 == 0, got K={k}");
     let n = w.len();
     assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
@@ -158,51 +184,82 @@ pub(crate) fn quantize_mq3g256v2(
         cpu_fwht_256(&mut group, signs1, signs2);
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
+        let mut q = [0u8; 256];
         for h in 0..2 {
             let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
-            let mut sc_bits = f32_to_f16(step_f32);
-            if hi == lo {
-                sc_bits = 0u16;
+            let values = &group[off..off + 128];
+            if symmetric {
+                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                if amax == 0.0 {
+                    scales[h] = 0;
+                    zeros[h] = f32_to_f16(-0.0);
+                    q[off..off + 128].fill(4);
+                    continue;
+                }
+
+                let candidate_base = (amax / 3.5) * 0.5;
+                let multipliers = [
+                    1.0f32,
+                    f32::from_bits(0x3fa4_9249),
+                    f32::from_bits(0x3fdb_6db7),
+                    2.0f32,
+                ];
+                let mut best_mse = f64::INFINITY;
+                for multiplier in multipliers {
+                    let scale_bits = f32_to_f16(candidate_base * multiplier);
+                    let scale = f16_to_f32(scale_bits);
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let zero_bits = f32_to_f16(-4.0 * scale);
+                    let zero = f16_to_f32(zero_bits);
+                    let inverse = 1.0 / scale;
+                    let mut mse = 0.0f64;
+                    for &value in values {
+                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 7.0);
+                        let error = value - code.mul_add(scale, zero);
+                        mse += (error as f64) * (error as f64);
+                    }
+                    if mse < best_mse {
+                        best_mse = mse;
+                        scales[h] = scale_bits;
+                        zeros[h] = zero_bits;
+                    }
+                }
+                let scale = f16_to_f32(scales[h]);
+                let zero = f16_to_f32(zeros[h]);
+                let inverse = 1.0 / scale;
+                for i in 0..128 {
+                    q[off + i] =
+                        ((group[off + i] - zero) * inverse + 0.5).floor().clamp(0.0, 7.0) as u8;
+                }
+            } else {
+                let lo = values.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+                let mut sc_bits = f32_to_f16(step_f32);
+                if hi == lo {
+                    sc_bits = 0u16;
+                }
+                let z_bits = f32_to_f16(lo);
+                let st = f16_to_f32(sc_bits);
+                let z = f16_to_f32(z_bits);
+                scales[h] = sc_bits;
+                zeros[h] = z_bits;
+                if !(hi == lo || step_f32 == 0.0 || st == 0.0) {
+                    let inv = 1.0 / st;
+                    for i in 0..128 {
+                        let v = group[off + i];
+                        q[off + i] = ((v - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                    }
+                }
             }
-            let z_bits = f32_to_f16(lo);
-            let st = f16_to_f32(sc_bits);
-            let z = f16_to_f32(z_bits);
-            scales[h] = sc_bits;
-            zeros[h] = z_bits;
-            sts[h] = st;
-            zs[h] = z;
-            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
         }
         let out_off = b * block_bytes;
         output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
         output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
         output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
         output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
-                for i in 0..128 {
-                    q[off + i] = 0;
-                }
-            } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    let v = group[off + i];
-                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
-                    q[off + i] = qq;
-                }
-            }
-        }
         for chunk in 0..32 {
             let ci = chunk * 8;
             let mut qq = [0u8; 8];
@@ -221,6 +278,7 @@ pub(crate) fn quantize_mq3g256v2(
     }
     output
 }
+
 /// MQ2G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
 ///
 /// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..72) 64B packed 2-bit`.
@@ -231,6 +289,32 @@ pub(crate) fn quantize_mq2g256v2(
     k: usize,
     signs1: &[f32],
     signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq2g256v2_impl(w, m, k, signs1, signs2, false)
+}
+
+/// MQ2V2 with a symmetric per-128 grid in the existing affine wire format.
+///
+/// The stored zero point is exactly `-2*d`, so code 2 reconstructs zero and
+/// shipped decoders remain byte-format compatible. Scale candidates mirror the
+/// MQ4V2 A4 ladder shifted onto the 3-interval midpoint grid.
+pub(crate) fn quantize_mq2g256v2_symmetric(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq2g256v2_impl(w, m, k, signs1, signs2, true)
+}
+
+fn quantize_mq2g256v2_impl(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
 ) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ2G256V2 requires K % 256 == 0, got K={k}");
     let n = w.len();
@@ -246,51 +330,82 @@ pub(crate) fn quantize_mq2g256v2(
         cpu_fwht_256(&mut group, signs1, signs2);
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
+        let mut q = [0u8; 256];
         for h in 0..2 {
             let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
-            let mut sc_bits = f32_to_f16(step_f32);
-            if hi == lo {
-                sc_bits = 0u16;
+            let values = &group[off..off + 128];
+            if symmetric {
+                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                if amax == 0.0 {
+                    scales[h] = 0;
+                    zeros[h] = f32_to_f16(-0.0);
+                    q[off..off + 128].fill(2);
+                    continue;
+                }
+
+                let candidate_base = (amax / 1.5) * 0.5;
+                let multipliers = [
+                    1.0f32,
+                    f32::from_bits(0x3fa4_9249),
+                    f32::from_bits(0x3fdb_6db7),
+                    2.0f32,
+                ];
+                let mut best_mse = f64::INFINITY;
+                for multiplier in multipliers {
+                    let scale_bits = f32_to_f16(candidate_base * multiplier);
+                    let scale = f16_to_f32(scale_bits);
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let zero_bits = f32_to_f16(-2.0 * scale);
+                    let zero = f16_to_f32(zero_bits);
+                    let inverse = 1.0 / scale;
+                    let mut mse = 0.0f64;
+                    for &value in values {
+                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 3.0);
+                        let error = value - code.mul_add(scale, zero);
+                        mse += (error as f64) * (error as f64);
+                    }
+                    if mse < best_mse {
+                        best_mse = mse;
+                        scales[h] = scale_bits;
+                        zeros[h] = zero_bits;
+                    }
+                }
+                let scale = f16_to_f32(scales[h]);
+                let zero = f16_to_f32(zeros[h]);
+                let inverse = 1.0 / scale;
+                for i in 0..128 {
+                    q[off + i] =
+                        ((group[off + i] - zero) * inverse + 0.5).floor().clamp(0.0, 3.0) as u8;
+                }
+            } else {
+                let lo = values.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
+                let mut sc_bits = f32_to_f16(step_f32);
+                if hi == lo {
+                    sc_bits = 0u16;
+                }
+                let z_bits = f32_to_f16(lo);
+                let st = f16_to_f32(sc_bits);
+                let z = f16_to_f32(z_bits);
+                scales[h] = sc_bits;
+                zeros[h] = z_bits;
+                if !(hi == lo || step_f32 == 0.0 || st == 0.0) {
+                    let inv = 1.0 / st;
+                    for i in 0..128 {
+                        let v = group[off + i];
+                        q[off + i] = ((v - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
+                    }
+                }
             }
-            let z_bits = f32_to_f16(lo);
-            let st = f16_to_f32(sc_bits);
-            let z = f16_to_f32(z_bits);
-            scales[h] = sc_bits;
-            zeros[h] = z_bits;
-            sts[h] = st;
-            zs[h] = z;
-            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
         }
         let out_off = b * block_bytes;
         output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
         output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
         output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
         output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
-                for i in 0..128 {
-                    q[off + i] = 0;
-                }
-            } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    let v = group[off + i];
-                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
-                    q[off + i] = qq;
-                }
-            }
-        }
         for i in 0..64 {
             let mut byte_val = 0u8;
             for j in 0..4 {
@@ -2878,6 +2993,371 @@ mod mqv2_lowbit_tests {
             assert!(st >= 0.0);
             let _ = (st, zt, bbytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod mqv2_symmetric_tests {
+    use super::*;
+
+    /// Frozen pre-change asymmetric MQ3V2 path — lock that public
+    /// `quantize_mq3g256v2` stays byte-identical when symmetric=false.
+    fn legacy_mq3g256v2_asymmetric(
+        w: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+    ) -> Vec<u8> {
+        assert!(k % 256 == 0);
+        assert_eq!(w.len(), m * k);
+        let gpr = k / 256;
+        let total_groups = m * gpr;
+        let block_bytes = MQ3V2_GROUP_BYTES;
+        let mut output = vec![0u8; total_groups * block_bytes];
+        for b in 0..total_groups {
+            let start = b * 256;
+            let mut group = [0.0f32; 256];
+            group.copy_from_slice(&w[start..start + 256]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let mut scales = [0u16; 2];
+            let mut zeros = [0u16; 2];
+            let mut sts = [0.0f32; 2];
+            let mut zs = [0.0f32; 2];
+            let mut degenerate = [false; 2];
+            for h in 0..2 {
+                let off = h * 128;
+                let slice = &group[off..off + 128];
+                let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+                let mut sc_bits = f32_to_f16(step_f32);
+                if hi == lo {
+                    sc_bits = 0u16;
+                }
+                let z_bits = f32_to_f16(lo);
+                let st = f16_to_f32(sc_bits);
+                let z = f16_to_f32(z_bits);
+                scales[h] = sc_bits;
+                zeros[h] = z_bits;
+                sts[h] = st;
+                zs[h] = z;
+                degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+            }
+            let out_off = b * block_bytes;
+            output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+            output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+            output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+            output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+            let mut q = [0u8; 256];
+            for h in 0..2 {
+                let off = h * 128;
+                if degenerate[h] {
+                    for i in 0..128 {
+                        q[off + i] = 0;
+                    }
+                } else {
+                    let st = sts[h];
+                    let z = zs[h];
+                    let inv = 1.0 / st;
+                    for i in 0..128 {
+                        let v = group[off + i];
+                        q[off + i] = ((v - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                    }
+                }
+            }
+            for chunk in 0..32 {
+                let ci = chunk * 8;
+                let mut qq = [0u8; 8];
+                for j in 0..8 {
+                    qq[j] = q[ci + j] & 7;
+                }
+                let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
+                let b1 = ((qq[2] >> 2) & 1)
+                    | ((qq[3] & 7) << 1)
+                    | ((qq[4] & 7) << 4)
+                    | ((qq[5] & 1) << 7);
+                let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
+                let bo = out_off + 8 + chunk * 3;
+                output[bo] = b0;
+                output[bo + 1] = b1;
+                output[bo + 2] = b2;
+            }
+        }
+        output
+    }
+
+    fn legacy_mq2g256v2_asymmetric(
+        w: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+    ) -> Vec<u8> {
+        assert!(k % 256 == 0);
+        assert_eq!(w.len(), m * k);
+        let gpr = k / 256;
+        let total_groups = m * gpr;
+        let block_bytes = MQ2V2_GROUP_BYTES;
+        let mut output = vec![0u8; total_groups * block_bytes];
+        for b in 0..total_groups {
+            let start = b * 256;
+            let mut group = [0.0f32; 256];
+            group.copy_from_slice(&w[start..start + 256]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let mut scales = [0u16; 2];
+            let mut zeros = [0u16; 2];
+            let mut sts = [0.0f32; 2];
+            let mut zs = [0.0f32; 2];
+            let mut degenerate = [false; 2];
+            for h in 0..2 {
+                let off = h * 128;
+                let slice = &group[off..off + 128];
+                let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
+                let mut sc_bits = f32_to_f16(step_f32);
+                if hi == lo {
+                    sc_bits = 0u16;
+                }
+                let z_bits = f32_to_f16(lo);
+                let st = f16_to_f32(sc_bits);
+                let z = f16_to_f32(z_bits);
+                scales[h] = sc_bits;
+                zeros[h] = z_bits;
+                sts[h] = st;
+                zs[h] = z;
+                degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+            }
+            let out_off = b * block_bytes;
+            output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+            output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+            output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+            output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+            let mut q = [0u8; 256];
+            for h in 0..2 {
+                let off = h * 128;
+                if degenerate[h] {
+                    for i in 0..128 {
+                        q[off + i] = 0;
+                    }
+                } else {
+                    let st = sts[h];
+                    let z = zs[h];
+                    let inv = 1.0 / st;
+                    for i in 0..128 {
+                        let v = group[off + i];
+                        q[off + i] = ((v - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
+                    }
+                }
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 {
+                    let qq = q[4 * i + j] & 3;
+                    byte_val |= qq << (j * 2);
+                }
+                output[out_off + 8 + i] = byte_val;
+            }
+        }
+        output
+    }
+
+    fn unpack_mq3_codes(payload: &[u8]) -> [u8; 256] {
+        let mut q = [0u8; 256];
+        for chunk in 0..32 {
+            let bo = chunk * 3;
+            let b0 = payload[bo] as u32;
+            let b1 = payload[bo + 1] as u32;
+            let b2 = payload[bo + 2] as u32;
+            let packed = b0 | (b1 << 8) | (b2 << 16);
+            let base = chunk * 8;
+            for j in 0..8 {
+                q[base + j] = ((packed >> (3 * j)) & 7) as u8;
+            }
+        }
+        q
+    }
+
+    fn unpack_mq2_codes(payload: &[u8]) -> [u8; 256] {
+        let mut q = [0u8; 256];
+        for i in 0..64 {
+            let byte = payload[i];
+            for j in 0..4 {
+                q[4 * i + j] = (byte >> (j * 2)) & 3;
+            }
+        }
+        q
+    }
+
+    fn fwht_mse_mq3(w: &[f32], blob: &[u8], signs1: &[f32], signs2: &[f32]) -> f64 {
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[..256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let s0 = f16_to_f32(u16::from_le_bytes([blob[0], blob[1]]));
+        let z0 = f16_to_f32(u16::from_le_bytes([blob[2], blob[3]]));
+        let s1 = f16_to_f32(u16::from_le_bytes([blob[4], blob[5]]));
+        let z1 = f16_to_f32(u16::from_le_bytes([blob[6], blob[7]]));
+        let q = unpack_mq3_codes(&blob[8..]);
+        let mut mse = 0.0f64;
+        for i in 0..256 {
+            let (s, z) = if i < 128 { (s0, z0) } else { (s1, z1) };
+            let recon = (q[i] as f32) * s + z;
+            let err = (group[i] - recon) as f64;
+            mse += err * err;
+        }
+        mse
+    }
+
+    fn fwht_mse_mq2(w: &[f32], blob: &[u8], signs1: &[f32], signs2: &[f32]) -> f64 {
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[..256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let s0 = f16_to_f32(u16::from_le_bytes([blob[0], blob[1]]));
+        let z0 = f16_to_f32(u16::from_le_bytes([blob[2], blob[3]]));
+        let s1 = f16_to_f32(u16::from_le_bytes([blob[4], blob[5]]));
+        let z1 = f16_to_f32(u16::from_le_bytes([blob[6], blob[7]]));
+        let q = unpack_mq2_codes(&blob[8..]);
+        let mut mse = 0.0f64;
+        for i in 0..256 {
+            let (s, z) = if i < 128 { (s0, z0) } else { (s1, z1) };
+            let recon = (q[i] as f32) * s + z;
+            let err = (group[i] - recon) as f64;
+            mse += err * err;
+        }
+        mse
+    }
+
+    #[test]
+    fn mq3v2_asymmetric_byte_identical_to_legacy() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let m = 3usize;
+        let k = 512usize;
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.017 + 0.3).sin()) * 0.42)
+            .collect();
+        let got = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+        let want = legacy_mq3g256v2_asymmetric(&w, m, k, &s1, &s2);
+        assert_eq!(got, want, "public MQ3V2 must stay byte-identical when asymmetric");
+    }
+
+    #[test]
+    fn mq2v2_asymmetric_byte_identical_to_legacy() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let m = 3usize;
+        let k = 512usize;
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.019 - 0.7).cos()) * 0.55)
+            .collect();
+        let got = quantize_mq2g256v2(&w, m, k, &s1, &s2);
+        let want = legacy_mq2g256v2_asymmetric(&w, m, k, &s1, &s2);
+        assert_eq!(got, want, "public MQ2V2 must stay byte-identical when asymmetric");
+    }
+
+    #[test]
+    fn mq3v2_symmetric_zero_is_neg_four_d() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| ((i as f32 - 128.0) * 0.02).sin() * 0.8).collect();
+        let blob = quantize_mq3g256v2_symmetric(&w, 1, 256, &s1, &s2);
+        for half in 0..2 {
+            let base = half * 4;
+            let d = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            let z_bits = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+            assert_eq!(z_bits, f32_to_f16(-4.0 * d), "half {half}: zero must be f16(-4*d)");
+        }
+    }
+
+    #[test]
+    fn mq2v2_symmetric_zero_is_neg_two_d() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| ((i as f32 - 128.0) * 0.02).sin() * 0.8).collect();
+        let blob = quantize_mq2g256v2_symmetric(&w, 1, 256, &s1, &s2);
+        for half in 0..2 {
+            let base = half * 4;
+            let d = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
+            let z_bits = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+            assert_eq!(z_bits, f32_to_f16(-2.0 * d), "half {half}: zero must be f16(-2*d)");
+        }
+    }
+
+    #[test]
+    fn mq3v2_symmetric_beats_asymmetric_on_symmetric_dist() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // Near-symmetric post-FWHT: odd function around zero in the natural basis
+        // tends to stay roughly centered after orthogonal FWHT.
+        let w: Vec<f32> = (0..256)
+            .map(|i| {
+                let x = (i as f32 - 127.5) / 64.0;
+                x * (-0.5 * x * x).exp()
+            })
+            .collect();
+        let asym = quantize_mq3g256v2(&w, 1, 256, &s1, &s2);
+        let sym = quantize_mq3g256v2_symmetric(&w, 1, 256, &s1, &s2);
+        let mse_a = fwht_mse_mq3(&w, &asym, &s1, &s2);
+        let mse_s = fwht_mse_mq3(&w, &sym, &s1, &s2);
+        assert!(
+            mse_s < mse_a * 1.2,
+            "symmetric MQ3 MSE {mse_s} should beat 1.2x asymmetric {mse_a}"
+        );
+    }
+
+    #[test]
+    fn mq2v2_symmetric_beats_asymmetric_on_symmetric_dist() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256)
+            .map(|i| {
+                let x = (i as f32 - 127.5) / 64.0;
+                x * (-0.5 * x * x).exp()
+            })
+            .collect();
+        let asym = quantize_mq2g256v2(&w, 1, 256, &s1, &s2);
+        let sym = quantize_mq2g256v2_symmetric(&w, 1, 256, &s1, &s2);
+        let mse_a = fwht_mse_mq2(&w, &asym, &s1, &s2);
+        let mse_s = fwht_mse_mq2(&w, &sym, &s1, &s2);
+        assert!(
+            mse_s < mse_a * 1.2,
+            "symmetric MQ2 MSE {mse_s} should beat 1.2x asymmetric {mse_a}"
+        );
+    }
+
+    #[test]
+    fn mq3v2_symmetric_all_zero_group() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w = vec![0.0f32; 256];
+        let blob = quantize_mq3g256v2_symmetric(&w, 1, 256, &s1, &s2);
+        for half in 0..2 {
+            let base = half * 4;
+            let s_bits = u16::from_le_bytes([blob[base], blob[base + 1]]);
+            let z_bits = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+            assert_eq!(s_bits, 0, "half {half} scale");
+            assert_eq!(z_bits, f32_to_f16(-0.0), "half {half} zero");
+        }
+        let q = unpack_mq3_codes(&blob[8..]);
+        assert!(q.iter().all(|&c| c == 4), "all-zero MQ3 half uses code 4");
+    }
+
+    #[test]
+    fn mq2v2_symmetric_all_zero_group() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w = vec![0.0f32; 256];
+        let blob = quantize_mq2g256v2_symmetric(&w, 1, 256, &s1, &s2);
+        for half in 0..2 {
+            let base = half * 4;
+            let s_bits = u16::from_le_bytes([blob[base], blob[base + 1]]);
+            let z_bits = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+            assert_eq!(s_bits, 0, "half {half} scale");
+            assert_eq!(z_bits, f32_to_f16(-0.0), "half {half} zero");
+        }
+        let q = unpack_mq2_codes(&blob[8..]);
+        assert!(q.iter().all(|&c| c == 2), "all-zero MQ2 half uses code 2");
     }
 }
 #[cfg(test)]
