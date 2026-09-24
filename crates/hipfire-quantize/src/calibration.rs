@@ -109,16 +109,17 @@ fn f16_bits_at(bytes: &[u8], index: usize) -> u16 {
 }
 
 /// Validate the frozen C3 record before any artifact byte is written.
-pub(crate) fn validate_mq4v2_final_code_record(
+pub(crate) fn validate_mqn_final_code_record(
     record: &Mq4v2FinalCodeRecord<'_>,
     expected_source_sha: &str,
+    expected_qt: u8,
 ) -> Result<(), String> {
     if record.name.is_empty() {
-        return Err("MQ4V2 final-code record has an empty tensor name".to_string());
+        return Err("final-code record has an empty tensor name".to_string());
     }
-    if record.qt != MQ4V2_FINAL_CODE_QTYPE {
+    if record.qt != expected_qt {
         return Err(format!(
-            "{}: final-code qt={} but MQ4V2 requires qt=44",
+            "{}: final-code qt={} but import requires qt={expected_qt}",
             record.name, record.qt
         ));
     }
@@ -195,14 +196,20 @@ pub(crate) fn validate_mq4v2_final_code_record(
             ));
         }
     }
+    let max_code = match expected_qt {
+        49 => 7,
+        50 => 3,
+        44 => 15,
+        _ => return Err(format!("unsupported final-code qt={expected_qt}")),
+    };
     if let Some((index, code)) = record
         .codes_u8
         .iter()
         .enumerate()
-        .find(|(_, code)| **code > 15)
+        .find(|(_, code)| **code > max_code)
     {
         return Err(format!(
-            "{}: codes_u8[{index}]={code} exceeds the uint4 range",
+            "{}: codes_u8[{index}]={code} exceeds the qt={expected_qt} range",
             record.name
         ));
     }
@@ -224,6 +231,13 @@ pub(crate) fn validate_mq4v2_final_code_record(
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_mq4v2_final_code_record(
+    record: &Mq4v2FinalCodeRecord<'_>,
+    expected_source_sha: &str,
+) -> Result<(), String> {
+    validate_mqn_final_code_record(record, expected_source_sha, MQ4V2_FINAL_CODE_QTYPE)
 }
 
 fn safetensor_range(
@@ -251,9 +265,10 @@ fn parse_record_metadata_usize(
         .map_err(|error| format!("{}: invalid metadata `{key}`: {error}", path.display()))
 }
 
-pub(crate) fn load_mq4v2_final_code_record(
+pub(crate) fn load_mqn_final_code_record(
     path: &Path,
     expected_source_sha: &str,
+    expected_qt: u8,
 ) -> Result<MappedMq4v2FinalCodeRecord, String> {
     let file = File::open(path)
         .map_err(|error| format!("open final-code record {}: {error}", path.display()))?;
@@ -343,13 +358,14 @@ pub(crate) fn load_mq4v2_final_code_record(
         codes_range,
         mmap,
     };
-    validate_mq4v2_final_code_record(&mapped.as_record(), expected_source_sha)?;
+    validate_mqn_final_code_record(&mapped.as_record(), expected_source_sha, expected_qt)?;
     Ok(mapped)
 }
 
-pub(crate) fn load_mq4v2_final_code_records(
+pub(crate) fn load_mqn_final_code_records(
     path: &Path,
     expected_source_sha: &str,
+    expected_qt: u8,
 ) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
     let mut paths = if path.is_dir() {
         std::fs::read_dir(path)
@@ -377,7 +393,7 @@ pub(crate) fn load_mq4v2_final_code_records(
     let mut records = Vec::with_capacity(paths.len());
     let mut names = HashSet::with_capacity(paths.len());
     for record_path in paths {
-        let record = load_mq4v2_final_code_record(&record_path, expected_source_sha)?;
+        let record = load_mqn_final_code_record(&record_path, expected_source_sha, expected_qt)?;
         let name = record.as_record().name.to_string();
         if !names.insert(name.clone()) {
             return Err(format!("duplicate MQ4V2 final-code record for `{name}`"));
@@ -385,6 +401,13 @@ pub(crate) fn load_mq4v2_final_code_records(
         records.push(record);
     }
     Ok(records)
+}
+
+pub(crate) fn load_mq4v2_final_code_records(
+    path: &Path,
+    expected_source_sha: &str,
+) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
+    load_mqn_final_code_records(path, expected_source_sha, MQ4V2_FINAL_CODE_QTYPE)
 }
 
 /// Shared runtime producer whose inverse-AWQ scale must be identical.

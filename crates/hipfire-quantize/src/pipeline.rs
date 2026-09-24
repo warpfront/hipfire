@@ -497,6 +497,238 @@ fn export_mq4v2_final_codes(
     Ok((records.len(), source_sha))
 }
 
+/// MQ3V2/MQ2V2 frozen-code import deliberately never writes fp16 headers or
+/// AWQ sidecars: the record grid is checked against the source before copying.
+fn export_mqn_final_codes(
+    input: &Path,
+    records_path: &Path,
+    output: &Path,
+    qt: u8,
+) -> Result<(usize, String), String> {
+    let (label, group_bytes, max_code) = match qt {
+        49 => ("MQ3V2", MQ3V2_GROUP_BYTES, 7u8),
+        50 => ("MQ2V2", MQ2V2_GROUP_BYTES, 3u8),
+        _ => return Err(format!("unsupported final-code qt={qt}")),
+    };
+    if !input.is_file() {
+        return Err(format!("--input must be an HFQ file, got {}", input.display()));
+    }
+    let canonical = std::fs::canonicalize(input)
+        .map_err(|error| format!("canonicalize input {}: {error}", input.display()))?;
+    if output.exists()
+        && std::fs::canonicalize(output).is_ok_and(|path| path == canonical)
+    {
+        return Err("--output must differ from the source HFQ".to_string());
+    }
+    if output.exists() {
+        return Err(format!("refusing to overwrite existing output {}", output.display()));
+    }
+    eprintln!("{label} final-code import: hashing {}", input.display());
+    let source_sha = sha256_file_hex(input)?;
+    let source = RuntimeHfqFile::open_with_reap_plan(input, None)
+        .map_err(|error| format!("open source HFQ {}: {error}", input.display()))?;
+    let by_name: HashMap<&str, &HfqTensorInfo> = source.tensors()
+        .iter().map(|tensor| (tensor.name.as_str(), tensor)).collect();
+    let records = load_mqn_final_code_records(records_path, &source_sha, qt)?;
+    for mapped in &records {
+        let record = mapped.as_record();
+        let tensor = by_name.get(record.name)
+            .ok_or_else(|| format!("{}: tensor `{}` is absent from source HFQ", mapped.path.display(), record.name))?;
+        let m = u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
+        let k = u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
+        let groups = record.m.checked_mul(record.k).ok_or_else(|| format!("{}: shape overflows", record.name))? / 256;
+        let expected_bytes = groups.checked_mul(group_bytes).ok_or_else(|| format!("{}: packed size overflows", record.name))?;
+        if tensor.quant_type != qt || tensor.group_size != 256
+            || tensor.shape != [m, k] || tensor.data_size != expected_bytes
+        {
+            return Err(format!(
+                "{}: source type-map entry for `{}` is qt={} shape={:?} group_size={} bytes={}, expected qt={qt} shape=[{m},{k}] group_size=256 bytes={expected_bytes}",
+                mapped.path.display(), record.name, tensor.quant_type, tensor.shape, tensor.group_size, tensor.data_size
+            ));
+        }
+        let (_, source_bytes) = source.tensor_data(record.name)
+            .ok_or_else(|| format!("{}: missing source tensor data", record.name))?;
+        for (group, bytes) in source_bytes.chunks_exact(group_bytes).enumerate() {
+            if bytes[..8] != record.d_z_f16[group * 8..group * 8 + 8] {
+                return Err(format!("{}: frozen d_z_f16 differs from source at group {group}", record.name));
+            }
+        }
+        let sidecar = awq_sidecar_name(record.name);
+        if let Some((info, data)) = source.tensor_data(&sidecar) {
+            if info.quant_type != QuantType::F16 as u8 || info.shape != [k] || data != record.s_f16 {
+                return Err(format!("{}: frozen S_f16 differs from source AWQ sidecar `{sidecar}`", record.name));
+            }
+        }
+        if let Some((index, code)) = record.codes_u8.iter().enumerate().find(|(_, code)| **code > max_code) {
+            return Err(format!("{}: code {code} at index {index} exceeds {label} range", record.name));
+        }
+    }
+
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!("output parent directory does not exist: {}", parent.display()));
+    }
+    let name = output.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid output path {}", output.display()))?;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock before Unix epoch: {error}"))?.as_nanos();
+    let temporary = parent.join(format!(".{name}.mqn-final-{}-{nonce}.tmp", std::process::id()));
+    let result = (|| -> Result<(), String> {
+        std::fs::copy(input, &temporary)
+            .map_err(|error| format!("copy source HFQ to {}: {error}", temporary.display()))?;
+        let file = OpenOptions::new().read(true).write(true).open(&temporary)
+            .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
+        let mut mapped = unsafe { memmap2::MmapMut::map_mut(&file) }
+            .map_err(|error| format!("map temporary HFQ {}: {error}", temporary.display()))?;
+        for record in records.iter().map(|entry| entry.as_record()) {
+            let tensor = by_name[record.name];
+            let start = tensor.data_offset;
+            let bytes = &mut mapped[start..start + tensor.data_size];
+            for (group, block) in bytes.chunks_exact_mut(group_bytes).enumerate() {
+                let codes = &record.codes_u8[group * 256..(group + 1) * 256];
+                if qt == 50 {
+                    for (i, dst) in block[8..].iter_mut().enumerate() {
+                        *dst = codes[i * 4] | codes[i * 4 + 1] << 2
+                            | codes[i * 4 + 2] << 4 | codes[i * 4 + 3] << 6;
+                    }
+                } else {
+                    // Encoder quantize_mq3g256v2: eight three-bit codes
+                    // form three little-endian bitstream bytes.
+                    for (chunk, dst) in block[8..].chunks_exact_mut(3).enumerate() {
+                        let q = &codes[chunk * 8..chunk * 8 + 8];
+                        dst[0] = q[0] | q[1] << 3 | (q[2] & 3) << 6;
+                        dst[1] = q[2] >> 2 | q[3] << 1 | q[4] << 4 | (q[5] & 1) << 7;
+                        dst[2] = q[5] >> 1 | q[6] << 2 | q[7] << 5;
+                    }
+                }
+            }
+        }
+        mapped.flush().map_err(|error| format!("flush temporary HFQ: {error}"))?;
+        drop(mapped);
+        file.sync_all().map_err(|error| format!("sync temporary HFQ: {error}"))?;
+        let rewritten = RuntimeHfqFile::open_with_reap_plan(&temporary, None)
+            .map_err(|error| format!("reopen temporary HFQ: {error}"))?;
+        if !same_hfq_manifest(&source, &rewritten) {
+            return Err("final-code import changed the HFQ manifest".to_string());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    std::fs::rename(&temporary, output)
+        .map_err(|error| format!("rename completed HFQ {} to {}: {error}", temporary.display(), output.display()))?;
+    Ok((records.len(), source_sha))
+}
+
+#[cfg(test)]
+mod mqn_final_code_tests {
+    use super::*;
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    use safetensors::Dtype;
+
+    fn exercise(qt: u8, changed: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("source.hfq");
+        let output = dir.path().join("result.hfq");
+        let record_path = dir.path().join("codes.safetensors");
+        let (m, k) = (2usize, 512usize);
+        let weights: Vec<f32> = (0..m * k).map(|i| ((i * 37) as f32 * 0.017).sin()).collect();
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let (encoded, quant, stride) = if qt == 49 {
+            (quantize_mq3g256v2(&weights, m, k, &signs1, &signs2), QuantType::MQ3G256V2, 104)
+        } else {
+            (quantize_mq2g256v2(&weights, m, k, &signs1, &signs2), QuantType::MQ2G256V2, 72)
+        };
+        let tensor_name = "model.layers.0.linear_attn.in_proj_a.weight";
+        let sidecar_name = awq_sidecar_name(tensor_name);
+        let s: Vec<u8> = (0..k).flat_map(|_| f32_to_f16(1.0).to_le_bytes()).collect();
+        write_hfq(&input, 1, "{}", &[
+            HfqTensor { name: tensor_name.into(), quant_type: quant, shape: vec![m as u32,k as u32],
+                        group_size: 256, data: encoded.clone(), spilled_len: 0 },
+            HfqTensor { name: sidecar_name, quant_type: QuantType::F16, shape: vec![k as u32],
+                        group_size: 0, data: s.clone(), spilled_len: 0 },
+            HfqTensor { name: "untouched.weight".into(), quant_type: QuantType::F16,
+                        shape: vec![4], group_size: 0, data: vec![7; 8], spilled_len: 0 },
+        ], None).unwrap();
+        let sha = sha256_file_hex(&input).unwrap();
+        let grid: Vec<u8> = encoded.chunks_exact(stride).flat_map(|group| group[..8].to_vec()).collect();
+        let mut codes = vec![0u8; m * k];
+        for (group, block) in encoded.chunks_exact(stride).enumerate() {
+            if qt == 50 {
+                for (i, &byte) in block[8..].iter().enumerate() {
+                    for j in 0..4 {
+                        codes[group * 256 + i * 4 + j] = byte >> (j * 2) & 3;
+                    }
+                }
+            } else {
+                for (i, chunk) in block[8..].chunks_exact(3).enumerate() {
+                    let word = u32::from(chunk[0]) | u32::from(chunk[1]) << 8 | u32::from(chunk[2]) << 16;
+                    for j in 0..8 {
+                        codes[group * 256 + i * 8 + j] = (word >> (j * 3) & 7) as u8;
+                    }
+                }
+            }
+        }
+        if changed {
+            codes[2] ^= if qt == 49 { 7 } else { 3 };
+        }
+        let tensors = [
+            ("S_f16", TensorView::new(Dtype::F16, vec![k], &s).unwrap()),
+            ("d_z_f16", TensorView::new(Dtype::F16, vec![m, k / 256, 2, 2], &grid).unwrap()),
+            ("codes_u8", TensorView::new(Dtype::U8, vec![m, k], &codes).unwrap()),
+        ];
+        let metadata = HashMap::from([
+            ("name".into(), tensor_name.into()), ("M".into(), m.to_string()),
+            ("K".into(), k.to_string()), ("qt".into(), qt.to_string()),
+            ("source_sha".into(), sha.clone()),
+        ]);
+        serialize_to_file(tensors, Some(metadata), &record_path).unwrap();
+        let (count, _) = export_mqn_final_codes(&input, &record_path, &output, qt).unwrap();
+        assert_eq!(count, 1);
+        if !changed {
+            let mapped = load_mqn_final_code_record(&record_path, &sha, qt).unwrap();
+            let record = mapped.as_record();
+            assert!(validate_mqn_final_code_record(
+                &Mq4v2FinalCodeRecord { qt: if qt == 49 { 50 } else { 49 }, ..record }, &sha, qt
+            ).is_err());
+            assert!(validate_mqn_final_code_record(
+                &Mq4v2FinalCodeRecord { m: m + 1, ..record }, &sha, qt
+            ).is_err());
+            assert!(validate_mqn_final_code_record(&record, &"0".repeat(64), qt).is_err());
+        }
+        let original = std::fs::read(&input).unwrap();
+        let rewritten = std::fs::read(&output).unwrap();
+        let offset = RuntimeHfqFile::open_with_reap_plan(&input, None).unwrap()
+            .tensors().iter().find(|tensor| tensor.name == tensor_name).unwrap().data_offset;
+        let changed_offsets: Vec<usize> = original.iter().zip(&rewritten).enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i)).collect();
+        let expected = if !changed { vec![] } else if qt == 49 {
+            vec![offset + 8, offset + 9] // code 2 straddles MQ3 bytes 0 and 1
+        } else {
+            vec![offset + 8] // code 2 occupies MQ2 bits 4..5 of byte 0
+        };
+        assert_eq!(changed_offsets, expected);
+        if !changed {
+            assert_eq!(rewritten, original);
+        }
+    }
+
+    #[test]
+    fn mq3_final_codes_roundtrip_and_one_code() {
+        exercise(49, false);
+        exercise(49, true);
+    }
+
+    #[test]
+    fn mq2_final_codes_roundtrip_and_one_code() {
+        exercise(50, false);
+        exercise(50, true);
+    }
+}
+
 pub(crate) fn run() {
     let args = QuantizeArgs::parse();
 
@@ -538,6 +770,25 @@ pub(crate) fn run() {
             Err(error) => {
                 eprintln!("error: MQ4V2 final-code import failed: {error}");
                 std::process::exit(2);
+            }
+        }
+    }
+
+    for (qt, records_path) in [
+        (49, args.mq3v2_final_codes.as_deref()),
+        (50, args.mq2v2_final_codes.as_deref()),
+    ] {
+        if let Some(records_path) = records_path {
+            let input = args.input.as_deref().expect("--input is required for final-code import");
+            match export_mqn_final_codes(Path::new(input), records_path, Path::new(&args.output), qt) {
+                Ok((count, source_sha)) => {
+                    eprintln!("MQ{}V2 final-code import complete: {count} tensor(s), source_sha={source_sha}, output={}", if qt == 49 { 3 } else { 2 }, args.output);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("error: final-code import failed: {error}");
+                    std::process::exit(2);
+                }
             }
         }
     }

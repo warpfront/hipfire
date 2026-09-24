@@ -245,6 +245,17 @@ pub(crate) struct QuantizeArgs {
     )]
     pub mq4v2_final_codes: Option<PathBuf>,
 
+    /// Replace only packed MQ3V2 code bytes in an existing HFQ using frozen-grid
+    /// safetensors records. The source HFQ SHA, tensor shape, qt=49, and
+    /// unchanged fp16 grid are checked before writing.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["mq4v2_final_codes", "mq2v2_final_codes", "flux_pipe", "reap_overlay", "reap_bake"])]
+    pub mq3v2_final_codes: Option<PathBuf>,
+
+    /// Replace only packed MQ2V2 code bytes in an existing HFQ using frozen-grid
+    /// safetensors records (qt=50).
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["mq4v2_final_codes", "mq3v2_final_codes", "flux_pipe", "reap_overlay", "reap_bake"])]
+    pub mq2v2_final_codes: Option<PathBuf>,
+
     /// Enable K-map promotion for dense models.
     #[arg(long)]
     pub kmap_dense: bool,
