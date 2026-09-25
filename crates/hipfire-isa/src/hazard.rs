@@ -60,3 +60,35 @@ impl Gfx11Hazards {
         waits
     }
 }
+/// gfx11/gfx12 `s_delay_alu` scheduling hints. The hardware interlocks VALU
+/// dependencies, but a dependent VALU issued without the hint stalls the SIMD's
+/// VALU pipeline instead of yielding to another wave. Before each VALU
+/// instruction that reads a VGPR written by one of the last four VALU
+/// instructions (or last three transcendentals) this names the nearest such
+/// producer, as LLVM's AMDGPUInsertDelayAlu does. Hints never affect results.
+#[derive(Clone,Debug,Default)]
+pub struct DelayAlu { recent: Vec<(Vec<RegRef>,bool)> }
+impl DelayAlu {
+    const TRANS: [&'static str; 7] = ["v_rcp_","v_sqrt_","v_rsq_","v_sin_","v_cos_","v_exp_","v_log_"];
+    /// A branch target may be reached from another stream: forget producers.
+    pub fn label(&mut self) { self.recent.clear() }
+    /// Hint text for a VALU instruction (None when no recent producer), then
+    /// record the instruction as the newest producer.
+    pub fn step(&mut self,mnemonic:&str,uses:&[RegRef],defs:&[RegRef])->Option<String> {
+        let (mut valu,mut trans,mut trans_seen)=(None,None,0usize);
+        for (distance,(written,is_trans)) in self.recent.iter().rev().enumerate().map(|(i,r)|(i+1,r)) {
+            if *is_trans {trans_seen+=1}
+            if !written.iter().any(|w|uses.iter().any(|u|u.kind==Kind::V&&w.overlaps(*u))) {continue}
+            if *is_trans&&trans_seen<=3 {trans.get_or_insert(trans_seen);} else if !*is_trans {valu.get_or_insert(distance);}
+        }
+        let trans_insn=Self::TRANS.iter().any(|p|mnemonic.starts_with(p));
+        self.recent.push((defs.iter().copied().filter(|r|r.kind==Kind::V).collect(),trans_insn));
+        if self.recent.len()>4 {self.recent.remove(0);}
+        match (valu,trans) {
+            (None,None)=>None,
+            (Some(v),None)=>Some(format!("s_delay_alu instid0(VALU_DEP_{v})")),
+            (None,Some(t))=>Some(format!("s_delay_alu instid0(TRANS32_DEP_{t})")),
+            (Some(v),Some(t))=>Some(format!("s_delay_alu instid0(VALU_DEP_{v}) | instid1(TRANS32_DEP_{t})")),
+        }
+    }
+}

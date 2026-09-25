@@ -1,0 +1,14 @@
+{
+  "symbol": "gdn_chunk_scan",
+  "counts": {
+    "v_wmma_f32_16x16x16_f16": 72,
+    "s_barrier_signal": 7,
+    "s_barrier_wait": 7
+  },
+  "forbidden": ["scratch_*", "s_waitcnt", "v_wmma_i32*", "v_swmmac*"],
+  "vgpr_max": 184,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true
+}

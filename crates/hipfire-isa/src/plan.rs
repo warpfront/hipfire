@@ -9,7 +9,9 @@ impl KernargLayout {
  pub fn hidden(mut self,name:&str,offset:u32,size:u32,value_kind:&str)->Self{self.args.push(Kernarg{name:name.into(),offset,size,value_kind:value_kind.into(),address_space:None});self}
  pub fn validate(&self)->Result<(),String>{let mut end=0;for a in &self.args {if a.offset<end||a.offset.checked_add(a.size).is_none_or(|n|n>self.size){return Err(format!("overlapping/out-of-bounds kernarg {}",a.name))}end=a.offset+a.size}Ok(())}
 }
-#[derive(Clone,Debug)] pub struct KernelSpec {pub kernel_id:String,pub variant:String,pub arch:Arch,pub symbol:String,pub kernargs:KernargLayout,pub user_sgpr_count:u8,pub system_sgpr_workgroup_id_y:bool,pub workgroup_size:u16,pub group_segment_fixed_size:u32,pub wave32:bool}
+#[derive(Clone,Debug)] pub struct KernelSpec {pub kernel_id:String,pub variant:String,pub arch:Arch,pub symbol:String,pub kernargs:KernargLayout,pub user_sgpr_count:u8,pub system_sgpr_workgroup_id_y:bool,pub workgroup_size:u16,pub group_segment_fixed_size:u32,pub wave32:bool,
+ /// CU mode (`workgroup_processor_mode 0`): every wave of a workgroup on one CU.
+ pub cu_mode:bool}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum MemoryScope { LdsOnly, Workgroup }
 #[derive(Clone,Debug,Default,Serialize)] pub struct IsaShape {pub instructions:usize,pub valu_slots:usize,pub vopd_pairs:usize,pub wmma:usize,pub ds:usize,pub vmem:usize,pub waits:usize,pub barriers:usize,pub next_free_vgpr:u16,pub next_free_sgpr:u16}
 #[derive(Clone,Debug,Serialize)] pub struct ClauseProof {pub start:usize,pub len:usize,pub class:String}

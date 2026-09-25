@@ -113,6 +113,11 @@ impl Ledger {
         self.pending.iter().any(|p| p.counter == Counter::Ds && !p.src_locks.is_empty())
     }
     pub fn is_empty(&self) -> bool { self.pending.is_empty() }
+    /// Pending operations without their ids: two ledgers with equal shapes
+    /// require the same waits for every later instruction.
+    pub fn shape(&self) -> Vec<(Counter, Vec<RegRef>, Vec<RegRef>, bool, MemoryFamily)> {
+        self.pending.iter().map(|p| (p.counter, p.defs.clone(), p.src_locks.clone(), p.in_order, p.family)).collect()
+    }
 
     pub fn wait_instruction(arch: Arch, waits: &[(Counter, u8, Reason)]) -> Result<Vec<(Counter, u8, String, Reason)>, String> {
         let mut out = Vec::new();

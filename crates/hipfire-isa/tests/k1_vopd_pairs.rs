@@ -39,7 +39,7 @@ fn all_96_k1_fold_packets_encode_on_gfx1201() {
         kernel_id: "iu4_k1_fold_test".into(), variant: "cacc2=0".into(),
         arch: Arch::Gfx1201, symbol: "iu4_k1_fold_test".into(),
         kernargs: KernargLayout::new(0), user_sgpr_count: 2,
-        workgroup_size: 256, group_segment_fixed_size: 0, wave32: true,
+        workgroup_size: 256, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
         system_sgpr_workgroup_id_y: false,
     };
     let mut b = Builder::new(spec, plan);

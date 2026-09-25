@@ -184,7 +184,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     let kspec = KernelSpec {
         kernel_id: "iu4_gemm".into(), variant: spec.variant_name(), arch: spec.arch, symbol: spec.symbol(),
         kernargs: spec.kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
-        workgroup_size: spec.tile.threads() as u16, group_segment_fixed_size: 0, wave32: true,
+        workgroup_size: spec.tile.threads() as u16, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut b = Builder::new(kspec, g.plan()?);
     g.declare_lds(&mut b)?;
