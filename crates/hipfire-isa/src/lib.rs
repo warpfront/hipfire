@@ -12,15 +12,15 @@ pub use reg::{RegPlan,V,S};
 pub use plan::{KernelSpec,KernargLayout,Emitted,BuilderProof,IsaShape,MemoryScope};
 use insn::{Instruction,Program,MemoryClass};
 use ledger::{Ledger,WaitProof,Counter,Reason};
-use hazard::{Gfx12Sgpr,Pipeline,HazardProof};
+use hazard::{Gfx12Sgpr,Gfx11Hazards,Pipeline,HazardProof};
 use lds::{Lds,Transition};
 use sha2::{Sha256,Digest};
 
 #[derive(Clone)] pub struct Builder { pub spec:KernelSpec,pub regs:RegPlan,pub program:Program,pub ledger:Ledger,pub lds:Lds,
  pub waits:Vec<WaitProof>,pub hazards:Vec<HazardProof>,pub clauses:Vec<plan::ClauseProof>,pub barriers:Vec<plan::BarrierProof>,pub loop_fixpoints:Vec<plan::LoopFixpoint>,
- hazard:Gfx12Sgpr,labels:Vec<String>,current_label:String,lds_access_allowed:bool,previous_wmma_dst:Option<reg::RegRef>,pending_barrier:Option<Vec<Transition>>,}
+ hazard:Gfx12Sgpr,gfx11_hazard:Gfx11Hazards,labels:Vec<String>,current_label:String,lds_access_allowed:bool,previous_wmma_dst:Option<reg::RegRef>,pending_barrier:Option<Vec<Transition>>,}
 impl Builder {
- pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:None,pending_barrier:None}}
+ pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),gfx11_hazard:Gfx11Hazards::default(),labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:None,pending_barrier:None}}
  pub fn label(&mut self,name:&str)->Result<(),String>{if self.labels.iter().any(|l|l==name){return Err(format!("duplicate label {name}"))}self.labels.push(name.into());self.current_label=name.into();self.program.instructions.push(Instruction::new(format!("{name}:"),vec![],vec![]));Ok(())}
  fn emit_wait(&mut self,c:Counter,n:u8,reason:Reason)->Result<(),String> {let entries=Ledger::wait_instruction(self.spec.arch,&[(c,n,reason.clone())])?;for (_,_,text,_) in entries {let pc_index=self.program.instructions.len();self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));self.waits.push(WaitProof{pc_index,insn:text,counter:c,count:n,reason:reason.clone()})}self.ledger.wait(c,n);Ok(())}
  pub fn wait(&mut self,c:Counter,n:u8)->Result<(),String>{self.emit_wait(c,n,Reason::Barrier)}
@@ -52,6 +52,11 @@ impl Builder {
   self.emit_required(self.ledger.required(&insn))?;
   let mnemonic=insn.mnemonic();let pipe=if matches!(insn.memory,Some(MemoryClass::VmemLoad|MemoryClass::VmemStore)){Pipeline::Vmem}else if insn.memory==Some(MemoryClass::SmemLoad){Pipeline::Smem}else if mnemonic.starts_with('s'){Pipeline::Salu}else if mnemonic.starts_with('v'){Pipeline::Valu}else{Pipeline::Ds};
   if self.spec.arch.gfx12(){let waits=self.hazard.step(pipe,&insn.uses,&insn.defs,false,false);if !waits.is_empty(){let text=format!("s_wait_alu {}",waits.join(" | "));let pc_index=self.program.instructions.len();self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));self.hazards.push(HazardProof{pc_index,insn:text,rule:"gfx12 SGPR read-after-write".into()})}}
+  if !self.spec.arch.gfx12(){for text in self.gfx11_hazard.step(pipe,mnemonic,&insn.uses,&insn.defs){
+   let pc_index=self.program.instructions.len();
+   self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));
+   self.hazards.push(HazardProof{pc_index,insn:text,rule:"gfx11 wave32 trans-use / VMEM SGPR dependence".into()});
+  }}
   if mnemonic.starts_with("v_wmma_")||mnemonic.starts_with("v_swmmac_"){
    let dst=*insn.defs.first().ok_or("WMMA destination is missing from instruction defs")?;
    if insn.uses.len()<2{return Err("WMMA A/B operands are missing from instruction uses".into())}
