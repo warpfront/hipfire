@@ -1219,7 +1219,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_GFX12_SRC: &str = concat!(
 );
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    "#define HIPFIRE_FP8_STREAM 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_FP8_PROD_SHORT 1\n#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_FP8_STREAM 1\n#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_FP8_PROD_SHORT 1\n#define HIPFIRE_RMSNORM_AWQ 1\n#define HIPFIRE_RMSNORM_FP8_STRIDED 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );

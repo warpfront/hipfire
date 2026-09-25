@@ -165,7 +165,13 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     // (depends only on K and warp_id), so this is safe before rms exists.
     const int groups_total = K / 256;
     const int groups_per_warp = (groups_total + num_warps - 1) / num_warps;
+#ifdef HIPFIRE_RMSNORM_FP8_STRIDED
+    // Spread consecutive 256-value groups across the eight waves; each wave
+    // still owns its own groups through rotation and exact FP8 half sums.
+    const int warp_group_start = warp_id;
+#else
     const int warp_group_start = warp_id * groups_per_warp;
+#endif
     const int d0 = lane_id * 8;
 
     float4 pref_x0, pref_x1, pref_w0, pref_w1;
@@ -233,7 +239,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 #else
     for (int gi = 0; gi < groups_per_warp; gi++) {
 #endif
+#ifdef HIPFIRE_RMSNORM_FP8_STRIDED
+        const int group = warp_group_start + gi * num_warps;
+#else
         const int group = warp_group_start + gi;
+#endif
         if (group >= groups_total) break;
 
         const int base = group * 256 + d0;
@@ -395,7 +405,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         fp8stream_pack_row_inreg(
             held, x_fp8 + frow, fp8_half_sums + (long long)token * (K >> 7),
             fp8_row_scales + token, row_amax, reduce, K, lane_id, warp_id,
+#ifdef HIPFIRE_RMSNORM_FP8_STRIDED
+            warp_group_start, num_warps, row_scale_shift);
+#else
             warp_group_start, 1, row_scale_shift);
+#endif
 #else
         fp8stream_pack_row_from_f32(
             x_rot_b,
