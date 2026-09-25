@@ -3855,11 +3855,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 e57061d5d7f580e8e070baa9d741c72e0759365bc956e9ed3b4a58ad6f47940b.
-/// Regenerate with `/home/kaden/qcal/perf/iu4-6k/s1/build.sh 74ba206be`
-/// and compare its digest before replacing this bundle.
+/// SHA-256 1e33ba5d0021ebbef7e6a37a57e9a7963ee90e6e6ba334c109024c7f05c8827a.
+/// Regenerate with the S1 recipe using the p4 generator and final SiLU contracts.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco");
+/// Original certified `_b1` bundle for same-binary model/performance controls.
+/// SHA-256 e57061d5d7f580e8e070baa9d741c72e0759365bc956e9ed3b4a58ad6f47940b.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

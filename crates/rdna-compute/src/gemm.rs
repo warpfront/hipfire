@@ -292,14 +292,27 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 /// domain is covered.
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
-/// `HIPFIRE_G12_IU4_V3=1` selects the K1 lean-issue IU4 module on gfx1201
-/// symmetric routes (default off). Parsed once per process.
+/// `HIPFIRE_G12_IU4_V3=1` enables the K1 lean-issue IU4 module on gfx1201
+/// symmetric routes (default on). Parsed once per process.
 static G12_IU4_V3: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_V3", false));
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_V3", true));
 
 #[inline]
 fn g12_iu4_v3_enabled() -> bool {
     *G12_IU4_V3
+}
+
+/// Select the original certified bundle in the same binary for parity/timing controls.
+static G12_IU4_B1_CONTROL: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_B1_CONTROL", false));
+
+#[inline]
+fn g12_iu4_b1_image() -> &'static [u8] {
+    if *G12_IU4_B1_CONTROL {
+        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL
+    } else {
+        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
+    }
 }
 
 /// The builder's single masked b128 store cannot serve odd row quads or
@@ -19882,7 +19895,7 @@ impl Gpu {
             if isa {
                 self.ensure_embedded_kernel(
                     module,
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+                    g12_iu4_b1_image(),
                     kernel_name,
                 )?;
             } else {
@@ -31976,7 +31989,7 @@ impl Gpu {
         if isa {
             self.ensure_embedded_kernel(
                 module,
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+                g12_iu4_b1_image(),
                 kernel,
             )?;
         } else {

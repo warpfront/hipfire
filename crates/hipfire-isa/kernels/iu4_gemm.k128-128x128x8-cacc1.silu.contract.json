@@ -2,12 +2,13 @@
   "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",
   "counts": {
     "v_wmma_i32_16x16x32_iu4": 128,
-    "vopd_packets": {
-      "min": 384
-    },
+    "vopd_packets": 532,
+    "v_dual_mov_b32": 36,
     "v_dual_subrev_f32": 128,
-    "v_dual_mul_f32": 128,
-    "v_dual_fmac_f32": 128
+    "v_dual_mul_f32": 160,
+    "v_dual_fmac_f32": 160,
+    "v_dual_sub_f32": 16,
+    "v_dual_add_f32": 32
   },
   "forbidden": [
     "s_waitcnt",
