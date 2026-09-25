@@ -1345,6 +1345,35 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_INREG_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
 );
+/// Gate-in-place twins of the four sigmoid FP8 producers above
+/// (`HIPFIRE_ROTATE_FP8_GATE_IL`): the sigmoid gate is read from the FA
+/// Q/gate projection rows `[N x K/256 x (256 q, 256 gate)]`, which
+/// `qwen35_fa_prep_fp8q_nogate_batched_gfx1201` leaves in place instead of
+/// copying. Same gate values, so byte-identical planes.
+pub const SIGMOID_MUL_MQ_ROTATE_X_FP8_GIL_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n#define HIPFIRE_ROTATE_FP8_GATE_IL 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq4v2_fp8_gil_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GIL_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n#define HIPFIRE_ROTATE_FP8_GATE_IL 1\n#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gil_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_FP8_INREG_GIL_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n#define HIPFIRE_ROTATE_FP8_GATE_IL 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gil_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_INREG_GIL_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n#define HIPFIRE_ROTATE_FP8_GATE_IL 1\n#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gil_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
 /// gfx11 FA out-proj IU4 producer: exact `sigmoid_mul_f32` formation +
 /// AWQ/FWHT rotate + in-register `block_i4_128`, under a distinct `_gfx11`
 /// entry symbol so gfx11 HSACO caches and profiler rows cannot alias the

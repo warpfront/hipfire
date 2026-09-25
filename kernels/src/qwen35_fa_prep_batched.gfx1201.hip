@@ -30,10 +30,17 @@
 // Code layout per (token, head): dim d = 16f + 8kg + j at byte kg*128 + f*8 + j
 // (one attention lane half reads 128 contiguous bytes); q_scale [N x NQ].
 //
+// qwen35_fa_prep_fp8q_nogate_batched_gfx1201 is the fp8q twin that leaves the
+// gate where the QKV projection wrote it (the second half of each 512-float
+// head row of q_interleaved): it neither reads that half nor writes a gate
+// copy, and the FP8 FA-output producer reads the gate in place
+// (HIPFIRE_ROTATE_FP8_GATE_IL in mq_rotate_x_fp8.gfx12.hip). Q codes, row
+// scales and K are byte-identical to qwen35_fa_prep_fp8q_batched_gfx1201.
+//
 // Admitted: NQ 24 / NK 4 (args), head_dim 256, n_rot 64.
 // Grid: [ceil((NQ + NK) * N / 8), 1, 1]. Block: [256, 1, 1] (8 rows).
 
-template <bool FP8Q>
+template <bool FP8Q, bool GATE = true>
 static __device__ __forceinline__ void qwen35_fa_prep_row_gfx1201(
     const float* __restrict__ q_interleaved,
     float* __restrict__ q,
@@ -76,7 +83,8 @@ static __device__ __forceinline__ void qwen35_fa_prep_row_gfx1201(
 #pragma unroll
         for (int kk = 0; kk < 8; ++kk) {
             v[kk] = src[lane + 32 * kk];
-            gate[row + lane + 32 * kk] = src[HD + lane + 32 * kk];
+            if (GATE)
+                gate[row + lane + 32 * kk] = src[HD + lane + 32 * kk];
         }
         weight = q_weight;
     } else {
@@ -186,5 +194,26 @@ __global__ void qwen35_fa_prep_fp8q_batched_gfx1201(
 {
     qwen35_fa_prep_row_gfx1201<true>(
         q_interleaved, nullptr, q_codes, q_scale, gate, k, q_weight, k_weight,
+        positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size);
+}
+
+extern "C" __launch_bounds__(256)
+__global__ void qwen35_fa_prep_fp8q_nogate_batched_gfx1201(
+    const float* __restrict__ q_interleaved, // [N x NQ x 256 x 2], gate read in place later
+    unsigned char* __restrict__ q_codes,     // [N x NQ x 256] permuted E4M3
+    float* __restrict__ q_scale,             // [N x NQ]
+    float* __restrict__ k,                   // [N x NK x 256], in-place in/out
+    const float* __restrict__ q_weight,      // [256]
+    const float* __restrict__ k_weight,      // [256]
+    const int* __restrict__ positions,       // [N] physical KV slots
+    float eps,
+    float freq_base,
+    int pos_offset,
+    int n_q_heads,
+    int n_kv_heads,
+    int batch_size)
+{
+    qwen35_fa_prep_row_gfx1201<true, false>(
+        q_interleaved, nullptr, q_codes, q_scale, nullptr, k, q_weight, k_weight,
         positions, eps, freq_base, pos_offset, n_q_heads, n_kv_heads, batch_size);
 }

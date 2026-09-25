@@ -253,13 +253,16 @@ impl Gpu {
     /// three-launch sequence (see the `.hip` header). With
     /// [`FaPrepQOut::Fp8Codes`] the Q rows are emitted as the exact E4M3
     /// codes and row scales the Q-resident attention prologue derives.
-    /// `k` is read pre-norm and written post-norm+rope in place.
+    /// `k` is read pre-norm and written post-norm+rope in place. `gate` is
+    /// the compact `[batch × n_q × 256]` gate copy; `None` (fp8 codes only)
+    /// leaves the gate in `q_interleaved` for
+    /// `Fp8SigmoidGate::QGateInterleaved` and skips the copy.
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_fa_prep_batched_gfx1201(
         &mut self,
         q_interleaved: &GpuTensor,
         q_out: FaPrepQOut<'_>,
-        gate: &GpuTensor,
+        gate: Option<&GpuTensor>,
         k: &GpuTensor,
         q_weight: &GpuTensor,
         k_weight: &GpuTensor,
@@ -285,14 +288,20 @@ impl Gpu {
             ));
         }
         let q_elems = batch_size * n_q_heads * 256;
-        let (symbol, qp, sp) = match q_out {
-            FaPrepQOut::F32(q) => {
+        let (symbol, qp, sp) = match (q_out, gate.is_some()) {
+            (FaPrepQOut::F32(q), true) => {
                 if q.numel() < q_elems {
                     return Err(hip_bridge::HipError::new(1, "fa prep: Q output too small"));
                 }
                 ("qwen35_fa_prep_batched_gfx1201", q.buf.as_ptr(), None)
             }
-            FaPrepQOut::Fp8Codes(codes) => {
+            (FaPrepQOut::F32(_), false) => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "fa prep: the F32 Q output requires a gate copy",
+                ));
+            }
+            (FaPrepQOut::Fp8Codes(codes), copy_gate) => {
                 let need = q_elems + batch_size * n_q_heads * 4;
                 if codes.dtype != crate::DType::Raw || codes.buf.size() < need {
                     return Err(hip_bridge::HipError::new(
@@ -302,13 +311,21 @@ impl Gpu {
                 }
                 let base = codes.buf.as_ptr();
                 let scales = unsafe { (base as *mut u8).add(q_elems) as *mut c_void };
-                ("qwen35_fa_prep_fp8q_batched_gfx1201", base, Some(scales))
+                let symbol = if copy_gate {
+                    "qwen35_fa_prep_fp8q_batched_gfx1201"
+                } else {
+                    "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"
+                };
+                (symbol, base, Some(scales))
             }
         };
+        if gate.is_some_and(|g| g.numel() < q_elems) {
+            return Err(hip_bridge::HipError::new(1, "fa prep: gate output too small"));
+        }
         self.ensure_kernel(symbol, FA_PREP_BATCHED_GFX1201_SRC, symbol)?;
 
         let qip = q_interleaved.buf.as_ptr();
-        let gp = gate.buf.as_ptr();
+        let gp = gate.map(|g| g.buf.as_ptr());
         let kp = k.buf.as_ptr();
         let qwp = q_weight.buf.as_ptr();
         let kwp = k_weight.buf.as_ptr();
@@ -326,8 +343,10 @@ impl Gpu {
         if let Some(sp) = sp.as_ref() {
             params.push(sp as *const _ as *mut c_void);
         }
+        if let Some(gp) = gp.as_ref() {
+            params.push(gp as *const _ as *mut c_void);
+        }
         params.extend_from_slice(&[
-            &gp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
             &qwp as *const _ as *mut c_void,
             &kwp as *const _ as *mut c_void,
@@ -341,8 +360,9 @@ impl Gpu {
         ]);
         let rows = (n_q_heads + n_kv_heads) * batch_size;
         let q_bytes = if sp.is_some() { 256 + 4 } else { 256 * 4 };
+        let gate_bytes = if gp.is_some() { 256 * 4 * 2 } else { 0 };
         let bytes = batch_size
-            * (n_q_heads * (256 * 4 * 2 + 256 * 4 + q_bytes) + n_kv_heads * 256 * 4 * 2);
+            * (n_q_heads * (256 * 4 + gate_bytes + q_bytes) + n_kv_heads * 256 * 4 * 2);
         let timer = crate::profile::begin_timer(&self.hip, "fused", symbol, bytes);
         let result = self.launch_maybe_blob(
             symbol,
@@ -357,7 +377,9 @@ impl Gpu {
                 if let Some(sp) = sp {
                     b.push_ptr(sp);
                 }
-                b.push_ptr(gp);
+                if let Some(gp) = gp {
+                    b.push_ptr(gp);
+                }
                 b.push_ptr(kp);
                 b.push_ptr(qwp);
                 b.push_ptr(kwp);

@@ -39,6 +39,17 @@ pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
     }
 }
 
+/// Where [`Gpu::rotate_x_mq_fp8_gfx12_batched`] reads the FA sigmoid gate.
+#[derive(Clone, Copy)]
+pub enum Fp8SigmoidGate<'a> {
+    /// Compact row-major `[batch × k]` F32 gate rows.
+    Rows(&'a GpuTensor),
+    /// The FA Q/gate projection rows `[batch × k/256 × (256 q, 256 gate)]`
+    /// F32, read in place (the gate half of each 512-float head row), as
+    /// left by `FaPrepQOut::Fp8Codes` with no gate copy.
+    QGateInterleaved(&'a GpuTensor),
+}
+
 
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
     let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
@@ -5497,12 +5508,14 @@ impl Gpu {
     }
     /// gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ
     /// divide. Emits MQ4v2 FP8 prepared planes; the opt-in in-register
-    /// variant does not write the rotated F32 row.
+    /// variant does not write the rotated F32 row. The gate is either compact
+    /// rows or read in place from the FA Q/gate projection rows
+    /// ([`Fp8SigmoidGate`]); both give byte-identical planes.
     #[allow(clippy::too_many_arguments)]
     pub fn rotate_x_mq_fp8_gfx12_batched(
         &mut self,
         x_in: &GpuTensor,
-        gate: Option<&GpuTensor>,
+        gate: Option<Fp8SigmoidGate<'_>>,
         awq: Option<&GpuTensor>,
         x_out: &GpuTensor,
         k: usize,
@@ -5523,7 +5536,10 @@ impl Gpu {
         }
         if x_in.numel() < batch_size * k
             || x_out.numel() < batch_size * k
-            || gate.is_some_and(|t| t.numel() < batch_size * k)
+            || gate.is_some_and(|g| match g {
+                Fp8SigmoidGate::Rows(t) => t.numel() < batch_size * k,
+                Fp8SigmoidGate::QGateInterleaved(t) => t.numel() < batch_size * 2 * k,
+            })
             || awq.is_some_and(|t| t.numel() < k)
         {
             return Err(hip_bridge::HipError::new(
@@ -5533,7 +5549,28 @@ impl Gpu {
         }
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
+        let gate_in_place = matches!(gate, Some(Fp8SigmoidGate::QGateInterleaved(_)));
         let (module, source, kernel) = match (gate.is_some(), awq.is_some(), fp8_prod_inreg(k)) {
+            (true, false, true) if gate_in_place => (
+                "sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gil_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_INREG_GIL_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gil_gfx12",
+            ),
+            (true, true, true) if gate_in_place => (
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gil_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_INREG_GIL_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gil_gfx12",
+            ),
+            (true, false, false) if gate_in_place => (
+                "sigmoid_mul_rotate_x_mq4v2_fp8_gil_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_GIL_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq4v2_fp8_gil_gfx12",
+            ),
+            (true, true, false) if gate_in_place => (
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gil_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GIL_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gil_gfx12",
+            ),
             (false, false, true) => (
                 "mq_rotate_x_mq4v2_fp8_inreg_gfx12",
                 kernels::MQ_ROTATE_X_FP8_INREG_GFX12_SRC,
@@ -5600,7 +5637,11 @@ impl Gpu {
             .scratch
             .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
         let mut xp = x_in.buf.as_ptr();
-        let mut gp = gate.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut gp = gate
+            .map(|g| match g {
+                Fp8SigmoidGate::Rows(t) | Fp8SigmoidGate::QGateInterleaved(t) => t.buf.as_ptr(),
+            })
+            .unwrap_or(std::ptr::null_mut());
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();

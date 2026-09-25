@@ -2658,12 +2658,17 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
 // ---- Register-resident-Q v2: exact reschedule of the v1 body ----
 // Same geometry and per-row arithmetic as
 // attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 (768 threads, 384 query-head
-// rows = 64 queries x 6 heads per KV head, KT64, 16 QK + 16 PV fp8 WMMA per
-// 16-key sub in the same accumulation order); every output bit matches v1.
-// Only the schedule and the evaluation of exactly-rounded quantities change:
-//  * K/V/scale loads for tile t+1 are issued before tile t's compute and
-//    committed to LDS after it; V arrives pre-transposed via
-//    GLOBAL_LOAD_TR_B64, so the SCR transpose plane and its bpermutes go.
+// rows = 64 queries x 6 heads per KV head, 16 QK + 16 PV fp8 WMMA per 16-key
+// sub in the same accumulation order and sub order); every output bit
+// matches v1. Only the schedule and the evaluation of exactly-rounded
+// quantities change:
+//  * Keys stream through two LDS buffers of KT48 (3 subs). Tile t+1 is
+//    committed to the idle buffer at the top of tile t and tile t+2's loads
+//    are issued, so one barrier per tile orders both the fill (RAW) and the
+//    buffer reuse (WAR); the v1-style single KT64 buffer needed two. All 24
+//    waves share the fills (12 K waves, 12 V waves, wave 0 also scales).
+//    V arrives pre-transposed via GLOBAL_LOAD_TR_B64, so the SCR transpose
+//    plane and its bpermutes go.
 //  * Scales are staged as exact f32 values; full subs skip masking and
 //    diagonal subs mask with selects instead of per-key branches.
 //  * x/448 uses q=x*c, r=fma(-q,448,x), fma(r,c,q) (exhaustively equal to
@@ -2674,7 +2679,8 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
 //    Unequal ends (0.007% of subs) recompute with IEEE division.
 //  * Workgroups run heaviest-first (grid x/z reversed).
 // Grid [ceil(min(batch,512)/64), 4, ceil(batch/512)], block 768,
-// 33536 B dynamic LDS: K8 16 KiB, V8 16 KiB, SK/SV f32 256 B each, bounds.
+// 49936 B dynamic LDS: two KT48 buffers of 24960 B (K8 12 KiB, V8 12 KiB,
+// SK/SV f32 192 B each), then the bounds pair at 49920.
 // HIPFIRE_FA2_QRESIDENT_V2_Q8 builds the Q8-input twin
 // attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201: identical body, but the
 // prologue loads the E4M3 Q codes and row scales emitted by
@@ -2753,11 +2759,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         qok ? (unsigned)query * 24u + (unsigned)head : 0u;
 
     extern __shared__ uint32_t LDS[];
-    unsigned char* K8 = (unsigned char*)LDS;
-    unsigned char* V8 = (unsigned char*)LDS + 16384;
-    float* SKf = (float*)((unsigned char*)LDS + 32768);
-    float* SVf = (float*)((unsigned char*)LDS + 33024);
-    int* bounds = (int*)((unsigned char*)LDS + 33280);
+    int* bounds = (int*)((unsigned char*)LDS + 49920);
 
     if (tid == 0) {
         bounds[0] = -1;
@@ -2856,20 +2858,23 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const int seq_len = gmax + 1;
     const bool qok_all = row_base + 383 < 6 * run_rows;
 
-    // Fill roles: waves 0..7 load K (8 b64 wave-loads each), waves 8..15
-    // load pre-transposed V (8 GLOBAL_LOAD_TR_B64 each), wave 16 scales.
-    // Keys at/after seq_len are zero in every plane, as in v1.
-    const bool kfill = wave < 8;
-    const bool vfill = wave >= 8 && wave < 16;
-    const bool sfill = wave == 16;
-    unsigned long long pre[8];
+    // Fill roles: waves 0..11 load K (4 b64 wave-loads each), waves 12..23
+    // load pre-transposed V (4 GLOBAL_LOAD_TR_B64 each), wave 0 also loads
+    // the tile's 48 K/V scale pairs. Keys at/after seq_len are zero in every
+    // plane, as in v1.
+    constexpr int TK = 48;
+    constexpr unsigned KPL = 12288u;
+    constexpr unsigned BUFB = 2u * KPL + 384u;
+    const bool kfill = wave < 12;
+    const bool sfill = wave == 0;
+    unsigned long long pre[4];
     uint32_t spre[2];
 
     auto issue = [&](int kt) {
         if (kfill) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int idx = wave * 8 + i;
+            for (int i = 0; i < 4; ++i) {
+                const int idx = wave * 4 + i;
                 const int sub = idx >> 4;
                 const int dcf = idx & 15;
                 const int gk = kt + sub * 16 + ml;
@@ -2880,17 +2885,12 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                         + (unsigned)(kv_h * 256 + dcf * 16 + kg * 8));
                 pre[i] = v;
             }
-        } else if (vfill) {
-            // GLOBAL_LOAD_TR_B64 returns lane l byte b from source lane
-            // 16(l>>4) + 8(b>>2) + 4((l>>3)&1) + (b&3), byte l&7 (measured on
-            // gfx1201). Source lane s reads key 8(s>>4) + 4((s>>3)&1) + (s&3),
-            // dims 8((s>>2)&1)..+7, so lane (ml,kg) byte j = V[key 8kg+j][dim ml],
-            // the v1 V fragment.
+        } else {
             const int skey = 8 * (lane >> 4) + 4 * ((lane >> 3) & 1)
                 + (lane & 3);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int idx = (wave - 8) * 8 + i;
+            for (int i = 0; i < 4; ++i) {
+                const int idx = (wave - 12) * 4 + i;
                 const int sub = idx >> 4;
                 const int dc = idx & 15;
                 const int gk = min(kt + sub * 16 + skey, seq_len - 1);
@@ -2903,7 +2903,8 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                 pre[i] = (unsigned long long)(uint32_t)r.x
                     | ((unsigned long long)(uint32_t)r.y << 32);
             }
-        } else if (sfill) {
+        }
+        if (sfill) {
             uint32_t s0 = 0u, s1 = 0u;
             const int gk0 = kt + lane;
             const int gk1 = kt + 32 + lane;
@@ -2915,7 +2916,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                 s0 = (uint32_t)*(const uint16_t*)kr
                     | ((uint32_t)*(const uint16_t*)vr << 16);
             }
-            if (gk1 < seq_len) {
+            if (lane < 16 && gk1 < seq_len) {
                 const unsigned char* kr = k_cache
                     + (unsigned long long)gk1 * 1032ULL + 1024u + kv_h * 2;
                 const unsigned char* vr = v_cache
@@ -2927,43 +2928,47 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
             spre[1] = s1;
         }
     };
-    auto commit = [&](int kt) {
+    auto commit = [&](int kt, unsigned b) {
+        unsigned char* K8w = (unsigned char*)LDS + b * BUFB;
+        unsigned char* V8w = K8w + KPL;
+        float* SKw = (float*)(K8w + 2u * KPL);
+        float* SVw = SKw + 48;
         if (kfill) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int idx = wave * 8 + i;
+            for (int i = 0; i < 4; ++i) {
+                const int idx = wave * 4 + i;
                 const int sub = idx >> 4;
                 const int dcf = idx & 15;
-                *(unsigned long long*)(K8
-                    + (unsigned)((((dcf >> 1) * 4 + sub) * 32 + lane) * 16
+                *(unsigned long long*)(K8w
+                    + (unsigned)((((dcf >> 1) * 3 + sub) * 32 + lane) * 16
                                  + (dcf & 1) * 8)) = pre[i];
             }
-        } else if (vfill) {
+        } else {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int idx = (wave - 8) * 8 + i;
+            for (int i = 0; i < 4; ++i) {
+                const int idx = (wave - 12) * 4 + i;
                 const int sub = idx >> 4;
                 const int dc = idx & 15;
                 unsigned long long v = pre[i];
-                // Fragment byte j is key sub*16 + 8kg + j.
                 const int k0 = kt + sub * 16 + kg * 8;
                 if (k0 + 8 > seq_len) {
                     const int nvalid = max(0, seq_len - k0);
                     v &= (1ULL << (8 * nvalid)) - 1ULL;
                 }
-                *(unsigned long long*)(V8
+                *(unsigned long long*)(V8w
                     + (unsigned)(((sub * 8 + (dc >> 1)) * 32 + lane) * 16
                                  + (dc & 1) * 8)) = v;
             }
-        } else if (sfill) {
-            // f16 -> f32 is exact; multiplying by the f32 value equals v1's
-            // f16-operand fma_mix with a -0 addend.
+        }
+        if (sfill) {
             const fa2_dw_t d0 = {.u = spre[0]};
             const fa2_dw_t d1 = {.u = spre[1]};
-            SKf[lane] = (float)d0.h[0];
-            SVf[lane] = (float)d0.h[1];
-            SKf[32 + lane] = (float)d1.h[0];
-            SVf[32 + lane] = (float)d1.h[1];
+            SKw[lane] = (float)d0.h[0];
+            SVw[lane] = (float)d0.h[1];
+            if (lane < 16) {
+                SKw[32 + lane] = (float)d1.h[0];
+                SVw[32 + lane] = (float)d1.h[1];
+            }
         }
     };
 
@@ -2980,14 +2985,24 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const float qs_tile = q_row_scale * scale_attn;
 
     issue(0);
-    for (int ktile = 0; ktile < seq_len; ktile += 64) {
-        commit(ktile);
-        if (ktile + 64 < seq_len)
-            issue(ktile + 64);
-        __syncthreads();
-        const bool full = qok_all && (ktile + 63 <= gmin);
+    commit(0, 0u);
+    if (TK < seq_len)
+        issue(TK);
+    __syncthreads();
+    unsigned buf = 0u;
+    for (int ktile = 0; ktile < seq_len; ktile += TK) {
+        if (ktile + TK < seq_len) {
+            commit(ktile + TK, buf ^ 1u);
+            if (ktile + 2 * TK < seq_len)
+                issue(ktile + 2 * TK);
+        }
+        const unsigned char* K8 = (const unsigned char*)LDS + buf * BUFB;
+        const unsigned char* V8 = K8 + KPL;
+        const float* SKf = (const float*)(K8 + 2u * KPL);
+        const float* SVf = SKf + 48;
+        const bool full = qok_all && (ktile + TK - 1 <= gmin);
 #pragma unroll 1
-        for (int sub = 0; sub < 4; ++sub) {
+        for (int sub = 0; sub < 3; ++sub) {
             const int kt_sub = ktile + sub * 16;
             if (kt_sub > gmax)
                 break;
@@ -2996,7 +3011,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
                 const uint4 kv = *(const uint4*)(K8
-                    + (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
+                    + (unsigned)(((p * 3 + sub) * 32 + lane) * 16));
                 const v2i_t kf0 = {(int)kv.x, (int)kv.y};
                 const v2i_t kf1 = {(int)kv.z, (int)kv.w};
                 sacc =
@@ -3132,6 +3147,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
             }
         }
         __syncthreads();
+        buf ^= 1u;
     }
 
     if (qok) {
