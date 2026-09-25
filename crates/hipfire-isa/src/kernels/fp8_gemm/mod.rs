@@ -91,6 +91,7 @@ pub fn emit(spec:Spec)->Result<Emitted,String>{
         kernargs:Spec::kernargs(),user_sgpr_count:2,system_sgpr_workgroup_id_y:true,
         workgroup_size:256,group_segment_fixed_size:0,wave32:true,cu_mode:false};
     let mut b=Builder::new(kernel,plan()?);
+    b.enable_delay_alu();
     declare_lds(&mut b)?;
     prologue::emit(&mut b,spec)?;
     kloop::emit(&mut b,spec)?;
