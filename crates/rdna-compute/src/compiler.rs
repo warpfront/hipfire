@@ -543,6 +543,15 @@ impl KernelCompiler {
         // Radiowave-selected spill-free RM2/BV6 schedule.
         if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
             vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+        } else if arch == "gfx1201"
+            && name == "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3"
+        {
+            // K1's measured 96/96 VOPD fold pairs require this exact LLVM
+            // scheduler; the shipping GEMM and decode modules stay unchanged.
+            vec![
+                "-mllvm".to_owned(),
+                "-amdgpu-sched-strategy=iterative-ilp".to_owned(),
+            ]
         } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
             && matches!(
                 name,
@@ -2049,6 +2058,44 @@ mod tests {
         assert_ne!(
             control.cache_hash(module, source),
             gfx1100.cache_hash(module, source)
+        );
+    }
+
+    #[test]
+    fn gfx1201_k1_scheduler_is_module_exact_and_cache_keyed() {
+        let source = "__global__ void kernel() {}";
+        let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3";
+        let shipping = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r";
+        let mut compiler = test_compiler("", "hipcc 7.2");
+        compiler.arch = "gfx1201".to_owned();
+
+        assert_eq!(
+            compiler.module_flags(module),
+            vec!["-mllvm", "-amdgpu-sched-strategy=iterative-ilp"]
+        );
+        assert!(compiler.module_flags(shipping).is_empty());
+        assert!(compiler.module_flags("gemv_mq4g256v2_mq4v2").is_empty());
+        assert_ne!(
+            compiler.cache_hash(module, source),
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1201",
+                "",
+                &[],
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+            )
+        );
+        assert_eq!(
+            compiler.cache_hash(shipping, source),
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1201",
+                "",
+                &[],
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+            )
         );
     }
 
