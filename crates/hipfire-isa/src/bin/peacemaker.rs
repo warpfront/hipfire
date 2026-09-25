@@ -9,6 +9,7 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else { return Err(usage().into()); };
     if command == "audit" { return run_audit(args); }
+    if command == "profile" { return run_profile(args); }
     if command != "custom" || args.next().as_deref() != Some("build") {
         return Err(usage().into());
     }
@@ -67,7 +68,62 @@ fn run() -> Result<(), String> {
 
 fn usage() -> &'static str {
     "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
-     peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]"
+     peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]\n\
+     peacemaker profile --arch gfx1201 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)"
+}
+
+/// DIAGNOSTIC: instrument one kernel with timestamp records, verify the
+/// rewrite, and assemble a separate object whose symbol carries the
+/// `__pm_profile` suffix. The output is never a production artifact.
+fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+    use hipfire_isa::{ledger_replay::replay_hazards, profile};
+    let (mut arch, mut source, mut points, mut output) = (None, None, None, None);
+    while let Some(option) = args.next() {
+        let value = args.next().ok_or_else(|| format!("missing value for {option}"))?;
+        match option.as_str() {
+            "--arch" => arch = Some(value),
+            "--s" => source = Some(PathBuf::from(value)),
+            "--points" => points = Some(PathBuf::from(value)),
+            "--out" => output = Some(PathBuf::from(value)),
+            _ => return Err(format!("unrecognized profile option {option}\n{}", usage())),
+        }
+    }
+    let arch = arch.ok_or("missing --arch")?;
+    if !arch.starts_with("gfx12") { return Err("profile targets gfx12 wave32 kernels".into()) }
+    let source_path = source.ok_or("missing --s")?;
+    let output = output.ok_or("missing --out")?;
+    let read = |p: &PathBuf| fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+    let source = read(&source_path)?;
+    let config: profile::Config = serde_json::from_str(&read(&points.ok_or("missing --points")?)?)
+        .map_err(|e| format!("points: {e}"))?;
+    let (text, map) = profile::instrument(&source, &config)?;
+    profile::verify(&source, &text, &map)?;
+    // The independent wait replay must find exactly the original's hazards
+    // (none for builder kernels; hipcc's interlocked DS-source reuse otherwise).
+    let original_replay = replay_hazards(&profile::kernel_body(&source, &map.symbol)?)?;
+    let profiled_replay = replay_hazards(&profile::kernel_body(&text, &map.profiled_symbol)?)?;
+    if original_replay != profiled_replay {
+        return Err(format!("wait replay: profiled kernel has {} hazards, original {}", profiled_replay.len(), original_replay.len()));
+    }
+    if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let s_path = output.with_extension("s");
+    fs::write(&s_path, &text).map_err(|e| e.to_string())?;
+    let build = assemble_link_bundle(&Toolchain::default(), &s_path, &output, &arch)?;
+    let mut json = serde_json::to_value(&map).map_err(|e| e.to_string())?;
+    json["source"] = source_path.display().to_string().into();
+    json["source_sha256"] = format!("{:x}", Sha256::digest(source.as_bytes())).into();
+    json["profiled_s_sha256"] = format!("{:x}", Sha256::digest(text.as_bytes())).into();
+    json["profiled_co_sha256"] = format!("{:x}", Sha256::digest(fs::read(&build.elf).map_err(|e| e.to_string())?)).into();
+    json["wait_replay_hazards_original"] = original_replay.len().into();
+    json["wait_replay_hazards_profiled"] = profiled_replay.len().into();
+    json["parse_back"] = "pass".into();
+    let map_path = output.with_extension("map.json");
+    fs::write(&map_path, serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    println!("DIAGNOSTIC {} sites={} delay_fixups={} vgpr {}->{} (limit {}) sgpr {}->{} kernarg {}+{}\n{}\n{}\n{}",
+        map.profiled_symbol, map.sites.len(), map.delay_fixups.len(), map.vgpr_before, map.vgpr_after, map.vgpr_limit,
+        map.sgpr_before, map.sgpr_after, map.kernarg_ext_offset, map.kernarg_ext_bytes,
+        s_path.display(), build.elf.display(), map_path.display());
+    Ok(())
 }
 
 fn run_audit(mut args: impl Iterator<Item=String>) -> Result<(), String> {

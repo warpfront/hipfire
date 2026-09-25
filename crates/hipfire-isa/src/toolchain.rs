@@ -160,10 +160,8 @@ pub fn parse_back(source: &str, disassembly: &str) -> Result<()> {
             let canonical_author = if a == "s_barrier_wait" && author.ends_with(" -1") {
                 author.replace(" -1", " 0xffff")
             } else { author.to_string() };
-            let canonical_decoded = if (a == "v_and_b16" || a == "v_or_b16")
-                && (decoded.ends_with(" op_sel:[0,0,1]") || decoded.ends_with(" op_sel:[1,0,0]"))
-                && (author.contains(".h") || author.contains(".l")) {
-                decoded.split(" op_sel:").next().unwrap_or(decoded).to_owned()
+            let canonical_decoded = if author.contains(".h") || author.contains(".l") {
+                redundant_op_sel(decoded).unwrap_or_else(|| decoded.to_string())
             } else { decoded.to_string() };
             if normalize(&canonical_author) != normalize(&canonical_decoded) {
                 return Err(format!("parse-back instruction {index}: {author} != {decoded}"));
@@ -171,6 +169,22 @@ pub fn parse_back(source: &str, disassembly: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// True16 source spells half selects as `.h`/`.l`; the disassembler repeats
+/// them as a trailing `op_sel:[src0,…,dst]`. Drop the suffix only when every
+/// bit equals the `.h` spelling of its operand, so no selection is hidden.
+fn redundant_op_sel(decoded: &str) -> Option<String> {
+    let (body, bits) = decoded.rsplit_once(" op_sel:[")?;
+    let bits: Vec<&str> = bits.strip_suffix(']')?.split(',').map(str::trim).collect();
+    let (_, operands) = body.split_once(char::is_whitespace)?;
+    let operands: Vec<&str> = operands.split(',').map(|o| o.trim().trim_matches(|c| c == '|' || c == '-')).collect();
+    let (dst, sources) = operands.split_first()?;
+    for (i, bit) in bits.iter().enumerate() {
+        let operand = if i + 1 == bits.len() { dst } else { sources.get(i)? };
+        if (*bit == "1") != operand.ends_with(".h") { return None; }
+    }
+    Some(body.to_string())
 }
 
 /// Check the *linked* object's disassembly and inspected resource metadata.
@@ -495,6 +509,14 @@ mod tests {
         let source = "buffer_load_b64 v[0:1], v2, s[4:7], s8 offen offset:4096\ns_endpgm";
         let decoded = "000000 <k>:\n buffer_load_b64 v[0:1], v2, s[4:7], s8 offen offset:0 // 0\n s_endpgm // 0";
         assert!(parse_back(source, decoded).is_err());
+    }
+    #[test]
+    fn parse_back_accepts_only_op_sel_spelled_by_true16_halves() {
+        let source = "v_mov_b16_e64 v139.l, v5.h\ns_endpgm";
+        let decoded = |sel: &str| format!("000000 <k>:\n v_mov_b16_e64 v139.l, v5.h op_sel:{sel} // 0\n s_endpgm // 0");
+        assert!(parse_back(source, &decoded("[1,0]")).is_ok());
+        // A dst-high select the source never spelled must not be hidden.
+        assert!(parse_back(source, &decoded("[1,1]")).is_err());
     }
     #[test]
     fn shape_counts_packets_not_wmma_as_valu() {

@@ -4,7 +4,7 @@
 //! `Ledger` plus EXEC/VCC/SCC/M0 capabilities; it reconciles pending counters
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
-pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco;
+pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco; pub mod profile;
 pub mod kernels { pub mod iu4_k1; pub mod iu4_gemm; pub mod fp8_gemm; pub mod gdn_scan; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;

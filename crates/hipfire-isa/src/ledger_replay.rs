@@ -63,6 +63,18 @@ fn retire(pending: &mut Vec<Pending<'_>>, kind: Kind, count: usize) {
 /// Reject RAW, WAW and store-source WAR hazards from machine-readable text.
 /// Combined waits decode both counters independently.
 pub fn replay_waits(assembly: &str) -> Result<(), String> {
+    replay(assembly, false).map(|_| ())
+}
+
+/// Every hazard the replay finds, as the offending instruction text, in
+/// order. Used to show a rewrite adds no hazard to foreign (hipcc) code whose
+/// hardware-interlocked DS-source reuse the strict replay already flags.
+pub fn replay_hazards(assembly: &str) -> Result<Vec<String>, String> {
+    replay(assembly, true)
+}
+
+fn replay(assembly: &str, all: bool) -> Result<Vec<String>, String> {
+    let mut hazards = Vec::new();
     let mut pending = Vec::<Pending>::new();
     for (line_no, source) in assembly.lines().enumerate() {
         let line = source.split(';').next().unwrap_or("").trim();
@@ -94,6 +106,12 @@ pub fn replay_waits(assembly: &str) -> Result<(), String> {
             retire(&mut pending, Kind::Ds, encoded & 0x3f);
             continue;
         }
+        // VM_VSRC counts VMEM instructions that have not yet read their
+        // source registers; at 0 every pending store has consumed its sources.
+        if name == "s_wait_alu" && operands.contains("depctr_vm_vsrc(0)") {
+            for item in pending.iter_mut().filter(|item| item.kind == Kind::Store) { item.locks.clear(); }
+            continue;
+        }
         let kind = if name.starts_with("buffer_load") || name.starts_with("global_load") {
             Some((Kind::Vmem, true))
         } else if name.starts_with("buffer_store") || name.starts_with("global_store") {
@@ -102,7 +120,8 @@ pub fn replay_waits(assembly: &str) -> Result<(), String> {
             Some((Kind::Ds, true))
         } else if name.starts_with("ds_store") {
             Some((Kind::Ds, false))
-        } else if name.starts_with("s_load") || name.starts_with("s_buffer_load") {
+        } else if name.starts_with("s_load") || name.starts_with("s_buffer_load")
+            || name.starts_with("s_sendmsg_rtn") {
             Some((Kind::Km, true))
         } else if name.starts_with("s_store") || name.starts_with("s_buffer_store") {
             Some((Kind::Km, false))
@@ -125,7 +144,8 @@ pub fn replay_waits(assembly: &str) -> Result<(), String> {
         } else { BTreeSet::new() };
         if pending.iter().any(|event| !event.defs.is_disjoint(&all_regs)
             || !event.locks.is_disjoint(&defs)) {
-            return Err(format!("line {}: {name} touches unfinished memory operands", line_no+1));
+            if !all { return Err(format!("line {}: {name} touches unfinished memory operands", line_no+1)); }
+            hazards.push(line.to_string());
         }
         if let Some((kind, load)) = kind {
             pending.push(Pending {
@@ -135,7 +155,7 @@ pub fn replay_waits(assembly: &str) -> Result<(), String> {
             });
         }
     }
-    Ok(())
+    Ok(hazards)
 }
 
 #[cfg(test)]
@@ -186,6 +206,15 @@ mod tests {
         let source = "s_load_b32 s4, s[0:1], 0\ns_add_u32 s5, s4, s6\n";
         assert!(replay_waits(source).is_err());
         assert!(replay_waits(&source.replace("s_add_u32", "s_wait_kmcnt 0\ns_add_u32")).is_ok());
+    }
+    #[test]
+    fn vm_vsrc_releases_store_sources_and_realtime_needs_kmcnt() {
+        let store = "global_store_addtid_b32 v9, s[4:5] offset:-8\nv_writelane_b32 v9, s6, 0\n";
+        assert!(replay_waits(store).is_err());
+        assert!(replay_waits(&store.replace("v_writelane", "s_wait_alu depctr_vm_vsrc(0)\nv_writelane")).is_ok());
+        let clock = "s_sendmsg_rtn_b64 s[6:7], sendmsg(MSG_RTN_GET_REALTIME)\nv_writelane_b32 v9, s6, 0\n";
+        assert!(replay_waits(clock).is_err());
+        assert!(replay_waits(&clock.replace("v_writelane", "s_wait_kmcnt 0x0\nv_writelane")).is_ok());
     }
     #[test]
     fn mixed_vmem_loads_require_zero_wait() {
