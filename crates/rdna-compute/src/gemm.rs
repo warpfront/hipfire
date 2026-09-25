@@ -302,9 +302,9 @@ fn g12_iu4_v3_enabled() -> bool {
     *G12_IU4_V3
 }
 
-/// Full-slab A-prefetch is opt-in until end-to-end measurements justify it.
+/// Full-slab A-prefetch is the measured A8 default; K32 remains selectable.
 static A8_APF_K32: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A8_APF_K32", true));
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A8_APF_K32", false));
 
 fn a8_module_source() -> (&'static str, &'static str) {
     if *A8_APF_K32 {
