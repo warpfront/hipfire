@@ -105,11 +105,23 @@ __device__ __forceinline__ void gk_tile(int t, int& rb, int& cb) {
     else { rb=3; cb=3; }
 }
 
+// Exact gfx1201 stages the K chunk once with 16-byte loads, prefetches the
+// three gate/beta columns and moves A/zeroing in 16-byte units.  Every WMMA
+// operand, solve step and FP16 rounding is unchanged.
+#if defined(__gfx1201__)
+#define GK_G12_VEC 1
+#else
+#define GK_G12_VEC 0
+#endif
+#define GK_KP 132
 struct __attribute__((aligned(16))) GkLds {
     unsigned short a[GK_C][GK_PITCH];
     unsigned short tmp[32][36];
     float gate[GK_C];
     float beta[GK_C];
+#if GK_G12_VEC
+    unsigned short kc[GK_C][GK_KP];
+#endif
 };
 
 extern "C" __launch_bounds__(128)
@@ -134,6 +146,33 @@ __global__ void gdn_chunk_kkt_solve(
     // Ten Gram tiles remain in registers while the three value-head systems
     // are solved.  Each wave owns at most three tiles.
     gk_f8 gram[3]={gk_zero(),gk_zero(),gk_zero()};
+#if GK_G12_VEC
+    __shared__ GkLds s;
+    float pgate[3]={0.0f,0.0f,0.0f},pbeta[3]={0.0f,0.0f,0.0f};
+    {uint4 w[8];
+#pragma unroll
+     for(int it=0;it<8;++it){const int idx=tid+it*128,r=idx>>4,rr=r<rows?r:rows-1;
+      w[it]=*reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned char*>(kp)+(unsigned)rr*(kstride*2u)+(unsigned)(idx&15)*16u);}
+     if(tid<rows){
+#pragma unroll
+      for(int sub=0;sub<3;++sub){const unsigned long long off=(unsigned long long)(parent0+tid)*48+kh*3+sub;pgate[sub]=G[off];pbeta[sub]=beta[off];}}
+#pragma unroll
+     for(int it=0;it<8;++it){const int idx=tid+it*128,r=idx>>4,c=(idx&15)*8;uint2*dst=reinterpret_cast<uint2*>(&s.kc[r][c]);
+      dst[0]=make_uint2(w[it].x,w[it].y);dst[1]=make_uint2(w[it].z,w[it].w);}}
+    __syncthreads();
+#pragma unroll
+    for(int slot=0;slot<3;++slot){
+        const int tile=wave+slot*4;
+        if(tile<10){int rb,cb;gk_tile(tile,rb,cb);
+#pragma unroll
+            for(int d=0;d<8;++d)
+                gram[slot]=gk_mma(
+                    gk_frag_shared(&s.kc[0][0],GK_KP,rb*GK_B,d*GK_B,lane),
+                    gk_frag_shared(&s.kc[0][0],GK_KP,cb*GK_B,d*GK_B,lane),
+                    gram[slot]);
+        }
+    }
+#else
 #pragma unroll
     for(int slot=0;slot<3;++slot){
         const int tile=wave+slot*4;
@@ -148,9 +187,18 @@ __global__ void gdn_chunk_kkt_solve(
     }
 
     __shared__ GkLds s;
+#endif
 #pragma unroll
     for(int sub=0;sub<3;++sub){
         const int vh=kh*3+sub;
+#if GK_G12_VEC
+        for(int x=tid;x<GK_C*GK_PITCH/8;x+=128)
+            reinterpret_cast<uint4*>(s.a)[x]=make_uint4(0u,0u,0u,0u);
+        if(tid<GK_C){
+            if(tid<rows){s.gate[tid]=pgate[sub]; s.beta[tid]=pbeta[sub];}
+            else{s.gate[tid]=0.0f;s.beta[tid]=0.0f;}
+        }
+#else
         for(int x=tid;x<GK_C*GK_PITCH;x+=128)
             reinterpret_cast<unsigned short*>(s.a)[x]=0;
         if(tid<GK_C){
@@ -159,10 +207,34 @@ __global__ void gdn_chunk_kkt_solve(
                 s.gate[tid]=G[off]; s.beta[tid]=beta[off];
             }else{s.gate[tid]=0.0f;s.beta[tid]=0.0f;}
         }
+#endif
         __syncthreads();
 
         // Place the symmetric Gram into strict-lower L.  Masking selects
         // -infinity before exp, so padded rows cannot create 0*infinity.
+#if GK_G12_VEC
+        // Same element expression; gates/beta come from vector LDS reads and
+        // the select replaces the branch (masked values are discarded).
+#pragma unroll
+        for(int slot=0;slot<3;++slot){
+            const int tile=wave+slot*4;
+            if(tile<10){int rb,cb;gk_tile(tile,rb,cb);
+                const int i=cb*GK_B+(lane&15),j0=rb*GK_B+8*(lane>>4);
+                const float gi=s.gate[i],bi=s.beta[i];
+                const float4 ga=*reinterpret_cast<const float4*>(&s.gate[j0]),gb=*reinterpret_cast<const float4*>(&s.gate[j0+4]);
+                const float gj[8]={ga.x,ga.y,ga.z,ga.w,gb.x,gb.y,gb.z,gb.w};
+                unsigned hb[8];
+#pragma unroll
+                for(int e=0;e<8;++e){const int j=j0+e;
+                    const float exponent=gi-gj[e];
+                    const float value=bi*expf(exponent)*gram[slot][e];
+                    hb[e]=gk_to_bf((i<rows && j<i && j<rows)?value:0.0f);}
+                uint2*dst=reinterpret_cast<uint2*>(&s.a[i][j0]);
+                dst[0]=make_uint2(hb[0]|(hb[1]<<16),hb[2]|(hb[3]<<16));
+                dst[1]=make_uint2(hb[4]|(hb[5]<<16),hb[6]|(hb[7]<<16));
+            }
+        }
+#else
 #pragma unroll
         for(int slot=0;slot<3;++slot){
             const int tile=wave+slot*4;
@@ -178,6 +250,7 @@ __global__ void gdn_chunk_kkt_solve(
                 }
             }
         }
+#endif
         __syncthreads();
 
         // Four BC16 diagonal forward solves, one per wave.  Lane 0..15 owns
@@ -185,6 +258,23 @@ __global__ void gdn_chunk_kkt_solve(
         if(lane<16){
             const int base=wave*GK_B;
             float col[GK_B];
+#if GK_G12_VEC
+            // The strict-lower block is read once as 8-byte rows before the
+            // unchanged sequential substitution.
+            uint2 rv[GK_B][4];
+#pragma unroll
+            for(int i=1;i<GK_B;++i)
+#pragma unroll
+                for(int q=0;q<4;++q) if(4*q<i) rv[i][q]=*reinterpret_cast<const uint2*>(&s.a[base+i][base+4*q]);
+#pragma unroll
+            for(int i=0;i<GK_B;++i){float value=(i==lane)?1.0f:0.0f;
+#pragma unroll
+                for(int j=0;j<GK_B;++j) if(j<i){
+                    const unsigned w=(j&2)?rv[i][j>>2].y:rv[i][j>>2].x;
+                    value-=gk_from_bf((unsigned short)((j&1)?(w>>16):(w&0xffffu)))*col[j];}
+                col[i]=value;
+            }
+#else
 #pragma unroll
             for(int i=0;i<GK_B;++i){float value=(i==lane)?1.0f:0.0f;
 #pragma unroll
@@ -192,6 +282,7 @@ __global__ void gdn_chunk_kkt_solve(
                     value-=gk_from_bf(s.a[base+i][base+j])*col[j];
                 col[i]=value;
             }
+#endif
 #pragma unroll
             for(int i=0;i<GK_B;++i)s.a[base+i][base+lane]=gk_to_bf(col[i]);
         }
@@ -247,10 +338,18 @@ __global__ void gdn_chunk_kkt_solve(
         __syncthreads();
 
         const unsigned long long abase=(unsigned long long)local0*48*GK_C+(unsigned long long)vh*GK_C;
+#if GK_G12_VEC
+        {unsigned char*ab=reinterpret_cast<unsigned char*>(A+abase);
+#pragma unroll
+         for(int it=0;it<4;++it){const int idx=tid+it*128,r=idx>>3,c=(idx&7)*8;
+          const uint2 lo2=*reinterpret_cast<const uint2*>(&s.a[r][c]),hi2=*reinterpret_cast<const uint2*>(&s.a[r][c+4]);
+          *reinterpret_cast<uint4*>(ab+(unsigned)r*(48u*GK_C*2u)+(unsigned)c*2u)=make_uint4(lo2.x,lo2.y,hi2.x,hi2.y);}}
+#else
         for(int x=tid;x<GK_C*GK_C;x+=128){
             const int r=x/GK_C,c=x-r*GK_C;
             A[abase+(unsigned long long)r*48*GK_C+c]=s.a[r][c];
         }
+#endif
         __syncthreads();
     }
 }
