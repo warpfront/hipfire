@@ -1395,6 +1395,9 @@ impl Gpu {
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
                 int4_mmq_generation: 0,
+                int8_mmq_x_scratch: None,
+                int8_mmq_x_scratch_bytes: 0,
+                int8_mmq_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
                 mq4v2_fp8_half_sums_scratch: None,
@@ -3051,6 +3054,54 @@ impl Gpu {
         self.scratch.reserve_int4_mmq(&self.hip, k, n)
     }
 
+    /// Re-quantize f32 activations for the gfx1201 A8 MMQ consumer.
+    pub fn ensure_int8_mmq_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<*mut c_void> {
+        let needed = crate::scratch::int8_mmq_x_needed(k, n);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.int8_mmq_x_scratch_bytes,
+            self.scratch.int8_mmq_x_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch.ensure_int8_mmq_x(
+            &self.hip, &mut self.compiler, &mut self.modules, &mut self.functions,
+            self.active_stream.as_ref(), &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode, self.flags.force_blob_path, &mut self.replay,
+            self.device_id, x, n, k,
+        )
+    }
+
+    /// Reserve (without launching the quantizer) for a fused A8 producer.
+    pub fn reserve_int8_mmq(&mut self, k: usize, n: usize) -> HipResult<crate::scratch::Int8MmqReservation> {
+        if k != 0 && n != 0 && k % 256 == 0 {
+            let needed = crate::scratch::int8_mmq_x_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int8_mmq_x_scratch_bytes,
+                self.scratch.int8_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int8_mmq(&self.hip, k, n)
+    }
+
+    pub fn int8_mmq_prepared_ptr(
+        &self, prepared: &crate::scratch::Int8MmqPrepared, k: usize, n: usize,
+    ) -> HipResult<*mut c_void> {
+        let (generation, ptr) = self.scratch.int8_mmq_live();
+        prepared.checked_ptr(generation, ptr, k, n)
+    }
+
+    pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
+        self.flags.a8_prefill_enabled()
+            && self.mq4v2_symmetric
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && n >= 64 && k > 0 && k % 256 == 0
+    }
+
     /// True when the portable producer-sidecar route is live for this call:
     /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
     /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
@@ -3072,6 +3123,7 @@ impl Gpu {
     /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_silu_quant_fused_enabled()
+            && !self.a8_prefill_active(batch, k)
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -3087,6 +3139,7 @@ impl Gpu {
     /// requires head_dim == 128 at its callsite helper.
     pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_producer_quant_fused_enabled()
+            && !self.a8_prefill_active(batch, k)
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -3119,6 +3172,7 @@ impl Gpu {
     /// requires Lloyd weights and scale_mode == 1. Default OFF.
     pub fn fp8_stream_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_fp8_stream_enabled()
+            && !self.a8_prefill_active(batch, k)
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode

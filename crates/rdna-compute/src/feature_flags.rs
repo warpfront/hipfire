@@ -47,6 +47,10 @@ pub struct FeatureFlags {
     /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
     /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
+    /// Exact gfx1201 MQ4v2 A8 prefill (int8 per K128); opt-in, default off.
+    pub a8_prefill: bool,
+    /// Fuse A8 sidecar emission into the four activation producers (default on).
+    pub a8_fused_prod: bool,
     /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
     /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
     pub gfx11_iu4_gridspec: bool,
@@ -578,6 +582,8 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
+            a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
+            a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
             gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
@@ -881,6 +887,11 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
+    /// A8 replaces the gfx1201 FP8 projection route only when explicitly selected.
+    pub fn a8_prefill_enabled(&self) -> bool {
+        self.a8_prefill && self.arch == "gfx1201"
+    }
+
     /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
@@ -984,6 +995,8 @@ impl FeatureFlags {
             // Deterministic unit-test baseline: the iu4 route stays off here
             // even though the process default is on.
             iu4_prefill: Some(false),
+            a8_prefill: false,
+            a8_fused_prod: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
             gfx11_iu4_symfold: false,
