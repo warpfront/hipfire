@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hipfire-isa",
     "crates/hip-bridge",
     "crates/va-bridge",
     "crates/hsa-bridge",
