@@ -2897,6 +2897,9 @@ fn verify_dflash_block_inner(
             &format!("DFlash verify KV token range overflow ({start_pos} + {b})"),
         )
     })?;
+    qwen35::prefill::release_widened_pbs_for_kv_growth(
+        gpu, &target.kv_cache, &target.config, &target.scratch, required_tokens,
+    )?;
     // Verify replay bypasses the regular qwen35 forward wrappers.
     target
         .kv_cache
