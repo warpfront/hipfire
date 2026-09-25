@@ -10,6 +10,8 @@ use super::{EPI, Epi, Gen, lit, mem, op, region::{self, Binding, Region}, s, sr,
 use crate::{Builder, insn::MemoryClass};
 
 struct Epilogue { tok: u8, row: u8, off: u8, lim: u8, lim_off: [u8; 4], ntok: [u8; 4], rm: [u8; 4], tm: [u8; 4], nbo: [u8; 4], masks: [u8; 4] }
+/// Concurrently live SiLU region instances (register slots).
+const SILU_SLOTS: u8 = 4;
 
 fn layout(g: &Gen) -> Epilogue {
     let e = g.epi_s;
@@ -106,21 +108,31 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
         Epi::GateUpSilu => {
             let silu_region = Region::silu()?;
             if silu_region.temps > region::SILU_TEMPS || silu_region.masks > region::SILU_MASKS { return Err("SiLU region needs more temporaries than planned".into()) }
+            // Four live instances: register slot q owns temporaries
+            // v[7q : 7q + 6] (v0..v27) and two lane-mask SGPRs, the four
+            // `e.masks` then s56..s59 (prologue temporaries, dead once the row
+            // offset above has read s56). Element k of a column block uses
+            // slot k % 4, so k + 4 starts once k has issued its last op; VOPD
+            // partners (2i, 2i + 1) sit an odd distance apart in every operand
+            // (7 temporaries, one accumulator or output), which keeps each
+            // same-op packet parity- and bank-legal.
+            let masks = [e.masks[0], e.masks[1], e.masks[2], e.masks[3], g.tmp, g.tmp + 1, g.tmp + 2, g.tmp + 3];
             for nb in 0..4 {
                 if nb > 0 { op(b, "s_mov_b32 exec_lo, -1", &[], &[])?; }
-                // One output octet per column block (v16..v47): no register
+                // One output octet per column block (v32..v63): no register
                 // is rewritten while a store reads it, so no store-counter
                 // wait (whose completion order the ledger replay rightly
                 // does not assume) is ever needed.
-                let out = g.cacc + 16 + 8 * nb as u8;
-                for j in (0..8u8).step_by(2) {
-                    let binds: Vec<_> = (0..2u8).map(|s| Binding {
-                        g: acc(nb, 0, 0) + j + s, u: acc(nb, 1, 0) + j + s, out: out + j + s,
-                        temps: (0..region::SILU_TEMPS as u8).map(|t| g.cacc + 7 * s + t).collect(),
-                        masks: vec![e.masks[2 * s as usize], e.masks[2 * s as usize + 1]],
-                    }).collect();
-                    region::emit_interleaved(b, &silu_region, &binds)?;
-                }
+                let out = g.cacc + 32 + 8 * nb as u8;
+                let binds: Vec<_> = (0..8u8).map(|k| {
+                    let q = k % SILU_SLOTS;
+                    Binding {
+                        g: acc(nb, 0, 0) + k, u: acc(nb, 1, 0) + k, out: out + k,
+                        temps: (0..region::SILU_TEMPS as u8).map(|t| g.cacc + 7 * q + t).collect(),
+                        masks: vec![masks[2 * q as usize], masks[2 * q as usize + 1]],
+                    }
+                }).collect();
+                region::emit_interleaved(b, &silu_region, &binds)?;
                 for c in 0..2 { quad(b, "buffer_store_b128", out + 4 * c as u8, nb, 0, c, false)?; }
             }
         }
