@@ -31,7 +31,8 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
     int head_dim,
     float eps,
     int K,
-    int N)
+    int N,
+    int row_scale_shift)
 {
     const int token = (int)blockIdx.x;
     if (token >= N || head_dim != 128 || K <= 0) return;
@@ -172,11 +173,11 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
     fp8stream_pack_row_inreg(
         held, x_fp8 + row_off,
         fp8_half_sums + (long long)token * (K >> 7),
-        fp8_row_scales + token, row_amax, pack_smem, K, lane, wave, wave, 8);
+        fp8_row_scales + token, row_amax, pack_smem, K, lane, wave, wave, 8, row_scale_shift);
 #else
     fp8stream_pack_row_from_f32(
         x_rot_b, x_fp8 + row_off,
         fp8_half_sums + (long long)token * (K >> 7),
-        fp8_row_scales + token, row_amax, pack_smem, K, tid, lane, wave);
+        fp8_row_scales + token, row_amax, pack_smem, K, tid, lane, wave, row_scale_shift);
 #endif
 }

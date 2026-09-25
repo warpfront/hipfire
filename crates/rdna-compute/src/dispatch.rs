@@ -1404,6 +1404,8 @@ impl Gpu {
                 mq4v2_fp8_half_sums_scratch_bytes: 0,
                 mq4v2_fp8_row_scales_scratch: None,
                 mq4v2_fp8_row_scales_scratch_bytes: 0,
+                fp8_f2_weights: None,
+                fp8_f2_weights_bytes: 0,
                 ksplit_det_partials: None,
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,

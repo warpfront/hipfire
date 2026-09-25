@@ -343,6 +343,12 @@ fn main() {
         std::process::exit(2);
     }
     let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
+    // Quality-only: execute the final, unscored token so the scored-region
+    // forward is tile-aligned; score only the original reference positions.
+    let pad_scoring_tail = std::env::var("HIPFIRE_FP8_G3_PAD_TAIL").as_deref() == Ok("1");
+    if pad_scoring_tail {
+        eprintln!("eval_hipfire: quality-only final-token padding; scored positions unchanged");
+    }
     let effective_n_chunk = match args.max_chunks {
         Some(m) => m.min(n_chunk),
         None => n_chunk,
@@ -600,7 +606,7 @@ fn main() {
 
         let hidden_buf = if args.scoring_mode == "prefill" {
             Some(
-                gpu.alloc_tensor(&[scored_per_chunk, config.dim], DType::F32)
+                gpu.alloc_tensor(&[scored_per_chunk + usize::from(pad_scoring_tail), config.dim], DType::F32)
                     .expect("alloc hidden_buf"),
             )
         } else {
@@ -680,7 +686,7 @@ fn main() {
                     &mut gpu,
                     &weights,
                     &config,
-                    &chunk_tokens[scoring_start..(n_ctx - 1)],
+                    &chunk_tokens[scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail))],
                     scoring_start,
                     &mut kv_cache,
                     &mut dn_state,

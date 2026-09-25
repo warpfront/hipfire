@@ -689,6 +689,25 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    // The repacker completely overwrites all three planes on each launch.
+    // ADD is a read-modify-write of Y0, represented conservatively as Write.
+    if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
+        return Some(vec![read(0), read(8), read(16), read(24),
+            write(32), write(40), write(48)]);
+    }
+    match kernel {
+        "gemm_mq4g256v2_fp8_set_row_b1"
+        | "gemm_mq4g256v2_fp8_add_row_b1"
+        | "gemm_mq4g256v2_fp8_silu_row_b1" =>
+            return Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)]),
+        "gemm_mq4g256v2_fp8_qkv_row_b1" =>
+            return Some(vec![read(0), read(8), read(16), read(24), read(32),
+                write(40), write(48), write(56)]),
+        "gemm_mq4g256v2_fp8_qkvza_row_b1" =>
+            return Some(vec![read(0), read(8), read(16), read(24), read(32),
+                write(40), write(48), write(56), write(64)]),
+        _ => {}
+    }
     if matches!(
         kernel,
         "fused_gate_up_hfq4g256"
@@ -1311,6 +1330,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
+        return Some(80);
+    }
+    if matches!(kernel, "gemm_mq4g256v2_fp8_set_row_b1"
+        | "gemm_mq4g256v2_fp8_add_row_b1"
+        | "gemm_mq4g256v2_fp8_silu_row_b1"
+        | "gemm_mq4g256v2_fp8_qkv_row_b1"
+        | "gemm_mq4g256v2_fp8_qkvza_row_b1") {
+        return Some(96);
+    }
     if matches!(
         kernel,
         "hc_pre_post_sigmoid_scale_f32" | "hc_sinkhorn_4x4" | "sqrt_softplus_f32" | "zero_f32"

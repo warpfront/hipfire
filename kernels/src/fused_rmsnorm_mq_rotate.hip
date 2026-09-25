@@ -97,7 +97,8 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     float* __restrict__ fp8_row_scales, // [N] f32 power-of-two-to-224 scales
     int K,
     float eps,
-    int N
+    int N,
+    int row_scale_shift
 #else
     float* __restrict__ x_rot,
     int K,
@@ -394,14 +395,14 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         fp8stream_pack_row_inreg(
             held, x_fp8 + frow, fp8_half_sums + (long long)token * (K >> 7),
             fp8_row_scales + token, row_amax, reduce, K, lane_id, warp_id,
-            warp_group_start, 1);
+            warp_group_start, 1, row_scale_shift);
 #else
         fp8stream_pack_row_from_f32(
             x_rot_b,
             x_fp8 + frow,
             fp8_half_sums + (long long)token * gpr * 2,
             fp8_row_scales + token,
-            row_amax, reduce, K, tid, lane_id, warp_id);
+            row_amax, reduce, K, tid, lane_id, warp_id, row_scale_shift);
 #endif
     }
     #endif

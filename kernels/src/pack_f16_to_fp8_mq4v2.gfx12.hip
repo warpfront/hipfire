@@ -94,7 +94,8 @@ void pack_f16_to_fp8_mq4v2_gfx12(
     float* row_scales,           // [N]
     int K,
     int N,
-    int scale_mode)             // 0=unit, 1=pow2-to-224
+    int scale_mode,              // 0=unit, 1=pow2-to-224
+    int row_scale_shift)
 {
     // 32 B static LDS: eight wave maxima, then republished a_n in slot 0.
     __shared__ float smem[8];
@@ -131,6 +132,7 @@ void pack_f16_to_fp8_mq4v2_gfx12(
             for (int w = 1; w < 8; ++w)
                 amax = fmaxf(amax, smem[w]);
             a_n = mq4v2_row_scale_from_absmax(amax);
+            if (row_scale_shift != 0) a_n *= mq4v2_fast_pow2(row_scale_shift);
             smem[0] = a_n;
             row_scales[n] = a_n;
         }
@@ -197,7 +199,8 @@ void pack_f32_to_fp8_mq4v2_gfx12(
     float* row_scales,           // [N]
     int K,
     int N,
-    int scale_mode)             // 0=unit, 1=pow2-to-224
+    int scale_mode,              // 0=unit, 1=pow2-to-224
+    int row_scale_shift)
 {
     // 32 B static LDS: eight wave maxima, then republished a_n in slot 0.
     __shared__ float smem[8];
@@ -234,6 +237,7 @@ void pack_f32_to_fp8_mq4v2_gfx12(
             for (int w = 1; w < 8; ++w)
                 amax = fmaxf(amax, smem[w]);
             a_n = mq4v2_row_scale_from_absmax(amax);
+            if (row_scale_shift != 0) a_n *= mq4v2_fast_pow2(row_scale_shift);
             smem[0] = a_n;
             row_scales[n] = a_n;
         }

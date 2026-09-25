@@ -3972,6 +3972,15 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 /// SHA-256 e57061d5d7f580e8e070baa9d741c72e0759365bc956e9ed3b4a58ad6f47940b.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
+/// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
+/// SHA-256 bb4e3b9b08f91d72b4aba4a250a2cb34a721abeceddce63baa7fff423e28ba33.
+pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco");
+/// Fused Wf/Rw/Ew repacker. SHA-256
+/// ef2f779637e797745651630b916858f64d2a006ca86502df2f4c91f417a64d29.
+pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/mq4v2_fp8_fragment_repack_gfx1201.hsaco");
+
 
 /// gfx1201 A8 MQ4v2: standalone K128 int8 quantizer and all three GEMM entries.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC: &str = concat!(

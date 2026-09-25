@@ -99,7 +99,8 @@ __device__ inline void fp8stream_pack_row_from_f32(
     int K,
     int tid,
     int lane,
-    int wave) {
+    int wave,
+    int row_scale_shift) {
     row_amax = fp8stream_wave_max(row_amax);
     if (lane == 0)
         smem8[wave] = row_amax;
@@ -111,6 +112,7 @@ __device__ inline void fp8stream_pack_row_from_f32(
         for (int w = 1; w < 8; ++w)
             amax = fmaxf(amax, smem8[w]);
         a_n = fp8stream_row_scale_from_absmax(amax);
+        if (row_scale_shift != 0) a_n *= fp8stream_fast_pow2(row_scale_shift);
         smem8[0] = a_n;
         *scale_slot = a_n;
     }
@@ -160,7 +162,8 @@ __device__ inline void fp8stream_pack_row_inreg(
     float* __restrict__ scale_slot,
     float row_amax,
     float* __restrict__ smem8,
-    int K, int lane, int wave, int first_group, int group_stride) {
+    int K, int lane, int wave, int first_group, int group_stride,
+    int row_scale_shift) {
     row_amax = fp8stream_wave_max(row_amax);
     if (lane == 0) smem8[wave] = row_amax;
     __syncthreads();
@@ -168,7 +171,8 @@ __device__ inline void fp8stream_pack_row_inreg(
         float amax = smem8[0];
         #pragma unroll
         for (int w = 1; w < 8; ++w) amax = fmaxf(amax, smem8[w]);
-        const float a_n = fp8stream_row_scale_from_absmax(amax);
+        float a_n = fp8stream_row_scale_from_absmax(amax);
+        if (row_scale_shift != 0) a_n *= fp8stream_fast_pow2(row_scale_shift);
         smem8[0] = a_n;
         *scale_slot = a_n;
     }

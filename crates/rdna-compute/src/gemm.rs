@@ -314,6 +314,19 @@ fn g12_iu4_b1_image() -> &'static [u8] {
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     }
 }
+/// Opt-in builder fp8 GEMM. Parsed once so a queued producer and its
+/// consumer cannot see different route settings.
+static G12_FP8_F2: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA", false));
+// Private quality-only candidate override: reference chunks are shorter
+// than product admission. Never enable this for normal prefill or timing.
+static G12_FP8_F2_FORCE_SMALL_N: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA_FORCE_SMALL_N", false));
+// Quality receipts count the real selected kernel sites, not attempted
+// admissions. Kept off in production and all timing runs.
+static G12_FP8_F2_COVERAGE: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA_COVERAGE", false));
+
 
 /// The builder's single masked b128 store cannot serve odd row quads or
 /// misaligned output pointers; hipcc `_v3` retains its b32 fallback.
@@ -9435,6 +9448,159 @@ impl Gpu {
         }
         result
     }
+    /// Admit only symmetric uniform qt44 with the existing Row-scale producer.
+    /// A failed admission keeps the incumbent v2 dispatch before any repack.
+    pub fn fp8_f2_row_active(&self, n: usize, k: usize, dims: &[usize], silu: bool) -> bool {
+        *G12_FP8_F2
+            && self.arch == "gfx1201"
+            && self.mq4v2_symmetric
+            && self.flags.gfx12_mq4v2_fp8_v2
+            && !self.flags.iu4_prefill_enabled()
+            && !self.a8_prefill_active(n, k)
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && (n >= 2048 || *G12_FP8_F2_FORCE_SMALL_N)
+            && k > 0
+            && k % 256 == 0
+            && !dims.is_empty()
+            && dims.len() <= 4
+            && dims.iter().all(|&m| m > 0 && m % 4 == 0 && m <= i32::MAX as usize)
+            && dims.iter().try_fold(0usize, |a, &m| a.checked_add(m))
+                .is_some_and(|m| m <= i32::MAX as usize)
+            && n <= i32::MAX as usize
+            && k <= i32::MAX as usize
+            && (!silu || (dims.len() == 2 && dims[0] == dims[1]))
+    }
+
+    /// One transaction on the active stream: completely repack the selected
+    /// weights into the grow-only workspace, then consume them with F2 Row.
+    /// Never retry the incumbent after either launch has begun.
+    #[allow(clippy::too_many_arguments)]
+    fn fp8_f2_row_prepared(
+        &mut self,
+        weights: &[&GpuTensor],
+        outputs: &[&GpuTensor],
+        prepared: &crate::scratch::Mq4v2Fp8Prepared,
+        dims: &[usize],
+        k: usize,
+        n: usize,
+        epi: &str,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let silu = epi == "silu";
+        if !self.fp8_f2_row_active(n, k, dims, silu)
+            || prepared.n != n || prepared.k != k || prepared.scale_mode != 1
+            || weights.len() != dims.len()
+            || outputs.len() != if silu { 1 } else { dims.len() }
+            || weights.iter().any(|w| w.dtype != DType::Raw)
+            || weights.iter().any(|w| (w.buf.as_ptr() as usize) % 16 != 0)
+            || weights.iter().zip(dims).any(|(w, &m)| {
+                m.checked_mul(k / 256).and_then(|v| v.checked_mul(136))
+                    .is_none_or(|bytes| w.numel() < bytes)
+            })
+            || outputs.iter().any(|y| (y.buf.as_ptr() as usize) % 16 != 0)
+        {
+            return Err(hip_bridge::HipError::new(0, "F2: invalid Row/qt44/shape/ABI admission"));
+        }
+        let mt: usize = dims.iter().sum();
+        let (wf_bytes, rw_bytes, ew_bytes) =
+            crate::scratch::fp8_f2_weight_extents(mt, k)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "F2: workspace extent overflow"))?;
+        let needed = wf_bytes.checked_add(rw_bytes).and_then(|x| x.checked_add(ew_bytes))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "F2: workspace extent overflow"))?;
+        // The prefill route is eager-only. A future caller cannot grow/free
+        // a captured workspace before the existing tape has been invalidated.
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(0, "F2: capture/replay rejected"));
+        }
+        const REPACK: &str = "mq4v2_fp8_fragment_repack_gfx1201";
+        const REPACK_MODULE: &str = "mq4v2_fp8_fragment_repack_gfx1201";
+        const GEMM_MODULE: &str = "gemm_mq4g256v2_wmma_fp8_gfx12_b1";
+        let symbol = match epi {
+            "set" => "gemm_mq4g256v2_fp8_set_row_b1",
+            "add" => "gemm_mq4g256v2_fp8_add_row_b1",
+            "silu" => "gemm_mq4g256v2_fp8_silu_row_b1",
+            "qkv" => "gemm_mq4g256v2_fp8_qkv_row_b1",
+            "qkvza" => "gemm_mq4g256v2_fp8_qkvza_row_b1",
+            _ => return Err(hip_bridge::HipError::new(0, "F2: unknown epilogue")),
+        };
+        self.ensure_embedded_kernel(REPACK_MODULE, kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201, REPACK)?;
+        self.ensure_embedded_kernel(GEMM_MODULE, kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1, symbol)?;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp8_f2_weights_bytes, self.scratch.fp8_f2_weights.is_some(), needed
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let base = self.scratch.ensure_fp8_f2_weights(&self.hip, needed)?;
+        let wf = base;
+        let rw = (base as *mut u8).wrapping_add(wf_bytes).cast::<c_void>();
+        let ew = (base as *mut u8).wrapping_add(wf_bytes + rw_bytes).cast::<c_void>();
+        let mut ws = [std::ptr::null_mut(); 4];
+        let mut ys = [std::ptr::null_mut(); 4];
+        let mut ms = [0i32; 4];
+        for (i, w) in weights.iter().enumerate() { ws[i] = w.buf.as_ptr(); ms[i] = dims[i] as i32; }
+        for (i, y) in outputs.iter().enumerate() { ys[i] = y.buf.as_ptr(); }
+        // Gate/up produces h into Y0. Y1 is deliberately null and untouched.
+        let mut wf_arg = wf;
+        let mut rw_arg = rw;
+        let mut ew_arg = ew;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut family = if silu { 1i32 } else { 0i32 };
+        let mut repack_params: Vec<*mut c_void> = ws.iter_mut().map(|p| p as *mut _ as *mut c_void).collect();
+        repack_params.extend([
+            &mut wf_arg as *mut _ as *mut c_void, &mut rw_arg as *mut _ as *mut c_void,
+            &mut ew_arg as *mut _ as *mut c_void,
+        ]);
+        repack_params.extend(ms.iter_mut().map(|v| v as *mut _ as *mut c_void));
+        repack_params.extend([&mut kv as *mut _ as *mut c_void, &mut family as *mut _ as *mut c_void]);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", REPACK, needed);
+        let repack = self.launch_maybe_blob(
+            REPACK,
+            [(mt.div_ceil(256) * 4) as u32, (k / 256) as u32, 1],
+            [256, 1, 1], 0, &mut repack_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ws { b.push_ptr(p); }
+                b.push_ptr(wf); b.push_ptr(rw); b.push_ptr(ew);
+                for m in ms { b.push_i32(m); }
+                b.push_i32(kv); b.push_i32(family); b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        repack?;
+        let mut x8 = prepared.x_fp8;
+        let mut d = prepared.row_scales;
+        let mut gemm_params: Vec<*mut c_void> = vec![
+            &mut wf_arg as *mut _ as *mut c_void,
+            &mut rw_arg as *mut _ as *mut c_void,
+            &mut ew_arg as *mut _ as *mut c_void,
+            &mut x8 as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+        gemm_params.extend(ys.iter_mut().map(|p| p as *mut _ as *mut c_void));
+        gemm_params.extend(ms.iter_mut().map(|m| m as *mut _ as *mut c_void));
+        gemm_params.extend([&mut kv as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void]);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * 4);
+        let result = self.launch_maybe_blob(
+            symbol, [mt.div_ceil(256) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1], 19_456, &mut gemm_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wf); b.push_ptr(rw); b.push_ptr(ew);
+                b.push_ptr(x8); b.push_ptr(d);
+                for p in ys { b.push_ptr(p); }
+                for m in ms { b.push_i32(m); }
+                b.push_i32(kv); b.push_i32(nv); b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        if result.is_ok() && *G12_FP8_F2_COVERAGE {
+            eprintln!("fp8_f2_selected: symbol={symbol} n={n} k={k} dims={dims:?}");
+        }
+        result
+    }
+
     /// Staged-tile v2 geometry selector (`HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM`).
     /// Returns `(BM, BN, BK, WAVES)`; absent/unknown values keep 128x128x64/8w
     /// on exact gfx1201 (measured pin) and the frozen 256x64x64/8w elsewhere.
@@ -9752,6 +9918,16 @@ impl Gpu {
                 0,
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: prepared (n,k) mismatch",
             ));
+        }
+        if self.flags.gfx12_mq4v2_fp8_qkvza
+            && self.fp8_f2_row_active(batch_size, k, &[qkv_m, z_m, beta_m, alpha_m], false)
+            && prepared.scale_mode == 1
+        {
+            return self.fp8_f2_row_prepared(
+                &[a_qkv, a_z, a_beta, a_alpha],
+                &[y_qkv, y_z, y_beta, y_alpha],
+                prepared, &[qkv_m, z_m, beta_m, alpha_m], k, batch_size, "qkvza",
+            );
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
@@ -10191,6 +10367,15 @@ impl Gpu {
                 0,
                 "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: prepared (n,k) mismatch",
             ));
+        }
+        if self.flags.gfx12_mq4v2_fp8_qkv
+            && self.fp8_f2_row_active(batch_size, k, &[q_m, k_m, v_m], false)
+            && prepared.scale_mode == 1
+        {
+            return self.fp8_f2_row_prepared(
+                &[a_q, a_k, a_v], &[y_q, y_k, y_v], prepared,
+                &[q_m, k_m, v_m], k, batch_size, "qkv",
+            );
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
@@ -31360,6 +31545,15 @@ impl Gpu {
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12: prepared (n,k) mismatch",
             ));
         }
+        if silu_h_requested
+            && self.fp8_f2_row_active(batch_size, k, &[gate_m, up_m], true)
+            && prepared.scale_mode == 1
+        {
+            return self.fp8_f2_row_prepared(
+                &[a_gate, a_up], &[y_gate], prepared,
+                &[gate_m, up_m], k, batch_size, "silu",
+            );
+        }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
@@ -33345,6 +33539,13 @@ impl Gpu {
                 0,
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12: prepared (n,k,scale_mode) mismatch",
             ));
+        }
+        if self.flags.gfx12_mq4v2_fp8_resid
+            && self.fp8_f2_row_active(batch_size, k, &[m], false)
+        {
+            return self.fp8_f2_row_prepared(
+                &[a_raw], &[y], prepared, &[m], k, batch_size, "add",
+            );
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,

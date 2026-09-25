@@ -226,6 +226,10 @@ pub struct ScratchState {
     /// Per-row power-of-two (or unit) scales [N] f32 for MQ4v2 FP8 activations.
     pub mq4v2_fp8_row_scales_scratch: Option<DeviceBuffer>,
     pub mq4v2_fp8_row_scales_scratch_bytes: usize,
+    /// One reusable F2 weight workspace: Wf followed by Rw and Ew. Each
+    /// repack overwrites all valid planes before its same-stream GEMM reads them.
+    pub fp8_f2_weights: Option<DeviceBuffer>,
+    pub fp8_f2_weights_bytes: usize,
     /// Partials buffer for the deterministic K-split GEMM (ksplit_det):
     /// [K_SPLITS][batch_size][M] fp32, grows-never-shrinks.
     pub ksplit_det_partials: Option<DeviceBuffer>,
@@ -652,7 +656,27 @@ pub(crate) fn mq4v2_fp8_needed(n: usize, k: usize) -> (usize, usize, usize) {
     (x_fp8_bytes, half_sums_bytes, row_scales_bytes)
 }
 
+/// Wf (Mp*K bytes), Rw (Mp*K/128 f32), Ew (Mp f32).
+pub(crate) fn fp8_f2_weight_extents(m: usize, k: usize) -> Option<(usize, usize, usize)> {
+    let mp = m.checked_add(255)? / 256 * 256;
+    let wf = mp.checked_mul(k)?;
+    let rw = mp.checked_mul(k / 128)?.checked_mul(4)?;
+    let ew = mp.checked_mul(4)?;
+    Some((wf, rw, ew))
+}
+
 impl ScratchState {
+    /// Grow the single ordered-stream F2 workspace; no caller may retain
+    /// its contents after a later repack, even when the allocation did not grow.
+    pub(crate) fn ensure_fp8_f2_weights(
+        &mut self,
+        hip: &HipRuntime,
+        needed: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(hip, &mut self.fp8_f2_weights, &mut self.fp8_f2_weights_bytes, needed)?;
+        Ok(self.fp8_f2_weights.as_ref().unwrap().as_ptr())
+    }
+
     /// Ensure the ksplit_det partials scratch is at least `n_bytes`, growing
     /// (never shrinking). Returns the device pointer. No init needed: every
     /// valid output cell is written exactly once per K-split before finalize.
@@ -1256,6 +1280,7 @@ impl ScratchState {
         k: usize,
         scale_mode: i32,
     ) -> HipResult<Mq4v2Fp8Prepared> {
+        let mut row_scale_shift = crate::gemv::fp8_row_scale_shift()?;
         compile_and_load_kernel(compiler, hip, modules, functions, module, ksrc, symbol)?;
 
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
@@ -1298,6 +1323,7 @@ impl ScratchState {
             &mut k_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
             &mut scale_mode_m as *mut _ as *mut c_void,
+            &mut row_scale_shift as *mut _ as *mut c_void,
         ];
         // Profile bytes: input row read (F16×2 B or F32×4 B per elem) + FP8
         // bytes, half-sums and row-scales writes. Bandwidth attribution only;
@@ -1340,6 +1366,7 @@ impl ScratchState {
                 b.push_i32(k_val);
                 b.push_i32(n_val);
                 b.push_i32(scale_mode);
+                b.push_i32(row_scale_shift);
                 b
             },
         );

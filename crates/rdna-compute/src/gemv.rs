@@ -5,7 +5,7 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-
+use std::sync::LazyLock;
 static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
 
 fn gfx942_rotate_live_validation_enabled() -> bool {
@@ -20,6 +20,25 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
 fn fp8_prod_inreg(k: usize) -> bool {
     k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
 }
+/// Process-frozen G3 row-scale perturbation, shared by fused and standalone
+/// fp8 producers. Reject unsupported shifts before any producer launch.
+pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
+    static SHIFT: LazyLock<Result<i32, String>> = LazyLock::new(|| {
+        let raw = hipfire_config::developer_var("HIPFIRE_FP8_ROW_SCALE_SHIFT")
+            .unwrap_or_else(|_| "0".to_owned());
+        let shift = raw.parse::<i32>()
+            .map_err(|_| format!("HIPFIRE_FP8_ROW_SCALE_SHIFT: invalid integer {raw:?}"))?;
+        if ![-1, 0, 1, 2, 3].contains(&shift) {
+            return Err(format!("HIPFIRE_FP8_ROW_SCALE_SHIFT: unsupported shift {shift}"));
+        }
+        Ok(shift)
+    });
+    match &*SHIFT {
+        Ok(shift) => Ok(*shift),
+        Err(reason) => Err(hip_bridge::HipError::new(0, reason)),
+    }
+}
+
 
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
     let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
@@ -3627,6 +3646,7 @@ impl Gpu {
                 "fused_rmsnorm_rotate_mq_fp8_gfx12_batched: need k%256==0 and n>0",
             ));
         }
+        let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
         let (module, source, kernel) = match (awq, fp8_prod_inreg(k), k <= 6144) {
             (Some(_), true, true) => (
@@ -3714,6 +3734,7 @@ impl Gpu {
                 &mut kv as *mut _ as *mut c_void,
                 &mut eps_v as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         } else {
             vec![
@@ -3728,6 +3749,7 @@ impl Gpu {
                 &mut kv as *mut _ as *mut c_void,
                 &mut eps_v as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         };
         let block_size = 256u32;
@@ -3766,6 +3788,7 @@ impl Gpu {
                 b.push_i32(kv);
                 b.push_f32(eps_v);
                 b.push_i32(nv);
+                b.push_i32(row_scale_shift);
                 b
             },
         );
@@ -3858,6 +3881,7 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_fp8_gfx12_batched: undersized tensor",
             ));
         }
+        let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
         let (module, source, kernel) = match (awq, inreg, h_input) {
             (Some(_), true, true) => (
@@ -3939,6 +3963,7 @@ impl Gpu {
                 &mut sclp as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         } else {
             vec![
@@ -3952,6 +3977,7 @@ impl Gpu {
                 &mut sclp as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         };
         let bytes = (k * 4 * 3 + k + (k / 256) * 2 * 4 + 4) * batch_size;
@@ -3986,6 +4012,7 @@ impl Gpu {
                 b.push_ptr(sclp);
                 b.push_i32(kv);
                 b.push_i32(nv);
+                b.push_i32(row_scale_shift);
                 b
             },
         );
@@ -4815,6 +4842,7 @@ impl Gpu {
                 "gated_norm_rotate_mq_fp8_gfx12_batched: undersized tensor",
             ));
         }
+        let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
         let inreg = fp8_prod_inreg(k) && (k + 8) * 4 <= 65_536;
         let (module, source, kernel) = match (awq, inreg) {
@@ -4899,6 +4927,7 @@ impl Gpu {
                 &mut ep as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut row_scale_shift as *mut _ as *mut c_void,
             ]
             .into_iter(),
         );
@@ -4938,6 +4967,7 @@ impl Gpu {
                 b.push_f32(ep);
                 b.push_i32(kv);
                 b.push_i32(nv);
+                b.push_i32(row_scale_shift);
                 b
             },
         );
@@ -5501,6 +5531,7 @@ impl Gpu {
                 "rotate_x_mq_fp8_gfx12_batched: undersized tensor",
             ));
         }
+        let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
         let (module, source, kernel) = match (gate.is_some(), awq.is_some(), fp8_prod_inreg(k)) {
             (false, false, true) => (
@@ -5596,6 +5627,7 @@ impl Gpu {
                 &mut sclp as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut row_scale_shift as *mut _ as *mut c_void,
             ]
             .into_iter(),
         );
@@ -5628,6 +5660,7 @@ impl Gpu {
                 b.push_ptr(sclp);
                 b.push_i32(kv);
                 b.push_i32(nv);
+                b.push_i32(row_scale_shift);
                 b
             },
         );

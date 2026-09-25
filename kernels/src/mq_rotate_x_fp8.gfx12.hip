@@ -28,7 +28,8 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
     float* __restrict__ fp8_half_sums,
     float* __restrict__ fp8_row_scales,
     int K,
-    int N)
+    int N,
+    int row_scale_shift)
 {
     const int token = (int)blockIdx.x;
     if (token >= N || K <= 0) return;
@@ -172,11 +173,11 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
     fp8stream_pack_row_inreg(
         held, x_fp8 + row_off,
         fp8_half_sums + (long long)token * (K >> 7),
-        fp8_row_scales + token, row_amax, smem8, K, lane, wave, wave, 8);
+        fp8_row_scales + token, row_amax, smem8, K, lane, wave, wave, 8, row_scale_shift);
 #else
     fp8stream_pack_row_from_f32(
         x_out_b, x_fp8 + row_off,
         fp8_half_sums + (long long)token * (K >> 7),
-        fp8_row_scales + token, row_amax, smem8, K, tid, lane, wave);
+        fp8_row_scales + token, row_amax, smem8, K, tid, lane, wave, row_scale_shift);
 #endif
 }
