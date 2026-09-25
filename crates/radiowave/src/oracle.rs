@@ -635,6 +635,7 @@ _amdgpu_cs_main:
                     ..KernelReport::default()
                 }],
             }),
+            peacemaker: None,
         };
         let report = OracleReport::from_hip_manifest(&manifest, "probe", [64, 1, 1]).unwrap();
         assert_eq!(report.compiler, OracleCompiler::HipccLlvm);

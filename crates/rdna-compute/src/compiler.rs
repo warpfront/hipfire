@@ -287,7 +287,7 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 3;
+const KERNEL_CACHE_ABI: u32 = 4;
 
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
@@ -613,6 +613,10 @@ impl KernelCompiler {
         module_flags: &[String],
         toolchain_id: &str,
         scheduler_profile: SchedulerProfile,
+        arm: &str,
+        builder_version: &str,
+        kernel_id_variant: &str,
+        assembler_identity: &str,
     ) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -624,8 +628,27 @@ impl KernelCompiler {
         }
         toolchain_id.hash(&mut hasher);
         scheduler_profile.as_str().hash(&mut hasher);
+        arm.hash(&mut hasher);
+        builder_version.hash(&mut hasher);
+        kernel_id_variant.hash(&mut hasher);
+        assembler_identity.hash(&mut hasher);
         KERNEL_CACHE_ABI.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+
+    /// Distinct identity for a builder-authored object. This computes the key
+    /// only; custom `.hxaco` publication is owned by the later admission path.
+    pub fn custom_isa_hash_for(
+        source: &str,
+        arch: &str,
+        builder_version: &str,
+        kernel_id_variant: &str,
+        assembler_identity: &str,
+    ) -> String {
+        Self::hash_parts(
+            source, arch, "", &[], "", SchedulerProfile::Default,
+            "custom-isa", builder_version, kernel_id_variant, assembler_identity,
+        )
     }
 
     fn cache_hash(&self, name: &str, source: &str) -> String {
@@ -636,6 +659,10 @@ impl KernelCompiler {
             &self.module_flags(name),
             &self.toolchain_id,
             self.scheduler_profile_for(name),
+            "hipcc",
+            "",
+            "",
+            "",
         )
     }
 
@@ -657,6 +684,10 @@ impl KernelCompiler {
             &self.module_flags(name),
             "",
             self.scheduler_profile_for(name),
+            "hipcc",
+            "",
+            "",
+            "",
         )
     }
 
@@ -687,6 +718,10 @@ impl KernelCompiler {
             &module_flags,
             "",
             scheduler_profile,
+            "hipcc",
+            "",
+            "",
+            "",
         )
     }
 
@@ -1440,8 +1475,19 @@ mod tests {
     }
 
     #[test]
-    fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
-        assert_eq!(KERNEL_CACHE_ABI, 3);
+    fn custom_arm_cache_key_cannot_alias_hipcc() {
+        let baseline = KernelCompiler::hash_parts(
+            "source", "gfx1201", "", &[], "llvm", SchedulerProfile::Default,
+            "hipcc", "", "", "",
+        );
+        let custom = KernelCompiler::custom_isa_hash_for(
+            "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=0", "llvm-mc 23",
+        );
+        assert_ne!(baseline, custom);
+        let other_variant = KernelCompiler::custom_isa_hash_for(
+            "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=1", "llvm-mc 23",
+        );
+        assert_ne!(custom, other_variant);
     }
 
     #[test]

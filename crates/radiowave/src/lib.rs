@@ -270,6 +270,7 @@ pub struct ExistingCodeObjectRequest {
     pub command: Vec<String>,
     pub manifest: Option<PathBuf>,
     pub scheduler_profile: SchedulerProfile,
+    pub peacemaker: Option<PeacemakerRecord>,
 }
 
 impl ExistingCodeObjectRequest {
@@ -287,6 +288,7 @@ impl ExistingCodeObjectRequest {
             command: Vec::new(),
             manifest: None,
             scheduler_profile: SchedulerProfile::Default,
+            peacemaker: None,
         }
     }
 
@@ -312,6 +314,11 @@ impl ExistingCodeObjectRequest {
 
     pub fn scheduler_profile(mut self, profile: SchedulerProfile) -> Self {
         self.scheduler_profile = profile;
+        self
+    }
+
+    pub fn peacemaker(mut self, record: PeacemakerRecord) -> Self {
+        self.peacemaker = Some(record);
         self
     }
 }
@@ -417,6 +424,65 @@ impl CodeObjectInspection {
     }
 }
 
+/// Provenance and shape evidence for an externally produced code object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeacemakerRecord {
+    pub arm: PeacemakerArm,
+    pub producer: PeacemakerProducer,
+    pub tools: Vec<PeacemakerTool>,
+    pub s_text_sha256: String,
+    pub text_section_sha256: String,
+    pub shape_contract: serde_json::Value,
+    pub shape_result: serde_json::Value,
+    pub oracle_receipt: Option<OracleReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PeacemakerArm {
+    CustomIsa,
+    CustomAco,
+    PostRa,
+    Hipcc,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeacemakerProducer {
+    pub builder_crate_version: String,
+    pub builder_git_sha: String,
+    pub proof_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aco_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeacemakerTool {
+    pub role: PeacemakerToolRole,
+    pub path: PathBuf,
+    pub version: String,
+    pub argv: Vec<String>,
+    pub sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeacemakerToolRole {
+    Assembler,
+    Linker,
+    Bundler,
+    Aco,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OracleReceipt {
+    pub suite: String,
+    pub fixtures_sha256: String,
+    pub cases: u32,
+    pub differing_bits: u64,
+    pub device_uuid: String,
+    pub date: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompileManifest {
     pub schema_version: u32,
@@ -435,6 +501,8 @@ pub struct CompileManifest {
     pub support_header_sha256: String,
     pub output_sha256: String,
     pub inspection: Option<CodeObjectInspection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peacemaker: Option<PeacemakerRecord>,
 }
 
 /// A manifest whose compiler identity, schema, inspection payload, and
@@ -471,6 +539,16 @@ impl CodeObjectCertification {
                 "code-object SHA-256 mismatch: manifest {}, actual {}",
                 manifest.output_sha256, actual_sha256
             )));
+        }
+        if manifest
+            .peacemaker
+            .as_ref()
+            .and_then(|record| record.oracle_receipt.as_ref())
+            .is_some_and(|receipt| receipt.differing_bits != 0)
+        {
+            return Err(Error::InvalidCertification(
+                "peacemaker oracle receipt has differing bits".to_owned(),
+            ));
         }
         Ok(Self { manifest })
     }
@@ -575,7 +653,7 @@ impl Compiler {
         rendered_command.push(request.hipcc.to_string_lossy().into_owned());
         rendered_command.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
         let manifest = CompileManifest {
-            schema_version: 4,
+            schema_version: 5,
             compiler: "radiowave".to_owned(),
             generated_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -593,6 +671,7 @@ impl Compiler {
             support_header_sha256: sha256_bytes(HIP_SUPPORT_HEADER.as_bytes()),
             output_sha256: output_sha256.clone(),
             inspection: inspection.clone(),
+            peacemaker: None,
         };
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
@@ -635,7 +714,7 @@ impl Compiler {
             fs::create_dir_all(parent)?;
         }
         let manifest = CompileManifest {
-            schema_version: 4,
+            schema_version: 5,
             compiler: "radiowave".to_owned(),
             generated_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -660,6 +739,7 @@ impl Compiler {
             support_header_sha256: sha256_bytes(&[]),
             output_sha256: output_sha256.clone(),
             inspection: Some(inspection.clone()),
+            peacemaker: request.peacemaker.clone(),
         };
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
@@ -1317,6 +1397,7 @@ mod tests {
             command: Vec::new(),
             source_sha256: "source".to_owned(),
             support_header_sha256: "header".to_owned(),
+            peacemaker: None,
             output_sha256: sha256_bytes(code_object),
             inspection: Some(CodeObjectInspection {
                 bundle_target: "hipv4-amdgcn-amd-amdhsa--gfx1201".to_owned(),
@@ -1456,6 +1537,7 @@ amdhsa.kernels:
                     ..KernelReport::default()
                 }],
             }),
+            peacemaker: None,
         };
         let encoded = serde_json::to_string(&manifest).unwrap();
         let certification = CodeObjectCertification::from_json(code, &encoded).unwrap();
@@ -1775,5 +1857,47 @@ amdhsa.kernels:
                 .unwrap();
         manifest["schema_version"] = 2.into();
         assert!(CodeObjectCertification::from_json(code, &manifest.to_string()).is_err());
+    }
+    #[test]
+    fn schema_five_preserves_custom_provenance_and_rejects_failed_oracle() {
+        let code = b"verified custom code object";
+        let mut manifest: CompileManifest = serde_json::from_str(
+            &certification_manifest(code, MutableReadCache::VmemOnly)
+        ).unwrap();
+        manifest.schema_version = 5;
+        manifest.peacemaker = Some(PeacemakerRecord {
+            arm: PeacemakerArm::CustomIsa,
+            producer: PeacemakerProducer {
+                builder_crate_version: "0.1".into(),
+                builder_git_sha: "abc".into(),
+                proof_sha256: "def".into(),
+                aco_commit: None,
+            },
+            tools: vec![PeacemakerTool {
+                role: PeacemakerToolRole::Assembler,
+                path: "llvm-mc".into(),
+                version: "23".into(),
+                argv: vec!["llvm-mc".into(), "-mcpu=gfx1201".into()],
+                sha256: "123".into(),
+            }],
+            s_text_sha256: "s".into(),
+            text_section_sha256: "t".into(),
+            shape_contract: serde_json::json!({"symbol": "consumer"}),
+            shape_result: serde_json::json!({"vopd_packets": 96}),
+            oracle_receipt: Some(OracleReceipt {
+                suite: "G1".into(), fixtures_sha256: "fixture".into(), cases: 34,
+                differing_bits: 0, device_uuid: "device".into(), date: "2026-09-25".into(),
+            }),
+        });
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        let certified = CodeObjectCertification::from_json(code, &encoded).unwrap();
+        let provenance = certified.manifest().peacemaker.as_ref().unwrap();
+        assert_eq!(provenance.arm, PeacemakerArm::CustomIsa);
+        assert_eq!(provenance.tools[0].argv[1], "-mcpu=gfx1201");
+        assert_eq!(provenance.oracle_receipt.as_ref().unwrap().cases, 34);
+        manifest.peacemaker.as_mut().unwrap().oracle_receipt.as_mut().unwrap().differing_bits = 1;
+        assert!(CodeObjectCertification::from_json(
+            code, &serde_json::to_string(&manifest).unwrap()
+        ).is_err());
     }
 }
