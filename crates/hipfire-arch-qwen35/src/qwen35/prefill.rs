@@ -1545,10 +1545,11 @@ fn dense_prefill_reservation_bytes(
         .checked_add(q16)?
         .checked_add(WIDENED_VRAM_HEADROOM_BYTES)
 }
-/// A widened PBS cache is optional. Retain it only if the *unmapped* VMM
-/// reserve can still become physical while leaving the minimum PBS and the
-/// ordinary headroom intact. Otherwise free it between requests, before the
-/// next prefill/decode can grow KV; the next request re-admits its chunk width.
+/// Retain a widened ordinary PBS while there is room for the minimum prefill
+/// and ordinary headroom. On a discrete gfx1201 card, future VMM KV growth
+/// reclaims the cache just before mapping if that growth needs its memory.
+/// Reserving *all* unmapped KV here made mixed-size prefills repeatedly free
+/// and reallocate the same multi-gigabyte PBS despite no KV growth.
 fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config) -> bool {
     if !kv.uses_vmm_backend() {
         return true;
@@ -1556,32 +1557,77 @@ fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config)
     let Some(minimum) = minimum_prefill_reservation_bytes(config, &gpu.arch) else {
         return false;
     };
+    let grow_only = widened_pbs_grow_only(gpu);
     let mut unmapped = 0usize;
-    for tensor in kv.k_gpu.iter().chain(kv.v_gpu.iter()) {
-        if tensor.buf.is_vmm_owner() {
-            let Some(mapped) = gpu.vmm_mapped_bytes(tensor) else {
-                return false;
-            };
-            unmapped = unmapped.saturating_add(tensor.byte_size().saturating_sub(mapped));
+    if !grow_only {
+        for tensor in kv.k_gpu.iter().chain(kv.v_gpu.iter()) {
+            if tensor.buf.is_vmm_owner() {
+                let Some(mapped) = gpu.vmm_mapped_bytes(tensor) else {
+                    return false;
+                };
+                unmapped = unmapped.saturating_add(tensor.byte_size().saturating_sub(mapped));
+            }
         }
     }
     gpu.hip.get_vram_info().is_ok_and(|(free, _)| {
         free >= unmapped.saturating_add(minimum).saturating_add(128 << 20)
     })
 }
+
+fn widened_pbs_grow_only(gpu: &Gpu) -> bool {
+    gpu.arch == "gfx1201"
+        && !gpu.is_uma()
+        && hipfire_config::developer_var("HIPFIRE_WIDENED_PBS_GROW_ONLY")
+            .ok()
+            .as_deref()
+            != Some("0")
+}
+
+/// Give a growing VMM KV mapping priority over optional cached PBS. This
+/// check is called before mapping, not when merely changing prompt size.
+/// The 1 GiB reservation in `minimum` covers VMM chunk/granularity rounding
+/// and other transient allocations; overflow or unknown capacity evicts.
+pub(crate) fn release_widened_pbs_for_kv_growth(
+    gpu: &mut Gpu,
+    kv: &llama::KvCache,
+    config: &Qwen35Config,
+    scratch: &Qwen35Scratch,
+    required_tokens: usize,
+) -> HipResult<()> {
+    if scratch.widened_prefill_batch.borrow().is_none() {
+        return Ok(());
+    }
+    if !kv.needs_mapped_growth(required_tokens)? || !widened_pbs_grow_only(gpu) {
+        return Ok(());
+    }
+    let keep = kv.planned_mapped_growth_bytes(gpu, required_tokens)
+        .ok()
+        .and_then(|growth| minimum_prefill_reservation_bytes(config, &gpu.arch)
+            .and_then(|minimum| growth.checked_add(minimum)))
+        .and_then(|needed| needed.checked_add(128 << 20))
+        .is_some_and(|needed| gpu.hip.get_vram_info().is_ok_and(|(free, _)| free >= needed));
+    if !keep {
+        if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
+            old.free_gpu(gpu)?;
+        }
+    }
+    Ok(())
+}
 ///
 /// Per-device capacity admission: largest performance-admitted rung
 /// `<= perf_rows` whose projected PBS bytes, projection-prelude deficit,
 /// missing FA Q16 bytes and 1 GiB headroom fit in current free device bytes.
-/// The retained PBS is conservatively included in projected bytes even when
-/// it will be reused. The query follows model+KV mapping and request-state
-/// allocation. Falls back to 512 when no enlarged rung fits.
+/// The retained PBS is credited only on the grow-only route: a fitting
+/// owner needs no allocation, and a smaller owner is freed before replacement.
+/// The query follows model+KV mapping and request-state allocation.
+/// Falls back to 512 when no enlarged rung fits.
 fn memory_admitted_rung(
     gpu: &Gpu,
     config: &Qwen35Config,
     kv_cache: &llama::KvCache,
     perf_rows: usize,
     lean: bool,
+    cached: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
         return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
@@ -1657,7 +1703,14 @@ fn memory_admitted_rung(
             .and_then(|v| v.checked_mul(2))
             .unwrap_or(usize::MAX);
         let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
-        let total = need_pbs
+        let pbs_credit = cached.filter(|p| p.lean == lean)
+            .and_then(|p| if lean {
+                lean_dense_prefill_allocation_bytes(config, p.max_batch)
+            } else {
+                dense_prefill_allocation_bytes(config, p.max_batch)
+            })
+            .unwrap_or(0);
+        let total = need_pbs.saturating_sub(pbs_credit)
             .saturating_add(projection_deficit)
             .saturating_add(q16_missing)
             .saturating_add(WIDENED_VRAM_HEADROOM_BYTES);
@@ -1684,6 +1737,18 @@ pub fn ordinary_prefill_chunk_limit(
     kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
+    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, pbs, None)
+}
+
+fn ordinary_prefill_chunk_limit_with_cache(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
+    pbs: Option<&PrefillBatchScratch>,
+    cached: Option<&PrefillBatchScratch>,
+) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
     let Some(perf) = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state) else {
         return Ok(legacy);
@@ -1692,7 +1757,7 @@ pub fn ordinary_prefill_chunk_limit(
         return Ok(perf.min(legacy));
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
-    let mut admitted = memory_admitted_rung(gpu, config, kv_cache, perf, lean)?;
+    let mut admitted = memory_admitted_rung(gpu, config, kv_cache, perf, lean, cached)?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
     }
@@ -2304,6 +2369,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         return Ok(());
     }
     let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_batch")?;
+    release_widened_pbs_for_kv_growth(gpu, kv_cache, config, scratch, required_tokens)?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
 
     // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
@@ -2533,7 +2599,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording();
     let limit = if wide_candidate {
-        ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, kv_cache, None)?
+        let cached = scratch.widened_prefill_batch.borrow();
+        ordinary_prefill_chunk_limit_with_cache(
+            gpu, weights, config, dn_state, kv_cache, None,
+            cached.as_ref().filter(|_| widened_pbs_grow_only(gpu)),
+        )?
     } else {
         max_batch
     };

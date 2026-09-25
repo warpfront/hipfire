@@ -1579,6 +1579,9 @@ pub fn forward_scratch(
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
     // Grow before any possible AR graph capture/replay. Stable virtual
     // addresses keep existing graph pointer arguments valid.
+    super::prefill::release_widened_pbs_for_kv_growth(
+        gpu, kv_cache, config, scratch, required_tokens,
+    )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
     // hipGraph capture for MoE was previously gated off-by-default behind
@@ -1901,6 +1904,9 @@ pub fn forward_scratch_with_hidden(
     hidden_rb: &mut HiddenStateRingBuffer,
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
+    super::prefill::release_widened_pbs_for_kv_growth(
+        gpu, kv_cache, config, scratch, required_tokens,
+    )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
     let pos_i32 = pos as i32;
@@ -1950,6 +1956,9 @@ pub fn forward_scratch_embed(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed")?;
+    super::prefill::release_widened_pbs_for_kv_growth(
+        gpu, kv_cache, config, scratch, required_tokens,
+    )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let pos_i32 = pos as i32;
     gpu.hip

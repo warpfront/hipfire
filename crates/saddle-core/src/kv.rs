@@ -1919,6 +1919,61 @@ impl KvCache {
         Ok(grown)
     }
 
+    /// Same fast no-growth gate used by `ensure_mapped_capacity`. Optional
+    /// caches need not scan every KV layer on each decode token.
+    pub fn needs_mapped_growth(&self, required_tokens: usize) -> HipResult<bool> {
+        Ok(self.fast_mapped_token_capacity()?.is_some_and(|capacity| required_tokens > capacity))
+    }
+
+    /// Physical bytes the next `ensure_mapped_capacity` would map. Used by
+    /// optional caches to yield memory to KV before mapping, with the same
+    /// per-tensor chunk plan and current encoding strides as actual growth.
+    pub fn planned_mapped_growth_bytes(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        if !self.uses_vmm_backend() {
+            return Ok(0);
+        }
+        let (k_stride, v_stride) = self.vmm_bytes_per_token()?;
+        let mut bytes = 0usize;
+        for (tensors, stride) in [(&self.k_gpu, k_stride), (&self.v_gpu, v_stride)] {
+            for tensor in tensors {
+                if !tensor.buf.is_vmm_owner() {
+                    if tensor.numel() > 1 {
+                        return Err(hip_bridge::HipError::new(0, "VMM KV contains a non-VMM tensor"));
+                    }
+                    continue;
+                }
+                let mapped = gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+                })?;
+                let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
+                })?;
+                let side_cap = (tensor.byte_size() / stride).min(self.physical_cap);
+                let plan = KvChunkPlan::new(
+                    stride,
+                    side_cap,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    granularity,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?;
+                if let Some(growth) = plan
+                    .growth(mapped, required_tokens)
+                    .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?
+                {
+                    bytes = bytes.checked_add(growth.size_bytes).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "VMM KV planned growth overflows usize")
+                    })?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Ensure both K and V mapped prefixes cover `required_tokens` at the
     /// **current** strides. Growth is independent per side and completes before
     /// the caller may write. Never replaces VMM owners.
