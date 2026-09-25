@@ -9445,6 +9445,21 @@ impl Gpu {
         v2 && self.mq4v2_symmetric
             && hipfire_config::developer_var("HIPFIRE_FP8_SYMFOLD").as_deref() != Ok("0")
     }
+    /// Only the measured symmetric 128x128 v2 route has a paired-row h
+    /// epilogue. The producer must retain h in registers at this K.
+    pub fn fp8_silu_h_active(&self, n: usize, k: usize, gate_m: usize, up_m: usize) -> bool {
+        self.arch == "gfx1201"
+            && self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_gateup
+            && self.fp8_v2_symfold_enabled(true)
+            && Self::fp8_v2_geom(&self.arch) == (128, 128, 64, 8)
+            && n >= 256
+            && k <= 17408
+            && gate_m == up_m
+            && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", false)
+            && hipfire_config::developer_bool("HIPFIRE_FP8_SILU_H", false)
+    }
+
 
     #[inline]
     fn fp8_v2_lds_bytes(vbm: usize, vbn: usize, vbk: usize, symfold: bool) -> u32 {
@@ -31140,10 +31155,9 @@ impl Gpu {
     }
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA gate/up prefill candidate, B=12.
     /// Research route, default-off (`HIPFIRE_GFX12_MQ4V2_FP8_GATEUP`).
-    /// Exact gfx1201, eager HIP only: rejects graph capture and replay
-    /// recording before compiling the kernel or launching. Kernarg order
-    /// matches `gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12`; grid
-    /// `[ceil((gate_m+up_m)/16), ceil(N/192), 1]`, block `[32, 1, 1]`.
+    /// The paired-row SiLU-h epilogue is gated by `HIPFIRE_FP8_SILU_H`.
+    /// Same positional ABI as the standard fp8 gate/up kernel; in h mode,
+    /// `y_gate` receives h and `y_up` is left untouched.
     pub fn gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
         &mut self,
         a_gate: &GpuTensor,
@@ -31155,6 +31169,7 @@ impl Gpu {
         up_m: usize,
         k: usize,
         batch_size: usize,
+        silu_h_requested: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
@@ -31167,6 +31182,12 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12: eager-only (capture/replay rejected)",
+            ));
+        }
+        if silu_h_requested && !self.fp8_silu_h_active(batch_size, k, gate_m, up_m) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fp8 SiLU-h requires equal gate/up rows and the symmetric 128x128 fp8 in-register route",
             ));
         }
         if gate_m == 0 || up_m == 0 || batch_size == 0 {
@@ -31214,7 +31235,14 @@ impl Gpu {
         // at N=640, +38% at N=768 over BT8; at N<=256 the mask waste flips the
         // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
-        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+        let silu_h = silu_h_requested;
+        let (func_name, ksrc, bv): (&str, &str, usize) = if silu_h {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_SRC,
+                8,
+            )
+        } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold",
@@ -31378,7 +31406,7 @@ impl Gpu {
         self.bind_thread()?;
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
-            a_gate, a_up, &prepared, y_gate, y_up, gate_m, up_m, k, batch_size,
+            a_gate, a_up, &prepared, y_gate, y_up, gate_m, up_m, k, batch_size, false,
         )
     }
     /// Pad an F32 [N, K] batch to a 64-multiple row count for the FP8-LUT

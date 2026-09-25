@@ -4373,6 +4373,13 @@ fp8_v2_symfold_source!(
     128, 128, 8, "",
     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold"
 );
+/// Paired-row gate/up computes h in the gate output, preserving the two-plane
+/// ABI while leaving the up output untouched.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_SYMFOLD 1\n#define HIPFIRE_FP8_SILU_H 1\n#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 128\n#define HIPFIRE_FP8_V2_BN 128\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+
 fp8_v2_symfold_source!(
     GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
     64, 256, 8, "",

@@ -229,6 +229,12 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #ifndef HIPFIRE_FP8_V2_TILE
 #define HIPFIRE_FP8_V2_TILE 0
 #endif
+// The fused variant interleaves gate/up virtual rows in one WMMA tile, then
+// pairs adjacent gate/up accumulators into the contiguous [N x gate_m] h.
+#ifndef HIPFIRE_FP8_SILU_H
+#define HIPFIRE_FP8_SILU_H 0
+#endif
+
 
 #if HIPFIRE_FP8_V2_TILE
 
@@ -502,7 +508,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #elif HIPFIRE_FP8_QKV
 #define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_q; int _v2l = _v2g; if (_v2g >= q_m + k_m) { _v2a = A_v; _v2l = _v2g - (q_m + k_m); } else if (_v2g >= q_m) { _v2a = A_k; _v2l = _v2g - q_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
 #else
+#if HIPFIRE_FP8_SILU_H
+#define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { (ASRC) = ((GR) & 1) ? A_up : A_gate; (LR) = (GR) >> 1; } while (0)
+#else
 #define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_gate; int _v2l = _v2g; if (_v2g >= gate_m) { _v2a = A_up; _v2l = _v2g - gate_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
+#endif
 #endif
     const unsigned st_quad = (unsigned)(tid & 3);
     const unsigned st_grp = (unsigned)(tid >> 2);
@@ -927,15 +937,27 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     float* lds_tile = (float*)lds;
     #pragma unroll
     for (int nb = 0; nb < 4; nb++) {
+#if HIPFIRE_FP8_SILU_H
+        const int h_token = bs + wave_tok + nb * 16 + ml;
+        const float h_at = (h_token < N) ? X_row_scales[h_token] : 0.0f;
+#endif
         #pragma unroll
         for (int wf = 0; wf < 2; wf++) {
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
+            for (int j = 0; j < (HIPFIRE_FP8_SILU_H ? 4 : 8); j++) {
                 // Row-skew (col+ml)&31: without it all 16 ml lanes hit bank
                 // col%32 on the dump (16-way conflict). Drain undoes it with
                 // (lane+r16)&31, a permutation of the same 128 B line.
+#if HIPFIRE_FP8_SILU_H
+                const float g = h_at * T[nb][wf][2 * j];
+                const float u = h_at * T[nb][wf][2 * j + 1];
+                const float h = (g / (1.0f + expf(-g))) * u;
+                const int col = (wf * 8 + 4 * kg + j + ml) & 31;
+                lds_tile[(unsigned int)(wave * 512 + ml * 32 + col)] = h;
+#else
                 const int col = (wf * 16 + 8 * kg + j + ml) & 31;
                 lds_tile[(unsigned int)(wave * 512 + ml * 32 + col)] = T[nb][wf][j];
+#endif
             }
         }
         __syncthreads();
@@ -943,11 +965,16 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         for (int r16 = 0; r16 < 16; r16++) {
             const int t = bs + wave_tok + nb * 16 + r16;
             if (t < N) {
+#if HIPFIRE_FP8_SILU_H
+                const int r = rs + wave_wt + 2 * lane;
+                const float y = lds_tile[(unsigned int)(wave * 512 + r16 * 32 + ((lane + r16) & 31))];
+#else
                 const float at = X_row_scales[t];
                 const int r = rs + wave_wt + lane;
                 const float v = lds_tile[(unsigned int)(wave * 512 + r16 * 32 + ((lane + r16) & 31))];
                 const float y = at * v;
-                if (r < tm) {
+#endif
+                if (r < tm && (!HIPFIRE_FP8_SILU_H || lane < 16)) {
 #if HIPFIRE_FP8_QKVZA
                     float* Yp;
                     int pr, os;
@@ -966,11 +993,15 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     else { Yp = Y_v; pr = r - (q_m + k_m); os = v_m; }
                     Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
 #else
+#if HIPFIRE_FP8_SILU_H
+                    Y_gate[(unsigned int)t * (unsigned int)gate_m + (unsigned int)(r >> 1)] = y;
+#else
                     float* Yp;
                     int pr, os;
                     if (r < gate_m) { Yp = Y_gate; pr = r; os = gate_m; }
                     else { Yp = Y_up; pr = r - gate_m; os = up_m; }
                     Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+#endif
 #endif
                 }
             }
