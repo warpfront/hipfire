@@ -3840,6 +3840,20 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC: &str = concat!
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
 );
+// gfx1201 K1 lean-issue IU4 (`HIPFIRE_G12_IU4_V3=1`, default off): same
+// ABI/launch geometry as the shipping `_symfold_g12r` module. Compile
+// defines match that build (symmetric fold + banded raster; A4C2 from hipcc).
+// Entrypoints carry `_v3` (macro-renamed if the .hip still uses bare names).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
+    "#define IU4_SYMMETRIC_FOLD 1\n",
+    "#define IU4_G12_RASTER 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4 gemm_mq4g256v2_residual_mmq_iu4_v3\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_add gemm_mq4g256v2_residual_mmq_iu4_full_add_v3\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_set gemm_mq4g256v2_residual_mmq_iu4_full_set_v3\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_iu4 gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

@@ -10,7 +10,7 @@ use crate::dispatch::{
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
@@ -291,6 +291,16 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 /// 128) diverts to MMQ before the gfx11 WMMA branch, so the whole reachable
 /// domain is covered.
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
+
+/// `HIPFIRE_G12_IU4_V3=1` selects the K1 lean-issue IU4 module on gfx1201
+/// symmetric routes (default off). Parsed once per process.
+static G12_IU4_V3: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_V3", false));
+
+#[inline]
+fn g12_iu4_v3_enabled() -> bool {
+    *G12_IU4_V3
+}
 
 #[derive(Clone, Copy)]
 enum MqV2PrefillProjection {
@@ -19794,37 +19804,61 @@ impl Gpu {
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
                 && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
+            // K1 lean-issue (`HIPFIRE_G12_IU4_V3=1`, default off): gfx1201 +
+            // symmetric only; same ABI/geometry as `_symfold_g12r`.
+            let v3 = symfold && g12_iu4_v3_enabled();
             // Banded CTA raster + wide epilogue (bit-identical outputs, see
             // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
             // incumbent modules.
             let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
-            let kernel_name = match (g12r, symfold, add) {
-                (true, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r",
-                (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r",
-                (true, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
-                (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r",
-                (false, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
-                (false, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
-                (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
-                (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
-            };
-            let (module, source) = match (g12r, symfold) {
-                (true, true) => (
-                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
-                ),
-                (true, false) => (
-                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC,
-                ),
-                (false, true) => (
-                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
-                ),
-                (false, false) => (
-                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
-                ),
+            let (module, source, kernel_name) = if v3 {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
+                    if add {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_v3"
+                    } else {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_v3"
+                    },
+                )
+            } else {
+                let kernel_name = match (g12r, symfold, add) {
+                    (true, true, true) => {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r"
+                    }
+                    (true, true, false) => {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r"
+                    }
+                    (true, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
+                    (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r",
+                    (false, true, true) => {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold"
+                    }
+                    (false, true, false) => {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold"
+                    }
+                    (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                    (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+                };
+                let (module, source) = match (g12r, symfold) {
+                    (true, true) => (
+                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
+                    ),
+                    (true, false) => (
+                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC,
+                    ),
+                    (false, true) => (
+                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
+                    ),
+                    (false, false) => (
+                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
+                    ),
+                };
+                (module, source, kernel_name)
             };
             self.ensure_kernel(module, source, kernel_name)?;
             let mut a_ptr = a_raw.buf.as_ptr();
@@ -31883,10 +31917,18 @@ impl Gpu {
         }
         self.bind_thread()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
-        // `HIPFIRE_G12_RASTER=0` keeps the incumbent module (two-group raster,
-        // b32 h stores); default is the banded-raster, wide-h-store build.
-        let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
-        let (module, source, kernel) = if g12r {
+        // K1 lean-issue (`HIPFIRE_G12_IU4_V3=1`, default off) takes the
+        // `_v3` module on this already-symmetric path. Else
+        // `HIPFIRE_G12_RASTER=0` keeps the incumbent module (two-group
+        // raster, b32 h stores); default is the banded-raster, wide-h-store
+        // build.
+        let (module, source, kernel) = if g12_iu4_v3_enabled() {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
+                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3",
+            )
+        } else if hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0") {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
