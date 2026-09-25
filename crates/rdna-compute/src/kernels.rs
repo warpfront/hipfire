@@ -3847,7 +3847,12 @@ pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::Schedu
 
     if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
         SchedulerProfile::IterativeIlp
-    } else if arch == "gfx1201" && name == "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3" {
+    } else if arch == "gfx1201"
+        && matches!(
+            name,
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3" | "gemm_mq4g256v2_residual_mmq_i8_gfx12"
+        )
+    {
         SchedulerProfile::IterativeIlp
     } else {
         SchedulerProfile::Default
