@@ -1,13 +1,12 @@
-//! GPU-vs-GPU bit oracle for gfx1201 K1 against the shipping symmetric raster kernel.
-//! Run with HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES both set to card C's UUID.
-//! TIME=1 runs sustained paired measurements and writes 20-Hz AMD-SMI CSVs to
-//! /home/kaden/qcal/perf/gemm-v3/k1/.
+//! GPU-vs-GPU bit oracle for gfx1201 builder kernels against hipcc K1.
+//! Pin HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES to card A's UUID.
+//! TIME=1 runs sustained ABBA measurements with 20-Hz AMD-SMI telemetry.
 //!
-//! Optional ISA candidate path load (plan Oracle-ext):
-//! - `HIPFIRE_ISA_MODULE=<path>` loads the candidate module from a file instead of
-//!   JIT-compiling the hipcc `_v3` sources. Reference stays shipping `_symfold_g12r`.
-//! - `HIPFIRE_ISA_SYMBOL_SUFFIX` (default `_v3`) selects candidate symbol names.
-//! - With `TIME=1`, the candidate arm label includes the sha256 of the module file.
+//! `HIPFIRE_ISA_MODULE=<path>` loads the candidate module; the reference is
+//! hipcc `_v3` JIT-compiled from source. `HIPFIRE_ISA_SYMBOL_SUFFIX` selects
+//! candidate symbols, and `_b1t256` uses a 256-row/512-thread/30,720-B tile.
+//! `HIPFIRE_ISA_TILE_ROWS=128|256` can override the suffix-derived geometry.
+//! Timed arm labels include the module SHA-256.
 
 use hip_bridge::{Function, KernargBlob, Module};
 use hipfire_runtime::hfq::HfqFile;
@@ -20,17 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BASE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r";
 const V3: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3";
-const SHIP_SRC: &str = concat!(
-    "#define IU4_SYMMETRIC_FOLD 1\n#define IU4_G12_RASTER 1\n",
-    "#define gemm_mq4g256v2_residual_mmq_iu4 gemm_mq4g256v2_residual_mmq_iu4_symfold_g12r\n",
-    "#define gemm_mq4g256v2_residual_mmq_iu4_full_add gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r\n",
-    "#define gemm_mq4g256v2_residual_mmq_iu4_full_set gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r\n",
-    "#define gemm_mq4g256v2_gate_up_silu_mmq_iu4 gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold_g12r\n",
-    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
-);
 const V3_SRC: &str = concat!(
     "#define IU4_SYMMETRIC_FOLD 1\n#define IU4_G12_RASTER 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -43,7 +32,7 @@ sys.path.insert(0, '/opt/rocm/core/share/amd_smi')
 import amdsmi
 amdsmi.amdsmi_init()
 h = next(h for h in amdsmi.amdsmi_get_processor_handles()
-         if amdsmi.amdsmi_get_gpu_device_bdf(h) == '0000:e3:00.0')
+         if amdsmi.amdsmi_get_gpu_device_bdf(h) == '0000:03:00.0')
 assert amdsmi.amdsmi_get_power_cap_info(h)['power_cap'] == 300000000
 with open(sys.argv[1], 'w', newline='', buffering=1) as file:
     w = csv.writer(file)
@@ -59,14 +48,24 @@ with open(sys.argv[1], 'w', newline='', buffering=1) as file:
         nxt += .05
         time.sleep(max(0, nxt-time.monotonic()))
 "#;
-const OUT: &str = "/home/kaden/qcal/perf/gemm-v3/k1";
+const OUT: &str = "/home/kaden/qcal/perf/iu4-6k/s2";
 const MODEL_PREFIX: &str = "model.language_model.layers.";
 
 type Matrix = (usize, usize, Vec<u8>);
 
+#[derive(Clone, Copy)]
+struct Geometry {
+    rows: usize,
+    block: u32,
+    lds: u32,
+}
+
+const K1_GEOMETRY: Geometry = Geometry { rows: 128, block: 256, lds: 20480 };
+
 /// Candidate kernel set: either JIT `_v3` (default) or a path-loaded module.
 struct Candidate {
     suffix: String,
+    geometry: Geometry,
     /// TIME=1 arm label: `"v3"` or `"isa-<sha256>"`.
     arm: String,
     /// Path-loaded functions keyed by full symbol name. Empty when JIT path.
@@ -109,14 +108,6 @@ fn weight(hfq: &HfqFile, layer: usize, suffixes: &[&str]) -> Matrix {
     (m, k, bytes)
 }
 
-fn ship_symbol(fused: bool, add: bool) -> &'static str {
-    match (fused, add) {
-        (true, _) => "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold_g12r",
-        (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r",
-        (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r",
-    }
-}
-
 fn cand_symbol(fused: bool, add: bool, suffix: &str) -> String {
     match (fused, add) {
         (true, _) => format!("gemm_mq4g256v2_gate_up_silu_mmq_iu4{suffix}"),
@@ -137,6 +128,7 @@ fn launch(
     k: usize,
     n: usize,
     add: bool,
+    geometry: Geometry,
 ) {
     let mut b = KernargBlob::new();
     b.push_ptr(a);
@@ -153,9 +145,9 @@ fn launch(
     }
     let mut blob = b.into_vec();
     let rows = if u.is_some() { 2 * m } else { m };
-    let grid = [rows.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
-    let block = [256, 1, 1];
-    let shared = 20480u32;
+    let grid = [rows.div_ceil(geometry.rows) as u32, n.div_ceil(128) as u32, 1];
+    let block = [geometry.block, 1, 1];
+    let shared = geometry.lds;
     match func {
         Some(f) => unsafe {
             gpu.hip
@@ -226,15 +218,15 @@ fn check(
     let np = ynew.buf.as_ptr() as *const c_void;
     let pp = yrep.buf.as_ptr() as *const c_void;
     let fused = u.is_some();
-    let ship = ship_symbol(fused, add);
     let cname = cand_symbol(fused, add, &cand.suffix);
     let cfunc = cand.func(&cname);
-    launch(gpu, None, ship, ap, up, xq, rp, *m, *k, n, add);
-    launch(gpu, cfunc, &cname, ap, up, xq, np, *m, *k, n, add);
-    launch(gpu, cfunc, &cname, ap, up, xq, pp, *m, *k, n, add);
+    let reference_symbol = cand_symbol(fused, add, "_v3");
+    launch(gpu, None, &reference_symbol, ap, up, xq, rp, *m, *k, n, add, K1_GEOMETRY);
+    launch(gpu, cfunc, &cname, ap, up, xq, np, *m, *k, n, add, cand.geometry);
+    launch(gpu, cfunc, &cname, ap, up, xq, pp, *m, *k, n, add, cand.geometry);
     gpu.hip.device_synchronize().expect("sync G1");
-    let reference = gpu.download_f32(&yref).expect("download shipping");
-    let candidate = gpu.download_f32(&ynew).expect("download v3");
+    let reference = gpu.download_f32(&yref).expect("download K1");
+    let candidate = gpu.download_f32(&ynew).expect("download builder");
     let repeat = gpu.download_f32(&yrep).expect("download repeat");
     let differing = compare(label, &reference, &candidate, *m);
     let repeated = compare(&format!("{label}/repeat"), &candidate, &repeat, *m);
@@ -266,8 +258,10 @@ fn timed(
     a: &Matrix,
     u: Option<&Matrix>,
     n: usize,
-    v3: bool,
-) -> f64 {
+    candidate: bool,
+    add: bool,
+    repetition: usize,
+) -> (f64, f64, f64) {
     let (m, k, bytes) = a;
     let x: Vec<f32> = (0..n * k).map(|i| rand(i, 0x71e0)).collect();
     let d_x = gpu.upload_f32(&x, &[n, *k]).expect("upload X");
@@ -276,24 +270,24 @@ fn timed(
     let d_u = u.map(|(_, _, b)| gpu.upload_raw(b, &[b.len()]).expect("upload U"));
     let ap = d_a.buf.as_ptr() as *const c_void;
     let up = d_u.as_ref().map(|t| t.buf.as_ptr() as *const c_void);
-    let y0 = vec![0.0f32; n * m];
+    let y0 = if add { vec![0.11f32; n * m] } else { vec![0.0f32; n * m] };
     let y = gpu.upload_f32(&y0, &[n, *m]).expect("upload Y");
     let yp = y.buf.as_ptr() as *const c_void;
     let fused = u.is_some();
-    let (sym_owned, func): (String, Option<&Function>) = if v3 {
-        let name = cand_symbol(fused, false, &cand.suffix);
+    let (sym_owned, func, geometry): (String, Option<&Function>, Geometry) = if candidate {
+        let name = cand_symbol(fused, add, &cand.suffix);
         let f = cand.func(&name);
-        (name, f)
+        (name, f, cand.geometry)
     } else {
-        (ship_symbol(fused, false).to_string(), None)
+        (cand_symbol(fused, add, "_v3"), None, K1_GEOMETRY)
     };
     let sym = sym_owned.as_str();
     for _ in 0..16 {
-        launch(gpu, func, sym, ap, up, xq, yp, *m, *k, n, false);
+        launch(gpu, func, sym, ap, up, xq, yp, *m, *k, n, add, geometry);
     }
     gpu.hip.device_synchronize().expect("warmup sync");
-    let arm = if v3 { cand.arm.as_str() } else { "ship" };
-    let csv = format!("{OUT}/{label}-{n}-{arm}-telemetry.csv");
+    let arm = if candidate { cand.arm.as_str() } else { "k1" };
+    let csv = format!("{OUT}/{label}-{n}-{}-{arm}-{repetition}-telemetry.csv", cand.suffix);
     let mut child = Command::new("python3")
         .args(["-u", "-c", TELEMETRY, &csv])
         .stdout(Stdio::piped())
@@ -304,18 +298,18 @@ fn timed(
         .read_line(&mut ready)
         .expect("sampler ready");
     assert_eq!(ready.trim(), "READY", "AMD-SMI sampler failed");
-    eprintln!("BEGIN {label} N={n} arm={arm}");
+    eprintln!("BEGIN {label} N={n} arm={arm} repetition={repetition}");
     let start = Instant::now();
     let mut calls = 0;
     while start.elapsed() < Duration::from_secs(10) {
         for _ in 0..32 {
-            launch(gpu, func, sym, ap, up, xq, yp, *m, *k, n, false);
+            launch(gpu, func, sym, ap, up, xq, yp, *m, *k, n, add, geometry);
         }
         gpu.hip.device_synchronize().expect("timed sync");
         calls += 32;
     }
     let elapsed = start.elapsed().as_secs_f64();
-    eprintln!("END {label} N={n} arm={arm}");
+    eprintln!("END {label} N={n} arm={arm} repetition={repetition}");
     child.kill().expect("stop sampler");
     child.wait().expect("reap sampler");
     let data = std::fs::read_to_string(&csv).expect("read telemetry");
@@ -349,10 +343,10 @@ fn timed(
     let us = elapsed * 1e6 / calls as f64;
     let tops = 2.0 * (if u.is_some() { 2.0 } else { 1.0 }) * (*m as f64) * (*k as f64) * n as f64
         / (us * 1e6);
+    let clock = median(&mut clocks);
+    let power = median(&mut watts);
     eprintln!(
-        "G2 {label} N={n} arm={arm} calls={calls} seconds={elapsed:.3} us/call={us:.3} TOPS={tops:.3} sclk_mhz={:.1} watts={:.1} busy_pct={:.1} samples={} spacing_ms={spacing:.1} csv={csv}",
-        median(&mut clocks),
-        median(&mut watts),
+        "G2 {label} N={n} arm={arm} repetition={repetition} calls={calls} seconds={elapsed:.3} us/call={us:.3} TOPS={tops:.3} sclk_mhz={clock:.1} watts={power:.1} busy_pct={:.1} samples={} spacing_ms={spacing:.1} csv={csv}",
         median(&mut busy),
         sample_times.len()
     );
@@ -362,7 +356,7 @@ fn timed(
         gpu.free_tensor(u).expect("free U");
     }
     gpu.free_tensor(y).expect("free Y");
-    tops
+    (tops, clock, power)
 }
 
 fn load_candidate(gpu: &mut Gpu) -> Candidate {
@@ -372,17 +366,22 @@ fn load_candidate(gpu: &mut Gpu) -> Candidate {
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
 
-    // Shipping reference always JIT'd from source.
+    let rows = std::env::var("HIPFIRE_ISA_TILE_ROWS")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("HIPFIRE_ISA_TILE_ROWS integer"))
+        .unwrap_or(if suffix.ends_with("t256") { 256 } else { 128 });
+    let geometry = match rows {
+        128 => K1_GEOMETRY,
+        256 => Geometry { rows: 256, block: 512, lds: 30720 },
+        _ => panic!("HIPFIRE_ISA_TILE_ROWS must be 128 or 256"),
+    };
+    eprintln!("CANDIDATE GEOMETRY rows={} block={} lds={}", geometry.rows, geometry.block, geometry.lds);
     for fused in [false, true] {
-        for add in if fused {
-            &[false][..]
-        } else {
-            &[false, true][..]
-        } {
-            let sym = ship_symbol(fused, *add);
-            gpu.ensure_kernel_public(BASE, SHIP_SRC, sym)
+        for add in if fused { &[false][..] } else { &[false, true][..] } {
+            let sym = cand_symbol(fused, *add, "_v3");
+            gpu.ensure_kernel_public(V3, V3_SRC, &sym)
                 .unwrap_or_else(|e| panic!("compile {sym}: {e}"));
-            eprintln!("JIT OK {sym}");
+            eprintln!("K1 JIT OK {sym}");
         }
     }
 
@@ -426,6 +425,7 @@ fn load_candidate(gpu: &mut Gpu) -> Candidate {
         }
         Candidate {
             suffix,
+            geometry,
             arm,
             funcs,
             _module: Some(module),
@@ -445,6 +445,7 @@ fn load_candidate(gpu: &mut Gpu) -> Candidate {
         }
         Candidate {
             suffix,
+            geometry,
             arm: "v3".to_string(),
             funcs: HashMap::new(),
             _module: None,
@@ -456,12 +457,12 @@ fn main() {
     let model = std::env::args()
         .nth(1)
         .expect("usage: tmp_iu4_gfx12_v3_oracle <model.hfq> [--compile-only]");
-    let uuid = "GPU-085289909a86cc63";
+    let uuid = "GPU-9eb7aeda51c88ffd";
     for key in ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"] {
         assert_eq!(
             std::env::var(key).as_deref(),
             Ok(uuid),
-            "{key} must pin card C by UUID"
+            "{key} must pin card A by UUID"
         );
     }
     let mut gpu = Gpu::init().expect("initialize GPU");
@@ -474,19 +475,19 @@ fn main() {
     assert!(hfq.mq4v2_symmetric(), "K1 requires symmetric qt44");
     if std::env::var("OCC").ok().as_deref() == Some("1") {
         for fused in [false, true] {
-            let ship = ship_symbol(fused, false);
+            let k1 = cand_symbol(fused, false, "_v3");
             eprintln!(
-                "OCC {ship} active_blocks_per_CU={}",
-                gpu.occupancy_max_active_blocks(ship, [256, 1, 1], 20480)
-                    .expect("occupancy ship")
+                "OCC {k1} active_blocks_per_CU={}",
+                gpu.occupancy_max_active_blocks(&k1, [256, 1, 1], 20480)
+                    .expect("occupancy K1")
             );
             let cname = cand_symbol(fused, false, &cand.suffix);
             let blocks = if let Some(f) = cand.func(&cname) {
                 gpu.hip
-                    .occupancy_max_active_blocks(f, 256, 20480)
+                    .occupancy_max_active_blocks(f, cand.geometry.block, cand.geometry.lds as usize)
                     .expect("occupancy cand")
             } else {
-                gpu.occupancy_max_active_blocks(&cname, [256, 1, 1], 20480)
+                gpu.occupancy_max_active_blocks(&cname, [cand.geometry.block, 1, 1], cand.geometry.lds)
                     .expect("occupancy cand")
             };
             eprintln!("OCC {cname} active_blocks_per_CU={blocks}");
@@ -499,24 +500,25 @@ fn main() {
         let up = weight(&hfq, 0, &["mlp.up_proj"]);
         let down = weight(&hfq, 0, &["mlp.down_proj"]);
         let set = weight(&hfq, 0, &["linear_attn.in_proj_qkv"]);
-        for n in [512, 8192] {
-            for (label, matrix, other) in [
-                ("gate", &gate, Some(&up)),
-                ("down", &down, None),
-                ("set", &set, None),
+        for n in [8192, 512] {
+            for (label, matrix, other, add) in [
+                ("gate", &gate, Some(&up), false),
+                ("down", &down, None, true),
+                ("set", &set, None, false),
             ] {
-                let ship = timed(&mut gpu, &cand, label, matrix, other, n, false);
-                let v3 = timed(&mut gpu, &cand, label, matrix, other, n, true);
-                let gain = (v3 / ship - 1.0) * 100.0;
+                let a = timed(&mut gpu, &cand, label, matrix, other, n, false, add, 0);
+                let b = timed(&mut gpu, &cand, label, matrix, other, n, true, add, 1);
+                let b2 = timed(&mut gpu, &cand, label, matrix, other, n, true, add, 2);
+                let a2 = timed(&mut gpu, &cand, label, matrix, other, n, false, add, 3);
+                let k1 = (a.0 + a2.0) / 2.0;
+                let builder = (b.0 + b2.0) / 2.0;
+                let gain = (builder / k1 - 1.0) * 100.0;
+                let threshold = if n == 512 { -3.0 } else if label == "set" { 3.0 } else { 4.0 };
                 eprintln!(
-                    "G2_COMPARE {label} N={n} shipping_TOPS={ship:.3} v3_TOPS={v3:.3} gain_pct={gain:.2} {}",
-                    if (n == 8192 && gain < if label == "set" { 10.0 } else { 15.0 })
-                        || (n == 512 && gain < -3.0)
-                    {
-                        "STOP"
-                    } else {
-                        "PASS"
-                    }
+                    "G2_COMPARE {label} N={n} K1_TOPS={k1:.3} builder_TOPS={builder:.3} gain_pct={gain:.2} K1_sclk_mhz={:.1} builder_sclk_mhz={:.1} K1_watts={:.1} builder_watts={:.1} threshold_pct={threshold:.1} {}",
+                    (a.1 + a2.1) / 2.0, (b.1 + b2.1) / 2.0,
+                    (a.2 + a2.2) / 2.0, (b.2 + b2.2) / 2.0,
+                    if gain >= threshold { "PASS" } else { "FAIL" }
                 );
             }
         }
