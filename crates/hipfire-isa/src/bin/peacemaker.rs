@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use hipfire_isa::audit::{self, Options as AuditOptions};
 use hipfire_isa::toolchain::{assemble_link_bundle, certify, read_kd, IsaShapeContract, Toolchain};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -6,8 +7,10 @@ use std::path::PathBuf;
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("custom") || args.next().as_deref() != Some("build") {
-        return Err("usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]".into());
+    let Some(command) = args.next() else { return Err(usage().into()); };
+    if command == "audit" { return run_audit(args); }
+    if command != "custom" || args.next().as_deref() != Some("build") {
+        return Err(usage().into());
     }
     let mut arch = None;
     let mut source = None;
@@ -59,6 +62,36 @@ fn run() -> Result<(), String> {
         println!("{:?}", read_kd(&build.elf, &symbol)?);
     }
     println!("{}", output.display());
+    Ok(())
+}
+
+fn usage() -> &'static str {
+    "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
+     peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]"
+}
+
+fn run_audit(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+    let mut options = AuditOptions::default();
+    while let Some(option) = args.next() {
+        if option == "--sweep-profiles" { options.sweep_profiles = true; continue; }
+        let value = args.next().ok_or_else(|| format!("missing value for {option}"))?;
+        match option.as_str() {
+            "--arch" => options.arch = value,
+            "--source" | "--hsaco" | "--input" => options.input = PathBuf::from(value),
+            "--prepend" => options.prepend.push(PathBuf::from(value)),
+            "--define" => options.defines.push(value),
+            "--flag" => options.flags.push(value),
+            "--intent" => options.intent = Some(PathBuf::from(value)),
+            "--json" => options.json = Some(PathBuf::from(value)),
+            "--markdown" => options.markdown = Some(PathBuf::from(value)),
+            _ => return Err(format!("unrecognized audit option {option}\n{}", usage())),
+        }
+    }
+    if options.input.as_os_str().is_empty() { return Err(usage().into()); }
+    let json = options.json.clone().unwrap_or_else(|| options.input.with_extension("audit.json"));
+    let markdown = options.markdown.clone().unwrap_or_else(|| options.input.with_extension("audit.md"));
+    audit::run(options)?;
+    println!("{}\n{}", json.display(), markdown.display());
     Ok(())
 }
 

@@ -8,6 +8,7 @@ pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod
 pub mod kernels { pub mod iu4_k1; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;
+#[cfg(feature="toolchain")] pub mod audit;
 pub use arch::Arch;
 pub use reg::{RegPlan,V,S};
 pub use plan::{KernelSpec,KernargLayout,Emitted,BuilderProof,IsaShape,MemoryScope};

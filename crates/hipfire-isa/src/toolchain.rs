@@ -315,6 +315,31 @@ pub struct BuildOutput {
     pub tools: Vec<PeacemakerTool>,
 }
 
+/// Extract and disassemble the exact device ELF in an uncompressed HIP bundle.
+/// An ELF input is accepted directly for offline audits of hand-linked objects.
+pub fn disassemble_code_object(toolchain: &Toolchain, input: &Path, arch: &str) -> Result<String> {
+    if fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?.starts_with(b"\x7fELF") {
+        return invoke(&toolchain.objdump,
+            &["--disassemble".into(), format!("--mcpu={arch}"), input.display().to_string()]);
+    }
+    let targets = invoke(&toolchain.bundler,
+        &["--type=o".into(), "--list".into(), format!("--input={}", input.display())])?;
+    let target = targets.lines().map(str::trim)
+        .find(|line| line.starts_with("hip") && line.ends_with(&format!("--{arch}")))
+        .ok_or_else(|| format!("no HIP bundle for {arch} in {}", input.display()))?;
+    let temporary = std::env::temp_dir().join(format!("peacemaker-{}-{}.co",
+        std::process::id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos()));
+    let result = (|| {
+        invoke(&toolchain.bundler, &["--type=o".into(), "--unbundle".into(),
+            format!("--input={}", input.display()), format!("--targets={target}"),
+            format!("--output={}", temporary.display())])?;
+        invoke(&toolchain.objdump, &["--disassemble".into(), format!("--mcpu={arch}"),
+            temporary.display().to_string()])
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
 /// The external commands are deliberately fixed: no HIP compilation or compression.
 pub fn assemble_link_bundle(toolchain: &Toolchain, source: &Path, output: &Path,
     arch: &str) -> Result<BuildOutput> {
