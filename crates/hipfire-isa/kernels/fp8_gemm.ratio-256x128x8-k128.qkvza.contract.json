@@ -16,5 +16,6 @@
   "sgpr_max": 104,
   "require_wave32": true,
   "require_zero_spills": true,
-  "require_zero_private": true
+  "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 19456
 }

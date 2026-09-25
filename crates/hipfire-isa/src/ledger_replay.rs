@@ -8,7 +8,7 @@ struct Pending<'a> { defs: BTreeSet<u16>, locks: BTreeSet<u16>, kind: Kind, opco
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind { Vmem, Store, Ds, Km }
 
-fn registers(operands: &str) -> BTreeSet<u16> {
+pub(crate) fn registers(operands: &str) -> BTreeSet<u16> {
     let bytes = operands.as_bytes();
     let mut found = BTreeSet::new();
     let mut i = 0;
@@ -90,8 +90,8 @@ pub fn replay_waits(assembly: &str) -> Result<(), String> {
             if encoded > 0x3f3f || encoded & 0xc0c0 != 0 {
                 return Err(format!("line {}: out-of-range combined wait", line_no+1));
             }
-            retire(&mut pending, Kind::Vmem, encoded & 0x3f);
-            retire(&mut pending, Kind::Ds, (encoded >> 8) & 0x3f);
+            retire(&mut pending, Kind::Vmem, (encoded >> 8) & 0x3f);
+            retire(&mut pending, Kind::Ds, encoded & 0x3f);
             continue;
         }
         let kind = if name.starts_with("buffer_load") || name.starts_with("global_load") {
@@ -153,10 +153,24 @@ mod tests {
     fn combined_wait_keeps_young_vmem_pending() {
         let stream = "buffer_load_b32 v0, v8, s[4:7], s9 offen\n\
             ds_load_b32 v1, v9\n\
-            s_wait_loadcnt_dscnt 0x1\n\
+            s_wait_loadcnt_dscnt 0x100\n\
             v_add_f32 v2, v1, v3\n";
         assert!(replay_waits(stream).is_ok());
         assert!(replay_waits(&(stream.to_owned() + "v_add_f32 v2, v0, v3\n")).is_err());
+    }
+    #[test]
+    fn asymmetric_combined_wait_decodes_load_then_ds() {
+        let mut source = String::new();
+        for i in 0..8 {
+            source.push_str(&format!("buffer_load_b32 v{i}, v20, s[4:7], s9 offen\n"));
+        }
+        for i in 0..4 {
+            source.push_str(&format!("ds_load_b32 v{}, v21\n", i + 8));
+        }
+        source.push_str("s_wait_loadcnt_dscnt 0x703\nv_add_f32 v22, v0, v8\n");
+        assert!(replay_waits(&source).is_ok());
+        assert!(replay_waits(&source.replace("0x703", "0x307")).is_err());
+        assert!(replay_waits(&source.replace("0x703", "0x707")).is_err());
     }
     #[test]
     fn store_lock_requires_storecnt_before_redefinition() {
