@@ -9446,7 +9446,9 @@ impl Gpu {
             && hipfire_config::developer_var("HIPFIRE_FP8_SYMFOLD").as_deref() != Ok("0")
     }
     /// Only the measured symmetric 128x128 v2 route has a paired-row h
-    /// epilogue. The producer must retain h in registers at this K.
+    /// epilogue. The producer must retain h in registers at this K. Default
+    /// on (byte-identical H2 KLD, +3.3% pp8192); `HIPFIRE_FP8_SILU_H=0` or
+    /// `HIPFIRE_FP8_PROD_INREG=0` restores the separate gate/up planes.
     pub fn fp8_silu_h_active(&self, n: usize, k: usize, gate_m: usize, up_m: usize) -> bool {
         self.arch == "gfx1201"
             && self.flags.gfx12_mq4v2_fp8_v2
@@ -9456,8 +9458,8 @@ impl Gpu {
             && n >= 256
             && k <= 17408
             && gate_m == up_m
-            && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", false)
-            && hipfire_config::developer_bool("HIPFIRE_FP8_SILU_H", false)
+            && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
+            && hipfire_config::developer_bool("HIPFIRE_FP8_SILU_H", true)
     }
 
 

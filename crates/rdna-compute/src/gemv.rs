@@ -15,8 +15,10 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
         == Some("1")
 }
 
+/// In-register fp8 producers (no `x_rot` round trip). Default on after
+/// byte-identical H2 KLD and +1.8% pp8192; `HIPFIRE_FP8_PROD_INREG=0` opts out.
 fn fp8_prod_inreg(k: usize) -> bool {
-    k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", false)
+    k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
 }
 
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
