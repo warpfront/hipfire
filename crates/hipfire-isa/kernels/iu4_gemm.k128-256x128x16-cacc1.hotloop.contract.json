@@ -1,0 +1,39 @@
+{
+  "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1t256",
+  "start_label": ".Liu4_k_loop",
+  "end_label": ".Liu4_k_loop_end",
+  "counts": {
+    "v_wmma_i32_16x16x32_iu4": 64,
+    "valu_slots": {
+      "max": 220
+    },
+    "vopd_packets": 192,
+    "v_dual_subrev_f32": 64,
+    "v_dual_mul_f32": 64,
+    "v_dual_fmac_f32": 64,
+    "v_xor_b32_e32": 16,
+    "v_cvt_f32_i32*": 0,
+    "v_add_co*": 0,
+    "v_add_nc_u32*": 0,
+    "v_mov_b32*": 0,
+    "v_cndmask_b32*": 0,
+    "buffer_load_b64": 12,
+    "buffer_load_b32": 4,
+    "global_*": 0,
+    "ds_*": 48,
+    "s_wait_alu": {
+      "max": 4
+    },
+    "s_barrier_signal": 4,
+    "s_barrier_wait": 4
+  },
+  "forbidden": [
+    "s_waitcnt",
+    "scratch_*",
+    "v_readlane*"
+  ],
+  "vgpr_max": 192,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true
+}

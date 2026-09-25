@@ -118,10 +118,10 @@ impl Ledger {
         let mut out = Vec::new();
         for (counter, count, reason) in waits {
             let text = match (arch.gfx12(), counter) {
-                (true, Counter::Load) => format!("s_wait_loadcnt {count}"),
-                (true, Counter::Store) => format!("s_wait_storecnt {count}"),
-                (true, Counter::Ds) => format!("s_wait_dscnt {count}"),
-                (true, Counter::Km) => format!("s_wait_kmcnt {count}"),
+                (true, Counter::Load) => format!("s_wait_loadcnt {count:#x}"),
+                (true, Counter::Store) => format!("s_wait_storecnt {count:#x}"),
+                (true, Counter::Ds) => format!("s_wait_dscnt {count:#x}"),
+                (true, Counter::Km) => format!("s_wait_kmcnt {count:#x}"),
                 (false, Counter::Vm) => format!("s_waitcnt vmcnt({count})"),
                 (false, Counter::Vs) => format!("s_waitcnt_vscnt null, {count}"),
                 (false, Counter::Lgkm) => format!("s_waitcnt lgkmcnt({count})"),

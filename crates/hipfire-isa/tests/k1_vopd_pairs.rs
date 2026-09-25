@@ -32,6 +32,7 @@ fn all_96_k1_fold_packets_encode_on_gfx1201() {
     });
     let magic = plan.v::<8>("magic8", 128, Live::Whole).unwrap();
     let sc_row = plan.v::<8>("sc_row", 136, Live::Whole).unwrap();
+    let sc_quads = [hipfire_isa::V::<4>(sc_row.base()), hipfire_isa::V::<4>(sc_row.base() + 4)];
     let t = plan.v::<8>("t", 144, Live::Whole).unwrap();
     let d = std::array::from_fn(|i| plan.v::<1>("d_x", (152 + i) as u8, Live::Whole).unwrap());
     let spec = KernelSpec {
@@ -42,13 +43,11 @@ fn all_96_k1_fold_packets_encode_on_gfx1201() {
         system_sgpr_workgroup_id_y: false,
     };
     let mut b = Builder::new(spec, plan);
-    emit_fold(&mut b, FoldRegisters { cacc, acc, magic, sc_row, t, d }).unwrap();
+    emit_fold(&mut b, FoldRegisters { cacc, acc, magic, sc: [sc_quads; 2], t, d }).unwrap();
     let packets: Vec<_> = b.program.instructions.iter().map(|i| i.text.as_str()).collect();
     assert_eq!(packets.len(), 96);
-    for (j, packet) in packets.chunks_exact(3).enumerate() {
-        assert!(packet[0].starts_with("v_dual_subrev_f32"), "pair {j}");
-        assert!(packet[1].starts_with("v_dual_mul_f32"), "pair {j}");
-        assert!(packet[2].starts_with("v_dual_fmac_f32"), "pair {j}");
+    for op in ["v_dual_subrev_f32", "v_dual_mul_f32", "v_dual_fmac_f32"] {
+        assert_eq!(packets.iter().filter(|p| p.starts_with(op)).count(), 32, "{op}");
     }
     let mut mc = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
         .args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1201", "-show-encoding"])

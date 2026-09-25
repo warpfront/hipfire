@@ -1,0 +1,24 @@
+{
+  "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1t256",
+  "counts": {
+    "v_wmma_i32_16x16x32_iu4": 128,
+    "vopd_packets": {
+      "min": 384
+    },
+    "v_dual_subrev_f32": 128,
+    "v_dual_mul_f32": 128,
+    "v_dual_fmac_f32": 128
+  },
+  "forbidden": [
+    "s_waitcnt",
+    "scratch_*",
+    "v_readlane*",
+    "global_*",
+    "flat_*"
+  ],
+  "vgpr_max": 192,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true
+}

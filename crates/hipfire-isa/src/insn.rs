@@ -51,11 +51,11 @@ impl Instruction {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Sop { Clause(u8), WaitLoad(u8), WaitDs(u8), WaitKm(u8), WaitStore(u8), End, Dealloc }
 impl Sop { pub fn encode(self,arch:Arch)->Result<Instruction,String> { let t=match self {
-    Self::Clause(n) if (2..=32).contains(&n)=>format!("s_clause {}",n-1),
-    Self::WaitLoad(n) if n<=63 => if arch.gfx12() { format!("s_wait_loadcnt {n}") } else { format!("s_waitcnt vmcnt({n})") },
-    Self::WaitDs(n) if n<=63 => if arch.gfx12() { format!("s_wait_dscnt {n}") } else { format!("s_waitcnt lgkmcnt({n})") },
-    Self::WaitKm(n) if arch.gfx12() && n<=31 => format!("s_wait_kmcnt {n}"),
-    Self::WaitStore(n) if arch.gfx12() && n<=63 => format!("s_wait_storecnt {n}"),
+    Self::Clause(n) if (2..=32).contains(&n)=>format!("s_clause {:#x}",n-1),
+    Self::WaitLoad(n) if n<=63 => if arch.gfx12() { format!("s_wait_loadcnt {n:#x}") } else { format!("s_waitcnt vmcnt({n})") },
+    Self::WaitDs(n) if n<=63 => if arch.gfx12() { format!("s_wait_dscnt {n:#x}") } else { format!("s_waitcnt lgkmcnt({n})") },
+    Self::WaitKm(n) if arch.gfx12() && n<=31 => format!("s_wait_kmcnt {n:#x}"),
+    Self::WaitStore(n) if arch.gfx12() && n<=63 => format!("s_wait_storecnt {n:#x}"),
     Self::End=>"s_endpgm".into(), Self::Dealloc=>"s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)".into(),
     _=>return Err("invalid SOP immediate or unsupported architecture".into()) }; Ok(Instruction::new(t,vec![],vec![])) } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Vbuffer { LoadB32, LoadB64, StoreB32, StoreB64 }
