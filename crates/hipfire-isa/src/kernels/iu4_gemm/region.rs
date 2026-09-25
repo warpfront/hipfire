@@ -353,3 +353,74 @@ pub fn slice_silu(disassembly: &str, symbol: &str) -> Result<String, String> {
 pub fn golden_body() -> String {
     SILU_GOLDEN.lines().filter(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty()).map(|l| format!("{l}\n")).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Arch, KernargLayout, KernelSpec, RegPlan, reg::Live};
+
+    /// `elements` instances over `slots` register slots, laid out the way the
+    /// gate/up epilogue binds them (partners an odd distance apart).
+    fn binds(elements: u8, slots: u8, out: u8) -> Vec<Binding> {
+        let masks = [85u8, 86, 87, 63, 56, 57, 58, 59];
+        (0..elements).map(|k| {
+            let q = k % slots;
+            Binding { g: 64 + k, u: 72 + k, out: out + k, temps: (0..7).map(|t| 7 * q + t).collect(),
+                masks: vec![masks[2 * q as usize], masks[2 * q as usize + 1]] }
+        }).collect()
+    }
+
+    fn emitted(binds: &[Binding]) -> Vec<String> {
+        let mut p = RegPlan::new(192, 104).unwrap();
+        for i in 0..32u8 { p.v::<4>("v", 4 * i, Live::Whole).unwrap(); }
+        for s in [56u8, 57, 58, 59, 63, 85, 86, 87] { p.s::<1>("mask", s, Live::Whole).unwrap(); }
+        let spec = KernelSpec { kernel_id: "silu".into(), variant: "test".into(), arch: Arch::Gfx1201, symbol: "silu".into(),
+            kernargs: KernargLayout::new(8), user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 256,
+            group_segment_fixed_size: 0, wave32: true };
+        let mut b = Builder::new(spec, p);
+        emit_interleaved(&mut b, &Region::silu().unwrap(), binds).unwrap();
+        b.program.instructions.iter().map(|i| i.text.clone()).collect()
+    }
+
+    /// Interleaving and VOPD packing only: the stream is exactly each
+    /// element's golden region, in golden order; packets join partners; one
+    /// VCC window at a time, closed after its `va_vcc` wait; every mask read
+    /// is fenced after the compare that wrote it.
+    #[test]
+    fn schedule_is_each_elements_golden_region() {
+        let region = Region::silu().unwrap();
+        for (elements, slots, out) in [(2u8, 2u8, 16u8), (8, 4, 32)] {
+            let bs = binds(elements, slots, out);
+            let lines = emitted(&bs);
+            let mut halves: Vec<(usize, String, Option<usize>)> = Vec::new();
+            for (i, l) in lines.iter().enumerate().filter(|(_, l)| l.starts_with("v_")) {
+                for h in l.split(" :: ") {
+                    let (m, a) = h.split_once(' ').unwrap();
+                    halves.push((i, format!("{} {a}", standalone(m)), None));
+                }
+            }
+            for (k, bind) in bs.iter().enumerate() {
+                let mut at = 0;
+                for (i, op) in region.ops.iter().enumerate().filter(|(_, o)| o.mnemonic != "s_wait_alu") {
+                    let text = render(op, bind, i + 1 == region.ops.len()).text;
+                    let j = (at..halves.len()).find(|&j| halves[j].2.is_none() && halves[j].1 == text)
+                        .unwrap_or_else(|| panic!("element {k} op {i} `{text}` missing or out of order"));
+                    halves[j].2 = Some(k);
+                    at = j + 1;
+                }
+            }
+            assert!(halves.iter().all(|h| h.2.is_some()), "ops outside the golden elements");
+            assert!(halves.len() > lines.iter().filter(|l| l.starts_with("v_")).count(), "no VOPD packet formed");
+            for w in halves.windows(2).filter(|w| w[0].0 == w[1].0) { assert_eq!(w[0].2.unwrap() ^ 1, w[1].2.unwrap(), "packet joins non-partners") }
+            let (mut open, mut waited, mut unfenced) = (false, false, BTreeSet::new());
+            for l in &lines {
+                if l.starts_with("v_div_scale_f32") && l.contains("vcc_lo") { assert!(!open, "overlapping VCC windows"); open = true; waited = false }
+                if l == "s_wait_alu depctr_va_vcc(0)" { waited = true }
+                if l.starts_with("v_div_fmas_f32") { assert!(open && waited, "div_fmas without its window/wait"); open = false }
+                if l == "s_wait_alu depctr_va_sdst(0)" { unfenced.clear() }
+                if l.starts_with("v_cmp_") { unfenced.insert(l.split([' ', ',']).nth(1).unwrap().to_owned()); }
+                if l.starts_with("v_cndmask_b32_e64") { assert!(!unfenced.contains(l.rsplit(", ").next().unwrap()), "unfenced mask read: {l}") }
+            }
+        }
+    }
+}
