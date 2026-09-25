@@ -4002,7 +4002,10 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 529f971d1d44927d770ce0a8d77f661e3b4630a5ad9b2bc75889fcb661ceea4b.
+/// SHA-256 1b25e3aad81a768e9bc208532f00690b672d3b8114329541ae5b9c0309d80666:
+/// the 529f971d schedule plus `s_delay_alu` issue hints, outputs byte-identical.
+/// Regenerate with `hipfire-isa emit --kernel fp8_gemm --scale both --epi all`
+/// and one contract-checked `peacemaker custom build` per Row epilogue.
 pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco");
 /// Fused Wf/Rw/Ew repacker. SHA-256
