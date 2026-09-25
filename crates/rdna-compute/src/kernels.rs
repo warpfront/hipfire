@@ -3973,7 +3973,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 bb4e3b9b08f91d72b4aba4a250a2cb34a721abeceddce63baa7fff423e28ba33.
+/// SHA-256 529f971d1d44927d770ce0a8d77f661e3b4630a5ad9b2bc75889fcb661ceea4b.
 pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco");
 /// Fused Wf/Rw/Ew repacker. SHA-256
