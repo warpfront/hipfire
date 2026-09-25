@@ -322,6 +322,19 @@ fn g12_iu4_b1_eligible(m: usize, k: usize, output: *mut c_void) -> bool {
     k % 256 == 0 && m % 4 == 0 && (output as usize) % 16 == 0
 }
 
+/// Full-slab A-prefetch is the measured A8 default; K32 remains selectable.
+static A8_APF_K32: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A8_APF_K32", false));
+
+fn a8_module_source() -> (&'static str, &'static str) {
+    if *A8_APF_K32 {
+        ("gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC)
+    } else {
+        ("gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC)
+    }
+}
 #[derive(Clone, Copy)]
 enum MqV2PrefillProjection {
     Qkvza,
@@ -10375,6 +10388,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.a8_prefill_active(batch_size, k) {
+            let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_z, xq, y_z, z_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively, so odd
         // prefill batches stay on the W4A4 path without host padding.
         if self.flags.iu4_prefill_enabled()
@@ -20375,6 +20396,122 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
     }
 
+    /// Gfx1201 A8 MQ4v2 SET/ADD. Xq is [K/128, N] of 136-byte blocks.
+    fn gemm_mq4g256v2_mmq_prequant_i8(
+        &mut self, a: &GpuTensor, xq: *mut c_void, y: &GpuTensor,
+        m: usize, k: usize, n: usize, add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        if self.arch != "gfx1201" || !self.mq4v2_symmetric || k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(1, "A8 MMQ requires symmetric MQ4v2 and gfx1201 K%256=0"));
+        }
+        let kernel = if add {
+            "gemm_mq4g256v2_residual_mmq_i8_full_add"
+        } else {
+            "gemm_mq4g256v2_residual_mmq_i8_full_set"
+        };
+        let (module, source) = a8_module_source();
+        self.ensure_kernel(module, source, kernel)?;
+        let mut ap = a.buf.as_ptr();
+        let mut xp = xq;
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut av = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel, [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1], 28672, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap); b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(mv); b.push_i32(kv); b.push_i32(nv); b.push_i32(av); b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_mq4g256v2_mmq_set_prequant_i8(
+        &mut self, a: &GpuTensor, xq: *mut c_void, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_i8(a, xq, y, m, k, n, false)
+    }
+
+    pub fn gemm_mq4g256v2_mmq_add_prequant_i8(
+        &mut self, a: &GpuTensor, xq: *mut c_void, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_i8(a, xq, y, m, k, n, true)
+    }
+
+    pub fn gemm_mq4g256v2_residual_wmma_i8_prepared(
+        &mut self, a: &GpuTensor, prepared: &crate::scratch::Int8MmqPrepared,
+        y: &GpuTensor, m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int8_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_i8(a, xq, y, m, k, n)
+    }
+
+    /// Gate/up SiLU writes H directly; no intermediate gate/up tensors.
+    pub fn gemm_gate_up_silu_mq4g256v2_i8_prepared(
+        &mut self, gate: &GpuTensor, up: &GpuTensor,
+        prepared: &crate::scratch::Int8MmqPrepared, h: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int8_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_gate_up_silu_mq4g256v2_i8_prequant(gate, up, xq, h, m, k, n)
+    }
+
+    pub fn gemm_gate_up_silu_mq4g256v2_i8_prequant(
+        &mut self, gate: &GpuTensor, up: &GpuTensor, xq: *mut c_void,
+        h: &GpuTensor, m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        if self.arch != "gfx1201" || !self.mq4v2_symmetric || m == 0 || m % 128 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(1, "A8 gate/up requires gfx1201 symmetric MQ4v2, M%128=K%256=0"));
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        const KERNEL: &str = "gemm_mq4g256v2_gate_up_silu_mmq_i8";
+        let (module, source) = a8_module_source();
+        self.ensure_kernel(module, source, KERNEL)?;
+        let mut gp = gate.buf.as_ptr();
+        let mut up = up.buf.as_ptr();
+        let mut xp = xq;
+        let mut hp = h.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void, &mut up as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void, &mut hp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL,
+            2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4);
+        let result = self.launch_maybe_blob(KERNEL,
+            [(2*m).div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1], 28672, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up); b.push_ptr(xp); b.push_ptr(hp);
+                b.push_i32(mv); b.push_i32(kv); b.push_i32(nv); b
+            });
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// ADD-epilogue fold, caller side. Offers `delta` (f32, >= n*m elements,
     /// otherwise dead until the next RMSNorm) to the next residual GEMM. When
     /// that GEMM takes the gfx1151 V2B route it writes its sum into `delta`
@@ -30341,6 +30478,13 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.a8_prefill_active(batch_size, k) {
+            let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_q, xq, y_q, q_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_k, xq, y_k, k_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_v, xq, y_v, v_m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
@@ -30964,6 +31108,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.a8_prefill_active(batch_size, k) {
+            let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_i8(a_up, xq, y_up, up_m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
@@ -33363,6 +33513,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.a8_prefill_active(batch_size, k) {
+            let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
+            return self.gemm_mq4g256v2_mmq_add_prequant_i8(a_raw, xq, y, m, k, batch_size);
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"

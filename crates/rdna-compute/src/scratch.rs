@@ -133,6 +133,43 @@ impl Int4MmqPrepared {
     }
 }
 
+/// Reservation for one producer-emitted `block_i8_128` sidecar.
+#[derive(Debug)]
+pub struct Int8MmqReservation {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int8MmqReservation {
+    pub fn ptr(&self) -> *mut c_void { self.ptr }
+    pub fn k(&self) -> usize { self.k }
+    pub fn n(&self) -> usize { self.n }
+}
+
+/// Valid only until the next int8 sidecar reservation or quantization.
+#[derive(Debug)]
+pub struct Int8MmqPrepared {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int8MmqPrepared {
+    pub fn from_reservation(res: Int8MmqReservation) -> Self {
+        Self { ptr: res.ptr, k: res.k, n: res.n, generation: res.generation }
+    }
+
+    pub fn checked_ptr(&self, generation: u64, ptr: *mut c_void, k: usize, n: usize) -> HipResult<*mut c_void> {
+        if ptr.is_null() || ptr != self.ptr || generation != self.generation || k != self.k || n != self.n {
+            return Err(hip_bridge::HipError::new(0, "Int8MmqPrepared: stale or mismatched A8 sidecar"));
+        }
+        Ok(ptr)
+    }
+}
+
 pub struct ScratchState {
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -175,6 +212,10 @@ pub struct ScratchState {
     /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
     /// cannot outlive a later re-reservation of the same scratch slot.
     pub int4_mmq_generation: u64,
+    /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
+    pub int8_mmq_x_scratch: Option<DeviceBuffer>,
+    pub int8_mmq_x_scratch_bytes: usize,
+    pub int8_mmq_generation: u64,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
     pub mq4v2_fp8_x_scratch: Option<DeviceBuffer>,
@@ -585,6 +626,11 @@ pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
 pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     let blocks_k = k / 128;
     blocks_k * n * 72
+}
+
+#[inline]
+pub(crate) fn int8_mmq_x_needed(k: usize, n: usize) -> usize {
+    k.div_ceil(128) * n * 136
 }
 
 /// Byte sizes of the three MQ4v2 FP8 pre-pass buffers `(x_fp8, half_sums,
@@ -1610,6 +1656,75 @@ impl ScratchState {
             n,
             generation: self.int4_mmq_generation,
         })
+    }
+
+    /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_int8_mmq_x(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        device_id: i32,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        crate::graph::bind_thread(hip, device_id)?;
+        compile_and_load_kernel(
+            compiler, hip, modules, functions,
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+            "quantize_int8_mmq_ds128",
+        )?;
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(hip, &mut self.int8_mmq_x_scratch, &mut self.int8_mmq_x_scratch_bytes, needed)?;
+        self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
+        let xp = x.buf.as_ptr();
+        let yp = self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let mut x_ptr = xp;
+        let mut y_ptr = yp;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void, &mut y_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void, &mut n_val as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(hip, "quantize", "quantize_int8_mmq_ds128", n*k*4 + needed);
+        launch_maybe_blob(
+            hip, Some(&*compiler), functions, stream, capture_blobs, capture_mode,
+            force_blob_path, Some(replay), "quantize_int8_mmq_ds128",
+            [k.div_ceil(1024) as u32, n as u32, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(yp); b.push_i32(k_val); b.push_i32(n_val); b
+            },
+        )?;
+        if let Some(t) = timer { t.finish(hip); }
+        Ok(yp)
+    }
+
+    pub fn reserve_int8_mmq(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<Int8MmqReservation> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(0, "reserve_int8_mmq: need k%256==0 and n>0"));
+        }
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(hip, &mut self.int8_mmq_x_scratch, &mut self.int8_mmq_x_scratch_bytes, needed)?;
+        self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
+        Ok(Int8MmqReservation {
+            ptr: self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr(),
+            k, n, generation: self.int8_mmq_generation,
+        })
+    }
+
+    pub fn int8_mmq_live(&self) -> (u64, *mut c_void) {
+        (self.int8_mmq_generation, self.int8_mmq_x_scratch.as_ref().map_or(std::ptr::null_mut(), |b| b.as_ptr()))
     }
     /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
     /// stream and return their device pointers `(x_fp8, half_sums,

@@ -3934,7 +3934,14 @@ pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::Schedu
 
     if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
         SchedulerProfile::IterativeIlp
-    } else if arch == "gfx1201" && name == "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3" {
+    } else if arch == "gfx1201"
+        && matches!(
+            name,
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3"
+                | "gemm_mq4g256v2_residual_mmq_i8_gfx12"
+                | "gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0"
+        )
+    {
         SchedulerProfile::IterativeIlp
     } else {
         SchedulerProfile::Default
@@ -3964,6 +3971,18 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 /// SHA-256 e57061d5d7f580e8e070baa9d741c72e0759365bc956e9ed3b4a58ad6f47940b.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
+
+/// gfx1201 A8 MQ4v2: standalone K128 int8 quantizer and all three GEMM entries.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx12.hip")
+);
+/// Full-slab A-prefetch variant (191 VGPR, 0 spills) for end-to-end screening.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC: &str = concat!(
+    "#define I8_APF_K32 0\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx12.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
