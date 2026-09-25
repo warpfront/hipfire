@@ -314,10 +314,18 @@ fn g12_iu4_b1_image() -> &'static [u8] {
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     }
 }
-/// Opt-in builder fp8 GEMM. Parsed once so a queued producer and its
-/// consumer cannot see different route settings.
+/// Builder fp8 GEMM (F2 Row, bundle 529f971d): default ON for the fp8
+/// prefill route on exact gfx1201 (`fp8_f2_row_active` admits N >= 2048
+/// only); `HIPFIRE_G12_FP8_ISA=0` opts out to the v2 route. Measured on H2,
+/// card B, 8 fresh processes ABBA+BAAB: pp8192 3,634.4 tok/s vs 3,407.3 for
+/// the previous bb4e3b9b bundle and 2,496.3 for v2 (2 processes). Quality,
+/// F2 forced to every site, mean of five paired scale-shift runs: WT2
+/// ΔKLD −0.000044 (pass); code24 (padded-tail scorer) ΔKLD +0.000414 against
+/// a +0.0002 margin — a paired gate MISS, shipped by explicit decision. The
+/// A4/IU4 default route never admits F2. Parsed once so a queued
+/// producer and its consumer cannot see different route settings.
 static G12_FP8_F2: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA", false));
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA", true));
 // Private quality-only candidate override: reference chunks are shorter
 // than product admission. Never enable this for normal prefill or timing.
 static G12_FP8_F2_FORCE_SMALL_N: LazyLock<bool> =
