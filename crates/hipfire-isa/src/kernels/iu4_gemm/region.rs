@@ -376,7 +376,7 @@ mod tests {
         for s in [56u8, 57, 58, 59, 63, 85, 86, 87] { p.s::<1>("mask", s, Live::Whole).unwrap(); }
         let spec = KernelSpec { kernel_id: "silu".into(), variant: "test".into(), arch: Arch::Gfx1201, symbol: "silu".into(),
             kernargs: KernargLayout::new(8), user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 256,
-            group_segment_fixed_size: 0, wave32: true };
+            group_segment_fixed_size: 0, wave32: true, cu_mode: false };
         let mut b = Builder::new(spec, p);
         emit_interleaved(&mut b, &Region::silu().unwrap(), binds).unwrap();
         b.program.instructions.iter().map(|i| i.text.clone()).collect()
