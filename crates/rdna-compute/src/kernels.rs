@@ -3948,7 +3948,8 @@ pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::Schedu
     }
 }
 
-// gfx1201 K1 lean-issue IU4 (`HIPFIRE_G12_IU4_V3=1`, default off): same
+// gfx1201 K1 lean-issue IU4 (default on; `HIPFIRE_G12_IU4_V3=0` restores
+// `_symfold_g12r`; also the fallback for shapes the builder `_b1` rejects): same
 // ABI/launch geometry as the shipping `_symfold_g12r` module. Compile
 // defines match that build (symmetric fold + banded raster; A4C2 from hipcc).
 // Entrypoints carry `_v3` (macro-renamed if the .hip still uses bare names).
