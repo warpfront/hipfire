@@ -540,10 +540,7 @@ impl KernelCompiler {
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
-        // Radiowave-selected spill-free RM2/BV6 schedule.
-        if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
-            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
-        } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+        if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
             && matches!(
                 name,
                 "gdn_chunk_prep"
@@ -566,41 +563,32 @@ impl KernelCompiler {
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
-        let mut flags = Self::module_flags_for(&self.arch, name, &self.gfx1151_cumode_modules);
-        let profile = self.scheduler_profile_for(name);
+        Self::module_flags_with_profile(
+            &self.arch,
+            name,
+            &self.gfx1151_cumode_modules,
+            self.scheduler_profile_for(name),
+        )
+    }
+
+    fn module_flags_with_profile(
+        arch: &str,
+        name: &str,
+        gfx1151_cumode_modules: &HashSet<String>,
+        profile: SchedulerProfile,
+    ) -> Vec<String> {
+        let mut flags = Self::module_flags_for(arch, name, gfx1151_cumode_modules);
         flags.extend(profile.llvm_args().iter().map(|flag| flag.to_string()));
         flags
     }
 
-    /// Select the scheduler profile for a kernel. The per-kernel table is the
-    /// primary source; `HIPFIRE_SCHED_PROFILE` overrides everything when set.
-    ///
-    /// **The table is deliberately empty.** A kernel was
-    /// briefly mapped to `MemoryClause` on the strength of static counters
-    /// (r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills, and
-    /// strictly better than every ILP profile). Measured device-side with HIP
-    /// events on gfx1201 that produced **no benefit** — multirow medians over
-    /// three runs were 22.32 / 22.88 / 23.56 us under `memory-clause` against
-    /// 22.32 / 22.56 / 22.56 us under `default`, overlapping at the fast end
-    /// and differing by less than the run-to-run spread.
-    ///
-    /// Better static counters are not a performance result. A non-default
-    /// compile policy with no measured win is carried complexity, so the
-    /// selection was withdrawn and the boring baseline kept. The mechanism
-    /// stays, and is worth keeping: the manifest now reports the real profile
-    /// instead of a hardcoded `Default`, the profile participates in the cache
-    /// hash so changing it cannot silently reuse a stale object, and
-    /// `HIPFIRE_SCHED_PROFILE` makes a sweep cheap.
-    ///
-    /// If you add an entry here, gate it on a device-side measurement, not on
-    /// VGPR or clause counts. Note also that `IterativeIlp` spills 138 VGPRs on
-    /// the GL multirow kernel and must never be selected for it.
+    /// Select the profile registered for this module; the developer-only
+    /// `HIPFIRE_SCHED_PROFILE` overrides it for whole-run experiments.
     fn scheduler_profile_for(&self, name: &str) -> SchedulerProfile {
         if let Some(profile) = self.sched_profile_override {
             return profile;
         }
-        let _ = name;
-        SchedulerProfile::Default
+        crate::kernels::scheduler_profile_for_module(&self.arch, name)
     }
 
     /// Single hashing sequence for all kernel cache keys. Every caller must
@@ -706,11 +694,17 @@ impl KernelCompiler {
         } else {
             HashSet::new()
         };
-        let module_flags = Self::module_flags_for(arch, name, &gfx1151_cumode_modules);
         let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
             .ok()
             .and_then(|value| SchedulerProfile::parse(&value));
-        let scheduler_profile = sched_profile_override.unwrap_or(SchedulerProfile::Default);
+        let scheduler_profile = sched_profile_override
+            .unwrap_or_else(|| crate::kernels::scheduler_profile_for_module(arch, name));
+        let module_flags = Self::module_flags_with_profile(
+            arch,
+            name,
+            &gfx1151_cumode_modules,
+            scheduler_profile,
+        );
         Self::hash_parts(
             source,
             arch,
@@ -761,7 +755,9 @@ impl KernelCompiler {
             .ok()
             .zip(std::fs::read_to_string(&manifest).ok())
             .is_some_and(|(code, encoded)| {
-                CodeObjectCertification::from_json(&code, &encoded).is_ok()
+                CodeObjectCertification::from_json(&code, &encoded).is_ok_and(|certification| {
+                    certification.manifest().scheduler_profile == self.scheduler_profile_for(name)
+                })
             });
         if already_valid {
             return;
@@ -2095,6 +2091,52 @@ mod tests {
         assert_ne!(
             control.cache_hash(module, source),
             gfx1100.cache_hash(module, source)
+        );
+    }
+
+    #[test]
+    fn gfx1201_k1_scheduler_is_module_exact_and_cache_keyed() {
+        let source = "__global__ void kernel() {}";
+        let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3";
+        let shipping = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r";
+        let mut compiler = test_compiler("", "hipcc 7.2");
+        compiler.arch = "gfx1201".to_owned();
+
+        assert_eq!(
+            compiler.module_flags(module),
+            SchedulerProfile::IterativeIlp
+                .llvm_args()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            compiler.scheduler_profile_for(module),
+            SchedulerProfile::IterativeIlp
+        );
+        assert!(compiler.module_flags(shipping).is_empty());
+        assert!(compiler.module_flags("gemv_mq4g256v2_mq4v2").is_empty());
+        assert_ne!(
+            compiler.cache_hash(module, source),
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1201",
+                "",
+                &[],
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+            )
+        );
+        assert_eq!(
+            compiler.cache_hash(shipping, source),
+            KernelCompiler::hash_parts(
+                source,
+                "gfx1201",
+                "",
+                &[],
+                "hipcc 7.2",
+                SchedulerProfile::Default,
+            )
         );
     }
 

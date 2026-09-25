@@ -147,4 +147,73 @@ __device__ inline void fp8stream_pack_row_from_f32(
     (void)tid;
 }
 
+// Each lane retains at most nine 256-value groups (K <= 18432). Group
+// ownership is fixed for the lifetime of the row, so scale publication is
+// the only inter-wave communication; neither F32 staging nor re-reading is
+// needed. The two 128-value halves retain the standalone packer's lane sum
+// tree and order of the four decoded E4M3 values.
+template <int Groups>
+__device__ inline void fp8stream_pack_row_inreg(
+    const float (&held)[Groups][8],
+    unsigned char* __restrict__ out_row,
+    float* __restrict__ sums_row,
+    float* __restrict__ scale_slot,
+    float row_amax,
+    float* __restrict__ smem8,
+    int K, int lane, int wave, int first_group, int group_stride) {
+    row_amax = fp8stream_wave_max(row_amax);
+    if (lane == 0) smem8[wave] = row_amax;
+    __syncthreads();
+    if (wave == 0 && lane == 0) {
+        float amax = smem8[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) amax = fmaxf(amax, smem8[w]);
+        const float a_n = fp8stream_row_scale_from_absmax(amax);
+        smem8[0] = a_n;
+        *scale_slot = a_n;
+    }
+    __syncthreads();
+    const float inv_a = 1.0f / smem8[0];
+    #pragma unroll
+    for (int gi = 0; gi < Groups; ++gi) {
+        const int group = first_group + gi * group_stride;
+        if (group >= (K >> 8)) continue;
+        const int k0 = group * 256 + lane * 8;
+        float lane_parts[2];
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int j = half * 4;
+            const float v0 = held[gi][j] * inv_a;
+            const float v1 = held[gi][j + 1] * inv_a;
+            const float v2 = held[gi][j + 2] * inv_a;
+            const float v3 = held[gi][j + 3] * inv_a;
+            unsigned int pack = 0u;
+            pack = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, pack, false);
+            pack = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pack, true);
+            *reinterpret_cast<unsigned int*>(out_row + k0 + j) = pack;
+            // gfx1201 packed E4M3 decode is bit-exact to the software table
+            // for every code (including subnormals); retain the four-term
+            // left-associative sum from the production packer.
+            typedef float fp8stream_f32x2 __attribute__((ext_vector_type(2)));
+            const fp8stream_f32x2 lo = __builtin_amdgcn_cvt_pk_f32_fp8(pack, 0);
+            const fp8stream_f32x2 hi = __builtin_amdgcn_cvt_pk_f32_fp8(pack, 1);
+            lane_parts[half] = lo[0] + lo[1] + hi[0] + hi[1];
+        }
+        // Each lane owns two adjacent production lanes (four decoded bytes
+        // each). The incumbent XOR tree's strides 16,8,4,2 become owner
+        // strides 8,4,2,1, independently in the lower/upper 16 lanes.
+        // Its final stride 1 combines our even/odd register parts. This
+        // preserves every f32 addition order without gathering 32 lanes.
+        float even = lane_parts[0];
+        float odd = lane_parts[1];
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1) {
+            even += __shfl_xor(even, off);
+            odd += __shfl_xor(odd, off);
+        }
+        if (lane == 0) sums_row[group * 2] = even + odd;
+        if (lane == 16) sums_row[group * 2 + 1] = even + odd;
+    }
+}
+
 #endif // HIPFIRE_MQ4V2_FP8_PRODUCER_PACK_HIP
