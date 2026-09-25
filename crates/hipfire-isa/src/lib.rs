@@ -5,7 +5,7 @@
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
 pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco;
-pub mod kernels { pub mod iu4_k1; pub mod iu4_gemm; }
+pub mod kernels { pub mod iu4_k1; pub mod iu4_gemm; pub mod fp8_gemm; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;
 #[cfg(feature="toolchain")] pub mod audit;
@@ -21,6 +21,10 @@ use sha2::{Sha256,Digest};
 #[derive(Clone)] pub struct Builder { pub spec:KernelSpec,pub regs:RegPlan,pub program:Program,pub ledger:Ledger,pub lds:Lds,
  pub waits:Vec<WaitProof>,pub hazards:Vec<HazardProof>,pub clauses:Vec<plan::ClauseProof>,pub barriers:Vec<plan::BarrierProof>,pub loop_fixpoints:Vec<plan::LoopFixpoint>,
  hazard:Gfx12Sgpr,gfx11_hazard:Gfx11Hazards,labels:Vec<String>,current_label:String,lds_access_allowed:bool,previous_wmma_dst:Option<reg::RegRef>,pending_barrier:Option<Vec<Transition>>,}
+// RDNA4 ISA §5.7.1: bits 15:8 are LOADcnt, bits 7:0 are DScnt.
+fn load_ds_wait_imm(load_count:u8,ds_count:u8)->u16 {
+ (u16::from(load_count)<<8)|u16::from(ds_count)
+}
 impl Builder {
  pub fn new(spec:KernelSpec,regs:RegPlan)->Self {let arch=spec.arch;Self{spec,regs,program:Program{arch,instructions:vec![]},ledger:Ledger::default(),lds:Lds::default(),waits:vec![],hazards:vec![],clauses:vec![],barriers:vec![],loop_fixpoints:vec![],hazard:Gfx12Sgpr::default(),gfx11_hazard:Gfx11Hazards::default(),labels:vec!["entry".into()],current_label:"entry".into(),lds_access_allowed:false,previous_wmma_dst:None,pending_barrier:None}}
  pub fn label(&mut self,name:&str)->Result<(),String>{if self.labels.iter().any(|l|l==name){return Err(format!("duplicate label {name}"))}self.labels.push(name.into());self.current_label=name.into();self.program.instructions.push(Instruction::new(format!("{name}:"),vec![],vec![]));Ok(())}
@@ -33,7 +37,7 @@ impl Builder {
    if let (Some(load),Some(ds))=(load,ds){
     let (load_count,load_reason)=(required[load].1,required[load].2.clone());
     let (ds_count,ds_reason)=(required[ds].1,required[ds].2.clone());
-    let text=format!("s_wait_loadcnt_dscnt {:#x}",u16::from(ds_count)<<8|u16::from(load_count));
+    let text=format!("s_wait_loadcnt_dscnt {:#x}",load_ds_wait_imm(load_count,ds_count));
     let pc_index=self.program.instructions.len();
     self.program.instructions.push(Instruction::new(text.clone(),vec![],vec![]));
     self.waits.push(WaitProof{pc_index,insn:text.clone(),counter:Counter::Load,count:load_count,reason:load_reason});
@@ -130,4 +134,14 @@ impl Builder {
  /// Finish only after every declared lifetime has both endpoints and all live aliases are disjoint.
  pub fn finish(self)->Result<Emitted,String>{if self.pending_barrier.is_some(){return Err("unmatched barrier signal".into())}if self.program.instructions.last().is_none_or(|i|i.mnemonic()!="s_endpgm"){return Err("kernel must end with s_endpgm".into())}if !self.ledger.is_empty(){return Err("outstanding memory operations: wait or end the kernel before finish".into())}self.regs.verify_lifetimes(&self.labels)?;if self.regs.next_free_vgpr()>self.regs.vgpr_budget||self.regs.next_free_sgpr()>self.regs.sgpr_budget {return Err("register plan exceeds budget".into())}let text=emit::assembly(&self.spec,&self.regs,&self.program)?;let hash=format!("{:x}",Sha256::digest(text.as_bytes()));let mut shape=IsaShape {instructions:self.program.instructions.len(),next_free_vgpr:self.regs.next_free_vgpr(),next_free_sgpr:self.regs.next_free_sgpr(),waits:self.waits.len()+self.hazards.len(),barriers:self.barriers.len(),..Default::default()};for i in &self.program.instructions{let name=i.mnemonic();if name.starts_with("v_dual_"){shape.vopd_pairs+=1;shape.valu_slots+=1}else if name.starts_with("v_wmma_"){shape.wmma+=1}else if name.starts_with('v'){shape.valu_slots+=1}if name.starts_with("ds_"){shape.ds+=1}if name.starts_with("buffer_")||name.starts_with("global_"){shape.vmem+=1}}
  let proof=BuilderProof{kernel_id:self.spec.kernel_id,variant:self.spec.variant,arch:self.spec.arch,builder_crate_version:env!("CARGO_PKG_VERSION").into(),builder_git_sha:option_env!("HIPFIRE_BUILDER_GIT_SHA").unwrap_or("unknown").into(),reg_plan:self.regs.ranges,next_free_vgpr:shape.next_free_vgpr,next_free_sgpr:shape.next_free_sgpr,waits:self.waits,hazards:self.hazards,clauses:self.clauses,vopd_pairs:shape.vopd_pairs,lds_slots:self.lds.slots,barriers:self.barriers,loop_fixpoints:self.loop_fixpoints,forbidden_mnemonics_checked:vec!["s_waitcnt (gfx12)".into(),"scratch_*".into()],s_text_sha256:hash};Ok(Emitted{s_text:text,proof,shape})}
+}
+
+#[cfg(test)]
+mod wait_encoding_tests {
+    use super::load_ds_wait_imm;
+
+    #[test]
+    fn asymmetric_load_ds_wait_fields() {
+        assert_eq!(load_ds_wait_imm(7,3),0x703);
+    }
 }

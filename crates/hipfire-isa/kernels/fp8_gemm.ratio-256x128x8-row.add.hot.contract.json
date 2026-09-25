@@ -1,0 +1,27 @@
+{
+  "symbol": "gemm_mq4g256v2_fp8_add_row_b1",
+  "counts": {
+    "v_wmma_f32_16x16x16_fp8_fp8": 256,
+    "v_dual_mul_f32": 128,
+    "s_barrier_signal": 4,
+    "s_barrier_wait": 4,
+    "s_wait_alu": {
+      "max": 8
+    }
+  },
+  "forbidden": [
+    "scratch_*",
+    "v_wmma_i32*",
+    "v_swmmac*",
+    "v_perm*",
+    "v_bfe*",
+    "s_waitcnt"
+  ],
+  "vgpr_max": 192,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true,
+  "start_label": ".Lfp8_ratio_256x128x8_row_add_loop",
+  "end_label": ".Lfp8_ratio_256x128x8_row_add_loop_end"
+}

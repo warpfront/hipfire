@@ -95,6 +95,31 @@ fn run_audit(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     Ok(())
 }
 
+fn check_combined_waits(kernel: &serde_json::Value) -> Result<(), String> {
+    let Some(waits) = kernel["waits"].as_array() else { return Ok(()) };
+    for wait in waits {
+        let Some(text) = wait["insn"].as_str() else { continue };
+        let Some(imm) = text.strip_prefix("s_wait_loadcnt_dscnt 0x") else { continue };
+        let encoded = u16::from_str_radix(imm, 16).map_err(|_| "invalid combined-wait proof immediate")?;
+        let (field, shift) = match wait["counter"].as_str() {
+            Some("Load") => ("Load", 8),
+            Some("Ds") => ("Ds", 0),
+            _ => return Err("combined-wait proof has the wrong counter".into()),
+        };
+        let count = wait["count"].as_u64().ok_or("combined-wait proof lacks count")?;
+        if u64::from((encoded >> shift) & 0x3f) != count {
+            return Err(format!("combined-wait {field} field disagrees with the builder proof"));
+        }
+        let siblings = waits.iter().filter(|other| other["pc_index"] == wait["pc_index"]
+            && other["insn"] == wait["insn"]).count();
+        if siblings != 2 || !waits.iter().any(|other| other["pc_index"] == wait["pc_index"]
+            && other["insn"] == wait["insn"] && other["counter"] != wait["counter"]) {
+            return Err("combined-wait proof requires one Load and one Ds field".into())
+        }
+    }
+    Ok(())
+}
+
 fn proof_binding(proof: &[u8], source: &[u8], arch: &str) -> Result<(String, String), String> {
     let decoded: serde_json::Value = serde_json::from_slice(proof).map_err(|e| e.to_string())?;
     let source_sha = format!("{:x}", Sha256::digest(source));
@@ -102,6 +127,11 @@ fn proof_binding(proof: &[u8], source: &[u8], arch: &str) -> Result<(String, Str
         || decoded["arch"].as_str() != Some(arch)
         || decoded["builder_crate_version"].as_str() != Some(env!("CARGO_PKG_VERSION")) {
         return Err("builder proof does not bind the emitted source, architecture and crate version".into());
+    }
+    if let Some(kernels) = decoded["kernels"].as_array() {
+        for kernel in kernels { check_combined_waits(kernel)?; }
+    } else {
+        check_combined_waits(&decoded)?;
     }
     let builder_sha = decoded["builder_git_sha"].as_str()
         .filter(|sha| !sha.is_empty()).ok_or("builder proof has no git SHA")?;
@@ -129,5 +159,28 @@ mod tests {
         assert!(proof_binding(&encoded, source, "gfx1201").is_ok());
         assert!(proof_binding(&encoded, b"s_nop 0\ns_endpgm\n", "gfx1201").is_err());
         assert!(proof_binding(&encoded, source, "gfx1100").is_err());
+    }
+
+    #[test]
+    fn combined_wait_proof_rejects_swapped_fields() {
+        let source = b"s_wait_loadcnt_dscnt 0x703\ns_endpgm\n";
+        let base = serde_json::json!({
+            "s_text_sha256": format!("{:x}", Sha256::digest(source)),
+            "arch": "gfx1201",
+            "builder_crate_version": env!("CARGO_PKG_VERSION"),
+            "builder_git_sha": "abc123",
+            "waits": [
+                {"pc_index": 0, "insn": "s_wait_loadcnt_dscnt 0x703", "counter": "Load", "count": 7},
+                {"pc_index": 0, "insn": "s_wait_loadcnt_dscnt 0x703", "counter": "Ds", "count": 3}
+            ]
+        });
+        assert!(proof_binding(&serde_json::to_vec(&base).unwrap(), source, "gfx1201").is_ok());
+        let mut duplicate = base.clone();
+        duplicate["waits"][1] = duplicate["waits"][0].clone();
+        assert!(proof_binding(&serde_json::to_vec(&duplicate).unwrap(), source, "gfx1201").is_err());
+        let mut swapped = base;
+        swapped["waits"][0]["count"] = serde_json::json!(3);
+        swapped["waits"][1]["count"] = serde_json::json!(7);
+        assert!(proof_binding(&serde_json::to_vec(&swapped).unwrap(), source, "gfx1201").is_err());
     }
 }

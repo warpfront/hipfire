@@ -27,7 +27,7 @@ impl Arch {
         }
     }
     pub fn check_mnemonic(self, mnemonic: &str) -> Result<(), String> {
-        if (self.gfx12() && (mnemonic == "s_waitcnt" || mnemonic == "s_waitcnt_vscnt")) || (!self.gfx12() && (mnemonic.starts_with("s_wait_loadcnt") || mnemonic.starts_with("s_wait_storecnt") || mnemonic.starts_with("s_wait_dscnt") || mnemonic.starts_with("s_wait_kmcnt") || mnemonic == "s_wait_alu" || mnemonic.starts_with("v_swmmac") || mnemonic == "v_wmma_i32_16x16x32_iu4" || mnemonic == "global_inv" || mnemonic == "s_barrier_signal" || mnemonic == "s_barrier_wait" || mnemonic == "s_add_f32" || mnemonic == "s_mul_f32" || mnemonic == "v_s_rcp_f32")) || (self.gfx12() && (mnemonic == "s_barrier" || mnemonic.starts_with("buffer_gl") || mnemonic == "s_waitcnt_depctr")) {
+        if (self.gfx12() && (mnemonic == "s_waitcnt" || mnemonic == "s_waitcnt_vscnt")) || (!self.gfx12() && (mnemonic.starts_with("s_wait_loadcnt") || mnemonic.starts_with("s_wait_storecnt") || mnemonic.starts_with("s_wait_dscnt") || mnemonic.starts_with("s_wait_kmcnt") || mnemonic == "s_wait_alu" || mnemonic.starts_with("v_swmmac") || mnemonic == "v_wmma_f32_16x16x16_fp8_fp8" || mnemonic == "v_wmma_i32_16x16x32_iu4" || mnemonic == "global_inv" || mnemonic == "s_barrier_signal" || mnemonic == "s_barrier_wait" || mnemonic == "s_add_f32" || mnemonic == "s_mul_f32" || mnemonic == "v_s_rcp_f32")) || (self.gfx12() && (mnemonic == "s_barrier" || mnemonic.starts_with("buffer_gl") || mnemonic == "s_waitcnt_depctr")) {
             return Err(format!("{mnemonic} is unsupported on {}", self.name()));
         }
         Ok(())

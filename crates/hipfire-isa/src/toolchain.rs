@@ -86,6 +86,7 @@ pub struct IsaShapeContract {
     #[serde(default)] pub require_wave32: bool,
     #[serde(default)] pub require_zero_spills: bool,
     #[serde(default)] pub require_zero_private: bool,
+    #[serde(default)] pub launch_dynamic_lds_bytes: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -97,6 +98,16 @@ pub struct IsaShapeResult {
     pub private_segment_fixed_size: u32,
     pub vgpr_spill_count: u32,
     pub sgpr_spill_count: u32,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub launch_dynamic_lds_bytes: Option<u32>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub max_lds_access_end: Option<u32>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub max_used_vgpr: Option<u32>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub max_used_sgpr: Option<u32>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub descriptor_vgpr_reservation: Option<u32>,
 }
 
 fn instruction(line: &str) -> Option<&str> {
@@ -382,10 +393,48 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             .inspect(&build.hsaco, arch).map_err(|e| e.to_string())?;
         let report = inspection.kernels.iter().find(|kernel| kernel.name == contract.symbol)
             .ok_or_else(|| format!("inspection missing kernel {}", contract.symbol))?;
-        let shape = check_shape(&build.disassembly, report, contract)?;
+        let mut shape = check_shape(&build.disassembly, report, contract)?;
         let kd = read_kd(&build.elf, &contract.symbol)?;
         if kd.private_segment_size != 0 || kd.group_segment_size != 0 || !kd.wave32 {
             return Err(format!("kernel descriptor violates custom-arm resources: {kd:?}"));
+        }
+        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") {
+            let mut highest_v=0u32;
+            let mut highest_s=0u32;
+            let mut in_symbol=false;
+            for line in build.disassembly.lines() {
+                let line=line.trim();
+                if line.ends_with(">:") && line.contains('<') {
+                    let label=line.split_once('<').and_then(|(_,rest)|rest.strip_suffix(">:")).unwrap_or("");
+                    if label==contract.symbol {in_symbol=true}
+                    else if in_symbol && !label.starts_with(".L") && !label.contains('+') {break}
+                }
+                if !in_symbol {continue}
+                let Some(insn)=instruction(line) else {continue};
+                let Some((_,operands))=insn.split_once(char::is_whitespace) else {continue};
+                for reg in crate::ledger_replay::registers(operands) {
+                    if reg<256 {highest_v=highest_v.max(u32::from(reg)+1)}
+                    else {highest_s=highest_s.max(u32::from(reg)-255)}
+                }
+            }
+            let descriptor_vgprs=((kd.compute_pgm_rsrc1&0x3f)+1)*8;
+            if highest_v>descriptor_vgprs || highest_v>report.vgpr_count
+                || highest_s>report.sgpr_count || descriptor_vgprs!=report.vgpr_count {
+                return Err(format!("F2 register use v{highest_v}/s{highest_s} exceeds descriptor/report reservation v{descriptor_vgprs}/s{}",report.sgpr_count));
+            }
+            shape.max_used_vgpr=Some(highest_v);
+            shape.max_used_sgpr=Some(highest_s);
+            shape.descriptor_vgpr_reservation=Some(descriptor_vgprs);
+        }
+        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") {
+            let dynamic=contract.launch_dynamic_lds_bytes.ok_or("F2 contract missing launch dynamic LDS bytes")?;
+            let source_text=fs::read_to_string(source).map_err(|e|e.to_string())?;
+            let max_end=crate::kernels::fp8_gemm::spec::check_lds_access(&source_text,&contract.symbol,dynamic)?;
+            if max_end>kd.group_segment_size+dynamic {
+                return Err(format!("F2 LDS access ends at {max_end} beyond launch allocation {}",kd.group_segment_size+dynamic));
+            }
+            shape.launch_dynamic_lds_bytes=Some(dynamic);
+            shape.max_lds_access_end=Some(max_end);
         }
         crate::ledger_replay::replay_waits(
             &fs::read_to_string(source).map_err(|e| e.to_string())?
