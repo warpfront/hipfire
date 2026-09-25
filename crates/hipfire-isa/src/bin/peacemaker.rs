@@ -42,9 +42,11 @@ fn run() -> Result<(), String> {
     if contract.is_some() && proof.is_none() {
         return Err("custom shape certification requires --proof".into());
     }
-    let proof_digest = proof.as_ref().map(|path| fs::read(path)
-        .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
-        .map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
+    let (proof_digest, builder_git_sha) = if let Some(path) = proof.as_ref() {
+        let proof_bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let source_bytes = fs::read(&source).map_err(|e| e.to_string())?;
+        proof_binding(&proof_bytes, &source_bytes, &arch)?
+    } else { (String::new(), String::new()) };
     let mut toolchain = Toolchain::default();
     if let Some(target) = host_target { toolchain.host_target = target; }
     if let Some(parent) = output.parent() {
@@ -52,7 +54,7 @@ fn run() -> Result<(), String> {
     }
     let build = assemble_link_bundle(&toolchain, &source, &output, &arch)?;
     certify(&toolchain, &build, &source, &arch, &manifest, contract.as_ref(),
-        &proof_digest, &git_sha())?;
+        &proof_digest, &builder_git_sha)?;
     if let Some(symbol) = descriptor {
         println!("{:?}", read_kd(&build.elf, &symbol)?);
     }
@@ -60,13 +62,39 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn git_sha() -> String {
-    std::process::Command::new("git").args(["rev-parse", "HEAD"])
-        .output().ok().filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|sha| sha.trim().to_owned()).unwrap_or_else(|| "unknown".into())
+fn proof_binding(proof: &[u8], source: &[u8], arch: &str) -> Result<(String, String), String> {
+    let decoded: serde_json::Value = serde_json::from_slice(proof).map_err(|e| e.to_string())?;
+    let source_sha = format!("{:x}", Sha256::digest(source));
+    if decoded["s_text_sha256"].as_str() != Some(source_sha.as_str())
+        || decoded["arch"].as_str() != Some(arch)
+        || decoded["builder_crate_version"].as_str() != Some(env!("CARGO_PKG_VERSION")) {
+        return Err("builder proof does not bind the emitted source, architecture and crate version".into());
+    }
+    let builder_sha = decoded["builder_git_sha"].as_str()
+        .filter(|sha| !sha.is_empty()).ok_or("builder proof has no git SHA")?;
+    Ok((format!("{:x}", Sha256::digest(proof)), builder_sha.to_owned()))
 }
 
 fn main() {
     if let Err(error) = run() { eprintln!("{error}"); std::process::exit(1); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_cannot_certify_another_source_or_architecture() {
+        let source = b"s_endpgm\n";
+        let proof = serde_json::json!({
+            "s_text_sha256": format!("{:x}", Sha256::digest(source)),
+            "arch": "gfx1201",
+            "builder_crate_version": env!("CARGO_PKG_VERSION"),
+            "builder_git_sha": "abc123",
+        });
+        let encoded = serde_json::to_vec(&proof).unwrap();
+        assert!(proof_binding(&encoded, source, "gfx1201").is_ok());
+        assert!(proof_binding(&encoded, b"s_nop 0\ns_endpgm\n", "gfx1201").is_err());
+        assert!(proof_binding(&encoded, source, "gfx1100").is_err());
+    }
 }
