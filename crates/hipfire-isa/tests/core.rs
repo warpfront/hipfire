@@ -160,3 +160,68 @@ fn gfx11_wave32_trans_and_sgpr_vmem_hazards() {
     assert_eq!(hazard.step(Pipeline::Vmem, "buffer_load_b32", &[s(4)], &[v(5)]), ["s_nop 4"]);
     assert!(hazard.step(Pipeline::Vmem, "buffer_load_b32", &[s(4)], &[v(6)]).is_empty());
 }
+
+#[test]
+fn typed_instruction_families_encode_on_both_architectures() {
+    use hipfire_isa::insn::{Wmma, Smem, Global, Vop1};
+    use hipfire_isa::reg::S;
+    for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
+        let instructions = [
+            Wmma::iu4(arch, V::<8>(0), V::<2>(8), V::<2>(10), None),
+            Ds::Load2Stride64B64.load(V::<4>(71).reg(), V::<1>(81), 0, 1).unwrap(),
+            Smem::LoadB256.load_b256(S::<8>(0), S::<2>(0), 0),
+            Global::load_b32(V::<1>(1), V::<1>(0), S::<2>(4)),
+            Vop1::CvtF32I32.emit(V::<1>(57), V::<1>(57)),
+        ];
+        let input = instructions.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join("\n");
+        let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
+            .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={}", arch.name()), "-show-encoding"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success(), "{}: {}", arch.name(), String::from_utf8_lossy(&result.stderr));
+        assert_eq!(String::from_utf8(result.stdout).unwrap().matches("encoding: [").count(), instructions.len());
+    }
+}
+
+#[test]
+fn hip_hidden_kernarg_metadata_assembles() {
+    use hipfire_isa::{Builder, KernelSpec, KernargLayout};
+    let spec = KernelSpec {
+        kernel_id: "metadata_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
+        symbol: "metadata_probe".into(),
+        kernargs: KernargLayout::new(16).pointer("arg", 0).hidden("block_x", 8, 4, "hidden_block_count_x"),
+        user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+    };
+    let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
+    builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+    let emitted = builder.finish().unwrap();
+    let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
+        .args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1201", "-filetype=obj", "-o", "/dev/null"])
+        .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(emitted.s_text.as_bytes()).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn gfx11_descriptor_extras_assemble() {
+    use hipfire_isa::{Builder, KernelSpec, KernargLayout};
+    for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+        let spec = KernelSpec {
+            kernel_id: "descriptor_probe".into(), variant: "default".into(), arch,
+            symbol: "descriptor_probe".into(), kernargs: KernargLayout::new(8).pointer("arg", 0),
+            user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+        };
+        let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
+        builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+        let emitted = builder.finish().unwrap();
+        let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
+            .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={}", arch.name()), "-filetype=obj", "-o", "/dev/null"])
+            .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(emitted.s_text.as_bytes()).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success(), "{}: {}", arch.name(), String::from_utf8_lossy(&result.stderr));
+    }
+}

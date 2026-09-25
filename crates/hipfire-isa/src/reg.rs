@@ -38,7 +38,7 @@ impl RegPlan {
     pub fn scratch_pool(&mut self, base: u8, len: u8) -> Result<(),String> { if u16::from(base)+u16::from(len)>self.vgpr_budget { return Err("scratch pool exceeds VGPR budget".into()) } self.scratch=Some((base,len)); Ok(()) }
     fn add(&mut self,name:&'static str,kind:Kind,base:u8,len:u8,live:Live)->Result<(),String> {
         if !matches!(len,1|2|4|8) { return Err("register width must be 1, 2, 4 or 8".into()) }
-        if kind==Kind::S && ((len==2 && base%2!=0)||(len==4 && base%4!=0)) { return Err(format!("misaligned SGPR {base}:{len}")) }
+        if kind==Kind::S && len>1 && base%len!=0 { return Err(format!("misaligned SGPR {base}:{len}")) }
         let budget=if kind==Kind::V { self.vgpr_budget } else { self.sgpr_budget };
         if u16::from(base)+u16::from(len)>budget { return Err(format!("{name} exceeds register budget")) }
         let reg=RegRef { kind,base,len };
