@@ -93,6 +93,17 @@ fn every_module_assembles_with_zero_diagnostics() {
     }
 }
 
+/// The independent source-text wait replay (the one `peacemaker custom
+/// build` runs) accepts every emitted module.
+#[cfg(feature = "toolchain")]
+#[test]
+fn module_waits_pass_independent_replay() {
+    for (tile, _) in POINTS {
+        let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, Arch::Gfx1201).unwrap();
+        hipfire_isa::ledger_replay::replay_waits(&text).unwrap_or_else(|e| panic!("{tile:?}: {e}"));
+    }
+}
+
 #[test]
 fn closed_and_dropped_axes_are_rejected() {
     for spec in [

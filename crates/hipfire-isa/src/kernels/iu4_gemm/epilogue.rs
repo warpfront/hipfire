@@ -108,9 +108,11 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
             if silu_region.temps > region::SILU_TEMPS || silu_region.masks > region::SILU_MASKS { return Err("SiLU region needs more temporaries than planned".into()) }
             for nb in 0..4 {
                 if nb > 0 { op(b, "s_mov_b32 exec_lo, -1", &[], &[])?; }
-                // Output quads double-buffer so the next block's values do not
-                // wait for this block's stores.
-                let out = g.cacc + 16 + 8 * (nb as u8 % 2);
+                // One output octet per column block (v16..v47): no register
+                // is rewritten while a store reads it, so no store-counter
+                // wait (whose completion order the ledger replay rightly
+                // does not assume) is ever needed.
+                let out = g.cacc + 16 + 8 * nb as u8;
                 for j in (0..8u8).step_by(2) {
                     let binds: Vec<_> = (0..2u8).map(|s| Binding {
                         g: acc(nb, 0, 0) + j + s, u: acc(nb, 1, 0) + j + s, out: out + j + s,
