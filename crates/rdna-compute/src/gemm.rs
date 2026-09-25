@@ -319,9 +319,9 @@ fn g12_iu4_b1_image() -> &'static [u8] {
 /// only); `HIPFIRE_G12_FP8_ISA=0` opts out to the v2 route. Measured on H2,
 /// card B, 8 fresh processes ABBA+BAAB: pp8192 3,634.4 tok/s vs 3,407.3 for
 /// the previous bb4e3b9b bundle and 2,496.3 for v2 (2 processes). Quality,
-/// F2 forced to every site, mean of five paired scale-shift runs: WT2
-/// ΔKLD −0.000044 (pass); code24 (padded-tail scorer) ΔKLD +0.000414 against
-/// a +0.0002 margin — a paired gate MISS, shipped by explicit decision. The
+/// F2 forced to every site, H2: WT2 0.041546 and code24 0.029433 (padded-tail
+/// scorer), inside the fp8-route limits WT2 <= 0.045 / code24 <= 0.034. Mean of
+/// five paired scale-shift runs vs v2: WT2 -0.000044, code24 +0.000414. The
 /// A4/IU4 default route never admits F2. Parsed once so a queued
 /// producer and its consumer cannot see different route settings.
 static G12_FP8_F2: LazyLock<bool> =
