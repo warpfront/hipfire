@@ -281,8 +281,8 @@ fn try_gfx12_rmsnorm_quant_fused_prepared(
 /// path. Admission is uniform `MQ4G256V2Lloyd` next-linear plus the shared
 /// `fp8_stream_active` gate (exact gfx1201, eager, batch >= 64,
 /// K % 256 == 0; partial N tiles are masked in-kernel, so odd tails run
-/// unpadded). The F32 `x_rot` store is always written, so every
-/// downstream reader is preserved byte-for-byte.
+/// unpadded). On `HIPFIRE_FP8_PROD_INREG=1` the producer leaves `x_rot`
+/// untouched; the admitted consumer reads only the prepared FP8 planes.
 fn try_gfx12_fp8_stream_rmsnorm_prepared(
     gpu: &mut Gpu,
     x: &GpuTensor,
@@ -310,10 +310,11 @@ fn try_gfx12_fp8_stream_rmsnorm_prepared(
     )?;
     Ok(Some(prep))
 }
-/// gfx1201 FP8-stream down-projection producer.  The admitted Lloyd route
-/// writes the exact F32 SwiGLU/AWQ/FWHT row plus the standalone packer's
-/// scale_mode=1 planes, allowing the residual GEMM to consume a prepared
-/// handle without a second launch.
+/// gfx1201 FP8-stream down-projection producer. The admitted Lloyd route
+/// writes the exact scale_mode=1 FP8 planes for the residual GEMM.
+/// `HIPFIRE_FP8_PROD_INREG=1` retains the FWHT row in registers and leaves
+/// `x_rot` untouched. The h-first variant awaits a fused fp8 gate/up epilogue;
+/// this route still receives separate gate and up tensors.
 fn try_gfx12_fp8_stream_silu_prepared(
     gpu: &mut Gpu,
     w_down: &hipfire_runtime::llama::WeightTensor,
@@ -405,7 +406,8 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     Ok(Some(prep))
 }
 /// gfx1201 FP8-stream FA output producer.  Folds sigmoid, optional AWQ,
-/// FWHT rotation and the scale_mode=1 pack into one row-wide launch.
+/// FWHT rotation and the scale_mode=1 pack into one row-wide launch;
+/// `HIPFIRE_FP8_PROD_INREG=1` keeps the row in registers and skips `x_rot`.
 fn try_gfx12_fp8_stream_sigmoid_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
@@ -516,7 +518,8 @@ fn try_gfx12_gdn_quant_fused_prepared(
     Ok(Some(prep))
 }
 /// gfx1201 FP8-stream LA output producer.  Replaces gated_norm + AWQ/FWHT
-/// rotate + standalone pack for Lloyd residual consumers.
+/// rotate + standalone pack for Lloyd residual consumers. With
+/// `HIPFIRE_FP8_PROD_INREG=1`, the FP8 prepared consumer does not read `x_rot`.
 #[allow(clippy::too_many_arguments)]
 fn try_gfx12_fp8_stream_gdn_prepared(
     gpu: &mut Gpu,

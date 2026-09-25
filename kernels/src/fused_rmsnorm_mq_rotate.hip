@@ -63,6 +63,12 @@
 #if defined(HIPFIRE_RMSNORM_P1A_BATCHED) && defined(HIPFIRE_RMSNORM_FOLD)
 #error "HIPFIRE_RMSNORM_P1A_BATCHED batches plain x loads only"
 #endif
+#ifdef HIPFIRE_FP8_PROD_SHORT
+#define HIPFIRE_RMSNORM_FP8_GROUPS 3
+#else
+#define HIPFIRE_RMSNORM_FP8_GROUPS 9
+#endif
+
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
@@ -116,8 +122,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 #endif
 #ifdef HIPFIRE_IU4_SIDECAR
           float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
+#elif defined(HIPFIRE_FP8_PROD_INREG)
+    if (K > HIPFIRE_RMSNORM_FP8_GROUPS * 2048 || (K & 255)) return;
+    float held[HIPFIRE_RMSNORM_FP8_GROUPS][8];
 #else
-          float* x_rot_b = x_rot + batch_off;
+    float* x_rot_b = x_rot + batch_off;
 #endif
 
     // Phase 1a: accumulate sum-of-squares (same stride/order as baseline).
@@ -217,7 +226,12 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 
     // Phase 2: FWHT. First group uses prefetched x/w; later groups (if any)
     // load as before. signs already in registers.
+#ifdef HIPFIRE_FP8_PROD_INREG
+    #pragma unroll
+    for (int gi = 0; gi < HIPFIRE_RMSNORM_FP8_GROUPS; gi++) {
+#else
     for (int gi = 0; gi < groups_per_warp; gi++) {
+#endif
         const int group = warp_group_start + gi;
         if (group >= groups_total) break;
 
@@ -349,6 +363,10 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
             f0, f1, f2, f3, f4, f5, f6, f7,
             x_i4, group, (int)blockIdx.x, N, lane_id);
 #else
+#ifdef HIPFIRE_FP8_PROD_INREG
+        held[gi][0] = f0; held[gi][1] = f1; held[gi][2] = f2; held[gi][3] = f3;
+        held[gi][4] = f4; held[gi][5] = f5; held[gi][6] = f6; held[gi][7] = f7;
+#else
         float4 out0;
         float4 out1;
         out0.x = f0;
@@ -362,6 +380,7 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         *reinterpret_cast<float4*>(x_rot_b + base) = out0;
         *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
 #endif
+#endif
     }
     #ifdef HIPFIRE_FP8_STREAM
     // FP8 stream: whole-row scale + pack from the just-written F32 row
@@ -371,17 +390,19 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         const int token = (int)blockIdx.x;
         const long long frow = (long long)token * K;
         const int gpr = K >> 8;
+#ifdef HIPFIRE_FP8_PROD_INREG
+        fp8stream_pack_row_inreg(
+            held, x_fp8 + frow, fp8_half_sums + (long long)token * (K >> 7),
+            fp8_row_scales + token, row_amax, reduce, K, lane_id, warp_id,
+            warp_group_start, 1);
+#else
         fp8stream_pack_row_from_f32(
             x_rot_b,
             x_fp8 + frow,
             fp8_half_sums + (long long)token * gpr * 2,
             fp8_row_scales + token,
-            row_amax,
-            reduce,
-            K,
-            tid,
-            lane_id,
-            warp_id);
+            row_amax, reduce, K, tid, lane_id, warp_id);
+#endif
     }
     #endif
 }

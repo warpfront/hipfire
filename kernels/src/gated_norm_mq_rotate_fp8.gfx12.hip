@@ -42,7 +42,12 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
     const long long row_off = (long long)token * K;
     const float* x_b = x + row_off;
     const float* z_b = z + row_off;
+#ifndef HIPFIRE_FP8_PROD_INREG
     float* x_rot_b = x_rot + row_off;
+#else
+    if (K > 18432 || (K & 255)) return;
+    float held[9][8];
+#endif
     extern __shared__ float smem[];
     float* normalized = smem;
     float* pack_smem = smem + K;
@@ -75,7 +80,14 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
 
     float row_amax = 0.0f;
     const int groups_total = K >> 8;
+#ifdef HIPFIRE_FP8_PROD_INREG
+    #pragma unroll
+    for (int gi = 0; gi < 9; ++gi) {
+        const int group = wave + gi * 8;
+        if (group >= groups_total) continue;
+#else
     for (int group = wave; group < groups_total; group += 8) {
+#endif
         const int d0 = lane * 8;
         const int base = group * 256 + d0;
         const float4 x0 = *reinterpret_cast<const float4*>(normalized + base);
@@ -132,6 +144,10 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
         float f5 = v5 * scale * s21.y;
         float f6 = v6 * scale * s21.z;
         float f7 = v7 * scale * s21.w;
+#ifdef HIPFIRE_FP8_PROD_INREG
+        held[gi][0] = f0; held[gi][1] = f1; held[gi][2] = f2; held[gi][3] = f3;
+        held[gi][4] = f4; held[gi][5] = f5; held[gi][6] = f6; held[gi][7] = f7;
+#else
         x_rot_b[base    ] = f0;
         x_rot_b[base + 1] = f1;
         x_rot_b[base + 2] = f2;
@@ -140,6 +156,7 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
         x_rot_b[base + 5] = f5;
         x_rot_b[base + 6] = f6;
         x_rot_b[base + 7] = f7;
+#endif
         row_amax = fmaxf(row_amax, fabsf(f0));
         row_amax = fmaxf(row_amax, fabsf(f1));
         row_amax = fmaxf(row_amax, fabsf(f2));
@@ -151,15 +168,15 @@ void HIPFIRE_GATED_NORM_FP8_KERNEL(
     }
 
     const int gpr = K >> 8;
+#ifdef HIPFIRE_FP8_PROD_INREG
+    fp8stream_pack_row_inreg(
+        held, x_fp8 + row_off,
+        fp8_half_sums + (long long)token * (K >> 7),
+        fp8_row_scales + token, row_amax, pack_smem, K, lane, wave, wave, 8);
+#else
     fp8stream_pack_row_from_f32(
-        x_rot_b,
-        x_fp8 + row_off,
-        fp8_half_sums + (long long)token * gpr * 2,
-        fp8_row_scales + token,
-        row_amax,
-        pack_smem,
-        K,
-        tid,
-        lane,
-        wave);
+        x_rot_b, x_fp8 + row_off,
+        fp8_half_sums + (long long)token * (K >> 7),
+        fp8_row_scales + token, row_amax, pack_smem, K, tid, lane, wave);
+#endif
 }

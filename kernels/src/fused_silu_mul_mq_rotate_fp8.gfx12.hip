@@ -43,15 +43,43 @@ void HIPFIRE_SILU_FP8_KERNEL(
     const int groups_total = K >> 8;
     const long long row_off = (long long)token * K;
     const float* gate_b = gate + row_off;
+#ifndef HIPFIRE_SILU_FP8_HIN
     const float* up_b = up + row_off;
+#endif
+#ifndef HIPFIRE_FP8_PROD_INREG
     float* x_rot_b = x_rot + row_off;
+#else
+    if (K > 18432 || (K & 255)) return;
+    float held[9][8];
+#endif
     float row_amax = 0.0f;
 
+#ifdef HIPFIRE_FP8_PROD_INREG
+    #pragma unroll
+    for (int gi = 0; gi < 9; ++gi) {
+        const int group = wave + gi * 8;
+        if (group >= groups_total) continue;
+#else
     for (int group = wave; group < groups_total; group += 8) {
+#endif
         const int d0 = lane * 8;
         const int base = group * 256 + d0;
 
+        #ifdef HIPFIRE_SILU_FP8_HIN
+        #define SILU_MUL(g, u) (g)
+        #else
         #define SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
+        #endif
+#ifdef HIPFIRE_SILU_FP8_HIN
+        float g0 = gate_b[base];     float u0 = 0.0f;
+        float g1 = gate_b[base + 1]; float u1 = 0.0f;
+        float g2 = gate_b[base + 2]; float u2 = 0.0f;
+        float g3 = gate_b[base + 3]; float u3 = 0.0f;
+        float g4 = gate_b[base + 4]; float u4 = 0.0f;
+        float g5 = gate_b[base + 5]; float u5 = 0.0f;
+        float g6 = gate_b[base + 6]; float u6 = 0.0f;
+        float g7 = gate_b[base + 7]; float u7 = 0.0f;
+#else
         float g0 = gate_b[base];     float u0 = up_b[base];
         float g1 = gate_b[base + 1]; float u1 = up_b[base + 1];
         float g2 = gate_b[base + 2]; float u2 = up_b[base + 2];
@@ -60,6 +88,7 @@ void HIPFIRE_SILU_FP8_KERNEL(
         float g5 = gate_b[base + 5]; float u5 = up_b[base + 5];
         float g6 = gate_b[base + 6]; float u6 = up_b[base + 6];
         float g7 = gate_b[base + 7]; float u7 = up_b[base + 7];
+#endif
 #ifdef HIPFIRE_SILU_FP8_AWQ
         float v0 = (SILU_MUL(g0, u0) / awq_scale[base    ]) * signs1[d0    ];
         float v1 = (SILU_MUL(g1, u1) / awq_scale[base + 1]) * signs1[d0 + 1];
@@ -120,6 +149,10 @@ void HIPFIRE_SILU_FP8_KERNEL(
         float f6 = v6 * s * signs2[d0 + 6];
         float f7 = v7 * s * signs2[d0 + 7];
 
+#ifdef HIPFIRE_FP8_PROD_INREG
+        held[gi][0] = f0; held[gi][1] = f1; held[gi][2] = f2; held[gi][3] = f3;
+        held[gi][4] = f4; held[gi][5] = f5; held[gi][6] = f6; held[gi][7] = f7;
+#else
         x_rot_b[base    ] = f0;
         x_rot_b[base + 1] = f1;
         x_rot_b[base + 2] = f2;
@@ -128,6 +161,7 @@ void HIPFIRE_SILU_FP8_KERNEL(
         x_rot_b[base + 5] = f5;
         x_rot_b[base + 6] = f6;
         x_rot_b[base + 7] = f7;
+#endif
         row_amax = fmaxf(row_amax, fabsf(f0));
         row_amax = fmaxf(row_amax, fabsf(f1));
         row_amax = fmaxf(row_amax, fabsf(f2));
@@ -140,15 +174,17 @@ void HIPFIRE_SILU_FP8_KERNEL(
 
     __shared__ float smem8[8];
     const int gpr = K >> 8;
+#ifdef HIPFIRE_FP8_PROD_INREG
+    fp8stream_pack_row_inreg(
+        held, x_fp8 + row_off,
+        fp8_half_sums + (long long)token * (K >> 7),
+        fp8_row_scales + token, row_amax, smem8, K, lane, wave, wave, 8);
+#else
     fp8stream_pack_row_from_f32(
         x_rot_b,
         x_fp8 + row_off,
-        fp8_half_sums + (long long)token * gpr * 2,
+        fp8_half_sums + (long long)token * (K >> 7),
         fp8_row_scales + token,
-        row_amax,
-        smem8,
-        K,
-        tid,
-        lane,
-        wave);
+        row_amax, smem8, K, tid, lane, wave);
+#endif
 }

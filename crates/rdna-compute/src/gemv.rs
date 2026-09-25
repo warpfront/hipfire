@@ -15,6 +15,10 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
         == Some("1")
 }
 
+fn fp8_prod_inreg(k: usize) -> bool {
+    k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", false)
+}
+
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
     let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
     let signs2 = crate::dispatch::gen_fwht_signs(1042, 256);
@@ -3529,9 +3533,9 @@ impl Gpu {
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx1201 FP8-stream producer: RMSNorm/FWHT + whole-row scale + E4M3
-    /// pack under the `_mq4v2_fp8_gfx12` entry symbols. `x_rot` is always
-    /// written (v1 keeps the F32 store, so every downstream reader is
-    /// preserved byte-for-byte). `awq = Some` selects the AWQ twin symbol.
+    /// pack. The opt-in in-register variant retains the F32 row only in
+    /// registers; its x_rot argument is not written and the prepared planes
+    /// must be the sole downstream input. `awq = Some` selects the AWQ twin.
     /// Grows the three MQ4v2 FP8 scratch planes (with pre-growth capture
     /// invalidation, mirroring `prepare_mq4v2_fp8_x`), launches the fused
     /// producer, and seals the pointers into [`crate::scratch::Mq4v2Fp8Prepared`]
@@ -3561,13 +3565,33 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (awq, fp8_prod_inreg(k), k <= 6144) {
+            (Some(_), true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
+            ),
+            (None, true, true) => (
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
+            ),
+            (Some(_), true, false) => (
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
+            ),
+            (None, true, false) => (
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_gfx12",
+            ),
+            (Some(_), false, _) => (
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            None => (
+            (None, false, _) => (
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12",
@@ -3699,10 +3723,10 @@ impl Gpu {
             scale_mode: 1,
         })
     }
-    /// gfx1201 FP8-stream producer for residual down projections.  Fuses the
-    /// incumbent SwiGLU/AWQ/FWHT producer with the scale_mode=1 MQ4v2 pack and
-    /// returns the three prepared planes without launching the standalone
-    /// packer.  The F32 rotated row is retained for byte-identical state.
+    /// gfx1201 FP8-stream producer for residual down projections. Fuses
+    /// SwiGLU/AWQ/FWHT with the scale_mode=1 MQ4v2 pack. Under
+    /// HIPFIRE_FP8_PROD_INREG=1, x_rot is not written; the prepared planes
+    /// are the only valid downstream output.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_silu_mul_rotate_mq_fp8_gfx12_batched(
         &mut self,
@@ -3710,6 +3734,33 @@ impl Gpu {
         up: &GpuTensor,
         awq: Option<&GpuTensor>,
         x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(
+            gate, Some(up), awq, Some(x_rot), k, batch_size,
+        )
+    }
+
+    /// The gate/up GEMM has already written h = silu(gate) * up; the producer
+    /// takes h as its first kernarg, with null up and x_rot kernargs.
+    pub fn fused_silu_hin_rotate_mq_fp8_gfx12_batched(
+        &mut self,
+        h: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(h, None, awq, None, k, batch_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_silu_rotate_mq_fp8_gfx12_batched_impl(
+        &mut self,
+        gate: &GpuTensor,
+        up: Option<&GpuTensor>,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
@@ -3726,9 +3777,17 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_fp8_gfx12_batched: need gfx1201, k%256==0 and n>0",
             ));
         }
+        let inreg = fp8_prod_inreg(k);
+        let h_input = up.is_none();
+        if h_input && (!inreg || x_rot.is_some()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_silu_hin_rotate_mq_fp8_gfx12_batched: needs in-register producer and no x_rot",
+            ));
+        }
         if gate.numel() < batch_size * k
-            || up.numel() < batch_size * k
-            || x_rot.numel() < batch_size * k
+            || up.is_some_and(|up| up.numel() < batch_size * k)
+            || x_rot.is_some_and(|x_rot| x_rot.numel() < batch_size * k)
             || awq.is_some_and(|scale| scale.numel() < k)
         {
             return Err(hip_bridge::HipError::new(
@@ -3737,13 +3796,33 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (awq, inreg, h_input) {
+            (Some(_), true, true) => (
+                "fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12",
+            ),
+            (None, true, true) => (
+                "fused_silu_mul_mq_rotate_hin_fp8_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_HIN_FP8_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_hin_fp8_gfx12",
+            ),
+            (Some(_), true, false) => (
+                "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
+            ),
+            (None, true, false) => (
+                "fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_INREG_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12",
+            ),
+            (Some(_), false, _) => (
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            None => (
+            (None, false, _) => (
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
@@ -3774,11 +3853,11 @@ impl Gpu {
             .scratch
             .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
         let mut gp = gate.buf.as_ptr();
-        let mut up = up.buf.as_ptr();
+        let mut up = up.map(|up| up.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let mut xrp = x_rot.buf.as_ptr();
+        let mut xrp = x_rot.map(|x_rot| x_rot.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut x8p = x_fp8_ptr;
         let mut sump = half_sums_ptr;
         let mut sclp = row_scales_ptr;
@@ -3850,7 +3929,9 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        self.invalidate_x_caches_for(xrp);
+        if !inreg {
+            self.invalidate_x_caches_for(xrp);
+        }
         result?;
         Ok(crate::scratch::Mq4v2Fp8Prepared {
             x_fp8: x_fp8_ptr,
@@ -4672,13 +4753,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let inreg = fp8_prod_inreg(k) && (k + 8) * 4 <= 65_536;
+        let (module, source, kernel) = match (awq, inreg) {
+            (Some(_), true) => (
+                "gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC,
+                "gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
+            ),
+            (None, true) => (
+                "gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_FP8_INREG_GFX12_SRC,
+                "gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12",
+            ),
+            (Some(_), false) => (
                 "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            None => (
+            (None, false) => (
                 "gated_norm_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_FP8_GFX12_SRC,
                 "gated_norm_mq_rotate_mq4v2_fp8_gfx12",
@@ -5311,7 +5403,8 @@ impl Gpu {
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ
-    /// divide.  Emits the exact rotated F32 row and MQ4v2 FP8 prepared planes.
+    /// divide. Emits MQ4v2 FP8 prepared planes; the opt-in in-register
+    /// variant does not write the rotated F32 row.
     #[allow(clippy::too_many_arguments)]
     pub fn rotate_x_mq_fp8_gfx12_batched(
         &mut self,
@@ -5346,23 +5439,43 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match (gate.is_some(), awq.is_some()) {
-            (false, false) => (
+        let (module, source, kernel) = match (gate.is_some(), awq.is_some(), fp8_prod_inreg(k)) {
+            (false, false, true) => (
+                "mq_rotate_x_mq4v2_fp8_inreg_gfx12",
+                kernels::MQ_ROTATE_X_FP8_INREG_GFX12_SRC,
+                "mq_rotate_x_mq4v2_fp8_inreg_gfx12",
+            ),
+            (false, true, true) => (
+                "rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12",
+                kernels::MQ_ROTATE_X_AWQ_FP8_INREG_GFX12_SRC,
+                "rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12",
+            ),
+            (true, false, true) => (
+                "sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_INREG_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gfx12",
+            ),
+            (true, true, true) => (
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_INREG_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12",
+            ),
+            (false, false, false) => (
                 "mq_rotate_x_mq4v2_fp8_gfx12",
                 kernels::MQ_ROTATE_X_FP8_GFX12_SRC,
                 "mq_rotate_x_mq4v2_fp8_gfx12",
             ),
-            (false, true) => (
+            (false, true, false) => (
                 "rotate_x_mq_awq_mq4v2_fp8_gfx12",
                 kernels::MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
                 "rotate_x_mq_awq_mq4v2_fp8_gfx12",
             ),
-            (true, false) => (
+            (true, false, false) => (
                 "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
                 kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_SRC,
                 "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
             ),
-            (true, true) => (
+            (true, true, false) => (
                 "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
                 kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
                 "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
