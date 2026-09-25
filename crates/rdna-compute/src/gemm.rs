@@ -302,6 +302,20 @@ fn g12_iu4_v3_enabled() -> bool {
     *G12_IU4_V3
 }
 
+/// Full-slab A-prefetch is opt-in until end-to-end measurements justify it.
+static A8_APF_K32: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A8_APF_K32", true));
+
+fn a8_module_source() -> (&'static str, &'static str) {
+    if *A8_APF_K32 {
+        ("gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC)
+    } else {
+        ("gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MqV2PrefillProjection {
     Qkvza,
@@ -20336,13 +20350,13 @@ impl Gpu {
         if self.arch != "gfx1201" || !self.mq4v2_symmetric || k == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(1, "A8 MMQ requires symmetric MQ4v2 and gfx1201 K%256=0"));
         }
-        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_i8_gfx12";
         let kernel = if add {
             "gemm_mq4g256v2_residual_mmq_i8_full_add"
         } else {
             "gemm_mq4g256v2_residual_mmq_i8_full_set"
         };
-        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC, kernel)?;
+        let (module, source) = a8_module_source();
+        self.ensure_kernel(module, source, kernel)?;
         let mut ap = a.buf.as_ptr();
         let mut xp = xq;
         let mut yp = y.buf.as_ptr();
@@ -20413,8 +20427,8 @@ impl Gpu {
         self.bind_thread()?;
         self.flush_residual_fold()?;
         const KERNEL: &str = "gemm_mq4g256v2_gate_up_silu_mmq_i8";
-        self.ensure_kernel("gemm_mq4g256v2_residual_mmq_i8_gfx12",
-            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC, KERNEL)?;
+        let (module, source) = a8_module_source();
+        self.ensure_kernel(module, source, KERNEL)?;
         let mut gp = gate.buf.as_ptr();
         let mut up = up.buf.as_ptr();
         let mut xp = xq;

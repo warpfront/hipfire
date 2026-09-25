@@ -3850,7 +3850,9 @@ pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::Schedu
     } else if arch == "gfx1201"
         && matches!(
             name,
-            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3" | "gemm_mq4g256v2_residual_mmq_i8_gfx12"
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3"
+                | "gemm_mq4g256v2_residual_mmq_i8_gfx12"
+                | "gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0"
         )
     {
         SchedulerProfile::IterativeIlp
@@ -3876,6 +3878,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
 
 /// gfx1201 A8 MQ4v2: standalone K128 int8 quantizer and all three GEMM entries.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx12.hip")
+);
+/// Full-slab A-prefetch variant (191 VGPR, 0 spills) for end-to-end screening.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC: &str = concat!(
+    "#define I8_APF_K32 0\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx12.hip")
 );

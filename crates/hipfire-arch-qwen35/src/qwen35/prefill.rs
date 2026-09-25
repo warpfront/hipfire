@@ -48,6 +48,73 @@ use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_batched_for;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
 
+/// Producer-emitted A8 RMSNorm/FWHT, selected only for uniform MQ4v2 weights.
+#[allow(clippy::too_many_arguments)]
+fn try_a8_rmsnorm_prepared(
+    gpu: &mut Gpu, x: &GpuTensor, weight: &GpuTensor,
+    next: &hipfire_runtime::llama::WeightTensor, k: usize, eps: f32, n: usize,
+) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
+    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k)
+        || next.gpu_dtype != DType::MQ4G256V2
+    {
+        return Ok(None);
+    }
+    let reservation = gpu.reserve_int8_mmq(k, n)?;
+    gpu.fused_rmsnorm_rotate_mq_i8_gfx12_batched(
+        x, weight, next.awq_scale.as_ref(), None, reservation, k, eps, n,
+    ).map(Some)
+}
+
+fn try_a8_hin_prepared(
+    gpu: &mut Gpu, down: &hipfire_runtime::llama::WeightTensor,
+    h: &GpuTensor, k: usize, n: usize,
+) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
+    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k)
+        || down.gpu_dtype != DType::MQ4G256V2 {
+        return Ok(None);
+    }
+    let Some(awq) = down.awq_scale.as_ref() else { return Ok(None) };
+    let reservation = gpu.reserve_int8_mmq(k, n)?;
+    gpu.fused_silu_hin_rotate_mq_i8_gfx12_batched(h, awq, reservation, k, n).map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_a8_gdn_prepared(
+    gpu: &mut Gpu, wo: &hipfire_runtime::llama::WeightTensor,
+    x: &GpuTensor, z: &GpuTensor, weight: &GpuTensor,
+    n_heads: usize, head_dim: usize, eps: f32, k: usize, n: usize,
+    epilogue: &BatchEpilogue<'_>,
+) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
+    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k)
+        || wo.gpu_dtype != DType::MQ4G256V2
+        || !matches!(epilogue, BatchEpilogue::Residual)
+        || head_dim != 128 || n_heads * head_dim != k {
+        return Ok(None);
+    }
+    let reservation = gpu.reserve_int8_mmq(k, n)?;
+    gpu.gated_norm_rotate_mq_i8_gfx12_batched(
+        x, z, weight, wo.awq_scale.as_ref(), None, reservation,
+        n_heads, head_dim, eps, k, n,
+    ).map(Some)
+}
+
+fn try_a8_sigmoid_prepared(
+    gpu: &mut Gpu, wo: &hipfire_runtime::llama::WeightTensor,
+    attn: &GpuTensor, gate: &GpuTensor, k: usize, n: usize,
+    epilogue: &BatchEpilogue<'_>,
+) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
+    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k)
+        || wo.gpu_dtype != DType::MQ4G256V2
+        || !matches!(epilogue, BatchEpilogue::Residual) {
+        return Ok(None);
+    }
+    let Some(awq) = wo.awq_scale.as_ref() else { return Ok(None) };
+    let reservation = gpu.reserve_int8_mmq(k, n)?;
+    gpu.sigmoid_mul_rotate_x_mq_awq_i8_gfx12_batched(
+        attn, gate, awq, None, reservation, k, n,
+    ).map(Some)
+}
+
 /// C2: when MQ4V2 + IU4 producer sidecar is live, emit block_i4_128 from
 /// RMSNorm/FWHT and return a prepared handle. `None` → caller keeps the
 /// incumbent fused_rmsnorm + standalone-quantizer path.
@@ -129,6 +196,28 @@ fn out_proj_residual_iu4_prepared(
     result
 }
 
+fn out_proj_residual_i8_prepared(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    w_gate: &hipfire_runtime::llama::WeightTensor,
+    prep: &rdna_compute::Int8MmqPrepared,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> HipResult<()> {
+    let fold = residual_fold_consumer_ready(gpu, w_gate, fusion, n, wo.m);
+    if fold {
+        gpu.arm_residual_fold(&pbs.gate_ffn_batch)?;
+    }
+    let result = gpu.gemm_mq4g256v2_residual_wmma_i8_prepared(
+        &wo.buf, prep, &pbs.x_batch, wo.m, wo.k, n,
+    );
+    if fold {
+        gpu.disarm_residual_fold();
+    }
+    result
+}
+
 /// C2: SwiGLU/FWHT IU4 producer for w_down. `None` → incumbent path.
 fn try_iu4_silu_prepared(
     gpu: &mut Gpu,
@@ -186,7 +275,8 @@ fn f1lite_ffn_eligible(
         && w_down.k == hidden_dim
         && matches!(epilogue, BatchEpilogue::Residual)
         && !s4_residual_fast(gpu, fusion, w_down.gpu_dtype, epilogue, n)
-        && (gpu.iu4_producer_sidecar_active(n, hidden_dim)
+        && (gpu.a8_prefill_active(n, w_gate.k) && hidden_dim % 128 == 0
+            || gpu.iu4_producer_sidecar_active(n, hidden_dim)
             || gpu.iu4_silu_quant_fused_active(n, hidden_dim))
 }
 
@@ -5878,9 +5968,14 @@ fn batch_chunk_delta_net_input_projection(
             layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
             layer.wqkv.k, n,
         );
+    let a8_prep = if [layer.wqkv.gpu_dtype, layer.wz.gpu_dtype,
+        layer.w_beta.gpu_dtype, layer.w_alpha.gpu_dtype] == [DType::MQ4G256V2; 4] {
+        try_a8_rmsnorm_prepared(gpu, &pbs.x_batch, &layer.attn_norm,
+            &layer.wqkv, dim, config.norm_eps, n)?
+    } else { None };
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
-    if is_mq {
+    if is_mq && a8_prep.is_none() {
         // Folded Z no longer needs the F32 sidecar for MW4 or its f16 convert.
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
@@ -5935,7 +6030,7 @@ fn batch_chunk_delta_net_input_projection(
                 n,
             )?;
         }
-    } else {
+    } else if !is_mq {
         gpu.rmsnorm_batched(
             &pbs.x_batch,
             &layer.attn_norm,
@@ -5947,7 +6042,17 @@ fn batch_chunk_delta_net_input_projection(
     }
 
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-    if let Some(prep) = &iu4_prep {
+    if let Some(prep) = &a8_prep {
+        let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wqkv.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.wqkv.buf, xq,
+            &pbs.dn_qkv_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.wz.buf, xq,
+            &pbs.dn_z_batch, layer.wz.m, layer.wz.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.w_beta.buf, xq,
+            &pbs.dn_beta_batch, layer.w_beta.m, layer.w_beta.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.w_alpha.buf, xq,
+            &pbs.dn_alpha_batch, layer.w_alpha.m, layer.w_alpha.k, n)?;
+    } else if let Some(prep) = &iu4_prep {
         if fold_betaalpha {
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_fold_prepared(
                 &layer.wqkv.buf, &layer.wz.buf, prep,
@@ -6644,20 +6749,18 @@ fn batch_chunk_delta_net_output_projection(
     // (`dn_normed_batch` has no other reader on the admitted
     // uniform-MQ4G256V2/Residual/head_dim-128 path); the f32 `x_rot` store
     // is skipped and only the iu4 sidecar is emitted by the fused producer.
-    let mut gdn_fused_prep = try_gfx12_gdn_quant_fused_prepared(
-        gpu,
-        &layer.wo,
-        &pbs.dn_attn_out_batch,
-        &pbs.dn_z_batch,
-        &layer.norm_weight,
-        &pbs.dn_normed_rot_batch,
-        n_v_heads,
-        config.linear_value_head_dim,
-        config.norm_eps,
-        layer.wo.k,
-        n,
-        &epilogue,
+    let a8_gdn_prep = try_a8_gdn_prepared(
+        gpu, &layer.wo, &pbs.dn_attn_out_batch, &pbs.dn_z_batch,
+        &layer.norm_weight, n_v_heads, config.linear_value_head_dim,
+        config.norm_eps, layer.wo.k, n, &epilogue,
     )?;
+    let mut gdn_fused_prep = if a8_gdn_prep.is_none() {
+        try_gfx12_gdn_quant_fused_prepared(
+            gpu, &layer.wo, &pbs.dn_attn_out_batch, &pbs.dn_z_batch,
+            &layer.norm_weight, &pbs.dn_normed_rot_batch, n_v_heads,
+            config.linear_value_head_dim, config.norm_eps, layer.wo.k, n, &epilogue,
+        )?
+    } else { None };
     if gdn_fused_prep.is_none() {
         gdn_fused_prep = try_gfx11_gdn_quant_fused_prepared(
             gpu,
@@ -6674,7 +6777,7 @@ fn batch_chunk_delta_net_output_projection(
         )?;
     }
     let mut fp8_gdn_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
-    if gdn_fused_prep.is_none() {
+    if a8_gdn_prep.is_none() && gdn_fused_prep.is_none() {
         fp8_gdn_prep = try_gfx12_fp8_stream_gdn_prepared(
             gpu,
             &layer.wo,
@@ -6689,7 +6792,7 @@ fn batch_chunk_delta_net_output_projection(
             n,
         )?;
     }
-    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
+    if a8_gdn_prep.is_none() && gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
         // Batched gated output norm.
         gpu.gated_norm_f32_batched(
             &pbs.dn_attn_out_batch,
@@ -6731,7 +6834,7 @@ fn batch_chunk_delta_net_output_projection(
     // Skipped when the slices-4 GDN producer already emitted both outputs
     // (`dn_normed_batch` is stale there by construction).
     let mut iu4_wo_prep: Option<rdna_compute::Int4MmqPrepared> = None;
-    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
+    if a8_gdn_prep.is_none() && gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
         iu4_wo_prep = try_iu4_rotate_prepared(
             gpu,
             &layer.wo,
@@ -6753,7 +6856,7 @@ fn batch_chunk_delta_net_output_projection(
             )?;
         }
     }
-    let wo_input = if gdn_fused_prep.is_some()
+    let wo_input = if a8_gdn_prep.is_some() || gdn_fused_prep.is_some()
         || fp8_gdn_prep.is_some()
         || iu4_wo_prep.is_some()
     {
@@ -6771,7 +6874,9 @@ fn batch_chunk_delta_net_output_projection(
     } else {
         &pbs.dn_normed_batch
     };
-    if let Some(prep) = gdn_fused_prep.as_ref().or(iu4_wo_prep.as_ref()) {
+    if let Some(prep) = &a8_gdn_prep {
+        out_proj_residual_i8_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
+    } else if let Some(prep) = gdn_fused_prep.as_ref().or(iu4_wo_prep.as_ref()) {
         out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
     } else if let Some(prep) = &fp8_gdn_prep {
         dispatch_batched_fp8_lloyd_epilogue(
@@ -7307,9 +7412,14 @@ fn batch_chunk_delta_net_ffn_gate_up(
     let ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype]);
+    let a8_prep = if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+        && layer.w_up.gpu_dtype == DType::MQ4G256V2 {
+        try_a8_rmsnorm_prepared(gpu, &pbs.x_batch, &layer.ffn_norm,
+            &layer.w_gate, dim, config.norm_eps, n)?
+    } else { None };
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
-    if ffn_is_mq {
+    if ffn_is_mq && a8_prep.is_none() {
         // C2: MQ4V2 IU4 producer (emit_f32=false — gate_up has no f32 small tails).
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
@@ -7364,7 +7474,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 n,
             )?;
         }
-    } else {
+    } else if !ffn_is_mq {
         gpu.rmsnorm_batched(
             &pbs.x_batch,
             &layer.ffn_norm,
@@ -7382,7 +7492,27 @@ fn batch_chunk_delta_net_ffn_gate_up(
     // GEMMs (not a fused kernel — slice 1). The HFQ3 WMMA-vs-base
     // split is folded into the FusedGateUpHfq3G256 run-arm, which
     // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
-    if let Some(prep) = &iu4_prep {
+    if let Some(prep) = &a8_prep {
+        let xq = gpu.int8_mmq_prepared_ptr(prep, layer.w_gate.k, n)?;
+        if f1lite {
+            gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
+                &layer.w_gate.buf, &layer.w_up.buf, xq, &pbs.gate_ffn_batch,
+                layer.w_gate.m, layer.w_gate.k, n,
+            )?;
+            return Ok(true);
+        }
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.w_gate.buf, xq,
+            &pbs.gate_ffn_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.w_up.buf, xq,
+            &pbs.up_batch, layer.w_up.m, layer.w_up.k, n)?;
+    } else if f1lite && gpu.a8_prefill_active(n, layer.w_gate.k) {
+        let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
+        gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
+            &layer.w_gate.buf, &layer.w_up.buf, xq, &pbs.gate_ffn_batch,
+            layer.w_gate.m, layer.w_gate.k, n,
+        )?;
+        return Ok(true);
+    } else if let Some(prep) = &iu4_prep {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
         if f1lite
             && gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
@@ -7672,6 +7802,25 @@ fn batch_chunk_delta_net_ffn_down(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
+    if h_ready && gpu.a8_prefill_active(n, hidden_dim)
+        && layer.w_down.gpu_dtype == DType::MQ4G256V2
+        && matches!(&epilogue, BatchEpilogue::Residual)
+    {
+        let xq = if let Some(prep) = try_a8_hin_prepared(
+            gpu, &layer.w_down, &pbs.gate_ffn_batch, hidden_dim, n,
+        )? {
+            gpu.int8_mmq_prepared_ptr(&prep, hidden_dim, n)?
+        } else {
+            rotate_x_mq_batched_for(
+                gpu, &layer.w_down, &pbs.gate_ffn_batch,
+                &pbs.ffn_hidden_batch, hidden_dim, n,
+            )?;
+            gpu.ensure_int8_mmq_x(&pbs.ffn_hidden_batch, n, hidden_dim)?
+        };
+        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8(
+            &layer.w_down.buf, xq, &pbs.x_batch, layer.w_down.m, hidden_dim, n,
+        );
+    }
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if w_down_is_mq {
@@ -7911,9 +8060,13 @@ fn batch_chunk_full_attn_input_projection(
         layer.wk.gpu_dtype == layer.wq.gpu_dtype && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
     // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
+    let a8_prep = if qkv_same_dtype && layer.wq.gpu_dtype == DType::MQ4G256V2 {
+        try_a8_rmsnorm_prepared(gpu, &pbs.x_batch, &layer.attn_norm,
+            &layer.wq, dim, config.norm_eps, n)?
+    } else { None };
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
-    if qkv_is_mq {
+    if qkv_is_mq && a8_prep.is_none() {
         // C2: MQ4V2 IU4 producer (emit_f32=false — FA qkv has no f32 small tails).
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
@@ -7968,7 +8121,7 @@ fn batch_chunk_full_attn_input_projection(
                 n,
             )?;
         }
-    } else {
+    } else if !qkv_is_mq {
         gpu.rmsnorm_batched(
             &pbs.x_batch,
             &layer.attn_norm,
@@ -7980,7 +8133,15 @@ fn batch_chunk_full_attn_input_projection(
     }
 
     // 2. Batched 3-way QKV projection (wq+wk+wv).
-    if let Some(prep) = &iu4_prep {
+    if let Some(prep) = &a8_prep {
+        let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wq.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.wq.buf, xq,
+            &pbs.fa_q_full_batch, layer.wq.m, layer.wq.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.wk.buf, xq,
+            &pbs.fa_k_batch, layer.wk.m, layer.wk.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.wv.buf, xq,
+            &pbs.fa_v_batch, layer.wv.m, layer.wv.k, n)?;
+    } else if let Some(prep) = &iu4_prep {
         gpu.gemm_qkv_mq4g256v2_wmma_iu4_prepared(
             &layer.wq.buf,
             &layer.wk.buf,
@@ -8520,15 +8681,16 @@ fn batch_chunk_full_attn_output_projection(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let mut iu4_wo_prep = try_gfx12_sigmoid_rotate_quant_fused_prepared(
-        gpu,
-        &layer.wo,
-        &pbs.fa_attn_out_batch,
-        &pbs.fa_gate_batch,
-        layer.wo.k,
-        n,
-        &epilogue,
+    let a8_wo_prep = try_a8_sigmoid_prepared(
+        gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch,
+        layer.wo.k, n, &epilogue,
     )?;
+    let mut iu4_wo_prep = if a8_wo_prep.is_none() {
+        try_gfx12_sigmoid_rotate_quant_fused_prepared(
+            gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch,
+            layer.wo.k, n, &epilogue,
+        )?
+    } else { None };
     if iu4_wo_prep.is_none() {
         // gfx11 twin of the slices-5 sigmoid fusion: skip the standalone
         // sigmoid store when the `_gfx11` producer admits (prepared GEMM is
@@ -8544,7 +8706,7 @@ fn batch_chunk_full_attn_output_projection(
         )?;
     }
     let mut fp8_wo_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
-    if iu4_wo_prep.is_none() {
+    if a8_wo_prep.is_none() && iu4_wo_prep.is_none() {
         fp8_wo_prep = try_gfx12_fp8_stream_sigmoid_prepared(
             gpu,
             &layer.wo,
@@ -8555,7 +8717,7 @@ fn batch_chunk_full_attn_output_projection(
             n,
         )?;
     }
-    if iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
+    if a8_wo_prep.is_none() && iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
         gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
         // T-B / slices-3: rotate+quantize once the standalone sigmoid has
         // produced the f32 input. All non-admitted routes remain unchanged.
@@ -8579,7 +8741,7 @@ fn batch_chunk_full_attn_output_projection(
             )?;
         }
     }
-    let fa_wo_input = if iu4_wo_prep.is_some() || fp8_wo_prep.is_some() {
+    let fa_wo_input = if a8_wo_prep.is_some() || iu4_wo_prep.is_some() || fp8_wo_prep.is_some() {
         &pbs.fa_attn_out_rot_batch
     } else if fa_wo_is_mq {
         rotate_x_mq_batched_for(
@@ -8594,7 +8756,9 @@ fn batch_chunk_full_attn_output_projection(
     } else {
         &pbs.fa_attn_out_batch
     };
-    if let Some(prep) = &iu4_wo_prep {
+    if let Some(prep) = &a8_wo_prep {
+        out_proj_residual_i8_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
+    } else if let Some(prep) = &iu4_wo_prep {
         out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
     } else if let Some(prep) = &fp8_wo_prep {
         dispatch_batched_fp8_lloyd_epilogue(
@@ -9174,9 +9338,14 @@ fn batch_chunk_full_attn_ffn_gate_up(
     let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let fa_ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype]);
+    let a8_prep = if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+        && layer.w_up.gpu_dtype == DType::MQ4G256V2 {
+        try_a8_rmsnorm_prepared(gpu, &pbs.x_batch, &layer.ffn_norm,
+            &layer.w_gate, dim, config.norm_eps, n)?
+    } else { None };
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
-    if fa_ffn_is_mq {
+    if fa_ffn_is_mq && a8_prep.is_none() {
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
             &pbs.x_batch,
@@ -9230,7 +9399,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 n,
             )?;
         }
-    } else {
+    } else if !fa_ffn_is_mq {
         gpu.rmsnorm_batched(
             &pbs.x_batch,
             &layer.ffn_norm,
@@ -9244,7 +9413,27 @@ fn batch_chunk_full_attn_ffn_gate_up(
     // (batched-prefill gate+up variant), mirroring the LA-FFN block
     // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
     // is folded into the FusedGateUpHfq3G256 run-arm.
-    if let Some(prep) = &iu4_prep {
+    if let Some(prep) = &a8_prep {
+        let xq = gpu.int8_mmq_prepared_ptr(prep, layer.w_gate.k, n)?;
+        if f1lite {
+            gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
+                &layer.w_gate.buf, &layer.w_up.buf, xq, &pbs.gate_ffn_batch,
+                layer.w_gate.m, layer.w_gate.k, n,
+            )?;
+            return Ok(true);
+        }
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.w_gate.buf, xq,
+            &pbs.gate_ffn_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(&layer.w_up.buf, xq,
+            &pbs.up_batch, layer.w_up.m, layer.w_up.k, n)?;
+    } else if f1lite && gpu.a8_prefill_active(n, layer.w_gate.k) {
+        let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
+        gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
+            &layer.w_gate.buf, &layer.w_up.buf, xq, &pbs.gate_ffn_batch,
+            layer.w_gate.m, layer.w_gate.k, n,
+        )?;
+        return Ok(true);
+    } else if let Some(prep) = &iu4_prep {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
         if f1lite
             && gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
@@ -9528,6 +9717,25 @@ fn batch_chunk_full_attn_ffn_down(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
+    if h_ready && gpu.a8_prefill_active(n, hidden_dim)
+        && layer.w_down.gpu_dtype == DType::MQ4G256V2
+        && matches!(&epilogue, BatchEpilogue::Residual)
+    {
+        let xq = if let Some(prep) = try_a8_hin_prepared(
+            gpu, &layer.w_down, &pbs.gate_ffn_batch, hidden_dim, n,
+        )? {
+            gpu.int8_mmq_prepared_ptr(&prep, hidden_dim, n)?
+        } else {
+            rotate_x_mq_batched_for(
+                gpu, &layer.w_down, &pbs.gate_ffn_batch,
+                &pbs.ffn_hidden_batch, hidden_dim, n,
+            )?;
+            gpu.ensure_int8_mmq_x(&pbs.ffn_hidden_batch, n, hidden_dim)?
+        };
+        return gpu.gemm_mq4g256v2_mmq_add_prequant_i8(
+            &layer.w_down.buf, xq, &pbs.x_batch, layer.w_down.m, hidden_dim, n,
+        );
+    }
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_w_down_is_mq {
