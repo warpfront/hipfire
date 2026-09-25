@@ -123,6 +123,12 @@ pub fn q8_flash_tile_size(
     q8_flash_reduce_safe_tile_size(preferred, head_dim, max_seq)
 }
 
+/// Dynamic LDS of the gfx1201 Q-resident v2 attention bodies: two KT48
+/// buffers (K8 12 KiB + V8 12 KiB + f32 K/V scales 2 x 192 B each) and the
+/// 8-byte position-bounds pair at 49,920 (`attention_q8_0_fa2_gqa.gfx1201.hip`).
+const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
+const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
+
 const V_MODE_Q8: i32 = 8;
 /// Token-local row bytes for the native fp8-E4M3 KV format (§2.1): Hkv*D
 /// codes followed by Hkv little-endian f16 scales. 1032 B/side at Hkv=4,D=256.
@@ -4867,8 +4873,9 @@ impl Gpu {
     }
 
     /// Bit-exact reschedule of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_gfx1201`]
-    /// (same grid, block and outputs; 33,536 B dynamic LDS). Default on exact
-    /// gfx1201 behind `kernel.attn_qresident_v2`; `false` restores v1.
+    /// (same grid, block and outputs; 49,936 B dynamic LDS: two double-buffered
+    /// KT48 K/V tiles). Default on exact gfx1201 behind
+    /// `kernel.attn_qresident_v2`; `false` restores v1.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         &mut self,
@@ -4886,7 +4893,7 @@ impl Gpu {
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC,
-            33536,
+            QRESIDENT_V2_LDS_BYTES,
             false,
             q,
             k_cache,
@@ -4924,7 +4931,7 @@ impl Gpu {
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
-            33536, true, q, k_cache, v_cache, out, positions,
+            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, out, positions,
             n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
         )
     }
