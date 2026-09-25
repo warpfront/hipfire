@@ -2718,6 +2718,29 @@ impl Gpu {
         )
     }
 
+    /// Load the admitted builder bundle into the same module/function cache as
+    /// JIT kernels. The embedded image keeps runtime independent of hipfire-isa
+    /// and of a working-tree-relative artifact path.
+    pub(crate) fn ensure_embedded_kernel(
+        &mut self,
+        module_name: &str,
+        image: &[u8],
+        func_name: &str,
+    ) -> HipResult<()> {
+        if self.functions.contains_key(func_name) {
+            return Ok(());
+        }
+        if !self.modules.contains_key(module_name) {
+            self.modules
+                .insert(module_name.to_owned(), self.hip.module_load_data(image)?);
+        }
+        let func = self
+            .hip
+            .module_get_function(&self.modules[module_name], func_name)?;
+        self.functions.insert(func_name.to_owned(), func);
+        Ok(())
+    }
+
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
     /// convert kernel if `x.buf.as_ptr()` matches the last converted source.
     /// Returns the FP16 device pointer.

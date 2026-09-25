@@ -302,6 +302,13 @@ fn g12_iu4_v3_enabled() -> bool {
     *G12_IU4_V3
 }
 
+/// The builder's single masked b128 store cannot serve odd row quads or
+/// misaligned output pointers; hipcc `_v3` retains its b32 fallback.
+#[inline]
+fn g12_iu4_b1_eligible(m: usize, k: usize, output: *mut c_void) -> bool {
+    k % 256 == 0 && m % 4 == 0 && (output as usize) % 16 == 0
+}
+
 #[derive(Clone, Copy)]
 enum MqV2PrefillProjection {
     Qkvza,
@@ -19804,14 +19811,26 @@ impl Gpu {
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
                 && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
-            // K1 lean-issue (`HIPFIRE_G12_IU4_V3=1`, default off): gfx1201 +
-            // symmetric only; same ABI/geometry as `_symfold_g12r`.
-            let v3 = symfold && g12_iu4_v3_enabled();
+            // The ISA bundle has the K1 ABI/geometry but only the masked
+            // b128 store. Unsupported shapes/pointers use hipcc `_v3`.
+            let isa_requested = symfold && self.flags.g12_iu4_isa;
+            let isa = isa_requested && g12_iu4_b1_eligible(m, k, y.buf.as_ptr());
+            let v3 = symfold && (isa_requested || g12_iu4_v3_enabled());
             // Banded CTA raster + wide epilogue (bit-identical outputs, see
             // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
             // incumbent modules.
             let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
-            let (module, source, kernel_name) = if v3 {
+            let (module, source, kernel_name) = if isa {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+                    "",
+                    if add {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1"
+                    } else {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1"
+                    },
+                )
+            } else if v3 {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
@@ -19860,7 +19879,15 @@ impl Gpu {
                 };
                 (module, source, kernel_name)
             };
-            self.ensure_kernel(module, source, kernel_name)?;
+            if isa {
+                self.ensure_embedded_kernel(
+                    module,
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+                    kernel_name,
+                )?;
+            } else {
+                self.ensure_kernel(module, source, kernel_name)?;
+            }
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
             let mut y_ptr = y.buf.as_ptr();
@@ -31917,12 +31944,17 @@ impl Gpu {
         }
         self.bind_thread()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
-        // K1 lean-issue (`HIPFIRE_G12_IU4_V3=1`, default off) takes the
-        // `_v3` module on this already-symmetric path. Else
-        // `HIPFIRE_G12_RASTER=0` keeps the incumbent module (two-group
-        // raster, b32 h stores); default is the banded-raster, wide-h-store
-        // build.
-        let (module, source, kernel) = if g12_iu4_v3_enabled() {
+        // ISA uses the K1 tile/ABI, but its b128 h store requires alignment
+        // and whole row quads. Route unsupported operands through hipcc K1.
+        let isa_requested = self.flags.g12_iu4_isa;
+        let isa = isa_requested && g12_iu4_b1_eligible(m, k, h.buf.as_ptr());
+        let (module, source, kernel) = if isa {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+                "",
+                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",
+            )
+        } else if isa_requested || g12_iu4_v3_enabled() {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
@@ -31941,7 +31973,15 @@ impl Gpu {
                 "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold",
             )
         };
-        self.ensure_kernel(module, source, kernel)?;
+        if isa {
+            self.ensure_embedded_kernel(
+                module,
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+                kernel,
+            )?;
+        } else {
+            self.ensure_kernel(module, source, kernel)?;
+        }
         let mut g_ptr = a_gate.buf.as_ptr();
         let mut u_ptr = a_up.buf.as_ptr();
         let mut xq_ptr = xq;
@@ -42101,6 +42141,15 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_iu4_store_guard_routes_unsupported_operands_to_hipcc() {
+        let aligned = 0x1000usize as *mut c_void;
+        assert!(g12_iu4_b1_eligible(128, 512, aligned));
+        assert!(!g12_iu4_b1_eligible(128, 384, aligned));
+        assert!(!g12_iu4_b1_eligible(127, 512, aligned));
+        assert!(!g12_iu4_b1_eligible(128, 512, 0x1004usize as *mut c_void));
+    }
 
     #[test]
     fn residual_kill_switch_dominates_ldsstage_and_ksplit() {
