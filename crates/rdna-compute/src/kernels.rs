@@ -3840,6 +3840,20 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC: &str = concat!
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
 );
+/// Scheduler policy registered with each built-in module. Unlisted modules use
+/// the upstream default; profile lowering lives in Radiowave.
+pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::SchedulerProfile {
+    use radiowave::SchedulerProfile;
+
+    if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
+        SchedulerProfile::IterativeIlp
+    } else if arch == "gfx1201" && name == "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3" {
+        SchedulerProfile::IterativeIlp
+    } else {
+        SchedulerProfile::Default
+    }
+}
+
 // gfx1201 K1 lean-issue IU4 (`HIPFIRE_G12_IU4_V3=1`, default off): same
 // ABI/launch geometry as the shipping `_symfold_g12r` module. Compile
 // defines match that build (symmetric fold + banded raster; A4C2 from hipcc).

@@ -381,6 +381,9 @@ pub struct FeatureFlags {
     pub rdna2_variant: Option<u32>,
 
     // ── Compiler.rs env reads ──────────────────────────────────────
+    /// `HIPFIRE_HIPCC_EXTRA_FLAGS`: global debug override for all module
+    /// compilations, not a way to ship flags. Production scheduler choices
+    /// belong in each module's Radiowave profile registration.
     pub hipcc_extra_flags: String,
 
     // ── Interpreter Phase 2a ───────────────────────────────────────
