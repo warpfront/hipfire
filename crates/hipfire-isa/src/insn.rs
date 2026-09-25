@@ -71,13 +71,19 @@ impl Vbuffer {
         Ok(Instruction::new(text,defs,uses).memory(if load {MemoryClass::VmemLoad}else{MemoryClass::VmemStore}))
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Wmma { Iu4, SwmmacIu4 }
-impl Wmma { pub fn mnemonic(self,arch:Arch)->Result<&'static str,String> { match self {Self::Iu4=>Ok(arch.wmma_iu4()),Self::SwmmacIu4 if arch.gfx12()=>Ok("v_swmmac_i32_16x16x64_iu4"),_=>Err("SWMMAC requires gfx12".into())} } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Wmma { Iu4, SwmmacIu4, Fp8 }
+impl Wmma { pub fn mnemonic(self,arch:Arch)->Result<&'static str,String> { match self {Self::Iu4=>Ok(arch.wmma_iu4()),Self::SwmmacIu4 if arch.gfx12()=>Ok("v_swmmac_i32_16x16x64_iu4"),Self::Fp8 if arch==Arch::Gfx1201=>Ok("v_wmma_f32_16x16x16_fp8_fp8"),_=>Err("WMMA opcode requires gfx1201".into())} } }
 impl Wmma {
     pub fn iu4(arch:Arch,dst:V<8>,a:V<2>,b:V<2>,acc:Option<V<8>>)->Instruction {
         let mut uses=vec![a.reg(),b.reg()];
         let c=if let Some(acc)=acc {uses.push(acc.reg());acc.reg().to_string()}else{"0".into()};
         Instruction::new(format!("{} {}, {}, {}, {c} neg_lo:[1,1,0]",arch.wmma_iu4(),dst.reg(),a.reg(),b.reg()),vec![dst.reg()],uses)
+    }
+    pub fn fp8(arch:Arch,dst:V<8>,w:V<2>,x:V<2>,acc:Option<V<8>>)->Result<Instruction,String> {
+        let opcode=Self::Fp8.mnemonic(arch)?;
+        let mut uses=vec![w.reg(),x.reg()];
+        let c=if let Some(acc)=acc {uses.push(acc.reg());acc.reg().to_string()}else{"0".into()};
+        Ok(Instruction::new(format!("{opcode} {}, {}, {}, {c}",dst.reg(),w.reg(),x.reg()),vec![dst.reg()],uses))
     }
     pub fn swmmac(arch:Arch,dst:V<8>,a:V<2>,b:V<4>,index:V<1>)->Result<Instruction,String> {
         if !arch.gfx12(){return Err("SWMMAC requires gfx12".into())}
