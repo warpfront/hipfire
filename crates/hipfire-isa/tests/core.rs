@@ -81,7 +81,7 @@ fn builder_combines_simultaneous_load_and_ds_waits() {
     let spec = KernelSpec {
         kernel_id: "wait_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
         symbol: "wait_probe".into(), kernargs: KernargLayout::new(8),
-        user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
     };
     let mut builder = Builder::new(spec, plan);
     let slot = builder.lds.add("A0", 0, 256).unwrap();
@@ -105,7 +105,7 @@ fn wmma_to_wmma_ab_dependency_inserts_nop() {
     let spec = KernelSpec {
         kernel_id: "wmma_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
         symbol: "wmma_probe".into(), kernargs: KernargLayout::new(8),
-        user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
     };
     let mut builder = Builder::new(spec, plan);
     builder.push(Instruction::new(
@@ -136,7 +136,7 @@ fn global_visibility_is_explicit_not_implied_by_lds_barrier() {
     let spec = KernelSpec {
         kernel_id: "barrier_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
         symbol: "barrier_probe".into(), kernargs: KernargLayout::new(8),
-        user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
     };
     let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
     builder.barrier(&[]).unwrap();
@@ -192,11 +192,12 @@ fn hip_hidden_kernarg_metadata_assembles() {
         kernel_id: "metadata_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
         symbol: "metadata_probe".into(),
         kernargs: KernargLayout::new(16).pointer("arg", 0).hidden("block_x", 8, 4, "hidden_block_count_x"),
-        user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+        user_sgpr_count: 2, system_sgpr_workgroup_id_y: true, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
     };
     let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
     builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
     let emitted = builder.finish().unwrap();
+    assert!(emitted.s_text.contains(".amdhsa_system_sgpr_workgroup_id_y 1"));
     let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
         .args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1201", "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -212,7 +213,7 @@ fn gfx11_descriptor_extras_assemble() {
         let spec = KernelSpec {
             kernel_id: "descriptor_probe".into(), variant: "default".into(), arch,
             symbol: "descriptor_probe".into(), kernargs: KernargLayout::new(8).pointer("arg", 0),
-            user_sgpr_count: 2, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
+            user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true,
         };
         let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
         builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
