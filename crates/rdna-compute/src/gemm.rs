@@ -315,7 +315,7 @@ fn g12_iu4_b1_image() -> &'static [u8] {
     }
 }
 /// Builder fp8 GEMM (F2 Row, bundle 529f971d): default ON for the fp8
-/// prefill route on exact gfx1201 (`fp8_f2_row_active` admits N >= 2048
+/// prefill route on exact gfx1201 (`fp8_f2_row_active` admits N >= 512
 /// only); `HIPFIRE_G12_FP8_ISA=0` opts out to the v2 route. Measured on H2,
 /// card B, 8 fresh processes ABBA+BAAB: pp8192 3,634.4 tok/s vs 3,407.3 for
 /// the previous bb4e3b9b bundle and 2,496.3 for v2 (2 processes). Quality,
@@ -326,6 +326,9 @@ fn g12_iu4_b1_image() -> &'static [u8] {
 /// producer and its consumer cannot see different route settings.
 static G12_FP8_F2: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA", true));
+// H2's 256-site weighted serial repack+F2 sweep (529f971d + ef2f7796)
+// beats v2 from N=512 onward; N=256 still loses.
+const G12_FP8_F2_MIN_N: usize = 512;
 // Private quality-only candidate override: reference chunks are shorter
 // than product admission. Never enable this for normal prefill or timing.
 static G12_FP8_F2_FORCE_SMALL_N: LazyLock<bool> =
@@ -9467,7 +9470,7 @@ impl Gpu {
             && !self.a8_prefill_active(n, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (n >= 2048 || *G12_FP8_F2_FORCE_SMALL_N)
+            && (n >= G12_FP8_F2_MIN_N || *G12_FP8_F2_FORCE_SMALL_N)
             && k > 0
             && k % 256 == 0
             && !dims.is_empty()
