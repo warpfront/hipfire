@@ -7,6 +7,10 @@
 // gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ divide.
 // It preserves the incumbent 32-lane group arithmetic and emits the exact
 // scale_mode=1 MQ4v2 FP8 planes after writing the rotated F32 row.
+// HIPFIRE_ROTATE_FP8_GATE_IL reads the sigmoid gate in place from the FA
+// Q/gate projection rows ([N x K/256 x (256 q, 256 gate)] floats) instead of
+// a compact [N x K] gate copy; the gate values, and so every output, are the
+// same.
 
 #ifndef HIPFIRE_ROTATE_FP8_KERNEL
 #define HIPFIRE_ROTATE_FP8_KERNEL mq_rotate_x_mq4v2_fp8_gfx12
@@ -40,7 +44,14 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
     const long long row_off = (long long)token * K;
     const float* x_in_b = x_in + row_off;
 #ifdef HIPFIRE_ROTATE_FP8_SIGMOID_GATE
+#ifdef HIPFIRE_ROTATE_FP8_GATE_IL
+    // Head group g's gate is floats [512 g + 256, 512 g + 512) of the row.
+    const float* gate_b = gate + (long long)token * (2LL * K) + 256;
+#define HIPFIRE_ROTATE_FP8_GATE_AT(b) ((((b) >> 8) << 9) + ((b) & 255))
+#else
     const float* gate_b = gate + row_off;
+#define HIPFIRE_ROTATE_FP8_GATE_AT(b) (b)
+#endif
 #endif
 #ifndef HIPFIRE_FP8_PROD_INREG
     float* x_out_b = x_out + row_off;
@@ -69,14 +80,14 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
         float x6 = x_in_b[base + 6];
         float x7 = x_in_b[base + 7];
 #ifdef HIPFIRE_ROTATE_FP8_SIGMOID_GATE
-        const float sg0 = 1.0f / (1.0f + expf(-gate_b[base    ]));
-        const float sg1 = 1.0f / (1.0f + expf(-gate_b[base + 1]));
-        const float sg2 = 1.0f / (1.0f + expf(-gate_b[base + 2]));
-        const float sg3 = 1.0f / (1.0f + expf(-gate_b[base + 3]));
-        const float sg4 = 1.0f / (1.0f + expf(-gate_b[base + 4]));
-        const float sg5 = 1.0f / (1.0f + expf(-gate_b[base + 5]));
-        const float sg6 = 1.0f / (1.0f + expf(-gate_b[base + 6]));
-        const float sg7 = 1.0f / (1.0f + expf(-gate_b[base + 7]));
+        const float sg0 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base)]));
+        const float sg1 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 1]));
+        const float sg2 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 2]));
+        const float sg3 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 3]));
+        const float sg4 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 4]));
+        const float sg5 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 5]));
+        const float sg6 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 6]));
+        const float sg7 = 1.0f / (1.0f + expf(-gate_b[HIPFIRE_ROTATE_FP8_GATE_AT(base) + 7]));
         x0 = x0 * sg0;
         x1 = x1 * sg1;
         x2 = x2 * sg2;
@@ -181,3 +192,6 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
         fp8_row_scales + token, row_amax, smem8, K, tid, lane, wave, row_scale_shift);
 #endif
 }
+#ifdef HIPFIRE_ROTATE_FP8_GATE_AT
+#undef HIPFIRE_ROTATE_FP8_GATE_AT
+#endif

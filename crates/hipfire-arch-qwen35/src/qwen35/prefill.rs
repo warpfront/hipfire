@@ -518,11 +518,13 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
 /// gfx1201 FP8-stream FA output producer.  Folds sigmoid, optional AWQ,
 /// FWHT rotation and the scale_mode=1 pack into one row-wide launch;
 /// `HIPFIRE_FP8_PROD_INREG=1` keeps the row in registers and skips `x_rot`.
+/// `gate` is the compact gate copy or, when the fp8q FA prep skipped the
+/// copy, the gate half of `fa_q_full_batch` read in place.
 fn try_gfx12_fp8_stream_sigmoid_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     attn: &GpuTensor,
-    gate: &GpuTensor,
+    gate: rdna_compute::gemv::Fp8SigmoidGate<'_>,
     x_rot: &GpuTensor,
     k: usize,
     n: usize,
@@ -8544,6 +8546,9 @@ fn batch_chunk_full_attn_prepare(
     fusion: DflashFusionCtx,
     gfx12_fa_prep: bool,
     gfx12_fa_prep_fp8q: bool,
+    // The fp8q prep leaves the gate in `fa_q_full_batch` (no gate copy); the
+    // output projection must then read it in place (`fa_gate_in_place`).
+    fa_gate_in_place: bool,
 ) -> HipResult<()> {
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
@@ -8584,7 +8589,8 @@ fn batch_chunk_full_attn_prepare(
             gpu.qwen35_fa_prep_batched_gfx1201(
                 &pbs.fa_q_full_batch,
                 rdna_compute::qwen35_fa_batch::FaPrepQOut::Fp8Codes(&q_codes),
-                &pbs.fa_gate_batch, &pbs.fa_k_batch, &layer.q_norm, &layer.k_norm,
+                (!fa_gate_in_place).then_some(&pbs.fa_gate_batch),
+                &pbs.fa_k_batch, &layer.q_norm, &layer.k_norm,
                 fa_prep_rope_pos_buf, config.norm_eps, config.rope_theta,
                 kv_cache.compact_offset as i32, config.n_heads, config.n_kv_heads, n,
             )?;
@@ -8592,7 +8598,7 @@ fn batch_chunk_full_attn_prepare(
             gpu.qwen35_fa_prep_batched_gfx1201(
                 &pbs.fa_q_full_batch,
                 rdna_compute::qwen35_fa_batch::FaPrepQOut::F32(&pbs.fa_q_batch),
-                &pbs.fa_gate_batch, &pbs.fa_k_batch, &layer.q_norm, &layer.k_norm,
+                Some(&pbs.fa_gate_batch), &pbs.fa_k_batch, &layer.q_norm, &layer.k_norm,
                 fa_prep_rope_pos_buf, config.norm_eps, config.rope_theta,
                 kv_cache.compact_offset as i32, config.n_heads, config.n_kv_heads, n,
             )?;
@@ -8721,6 +8727,9 @@ fn batch_chunk_full_attn_output_projection(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    // Set with the matching `batch_chunk_full_attn_prepare` flag: the gate
+    // was left in `fa_q_full_batch` and only the FP8-stream producer reads it.
+    fa_gate_in_place: bool,
 ) -> HipResult<()> {
     // S4: one sigmoid*attn+FWHT+F16 producer + direct-F16 residual GEMM
     // instead of sigmoid_mul_f32 + mq_rotate_x + convert. The F32 attn
@@ -8786,17 +8795,21 @@ fn batch_chunk_full_attn_output_projection(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let a8_wo_prep = try_a8_sigmoid_prepared(
-        gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch,
-        layer.wo.k, n, &epilogue,
-    )?;
-    let mut iu4_wo_prep = if a8_wo_prep.is_none() {
+    let a8_wo_prep = if fa_gate_in_place {
+        None
+    } else {
+        try_a8_sigmoid_prepared(
+            gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch,
+            layer.wo.k, n, &epilogue,
+        )?
+    };
+    let mut iu4_wo_prep = if a8_wo_prep.is_none() && !fa_gate_in_place {
         try_gfx12_sigmoid_rotate_quant_fused_prepared(
             gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch,
             layer.wo.k, n, &epilogue,
         )?
     } else { None };
-    if iu4_wo_prep.is_none() {
+    if iu4_wo_prep.is_none() && !fa_gate_in_place {
         // gfx11 twin of the slices-5 sigmoid fusion: skip the standalone
         // sigmoid store when the `_gfx11` producer admits (prepared GEMM is
         // the only consumer, `attn` left unmodified).
@@ -8812,15 +8825,26 @@ fn batch_chunk_full_attn_output_projection(
     }
     let mut fp8_wo_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if a8_wo_prep.is_none() && iu4_wo_prep.is_none() {
+        let gate = if fa_gate_in_place {
+            rdna_compute::gemv::Fp8SigmoidGate::QGateInterleaved(&pbs.fa_q_full_batch)
+        } else {
+            rdna_compute::gemv::Fp8SigmoidGate::Rows(&pbs.fa_gate_batch)
+        };
         fp8_wo_prep = try_gfx12_fp8_stream_sigmoid_prepared(
             gpu,
             &layer.wo,
             &pbs.fa_attn_out_batch,
-            &pbs.fa_gate_batch,
+            gate,
             &pbs.fa_attn_out_rot_batch,
             layer.wo.k,
             n,
         )?;
+        if fa_gate_in_place && fp8_wo_prep.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "FA output: gate left in fa_q_full_batch but the FP8-stream producer was not admitted",
+            ));
+        }
     }
     if a8_wo_prep.is_none() && iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
         gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
@@ -9301,6 +9325,17 @@ pub(crate) fn batch_chunk_full_attn_attn(
         && (commit_stride.is_none()
             || (commit_stride == Some(WIDENED_COMMIT_ROWS)
                 && n % WIDENED_COMMIT_ROWS == 0));
+    // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
+    // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
+    // the output projection will select the FP8-stream sigmoid producer,
+    // which then reads the gate in place. Mirrors that producer's admission:
+    // A8 is excluded by `fp8_stream_active`, the IU4/gfx11 sigmoid fusions
+    // by their predicates; gfx1100 S4 needs `gfx12_fa_prep`'s gfx1201 false.
+    let fa_gate_in_place = gfx12_fa_prep_fp8q
+        && matches!(layer.wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
+        && gpu.fp8_stream_active(n, layer.wo.k)
+        && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
+        && layer.wo.k == q_dim;
     batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
     batch_chunk_full_attn_prepare(
@@ -9322,6 +9357,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         fusion,
         gfx12_fa_prep,
         gfx12_fa_prep_fp8q,
+        fa_gate_in_place,
     )?;
 
     // 6–7. Batched KV write + flash attention (via dispatch). Split out of
@@ -9354,6 +9390,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         arch_has_wmma,
         epilogue,
         fusion,
+        fa_gate_in_place,
     )?;
 
     Ok(())
@@ -12147,6 +12184,7 @@ fn forward_prefill_chunk_pair(
                         fusion,
                         false,
                         false,
+                        false,
                     )?;
                     batch_chunk_full_attn_input_projection(
                         gpu, layer, config, pbs_n, n, dim, q8_wmma_arch, fusion,
@@ -12168,6 +12206,7 @@ fn forward_prefill_chunk_pair(
                         kv_layer_idx,
                         layer_idx,
                         fusion,
+                        false,
                         false,
                         false,
                     )?;
@@ -12193,6 +12232,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        false,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
@@ -12216,6 +12256,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        false,
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
