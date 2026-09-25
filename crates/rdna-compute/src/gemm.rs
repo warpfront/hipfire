@@ -292,10 +292,10 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 /// domain is covered.
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
-/// `HIPFIRE_G12_IU4_V3=1` selects the K1 lean-issue IU4 module on gfx1201
-/// symmetric routes (default off). Parsed once per process.
+/// K1 lean-issue IU4 module on gfx1201 symmetric routes. Default on;
+/// `HIPFIRE_G12_IU4_V3=0` restores the `_symfold_g12r` module. Parsed once.
 static G12_IU4_V3: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_V3", false));
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_V3", true));
 
 #[inline]
 fn g12_iu4_v3_enabled() -> bool {
@@ -19804,7 +19804,7 @@ impl Gpu {
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
                 && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
-            // K1 lean-issue (`HIPFIRE_G12_IU4_V3=1`, default off): gfx1201 +
+            // K1 lean-issue (default on, `HIPFIRE_G12_IU4_V3=0` off): gfx1201 +
             // symmetric only; same ABI/geometry as `_symfold_g12r`.
             let v3 = symfold && g12_iu4_v3_enabled();
             // Banded CTA raster + wide epilogue (bit-identical outputs, see
@@ -31917,7 +31917,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
-        // K1 lean-issue (`HIPFIRE_G12_IU4_V3=1`, default off) takes the
+        // K1 lean-issue (default on, `HIPFIRE_G12_IU4_V3=0` off) takes the
         // `_v3` module on this already-symmetric path. Else
         // `HIPFIRE_G12_RASTER=0` keeps the incumbent module (two-group
         // raster, b32 h stores); default is the banded-raster, wide-h-store
