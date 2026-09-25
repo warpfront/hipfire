@@ -6,10 +6,11 @@
 //! that DAG verbatim, so it is not re-derived: it is sliced out of hipcc's own
 //! disassembly (`slice_silu`), committed as `kernels/iu4_gemm.silu.region.s`,
 //! parsed back into a register-renamed template (`Region::parse`) and
-//! instantiated per element. Only the registers, the interleaving of two
-//! independent elements and hazard waits are chosen here.
+//! instantiated per element. Only the registers, the interleaving of
+//! independent elements, the VOPD packing of their VOP2 operations and hazard
+//! waits are chosen here; every element keeps its ops in golden order.
 use super::op;
-use crate::{Builder, reg::{Kind, RegRef}};
+use crate::{Builder, reg::{Kind, RegRef}, vopd::{self, VopdF32, VopdOp}};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SILU_GOLDEN: &str = include_str!("../../../kernels/iu4_gemm.silu.region.s");
@@ -20,7 +21,7 @@ pub const SILU_MASKS: usize = 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operand { G, U, Temp(usize), Mask(usize), Fixed(String) }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Op { mnemonic: String, operands: Vec<(bool, Operand)>, vcc_def: bool, vcc_use: bool }
+struct Op { mnemonic: String, operands: Vec<(bool, Operand)>, vcc_def: bool, vcc_use: bool, dual: Option<VopdF32> }
 
 /// A parsed, register-renamed region: two VGPR inputs, one VGPR output
 /// (the last definition), `temps` VGPR and `masks` SGPR temporaries, and
@@ -33,6 +34,24 @@ fn standalone(mnemonic: &str) -> String {
     match mnemonic.strip_prefix("v_dual_") {
         Some(rest) => format!("v_{rest}_e32"),
         None => mnemonic.to_owned(),
+    }
+}
+/// The VOPD opcode a VOP2 region op issues as when its operands fit a VOPD
+/// half: VGPR destination, unmodified sources, VGPR src1. VOP1/VOP3 forms,
+/// compares, selects and the division sequence always issue alone.
+fn dual_form(mnemonic: &str, operands: &[(bool, Operand)]) -> Option<VopdF32> {
+    let op = match mnemonic {
+        "v_add_f32_e32" => VopdF32::Add,
+        "v_sub_f32_e32" => VopdF32::Sub,
+        "v_subrev_f32_e32" => VopdF32::Subrev,
+        "v_mul_f32_e32" => VopdF32::Mul,
+        "v_fmac_f32_e32" => VopdF32::Fmac,
+        _ => return None,
+    };
+    let vgpr = |o: &Operand| matches!(o, Operand::G | Operand::U | Operand::Temp(_));
+    match operands {
+        [(false, Operand::Temp(_)), (false, _), (false, src1)] if vgpr(src1) => Some(op),
+        _ => None,
     }
 }
 fn register(token: &str) -> Option<(bool, char, u16)> {
@@ -59,7 +78,7 @@ impl Region {
         for line in text.lines() {
             let Some((mnemonic, args)) = instruction(line) else { continue };
             if mnemonic == "s_wait_alu" {
-                ops.push(Op { mnemonic: mnemonic.into(), operands: vec![(false, Operand::Fixed(args.into()))], vcc_def: false, vcc_use: false });
+                ops.push(Op { mnemonic: mnemonic.into(), operands: vec![(false, Operand::Fixed(args.into()))], vcc_def: false, vcc_use: false, dual: None });
                 continue;
             }
             let tokens: Vec<_> = args.split(',').map(str::trim).collect();
@@ -84,7 +103,9 @@ impl Region {
             }
             let vcc_def = tokens.get(1) == Some(&"vcc_lo");
             let vcc_use = mnemonic == "v_div_fmas_f32";
-            ops.push(Op { mnemonic: standalone(mnemonic), operands, vcc_def, vcc_use });
+            let mnemonic = standalone(mnemonic);
+            let dual = dual_form(&mnemonic, &operands);
+            ops.push(Op { mnemonic, operands, vcc_def, vcc_use, dual });
         }
         if inputs.len() != 2 { return Err("region must read exactly two live-ins".into()) }
         match ops.last() { Some(op) if matches!(op.operands.first(), Some((false, Operand::Temp(_)))) => {}, _ => return Err("region must end in a VGPR definition".into()) }
@@ -102,64 +123,159 @@ impl Region {
 #[derive(Clone, Debug)]
 pub struct Binding { pub g: u8, pub u: u8, pub out: u8, pub temps: Vec<u8>, pub masks: Vec<u8> }
 
-fn render(op: &Op, bind: &Binding, last: bool) -> (String, Vec<RegRef>, Vec<RegRef>) {
+/// One rendered instance op: its standalone text, register effects, and its
+/// typed VOPD half (with the half's own text) when it has one.
+struct Issue { text: String, defs: Vec<RegRef>, uses: Vec<RegRef>, dual: Option<(VopdOp, String)> }
+
+/// A src0 constant as the VOPD literal rule sees it. Hex and non-inline
+/// integers are literals, small integers are inline; inline floats (`1.0`)
+/// are counted as literals of their bits, which can only reject a legal
+/// pair, never admit an illegal one.
+fn constant(text: &str) -> Option<vopd::Operand> {
+    if let Some(hex) = text.strip_prefix("0x") { return u32::from_str_radix(hex, 16).ok().map(vopd::Operand::Lit) }
+    if let Ok(n) = text.parse::<i64>() {
+        return Some(if (-16..=64).contains(&n) { vopd::Operand::Inline(n as i8) } else { vopd::Operand::Lit(n as u32) });
+    }
+    text.parse::<f32>().ok().map(|x| vopd::Operand::Lit(x.to_bits()))
+}
+
+fn render(op: &Op, bind: &Binding, last: bool) -> Issue {
     let mut text = op.mnemonic.clone();
     let (mut defs, mut uses) = (Vec::new(), Vec::new());
-    let arity = op.operands.len();
+    let mut spelled = Vec::new();
+    let mut src0 = None;
     for (i, (neg, operand)) in op.operands.iter().enumerate() {
-        let (spelled, reg) = match operand {
-            Operand::G => (format!("v{}", bind.g), Some(RegRef { kind: Kind::V, base: bind.g, len: 1 })),
-            Operand::U => (format!("v{}", bind.u), Some(RegRef { kind: Kind::V, base: bind.u, len: 1 })),
-            Operand::Temp(n) => {
-                let r = if last && i == 0 { bind.out } else { bind.temps[*n] };
-                (format!("v{r}"), Some(RegRef { kind: Kind::V, base: r, len: 1 }))
-            }
+        let vreg = |n: u8| (format!("v{n}"), Some(RegRef { kind: Kind::V, base: n, len: 1 }));
+        let (name, reg) = match operand {
+            Operand::G => vreg(bind.g),
+            Operand::U => vreg(bind.u),
+            Operand::Temp(n) => vreg(if last && i == 0 { bind.out } else { bind.temps[*n] }),
             Operand::Mask(n) => (format!("s{}", bind.masks[*n]), Some(RegRef { kind: Kind::S, base: bind.masks[*n], len: 1 })),
             Operand::Fixed(t) => (t.clone(), None),
         };
+        if i == 1 {
+            src0 = match (operand, reg) {
+                (Operand::Mask(_), Some(r)) => Some(vopd::Operand::S(r.base)),
+                (_, Some(r)) => Some(vopd::Operand::V(r.base)),
+                (_, None) => constant(&name),
+            };
+        }
         text.push_str(if i == 0 { " " } else { ", " });
         if *neg { text.push('-') }
-        text.push_str(&spelled);
+        text.push_str(&name);
+        spelled.push(name);
         if let Some(r) = reg {
             if i == 0 && op.mnemonic != "s_wait_alu" { defs.push(r) } else { uses.push(r) }
         }
-        let _ = arity;
     }
     if op.mnemonic.starts_with("v_fmac") { uses.extend(defs.iter().copied()) }
-    (text, defs, uses)
+    let dual = match (op.dual, src0, defs.first()) {
+        (Some(kind), Some(src0), Some(dst)) => {
+            let base = op.mnemonic.strip_prefix("v_").and_then(|m| m.strip_suffix("_e32")).unwrap_or(&op.mnemonic);
+            let src1 = match &op.operands[2].1 { Operand::G => bind.g, Operand::U => bind.u, Operand::Temp(n) => bind.temps[*n], _ => unreachable!("dual_form admits VGPR src1 only") };
+            Some((VopdOp { op: kind, dst: dst.base, src0, src1 }, format!("v_dual_{base} {}", spelled.join(", "))))
+        }
+        _ => None,
+    };
+    Issue { text, defs, uses, dual }
 }
 
-/// Emit instances of `region` for independent elements, round-robin. An
-/// instance may not define VCC while another instance's VCC window (its
-/// `v_div_scale` to its `v_div_fmas`) is open. Before an instruction reads a
-/// lane mask written by VALU since the last fence, a `va_sdst` wait is issued.
+/// The typed VOPD packet of two instance ops, when legal: both have VOPD
+/// halves, `vopd::validate_pair` accepts their parity/bank/literal use, and
+/// neither half reads or writes the other's destination.
+fn packet(arch: crate::Arch, a: &Issue, b: &Issue) -> Option<(String, Vec<RegRef>, Vec<RegRef>)> {
+    let ((x, x_text), (y, y_text)) = (a.dual.as_ref()?, b.dual.as_ref()?);
+    vopd::validate_pair(arch, *x, *y).ok()?;
+    let touches = |defs: &[RegRef], other: &Issue| defs.iter().any(|d| other.uses.iter().chain(&other.defs).any(|r| r.overlaps(*d)));
+    if touches(&a.defs, b) || touches(&b.defs, a) { return None }
+    Some((format!("{x_text} :: {y_text}"), [a.defs.clone(), b.defs.clone()].concat(), [a.uses.clone(), b.uses.clone()].concat()))
+}
+
+/// Issue-model latencies, in issue slots, used only to rank ready work: the
+/// hardware interlocks VGPR dependences, and SGPR/VCC hazards have explicit
+/// waits, so these numbers never decide correctness.
+const LATENCY: u32 = 5;
+const TRANS_LATENCY: u32 = 10;
+fn latency(mnemonic: &str) -> u32 {
+    let trans = ["v_exp_", "v_log_", "v_rcp_", "v_rsq_", "v_sqrt_", "v_sin_", "v_cos_"].iter().any(|p| mnemonic.starts_with(p));
+    if trans { TRANS_LATENCY } else { LATENCY }
+}
+
+/// Emit instances of `region` for independent elements; every instance
+/// issues its own ops in golden order.
+///
+/// - Instances `2k` and `2k + 1` are VOPD partners. When both stand at the
+///   same op and `packet` accepts it, the two issue as one VOPD packet; an
+///   instance waits for a partner that is behind it, unless it holds the VCC
+///   window.
+/// - An instance starts only after every earlier instance sharing one of its
+///   registers has issued its last op, so register slots are reused in order.
+/// - An instance may not define VCC while another instance's VCC window (its
+///   `v_div_scale` to its `v_div_fmas`) is open.
+/// - Before an instruction reads a lane mask written by VALU since the last
+///   fence, a `va_sdst` wait is issued.
+/// - Each slot takes the first-listed issuable op (or packet) whose sources
+///   are ready under the fixed latency model, else the one ready soonest.
 pub fn emit_interleaved(b: &mut Builder, region: &Region, binds: &[Binding]) -> Result<(), String> {
-    let mut next = vec![0usize; binds.len()];
+    let (n, len, arch) = (binds.len(), region.ops.len(), b.spec.arch);
+    let owned: Vec<BTreeSet<(bool, u8)>> = binds.iter().map(|bind| {
+        [bind.g, bind.u, bind.out].into_iter().chain(bind.temps.iter().copied()).map(|r| (false, r))
+            .chain(bind.masks.iter().map(|&m| (true, m))).collect()
+    }).collect();
+    let after: Vec<Vec<usize>> = (0..n).map(|k| (0..k).filter(|&e| !owned[e].is_disjoint(&owned[k])).collect()).collect();
+    let issue = |s: usize, i: usize| render(&region.ops[i], &binds[s], i + 1 == len);
+    let mut next = vec![0usize; n];
     let mut open: Option<usize> = None;
     let mut unfenced: BTreeSet<u8> = BTreeSet::new();
-    let mut turn = 0usize;
-    while next.iter().any(|&i| i < region.ops.len()) {
-        let mut progressed = false;
-        for step in 0..binds.len() {
-            let s = (turn + step) % binds.len();
-            let Some(op) = region.ops.get(next[s]) else { continue };
+    let mut ready: BTreeMap<(bool, u8), u32> = BTreeMap::new();
+    let mut vcc_ready = 0u32;
+    let mut clock = 0u32;
+    while next.iter().any(|&i| i < len) {
+        let live = |s: usize| next[s] < len && (next[s] > 0 || after[s].iter().all(|&e| next[e] == len));
+        let ready_at = |s: usize| {
+            let op = &region.ops[next[s]];
+            let regs = issue(s, next[s]).uses.iter().flat_map(|r| (0..r.len).map(move |k| (r.kind == Kind::S, r.base + k)))
+                .map(|key| ready.get(&key).copied().unwrap_or(0)).max().unwrap_or(0);
+            if op.mnemonic == "s_wait_alu" { regs.max(vcc_ready) } else { regs }
+        };
+        let mut groups: Vec<(Vec<usize>, u32)> = Vec::new();
+        for s in (0..n).filter(|&s| live(s)) {
+            let i = next[s];
+            let op = &region.ops[i];
             if op.vcc_def && open.is_some_and(|o| o != s) { continue }
-            let last = next[s] + 1 == region.ops.len();
-            let (text, defs, uses) = render(op, &binds[s], last);
-            if uses.iter().any(|r| r.kind == Kind::S && unfenced.contains(&r.base)) {
-                op_fence(b)?;
-                unfenced.clear();
+            let p = s ^ 1;
+            if op.dual.is_some() && open != Some(s) && p < n && next[p] <= i && packet(arch, &issue(s, i), &issue(p, i)).is_some() {
+                // Same op for both partners: one packet, listed once. A
+                // partner that is behind (or not yet started) is waited for.
+                if next[p] == i && live(p) && s < p { groups.push((vec![s, p], ready_at(s).max(ready_at(p)))) }
+                continue;
             }
-            super::op(b, text, &defs, &uses)?;
-            for r in defs.iter().filter(|r| r.kind == Kind::S) { unfenced.insert(r.base); }
-            if op.vcc_def { open = Some(s) }
+            groups.push((vec![s], ready_at(s)));
+        }
+        let (members, at) = groups.iter().find(|(_, t)| *t <= clock).or_else(|| groups.iter().min_by_key(|(_, t)| *t))
+            .cloned().ok_or("region interleave deadlock")?;
+        clock = clock.max(at);
+        let issues: Vec<Issue> = members.iter().map(|&s| issue(s, next[s])).collect();
+        let (text, defs, uses) = match issues.as_slice() {
+            [a, b] => packet(arch, a, b).ok_or("VOPD packet rejected after selection")?,
+            [a] => (a.text.clone(), a.defs.clone(), a.uses.clone()),
+            _ => unreachable!("groups hold one op or one packet"),
+        };
+        if uses.iter().any(|r| r.kind == Kind::S && unfenced.contains(&r.base)) {
+            op_fence(b)?;
+            unfenced.clear();
+        }
+        op(b, text, &defs, &uses)?;
+        for r in defs.iter().filter(|r| r.kind == Kind::S) { unfenced.insert(r.base); }
+        let lat = if members.len() == 2 { LATENCY } else { latency(&region.ops[next[members[0]]].mnemonic) };
+        for r in &defs { for k in 0..r.len { ready.insert((r.kind == Kind::S, r.base + k), clock + lat); } }
+        for &s in &members {
+            let op = &region.ops[next[s]];
+            if op.vcc_def { open = Some(s); vcc_ready = clock + lat }
             if op.vcc_use { open = None }
             next[s] += 1;
-            turn = s + 1;
-            progressed = true;
-            break;
         }
-        if !progressed { return Err("region interleave deadlock".into()) }
+        clock += 1;
     }
     Ok(())
 }
