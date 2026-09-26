@@ -26,27 +26,44 @@ pub(crate) fn ds_load(b: &mut Builder, slot: usize, text: String, dst: crate::re
     b.ds_load(slot, Instruction::new(text, vec![dst], vec![v(addr)]).memory(MemoryClass::DsLoad))
 }
 
-/// Slab-1 prefetch of block `h` (K bytes 32..63 of the block's 64 nibble bytes).
+/// Fetch slab 1 of block `h` (K bytes 32..63), using the group-relative W offset.
 pub(crate) fn fetch_slab1(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
+    fetch_slab1_at(b, g, h, h as u32 * 64 + 40)
+}
+
+/// Fetch the next group's even block before `goff` advances at trip end.
+pub(crate) fn fetch_slab1_next_group(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    fetch_slab1_at(b, g, 0, super::spec::GROUP_BYTES + 40)
+}
+
+fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Result<(), String> {
     let tile = g.tile;
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
             vload(b, dst, 2, g.st_a, g.srd_a[h], None, 40 + r as u32 * tile.round_rows() * super::spec::BLOCK_I4_128)?;
         }
         for (r, &dst) in g.w_pf.iter().enumerate() {
-            vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), h as u32 * 64 + 40)?;
+            vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), weight_offset)?;
         }
         Ok(())
     })
 }
 
-/// Next-block fetch epoch, issued right after B1 of block `h`: slab 0 of the
-/// next block plus one token-`d` word and one packed row header word.
+/// Issue next-block token scale and packed row header before B1: neither
+/// payload register is still live after the preceding block's B2 publication.
+pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
+    let header = if h == 0 { 4 } else { super::spec::GROUP_BYTES };
+    b.clause(|b| {
+        vload(b, g.ds_nx, 1, g.ds_voff, g.srd_a[h ^ 1], None, 0)?;
+        vload(b, g.sz_nx, 1, g.sz_voff, g.srd_z, Some(g.goff), header)
+    })
+}
+
+/// Next-block slab-0 fetch epoch after B1 of block `h`.
 pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
     let tile = g.tile;
     // Next (group, half) relative to the current group offset in `goff`.
     let next = if h == 0 { 64 } else { super::spec::GROUP_BYTES };
-    let header = if h == 0 { 4 } else { super::spec::GROUP_BYTES };
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
             vload(b, dst, 2, g.st_a, g.srd_a[h ^ 1], None, 8 + r as u32 * tile.round_rows() * super::spec::BLOCK_I4_128)?;
@@ -54,8 +71,7 @@ pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Strin
         for (r, &dst) in g.w_pf.iter().enumerate() {
             vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), next + 8)?;
         }
-        vload(b, g.ds_nx, 1, g.ds_voff, g.srd_a[h ^ 1], None, 0)?;
-        vload(b, g.sz_nx, 1, g.sz_voff, g.srd_z, Some(g.goff), header)
+        Ok(())
     })
 }
 

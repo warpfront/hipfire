@@ -220,5 +220,9 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     }
     publish::publish_slab(b, g, 0)?;
     publish::publish_meta(b, g, 0)?;
-    b.barrier(&[Transition::Ready(g.slot_a[0]), Transition::Ready(g.slot_w[0]), Transition::Ready(g.slot_ds[0]), Transition::Ready(g.slot_sz[0])])
+    b.barrier_signal(&[Transition::Ready(g.slot_a[0]), Transition::Ready(g.slot_w[0]), Transition::Ready(g.slot_ds[0]), Transition::Ready(g.slot_sz[0])])?;
+    // Seed the ring: every subsequent slab-1 fetch is issued by its
+    // predecessor after the slab-0 payload has been published.
+    publish::fetch_slab1(b, g, 0)?;
+    b.barrier_wait()
 }

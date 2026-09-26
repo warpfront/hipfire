@@ -3993,8 +3993,8 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 1e33ba5d0021ebbef7e6a37a57e9a7963ee90e6e6ba334c109024c7f05c8827a.
-/// Regenerate with the S1 recipe using the p4 generator and final SiLU contracts.
+/// SHA-256 8b18244598efa7cfb32baf15a9a06ef4275cf03417d75a801e56286c8773f52b:
+/// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco");
 /// Original certified `_b1` bundle for same-binary model/performance controls.

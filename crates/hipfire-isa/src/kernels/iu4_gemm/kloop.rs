@@ -4,14 +4,13 @@
 //! second block fetches and publishes nothing.
 //!
 //! Block (plane `h`), after hipcc K1-ILP's measured order:
-//! - Phase A: slab-1 prefetch clause; fragment loads from slot 0; slab-0
-//!   WMMAs (the first seeds every accumulator with the magic); publish slab 1
-//!   into slot 1; B1 (retire slot 0, publish slot 1).
-//! - Phase B: next-block fetch clause; fragment loads from slot 1 and the
-//!   token scales; slab-1 WMMAs with the scale rows loaded into fragment
-//!   registers freed by slab 0, and the fold's `subrev` stage between them;
-//!   publish the next block into slot 0 and planes `h^1`; B2 signal; the
-//!   fold's `mul`/`fmac` stage; B2 wait.
+//! - Phase A: slab-1 was fetched by the preceding block (or the prologue);
+//!   fragment loads from slot 0; slab-0 WMMAs; publish slab 1 into slot 1;
+//!   B1 retires slot 0 and publishes slot 1.
+//! - Phase B: next-block slab-0 fetch and metadata; fragment loads from slot 1;
+//!   slab-1 WMMAs and the fold's `subrev` stage; publish the next block into
+//!   slot 0; B2 signal retires its payload; fetch next block's slab 1 during
+//!   the fold's `mul`/`fmac` stage; B2 wait.
 use super::{Gen, K_LOOP, K_LOOP_END, EPI, fold, op, publish::{self, ds_load}, s, sr};
 use crate::{Builder, V, insn::Wmma, lds::Transition, reg::Live};
 
@@ -48,7 +47,7 @@ fn tail_label(h: usize) -> String { label(&format!("t{h}")) }
 fn block(b: &mut Builder, g: &Gen, tag: &str, h: usize, fetch_next: bool, end: &str) -> Result<(), String> {
     block_with(b, g, tag, h, fetch_next, end, |_| Ok(()))
 }
-/// One 128-K block; `after_slab1_fetch` runs right after the phase-A clause.
+/// One K128 block; `after_slab1_fetch` runs when its preceding fetch has issued.
 fn block_with(b: &mut Builder, g: &Gen, tag: &str, h: usize, fetch_next: bool, end: &str,
     after_slab1_fetch: impl Fn(&mut Builder) -> Result<(), String>) -> Result<(), String> {
     let (x, x0, x1) = (label(tag), label(&format!("{tag}_s0")), label(&format!("{tag}_s1")));
@@ -64,11 +63,13 @@ fn block_with(b: &mut Builder, g: &Gen, tag: &str, h: usize, fetch_next: bool, e
     b.regs.v::<8>("fold_t", f1 + 4, between(&x1, end))?;
 
     // Phase A: slab 0 from slot 0, slab 1 staged into slot 1.
-    publish::fetch_slab1(b, g, h)?;
     after_slab1_fetch(b)?;
     fragments(b, g, 0)?;
     for sb in 0..2 { bundle(b, g, sb, sb == 0, |_, _| Ok(()))?; }
     publish::publish_slab(b, g, 1)?;
+    // The next block's scale/header registers are independent of the
+    // published slab; overlap their VMEM with the B1 wave rendezvous.
+    if fetch_next { publish::fetch_next_meta(b, g, h)?; }
     b.barrier(&[Transition::Retire(g.slot_a[0]), Transition::Retire(g.slot_w[0]), Transition::Ready(g.slot_a[1]), Transition::Ready(g.slot_w[1])])?;
 
     // Phase B: slab 1 from slot 1, the fold, next block staged into slot 0.
@@ -95,6 +96,12 @@ fn block_with(b: &mut Builder, g: &Gen, tag: &str, h: usize, fetch_next: bool, e
         publish::publish_meta(b, g, h ^ 1)?;
         b.barrier_signal(&[Transition::Retire(g.slot_a[1]), Transition::Retire(g.slot_w[1]), Transition::Retire(g.slot_ds[h]), Transition::Retire(g.slot_sz[h]),
             Transition::Ready(g.slot_a[0]), Transition::Ready(g.slot_w[0]), Transition::Ready(g.slot_ds[h ^ 1]), Transition::Ready(g.slot_sz[h ^ 1])])?;
+        // The B2 signal drained slab-0 stores; the retired payload ring can
+        // now hold the next K128's slab 1 while this block still folds.
+        // At the odd-to-even boundary goff has not yet advanced, so its W
+        // addresses include the 136-byte group stride explicitly.
+        if h == 0 { publish::fetch_slab1(b, g, 1)?; }
+        else { publish::fetch_slab1_next_group(b, g)?; }
     }
     fold::scale(b, g)?;
     if fetch_next { b.barrier_wait()?; }
