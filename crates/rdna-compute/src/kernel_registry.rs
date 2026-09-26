@@ -123,9 +123,9 @@ fn assemble_asym(body: &str) -> String {
 
 /// Sources covering the gfx1201 H2 FP8-KV/MQ4v2 and 0.8B Q8-KV/MQ4 routes,
 /// plus the union of the daemon's Qwen3.5 `{mq4,mq6,hfq4,hfq6,q8} ×
-/// {asym3,q8}` default precompile matrix. Other arches currently advertise
-/// only the architecture-independent precompile entries below; rejected pairs
-/// are explicit rather than compiled from a guessed basename.
+/// {asym3,q8}` default precompile matrix. Other arches advertise this
+/// installer inventory plus the default Q8 scalar-flash specialization,
+/// but not unobserved model-specific routes; unsupported pairs fail explicitly.
 ///
 /// `extra_flags` must be the same process-config value used by KernelCompiler.
 /// Non-default runtime selector flags require a separately admitted registry.
