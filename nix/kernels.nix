@@ -1,42 +1,40 @@
 { lib
-, stdenv
+, rustPlatform
 , rocmPackages
-, gpuTargets ? []
+, src ? lib.cleanSource ./..
+, cargoLockFile ? ../Cargo.lock
+, gpuTargets ? [ "gfx1201" "gfx1100" "gfx1151" "gfx906" "gfx942" ]
 }:
 
 let
-  src = lib.cleanSource ./..;
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
 in
-stdenv.mkDerivation {
+rustPlatform.buildRustPackage {
   pname = "hipfire-kernels";
   version = cargoToml.workspace.package.version or cargoToml.package.version;
 
   inherit src;
+  cargoLock.lockFile = cargoLockFile;
+  doCheck = false;
+  dontCargoInstall = true;
 
-  nativeBuildInputs = [
-    rocmPackages.clr
-    rocmPackages.llvm.clang
-  ];
+  nativeBuildInputs = [ rocmPackages.clr rocmPackages.llvm.clang ];
 
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    # Allow partial failures — some kernels are arch-specific and won't
-    # compile for every target. The daemon JIT-compiles missing kernels.
-    bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets} || {
-      echo "WARNING: some kernels failed to compile (see above). Daemon will JIT-compile them on first use."
-    }
+    export HIPFIRE_ROCM_PATH=${rocmPackages.clr}
+    export HIPFIRE_HIPCC_EXTRA_FLAGS=--rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode
+    bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets}
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
-    mkdir -p $out/kernels/compiled
+    mkdir -p "$out/kernels/compiled"
     for arch in ${lib.concatStringsSep " " gpuTargets}; do
-      if [ -d "kernels/compiled/$arch" ]; then
-        cp -r "kernels/compiled/$arch" "$out/kernels/compiled/"
-      fi
+      test -f "kernels/compiled/$arch/rmsnorm.index.json"
+      cp -r "kernels/compiled/$arch" "$out/kernels/compiled/"
     done
     runHook postInstall
   '';

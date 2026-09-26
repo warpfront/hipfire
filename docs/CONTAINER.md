@@ -5,7 +5,7 @@ Two final targets share a ROCm base:
 
 | Target | Purpose | Image contents |
 |---|---|---|
-| `runtime` | Deliverable inference image | Wrapped `daemon` + compiled standalone `hipfire` CLI |
+| `runtime` | Deliverable inference image | Daemon + native CLI + five-arch indexed registry kernel packages |
 | `gate-runner` | Local GPU harness / historical gate runner | Full builder tree + source + in-image entry scripts |
 
 | Field | Value |
@@ -26,9 +26,9 @@ exercise the image or the GPU.
 - **ROCm is dlopen'd at runtime** — the image build needs no GPU.
 - **gfx1151 needs ROCm 7.2+** — do not downgrade the base; if `hipcc`/HIP
   headers are missing, switch the tag to `7.2.4-complete`.
-- **Kernels JIT on first use.** `.hip` sources and helpers are embedded in
-  the daemon via `include_str!`; the runtime image needs `hipcc` + HIP
-  headers from the base, not `kernels/src/` on disk.
+- **Exact-source registry kernels are packaged at build time.** Each installed
+  object carries a verified `.index.json` beside the daemon. For an unregistered
+  route or rejected package, the ROCm base still supplies hipcc for JIT.
 - **CLI is native Rust.** `hipfire-registry` embeds `registry/v1.json`; neither
   the builder nor runtime image installs Bun, Node, or a TypeScript payload.
 - **Models are never baked in** — mount a volume.
@@ -55,6 +55,10 @@ Daemon and CLI builds inside the image (Containerfile builder stage):
 cargo build --release --locked -p hipfire-daemon
 cargo build --release --locked -p hipfire-cli
 ```
+
+The builder also runs `scripts/compile-kernels.sh`, failing the image build
+if any registry module cannot produce an indexed object. Runtime copies
+`kernels/compiled/` to `/opt/hipfire/bin/kernels/compiled/`.
 
 ## Run the runtime image (GPU required)
 

@@ -5,7 +5,7 @@
 //! Machine install / repair wizard (`hipfire setup`).
 //!
 //! Bash only bootstraps the CLI binary; this module owns ROCm/GPU resolution,
-//! runtime builds, atomic binary install, cold-kernel seeding, and install.json.
+//! runtime builds, atomic binary install, exact-registry kernel packaging, and install.json.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -308,40 +308,38 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         err
     })?;
 
-    if let Some(arch) = gpu_arch.as_deref() {
-        let cold = bin_dir.join("kernels").join("compiled").join(arch);
-        if let Err(err) = fs::create_dir_all(&cold) {
-            rollback_replacements(&replacements);
-            return Err(err)
-                .with_context(|| format!("failed to create cold kernel dir {}", cold.display()));
-        }
-    }
-    ensure_not_interrupted().map_err(|err| {
-        rollback_replacements(&replacements);
-        err
-    })?;
-
-    let mut precompile = Command::new(bin_dir.join("daemon"));
-    precompile.arg("--precompile");
-    apply_rocm_env(&mut precompile, &rocm_root);
-    match run_capturing(precompile) {
-        Ok(out) if out.status.success() && !interrupted() => {}
-        Ok(out) if interrupted() => {
-            let _ = out;
-            rollback_replacements(&replacements);
-            bail!("setup interrupted");
-        }
-        Ok(out) => {
-            print_command_output(&out);
-            rollback_replacements(&replacements);
-            bail!(
-                "required kernel precompile failed; previous binaries remain in place ({})",
-                out.status
-            );
-        }
-        Err(err) => {
-            rollback_replacements(&replacements);
-            return Err(err).context("failed to start installed daemon --precompile");
+    if let Some(arch) = gpu_arch.as_deref().filter(|arch| {
+        !rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(arch)
+    }) {
+        eprintln!(
+            "No indexed kernel registry for {arch}; hipcc remains required for JIT on this GPU."
+        );
+    } else {
+        // The daemon packages the exact registry through KernelCompiler::pack_to,
+        // the same indexed publisher used by hipfire-kernel-pack. Failure is
+        // required: never leave an unindexed compiler-free installation behind.
+        let mut precompile = Command::new(bin_dir.join("daemon"));
+        precompile.arg("--precompile");
+        apply_rocm_env(&mut precompile, &rocm_root);
+        match run_capturing(precompile) {
+            Ok(out) if out.status.success() && !interrupted() => {}
+            Ok(out) if interrupted() => {
+                let _ = out;
+                rollback_replacements(&replacements);
+                bail!("setup interrupted");
+            }
+            Ok(out) => {
+                print_command_output(&out);
+                rollback_replacements(&replacements);
+                bail!(
+                    "required indexed kernel packaging failed; previous binaries remain in place ({})",
+                    out.status
+                );
+            }
+            Err(err) => {
+                rollback_replacements(&replacements);
+                return Err(err).context("failed to start installed daemon indexed kernel packaging");
+            }
         }
     }
 

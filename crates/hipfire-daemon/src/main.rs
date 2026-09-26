@@ -807,13 +807,9 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // --precompile: compile all kernels for this GPU, write hash files, exit.
-    // Used by scripts/install.sh and `hipfire update` so first `hipfire run`
-    // isn't a 2-minute hipcc wait.
-    //
-    // Covers the current default path (mq4 weights + asym3 KV) plus the legacy
-    // compat paths (hfq4, hfq6, q8 weights × asym3, q8 KV) so models from any
-    // era of the registry start instantly.
+    // --precompile packages the exact-source registry beside this executable.
+    // The installed index, not a historical model/format hand list, defines
+    // which objects can be used without a device compiler.
     if args.iter().any(|a| a == "--precompile") {
         let process_config = hipfire_config::load_local_process_config().unwrap_or_else(|error| {
             eprintln!("FATAL: invalid process configuration: {error}");
@@ -823,25 +819,9 @@ fn main() {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
-        // Create the install-side package root before GPU init: KernelCompiler
-        // discovers it once, then publishes portable-key `.hsaco`/`.hash`
-        // pairs and a checked `.index.json` recording SHA-256 and hipcc ID.
-        // Hot JIT cache keys remain toolchain-specific.
-        if let Some(exe_dir) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        {
-            // Arch is unknown until Gpu::init; use a broad mkdir for the common arches
-            // we support so the probe picks one up. The real arch check after init
-            // will log the active dir.
-            for arch in [
-                "gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101",
-                "gfx1102", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
-            ] {
-                let _ =
-                    std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
-            }
-        }
+        // A separate --module probe below exercises the real GPU launch. Normal
+        // packaging needs the active architecture but no writable cold directory
+        // during Gpu::init: pack_to publishes to the executable-neighbor path.
         let mut gpu = match rdna_compute::Gpu::init() {
             Ok(g) => g,
             Err(e) => {
@@ -884,24 +864,37 @@ fn main() {
             );
             return;
         }
-        eprintln!("Pre-compiling indexed cold kernels for {}...", gpu.arch);
-        let mut ok = 0usize;
-        let mut failed = 0usize;
-        for kv in &["asym3", "q8"] {
-            for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
-                if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
-                    if *wq == "mq4" && *kv == "asym3" {
-                        eprintln!("ERROR: required kernel precompile failed: mq4/asym3: {e}");
-                        std::process::exit(1);
-                    }
-                    eprintln!("  {wq}/{kv}: {e}");
-                    failed += 1;
-                } else {
-                    ok += 1;
-                }
-            }
+        let output = std::env::current_exe()
+            .expect("cannot resolve daemon executable")
+            .parent()
+            .expect("daemon executable has no parent")
+            .join("kernels")
+            .join("compiled")
+            .join(&gpu.arch);
+        let extra_flags = rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
+        let entries = rdna_compute::kernel_registry::entries(&gpu.arch, &extra_flags)
+            .unwrap_or_else(|error| {
+                eprintln!("ERROR: no indexed kernel registry for {}: {error:?}", gpu.arch);
+                std::process::exit(1);
+            });
+        let count = entries.len();
+        let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, extra_flags)
+            .unwrap_or_else(|error| {
+                eprintln!("ERROR: kernel packer initialization failed: {error}");
+                std::process::exit(1);
+            });
+        for entry in entries {
+            compiler.pack_to(
+                entry.module,
+                entry.source(),
+                &entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect::<Vec<_>>(),
+                &output,
+            ).unwrap_or_else(|error| {
+                eprintln!("ERROR: packaging {} failed: {error}", entry.module);
+                std::process::exit(1);
+            });
         }
-        eprintln!("precompile: {ok} ok, {failed} optional failed");
+        eprintln!("precompile: packaged {count} indexed modules for {}", gpu.arch);
         return;
     }
 

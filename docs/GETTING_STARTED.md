@@ -76,11 +76,14 @@ Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
-The installer detects GPU arch, ensures HIP and Rust build prerequisites, builds
-or copies the daemon, installs the native `hipfire` binary under
-`~/.hipfire/bin/`, and places kernels at
-`~/.hipfire/bin/kernels/compiled/<arch>/`. It can add that bin directory to
-`PATH`; reload the shell afterward if `hipfire` is not found.
+The installer detects GPU arch and ROCm, builds the daemon and native CLI,
+then packages exact-source registry kernels with `hipfire-kernel-pack`'s shared
+compiler into `~/.hipfire/bin/kernels/compiled/<arch>/`. Each `.hsaco` requires
+a matching `.index.json`; re-run the installer after upgrading an older install.
+The bin directory can be added to `PATH`; reload the shell afterward.
+
+GPUs not in the admitted registry remain JIT-only and need hipcc at runtime;
+they cannot run with `HIPFIRE_NO_DEVICE_COMPILER=1`.
 
 ### Windows — select a branch, tag, or commit
 
@@ -109,17 +112,14 @@ The native `hipfire update` command remains Linux-only because Windows cannot
 atomically replace the running executable; re-run `install.ps1` with the
 desired selector instead.
 
-Uses a GitHub release `daemon.exe` when available; otherwise builds from source
-under `~\.hipfire\src`. The native CLI is built from the same checkout, and the
-installer runs `daemon.exe --precompile` into
-`~\.hipfire\bin\kernels\compiled\<arch>\`. To force a full kernel compile after install:
+Builds `daemon.exe` and the native CLI from the same selected source revision
+under `~\.hipfire\src`; hipcc from the HIP SDK is required to package exact
+registry sources. The installer runs `daemon.exe --precompile` to produce
+indexed packages in `~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run
+`install.ps1` after upgrading: copying bare `.hsaco` files is insufficient.
 
-```powershell
-cd ~\.hipfire\src
-.\scripts\compile-kernels.ps1 gfx1100   # or your arch
-# script writes to the checkout's kernels\compiled\<arch>\ — copy into the install cache (or re-run install.ps1):
-Copy-Item .\kernels\compiled\<arch>\* $env:USERPROFILE\.hipfire\bin\kernels\compiled\<arch>\ -Force
-```
+Unsupported GPU architectures likewise require hipcc JIT at runtime; the
+installer does not copy bare checkout objects into the installed cache.
 
 ### Source checkout
 

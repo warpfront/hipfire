@@ -59,15 +59,21 @@ let
       }
     else null;
 
-  hipfirePkg =
-    if effectiveSrc != null then
-      cfg.package.override { src = effectiveSrc; cargoLockFile = "${effectiveSrc}/Cargo.lock"; }
-    else
-      cfg.package;
   hipfireKernelsPkg =
     if cfg.kernelsPackage == pkgs.hipfire-kernels
-    then cfg.kernelsPackage.override { gpuTargets = cfg.gpuTargets; }
+    then cfg.kernelsPackage.override ({
+      gpuTargets = cfg.gpuTargets;
+    } // lib.optionalAttrs (effectiveSrc != null) {
+      src = effectiveSrc;
+      cargoLockFile = "${effectiveSrc}/Cargo.lock";
+    })
     else cfg.kernelsPackage;
+  hipfirePkg = cfg.package.override ({
+    kernels = hipfireKernelsPkg;
+  } // lib.optionalAttrs (effectiveSrc != null) {
+    src = effectiveSrc;
+    cargoLockFile = "${effectiveSrc}/Cargo.lock";
+  });
 
   envList =
     (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment)
@@ -377,7 +383,7 @@ in
       systemd.services.hipfire-setup = {
         description = "hipfire config setup";
         wantedBy = [ "multi-user.target" ];
-        before = [ "hipfire-precompile.service" "hipfire.service" ];
+        before = [ "hipfire.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -391,38 +397,14 @@ in
           cp -f ${modelsToml} /var/lib/hipfire/.hipfire/models.toml
           rm -f /var/lib/hipfire/.hipfire/config.json /var/lib/hipfire/.hipfire/per_model_config.json
           ln -sf ${hipfirePkg}/bin/hipfire-daemon /var/lib/hipfire/.hipfire/bin/daemon
-          ln -sfn ${hipfireKernelsPkg}/kernels /var/lib/hipfire/.hipfire/bin/kernels
+          # Packaged indexes and objects live beside hipfire-daemon-unwrapped.
         '';
       };
 
-      systemd.services.hipfire-precompile = {
-        description = "hipfire GPU kernel pre-compilation";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "hipfire-setup.service" ];
-        before = [ "hipfire.service" ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = cfg.user;
-          Group = cfg.group;
-          StateDirectory = "hipfire";
-          CacheDirectory = "hipfire";
-          WorkingDirectory = "/var/lib/hipfire";
-          Environment = envList ++ [
-            "HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels"
-          ];
-        };
-        script = ''
-          export HOME=/var/lib/hipfire
-          if ! ${hipfirePkg}/bin/hipfire-daemon --precompile; then
-            echo "WARNING: kernel pre-compilation failed (exit $?). Daemon will JIT-compile on first request." >&2
-          fi
-        '';
-      };
 
       systemd.services.hipfire = {
         description = "hipfire inference daemon";
-        after = [ "network.target" "hipfire-precompile.service" ];
+        after = [ "network.target" "hipfire-setup.service" ];
         wantedBy = [ "multi-user.target" ];
         path = lib.optionals cfg.rocmSupport [ pkgs.rocmPackages.clr ];
         serviceConfig = {

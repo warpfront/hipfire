@@ -21,15 +21,14 @@
           rocmSupport = true;
           src = lib.cleanSource ./.;
           cargoLockFile = ./Cargo.lock;
+          kernels = hipfire-kernels;
         };
 
-        # Default to no precompiled kernels — daemon JIT-compiles on first
-        # use. Override via `services.hipfire.gpuTargets` in NixOS module
-        # (e.g. `lib.mkForce [ "gfx1010" ]`) or pass an override to
-        # `hipfire-kernels` in your own flake. Empty default avoids the
-        # silent footgun where 5700-XT users build gfx1100 kernels.
+        # The package and standalone kernel output share the same source and
+        # exact-source registry. Unsupported GPUs still use hipcc JIT.
         hipfire-kernels = pkgs.callPackage ./nix/kernels.nix {
-          gpuTargets = [];
+          src = lib.cleanSource ./.;
+          cargoLockFile = ./Cargo.lock;
         };
       in
       {
@@ -60,9 +59,11 @@
           rocmSupport = true;
           src = lib.cleanSource ./.;
           cargoLockFile = ./Cargo.lock;
+          kernels = final.hipfire-kernels;
         };
         hipfire-kernels = final.callPackage ./nix/kernels.nix {
-          gpuTargets = [];  # JIT by default; override per-host
+          src = lib.cleanSource ./.;
+          cargoLockFile = ./Cargo.lock;
         };
       };
     };

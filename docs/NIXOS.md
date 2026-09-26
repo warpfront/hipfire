@@ -6,7 +6,7 @@ packages and the NixOS module under `nix/`.
 | Output | Path / attribute | Role |
 |---|---|---|
 | Package | `packages.hipfire` (default) | Native `hipfire` CLI + wrapped `hipfire-daemon` |
-| Kernels | `packages.hipfire-kernels` | Optional precompile via `scripts/compile-kernels.sh` |
+| Kernels | `packages.hipfire-kernels` | Indexed exact-source registry packages for gfx1201/gfx1100/gfx1151/gfx906/gfx942; also bundled with `packages.hipfire` |
 | Dev shell | `devShells.default` | Rust and hipcc/ROCm tools when `rocmSupport` |
 | Module | `nixosModules.default` | `services.hipfire` systemd unit(s) |
 | Overlay | `overlays.default` | Pins `rocmPackages` from this flake’s nixpkgs + hipfire packages |
@@ -16,7 +16,7 @@ packages and the NixOS module under `nix/`.
 | Flake nixpkgs input | `github:NixOS/nixpkgs/nixos-unstable` |
 | Module default port | `11435` |
 | System model dir option default | `/var/lib/hipfire/models` (see [modelDir limitation](#modeldir-and-effective-paths)) |
-| Kernel package default targets | `[]` (JIT only unless overridden) |
+| Kernel package default targets | `gfx1201`, `gfx1100`, `gfx1151`, `gfx906`, `gfx942` |
 
 Truth state: **shipped / ref-pinned** for the flake/module surface described
 here. Pin a release tag or commit for production hosts; building
@@ -72,13 +72,14 @@ hipfire.url = "github:warpfront/hipfire/<tag-or-commit>";
 
 ### Precompiled kernels package
 
-```bash
-nix build github:warpfront/hipfire#hipfire-kernels
-```
-
-Default `gpuTargets = []` produces an empty/near-empty kernels tree; the
-daemon JIT-compiles on first use. Override targets in the NixOS module or
-your own package override — an empty default avoids baking the wrong arch.
+`nix build github:warpfront/hipfire` bundles indexed kernel objects beside
+`hipfire-daemon-unwrapped`. The separate
+`nix build github:warpfront/hipfire#hipfire-kernels` output contains the same
+exact-source registry objects and `.index.json` files. Override `gpuTargets`
+with the architecture of your GPU to avoid building the entire five-arch set;
+the NixOS module uses `services.hipfire.gpuTargets`. An unsupported architecture
+or unregistered runtime route requires hipcc JIT. Packaging fails if a required
+registry entry cannot compile; partial unindexed packages are not installed.
 
 ## NixOS module
 
@@ -248,8 +249,7 @@ When `userService = false` (default):
 
 | Unit | Role |
 |---|---|
-| `hipfire-setup.service` | Oneshot: native `config.toml` + `models.toml`, `bin/daemon` symlink, kernels symlink under `/var/lib/hipfire/.hipfire` |
-| `hipfire-precompile.service` | Oneshot: `hipfire-daemon --precompile` (failure is warned; JIT still works) |
+| `hipfire-setup.service` | Oneshot: native config and daemon symlink; the daemon resolves verified kernels from its immutable Nix package |
 | `hipfire.service` | `ExecStart = hipfire serve`, restart on failure |
 
 Environment always includes `HIPFIRE_MODELS_DIR=<modelDir>`; the native CLI
@@ -302,8 +302,8 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | `github.repo` | str | `"hipfire"` | fetch repo |
 | `github.rev` | str or null | `null` | branch/tag/commit |
 | `github.hash` | str | `""` | SRI hash for fetch |
-| `kernelsPackage` | package | `pkgs.hipfire-kernels` | Precompiled kernels |
-| `gpuTargets` | list of str | `[]` (**required non-empty when enabled**) | Kernel compile arches |
+| `kernelsPackage` | package | `pkgs.hipfire-kernels` | Exact-source indexed kernels bundled alongside the daemon |
+| `gpuTargets` | list of str | `[]` (**required non-empty when enabled**) | Kernel package architectures |
 | `rocmSupport` | bool | `true` | Use nixpkgs ROCm + graphics ICD |
 | `port` | port | `11435` | Serve port |
 | `defaultModel` | str | `""` | Empty omits `serve.default_model` and makes the module start `hipfire serve --no-prewarm`; a non-empty value is pre-warmed |
@@ -404,11 +404,12 @@ hardware.amdgpu.initrd.enable = true;
 
 Ensure `hardware.graphics.enable = true` when using bundled ROCm.
 
-### Kernel pre-compilation fails
+### Indexed kernel package build fails
 
-`hipfire-precompile` warns and continues; first request JIT-compiles. Check
-`hipcc --version` against the target arch. gfx1151 expects ROCm 7.2+ class
-tooling (aligned with the container base and flake overlay intent).
+`hipfire-kernels` now fails its build when an admitted registry entry cannot
+compile; there is no partial package or boot-time `hipfire-precompile` service.
+Check the selected `gpuTargets`, ROCm hipcc and device libraries, then rebuild.
+gfx1151 expects ROCm 7.2+ class tooling (aligned with the container base).
 
 ## Related
 

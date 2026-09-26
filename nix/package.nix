@@ -5,6 +5,7 @@
 , rocmSupport ? true
 , src ? lib.cleanSource ./..
 , cargoLockFile ? ../Cargo.lock
+, kernels
 }:
 
 let
@@ -34,19 +35,24 @@ rustPlatform.buildRustPackage {
     runHook preInstall
 
     mkdir -p $out/bin
+    # current_exe resolves to hipfire-daemon-unwrapped in this directory.
+    cp -r ${kernels}/kernels $out/bin/kernels
 
     # Install and wrap daemon binary with LD_LIBRARY_PATH for libamdhip64.so dlopen.
     # `hipfire-daemon`'s [[bin]] name is `daemon`, so the artifact is
     # target/release/daemon (mirrors Containerfile's COPY to /opt/hipfire/bin/daemon).
     cp target/release/daemon $out/bin/hipfire-daemon-unwrapped
     makeWrapper $out/bin/hipfire-daemon-unwrapped $out/bin/hipfire-daemon \
-      ${lib.optionalString rocmSupport
-        "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
+      ${lib.optionalString rocmSupport ''
+        --set HIPFIRE_ROCM_PATH ${rocmPackages.clr} \
+        --set HIPFIRE_HIPCC_EXTRA_FLAGS --rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode \
+        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
           rocmPackages.clr
           rocmPackages.rocm-runtime
           rocmPackages.rocm-comgr
           rocmPackages.rocprofiler-register
-        ]}"}
+        ]}
+      ''}
 
     # Install the native Rust control plane. HIPFIRE_DAEMON_BIN points it at
     # the ROCm-wrapped daemon rather than relying on a source-tree layout.

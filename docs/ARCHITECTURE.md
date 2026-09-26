@@ -267,20 +267,20 @@ clauses when a newer predicate subsumes them.
 ### Kernel build
 
 ```text
-kernels/src/<name>.hip
-kernels/src/<name>.gfx1201.hip          # chip override
-kernels/src/<name>.gfx12.hip            # family override (e.g. gfx1200+gfx1201)
-        │  scripts/compile-kernels.sh  (chip → family → base)
+Rust ensure_kernel source expression (preambles, header stitching, selectors)
+        │ hipfire-kernel-registry --arch <arch>
         ▼
-kernels/compiled/<arch>/…               # packaged / tree prebuild output
-~/.hipfire_kernels/<arch>/<name>.<hash>.hsaco  # default JIT cache (or HIPFIRE_KERNEL_CACHE)
+exact six-column source/flags registry
+        │ scripts/compile-kernels.sh → hipfire-kernel-pack
+        ▼
+<daemon-bin-dir>/kernels/compiled/<arch>/<module>.hsaco + .index.json + .hash
+~/.hipfire_kernels/<arch>/<module>.<hash>.hsaco  # writable JIT cache
 ```
 
-On startup the runtime prefers a hash-matching precompiled blob. Missing or
-mismatched hash → hipcc JIT into the cache when hipcc is available; if hipcc is
-unavailable, an explicitly warned **unvalidated** precompiled blob may still be
-used. `hipfire diag` reports compiled blob/hash counts per arch, not which path
-supplied each kernel.
+The runtime verifies the installed index and object SHA-256 before loading,
+even with hipcc present. A missing or stale index falls back to JIT only when
+hipcc is available; compiler-free loads fail closed. Packaged module names
+come from the exact Rust registry, never HIP source basenames.
 
 Some arch crates also ship crate-local HIP (registered through their own
 `kernels.rs`) for family-specific ops.

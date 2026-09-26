@@ -4,7 +4,8 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 
-# Thin bootstrap: obtain source, build hipfire-cli, hand off to `hipfire setup`.
+# Thin bootstrap: obtain source, build hipfire-cli, hand off to `hipfire setup`
+# for exact-registry indexed kernel packaging beside the installed daemon.
 # Usage: curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
 # Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch beta
 set -euo pipefail

@@ -242,6 +242,12 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
 
+For a full indexed install, run `scripts/compile-kernels.sh gfx1201` from the
+matching source revision with hipcc available, and install the resulting
+`kernels/compiled/gfx1201/` directory beside the daemon executable. Native
+installers and container/Nix builds perform this registry packaging directly.
+Do not copy bare `.hsaco` or `.hash` files from older installations.
+
 To build a compiler-free `gfx1201` RMSNorm package for the production
 `Gpu::rmsnorm_f32` route, run
 `hipfire-kernel-pack --arch gfx1201 --output <daemon-bin-dir>/kernels/compiled/gfx1201 --extra-flags '-DIU4_A4_CANDIDATES=2' --kernel rmsnorm_f32:rmsnorm_f32:kernels/src/rmsnorm.hip`

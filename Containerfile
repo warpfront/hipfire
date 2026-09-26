@@ -7,11 +7,9 @@
 # Design notes:
 #   * ROCm/HIP is dlopen'd at runtime; the build itself needs no GPU.
 #   * gfx1151 requires ROCm 7.2+ (6.4.3 segfaults on it) — do NOT downgrade.
-#   * Kernels are JIT-compiled on first use: every .hip source AND its helper
-#     headers (turbo_common.h, *.cuh, ...) are embedded into the daemon binary
-#     via include_str! and stitched in Rust before hipcc runs. So neither
-#     kernels/src/ nor registry.json need to exist on disk in the runtime image;
-#     the image only needs `hipcc` + HIP headers (from the ROCm base) at runtime.
+#   * The builder compiles exact Rust registry sources into indexed code-object
+#     packages. The runtime image carries them beside the daemon; hipcc remains
+#     available for unregistered routes and a rejected package fallback.
 #   * Models are runtime-only downloads — never baked in; mount as a volume.
 #
 # Build:
@@ -68,6 +66,7 @@ COPY . .
 # architecture unconditionally — no --features or --example needed.
 RUN cargo build --release --locked -p hipfire-daemon
 RUN cargo build --release --locked -p hipfire-cli
+RUN bash scripts/compile-kernels.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # runtime — TARGET A, deliverable. No Rust, no source tree, no gate scripts.
@@ -75,6 +74,7 @@ RUN cargo build --release --locked -p hipfire-cli
 FROM base-rocm AS runtime
 
 COPY --from=builder /hipfire/target/release/daemon /opt/hipfire/bin/daemon
+COPY --from=builder /hipfire/kernels/compiled /opt/hipfire/bin/kernels/compiled
 COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
 ENV HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
