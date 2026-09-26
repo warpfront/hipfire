@@ -28,6 +28,7 @@ pub mod abi;
 #[doc(hidden)]
 pub mod packet;
 mod pm4;
+pub mod pm4_decode;
 mod pm4_gfx10;
 mod runtime;
 
