@@ -16,12 +16,14 @@ fn run() -> Result<(), String> {
     let mut arch = None;
     let mut output = None;
     let mut extra_flags = String::new();
+    let mut registry = None;
     let mut jobs: Vec<(String, Vec<String>, PathBuf)> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--arch" => arch = Some(args.next().ok_or("--arch needs a value")?),
             "--output" => output = Some(PathBuf::from(args.next().ok_or("--output needs a value")?)),
             "--extra-flags" => extra_flags = args.next().ok_or("--extra-flags needs a value")?,
+            "--registry" => registry = Some(PathBuf::from(args.next().ok_or("--registry needs a path")?)),
             "--kernel" => {
                 let value = args.next().ok_or("--kernel needs module:symbol[,symbol...]:source")?;
                 let (module, rest) = value.split_once(':').ok_or("--kernel needs module:symbol[,symbol...]:source")?;
@@ -33,7 +35,7 @@ fn run() -> Result<(), String> {
                 jobs.push((module.to_owned(), symbols, PathBuf::from(source)));
             }
             "--help" | "-h" => {
-                eprintln!("Usage: hipfire-kernel-pack --arch gfx1201 --output <arch-dir> --kernel module:symbol[,symbol...]:effective-source.hip [--kernel ...] [--extra-flags flags]");
+                eprintln!("Usage: hipfire-kernel-pack --arch gfx1201 --output <arch-dir> [--registry registry.tsv] [--kernel module:symbol[,symbol...]:effective-source.hip ...] [--extra-flags flags]");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}")),
@@ -41,6 +43,33 @@ fn run() -> Result<(), String> {
     }
     let arch = arch.ok_or("missing --arch")?;
     let output = output.ok_or("missing --output")?;
+    if let Some(path) = registry {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        for (line_no, line) in text.lines().enumerate() {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            if columns.len() != 6 {
+                return Err(format!("{}:{}: expected six TSV columns", path.display(), line_no + 1));
+            }
+            let [entry_arch, module, symbols, source_path, flags, profile] = columns.as_slice() else {
+                unreachable!()
+            };
+            if *entry_arch != arch || module.is_empty() || source_path.is_empty() {
+                return Err(format!("{}:{}: invalid arch/module/source", path.display(), line_no + 1));
+            }
+            let source = std::fs::read_to_string(source_path)
+                .map_err(|e| format!("{}: {e}", source_path))?;
+            let recipe = rdna_compute::KernelCompiler::recipe_for_source(&arch, module, &source, &extra_flags);
+            if recipe.flags.join(" ") != *flags || recipe.scheduler_profile.as_deref() != Some(profile) {
+                return Err(format!("{}:{}: registry flags/profile differ from compiler recipe", path.display(), line_no + 1));
+            }
+            jobs.push((
+                (*module).to_owned(),
+                symbols.split(',').map(str::to_owned).collect(),
+                PathBuf::from(source_path),
+            ));
+        }
+    }
     if jobs.is_empty() {
         return Err("at least one --kernel is required".into());
     }

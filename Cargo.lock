@@ -2783,6 +2783,9 @@ dependencies = [
  "rayon",
  "redline-dispatch",
  "redline-rocr",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

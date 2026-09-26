@@ -2,6 +2,7 @@
 
 ## Unreleased
 - Daemon GPU reservations are now machine-wide, non-blocking flock files keyed by physical HIP UUID, acquired in sorted order for all visible/configured devices. The lock directory is `HIPFIRE_LOCK_DIR` when set, otherwise `/run/lock/hipfire` if writable, else `/tmp/hipfire-locks`; scripts use the same selection, and different directories do not contend. Distinct GPUs may run concurrently under the same HOME; conflicts report UUID, PCI BDF and holder PID. Per-GPU-set HOME PID files remain advisory for uninstall.
+- Installed kernel objects now use the portable packaging key (including daemon `--precompile` writeback), while writable hot JIT entries retain toolchain-specific keys. A versioned per-module index binds module, exported symbols, arch, source SHA-256, compile flags/profile, cache ABI, hipcc identity and object SHA-256; indexed objects are verified before `hipModuleLoad` with or without a local compiler. `hipfire-kernel-pack` produces indexed objects from explicit sources or the exact-source registry, and `hipfire-daemon --precompile --module rmsnorm` probes the gfx1201 single-object route. Existing unindexed install objects must be repackaged.
 
 
 ### v0.4.0 — KV backend, long context, and gfx11 prefill

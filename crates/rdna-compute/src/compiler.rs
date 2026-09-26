@@ -914,7 +914,6 @@ impl KernelCompiler {
             Ok(index) => index,
             Err(error) => {
                 eprintln!("  WARNING: {module}: cold index unavailable ({error})");
-                writeback_cold(module, object, &key, dir, force);
                 return;
             }
         };
@@ -934,9 +933,7 @@ impl KernelCompiler {
                 && prior.toolchain_sha256 == index.toolchain_sha256
         });
         if same_bytes && pair_valid(&cold_object, &cold_hash, &key) {
-            if !index.symbols.iter().any(|s| s == symbol) {
-                index.symbols.extend(existing.unwrap().symbols.into_iter().filter(|s| s != symbol));
-            }
+            index.symbols.extend(existing.unwrap().symbols.into_iter().filter(|s| s != symbol));
             // Even if the old index says its digest matches, check the actual
             // cold bytes; a corrupted blob must be repaired from the hot object.
             if std::fs::read(&cold_object)
@@ -2966,6 +2963,19 @@ mod tests {
                 assert_eq!(consumer.compile_for_symbol(name, source, symbol).unwrap(), object);
             }
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_writeback_preserves_all_symbols_in_shared_module() {
+        let root = temp_root("shared_module_symbols");
+        let source = "__global__ void a() {} __global__ void b() {}";
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        producer.compile_for_symbol("shared", source, "a").unwrap();
+        producer.compile_for_symbol("shared", source, "b").unwrap();
+        let mut consumer = prebuilt_gate_compiler(&root, false);
+        assert!(consumer.compile_for_symbol("shared", source, "a").is_ok());
+        assert!(consumer.compile_for_symbol("shared", source, "b").is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 
