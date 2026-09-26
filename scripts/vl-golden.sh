@@ -55,8 +55,8 @@ if [ -e "$IMAGE_MD5_FILE" ]; then
   fi
 fi
 
-# Isolated HOME: the daemon pid lock is an flock on $HOME/.hipfire/daemon.pid,
-# so a developer's running daemon would otherwise make this fail spuriously.
+# Isolated HOME keeps the fixture's config/cache independent. It does not
+# bypass machine-wide UUID locks; pick an unreserved GPU for this gate.
 RUNHOME="$(mktemp -d)"
 trap 'rm -rf "$RUNHOME"' EXIT
 OUT="$RUNHOME/decoded.txt"

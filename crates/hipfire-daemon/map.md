@@ -5,11 +5,13 @@
 
 ## Purpose
 
-The product entry point (`crates/hipfire-daemon/src/main.rs`, 3,879 lines per `docs/ARCHITECTURE.md`). Owns message dispatch and process lifetime only — `flock(2)` on `~/.hipfire/daemon.pid` (single daemon invariant), JSONL stdin/stdout protocol (`load`/`generate`/`unload` plus image-augmented `generate`), and the `generate(…)` ladder that delegates to `hipfire-loader::load_model` and the `hipfire-generate` bodies. Build is `cargo build --release` with no `--features` (required-features 71 → 0).
+The product entry point (`crates/hipfire-daemon/src/main.rs`). Owns message dispatch and process lifetime — machine-wide, UUID-keyed `flock(2)` files under the resolved lock directory, JSONL stdin/stdout protocol (`load`/`generate`/`unload` plus image-augmented `generate`), and the `generate(…)` ladder that delegates to `hipfire-loader::load_model` and the `hipfire-generate` bodies. Build is `cargo build --release` with no `--features`.
 
 ## Gotchas
 
-- Exactly one daemon per machine — a second invocation exits `FATAL: hipfire daemon already running (PID N)` before touching the GPU; do not remove the `flock` gate.
+- Daemons may share a HOME only when their physical GPU UUID sets do not overlap. Locks are acquired sorted and non-blocking before GPU initialization; contention reports the UUID, PCI BDF and holder PID. Never unlink a GPU lock file: flock releases on death, and unlinking creates a second inode.
+- Lock directory: `HIPFIRE_LOCK_DIR` if set (must be absolute and writable); otherwise `/run/lock/hipfire` when writable, then `/tmp/hipfire-locks`. The daemon logs its resolved directory at startup. Daemons or scripts pointed at **different** lock directories do not contend; all users/processes sharing a card must use the same directory. `gpu-lock.sh` follows the identical selection policy.
+- `~/.hipfire/daemon-GPU-<uuid>[_GPU-<uuid>...].pid` is advisory PID discovery for uninstall, not a mutex. Native CLI/client processes communicate with their own stdio daemon; serve discovery uses `serve.pid`/its HTTP port. A private HOME does **not** bypass GPU contention.
 - The binary name is `daemon` (`[[bin]]` in `Cargo.toml`), not `hipfire-daemon`; the `target/release/hipfire` wrapper is separate.
 - The serve vs one-shot decision lives in `hipfire-cli` (forced local when `HIPFIRE_LOCAL=1`, `--kv-mode`, `--json`, or `--no-stream`) — daemon always assumes it was given the correct path.
 

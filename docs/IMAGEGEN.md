@@ -225,9 +225,9 @@ the table in the crate README lists them.
   (section 4) and pass the trunk pack.
 - `... needs the t5 and clip sidecar packs next to it` — the sidecars are
   looked up next to the trunk by name; keep the packer's output together.
-- `FATAL: hipfire daemon already running` — one daemon per `$HOME/.hipfire`.
-  Stop the other one (`hipfire stop`) or run the test with a private
-  `HOME=/tmp/hipfire-home`.
+- `FATAL: GPU GPU-... already reserved by holder PID ...` — another
+  daemon owns that physical GPU. Stop it or select a different card with
+  `hardware.devices`; a private HOME does not bypass the lock.
 - A very slow first image — kernel JIT plus the weight upload. Run once more
   before you read any timing.
 - Out of device memory on FLUX.1 — the T5 and CLIP encoders fall back to

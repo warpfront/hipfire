@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Daemon GPU reservations are now machine-wide, non-blocking flock files keyed by physical HIP UUID, acquired in sorted order for all visible/configured devices. The lock directory is `HIPFIRE_LOCK_DIR` when set, otherwise `/run/lock/hipfire` if writable, else `/tmp/hipfire-locks`; scripts use the same selection, and different directories do not contend. Distinct GPUs may run concurrently under the same HOME; conflicts report UUID, PCI BDF and holder PID. Per-GPU-set HOME PID files remain advisory for uninstall.
+
 
 ### v0.4.0 — KV backend, long context, and gfx11 prefill
 

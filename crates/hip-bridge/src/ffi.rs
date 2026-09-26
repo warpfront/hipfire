@@ -234,6 +234,8 @@ pub struct HipRuntime {
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
     fn_set_device_flags: unsafe extern "C" fn(c_uint) -> u32,
     fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    fn_device_get_uuid: unsafe extern "C" fn(*mut u8, c_int) -> u32,
+    fn_device_get_pci_bus_id: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32,
 
     // Multi-device / peer access
     fn_device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -426,6 +428,16 @@ impl HipRuntime {
                     lib,
                     "hipGetDevice",
                     unsafe extern "C" fn(*mut c_int) -> u32
+                ),
+                fn_device_get_uuid: load_fn!(
+                    lib,
+                    "hipDeviceGetUuid",
+                    unsafe extern "C" fn(*mut u8, c_int) -> u32
+                ),
+                fn_device_get_pci_bus_id: load_fn!(
+                    lib,
+                    "hipDeviceGetPCIBusId",
+                    unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32
                 ),
                 fn_device_can_access_peer: load_fn!(
                     lib,
@@ -771,6 +783,36 @@ impl HipRuntime {
         self.check(code, "hipGetDeviceCount")?;
         Ok(count)
     }
+    /// ROCm encodes the 16 hex digits of the physical GPU UUID as ASCII in
+    /// hipUUID.bytes. Retain that spelling so it matches GPU-... selectors.
+    pub fn device_uuid(&self, id: i32) -> HipResult<String> {
+        let mut bytes = [0u8; 16];
+        let code = unsafe { (self.fn_device_get_uuid)(bytes.as_mut_ptr(), id) };
+        self.check(code, "hipDeviceGetUuid")?;
+        let mut uuid = String::with_capacity(36);
+        uuid.push_str("GPU-");
+        if bytes.iter().all(u8::is_ascii_hexdigit) {
+            for byte in bytes {
+                uuid.push((byte as char).to_ascii_lowercase());
+            }
+        } else {
+            use std::fmt::Write;
+            for byte in bytes {
+                write!(&mut uuid, "{byte:02x}").expect("write to String");
+            }
+        }
+        Ok(uuid)
+    }
+
+    pub fn device_pci_bus_id(&self, id: i32) -> HipResult<String> {
+        let mut bytes = [0 as c_char; 32];
+        let code = unsafe { (self.fn_device_get_pci_bus_id)(bytes.as_mut_ptr(), 32, id) };
+        self.check(code, "hipDeviceGetPCIBusId")?;
+        Ok(unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+
 
     pub fn set_device(&self, id: i32) -> HipResult<()> {
         let code = unsafe { (self.fn_set_device)(id) };

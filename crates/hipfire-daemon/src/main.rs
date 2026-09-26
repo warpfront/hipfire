@@ -6,10 +6,8 @@
 //! The Bun CLI spawns this process and communicates via IPC.
 //! Usage: daemon (reads JSON from stdin, writes JSON to stdout)
 //!
-//! Exactly one daemon runs at a time per machine — enforced by an exclusive
-//! flock(2) on ~/.hipfire/daemon.pid. A second daemon invocation exits with
-//! `FATAL: hipfire daemon already running (PID N)` before touching the GPU,
-//! preventing orphan doubles from silently double-consuming VRAM.
+//! Daemons sharing a physical GPU are excluded by machine-wide, UUID-keyed
+//! flock(2) locks. Daemons on distinct GPUs may coexist, even in one HOME.
 //!
 //! Protocol:
 //!   → {"type":"load","model":"path.hfq","params":{"max_seq":4096}}
@@ -385,58 +383,112 @@ fn gpu_block_attractor_token(
             .memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
     }
 }
+#[cfg(unix)]
+fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.is_absolute() {
+        return Err(format!("GPU lock directory must be absolute: {}", path.display()));
+    }
+    if !path.exists() {
+        std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
+            .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
+    }
+    if !path.is_dir() {
+        return Err(format!("GPU lock path is not a directory: {}", path.display()));
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        return Err(format!("GPU lock directory is not writable: {}", path.display()));
+    }
+    Ok(())
+}
 
-fn acquire_daemon_lock() -> std::fs::File {
-    use std::io::{Seek, Write};
+#[cfg(unix)]
+fn gpu_lock_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(override_dir) = std::env::var_os("HIPFIRE_LOCK_DIR") {
+        let dir = std::path::PathBuf::from(override_dir);
+        prepare_gpu_lock_dir(&dir)?;
+        return Ok(dir);
+    }
+    let primary = Path::new("/run/lock/hipfire");
+    if prepare_gpu_lock_dir(primary).is_ok() {
+        return Ok(primary.to_path_buf());
+    }
+    let fallback = Path::new("/tmp/hipfire-locks");
+    prepare_gpu_lock_dir(fallback)?;
+    Ok(fallback.to_path_buf())
+}
 
-    #[cfg(unix)]
-    let home = std::env::var("HOME").expect("HOME environment variable not set");
-    #[cfg(windows)]
-    let home = std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set");
 
-    let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
-    std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
-    let pid_path = hipfire_dir.join("daemon.pid");
+#[cfg(unix)]
+/// The open descriptors keep all selected GPUs reserved until process exit.
+/// The per-HOME PID file is advisory discovery for uninstall tooling, not a
+/// mutex: two daemons using different cards in one HOME must both run.
+fn acquire_gpu_locks() -> Result<Vec<std::fs::File>, String> {
+    use std::io::{Read, Seek, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
 
-    let mut f = {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(&pid_path)
-            .expect("failed to open ~/.hipfire/daemon.pid")
-    };
+    let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
+    let count = hip.device_count().map_err(|e| e.to_string())?;
+    if count < 1 {
+        return Err("no visible GPUs to reserve".into());
+    }
+    let mut devices = Vec::with_capacity(count as usize);
+    for id in 0..count {
+        let uuid = hip.device_uuid(id).map_err(|e| e.to_string())?;
+        let bdf = hip.device_pci_bus_id(id).unwrap_or_else(|_| format!("HIP device {id}"));
+        devices.push((uuid, bdf));
+    }
+    devices.sort_unstable();
+    devices.dedup_by(|a, b| a.0 == b.0);
 
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let dir = gpu_lock_dir()?;
+    eprintln!("[gpu-lock] directory={}", dir.display());
+    let mut locks = Vec::with_capacity(devices.len());
+    for (uuid, bdf) in &devices {
+        let path = dir.join(format!("gpu-{uuid}.lock"));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            let mut existing = String::new();
-            let _ = f.read_to_string(&mut existing);
-            let pid = existing.trim();
-            let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
-            let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
-            eprintln!(
-                "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
-                pid_display, kill_arg
-            );
-            std::process::exit(1);
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                let mut holder = String::new();
+                let _ = file.read_to_string(&mut holder);
+                return Err(format!(
+                    "GPU {uuid} (PCI {bdf}) already reserved by holder PID {}",
+                    holder.split_whitespace().next().unwrap_or("<unknown>")
+                ));
+            }
+            return Err(format!("flock {}: {error}", path.display()));
         }
+        // The lock file stays on disk forever; never unlink an active inode.
+        // Loosen files created under a restrictive umask for other HOME/users.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+        file.set_len(0).map_err(|e| e.to_string())?;
+        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        writeln!(file, "{} {}", std::process::id(), bdf).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        locks.push(file);
     }
 
-    // Got the lock (Unix) / opened the PID file (Windows). Truncate any stale
-    // content and write our PID so tooling and the Unix-side error above can
-    // both show a useful number.
-    f.set_len(0).ok();
-    f.seek(std::io::SeekFrom::Start(0)).ok();
-    writeln!(f, "{}", std::process::id()).ok();
-    f.flush().ok();
-    f
+    let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
+    let hipfire_dir = Path::new(&home).join(".hipfire");
+    std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
+    let suffix = devices.iter().map(|(uuid, _)| uuid.as_str()).collect::<Vec<_>>().join("_");
+    let pid_path = hipfire_dir.join(format!("daemon-{suffix}.pid"));
+    std::fs::write(&pid_path, format!("{}\n", std::process::id()))
+        .map_err(|e| format!("write {}: {e}", pid_path.display()))?;
+    Ok(locks)
+}
+
+#[cfg(not(unix))]
+fn acquire_gpu_locks() -> Result<Vec<std::fs::File>, String> {
+    Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
 }
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the
@@ -818,11 +870,8 @@ fn main() {
         return;
     }
 
-    // Machine-wide mutex — prevents orphan daemons from silently coexisting
-    // (observed 2026-04-13: two daemons at 100% CPU survived pkill -f rounds
-    // because they'd been reparented to PID 1 after their bun parent died).
-    // Kept in a binding so the fd lives for the full process lifetime.
-    let _daemon_lock = acquire_daemon_lock();
+    // Resolve configured ROCr/HIP visibility before identifying and reserving
+    // the complete physical GPU set; do not allocate a GPU context first.
 
     let mut stdout = std::io::stdout();
     let Some((process_config, pending_message, acknowledge_config)) =
@@ -835,6 +884,10 @@ fn main() {
     };
     install_process_config(process_config).unwrap_or_else(|error| {
         eprintln!("FATAL: failed to install process configuration: {error}");
+        std::process::exit(1);
+    });
+    let _gpu_locks = acquire_gpu_locks().unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
     if acknowledge_config {
