@@ -85,6 +85,17 @@ fn prepend_kv_slot_desc(body: &str) -> String {
     )
 }
 
+fn q8_flash_prefill_default_source() -> String {
+    // attention.rs:3482-3504 uses NTHREADS=256; the default dispatcher
+    // selects BR=8, BC=16 (hipfire-dispatch/src/families/attention.rs:2236-2258).
+    // Explicit HIPFIRE_FLASH_PREFILL_BR/BC overrides require separate entries.
+    format!(
+        "#define BR 8\n#define BC 16\n#define NTHREADS 256\n{}\n{}",
+        kernels::KV_SLOT_DESC_H,
+        kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC.replace("#include \"kv_slot_desc.h\"", "")
+    )
+}
+
 fn assemble_asym(body: &str) -> String {
     // The slot descriptor appears in asym3 but not all the other asym bodies.
     let needs_slot = body.contains("#include \"kv_slot_desc.h\"");
@@ -218,6 +229,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("attention_q8_0_kv_batched", prepend_kv_slot_desc(kernels::ATTENTION_Q8_0_KV_BATCHED_SRC), ["attention_q8_0_kv_batched"]);
     add!("attention_q8_0_kv_independent_masked_windowed", prepend_kv_slot_desc(kernels::ATTENTION_Q8_0_KV_BATCHED_SRC), ["attention_q8_0_kv_independent_masked_windowed"]);
     add!("attention_q8_0_flash_prefill", prepend_kv_slot_desc(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC), ["attention_q8_0_flash_prefill"]);
+    // The installer-only unspecialized module above cannot satisfy this
+    // runtime's default scalar-prefill module or its BR/BC-specialized source.
+    add!("attention_q8_0_flash_prefill_br8_bc16", q8_flash_prefill_default_source(), ["attention_q8_0_flash_prefill"]);
     add!("kv_cache_write_q8_0_batched", prepend_kv_slot_desc(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC), ["kv_cache_write_q8_0_batched"]);
     add!("kv_cache_write_q8_0_independent", prepend_kv_slot_desc(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC), ["kv_cache_write_q8_0_independent"]);
     add!("kv_cache_write_q8_0_independent_masked", prepend_kv_slot_desc(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC), ["kv_cache_write_q8_0_independent_masked"]);
@@ -305,7 +319,23 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 92);
-        assert_eq!(count, registry.len(), "unverified gfx1201 source");
+        // The installer trace predates the scalar-prefill runtime's BR/BC
+        // specialization. Its default key/source is additional to P0's 92.
+        assert_eq!(registry.len(), count + 1, "unexpected gfx1201 inventory size");
+        let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
+        assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
+        assert!(default_prefill.source().starts_with(
+            "#define BR 8\n#define BC 16\n#define NTHREADS 256\n"
+        ));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(default_prefill.source().as_bytes())),
+            "680c37bf2f4f978d0361bd5c1b48c1fbd6430d1777663d31b45c9b6ad510bb95",
+            "default Q8 flash prefill source changed"
+        );
+        assert_ne!(
+            default_prefill.source(),
+            by_name.get("attention_q8_0_flash_prefill").unwrap().source()
+        );
         if !root.is_dir() {
             // P0 cache paths are machine-local. The 92 digests above are
             // checked everywhere; on the capture machine, also compare bytes
@@ -342,5 +372,9 @@ mod tests {
         assert!(matches!(lookup("gfx942", "qwen35_fa_prep_batched_gfx1201", ""), Err(RegistryError::UnsupportedModule { .. })));
         assert!(lookup("gfx942", "fused_qkv_hfq4g256_wave64", "").is_ok());
         assert!(lookup("gfx906", "gemm_qkv_hfq4g256_wmma_gfx12", "").is_err());
+        for arch in SUPPORTED_ARCHES {
+            assert!(lookup(arch, "attention_q8_0_flash_prefill_br8_bc16", "").is_ok());
+            assert!(lookup(arch, "attention_q8_0_flash_prefill_br16_bc32", "").is_err());
+        }
     }
 }
