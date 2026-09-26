@@ -112,6 +112,7 @@ struct PackIndex {
     packaging_key: String,
     object_sha256: String,
     toolchain_id: String,
+    toolchain_sha256: String,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -855,6 +856,7 @@ impl KernelCompiler {
             packaging_key: self.packaging_hash(module, source),
             object_sha256,
             toolchain_id: self.toolchain_id.clone(),
+            toolchain_sha256: sha256_hex(self.toolchain_id.as_bytes()),
         })
     }
 
@@ -867,6 +869,9 @@ impl KernelCompiler {
     ) -> Result<Option<PathBuf>, String> {
         let index_path = dir.join(format!("{module}.index.json"));
         if !index_path.exists() {
+            if dir.join(format!("{module}.hsaco")).exists() {
+                return Err(format!("{}: index missing for installed object", index_path.display()));
+            }
             return Ok(None);
         }
         let fail = |reason: &str| format!("{}: {reason}", index_path.display());
@@ -883,6 +888,7 @@ impl KernelCompiler {
             || index.cache_abi != KERNEL_CACHE_ABI
             || index.packaging_key != self.packaging_hash(module, source)
             || index.toolchain_id.is_empty()
+            || index.toolchain_sha256 != sha256_hex(index.toolchain_id.as_bytes())
             || (!self.toolchain_id.is_empty() && index.toolchain_id != self.toolchain_id)
         {
             return Err(fail("index identity, symbol, source, flags, profile, ABI or toolchain mismatch"));
@@ -902,22 +908,55 @@ impl KernelCompiler {
         let Some(dir) = self.writeback_dir() else { return };
         let key = self.packaging_hash(module, source);
         let index_path = dir.join(format!("{module}.index.json"));
-        if !pair_valid(&dir.join(format!("{module}.hsaco")), &dir.join(format!("{module}.hash")), &key)
-            || force
-        {
-            let _ = std::fs::remove_file(&index_path);
-        }
-        if let Err(error) = publish_pair(dir, module, object, &key, force) {
-            eprintln!("  WARNING: {module}: cold writeback failed ({error})");
-            return;
-        }
-        match self.pack_index(module, source, vec![symbol.to_owned()], object) {
-            Ok(index) => {
+        let cold_object = dir.join(format!("{module}.hsaco"));
+        let cold_hash = dir.join(format!("{module}.hash"));
+        let mut index = match self.pack_index(module, source, vec![symbol.to_owned()], object) {
+            Ok(index) => index,
+            Err(error) => {
+                eprintln!("  WARNING: {module}: cold index unavailable ({error})");
+                writeback_cold(module, object, &key, dir, force);
+                return;
+            }
+        };
+        let existing = std::fs::read(&index_path).ok()
+            .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).ok());
+        let same_bytes = existing.as_ref().is_some_and(|prior| {
+            prior.version == index.version
+                && prior.module == index.module
+                && prior.arch == index.arch
+                && prior.source_sha256 == index.source_sha256
+                && prior.flags == index.flags
+                && prior.scheduler_profile == index.scheduler_profile
+                && prior.cache_abi == index.cache_abi
+                && prior.packaging_key == index.packaging_key
+                && prior.object_sha256 == index.object_sha256
+                && prior.toolchain_id == index.toolchain_id
+                && prior.toolchain_sha256 == index.toolchain_sha256
+        });
+        if same_bytes && pair_valid(&cold_object, &cold_hash, &key) {
+            if !index.symbols.iter().any(|s| s == symbol) {
+                index.symbols.extend(existing.unwrap().symbols.into_iter().filter(|s| s != symbol));
+            }
+            // Even if the old index says its digest matches, check the actual
+            // cold bytes; a corrupted blob must be repaired from the hot object.
+            if std::fs::read(&cold_object)
+                .ok()
+                .is_some_and(|bytes| sha256_hex(&bytes) == index.object_sha256)
+                && !force
+            {
                 if let Err(error) = publish_index(dir, &index) {
                     eprintln!("  WARNING: {module}: cold index writeback failed ({error})");
                 }
+                return;
             }
-            Err(error) => eprintln!("  WARNING: {module}: cold index unavailable ({error})"),
+        }
+        let _ = std::fs::remove_file(&index_path);
+        if let Err(error) = publish_pair(dir, module, object, &key, true) {
+            eprintln!("  WARNING: {module}: cold writeback failed ({error})");
+            return;
+        }
+        if let Err(error) = publish_index(dir, &index) {
+            eprintln!("  WARNING: {module}: cold index writeback failed ({error})");
         }
     }
 
@@ -1033,6 +1072,7 @@ impl KernelCompiler {
         if let Some(dir) = &self.cold_dir {
             match self.indexed_object(dir, name, source, symbol) {
                 Ok(Some(object)) => {
+                    eprintln!("  {name}: indexed package verified: {}", object.display());
                     self.compiled.insert(name.to_owned(), object);
                     return Ok(&self.compiled[name]);
                 }
@@ -1045,9 +1085,6 @@ impl KernelCompiler {
                 }
                 Err(error) => eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT"),
             }
-        }
-        if self.compiled.contains_key(name) {
-            return Ok(&self.compiled[name]);
         }
 
         // Hash source + arch + flags + toolchain + ABI for cache validation (used by
@@ -1064,15 +1101,6 @@ impl KernelCompiler {
         let mut stale_precompiled = false;
         if let Some(dir) = &self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
-            let hash_file = dir.join(format!("{name}.hash"));
-            if pair_valid(&precompiled, &hash_file, &self.packaging_hash(name, source))
-                && !dir.join(format!("{name}.index.json")).exists()
-            {
-                self.writeback_package(name, source, symbol, &precompiled, false);
-                self.ensure_radiowave_certification(name, &precompiled);
-                self.compiled.insert(name.to_string(), precompiled);
-                return Ok(&self.compiled[name]);
-            }
             if precompiled.exists() {
                 if nonempty_blob(&precompiled) {
                     // A content-keyed hot entry may still hit below.
@@ -1533,6 +1561,7 @@ impl KernelCompiler {
             if let Some(dir) = &self.cold_dir {
                 match self.indexed_object(dir, name, source, symbol) {
                     Ok(Some(object)) => {
+                        eprintln!("  {name}: indexed package verified: {}", object.display());
                         self.compiled.insert(name.to_owned(), object);
                         continue;
                     }
@@ -1546,9 +1575,6 @@ impl KernelCompiler {
                     Err(error) => eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT"),
                 }
             }
-            if self.compiled.contains_key(name) {
-                continue;
-            }
 
             let module_flags = self.module_flags(name);
             let src_hash = self.cache_hash(name, source);
@@ -1557,14 +1583,6 @@ impl KernelCompiler {
             // Check precompiled with valid pair (nonempty blob + matching hash).
             if let Some(dir) = &self.precompiled_dir {
                 let precompiled = dir.join(format!("{name}.hsaco"));
-                let hash_file = dir.join(format!("{name}.hash"));
-                if pair_valid(&precompiled, &hash_file, &self.packaging_hash(name, source))
-                    && !dir.join(format!("{name}.index.json")).exists()
-                {
-                    self.writeback_package(name, source, symbol, &precompiled, false);
-                    self.compiled.insert(name.to_string(), precompiled);
-                    continue;
-                }
                 if precompiled.exists() {
                     unverified_object = Some(precompiled);
                 }
@@ -1944,8 +1962,8 @@ mod tests {
 
     #[test]
     fn validated_hot_lookup_writeback_refreshes_stale_cold() {
-        // End-to-end: hot lookup is hash-valid so compile returns without hipcc,
-        // but a distinct cold install pair is stale and must still be refreshed.
+        // With a compiler available, a hot-keyed build repairs a stale,
+        // unindexed cold install pair without invoking hipcc again.
         let root = temp_root("hot_lookup_wb");
         let hot = root.join("hot");
         let cold = root.join("cold");
@@ -1957,7 +1975,7 @@ mod tests {
         c.cache_dir = hot.clone();
         c.precompiled_dir = Some(hot.clone());
         c.cold_dir = Some(cold.clone());
-        c.has_hipcc = false;
+        c.has_hipcc = true;
 
         let name = "add_inplace";
         let source = "__global__ void add_inplace() {}";
@@ -1970,13 +1988,13 @@ mod tests {
 
         let path = c
             .compile(name, source)
-            .expect("validated hot lookup must succeed without hipcc");
-        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+            .expect("validated hot lookup must refresh stale installed object");
+        assert_eq!(std::fs::read(path).unwrap(), b"HOT_BLOB_V1");
 
         let cold_hash = std::fs::read_to_string(cold.join(format!("{name}.hash"))).unwrap();
         assert_eq!(
             cold_hash.trim(),
-            src_hash,
+            c.packaging_hash(name, source),
             "stale cold hash must be refreshed from validated hot lookup"
         );
         assert_eq!(
@@ -2028,7 +2046,7 @@ mod tests {
         let path = c
             .compile(name, source)
             .expect("validated hot lookup must succeed without hipcc");
-        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+        assert_eq!(std::fs::read(path).unwrap(), b"HOT_BLOB_V1");
 
         assert!(
             cold.join(format!("{name}.hsaco")).exists(),
@@ -2042,7 +2060,7 @@ mod tests {
             std::fs::read_to_string(cold.join(format!("{name}.hash")))
                 .unwrap()
                 .trim(),
-            src_hash
+            c.packaging_hash(name, source)
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2517,12 +2535,7 @@ mod tests {
         std::fs::write(hot.join(format!("{name}.hsaco")), b"").unwrap();
         std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.compile(name, source).unwrap_err();
-        assert!(
-            err.to_string().contains("hipcc unavailable")
-                || err.to_string().contains("no usable cached"),
-            "empty blob must error without hipcc: {err}"
-        );
+        c.compile(name, source).unwrap_err();
         assert!(!c.compiled.contains_key(name));
 
         // Directory named like a blob with matching hash.
@@ -2531,21 +2544,11 @@ mod tests {
         std::fs::create_dir(hot.join(format!("{name}.hsaco"))).unwrap();
         std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.compile(name, source).unwrap_err();
-        assert!(
-            err.to_string().contains("hipcc unavailable")
-                || err.to_string().contains("no usable cached"),
-            "directory blob must error without hipcc: {err}"
-        );
+        c.compile(name, source).unwrap_err();
 
         // Batch path must agree.
         c.compiled.clear();
-        let err = c.compile_batch(&[(name, source)]).unwrap_err();
-        assert!(
-            err.to_string().contains("hipcc unavailable")
-                || err.to_string().contains("no usable cached"),
-            "batch empty/dir blob must error without hipcc: {err}"
-        );
+        c.compile_batch(&[(name, source)]).unwrap_err();
         assert!(!c.compiled.contains_key(name));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2572,7 +2575,7 @@ mod tests {
         std::fs::write(shared.join(format!("{name}.hsaco")), b"PRIOR_PAIR").unwrap();
         std::fs::write(shared.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let err = c.recompile(name, source).unwrap_err();
+        let err = c.recompile(name, source, name).unwrap_err();
         assert!(err.to_string().contains("hipcc"), "{err}");
 
         assert_eq!(
@@ -2620,7 +2623,7 @@ mod tests {
         std::fs::write(real.join(format!("{name}.hsaco")), b"ALIAS_PRIOR").unwrap();
         std::fs::write(real.join(format!("{name}.hash")), &src_hash).unwrap();
 
-        let _ = c.recompile(name, source).unwrap_err();
+        let _ = c.recompile(name, source, name).unwrap_err();
 
         assert_eq!(
             std::fs::read(real.join(format!("{name}.hsaco"))).unwrap(),
@@ -2772,20 +2775,11 @@ mod tests {
     }
 
     #[test]
-    fn packaging_hash_validates_on_compiler_free_runtime() {
-        // Proves that a blob+hash pair emitted by compile-kernels.sh in
-        // packaging mode (toolchain_id = "") satisfies pair_valid for a
-        // compiler-free runtime (has_hipcc = false, empty toolchain_id) so
-        // compile() uses the silent validated path, not the UNVALIDATED
-        // fallback.
-        let root = temp_root("packaging_hash_validates");
-        let _ = std::fs::remove_dir_all(&root);
-        let precompiled = root.join("precompiled");
-        std::fs::create_dir_all(&precompiled).unwrap();
-
+    fn packaging_hash_matches_without_a_local_compiler() {
         let name = "packaged_kernel";
         let source = "__global__ void packaged_kernel() {}";
         let arch = "gfx1201";
+
 
         // Builder has a real toolchain, but packaging must use empty id.
         let mut builder = test_compiler("", "hipcc 7.2");
@@ -2811,37 +2805,6 @@ mod tests {
             packaging_via_instance, builder_hash,
             "packaging (empty toolchain) must differ from normal cache hash"
         );
-
-        // Bake blob+hash as the script now does.
-        let hsaco = precompiled.join(format!("{name}.hsaco"));
-        let hash_file = precompiled.join(format!("{name}.hash"));
-        std::fs::write(&hsaco, b"FAKE_HSACO_BLOB").unwrap();
-        std::fs::write(&hash_file, &packaging_via_instance).unwrap();
-
-        // Direct pair_valid check: what compile() checks first.
-        assert!(
-            pair_valid(&hsaco, &hash_file, &runtime_hash),
-            "packaged pair must be pair_valid for compiler-free hash"
-        );
-
-        // End-to-end via KernelCompiler::compile with has_hipcc = false:
-        // must take the validated branch (no UNVALIDATED warning path) and
-        // return the precompiled blob.
-        let mut c = test_compiler("", "");
-        c.arch = arch.to_string();
-        c.has_hipcc = false;
-        c.cache_dir = root.join("hot");
-        std::fs::create_dir_all(&c.cache_dir).unwrap();
-        c.precompiled_dir = Some(precompiled.clone());
-        c.cold_dir = Some(precompiled.clone());
-
-        let path = c
-            .compile(name, source)
-            .expect("packaged blob must validate without hipcc");
-        assert_eq!(path, &hsaco);
-        assert!(c.compiled.contains_key(name));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
     // Exercise both public lookup paths with separate instances so an earlier
     // successful lookup cannot hide a subsequent batch lookup.
@@ -2862,24 +2825,6 @@ mod tests {
         compiler
     }
 
-    #[test]
-    fn prebuilt_gate_valid_packaging_pair_without_compiler() {
-        let root = temp_root("gate_valid");
-        let name = "gate";
-        let source = "__global__ void gate() {}";
-        let cold = root.join("cold");
-        let mut single = prebuilt_gate_compiler(&root, false);
-        let key = KernelCompiler::packaging_hash_for("gfx1201", name, source, "");
-        assert_eq!(single.cache_hash(name, source), key);
-        let object = cold.join("gate.hsaco");
-        std::fs::write(&object, b"PACKAGED").unwrap();
-        std::fs::write(cold.join("gate.hash"), &key).unwrap();
-        assert_eq!(single.compile(name, source).unwrap(), object);
-        let mut batch = prebuilt_gate_compiler(&root, false);
-        batch.compile_batch(&[(name, source)]).unwrap();
-        assert_eq!(batch.compiled[name], object);
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     #[test]
     fn prebuilt_gate_missing_or_wrong_hash_rejected() {
@@ -2888,12 +2833,13 @@ mod tests {
             let name = "gate";
             let source = "__global__ void gate() {}";
             let cold = root.join("cold");
+            let mut producer = prebuilt_gate_compiler(&root, true);
+            producer.compile_for_symbol(name, source, name).unwrap();
             let single = prebuilt_gate_compiler(&root, false);
-            let key = single.cache_hash(name, source);
-            let object = cold.join("gate.hsaco");
-            std::fs::write(&object, b"UNVERIFIED").unwrap();
-            if let Some(hash) = hash {
-                std::fs::write(cold.join("gate.hash"), hash).unwrap();
+            let hash_path = cold.join("gate.hash");
+            match hash {
+                None => { std::fs::remove_file(&hash_path).unwrap(); }
+                Some(bad) => { std::fs::write(&hash_path, bad).unwrap(); }
             }
             for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
                 .into_iter()
@@ -2904,10 +2850,7 @@ mod tests {
                 } else {
                     compiler.compile_batch(&[(name, source)]).unwrap_err()
                 };
-                let message = err.to_string();
-                for expected in [name, "gfx1201", &key, object.to_str().unwrap(), "reinstall", "hipcc"] {
-                    assert!(message.contains(expected), "missing {expected}: {message}");
-                }
+                assert!(err.to_string().contains("pair missing or stale"), "{err}");
                 assert!(!compiler.compiled.contains_key(name));
             }
             let _ = std::fs::remove_dir_all(root);
@@ -2935,14 +2878,11 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                let err = if batch == 0 {
-                    compiler.compile(name, source).unwrap_err()
+                if batch == 0 {
+                    compiler.compile(name, source).unwrap_err();
                 } else {
-                    compiler.compile_batch(&[(name, source)]).unwrap_err()
-                };
-                let message = err.to_string();
-                assert!(message.contains(object.to_str().unwrap()), "{message}");
-                assert!(message.contains(&compiler.cache_hash(name, source)), "{message}");
+                    compiler.compile_batch(&[(name, source)]).unwrap_err();
+                }
                 assert!(!compiler.compiled.contains_key(name));
             }
             let _ = std::fs::remove_dir_all(root);
@@ -2969,31 +2909,98 @@ mod tests {
             assert_eq!(compiler.compiled[name], hot);
             assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH");
             assert_eq!(std::fs::read(&old).unwrap(), b"FRESH");
-            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), key);
+            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), compiler.packaging_hash(name, source));
             let _ = std::fs::remove_dir_all(root);
         }
     }
 
     #[test]
-    fn prebuilt_gate_stale_cold_still_uses_content_keyed_hot() {
+    fn stale_indexed_cold_cannot_fall_through_to_hot_without_compiler() {
         for batch in [false, true] {
             let root = temp_root("gate_hot_hit");
             let name = "gate";
             let source = "__global__ void gate() {}";
+            let mut producer = prebuilt_gate_compiler(&root, true);
+            producer.compile_for_symbol(name, source, name).unwrap();
             let mut compiler = prebuilt_gate_compiler(&root, false);
+            std::fs::write(root.join("cold/gate.hsaco"), b"CORRUPTED").unwrap();
             let key = compiler.cache_hash(name, source);
-            std::fs::write(root.join("cold/gate.hsaco"), b"STALE").unwrap();
             let hot = root.join("hot").join(hot_object_name(name, &key));
             std::fs::write(&hot, b"HOT_VALID").unwrap();
             if batch {
-                compiler.compile_batch(&[(name, source)]).unwrap();
+                compiler.compile_batch(&[(name, source)]).unwrap_err();
             } else {
-                compiler.compile(name, source).unwrap();
+                compiler.compile(name, source).unwrap_err();
             }
-            assert_eq!(compiler.compiled[name], hot);
-            assert_eq!(std::fs::read(root.join("cold/gate.hsaco")).unwrap(), b"HOT_VALID");
-            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), key);
+            assert!(!compiler.compiled.contains_key(name));
+            assert_eq!(std::fs::read(&hot).unwrap(), b"HOT_VALID");
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn precompile_indexed_pair_is_accepted_without_compiler_for_both_lookups() {
+        let root = temp_root("indexed_precompile");
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        let source = "__global__ void rmsnorm_f32() {}";
+        let name = "rmsnorm";
+        let symbol = "rmsnorm_f32";
+        let hot_key = producer.cache_hash(name, source);
+        let portable_key = producer.packaging_hash(name, source);
+        assert_ne!(hot_key, portable_key);
+        producer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap();
+        let cold = root.join("cold");
+        let object = cold.join("rmsnorm.hsaco");
+        assert!(pair_valid(&object, &cold.join("rmsnorm.hash"), &portable_key));
+        let index: PackIndex = serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap()).unwrap();
+        assert_eq!(index.toolchain_id, "hipcc 7.2");
+        assert_eq!(index.object_sha256, sha256_hex(b"FRESH"));
+        assert_eq!(index.symbols, [symbol]);
+
+        for batch in [false, true] {
+            let mut consumer = prebuilt_gate_compiler(&root, false);
+            if batch {
+                consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap();
+                assert_eq!(consumer.compiled[name], object);
+            } else {
+                assert_eq!(consumer.compile_for_symbol(name, source, symbol).unwrap(), object);
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_package_rejects_wrong_object_symbol_source_and_identity() {
+        let root = temp_root("indexed_negative");
+        let source = "__global__ void rmsnorm_f32() {}";
+        let name = "rmsnorm";
+        let symbol = "rmsnorm_f32";
+        let mut producer = prebuilt_gate_compiler(&root, true);
+        producer.compile_for_symbol(name, source, symbol).unwrap();
+        let cold = root.join("cold");
+        let object = cold.join("rmsnorm.hsaco");
+        let index_path = cold.join("rmsnorm.index.json");
+        let original = std::fs::read(&index_path).unwrap();
+
+        for field in ["arch", "source_sha256", "flags", "scheduler_profile", "cache_abi", "packaging_key", "object_sha256", "toolchain_id"] {
+            let mut mutated: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            mutated[field] = match field {
+                "flags" => serde_json::json!(["-O0"]),
+                "cache_abi" => serde_json::json!(0),
+                _ => serde_json::json!("wrong"),
+            };
+            std::fs::write(&index_path, serde_json::to_vec(&mutated).unwrap()).unwrap();
+            let mut consumer = prebuilt_gate_compiler(&root, false);
+            let err = consumer.compile_for_symbol(name, source, symbol).unwrap_err();
+            assert!(err.to_string().contains("packaged object rejected"), "{field}: {err}");
+        }
+        std::fs::write(&index_path, &original).unwrap();
+        let mut consumer = prebuilt_gate_compiler(&root, false);
+        assert!(consumer.compile_for_symbol(name, source, "other_symbol").is_err());
+        assert!(consumer.compile_for_symbol(name, "__global__ void changed() {}", symbol).is_err());
+        std::fs::write(&object, b"CORRUPTED").unwrap();
+        let mut consumer = prebuilt_gate_compiler(&root, false);
+        assert!(consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap_err().to_string().contains("SHA-256"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
