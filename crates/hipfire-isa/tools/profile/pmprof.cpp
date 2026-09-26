@@ -2,6 +2,7 @@
 // DIAGNOSTIC host runner for `peacemaker profile` kernels (never production).
 //
 //   pmprof f2   <base.hsaco> <profiled.co> <N> <outdir> [rounds]
+//   pmprof iu4  <base.hxaco> <profiled.co> <gate|down> <N> <outdir> [rounds]
 //   pmprof attn <base.hsaco> <profiled.co> <batch> <start> <outdir> [rounds]
 //
 // For one real H2 shape it runs the uninstrumented and the profiled kernel on
@@ -16,6 +17,9 @@
 // f2: gemm_mq4g256v2_fp8_silu_row_b1, gate/up M0 = M1 = 17408, K = 5120,
 //     grid [2*M0/256, N/128], block 256, LDS 19456. Synthetic deterministic
 //     repacked weights/ratios/activations (timing is data-independent).
+// iu4: gate/up M17408 K5120 or down ADD M5120 K17408, N8192,
+//     grid [ceil(rows/128), N/128], block 256, LDS 20480. Synthetic valid
+//     MQ4V2 and block_i4_128 records; timing/clock can depend on payload.
 // attn: attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201 (KT48), 24 Q / 4 KV
 //     heads, d 256, grid [ceil(min(B,512)*6/384), 4, ceil(B/512)], block 768,
 //     LDS 49936; inputs generated exactly as fp8-ng/attn/harness/attn_bench.
@@ -160,6 +164,46 @@ int main(int argc, char** argv) {
         L.grid[0] = total / 256; L.grid[1] = (N + 127) / 128; L.grid[2] = 1; L.block = 256; L.lds = 19456;
         waves_per_wg = 8;
         periods = blocks;
+    } else if (mode == "iu4") {
+        const std::string family = argv[4];
+        const int N = atoi(argv[5]); outdir = argv[6]; rounds = argc > 7 ? atoi(argv[7]) : 8;
+        const bool gate = family == "gate";
+        if (!gate && family != "down") { fprintf(stderr, "iu4 family must be gate or down\n"); return 2; }
+        const int M = gate ? 17408 : 5120, K = gate ? 5120 : 17408;
+        const int wgroups = K / 256, xblocks = K / 128;
+        sym = gate ? "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1"
+                   : "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1";
+        shape = "iu4 " + family + " M=" + std::to_string(M) + " K=" + std::to_string(K)
+              + " N=" + std::to_string(N);
+        std::vector<unsigned char> weights((size_t)M * wgroups * 136);
+        for (size_t row = 0; row < (size_t)M * wgroups; ++row) {
+            unsigned char* p = weights.data() + row * 136;
+            for (int j = 0; j < 8; j += 2) {
+                p[j] = (unsigned char)(salt(row, j) & 31);
+                p[j + 1] = 0x3c;  // normal f16 metadata
+            }
+            for (int j = 8; j < 136; ++j) p[j] = (unsigned char)salt(row * 136 + j, 0x91);
+        }
+        std::vector<unsigned char> x((size_t)N * xblocks * 72);
+        for (size_t block = 0; block < (size_t)N * xblocks; ++block) {
+            unsigned char* p = x.data() + block * 72;
+            const float scale = 0.125f + (salt(block, 0x52) & 7) * 0.0625f;
+            memcpy(p, &scale, sizeof(scale));
+            memset(p + 4, 0, 4);
+            for (int j = 8; j < 72; ++j) p[j] = (unsigned char)salt(block * 72 + j, 0x18);
+        }
+        Buf W = upload(weights.data(), weights.size()), X = upload(x.data(), x.size());
+        Buf U = gate ? upload(weights.data(), weights.size()) : Buf{nullptr, 0};
+        Buf Y = alloc(((size_t)M * N + 64) * sizeof(float));
+        outputs = {Y};
+        L.args = {arg(W.p)};
+        if (gate) L.args.push_back(arg(U.p));
+        L.args.push_back(arg(X.p)); L.args.push_back(arg(Y.p));
+        L.args.push_back(arg(M)); L.args.push_back(arg(K)); L.args.push_back(arg(N));
+        if (!gate) L.args.push_back(arg(1));  // residual ADD
+        L.grid[0] = (gate ? 2 * M : M) / 128;
+        L.grid[1] = (N + 127) / 128; L.grid[2] = 1;
+        L.block = 256; L.lds = 20480; waves_per_wg = 8; periods = xblocks;
     } else if (mode == "attn") {
         const int batch = atoi(argv[4]), start = atoi(argv[5]);
         outdir = argv[6]; rounds = argc > 7 ? atoi(argv[7]) : 8;

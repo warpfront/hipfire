@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DIAGNOSTIC: turn `peacemaker profile` records into phase statistics.
 
-    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn> [out_dir]
+    pmprof_analyze.py <profiled.map.json> <run_dir> <f2|attn|iu4> [out_dir]
 
 Reads run_dir/{trace.bin (or trace.bin.zst),meta.json} written by pmprof. Writes out_dir
 (default run_dir) summary.json, summary.md, waves.csv (one row per wave:
@@ -33,6 +33,26 @@ PHASES = {
         ("bar.post_wait#2", "epilogue"): "block tail (s85++, wait_all)",
         ("epilogue", "exit"): "epilogue: SiLU + Y stores",
     },
+    "iu4": {
+        ("slab", "lds.pre"): "prefetch VMEM + fragment LDS issue",
+        ("lds.pre", "lds.post"): "exposed first-fragment LDS wait",
+        ("lds.post", "vmem.pre"): "WMMA and staging before first VMEM drain",
+        ("vmem.pre", "vmem.post"): "exposed first VMEM wait",
+        ("vmem.post", "vmem0.pre"): "staging between VMEM drains",
+        ("vmem0.pre", "vmem0.post"): "exposed final VMEM wait",
+        ("vmem0.post", "bar.pre_signal#1"): "WMMA / LDS publish before B1",
+        ("bar.pre_signal#1", "bar.post_signal#1"): "barrier signal",
+        ("bar.post_signal#1", "bar.pre_wait#1"): "signal-to-wait gap",
+        ("bar.pre_wait#1", "bar.post_wait#1"): "barrier wait B1",
+        ("bar.post_wait#1", "bar.pre_signal#2"): "WMMA / LDS publish before B2",
+        ("bar.pre_signal#2", "bar.post_signal#2"): "barrier signal",
+        ("bar.post_signal#2", "bar.pre_wait#2"): "K128 fold after B2 signal",
+        ("bar.pre_wait#2", "bar.post_wait#2"): "barrier wait B2",
+        ("bar.post_wait#2", "slab"): "slab tail",
+        ("bar.post_wait#2", "epilogue"): "slab tail to epilogue",
+        ("bar.post_wait#1", "epilogue"): "final K128 slab to epilogue",
+        ("epilogue", "exit"): "epilogue and stores",
+    },
     "attn": {
         ("tile", "fill.done"): "tile fill: LDS commit t+1, issue t+2 K/V loads",
         ("fill.done", "sub"): "sub loop setup",
@@ -53,13 +73,15 @@ PHASES = {
         ("epilogue", "exit"): "epilogue: O normalize + stores",
     },
 }
-PERIOD = {"f2": "kblock", "attn": "tile"}
-# Load issue -> first use ready: F2 weights/fragments are issued after the
-# block start and first consumed after w0; KT48 tile t+2 K/V loads are issued
-# in the fill and drained by the barrier's s_wait_loadcnt_dscnt 0.
-ISSUE_USE = {"f2": ("kblock", "w0.post"), "attn": ("fill.done", "bar.pre_signal")}
-EXPOSED = {"f2": ("w0.pre", "w0.post"), "attn": ("bar.pre_drain", "bar.pre_signal")}
-QUALIFY = {"f2": {"bar.pre_signal", "bar.post_signal", "bar.post_wait"}, "attn": set()}
+PERIOD = {"f2": "kblock", "attn": "tile", "iu4": "slab"}
+# Load issue -> first use: F2 weights/fragments are issued after block start;
+# iu4 VMEM is issued at slab start and its first drain follows 16 WMMAs.
+ISSUE_USE = {"f2": ("kblock", "w0.post"), "attn": ("fill.done", "bar.pre_signal"),
+             "iu4": ("slab", "vmem.post")}
+EXPOSED = {"f2": ("w0.pre", "w0.post"), "attn": ("bar.pre_drain", "bar.pre_signal"),
+           "iu4": ("vmem.pre", "vmem.post")}
+QUALIFY = {"f2": {"bar.pre_signal", "bar.post_signal", "bar.post_wait"}, "attn": set(),
+           "iu4": {"bar.pre_signal", "bar.post_signal", "bar.pre_wait", "bar.post_wait"}}
 
 
 def parse(map_path, run_dir):

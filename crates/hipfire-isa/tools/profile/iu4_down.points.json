@@ -1,0 +1,17 @@
+{
+  "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",
+  "rules": [
+    {"name": "slab", "before": "s_clause 0x3"},
+    {"name": "lds.pre", "before": "s_wait_dscnt 0x4"},
+    {"name": "lds.post", "after": "s_wait_dscnt 0x4"},
+    {"name": "vmem.pre", "before": "s_wait_loadcnt 0x1", "first_after": "s_clause 0x3"},
+    {"name": "vmem.post", "after": "s_wait_loadcnt 0x1", "first_after": "s_clause 0x3"},
+    {"name": "vmem0.pre", "before": "s_wait_loadcnt 0x0", "first_after": "s_clause 0x3"},
+    {"name": "vmem0.post", "after": "s_wait_loadcnt 0x0", "first_after": "s_clause 0x3"},
+    {"name": "bar.pre_signal", "before": "s_barrier_signal"},
+    {"name": "bar.post_signal", "after": "s_barrier_signal"},
+    {"name": "bar.pre_wait", "before": "s_barrier_wait"},
+    {"name": "bar.post_wait", "after": "s_barrier_wait"},
+    {"name": "epilogue", "label": ".Liu4_add_epilogue"}
+  ]
+}
