@@ -3839,6 +3839,40 @@ impl Gpu {
         )
     }
 
+    // Quality-only emulation for the embedded B1 gate/up GEMMs: both A4 and
+    // fp8 have already materialized h in f32. Round it in place immediately
+    // before HIN reads it, without changing the handoff's buffer width.
+    fn round_h_bf16_quality_only(&mut self, h: &GpuTensor, count: usize) -> HipResult<()> {
+        static ENABLED: LazyLock<bool> =
+            LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_EMU_BF16_H", false));
+        if self.arch != "gfx1201" || !*ENABLED {
+            return Ok(());
+        }
+        const KERNEL: &str = "round_h_bf16_quality_gfx12";
+        self.ensure_kernel(KERNEL, kernels::ROUND_H_BF16_QUALITY_GFX12_SRC, KERNEL)?;
+        let mut hp = h.buf.as_ptr();
+        let mut len = count as u64;
+        let mut params = [
+            &mut hp as *mut _ as *mut c_void,
+            &mut len as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [count.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(hp);
+                b.push_u64(len);
+                b
+            },
+        )?;
+        self.invalidate_x_caches_for(hp);
+        Ok(())
+    }
+
     /// The gate/up GEMM has already written h = silu(gate) * up; the producer
     /// takes h as its first kernarg, with null up and x_rot kernargs.
     pub fn fused_silu_hin_rotate_mq_fp8_gfx12_batched(
@@ -3848,6 +3882,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        self.round_h_bf16_quality_only(h, batch_size * k)?;
         self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(h, None, awq, None, k, batch_size)
     }
 
@@ -4185,6 +4220,7 @@ impl Gpu {
                 "fused_silu_hin_rotate_mq_i4_batched: reservation (k,n) mismatch",
             ));
         }
+        self.round_h_bf16_quality_only(h, batch_size * k)?;
         self.ensure_mq_signs()?;
         let (source, kernel) = if self.arch == "gfx1201" {
             (
