@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Print the packaging hash for a kernel source file.
+//! Print the portable cold/install hash for a kernel source file.
 //!
-//! Reuses the SAME `KernelCompiler::hash_parts` code path as the runtime
-//! (`packaging_hash_for` → `hash_parts` with `toolchain_id = ""`) so
-//! KERNEL_CACHE_ABI or field-order changes cannot silently diverge.
+//! Uses the runtime's `hash_parts` with an empty toolchain ID: both an
+//! installer with hipcc and a compiler-free process look up this same key.
+//! Indexed packages additionally bind the producing hipcc identity and SHA-256.
 //!
 //! Usage:
 //!   hipfire-kernel-hash --arch <gfx> [--extra-flags <flags>] [--name <kernel>] <source.hip>
@@ -22,8 +22,8 @@ fn print_help() {
         "Usage: hipfire-kernel-hash --arch <gfx> [--extra-flags <flags>] [--name <kernel>] <source.hip>"
     );
     eprintln!("");
-    eprintln!("Prints the packaging hash (toolchain_id=\"\") for the given kernel source.");
-    eprintln!("Reuses KernelCompiler::packaging_hash_for so the key matches a compiler-free runtime.");
+    eprintln!("Prints the cold/install packaging hash for the given kernel source.");
+    eprintln!("Use hipfire-kernel-pack to produce the matching verified object and index.");
 }
 
 fn derive_name(source_path: &str) -> String {

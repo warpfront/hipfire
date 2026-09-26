@@ -823,10 +823,10 @@ fn main() {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
-        // Pre-create the expected precompiled-dir next to this binary so the
-        // compiler's writeback path fires. Without this, Gpu::init probes for
-        // an existing dir and silently disables writeback if it's missing —
-        // meaning fresh installs would compile but never cache cross-invocation.
+        // Create the install-side package root before GPU init: KernelCompiler
+        // discovers it once, then publishes portable-key `.hsaco`/`.hash`
+        // pairs and a checked `.index.json` recording SHA-256 and hipcc ID.
+        // Hot JIT cache keys remain toolchain-specific.
         if let Some(exe_dir) = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -849,7 +849,27 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        eprintln!("Pre-compiling kernels for {}...", gpu.arch);
+        // A single-module precompile/probe uses the identical runtime
+        // ensure_kernel → hipModuleLoad path without requiring a model. It
+        // also makes a compiler-free install check independent of the full
+        // model-dependent precompile matrix.
+        if let Some(position) = args.iter().position(|arg| arg == "--module") {
+            if args.get(position + 1).map(String::as_str) != Some("rmsnorm") {
+                eprintln!("ERROR: --precompile --module currently supports only rmsnorm");
+                std::process::exit(2);
+            }
+            gpu.ensure_kernel_public(
+                "rmsnorm",
+                include_str!("../../../kernels/src/rmsnorm.hip"),
+                "rmsnorm_f32",
+            ).unwrap_or_else(|error| {
+                eprintln!("ERROR: rmsnorm module load failed: {error}");
+                std::process::exit(1);
+            });
+            eprintln!("precompile: rmsnorm_f32 module load succeeded on {}", gpu.arch);
+            return;
+        }
+        eprintln!("Pre-compiling indexed cold kernels for {}...", gpu.arch);
         let mut ok = 0usize;
         let mut failed = 0usize;
         for kv in &["asym3", "q8"] {

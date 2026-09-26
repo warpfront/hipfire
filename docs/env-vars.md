@@ -238,8 +238,19 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_DS4_DENSE_ACT_DIR` | DeepSeek4 calibration-only dump of P1 projection inputs in `collect_e8_hessian` format; direct evaluator flag `--dump-dense-acts` is preferred. |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | Compatibility alias for `diagnostic.compiler.hipcc_extra_flags` |
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
+| `HIPFIRE_NO_DEVICE_COMPILER=1` | Require verified installed kernel objects instead of JIT; a missing/stale index, wrong symbol/source/flags/profile/ABI/toolchain identity or object SHA-256 fails before HIP loads it. Hot JIT keys remain toolchain-specific. |
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
+
+To build a compiler-free `gfx1201` RMSNorm package, run
+`hipfire-kernel-pack --arch gfx1201 --output <daemon-bin-dir>/kernels/compiled/gfx1201 --kernel rmsnorm:rmsnorm_f32:kernels/src/rmsnorm.hip`
+with the selected ROCm hipcc installed. The tool writes `rmsnorm.hsaco`,
+`rmsnorm.hash` (portable cold key), and `rmsnorm.index.json` (versioned
+source/flags/profile/ABI/symbol/toolchain/object-SHA record). A compiler-free
+`hipfire-daemon --precompile --module rmsnorm` probes the same load path and
+reports whether the indexed object was accepted. The installed objects must
+be beside the actual daemon executable, not merely in the CWD; the cache
+override controls only writable hot JIT entries.
 Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
 `HIPFIRE_MOE_*` levers are **research/power-user**. Centralized
 `FeatureFlags` controls now have typed TOML keys under `kernel` or
