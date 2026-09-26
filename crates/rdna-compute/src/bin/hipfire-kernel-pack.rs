@@ -6,7 +6,8 @@
 //! The source must be byte-identical to the string passed to ensure_kernel.
 //!
 //! hipfire-kernel-pack --arch gfx1201 --output bin/kernels/compiled/gfx1201 \
-//!   --kernel rmsnorm:rmsnorm_f32:kernels/src/rmsnorm.hip
+//!   --extra-flags '-DIU4_A4_CANDIDATES=2' \
+//!   --kernel rmsnorm_f32:rmsnorm_f32:kernels/src/rmsnorm.hip
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -242,15 +242,18 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
 
-To build a compiler-free `gfx1201` RMSNorm package, run
-`hipfire-kernel-pack --arch gfx1201 --output <daemon-bin-dir>/kernels/compiled/gfx1201 --kernel rmsnorm:rmsnorm_f32:kernels/src/rmsnorm.hip`
-with the selected ROCm hipcc installed. The tool writes `rmsnorm.hsaco`,
-`rmsnorm.hash` (portable cold key), and `rmsnorm.index.json` (versioned
-source/flags/profile/ABI/symbol/toolchain/object-SHA record). A compiler-free
-`hipfire-daemon --precompile --module rmsnorm` probes the same load path and
-reports whether the indexed object was accepted. The installed objects must
-be beside the actual daemon executable, not merely in the CWD; the cache
-override controls only writable hot JIT entries.
+To build a compiler-free `gfx1201` RMSNorm package for the production
+`Gpu::rmsnorm_f32` route, run
+`hipfire-kernel-pack --arch gfx1201 --output <daemon-bin-dir>/kernels/compiled/gfx1201 --extra-flags '-DIU4_A4_CANDIDATES=2' --kernel rmsnorm_f32:rmsnorm_f32:kernels/src/rmsnorm.hip`
+with the selected ROCm hipcc installed. The tool writes `rmsnorm_f32.hsaco`,
+`rmsnorm_f32.hash` (portable cold key), and `rmsnorm_f32.index.json` (versioned
+source/flags/profile/ABI/symbol/toolchain/object-SHA record). Compiler flags
+must match the daemon's active `FeatureFlags` (including arch defaults);
+the exact-source registry exporter emits these flags for `--registry` builds.
+A compiler-free `daemon --precompile --module rmsnorm_f32` probes the real
+`Gpu::rmsnorm_f32` kernel load and verifies numerical output. The installed
+objects must be beside the actual daemon executable, not merely in the CWD;
+the cache override controls only writable hot JIT entries.
 Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
 `HIPFIRE_MOE_*` levers are **research/power-user**. Centralized
 `FeatureFlags` controls now have typed TOML keys under `kernel` or
