@@ -1616,6 +1616,10 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_hin_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
+/// Quality-only bf16-H emulation. An opt-in extra pass on the existing f32
+/// gate/up output, because the default A4 and fp8 GEMMs load embedded B1 objects.
+pub const ROUND_H_BF16_QUALITY_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/round_h_bf16_quality.gfx12.hip");
 /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` emit.
 /// Same shared quant recipe as the C2 sidecars, but distinct entry symbols so
 /// gfx1151 HSACO caches and profiler rows cannot alias the gfx1201 fusion.
