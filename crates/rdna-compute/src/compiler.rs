@@ -737,6 +737,24 @@ impl KernelCompiler {
         )
     }
 
+    fn unverified_object_error(
+        &self,
+        name: &str,
+        expected_key: &str,
+        found: &Path,
+    ) -> hip_bridge::HipError {
+        self.compiler_unavailable_error(
+            name,
+            &format!(
+                "unverified kernel image for arch {}: expected key {expected_key} for {} \
+                 (missing or mismatched .hash, or empty/non-file object); \
+                 reinstall kernels with matching .hash sidecars or install hipcc to recompile",
+                self.arch,
+                found.display()
+            ),
+        )
+    }
+
     /// Attach a hash-bound Radiowave inspection to an already validated
     /// Hipfire kernel-cache artifact. Retained PM4 consumes this adjacent
     /// manifest for cache-scope and argument-effect proofs; without it the
@@ -797,10 +815,10 @@ impl KernelCompiler {
         let module_flags = self.module_flags(name);
         let src_hash = self.cache_hash(name, source);
 
-        // Try pre-compiled .hsaco first. A hit requires a nonempty regular blob;
-        // matching hash certifies it. Hashless/mismatched nonempty blobs may be
-        // used only when hipcc is unavailable (packaged install), with warning.
-        // See: https://github.com/warpfront/hipfire/issues/2
+        // Only a nonempty object with a matching sidecar can be selected.
+        // Keep the rejected path for a useful compiler-free error, but try
+        // content-keyed hot and validated legacy entries before failing.
+        let mut unverified_object = None;
         let mut stale_precompiled = false;
         if let Some(dir) = &self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
@@ -815,20 +833,12 @@ impl KernelCompiler {
                 self.compiled.insert(name.to_string(), precompiled);
                 return Ok(&self.compiled[name]);
             }
-            if nonempty_blob(&precompiled) {
-                if !self.has_hipcc {
-                    eprintln!(
-                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                    );
-                    eprintln!(
-                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                    );
-                    self.compiled.insert(name.to_string(), precompiled);
-                    return Ok(&self.compiled[name]);
+            if precompiled.exists() {
+                if nonempty_blob(&precompiled) {
+                    // A content-keyed hot entry may still hit below.
+                    stale_precompiled = true;
                 }
-                // Stale legacy pair; a content-keyed hot entry may still hit
-                // below, so report the recompile only once that is ruled out.
-                stale_precompiled = true;
+                unverified_object = Some(precompiled);
             }
         }
 
@@ -870,22 +880,13 @@ impl KernelCompiler {
         }
 
         if !self.has_hipcc {
-            // Content-keyed hits returned above, so only a legacy unvalidated
-            // blob can still be usable on packaged installs (same warning as
-            // the precompiled path).
-            if nonempty_blob(&legacy_obj) {
-                eprintln!(
-                    "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                );
-                eprintln!(
-                    "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                );
-                self.compiled.insert(name.to_string(), legacy_obj);
-                return Ok(&self.compiled[name]);
+            if unverified_object.is_none() && legacy_obj.exists() {
+                unverified_object = Some(legacy_obj);
             }
-            return Err(
-                self.compiler_unavailable_error(name, "no usable cached kernel image exists")
-            );
+            return Err(match unverified_object {
+                Some(found) => self.unverified_object_error(name, &src_hash, &found),
+                None => self.compiler_unavailable_error(name, "no usable cached kernel image exists"),
+            });
         }
 
         if stale_precompiled {
@@ -1297,6 +1298,7 @@ impl KernelCompiler {
 
             let module_flags = self.module_flags(name);
             let src_hash = self.cache_hash(name, source);
+            let mut unverified_object = None;
 
             // Check precompiled with valid pair (nonempty blob + matching hash).
             if let Some(dir) = &self.precompiled_dir {
@@ -1311,17 +1313,8 @@ impl KernelCompiler {
                     self.compiled.insert(name.to_string(), precompiled);
                     continue;
                 }
-                if nonempty_blob(&precompiled) && !self.has_hipcc {
-                    // Mirror compile()'s two-line warning so a later compile()
-                    // short-circuit via `compiled` cannot suppress it.
-                    eprintln!(
-                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                    );
-                    eprintln!(
-                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                    );
-                    self.compiled.insert(name.to_string(), precompiled);
-                    continue;
+                if precompiled.exists() {
+                    unverified_object = Some(precompiled);
                 }
             }
 
@@ -1355,19 +1348,13 @@ impl KernelCompiler {
             }
 
             if !self.has_hipcc {
-                if nonempty_blob(&legacy_obj) {
-                    eprintln!(
-                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
-                    );
-                    eprintln!(
-                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
-                    );
-                    self.compiled.insert(name.to_string(), legacy_obj);
-                    continue;
+                if unverified_object.is_none() && legacy_obj.exists() {
+                    unverified_object = Some(legacy_obj);
                 }
-                return Err(
-                    self.compiler_unavailable_error(name, "no usable cached kernel image exists")
-                );
+                return Err(match unverified_object {
+                    Some(found) => self.unverified_object_error(name, &src_hash, &found),
+                    None => self.compiler_unavailable_error(name, "no usable cached kernel image exists"),
+                });
             }
 
             to_compile.push((name.to_string(), source.to_string(), src_hash, module_flags));
@@ -2125,6 +2112,7 @@ mod tests {
                 &[],
                 "hipcc 7.2",
                 SchedulerProfile::Default,
+                "hipcc", "", "", "",
             )
         );
         assert_eq!(
@@ -2136,6 +2124,7 @@ mod tests {
                 &[],
                 "hipcc 7.2",
                 SchedulerProfile::Default,
+                "hipcc", "", "", "",
             )
         );
     }
@@ -2611,5 +2600,158 @@ mod tests {
         assert!(c.compiled.contains_key(name));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+    // Exercise both public lookup paths with separate instances so an earlier
+    // successful lookup cannot hide a subsequent batch lookup.
+    fn prebuilt_gate_compiler(root: &Path, with_hipcc: bool) -> KernelCompiler {
+        let mut compiler = test_compiler("", "");
+        compiler.arch = "gfx1201".to_owned();
+        compiler.cache_dir = root.join("hot");
+        std::fs::create_dir_all(&compiler.cache_dir).unwrap();
+        let cold = root.join("cold");
+        std::fs::create_dir_all(&cold).unwrap();
+        compiler.precompiled_dir = Some(cold.clone());
+        compiler.cold_dir = Some(cold);
+        compiler.has_hipcc = with_hipcc;
+        if with_hipcc {
+            compiler.toolchain_id = "hipcc 7.2".to_owned();
+            compiler.hipcc_bin = install_fake_hipcc(&root.join("bin"), b"FRESH", false);
+        }
+        compiler
+    }
+
+    #[test]
+    fn prebuilt_gate_valid_packaging_pair_without_compiler() {
+        let root = temp_root("gate_valid");
+        let name = "gate";
+        let source = "__global__ void gate() {}";
+        let cold = root.join("cold");
+        let mut single = prebuilt_gate_compiler(&root, false);
+        let key = KernelCompiler::packaging_hash_for("gfx1201", name, source, "");
+        assert_eq!(single.cache_hash(name, source), key);
+        let object = cold.join("gate.hsaco");
+        std::fs::write(&object, b"PACKAGED").unwrap();
+        std::fs::write(cold.join("gate.hash"), &key).unwrap();
+        assert_eq!(single.compile(name, source).unwrap(), object);
+        let mut batch = prebuilt_gate_compiler(&root, false);
+        batch.compile_batch(&[(name, source)]).unwrap();
+        assert_eq!(batch.compiled[name], object);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prebuilt_gate_missing_or_wrong_hash_rejected() {
+        for hash in [None, Some("wrong-key")] {
+            let root = temp_root("gate_bad_hash");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let cold = root.join("cold");
+            let single = prebuilt_gate_compiler(&root, false);
+            let key = single.cache_hash(name, source);
+            let object = cold.join("gate.hsaco");
+            std::fs::write(&object, b"UNVERIFIED").unwrap();
+            if let Some(hash) = hash {
+                std::fs::write(cold.join("gate.hash"), hash).unwrap();
+            }
+            for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
+                .into_iter()
+                .enumerate()
+            {
+                let err = if batch == 0 {
+                    compiler.compile(name, source).unwrap_err()
+                } else {
+                    compiler.compile_batch(&[(name, source)]).unwrap_err()
+                };
+                let message = err.to_string();
+                for expected in [name, "gfx1201", &key, object.to_str().unwrap(), "reinstall", "hipcc"] {
+                    assert!(message.contains(expected), "missing {expected}: {message}");
+                }
+                assert!(!compiler.compiled.contains_key(name));
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn prebuilt_gate_truncated_to_empty_and_legacy_without_hash_rejected() {
+        for legacy in [false, true] {
+            let root = temp_root("gate_empty_or_legacy");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let single = prebuilt_gate_compiler(&root, false);
+            let dir = if legacy { root.join("hot") } else { root.join("cold") };
+            let object = dir.join("gate.hsaco");
+            std::fs::write(&object, b"PREBUILT").unwrap();
+            if legacy {
+                // A legacy hot entry without its sidecar is not content-keyed.
+            } else {
+                std::fs::write(dir.join("gate.hash"), single.cache_hash(name, source)).unwrap();
+                // Simulate an interrupted/truncated copy of a formerly valid pair.
+                std::fs::write(&object, b"").unwrap();
+            }
+            for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
+                .into_iter()
+                .enumerate()
+            {
+                let err = if batch == 0 {
+                    compiler.compile(name, source).unwrap_err()
+                } else {
+                    compiler.compile_batch(&[(name, source)]).unwrap_err()
+                };
+                let message = err.to_string();
+                assert!(message.contains(object.to_str().unwrap()), "{message}");
+                assert!(message.contains(&compiler.cache_hash(name, source)), "{message}");
+                assert!(!compiler.compiled.contains_key(name));
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn prebuilt_gate_bad_cold_falls_through_to_hipcc() {
+        for batch in [false, true] {
+            let root = temp_root("gate_recompile");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let mut compiler = prebuilt_gate_compiler(&root, true);
+            let old = root.join("cold/gate.hsaco");
+            std::fs::write(&old, b"STALE").unwrap();
+            std::fs::write(root.join("cold/gate.hash"), "wrong-key").unwrap();
+            let key = compiler.cache_hash(name, source);
+            if batch {
+                compiler.compile_batch(&[(name, source)]).unwrap();
+            } else {
+                compiler.compile(name, source).unwrap();
+            }
+            let hot = root.join("hot").join(hot_object_name(name, &key));
+            assert_eq!(compiler.compiled[name], hot);
+            assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH");
+            assert_eq!(std::fs::read(&old).unwrap(), b"FRESH");
+            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), key);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn prebuilt_gate_stale_cold_still_uses_content_keyed_hot() {
+        for batch in [false, true] {
+            let root = temp_root("gate_hot_hit");
+            let name = "gate";
+            let source = "__global__ void gate() {}";
+            let mut compiler = prebuilt_gate_compiler(&root, false);
+            let key = compiler.cache_hash(name, source);
+            std::fs::write(root.join("cold/gate.hsaco"), b"STALE").unwrap();
+            let hot = root.join("hot").join(hot_object_name(name, &key));
+            std::fs::write(&hot, b"HOT_VALID").unwrap();
+            if batch {
+                compiler.compile_batch(&[(name, source)]).unwrap();
+            } else {
+                compiler.compile(name, source).unwrap();
+            }
+            assert_eq!(compiler.compiled[name], hot);
+            assert_eq!(std::fs::read(root.join("cold/gate.hsaco")).unwrap(), b"HOT_VALID");
+            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), key);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
