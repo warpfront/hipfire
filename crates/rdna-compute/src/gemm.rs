@@ -314,24 +314,20 @@ fn g12_iu4_b1_image() -> &'static [u8] {
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     }
 }
-/// Builder fp8 GEMM (F2 Row, bundle 1b25e3aa = 529f971d plus `s_delay_alu`
-/// hints, outputs byte-identical): default ON for the fp8 prefill route on
+/// Builder fp8 GEMM (F2 Row, bundle 962fe61d with next-K128 W and Rw
+/// prefetch), byte-identical to 1b25e3aa. Default ON for fp8 prefill on
 /// exact gfx1201 (`fp8_f2_row_active` admits N >= 512 only);
-/// `HIPFIRE_G12_FP8_ISA=0` opts out to the v2 route. The hints cut H2's
-/// weighted pp8192 GEMM time 0.82%, every site family faster. Measured with
-/// 529f971d on H2, card B, 8 fresh processes ABBA+BAAB: pp8192 3,634.4 tok/s
-/// vs 3,407.3 for the previous bb4e3b9b bundle and 2,496.3 for v2
-/// (2 processes). Quality, F2 forced to every site, H2: WT2 0.041546 and
-/// code24 0.029433 (padded-tail scorer), inside the fp8-route limits
-/// WT2 <= 0.045 / code24 <= 0.034. Mean of
-/// five paired scale-shift runs vs v2: WT2 -0.000044, code24 +0.000414. The
-/// A4/IU4 default route never admits F2. Parsed once so a queued
-/// producer and its consumer cannot see different route settings.
+/// `HIPFIRE_G12_FP8_ISA=0` opts out to the v2 route. H2 five-family
+/// N8192 weighted GEMM time improves 1.75% / 2.09% in ABBA / BAAB against
+/// the prior bundle at 300 W; model and quality receipts are recorded at
+/// `/home/kaden/qcal/perf/fp8-4k5/f2/prefetch/report.md`. The A4/IU4
+/// default route never admits F2. Parsed once so a queued producer and
+/// its consumer cannot see different route settings.
 static G12_FP8_F2: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA", true));
-// H2's 256-site weighted serial repack+F2 sweep (529f971d + ef2f7796)
-// beats v2 from N=512 onward; N=256 still loses. 1b25e3aa is faster than
-// 529f971d at N=512 in every site family.
+// H2's earlier 256-site serial repack+F2 cutoff sweep (529f971d +
+// ef2f7796) beat v2 from N=512 onward; N=256 lost. This bit-exact
+// prefetch changes neither the scale mode nor the admission threshold.
 const G12_FP8_F2_MIN_N: usize = 512;
 // Private quality-only candidate override: reference chunks are shorter
 // than product admission. Never enable this for normal prefill or timing.

@@ -19,9 +19,12 @@ fn step(b:&mut Builder,unit:usize,st:usize,first:bool,slot:usize)->Result<(),Str
 /// omits next-block prefetch and fold. No packed weight decode is performed.
 fn block(b:&mut Builder,spec:Spec,next:bool,first:bool)->Result<(),String>{
     publish::weight_base(b)?;
-    publish::fetch_w(b,0)?;
-    publish::fetch_w(b,1)?;
+    if first {
+        publish::fetch_w(b,0)?;
+        publish::fetch_w(b,1)?;
+    }
     publish::fetch_a(b,0,1)?;
+    if next {publish::fetch_next_ratio(b,1)?;}
     for u in 0..2 {
         for st in 0..2 {step(b,u,st,first&&u==0&&st==0,0)?;}
         // Two-unit 16-VGPR ring: the unit just consumed is dead.
@@ -37,7 +40,12 @@ fn block(b:&mut Builder,spec:Spec,next:bool,first:bool)->Result<(),String>{
     }
     b.barrier(&b1)?;
     if next {publish::fetch_a(b,1,0)?;}
-    for u in 2..4 {for st in 0..2 {step(b,u,st,false,1)?;}}
+    for u in 2..4 {
+        for st in 0..2 {step(b,u,st,false,1)?;}
+        // The retired K32 unit is free while the other unit still feeds WMMA.
+        // W for the next K128 is 0x8000 bytes beyond this block's base.
+        if next {publish::fetch_w(b,u+14)?;}
+    }
     if next {
         // The next A0 payload was prefetched before slab 1. Its stores are
         // deliberately delayed until all A1 reads have issued.

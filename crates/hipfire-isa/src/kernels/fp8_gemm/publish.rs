@@ -25,12 +25,16 @@ pub(super) fn stage_a(b:&mut Builder,slot:usize,slab:u32)->Result<(),String>{
 /// Repack Rw planes are indexed by (row_tile, half, virtual_row). Each lane
 /// writes exactly its own virtual row. For block scaling only tid<128 writes
 /// the per-token D ratio, so its slot has a unique producer for every word.
-pub(super) fn publish_next_ratios(b:&mut Builder,spec:Spec,next_kb:u32,plane:usize)->Result<(),String>{
+/// The row ratio has no dependence on either A slot. Hold it in an address
+/// register unused by the K loop, then publish from there after A1 is stored.
+pub(super) fn fetch_next_ratio(b:&mut Builder,next_kb:u32)->Result<(),String>{
     so(b,"s_add_co_i32 s92, s94, s85",&[92],&[94,85])?;
     so(b,format!("s_add_co_i32 s92, s92, {next_kb}"),&[92],&[92])?;
     so(b,"s_lshl_b32 s92, s92, 10",&[92],&[92])?;
-    vload(b,168,1,182,40,Some(92),0)?;
-    ds_store(b,2+plane,168,1,182,16384+plane as u32*1024)?;
+    vload(b,184,1,182,40,Some(92),0)
+}
+pub(super) fn publish_next_ratios(b:&mut Builder,spec:Spec,next_kb:u32,plane:usize)->Result<(),String>{
+    ds_store(b,2+plane,184,1,182,16384+plane as u32*1024)?;
     if spec.act_scale==ActScale::K128 {
         so(b,"s_add_co_i32 s93, s85, 0",&[93],&[85])?;
         so(b,"s_lshl_b32 s93, s93, 2",&[93],&[93])?;
