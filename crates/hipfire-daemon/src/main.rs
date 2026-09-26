@@ -849,24 +849,39 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        // A single-module precompile/probe uses the identical runtime
-        // ensure_kernel → hipModuleLoad path without requiring a model. It
-        // also makes a compiler-free install check independent of the full
-        // model-dependent precompile matrix.
+        // Exercise the production Gpu::rmsnorm_f32 route, whose installed
+        // module key is rmsnorm_f32 (the batched route uses rmsnorm).
         if let Some(position) = args.iter().position(|arg| arg == "--module") {
-            if args.get(position + 1).map(String::as_str) != Some("rmsnorm") {
-                eprintln!("ERROR: --precompile --module currently supports only rmsnorm");
+            if args.get(position + 1).map(String::as_str) != Some("rmsnorm_f32") {
+                eprintln!("ERROR: --precompile --module currently supports only rmsnorm_f32");
                 std::process::exit(2);
             }
-            gpu.ensure_kernel_public(
-                "rmsnorm",
-                include_str!("../../../kernels/src/rmsnorm.hip"),
-                "rmsnorm_f32",
-            ).unwrap_or_else(|error| {
-                eprintln!("ERROR: rmsnorm module load failed: {error}");
+            let result = (|| -> rdna_compute::HipResult<Vec<f32>> {
+                let input = gpu.upload_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8])?;
+                let weight = gpu.upload_f32(&[1.0, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25], &[8])?;
+                let output = gpu.zeros(&[8], rdna_compute::DType::F32)?;
+                gpu.rmsnorm_f32(&input, &weight, &output, 1e-5)?;
+                let values = gpu.download_f32(&output)?;
+                gpu.free_tensor(input)?;
+                gpu.free_tensor(weight)?;
+                gpu.free_tensor(output)?;
+                Ok(values)
+            })().unwrap_or_else(|error| {
+                eprintln!("ERROR: rmsnorm_f32 execution failed: {error}");
                 std::process::exit(1);
             });
-            eprintln!("precompile: rmsnorm_f32 module load succeeded on {}", gpu.arch);
+            let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let weight = [1.0f32, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25];
+            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5).sqrt().recip();
+            if result.iter().zip(input.iter().zip(weight)).any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5) {
+                eprintln!("ERROR: rmsnorm_f32 numerical output differs from reference: {result:?}");
+                std::process::exit(1);
+            }
+            eprintln!(
+                "precompile: rmsnorm_f32 execution succeeded on {}: output_bits={:?}",
+                gpu.arch,
+                result.iter().map(|v| format!("{:08x}", v.to_bits())).collect::<Vec<_>>()
+            );
             return;
         }
         eprintln!("Pre-compiling indexed cold kernels for {}...", gpu.arch);
