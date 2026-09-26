@@ -4,13 +4,14 @@
 //! (row, token) int32 dot starts from the fold magic, is folded once as
 //! `acc = fma(RN(sc*d), float(C) - magic, acc)` in ascending block order,
 //! and the epilogue writes `Y = acc`, `Y = RN(Y + acc)` or the imported hipcc
-//! SiLU region. Everything else (CTA raster, staging map, store shape, waits)
-//! is a free schedule choice and is generated here.
+//! SiLU region. The `_b1_bf16` SiLU variant rounds h to packed bf16 (RNE).
+//! Everything else (CTA raster, staging map, store shape, waits) is generated here.
 //!
 //! Launch contract: grid `[ceil(rows / tile_rows), ceil(N / 128)]` with
 //! `rows = M` (SET/ADD) or `2M` (gate/up), block `[tile_threads, 1, 1]`,
 //! dynamic LDS `Layout::launch` bytes. Preconditions shared with the hipcc
-//! wide epilogue: `K % 256 == 0`, `M % 4 == 0`, and `Y`/`H` 4-byte aligned.
+//! wide epilogue: `K % 256 == 0`, `M % 4 == 0`, and `Y`/`H` 4-byte aligned;
+//! packed bf16 h uses contiguous rows with `M * 2` byte stride.
 pub mod spec;
 pub mod prologue;
 pub mod kloop;
@@ -90,7 +91,7 @@ pub(crate) const EPI_S: u8 = 24;
 impl Gen {
     fn new(spec: Spec) -> Self {
         let tile = spec.tile;
-        let args = if spec.epi == Epi::GateUpSilu {
+        let args = if spec.epi.is_silu() {
             Args { a: 8, u: Some(10), xq: 12, y: 14, m: 16, k: 17, n: 18, bcx: 20, bcy: 21 }
         } else {
             Args { a: 8, u: None, xq: 10, y: 12, m: 14, k: 15, n: 16, bcx: 18, bcy: 19 }
@@ -106,7 +107,7 @@ impl Gen {
         let meta_ds = take(1);
         let meta_sz = if tile == Tile::T128x128x8 { meta_ds } else { take(1) };
         let ds_voff = take(1); let sz_voff = take(1); let sc_addr = take(1); let d_addr = take(1);
-        let silu = spec.epi == Epi::GateUpSilu;
+        let silu = spec.epi.is_silu();
         Self {
             spec, tile, layout: tile.layout(), args,
             cacc: 0, acc: 64, magic: 128, f: [136, 148], d: 160,
@@ -235,11 +236,12 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
     Ok((text, proof))
 }
 
-/// All three epilogue symbols of one (fold, tile, cacc) point as a module.
+/// All original epilogue symbols plus packed bf16 h for the production tile.
 pub fn emit_module(fold: Fold, tile: Tile, cacc: Cacc, arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
-    let specs = [Epi::Set, Epi::Add, Epi::GateUpSilu].map(|epi| Spec { fold, tile, cacc, epi, arch });
-    let emitted = specs.iter().map(|s| emit(*s)).collect::<Result<Vec<_>, _>>()?;
-    let (text, proof) = module(&emitted, &specs[0].module())?;
+    let mut epis = vec![Epi::Set, Epi::Add, Epi::GateUpSilu];
+    if tile == Tile::T128x128x8 { epis.push(Epi::GateUpSiluBf16); }
+    let emitted = epis.into_iter().map(|epi| emit(Spec { fold, tile, cacc, epi, arch })).collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = module(&emitted, &Spec { fold, tile, cacc, epi: Epi::Set, arch }.module())?;
     Ok((emitted, text, proof))
 }
 

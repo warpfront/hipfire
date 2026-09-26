@@ -14,7 +14,7 @@ pub enum Tile { T128x128x8, T256x128x16 }
 pub enum Cacc { One, Two }
 /// Epilogue family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Epi { Set, Add, GateUpSilu }
+pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Spec { pub fold: Fold, pub tile: Tile, pub cacc: Cacc, pub epi: Epi, pub arch: Arch }
@@ -66,8 +66,9 @@ impl Fold {
 }
 
 impl Epi {
-    pub fn variant(self) -> Variant { match self { Self::Set => Variant::FullSet, Self::Add => Variant::FullAdd, Self::GateUpSilu => Variant::GateUpSilu } }
-    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu => "silu" } }
+    pub fn variant(self) -> Variant { match self { Self::Set => Variant::FullSet, Self::Add => Variant::FullAdd, Self::GateUpSilu | Self::GateUpSiluBf16 => Variant::GateUpSilu } }
+    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu => "silu", Self::GateUpSiluBf16 => "silu-bf16" } }
+    pub fn is_silu(self) -> bool { matches!(self, Self::GateUpSilu | Self::GateUpSiluBf16) }
 }
 
 impl Spec {
@@ -80,9 +81,9 @@ impl Spec {
         let stem = match self.epi {
             Epi::Set => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             Epi::Add => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
-            Epi::GateUpSilu => "gemm_mq4g256v2_gate_up_silu_mmq_iu4",
+            Epi::GateUpSilu | Epi::GateUpSiluBf16 => "gemm_mq4g256v2_gate_up_silu_mmq_iu4",
         };
-        format!("{stem}{}", self.suffix())
+        format!("{stem}{}{}", self.suffix(), if self.epi == Epi::GateUpSiluBf16 { "_bf16" } else { "" })
     }
     pub fn kernargs(self) -> KernargLayout { self.epi.variant().kernargs() }
     pub fn variant_name(self) -> String {
@@ -97,6 +98,7 @@ impl Spec {
         if self.arch != Arch::Gfx1201 { return Err("iu4_gemm targets gfx1201 only".into()) }
         if self.fold != Fold::K128 { return Err("K256 folds are closed at Q0 (plan §5); no product generator".into()) }
         if self.cacc != Cacc::One { return Err("Cacc::Two is dropped by G0g: it cannot fit the 192-VGPR occupancy ceiling".into()) }
+        if self.epi == Epi::GateUpSiluBf16 && self.tile != Tile::T128x128x8 { return Err("packed bf16 h is emitted only for the production _b1 tile".into()) }
         Ok(())
     }
 }
@@ -104,4 +106,4 @@ impl Spec {
 impl std::str::FromStr for Fold { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "k128" => Ok(Self::K128), "k256s" => Ok(Self::K256Shared), "k256p" => Ok(Self::K256Pow2), _ => Err(format!("unknown fold {s}")) } } }
 impl std::str::FromStr for Tile { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "128x128x8" => Ok(Self::T128x128x8), "256x128x16" => Ok(Self::T256x128x16), _ => Err(format!("unknown tile {s}")) } } }
 impl std::str::FromStr for Cacc { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "1" => Ok(Self::One), "2" => Ok(Self::Two), _ => Err(format!("unknown cacc {s}")) } } }
-impl std::str::FromStr for Epi { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "set" => Ok(Self::Set), "add" => Ok(Self::Add), "silu" => Ok(Self::GateUpSilu), _ => Err(format!("unknown epilogue {s}")) } } }
+impl std::str::FromStr for Epi { type Err = String; fn from_str(s: &str) -> Result<Self, String> { match s { "set" => Ok(Self::Set), "add" => Ok(Self::Add), "silu" => Ok(Self::GateUpSilu), "silu-bf16" => Ok(Self::GateUpSiluBf16), _ => Err(format!("unknown epilogue {s}")) } } }

@@ -1,0 +1,28 @@
+{
+  "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1_bf16",
+  "counts": {
+    "v_wmma_i32_16x16x32_iu4": 128,
+    "vopd_packets": 532,
+    "v_dual_mov_b32": 36,
+    "v_dual_subrev_f32": 128,
+    "v_dual_mul_f32": 160,
+    "v_dual_fmac_f32": 160,
+    "v_dual_sub_f32": 16,
+    "v_dual_add_f32": 32,
+    "v_cndmask_b32_e64": 96,
+    "v_cndmask_b32_e32": 32,
+    "buffer_store_b32": 16
+  },
+  "forbidden": [
+    "s_waitcnt",
+    "scratch_*",
+    "v_readlane*",
+    "global_*",
+    "flat_*"
+  ],
+  "vgpr_max": 192,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true
+}

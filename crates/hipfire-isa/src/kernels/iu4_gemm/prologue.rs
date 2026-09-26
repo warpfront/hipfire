@@ -1,7 +1,7 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{END, Epi, Gen, Tile, lit, mem, op, publish, s, sr, v};
+use super::{END, Gen, Tile, lit, mem, op, publish, s, sr, v};
 use crate::{Builder, insn::MemoryClass, lds::Transition};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
@@ -41,7 +41,7 @@ fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Res
 
 pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     let a = g.args;
-    let silu = g.spec.epi == Epi::GateUpSilu;
+    let silu = g.spec.epi.is_silu();
     let tile = g.tile;
     let t: [u8; 8] = std::array::from_fn(|i| g.tmp + i as u8);
     mem(b, "s_load_b256 s[8:15], s[0:1], 0x0", &[sr(8, 8)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
