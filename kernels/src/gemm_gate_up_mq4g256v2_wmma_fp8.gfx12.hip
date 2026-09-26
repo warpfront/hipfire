@@ -234,6 +234,15 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #ifndef HIPFIRE_FP8_SILU_H
 #define HIPFIRE_FP8_SILU_H 0
 #endif
+#ifndef HIPFIRE_FP8_SILU_H_BF16
+#define HIPFIRE_FP8_SILU_H_BF16 0
+#endif
+#if HIPFIRE_FP8_SILU_H_BF16
+#if !HIPFIRE_FP8_SILU_H
+#error "bf16-h requires the paired-row SiLU h variant"
+#endif
+#include <hip/hip_bfloat16.h>
+#endif
 
 
 #if HIPFIRE_FP8_V2_TILE
@@ -994,7 +1003,14 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
 #else
 #if HIPFIRE_FP8_SILU_H
+#if HIPFIRE_FP8_SILU_H_BF16
+                    // Compact row-major h[token][row] in the gate allocation.
+                    // Convert only after the original f32 SiLU arithmetic.
+                    ((hip_bfloat16*)Y_gate)[(unsigned int)t * (unsigned int)gate_m + (unsigned int)(r >> 1)] =
+                        hip_bfloat16::round_to_bfloat16(y);
+#else
                     Y_gate[(unsigned int)t * (unsigned int)gate_m + (unsigned int)(r >> 1)] = y;
+#endif
 #else
                     float* Yp;
                     int pr, os;
