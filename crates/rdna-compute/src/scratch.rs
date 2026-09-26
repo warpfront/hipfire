@@ -274,7 +274,7 @@ pub(crate) fn compile_and_load_kernel(
     if functions.contains_key(func_name) {
         return Ok(());
     }
-    let obj_path = compiler.compile(module_name, source)?;
+    let obj_path = compiler.compile_for_symbol(module_name, source, func_name)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
     // Alias the launched function name to this arch's compiled artifact so the
     // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
@@ -284,7 +284,7 @@ pub(crate) fn compile_and_load_kernel(
         compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
     }
     if !modules.contains_key(module_name) {
-        let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
+        let module = module_load_or_recompile(hip, compiler, module_name, source, func_name, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
     }
     let module = &modules[module_name];
@@ -309,6 +309,7 @@ pub(crate) fn module_load_or_recompile(
     compiler: &mut crate::compiler::KernelCompiler,
     module_name: &str,
     source: &str,
+    symbol: &str,
     obj_path: &str,
 ) -> HipResult<Module> {
     match hip.module_load(obj_path) {
@@ -318,7 +319,7 @@ pub(crate) fn module_load_or_recompile(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            let fresh = compiler.recompile(module_name, source)?;
+            let fresh = compiler.recompile(module_name, source, symbol)?;
             hip.module_load(fresh.to_str().unwrap())
         }
         Err(e) => Err(e),

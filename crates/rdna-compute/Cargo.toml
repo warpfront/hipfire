@@ -18,6 +18,9 @@ redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
 libloading = { workspace = true, optional = true }
 rayon = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }

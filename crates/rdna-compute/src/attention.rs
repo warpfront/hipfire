@@ -7654,7 +7654,7 @@ impl Gpu {
                 stripped
             )
         };
-        let obj_path = self.compiler.compile(name, &full_src)?;
+        let obj_path = self.compiler.compile_for_symbol(name, &full_src, func_name)?;
         let obj_path_str = obj_path.to_str().unwrap().to_string();
         if !self.modules.contains_key(name) {
             let module = crate::scratch::module_load_or_recompile(
@@ -7662,6 +7662,7 @@ impl Gpu {
                 &mut self.compiler,
                 name,
                 &full_src,
+                func_name,
                 &obj_path_str,
             )?;
             self.modules.insert(name.to_string(), module);

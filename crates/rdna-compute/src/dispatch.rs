@@ -3459,11 +3459,10 @@ impl Gpu {
     /// TURBO_COMMON_H already prepended in their source.
     pub fn precompile_kernels(&mut self, specs: &[(&str, &str, &str)]) -> HipResult<()> {
         self.bind_thread()?;
-        // Collect (name, source) pairs for the compiler batch, skipping already-loaded
-        let batch: Vec<(&str, &str)> = specs
+        let batch: Vec<(&str, &str, &str)> = specs
             .iter()
             .filter(|(_, _, func)| !self.functions.contains_key(*func))
-            .map(|(module, source, _)| (*module, *source))
+            .copied()
             .collect();
 
         if batch.is_empty() {
@@ -3471,14 +3470,14 @@ impl Gpu {
         }
 
         // Parallel hipcc compilation
-        self.compiler.compile_batch(&batch)?;
+        self.compiler.compile_batch_for_symbols(&batch)?;
 
         // Now load modules + extract functions (must be sequential — GPU API calls)
         for &(module_name, source, func_name) in specs {
             if self.functions.contains_key(func_name) {
                 continue;
             }
-            let obj_path = self.compiler.compile(module_name, source)?;
+            let obj_path = self.compiler.compile_for_symbol(module_name, source, func_name)?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(module_name) {
                 let module = crate::scratch::module_load_or_recompile(
@@ -3486,6 +3485,7 @@ impl Gpu {
                     &mut self.compiler,
                     module_name,
                     source,
+                    func_name,
                     &obj_path_str,
                 )?;
                 self.modules.insert(module_name.to_string(), module);
@@ -5436,18 +5436,8 @@ impl Gpu {
             specs.push((name, src));
         }
 
-        // Convert to (&str, &str) for the batch API
-        let batch: Vec<(&str, &str)> = specs
-            .iter()
-            .map(|(name, src)| (*name, src.as_str()))
-            .collect();
-        self.compiler.compile_batch(&batch)?;
-
-        // Now load all modules + functions sequentially (GPU API)
-        for (name, src) in &specs {
-            // Map module name → function name(s). Most modules expose exactly one
-            // function; multirow modules expose three (r2/r4/r8).
-            let func_names: Vec<&str> = match *name {
+        fn precompile_symbols(name: &str) -> Vec<&str> {
+            match name {
                 "rmsnorm" => vec!["rmsnorm_f32"],
                 "add_inplace" => vec!["add_inplace_f32"],
                 "mul" => vec!["mul_f32"],
@@ -5522,9 +5512,20 @@ impl Gpu {
                     "sample_topk_finalize_fast65",
                 ],
                 other => vec![other],
-            };
+            }
+        }
+        // Batch each module once, authenticating its first exported symbol.
+        let batch: Vec<(&str, &str, &str)> = specs
+            .iter()
+            .map(|(name, src)| (*name, src.as_str(), precompile_symbols(name)[0]))
+            .collect();
+        self.compiler.compile_batch_for_symbols(&batch)?;
+
+        // Now load all modules + functions sequentially (GPU API).
+        for (name, src) in &specs {
+            let func_names = precompile_symbols(name);
             // Compile and ensure the module is loaded once.
-            let obj_path = self.compiler.compile(name, src)?;
+            let obj_path = self.compiler.compile_for_symbol(name, src, func_names[0])?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(*name) {
                 let module = crate::scratch::module_load_or_recompile(
@@ -5532,6 +5533,7 @@ impl Gpu {
                     &mut self.compiler,
                     name,
                     src,
+                    func_names[0],
                     &obj_path_str,
                 )?;
                 self.modules.insert(name.to_string(), module);
@@ -5541,6 +5543,7 @@ impl Gpu {
                 if self.functions.contains_key(*func_name) {
                     continue;
                 }
+                self.compiler.compile_for_symbol(name, src, func_name)?;
                 let func = self.hip.module_get_function(module, func_name)?;
                 self.functions.insert(func_name.to_string(), func);
             }
