@@ -2661,9 +2661,9 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Resolve logical device IDs after the physical `hardware.devices` list has
-/// been installed as `ROCR_VISIBLE_DEVICES` and HIP has received the matching
-/// post-filter logical IDs. When unset, take the first `n_devices` visible IDs.
+/// Resolve logical device IDs after `hardware.devices` has been resolved to
+/// physical cards and installed as `ROCR_VISIBLE_DEVICES` plus HIP logical
+/// `0..N-1`. When unset, take the first `n_devices` visible IDs.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
     if let Some(ref s) = crate::config::get().devices {
         let ids: Vec<i32> = s
@@ -2692,7 +2692,38 @@ fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
     for &id in ids {
         devices.push(Gpu::init_with_device(id)?);
     }
+    verify_resolved_devices(&devices)?;
     Ok(devices)
+}
+
+/// Abort unless every constructed logical device is the physical card
+/// `hardware.devices` resolved for it (HIP `gcnArchName` and PCI bus ID).
+fn verify_resolved_devices(devices: &[Gpu]) -> HipResult<()> {
+    let Some(active) = hipfire_config::devices::active_devices() else {
+        return Ok(());
+    };
+    let observed = devices
+        .iter()
+        .map(|gpu| {
+            Ok(hipfire_config::devices::ObservedDevice {
+                logical: gpu.device_id as usize,
+                arch: gpu.hip.get_arch(gpu.device_id)?,
+                pci_bus_id: gpu.hip.device_pci_bus_id(gpu.device_id)?,
+            })
+        })
+        .collect::<HipResult<Vec<_>>>()?;
+    active
+        .verify(&observed)
+        .map_err(|message| HipError::new(0, &message))?;
+    eprintln!(
+        "[devices] multi-GPU init verified {}",
+        observed
+            .iter()
+            .map(|seen| format!("logical {}={} {}", seen.logical, seen.arch, seen.pci_bus_id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
 }
 
 fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResult<()> {

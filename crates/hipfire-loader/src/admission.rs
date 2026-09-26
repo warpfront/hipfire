@@ -512,8 +512,8 @@ fn visible_device_count() -> Option<usize> {
         return Some(count_device_list(devices));
     }
     for var in [
-        hipfire_config::HIP_VISIBLE_DEVICES,
-        hipfire_config::ROCR_VISIBLE_DEVICES,
+        hipfire_config::devices::HIP_VISIBLE_DEVICES,
+        hipfire_config::devices::ROCR_VISIBLE_DEVICES,
     ] {
         if let Ok(value) = std::env::var(var) {
             if !value.trim().is_empty() {

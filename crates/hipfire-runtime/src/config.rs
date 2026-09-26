@@ -186,9 +186,9 @@ impl RuntimeConfig {
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
-            // `hardware.devices` is installed as physical ROCr selectors and
-            // matching logical HIP selectors before GPU initialization. The
-            // engine therefore addresses the filtered set as logical 0..N-1.
+            // Each `hardware.devices` entry resolves to one physical card,
+            // installed as a ROCr selector with HIP logical `0..N-1` before
+            // GPU initialization. The engine addresses that set as 0..N-1.
             devices: value("HIPFIRE_DEVICES")
                 .filter(|value| !value.is_empty())
                 .map(|value| {

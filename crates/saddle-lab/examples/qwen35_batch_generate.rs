@@ -246,8 +246,11 @@ fn run() -> Result<(), String> {
             hipfire_config::resolve(layers).map_err(|e| format!("resolve config: {e}"))?;
         let process = hipfire_config::ProcessConfig::from_resolved(&resolved)
             .map_err(|e| format!("build process config: {e}"))?;
-        hipfire_config::apply_device_visibility(&process)
-            .map_err(|e| format!("apply device visibility: {e}"))?;
+        // Lab harness: resolves the device list but takes no daemon GPU lock.
+        hipfire_config::devices::apply_device_visibility(&process, &mut |_| {
+            Ok(hipfire_config::devices::Claim::Claimed)
+        })
+        .map_err(|e| format!("apply device visibility: {e}"))?;
         let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&process);
         hipfire_config::install_process_config(process)
             .map_err(|_| "process configuration was already initialized".to_string())?;

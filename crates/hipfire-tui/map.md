@@ -10,7 +10,7 @@ Terminal UI for hipfire (`ratatui` + `crossterm`): chat surface over the daemon 
 ## Gotchas
 
 - Owns its own panic hook (`src/main.rs`) to restore the terminal — a new panic path that bypasses it will leave the terminal in raw mode.
-- TUIs on different physical GPUs may coexist; TUIs targeting the same UUID contend in the daemon's machine-wide lock directory (default `/run/lock/hipfire`, fallback `/tmp/hipfire-locks`), regardless of HOME.
+- TUIs on different physical GPUs may coexist; TUIs targeting the same card (UUID, or PCI address for no-UUID cards) contend in the daemon's machine-wide lock directory (default `/run/lock/hipfire`, fallback `/tmp/hipfire-locks`), regardless of HOME.
 
 ## Crate map
 

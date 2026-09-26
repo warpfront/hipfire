@@ -8,10 +8,13 @@
 # Source this in an agent session:  source scripts/gpu-lock.sh
 # Then:  gpu_acquire "model-ingestion" && { run tests; gpu_release; }
 # Per-card: gpu_acquire "model-ingestion" GPU-05f92432f2312a0e
+#           gpu_acquire "model-ingestion" 0000:99:00.0   (card without a UUID)
 # A single UUID in HIP_VISIBLE_DEVICES is inferred when no second argument is
-# given; otherwise no UUID uses the legacy global /tmp/hipfire-gpu.lock.
-# Per-UUID locks use HIPFIRE_LOCK_DIR if set, else writable
-# /run/lock/hipfire, else /tmp/hipfire-locks (the daemon's same policy).
+# given; otherwise no card uses the legacy global /tmp/hipfire-gpu.lock.
+# Per-card locks use the daemon's keys: gpu-GPU-<16 hex>.lock for a card with
+# a UUID, gpu-pci-<dddd:bb:dd.f>.lock for one without (its UUID reads 0/XX).
+# They live in HIPFIRE_LOCK_DIR if set, else writable /run/lock/hipfire, else
+# /tmp/hipfire-locks (the daemon's same policy).
 #
 # Backed by flock(1): the lock is held on an open file descriptor, so the
 # Linux kernel releases it automatically when the holding process dies for
@@ -32,21 +35,37 @@ POLL_INTERVAL="${GPU_POLL_INTERVAL:-5}"          # cadence of "busy" messages (s
 GPU_LOCK_TIMEOUT="${GPU_LOCK_TIMEOUT:-1800}"     # hard cap (s); 0 = wait forever
 GPU_LOCK_FD=""                                   # set by gpu_acquire (auto-alloc)
 
-gpu_acquire() {
-    local agent_name="${1:?usage: gpu_acquire <agent-name> [GPU-uuid]}"
-    local uuid="${2:-}"
-    local requested_lockfile
-    if [ -z "$uuid" ] && [[ "${HIP_VISIBLE_DEVICES:-}" =~ ^GPU-[[:xdigit:]]{16}$ ]]; then
-        uuid="$HIP_VISIBLE_DEVICES"
-    fi
-    if [ -n "$uuid" ]; then
-        if [[ ! "$uuid" =~ ^GPU-[[:xdigit:]]{16}$ ]]; then
-            echo "[gpu-lock] invalid GPU UUID: $uuid" >&2
+# Print the daemon's lock identity for a GPU-<hex> UUID or a PCI address.
+gpu_lock_identity() {
+    local card="$1"
+    if [[ "$card" =~ ^[Gg][Pp][Uu]-([[:xdigit:]]{1,16})$ ]]; then
+        local hex="${BASH_REMATCH[1],,}"
+        while [[ "$hex" == 0* ]]; do hex="${hex#0}"; done
+        if [ -z "$hex" ]; then
+            echo "[gpu-lock] $card is the no-UUID placeholder; pass the card's PCI address" >&2
             return 3
         fi
-        uuid="GPU-${uuid:4}"
-        uuid="${uuid,,}"
-        uuid="GPU-${uuid:4}"
+        while [ "${#hex}" -lt 16 ]; do hex="0$hex"; done
+        printf 'GPU-%s\n' "$hex"
+    elif [[ "$card" =~ ^(([[:xdigit:]]{1,8}):)?([[:xdigit:]]{1,2}):([[:xdigit:]]{1,2})\.([0-7])$ ]]; then
+        printf 'pci-%04x:%02x:%02x.%x\n' "0x${BASH_REMATCH[2]:-0}" "0x${BASH_REMATCH[3]}" \
+            "0x${BASH_REMATCH[4]}" "0x${BASH_REMATCH[5]}"
+    else
+        echo "[gpu-lock] expected GPU-<uuid> or a PCI address [DDDD:]BB:DD.F: $card" >&2
+        return 3
+    fi
+}
+
+gpu_acquire() {
+    local agent_name="${1:?usage: gpu_acquire <agent-name> [GPU-uuid|PCI-address]}"
+    local card="${2:-}"
+    local identity=""
+    local requested_lockfile
+    if [ -z "$card" ] && [[ "${HIP_VISIBLE_DEVICES:-}" =~ ^GPU-[[:xdigit:]]{16}$ ]]; then
+        card="$HIP_VISIBLE_DEVICES"
+    fi
+    if [ -n "$card" ]; then
+        identity=$(gpu_lock_identity "$card") || return 3
         if [ "${HIPFIRE_LOCK_DIR+x}" = x ]; then
             GPU_LOCK_DIR="$HIPFIRE_LOCK_DIR"
             if [[ "$GPU_LOCK_DIR" != /* ]]; then
@@ -75,7 +94,7 @@ gpu_acquire() {
             fi
         fi
         echo "[gpu-lock] directory=$GPU_LOCK_DIR"
-        requested_lockfile="$GPU_LOCK_DIR/gpu-${uuid}.lock"
+        requested_lockfile="$GPU_LOCK_DIR/gpu-${identity}.lock"
     else
         requested_lockfile="$LOCKFILE"
     fi

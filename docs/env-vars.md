@@ -79,7 +79,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_MODELS_DIR` | Model discovery/lifecycle root | Overrides list/pull/remove/pre-warm and TUI model paths. |
 | `HIPFIRE_MODEL` | Serve/run model tag or path | Also `default_model` config. |
 | `HIPFIRE_DAEMON_BIN` | Daemon binary override | |
-| `HIPFIRE_LOCK_DIR` | Shared per-GPU UUID lock directory | Absolute writable path; daemon and `gpu-lock.sh` must use the same setting to contend. Default `/run/lock/hipfire` if writable, otherwise `/tmp/hipfire-locks`; different directories do not see each other's locks. |
+| `HIPFIRE_LOCK_DIR` | Shared per-GPU lock directory | Absolute writable path; daemon and `gpu-lock.sh` must use the same setting to contend. Default `/run/lock/hipfire` if writable, otherwise `/tmp/hipfire-locks`; different directories do not see each other's locks. Files are `gpu-GPU-<uuid>.lock`, or `gpu-pci-<dddd:bb:dd.f>.lock` for cards without a UUID. |
 | `HIPFIRE_TUI_BIN` | TUI binary | |
 | `HIPFIRE_ROCM_PATH` | hipfire-specific ROCm SDK root override | Highest priority (`HIPFIRE_ROCM_PATH` > `ROCM_PATH` > `HIP_PATH`). Must provide the runtime, headers, and `hipcc`. Authoritative: no fallback to another install or bare soname. |
 | `ROCM_PATH` / `HIP_PATH` | ROCm/HIP compatibility root overrides | Used only when `HIPFIRE_ROCM_PATH` is unset (`ROCM_PATH` before `HIP_PATH`). `HIP_PATH=<root>/hip` normalizes to `<root>`. Multiple equally eligible roots without an override are refused — set `HIPFIRE_ROCM_PATH`. |
@@ -201,7 +201,7 @@ diagnostic and developer harness exports pending their cleanup.
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
 | `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 or exact-gfx1201 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, HIP graph capture off, retained replay recording off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
-| `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` is the compatibility alias for `hardware.devices`; startup lowers its physical list to ROCr selectors plus matching HIP logical selectors. |
+| `HIPFIRE_DEVICES` / `HIPFIRE_DEVICE` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` (singular alias `HIPFIRE_DEVICE`; conflicting values fail) is the compatibility spelling of `hardware.devices`: comma-separated, in logical order, each entry a PCI-order index (`rocm-smi` order, not ROCr/HIP ordinals), `gfxNNNN` (first free card of that arch; repeat for more), `GPU-<uuid>`, or PCI address `[DDDD:]BB:DD.F` (required for no-UUID cards). Resolved from the KFD topology without touching a GPU, reserved, lowered to ROCr UUIDs/ordinals plus HIP `0..N-1`, and checked against HIP's arch and PCI bus ID after init. See [multi-gpu.md](multi-gpu.md#device-selection). |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
@@ -311,7 +311,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `serve.multi_slot_prefill_chunk` | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` |
 | `prefill_*` | matching `HIPFIRE_PREFILL_*` |
 | `mmq_screen*` | `HIPFIRE_MMQ_SCREEN*` |
-| `hardware.devices` | `HIPFIRE_DEVICES`; synchronizes `ROCR_VISIBLE_DEVICES=<physical list>` with `HIP_VISIBLE_DEVICES=0..N-1` before GPU initialization |
+| `hardware.devices` | `HIPFIRE_DEVICES` / `HIPFIRE_DEVICE`; resolves index / `gfxNNNN` / `GPU-<uuid>` / PCI entries to physical cards and synchronizes `ROCR_VISIBLE_DEVICES=<their ROCr selectors>` with `HIP_VISIBLE_DEVICES=0..N-1` before GPU initialization |
 | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` |
 | `hardware.tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` |
 | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` |
@@ -496,7 +496,8 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DETECTED_NAME` | scripts/_detect-gpu.sh |
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh |
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-runtime/examples/pp_parity_chatml.rs |
-| `HIPFIRE_DEVICES` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
+| `HIPFIRE_DEVICE` | crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_DEVICES` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |

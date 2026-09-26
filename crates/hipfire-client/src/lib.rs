@@ -536,30 +536,15 @@ impl Engine {
     /// Start the engine daemon and install validated process policy before the
     /// daemon initializes a GPU. This is the native control-plane path; the
     /// environment map is reserved for non-hipfire bootstrap state inherited
-    /// by external launchers.
+    /// by external launchers. The daemon itself resolves `hardware.devices`,
+    /// reserving the chosen cards in the same step, and lowers it to ROCr/HIP
+    /// visibility; resolving here could not hold those reservations.
     pub fn spawn_configured(
         daemon: impl AsRef<Path>,
         environment: &BTreeMap<String, String>,
         config: &hipfire_config::ProcessConfig,
     ) -> Result<Self> {
-        let mut environment = environment.clone();
-        let hip = environment
-            .get(hipfire_config::HIP_VISIBLE_DEVICES)
-            .cloned()
-            .or_else(|| std::env::var(hipfire_config::HIP_VISIBLE_DEVICES).ok());
-        let rocr = environment
-            .get(hipfire_config::ROCR_VISIBLE_DEVICES)
-            .cloned()
-            .or_else(|| std::env::var(hipfire_config::ROCR_VISIBLE_DEVICES).ok());
-        let visibility =
-            hipfire_config::synchronized_device_visibility(config, hip.as_deref(), rocr.as_deref())
-                .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        if let Some(visibility) = visibility {
-            environment.insert(hipfire_config::HIP_VISIBLE_DEVICES.into(), visibility.hip);
-            environment.insert(hipfire_config::ROCR_VISIBLE_DEVICES.into(), visibility.rocr);
-        }
-
-        let engine = Self::spawn(daemon, &environment)?;
+        let engine = Self::spawn(daemon, environment)?;
         let response = engine.request(&serde_json::json!({
             "type": "configure",
             "config": config,
@@ -1695,7 +1680,7 @@ mod tests {
         ));
         let daemon = write_fake_daemon(
             &root,
-            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) if [ \"$HIP_VISIBLE_DEVICES\" = '0,1' ] && [ \"$ROCR_VISIBLE_DEVICES\" = '2,3' ]; then configured=1; echo '{\"type\":\"configured\"}'; else echo '{\"type\":\"error\",\"message\":\"device visibility is not synchronized\"}'; fi ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
+            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) case \"$line\" in *'\"hardware.devices\":\"2,3\"'*) configured=1; echo '{\"type\":\"configured\"}' ;; *) echo '{\"type\":\"error\",\"message\":\"device policy missing\"}' ;; esac ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
         );
         let mut layer = hipfire_config::ConfigLayer::default();
         layer.set_cli("hardware.devices", "2,3").unwrap();

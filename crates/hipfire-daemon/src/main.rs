@@ -6,8 +6,9 @@
 //! The Bun CLI spawns this process and communicates via IPC.
 //! Usage: daemon (reads JSON from stdin, writes JSON to stdout)
 //!
-//! Daemons sharing a physical GPU are excluded by machine-wide, UUID-keyed
-//! flock(2) locks. Daemons on distinct GPUs may coexist, even in one HOME.
+//! Daemons sharing a physical GPU are excluded by machine-wide flock(2) locks
+//! keyed on the card's resolved identity (UUID, else PCI address). Daemons on
+//! distinct GPUs may coexist, even in one HOME.
 //!
 //! Protocol:
 //!   → {"type":"load","model":"path.hfq","params":{"max_seq":4096}}
@@ -21,6 +22,7 @@
 
 use base64::Engine;
 use hipfire_config::developer_var;
+use hipfire_config::devices::{Claim, DeviceSelection, GpuDevice, ObservedDevice};
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
@@ -421,35 +423,38 @@ fn gpu_lock_dir() -> Result<std::path::PathBuf, String> {
     Ok(fallback.to_path_buf())
 }
 
+/// Machine-wide GPU reservations held until process exit. Lock files are
+/// keyed by [`GpuDevice::lock_identity`]: `gpu-GPU-<uuid>.lock`, or
+/// `gpu-pci-<bdf>.lock` for cards without a UUID. The per-HOME PID file is
+/// advisory discovery for uninstall tooling, not a mutex: two daemons using
+/// different cards in one HOME must both run.
+#[cfg(unix)]
+struct GpuLocks {
+    dir: std::path::PathBuf,
+    held: Vec<(String, std::fs::File)>,
+}
 
 #[cfg(unix)]
-/// The open descriptors keep all selected GPUs reserved until process exit.
-/// The per-HOME PID file is advisory discovery for uninstall tooling, not a
-/// mutex: two daemons using different cards in one HOME must both run.
-fn acquire_gpu_locks() -> Result<Vec<std::fs::File>, String> {
-    use std::io::{Read, Seek, Write};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::os::unix::io::AsRawFd;
-
-    let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
-    let count = hip.device_count().map_err(|e| e.to_string())?;
-    if count < 1 {
-        return Err("no visible GPUs to reserve".into());
+impl GpuLocks {
+    fn open() -> Result<Self, String> {
+        let dir = gpu_lock_dir()?;
+        eprintln!("[gpu-lock] directory={}", dir.display());
+        Ok(Self { dir, held: Vec::new() })
     }
-    let mut devices = Vec::with_capacity(count as usize);
-    for id in 0..count {
-        let uuid = hip.device_uuid(id).map_err(|e| e.to_string())?;
-        let bdf = hip.device_pci_bus_id(id).unwrap_or_else(|_| format!("HIP device {id}"));
-        devices.push((uuid, bdf));
-    }
-    devices.sort_unstable();
-    devices.dedup_by(|a, b| a.0 == b.0);
 
-    let dir = gpu_lock_dir()?;
-    eprintln!("[gpu-lock] directory={}", dir.display());
-    let mut locks = Vec::with_capacity(devices.len());
-    for (uuid, bdf) in &devices {
-        let path = dir.join(format!("gpu-{uuid}.lock"));
+    /// Non-blocking reservation; a busy card reports its holder so arch
+    /// selectors can move on to the next card. Never waits, so the claim
+    /// order cannot deadlock against another daemon.
+    fn try_claim(&mut self, device: &GpuDevice) -> Result<Claim, String> {
+        use std::io::{Read, Seek, Write};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::io::AsRawFd;
+
+        let identity = device.lock_identity();
+        if self.held.iter().any(|(held, _)| *held == identity) {
+            return Ok(Claim::Claimed);
+        }
+        let path = self.dir.join(device.lock_file_name());
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
         let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -459,10 +464,10 @@ fn acquire_gpu_locks() -> Result<Vec<std::fs::File>, String> {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 let mut holder = String::new();
                 let _ = file.read_to_string(&mut holder);
-                return Err(format!(
-                    "GPU {uuid} (PCI {bdf}) already reserved by holder PID {}",
+                return Ok(Claim::Busy(format!(
+                    "already reserved by holder PID {}",
                     holder.split_whitespace().next().unwrap_or("<unknown>")
-                ));
+                )));
             }
             return Err(format!("flock {}: {error}", path.display()));
         }
@@ -471,24 +476,140 @@ fn acquire_gpu_locks() -> Result<Vec<std::fs::File>, String> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
         file.set_len(0).map_err(|e| e.to_string())?;
         file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        writeln!(file, "{} {}", std::process::id(), bdf).map_err(|e| e.to_string())?;
+        writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
         file.flush().map_err(|e| e.to_string())?;
-        locks.push(file);
+        eprintln!("[gpu-lock] reserved {}", path.display());
+        self.held.push((identity, file));
+        Ok(Claim::Claimed)
     }
 
-    let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
-    let hipfire_dir = Path::new(&home).join(".hipfire");
-    std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
-    let suffix = devices.iter().map(|(uuid, _)| uuid.as_str()).collect::<Vec<_>>().join("_");
-    let pid_path = hipfire_dir.join(format!("daemon-{suffix}.pid"));
-    std::fs::write(&pid_path, format!("{}\n", std::process::id()))
-        .map_err(|e| format!("write {}: {e}", pid_path.display()))?;
-    Ok(locks)
+    /// Reserve every card in `devices`, sorted by identity; any busy card
+    /// fails the whole set (held descriptors close on process exit).
+    fn claim_all(&mut self, devices: &[GpuDevice]) -> Result<(), String> {
+        let mut sorted = devices.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|device| device.lock_identity());
+        for device in sorted {
+            if let Claim::Busy(holder) = self.try_claim(device)? {
+                return Err(format!(
+                    "GPU {} (PCI {}) {holder}",
+                    device.lock_identity(),
+                    device.bdf
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_pid_file(&self) -> Result<(), String> {
+        if self.held.is_empty() {
+            return Err("no visible GPUs to reserve".into());
+        }
+        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
+        identities.sort_unstable();
+        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
+        let hipfire_dir = Path::new(&home).join(".hipfire");
+        std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
+        let pid_path = hipfire_dir.join(format!("daemon-{}.pid", identities.join("_")));
+        std::fs::write(&pid_path, format!("{}\n", std::process::id()))
+            .map_err(|e| format!("write {}: {e}", pid_path.display()))
+    }
 }
 
 #[cfg(not(unix))]
-fn acquire_gpu_locks() -> Result<Vec<std::fs::File>, String> {
-    Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
+struct GpuLocks;
+
+#[cfg(not(unix))]
+impl GpuLocks {
+    fn open() -> Result<Self, String> {
+        Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
+    }
+    fn try_claim(&mut self, _: &GpuDevice) -> Result<Claim, String> {
+        unreachable!("GpuLocks::open fails on non-Unix hosts")
+    }
+    fn claim_all(&mut self, _: &[GpuDevice]) -> Result<(), String> {
+        unreachable!("GpuLocks::open fails on non-Unix hosts")
+    }
+    fn write_pid_file(&self) -> Result<(), String> {
+        unreachable!("GpuLocks::open fails on non-Unix hosts")
+    }
+}
+
+/// Query what HIP exposes: one entry per logical device.
+fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
+    let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
+    let count = hip.device_count().map_err(|e| e.to_string())?;
+    if count < 1 {
+        return Err("no visible GPUs to reserve".into());
+    }
+    (0..count)
+        .map(|id| {
+            Ok(ObservedDevice {
+                logical: id as usize,
+                arch: hip.get_arch(id).map_err(|e| e.to_string())?,
+                pci_bus_id: hip.device_pci_bus_id(id).map_err(|e| e.to_string())?,
+            })
+        })
+        .collect()
+}
+
+/// Complete the GPU reservation after visibility is installed and check the
+/// identity of every logical device HIP now exposes.
+///
+/// `hardware.devices` already reserved its cards while resolving; here each
+/// logical device must be exactly the resolved card (arch and PCI bus ID).
+/// Without it (raw inherited filters or none), the HIP-visible cards are
+/// identified by PCI address in the KFD topology and reserved all-or-nothing.
+fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
+    let observed = observe_hip_devices()?;
+    if let Some(active) = hipfire_config::devices::active_devices() {
+        active.verify_visible(&observed)?;
+        for (seen, device) in observed.iter().zip(&active.devices) {
+            eprintln!(
+                "[devices] verified logical {}: HIP {} {} = index {} {} rocr={}",
+                seen.logical,
+                seen.arch,
+                seen.pci_bus_id,
+                device.index,
+                device.lock_identity(),
+                device.rocr_selector()
+            );
+        }
+    } else {
+        let topology = hipfire_config::devices::enumerate_gpus(Path::new(
+            hipfire_config::devices::KFD_TOPOLOGY_NODES,
+        ))
+        .map_err(|e| e.to_string())?;
+        let devices = observed
+            .iter()
+            .map(|seen| {
+                let bdf = hipfire_config::devices::PciBdf::parse(&seen.pci_bus_id);
+                topology
+                    .iter()
+                    .find(|device| Some(device.bdf) == bdf)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "HIP logical device {} (PCI {}) is not in the KFD topology\n{}",
+                            seen.logical,
+                            seen.pci_bus_id,
+                            hipfire_config::devices::device_table(&topology)
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        locks.claim_all(&devices)?;
+        for (seen, device) in observed.iter().zip(&devices) {
+            eprintln!(
+                "[devices] logical {}: HIP {} {} = index {} {}",
+                seen.logical,
+                seen.arch,
+                seen.pci_bus_id,
+                device.index,
+                device.lock_identity()
+            );
+        }
+    }
+    locks.write_pid_file()
 }
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the
@@ -720,9 +841,34 @@ fn init_tracing() {
     }
 }
 
-fn install_process_config(config: hipfire_config::ProcessConfig) -> Result<(), String> {
+/// Validate and install process policy, resolving `hardware.devices` against
+/// the KFD topology before any GPU runtime initializes. `claim` reserves each
+/// resolved card as part of that same step.
+fn install_process_config(
+    config: hipfire_config::ProcessConfig,
+    claim: &mut hipfire_config::devices::ClaimFn<'_>,
+) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
-    hipfire_config::apply_device_visibility(&config).map_err(|error| error.to_string())?;
+    let selection = hipfire_config::devices::apply_device_visibility(&config, claim)
+        .map_err(|error| error.to_string())?;
+    match &selection {
+        DeviceSelection::Resolved { devices, visibility } => eprintln!(
+            "[devices] hardware.devices={:?} -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
+            config.legacy_value("HIPFIRE_DEVICES").unwrap_or_default(),
+            devices
+                .iter()
+                .map(|device| format!("index {} {} {} {}", device.index, device.arch, device.lock_identity(), device.bdf))
+                .collect::<Vec<_>>()
+                .join(", "),
+            visibility.rocr,
+            visibility.hip
+        ),
+        DeviceSelection::Inherited(visibility) => eprintln!(
+            "[devices] inherited ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={}",
+            visibility.rocr, visibility.hip
+        ),
+        DeviceSelection::Unfiltered => {}
+    }
     let runtime = hipfire_runtime::config::RuntimeConfig::from_process_config(&config);
     hipfire_config::install_process_config(config)
         .map_err(|_| "process configuration was already initialized".to_owned())?;
@@ -815,7 +961,8 @@ fn main() {
             eprintln!("FATAL: invalid process configuration: {error}");
             std::process::exit(1);
         });
-        install_process_config(process_config).unwrap_or_else(|error| {
+        // Packaging needs only the arch and reserves no card.
+        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(|error| {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
@@ -898,8 +1045,9 @@ fn main() {
         return;
     }
 
-    // Resolve configured ROCr/HIP visibility before identifying and reserving
-    // the complete physical GPU set; do not allocate a GPU context first.
+    // Resolve hardware.devices, reserve the cards it names and install ROCr/HIP
+    // visibility in one step, then check what HIP exposes before any GPU
+    // context is created.
 
     let mut stdout = std::io::stdout();
     let Some((process_config, pending_message, acknowledge_config)) =
@@ -910,11 +1058,16 @@ fn main() {
     else {
         return;
     };
-    install_process_config(process_config).unwrap_or_else(|error| {
-        eprintln!("FATAL: failed to install process configuration: {error}");
+    let mut gpu_locks = GpuLocks::open().unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
-    let _gpu_locks = acquire_gpu_locks().unwrap_or_else(|error| {
+    install_process_config(process_config, &mut |device| gpu_locks.try_claim(device))
+        .unwrap_or_else(|error| {
+            eprintln!("FATAL: failed to install process configuration: {error}");
+            std::process::exit(1);
+        });
+    reserve_and_verify_gpus(&mut gpu_locks).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });

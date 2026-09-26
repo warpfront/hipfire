@@ -133,7 +133,7 @@ Process-wide scalar policy is typed as well:
 
 | Key | Default | Values / purpose |
 |---|---:|---|
-| `hardware.devices` | `null` | Physical device list installed as `ROCR_VISIBLE_DEVICES`; HIP receives matching post-filter logical selectors `0..N-1` before initialization, avoiding compounded nonzero filters. |
+| `hardware.devices` | `null` | Comma-separated device list in logical order: PCI-order index (`rocm-smi` order), `gfxNNNN` (first free card of that arch; repeat for more), `GPU-<uuid>`, or PCI address. Resolved from the KFD topology, reserved, installed as `ROCR_VISIBLE_DEVICES` UUIDs/ordinals plus HIP `0..N-1` before initialization, and checked against HIP after it. See [multi-gpu.md](multi-gpu.md#device-selection). |
 | `hardware.uniform_vram_tolerance_gb` | `null` | Free-VRAM spread override; unset uses the compiled default. |
 | `generation.loop_guard_threshold` | `0` | Repeated 4-gram count that forces EOS; zero disables. |
 | `generation.loop_guard_window` | `256` | Token window inspected by the loop guard. |
@@ -708,7 +708,7 @@ uses ambient variables in engine hot paths.
 | `ngram_min_count` | `speculation.ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | 2 |
 | `prompt_cache_capacity` | `memory.prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | 32 |
 | `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
-| `devices` | `hardware.devices` | `HIPFIRE_DEVICES` | unset |
+| `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
 | `mtp_mode` | `speculation.mtp` | `HIPFIRE_MTP_MODE` | `"auto"` |

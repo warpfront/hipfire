@@ -49,10 +49,11 @@ raw daemon JSONL `load` (or any client that builds that message). Examples and
 
 Source of truth: `Gpus` in `multi_gpu.rs`.
 
-1. **Device pick** — `hardware.devices = "0,1,..."` is the physical visibility
-   list. Startup installs it as `ROCR_VISIBLE_DEVICES` and gives HIP the
-   matching post-filter logical list `0..N-1`; this avoids compounded nonzero
-   filters while keeping both backends on the same physical GPUs.
+1. **Device pick** — `hardware.devices` lists physical cards in logical order
+   (see [Device selection](#device-selection)). Startup resolves it from the
+   KFD topology, reserves the cards, installs ROCr selectors plus HIP logical
+   `0..N-1`, and after HIP init aborts unless every logical device has the
+   resolved card's arch and PCI bus ID. `Gpus` construction repeats that check.
 2. **Layer map**
    - Default: `Gpus::init_uniform(pp, n_layers)` — contiguous bands,
      `base = n_layers / N`, remainder distributed so max−min ≤ 1 layer.
@@ -97,6 +98,47 @@ rocm-smi --showtopoaccess
 A full `True` peer-access matrix is ideal. Missing peer access does not block
 load; copies fall back to host staging.
 
+### Device selection
+
+`hardware.devices` (`HIPFIRE_DEVICES`, singular alias `HIPFIRE_DEVICE`) is a
+comma-separated list; its order is the logical device order for PP/TP/EP.
+Entries:
+
+| Entry | Meaning |
+|---|---|
+| `N` | Index into the GPUs sorted by PCI address — the `rocm-smi` order. Not a ROCr or HIP ordinal. |
+| `gfxNNNN` | First card of that arch, in PCI order, that is free (its daemon lock is not held) and not named elsewhere in the list. `gfx1201,gfx1201` gives two distinct cards. |
+| `GPU-<hex>` | Exact UUID (`rocminfo` / `rocm-smi --showuniqueid`). |
+| `DDDD:BB:DD.F` or `BB:DD.F` | Exact PCI address — the only exact form for cards whose UUID reads `GPU-XX`/`0x0`. |
+
+Why a new index: ROCr numbers GPUs in KFD topology node order (`rocminfo`),
+HIP numbers whatever ROCr exposed, and `rocm-smi` sorts by PCI bus. On a host
+with a 7900 XTX (66:00.0), 6950 XT (6e:00.0), 5700 XT (99:00.0) and Strix Halo
+iGPU (bf:00.0) the ROCr order is gfx1100, gfx1151, gfx1030, gfx1010 while the
+PCI order is gfx1100, gfx1030, gfx1010, gfx1151. `HIPFIRE_DEVICES=2` is the
+5700 XT there regardless of what ROCr calls it.
+
+Resolution reads `/sys/class/kfd/kfd/topology/nodes/*/properties` only (no GPU
+contact): nodes with SIMDs are GPUs, `gfx_target_version` gives the arch,
+`unique_id` the UUID (0 = none), `domain` + `location_id` the PCI address. The
+KFD GPU-node order equals ROCr's agent order (checked against `rocminfo` on a
+5× gfx1201 host and the mixed host above). Each card lowers to
+`ROCR_VISIBLE_DEVICES` as its UUID, or as its ROCr ordinal when it has none;
+HIP gets `0..N-1`. Exact entries are claimed first, then each `gfxNNNN` entry in
+list order. Unknown entries, misses, duplicates, a busy exact card, or no free
+card of an arch fail closed and print the full device table.
+
+Raw inherited `ROCR_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` remain the expert
+override when `hardware.devices` is unset: compatible pairs are normalized,
+ambiguous pairs fail closed, and the daemon then identifies the HIP-visible
+cards by PCI address to lock them.
+
+Each daemon holds a non-blocking flock per card in `HIPFIRE_LOCK_DIR` (else
+`/run/lock/hipfire`, else `/tmp/hipfire-locks`): `gpu-GPU-<uuid>.lock`, or
+`gpu-pci-<dddd:bb:dd.f>.lock` for a card without a UUID. The `gfxNNNN` choice
+and the reservation are one step, so two daemons asking for `gfx1201` get
+different cards. `scripts/gpu-lock.sh` uses the same keys.
+
 ## Launch and config
 
 ### PP load (daemon JSONL)
@@ -108,7 +150,7 @@ load; copies fall back to host staging.
 Example process:
 
 ```sh
-# Persist one physical device list for both HIP and ROCr.
+# Persist one device list for both HIP and ROCr (PCI-order indices).
 hipfire config set hardware.devices 0,1
 
 # Optional: asymmetric bands (must sum to n_layers, length == pp)
@@ -124,7 +166,7 @@ cargo run --release --features deltanet -p hipfire-runtime --example daemon
 ### EP load (CLI)
 
 ```sh
-HIP_VISIBLE_DEVICES=0,1 hipfire serve <minimax-or-deepseek4-tag> --tp 2
+HIPFIRE_DEVICES=gfx1201,gfx1201 hipfire serve <minimax-or-deepseek4-tag> --tp 2
 # equivalent: HIPFIRE_TP=2 …
 ```
 
@@ -137,9 +179,9 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 
 | Variable | Role |
 |---|---|
-| `hardware.devices` | Persistent physical device list; lowers to ROCr physical selectors and matching HIP logical selectors before initialization |
-| `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` | Legacy one-shot filters; compatible pairs are normalized and ambiguous pairs fail closed |
-| `HIPFIRE_DEVICES` | Legacy compatibility alias for `hardware.devices` |
+| `hardware.devices` | Persistent device list (index, `gfxNNNN`, `GPU-<uuid>`, PCI address); resolved to physical cards, reserved, lowered to ROCr selectors plus HIP logical `0..N-1` |
+| `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` | Expert one-shot filters when `hardware.devices` is unset; compatible pairs are normalized and ambiguous pairs fail closed |
+| `HIPFIRE_DEVICES` / `HIPFIRE_DEVICE` | Compatibility aliases for `hardware.devices` |
 | `HIPFIRE_PP_LAYERS` | Explicit per-device layer counts for PP |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | `init_uniform` / `init_tp` free-VRAM delta |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
@@ -396,7 +438,7 @@ Direct daemon JSON (driving without the CLI):
 
 | Variable | Effect |
 |----------|--------|
-| `hardware.devices = "3,1"` | ROCr physical filter `3,1`; HIP and the engine receive matching logical devices `0,1` |
+| `hardware.devices = "3,1"` | PCI-order cards 3 and 1 become logical devices 0 and 1; ROCr receives their UUIDs (or ROCr ordinals for no-UUID cards) |
 | `HIPFIRE_DETERMINISTIC=1` | Force k2 WMMA reduction (no atomicAdd) — bit-identical across processes/pp configs at ~33% perf cost on small-batch decode |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=N` | Pre-flight VRAM-asymmetry tolerance for `Gpus::init_uniform` (default 2.0) |
 | `HIPFIRE_PREFILL_BATCHED=0` | Disable batched WMMA prefill (per-token fallback). Diagnostic for ksplit non-det isolation |
@@ -483,4 +525,4 @@ should work. If not, hipfire falls back to host-staging via pinned buffers (slow
 
 - DFlash + PP integration scope — pending maintainer guidance on issue #58
 - Whether mixed-arch should be soft-warn or hard-fail — currently hard-fail
-- `hardware.devices` is the physical visibility source of truth; startup lowers ROCr physical selectors to matching HIP logical `0..N-1`
+- `hardware.devices` is the physical device source of truth; see [Device selection](#device-selection)

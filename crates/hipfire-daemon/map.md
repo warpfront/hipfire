@@ -5,13 +5,13 @@
 
 ## Purpose
 
-The product entry point (`crates/hipfire-daemon/src/main.rs`). Owns message dispatch and process lifetime — machine-wide, UUID-keyed `flock(2)` files under the resolved lock directory, JSONL stdin/stdout protocol (`load`/`generate`/`unload` plus image-augmented `generate`), and the `generate(…)` ladder that delegates to `hipfire-loader::load_model` and the `hipfire-generate` bodies. Build is `cargo build --release` with no `--features`.
+The product entry point (`crates/hipfire-daemon/src/main.rs`). Owns message dispatch and process lifetime — `hardware.devices` resolution with machine-wide per-card `flock(2)` files under the resolved lock directory, JSONL stdin/stdout protocol (`load`/`generate`/`unload` plus image-augmented `generate`), and the `generate(…)` ladder that delegates to `hipfire-loader::load_model` and the `hipfire-generate` bodies. Build is `cargo build --release` with no `--features`.
 
 ## Gotchas
 
-- Daemons may share a HOME only when their physical GPU UUID sets do not overlap. Locks are acquired sorted and non-blocking before GPU initialization; contention reports the UUID, PCI BDF and holder PID. Never unlink a GPU lock file: flock releases on death, and unlinking creates a second inode.
+- Daemons may share a HOME only when their physical GPU sets do not overlap. Lock files are keyed by resolved identity: `gpu-GPU-<uuid>.lock`, or `gpu-pci-<dddd:bb:dd.f>.lock` for cards without a UUID. With `hardware.devices`, `hipfire_config::devices` resolves the list from the KFD topology and the daemon takes each card's lock (non-blocking) inside that step, so a `gfxNNNN` entry skips busy cards; after HIP loads, every logical device's arch and PCI bus ID must match or startup aborts with both tables. Without it, the HIP-visible cards are mapped to KFD by PCI address and locked sorted, all-or-nothing. Contention reports the identity, PCI BDF and holder PID. Never unlink a GPU lock file: flock releases on death, and unlinking creates a second inode.
 - Lock directory: `HIPFIRE_LOCK_DIR` if set (must be absolute and writable); otherwise `/run/lock/hipfire` when writable, then `/tmp/hipfire-locks`. The daemon logs its resolved directory at startup. Daemons or scripts pointed at **different** lock directories do not contend; all users/processes sharing a card must use the same directory. `gpu-lock.sh` follows the identical selection policy.
-- `~/.hipfire/daemon-GPU-<uuid>[_GPU-<uuid>...].pid` is advisory PID discovery for uninstall, not a mutex. Native CLI/client processes communicate with their own stdio daemon; serve discovery uses `serve.pid`/its HTTP port. A private HOME does **not** bypass GPU contention.
+- `~/.hipfire/daemon-<identity>[_<identity>...].pid` (identity = `GPU-<uuid>` or `pci-<bdf>`) is advisory PID discovery for uninstall, not a mutex. Native CLI/client processes communicate with their own stdio daemon; serve discovery uses `serve.pid`/its HTTP port. A private HOME does **not** bypass GPU contention.
 - The binary name is `daemon` (`[[bin]]` in `Cargo.toml`), not `hipfire-daemon`; the `target/release/hipfire` wrapper is separate.
 - The serve vs one-shot decision lives in `hipfire-cli` (forced local when `HIPFIRE_LOCAL=1`, `--kv-mode`, `--json`, or `--no-stream`) — daemon always assumes it was given the correct path.
 
