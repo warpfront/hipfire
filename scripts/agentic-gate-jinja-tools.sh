@@ -296,7 +296,7 @@ for line in raw.splitlines():
         pass
 
 panic = next((ev for ev in events if ev.get("type") == "error"), None)
-fatal_singleton = "FATAL: hipfire daemon already running" in raw
+fatal_singleton = "already reserved by holder PID" in raw
 toks = [ev["text"] for ev in events if ev.get("type") == "token" and ev.get("id") == "jinja_tools_t1"]
 text = "".join(toks)
 
