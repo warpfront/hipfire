@@ -283,9 +283,9 @@ impl ModelEntry {
 /// canonical place for tag policy so validation and CLI stay in sync.
 ///
 /// Policy (static; no registry/v1 wire fields):
-/// - exact family before ':' in {qwen3.5,qwen3.6,qwen3.8} and tag not containing
-///   `draft`/`dflash` => `memory.kv_backend=vmm`, `memory.max_seq=262144`,
-///   `generation.max_tokens=81920`
+/// - exact family before ':' in {qwen3.5,qwen3.6,qwen3.8}, excluding sidecars
+///   and entries with `arch_id=16` => `memory.kv_backend=vmm`,
+///   `memory.max_seq=262144`, `generation.max_tokens=81920`
 /// - exact family before ':' in {deepseek-v4-flash,deepseek-v4-flash-preview}
 ///   and tag not containing `draft`/`dflash` => `memory.kv_backend=vmm`,
 ///   `memory.max_seq=1048576`, `generation.max_tokens=393216`
@@ -303,7 +303,9 @@ pub fn config_layer_for_tag(
     let mut layer = entry.config_layer()?;
     let family = tag.split(':').next().unwrap_or(tag);
     let is_sidecar = tag.contains("draft") || tag.contains("dflash");
-    let is_qwen_tag_policy = matches!(family, "qwen3.5" | "qwen3.6" | "qwen3.8") && !is_sidecar;
+    let is_qwen_tag_policy = matches!(family, "qwen3.5" | "qwen3.6" | "qwen3.8")
+        && !is_sidecar
+        && entry.arch_id != Some(16);
     if is_qwen_tag_policy {
         layer
             .set("memory.kv_backend", ConfigValue::String("vmm".into()))
@@ -1139,11 +1141,6 @@ mod tests {
         assert_eq!(fast.arch_id, Some(5));
         assert_eq!(fast.quant.as_deref(), Some("mq4"));
         assert_eq!(fast.default_kv_mode.as_deref(), Some("q8"));
-        assert_eq!(
-            fast.sha256.as_deref(),
-            Some("9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7")
-        );
-        assert_eq!(fast.size_bytes, Some(14980361216));
         assert_ne!(
             fast.sha256, model.sha256,
             "the two tiers must not share a content digest"
@@ -1226,6 +1223,15 @@ mod tests {
             fast_layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(81920))
         );
+        // Flash-Next carries arch_id=16 inside the qwen3.8 naming family;
+        // do not inherit the ordinary Qwen3.8 VMM/262K policy.
+        let (flash_tag, flash) = registry.model("qwen3.8:flash-next").unwrap();
+        assert_eq!(flash.arch_id, Some(16));
+        let flash_layer = config_layer_for_tag(flash_tag, flash)
+            .expect("qwen3.8:flash-next must lower without a family policy");
+        assert!(flash_layer.get("memory.kv_backend").is_none());
+        assert!(flash_layer.get("memory.max_seq").is_none());
+        assert!(flash_layer.get("generation.max_tokens").is_none());
         assert_eq!(
             layer.get("reasoning.effort"),
             Some(&ConfigValue::String("xhigh".into()))

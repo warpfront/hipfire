@@ -37,6 +37,7 @@ pub mod dspark_block_controller;
 pub mod dspark_core;
 pub mod ep;
 pub mod eval_common;
+pub mod external_rows;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_parallel;

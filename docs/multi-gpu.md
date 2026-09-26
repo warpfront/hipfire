@@ -97,6 +97,66 @@ rocm-smi --showtopoaccess
 A full `True` peer-access matrix is ideal. Missing peer access does not block
 load; copies fall back to host staging.
 
+## Logical GPU emulation (developer-only)
+
+Logical GPU emulation is a developer-only diagnostic route for exercising
+expert-parallel rank, ownership, and combine behavior on one physical device.
+It is not a multi-GPU product mode and does not change ordinary physical
+admission.
+
+`HIPFIRE_EMULATE_GPUS` is captured in the startup snapshot before GPU
+initialization and parsed as `usize`. Only a successfully parsed integer `>=2`
+enables emulation; an unset or malformed value, `0`, or `1` disables it. When
+enabled, each requested logical device ID is aliased modulo the loaded
+physical-device count:
+
+| Physical devices loaded | Requested logical IDs | Resolved physical IDs |
+|---|---|---|
+| 1 | `[0, 1, 2, 3]` | `[0, 0, 0, 0]` |
+| 2 | `[0, 1, 2, 3]` | `[0, 1, 0, 1]` |
+
+The switch is only an enable switch; it does not choose the logical EP width.
+`Gpus::init_ep(2, ...)` owns the two-rank layout and `Gpus::init_ep(4, ...)`
+owns the four-rank layout. Duplicate physical IDs remain refused in ordinary
+mode; the snapshotted emulation state is the explicit diagnostic exception for
+sealed ownership, load, and batch policy.
+
+### Single-device proof workflow
+
+Use one physical device and keep the selectors explicit:
+
+```sh
+unset HIPFIRE_DEVICES HIPFIRE_TP_USE_RCCL
+export HIP_VISIBLE_DEVICES=0
+export HIPFIRE_EMULATE_GPUS=4       # use 2 for the logical EP2 route
+export HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1
+export HIPFIRE_EP_PEER_ALLREDUCE=1
+```
+
+Use `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` for decode and
+`HIPFIRE_EP_PEER_ALLREDUCE=1` for batched prefill/tick. These selectors must be
+chosen explicitly for the corresponding route. Never set either selector to
+`0`, and never set `HIPFIRE_TP_USE_RCCL=0`: those values select/request RCCL
+behavior and are not a host all-reduce fallback.
+
+Aliased logical ranks retain separate rank state, streams, buffers, and sealed
+ownership. Same-device peer setup is fail-soft: when two logical ranks resolve
+to the same physical device, peer capability/enable calls are skipped for that
+pair and the route continues with peer access disabled rather than aborting.
+
+### Evidence boundary
+
+The logical EP route-oracle suite is designed as byte-exact checks on one
+gfx1151 device. A successful run validates sealed ownership, route broadcast,
+canonical slot-order combine, result broadcast, inactive rows, and lifecycle
+sequencing. The setup documented here is not itself evidence of a completed
+lifecycle pass.
+
+A passing logical-rank oracle does **not** prove RCCL, PCIe/xGMI or other
+interconnect behavior, physical-device synchronization, throughput, product
+gfx1201 admission, or G5 acceptance. Do not describe this evidence as physical
+EP2/EP4, interconnect, or performance validation.
+
 ## Launch and config
 
 ### PP load (daemon JSONL)

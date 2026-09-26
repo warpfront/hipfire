@@ -1328,6 +1328,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen4"
+version = "0.3.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "memmap2",
+ "rdna-compute",
+ "saddle-quant",
+ "serde_json",
+ "sha2",
+ "smallvec",
+]
+
+[[package]]
 name = "hipfire-arch-toy"
 version = "0.3.1"
 dependencies = [
@@ -1429,6 +1444,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "rdna-compute",
+ "smallvec",
 ]
 
 [[package]]
@@ -1487,6 +1503,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",
@@ -1518,6 +1535,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-runtime",
  "rdna-compute",
@@ -1546,6 +1564,7 @@ dependencies = [
  "faer",
  "half",
  "hipfire-arch-gemma4",
+ "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-reap",
  "hipfire-runtime",
@@ -1558,6 +1577,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

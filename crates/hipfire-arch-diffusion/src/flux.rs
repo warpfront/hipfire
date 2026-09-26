@@ -2768,30 +2768,6 @@ mod load_tests {
     }
 
     #[test]
-    fn stage_reports_the_offending_tensor_on_a_bad_dtype() {
-        use crate::f16_stage::F16Stage;
-        let cfg = test_cfg();
-        let dir = temp_dir("stream_baddtype");
-        std::fs::write(
-            dir.join("config.json"),
-            json!({ "model_type": "flux" }).to_string(),
-        )
-        .unwrap();
-        let tensors =
-            checkpoint_tensors(&cfg, Some(("img_in.bias", "F64", vec![cfg.hidden_size], 8)));
-        write_safetensors(&dir.join("model.safetensors"), &tensors);
-        let src = open_source(&dir);
-        let plan = FluxPlan::bfl(&cfg);
-        let key = manifest::expected_flux_keys(&cfg)
-            .into_iter()
-            .find(|k| k.name == "img_in.bias")
-            .unwrap();
-        let mut stage = F16Stage::new();
-        let err = plan.stage_f16(&*src, &key, &mut stage).unwrap_err();
-        assert!(err.contains("img_in.bias") && err.contains("F64"), "{err}");
-    }
-
-    #[test]
     fn host_load_rejects_shape_mismatch() {
         let cfg = test_cfg();
         let dir = temp_dir("badshape");
@@ -2811,7 +2787,7 @@ mod load_tests {
     }
 
     #[test]
-    fn host_load_rejects_unsupported_dtype() {
+    fn source_open_rejects_unsupported_dtype() {
         let cfg = test_cfg();
         let dir = temp_dir("baddtype");
         std::fs::write(
@@ -2822,8 +2798,10 @@ mod load_tests {
         let tensors =
             checkpoint_tensors(&cfg, Some(("img_in.bias", "F64", vec![cfg.hidden_size], 8)));
         write_safetensors(&dir.join("model.safetensors"), &tensors);
-        let src = open_source(&dir);
-        let err = load_weights(&*src, &cfg).unwrap_err();
+        let err = match hipfire_runtime::safetensors_source::SafetensorsSource::open(&dir) {
+            Ok(_) => panic!("unsupported safetensors dtype must fail source open"),
+            Err(error) => error.to_string(),
+        };
         assert!(err.contains("img_in.bias") && err.contains("F64"), "{err}");
     }
 

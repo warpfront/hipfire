@@ -28,8 +28,7 @@ const INDEXER_TOP_K_BUF_PARALLEL_KERNEL: &str = "indexer_top_k_buf_parallel_gfx9
 // Re-export of the frozen kernels.rs contract const (single include_str! site;
 // all other gfx942 sources in this file predate the kernels.rs re-export
 // convention and keep their local includes).
-const INDEXER_TOP_K_BUF_BOUNDED_SRC: &str =
-    crate::kernels::INDEXER_TOP_K_BUF_BOUNDED_GFX942_SRC;
+const INDEXER_TOP_K_BUF_BOUNDED_SRC: &str = crate::kernels::INDEXER_TOP_K_BUF_BOUNDED_GFX942_SRC;
 const INDEXER_TOP_K_BUF_BOUNDED_KERNEL: &str = "indexer_top_k_buf_parallel_gfx942_bounded";
 const MQ2_LLOYD_GATE_UP_WAVE64_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip");
@@ -421,9 +420,15 @@ impl Gfx942Device<'_> {
     ) -> HipResult<()> {
         self.gpu.bind_thread()?;
         let (src, kernel) = if bounded {
-            (INDEXER_TOP_K_BUF_BOUNDED_SRC, INDEXER_TOP_K_BUF_BOUNDED_KERNEL)
+            (
+                INDEXER_TOP_K_BUF_BOUNDED_SRC,
+                INDEXER_TOP_K_BUF_BOUNDED_KERNEL,
+            )
         } else {
-            (INDEXER_TOP_K_BUF_PARALLEL_SRC, INDEXER_TOP_K_BUF_PARALLEL_KERNEL)
+            (
+                INDEXER_TOP_K_BUF_PARALLEL_SRC,
+                INDEXER_TOP_K_BUF_PARALLEL_KERNEL,
+            )
         };
         self.gpu.ensure_kernel(kernel, src, kernel)?;
         let scores_ptr = scores.buf.as_ptr();

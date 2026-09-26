@@ -3673,7 +3673,7 @@ fn apply_moe_branch(
     )?;
 
     // 10) combined = cur_mlp + cur_moe → scratch.tmp
-    gpu.add_f32_graph_safe(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
+    gpu.add_f32(&scratch.moe_cur_mlp, &scratch.moe_cur_moe, &scratch.tmp)?;
 
     // 11) tmp = post_feedforward_layernorm(combined)
     gpu.rmsnorm_f32(&scratch.tmp, post_ffn_norm, &scratch.tmp, config.norm_eps)?;

@@ -155,6 +155,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_CALIB_BF16` | Calibration-only: keep native-BF16 teachers in BF16 (`kernel.calib_force_bf16`, default off; shipped inference unaffected) |
 | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` / `_RESID` / `_QKVZA` / `_QKV` | gfx1201 FP8-WMMA MQ4v2 prefill route — default ON on exact gfx1201 (prefill chunk 512); `=0` on any one opts out toward the F16 path (chunk 384). `=1` forces on; launchers stay exact-gfx1201-only, so other arches are unchanged |
 | `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | Two-slab S2BT8 FP8 symbols by default; `=1` selects the single-slab symbols |
+| `HIPFIRE_QWEN4_GFX11` | Qwen4 routes tuned on gfx1151 (F16 WMMA prefill, MQ6 X-LDS, MoE/BF16/GDN/HC/QSA kernels) run by default on the RDNA3.5 APUs gfx1150/1151/1152; `=1` (`developer.qwen4_gfx11`) admits every other gfx11 GPU. Unmeasured there; gfx12 and older never take them (`ArchCaps::qwen4_tuned_routes`) |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -186,9 +187,40 @@ diagnostic and developer harness exports pending their cleanup.
 | `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 or exact-gfx1201 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, HIP graph capture off, retained replay recording off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
 | `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` is the compatibility alias for `hardware.devices`; startup lowers its physical list to ROCr selectors plus matching HIP logical selectors. |
+| `HIPFIRE_EMULATE_GPUS` | **Developer-only logical GPU emulation.** A successfully parsed integer `>=2` enables; missing, malformed, `0`, and `1` disable. Requested logical IDs are aliased modulo the loaded physical count; this switch does not choose the EP rank count and is not a product admission. |
+| `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` | Explicit peer all-reduce selector for logical EP decode proofs; do not set it to `0`. |
+| `HIPFIRE_EP_PEER_ALLREDUCE=1` | Explicit peer all-reduce selector for logical EP batched prefill/tick proofs; do not set it to `0`. |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
+
+#### Logical GPU emulation (developer-only)
+
+`HIPFIRE_EMULATE_GPUS` is an environment-only diagnostic switch captured in
+the startup snapshot. It is deliberately not a user-facing CLI or persistent
+TOML/config key. The value is parsed as `usize`: only a successfully parsed
+integer `>=2` enables emulation. Missing, malformed (including negative
+values), `0`, and `1` leave emulation disabled.
+
+When enabled, each requested logical device ID is resolved modulo the loaded
+physical-device count:
+
+| Physical devices loaded | Requested logical IDs | Resolved physical IDs |
+|---|---|---|
+| 1 | `[0, 1, 2, 3]` | `[0, 0, 0, 0]` |
+| 2 | `[0, 1, 2, 3]` | `[0, 1, 0, 1]` |
+
+The switch is an enable switch, not a rank-count setting. `Gpus::init_ep(2,
+...)` owns a two-logical-rank EP layout, and `Gpus::init_ep(4, ...)` owns a
+four-logical-rank layout. Duplicate physical IDs remain rejected in ordinary
+mode; the snapshotted emulation state is the explicit diagnostic exception for
+sealed, load, and batch admission.
+
+For a one-device proof, leave `HIPFIRE_DEVICES` unset and set
+`HIP_VISIBLE_DEVICES=0`; set both peer selectors above explicitly to `1`.
+Leave `HIPFIRE_TP_USE_RCCL` unset—`=0` is not a host all-reduce fallback.
+The complete route-oracle workflow and evidence boundary are in
+[`multi-gpu.md`](multi-gpu.md#logical-gpu-emulation-developer-only).
 
 ### Redline / retained replay
 

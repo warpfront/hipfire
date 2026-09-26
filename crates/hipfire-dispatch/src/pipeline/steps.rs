@@ -82,25 +82,47 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
-    /// Complete validated MoE program. The call owns the bound expert view and
-    /// raw operands privately; callers can only obtain it through `seal_*`.
+    /// Grouped hyper-connection read.  The operation contract is model-neutral;
+    /// architecture crates bind the resident projections and fixed-capacity views.
+    HyperRead(crate::pipeline::layer_ops::HyperReadOp<'a>),
+    /// Gated DeltaNet recurrent attention with borrowed state and scratch.
+    GatedDeltaNet(crate::pipeline::layer_ops::GatedDeltaNetOp<'a>),
+    /// Indexed causal attention with borrowed cache metadata.
+    IndexedAttention(crate::pipeline::layer_ops::IndexedAttentionOp<'a>),
+    /// Grouped hyper-connection write with in-place residual injection.
+    HyperWrite(crate::pipeline::layer_ops::HyperWriteOp<'a>),
+    /// Grouped causal convolution/gating operation.
+    GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
+    /// Launch-free clear of a preallocated scratch prefix.
+    Clear(crate::pipeline::layer_ops::ClearOp<'a>),
+    /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
+    /// Validated granular MoE stage; the sealed call is still the public authority.
+    MoeStage(
+        crate::pipeline::moe_program::SealedMoeOp<'a>,
+        crate::pipeline::moe_program::MoeStage,
+    ),
 }
 
-/// Op-kind for fusion matching. Total over Step variants.
-fn op_kind(step: &Step) -> PipelineOp {
+/// Op-kind for fusion matching. Composite and opaque MoE operations are
+/// barriers, represented by `None` rather than a fake numeric opcode.
+fn op_kind(step: &Step) -> Option<PipelineOp> {
     match step {
-        Step::Gemv { .. } => PipelineOp::Gemv,
-        Step::GemvResidual { .. } => PipelineOp::GemvResidual,
-        Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
-        Step::Attend { .. } => PipelineOp::Attend,
-        Step::Rope { .. } => PipelineOp::Rope,
-        Step::QkNorm { .. } => PipelineOp::QkNorm,
-        Step::BiasAdd { .. } => PipelineOp::BiasAdd,
-        // MoE is already a complete grammar, so it must never be considered
-        // a projection fusion prefix.  `MoeCombine` is the existing pipeline
-        // marker and lowers to the dedicated `SuperOpKind::Moe`.
-        Step::Moe(_) => PipelineOp::MoeCombine,
+        Step::Gemv { .. } => Some(PipelineOp::Gemv),
+        Step::GemvResidual { .. } => Some(PipelineOp::GemvResidual),
+        Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::Attend { .. } => Some(PipelineOp::Attend),
+        Step::Rope { .. } => Some(PipelineOp::Rope),
+        Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
+        Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
+        Step::HyperRead(_)
+        | Step::GatedDeltaNet(_)
+        | Step::IndexedAttention(_)
+        | Step::HyperWrite(_)
+        | Step::GroupedDepthwise(_)
+        | Step::Clear(_)
+        | Step::Moe(_)
+        | Step::MoeStage(..) => None,
     }
 }
 
@@ -472,24 +494,24 @@ pub fn match_prefix(
         .filter(|p| {
             !p.ops.is_empty()
                 && p.ops.len() <= steps.len()
-                && p.ops.iter().zip(steps).all(|(o, s)| *o == op_kind(s))
+                && p.ops.iter().zip(steps).all(|(o, s)| op_kind(s) == Some(*o))
                 && (p.guard)(&steps[..p.ops.len()], ctx)
         })
         .max_by_key(|p| p.ops.len())
         .map(|p| (p.key, p.ops.len()))
 }
 
-/// Lower-time fusion match over the canonical `FUSED_TABLE`. The Ship-6 super-op
-/// lowering (`superop::lower_layer`) calls THIS — reusing the same table + guards
-/// verbatim — so a lowered program can never drift from what `execute_steps`
-/// would dispatch live (the fusion-drift mitigation, spike risk #1).
-pub(crate) fn match_fused_prefix(steps: &[Step], ctx: &DispatchCtx) -> Option<(KernelKey, usize)> {
-    match_prefix(FUSED_TABLE, steps, ctx)
+/// Crate-local accessor retained for the dormant super-op substrate. Opaque
+/// MoE operations remain fusion barriers and map to the complete MoE marker
+/// only when that substrate asks for a single-step kind.
+pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
+    op_kind(step).unwrap_or(PipelineOp::MoeCombine)
 }
 
-/// Public(crate) op-kind accessor for the lowering (mirror of the private `op_kind`).
-pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
-    op_kind(step)
+/// Match the canonical fused-operation table while treating sealed MoE
+/// operations as fusion barriers.
+pub(crate) fn match_fused_prefix(steps: &[Step], ctx: &DispatchCtx) -> Option<(KernelKey, usize)> {
+    match_prefix(FUSED_TABLE, steps, ctx)
 }
 
 const QKV3: &[PipelineOp] = &[
@@ -653,22 +675,46 @@ const FUSED_TABLE: &[FusedPattern] = &[
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
-
-pub fn execute_steps(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    steps: &[Step],
-) -> Result<(), DispatchError> {
-    // Validate every sealed call before issuing even the first non-MoE launch.
-    // This is intentionally a separate pass: a malformed later call must not
-    // leave an earlier step partially executed.
+/// Preflight every new composite operation and sealed MoE call in a typed
+/// program without launching or mutating state.  The legacy scalar `Step`
+/// variants deliberately retain their existing launch-time validation and are
+/// not widened by this seam.
+///
+/// Architecture binders use this before unrelated effects (embedding, cache
+/// staging, or PLE leases) begin.
+pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchError> {
     for step in steps {
         match step {
             Step::Moe(call) => call.validate_for_gpu(gpu)?,
+            Step::HyperRead(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedDeltaNet(op) => op.validate_for_gpu(gpu)?,
+            Step::IndexedAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
+            Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
+            Step::Clear(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
+    Ok(())
+}
 
+pub fn execute_steps<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+) -> Result<(), DispatchError> {
+    validate_steps(gpu, steps)?;
+    execute_validated_steps(gpu, ctx, steps)
+}
+
+/// Execute a list after [`validate_steps`] has completed.  This entry point is
+/// for architecture owners that must preflight the entire list before other
+/// request effects begin.
+pub fn execute_validated_steps<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+) -> Result<(), DispatchError> {
     let mut i = 0;
     while i < steps.len() {
         if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
@@ -729,7 +775,10 @@ fn qkv_bias_fold_supported(key: KernelKey, ctx: &DispatchCtx) -> bool {
 /// bias tensors `[bias_q, bias_k, bias_v]`. Otherwise `None` (no fold). The
 /// ptr-identity check guarantees we only fold the qwen2 `attention_bias` adds
 /// that immediately follow this exact QKV window, never an unrelated `BiasAdd`.
-fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a GpuTensor; 3]> {
+fn match_trailing_qkv_bias<'step, 'res>(
+    steps: &'step [Step<'res>],
+    len: usize,
+) -> Option<[&'res GpuTensor; 3]> {
     if len + 3 > steps.len() {
         return None;
     }
@@ -754,7 +803,7 @@ fn match_trailing_qkv_bias<'a>(steps: &'a [Step<'a>], len: usize) -> Option<[&'a
         && std::ptr::eq(*bx_k as *const GpuTensor, out_k as *const GpuTensor)
         && std::ptr::eq(*bx_v as *const GpuTensor, out_v as *const GpuTensor)
     {
-        Some([bq, bk, bv])
+        Some([*bq, *bk, *bv])
     } else {
         None
     }
@@ -1018,32 +1067,39 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
-        Step::Moe(call) => sealed_moe::execute_sealed(gpu, ctx, call),
+        Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
+        Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
+        Step::IndexedAttention(op) => {
+            crate::pipeline::layer_ops::execute_indexed_attention(gpu, op)
+        }
+        Step::HyperWrite(op) => crate::pipeline::layer_ops::execute_hyper_write(gpu, op),
+        Step::GroupedDepthwise(op) => {
+            crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
+        }
+        Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
+        Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
+        Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
     }
 }
-
-/// Borrow `out` from a `RmsnormAutomatic` step. The guard has already confirmed
-/// step[0] is RmsnormAutomatic; this panics in debug if called incorrectly.
-fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a rdna_compute::GpuTensor {
+fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
     match step {
-        Step::RmsnormAutomatic { out, .. } => out,
+        Step::RmsnormAutomatic { out, .. } => *out,
         _ => panic!("launch_fused: expected RmsnormAutomatic at step[0]"),
     }
 }
 
 /// Borrow `w` and `out` from a `Gemv` step.
-fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
+fn gemv_weight_out<'a>(step: &Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
     match step {
-        Step::Gemv { w, out, .. } => (w, out),
+        Step::Gemv { w, out, .. } => (*w, *out),
         _ => panic!("launch_fused: expected Gemv step"),
     }
 }
-
-fn launch_fused(
+fn launch_fused<'a>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     key: KernelKey,
-    steps: &[Step],
+    steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;
@@ -1356,19 +1412,9 @@ mod tests {
         // returns false even for otherwise-matching dtypes. We can't build full
         // Steps with real GPU tensors, so we test the guard logic directly with
         // the flag set.
-        use rdna_compute::feature_flags::FeatureFlags;
         use std::sync::Arc;
-        let mut flags = FeatureFlags::for_test("gfx1100");
-        flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        Arc::make_mut(&mut ctx.flags).force_unfused = true;
         // short-circuit: every guard opens with `force_unfused → false`, so even
         // an empty slice returns false. This proves the branch exists.
         let empty: &[Step] = &[];
@@ -1514,19 +1560,9 @@ mod tests {
     fn q4k_q8_0_guards_reject_force_unfused() {
         // All three new guards must return false when force_unfused is set,
         // even for empty slices (the guard opens with the early-return).
-        use rdna_compute::feature_flags::FeatureFlags;
         use std::sync::Arc;
-        let mut flags = FeatureFlags::for_test("gfx1100");
-        flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        Arc::make_mut(&mut ctx.flags).force_unfused = true;
         let empty: &[Step] = &[];
         assert!(
             !guard_qkv_q4k(empty, &ctx),

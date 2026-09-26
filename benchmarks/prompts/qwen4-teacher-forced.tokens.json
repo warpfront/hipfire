@@ -1,0 +1,7 @@
+{
+  "schema": "hipfire.qwen4.teacher_forced_corpus.v1",
+  "path": "qwen4-teacher-forced.tokens.u32le",
+  "format": "u32le",
+  "count": 17,
+  "sha256": "e53de8c7b501eaaea637648feb6f569dd17cd564c2f669b2924ccdf1b7e52e2f"
+}

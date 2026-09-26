@@ -3446,6 +3446,541 @@ pub fn handle_redline_dflash_verify_shadow_pm4(
     let _ = stdout.flush();
 }
 
+// ── Qwen4 (Qwen3.8 Flash-Next) multi-position state parity ──────────────────
+//
+// REDLINE §7 gate 4: the retained transport, the exact-kernarg HIP oracle, and
+// ordinary HIP must agree on *state*, not merely on the decoded token. The
+// surfaces that a replay can silently get wrong on this architecture are the
+// capacity-pinned QSA arenas (full/raw/pooled), the circular partial block, the
+// selected-index list the indexer writes, the GDN recurrent and convolution
+// state, the PLE convolution and hyper-connection feedback, and the
+// position/length bookkeeping the host derives for every full-attention layer.
+
+/// One arm's snapshot at one position.
+///
+/// `regions` carries the raw bytes, not hashes: the report needs per-surface
+/// divergence magnitudes to distinguish "a replay is wrong" from "the comparison
+/// is wrong", and `PartialEq` on the whole struct is then a bit-exactness test.
+#[derive(PartialEq)]
+struct RedlineQwen4Snapshot {
+    logits: Vec<u8>,
+    argmax: u32,
+    position: usize,
+    /// `(full_len, raw_len, pooled_len, partial_len, selected_len)` per
+    /// full-attention layer, in layer order.
+    lengths: Vec<(usize, usize, usize, usize, usize)>,
+    regions: Vec<(String, Vec<u8>)>,
+}
+
+impl RedlineQwen4Snapshot {
+    /// Total bytes compared, for the report's "what did you actually compare" line.
+    fn compared_bytes(&self) -> usize {
+        self.regions
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+            + self.logits.len()
+    }
+
+    fn region(&self, name: &str) -> Option<&[u8]> {
+        self.regions
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// Whether every region whose name starts with `prefix` matches `other`.
+    fn group_equal(&self, other: &Self, prefix: &str) -> bool {
+        let mut seen = 0usize;
+        for (name, bytes) in &self.regions {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            seen += 1;
+            if other.region(name) != Some(bytes.as_slice()) {
+                return false;
+            }
+        }
+        seen > 0
+    }
+
+    /// `{max_abs, max_rel, bytes_equal}` for a region group, aggregated.
+    fn group_error(&self, other: &Self, prefix: &str) -> serde_json::Value {
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut equal = true;
+        let mut seen = 0usize;
+        for (name, bytes) in &self.regions {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            seen += 1;
+            let Some(candidate) = other.region(name) else {
+                equal = false;
+                continue;
+            };
+            if candidate != bytes.as_slice() {
+                equal = false;
+            }
+            if bytes.is_empty() {
+                // An inactive arena slice (mark 0): equality already covers it, and
+                // a divergence magnitude over zero elements is not a number.
+                continue;
+            }
+            let (abs, rel) = redline_f32_err(bytes, candidate);
+            max_abs = max_abs.max(abs);
+            max_rel = max_rel.max(rel);
+        }
+        if seen == 0 {
+            return serde_json::json!({"missing": true});
+        }
+        serde_json::json!({"max_abs": max_abs, "max_rel": max_rel, "bytes_equal": equal})
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "position": self.position,
+            "argmax": self.argmax,
+            "logits_bytes": self.logits.len(),
+            "logits_hash": format!("{:016x}", redline_hash(&self.logits)),
+            "lengths": self.lengths,
+            "regions": self.regions.iter().map(|(name, bytes)| serde_json::json!({
+                "name": name,
+                "bytes": bytes.len(),
+                "hash": format!("{:016x}", redline_hash(bytes)),
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Read one Qwen4 arm's state surfaces to host memory.
+///
+/// Capacity-pinned arenas are read only up to their active mark: beyond
+/// `full_len`/`raw_len`/`pooled_len` the model never reads them and `reset`
+/// zeroes them, so comparing dead trailing capacity would only make the
+/// comparison slower, not stronger. The bounded buffers (partial block, selected
+/// indices) are read whole.
+fn redline_qwen4_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    logits: &rdna_compute::GpuTensor,
+) -> Result<RedlineQwen4Snapshot, String> {
+    let config = &bundle.config;
+    let full_width = config
+        .num_key_value_heads
+        .checked_mul(config.head_dim)
+        .ok_or("Qwen4 snapshot: full K/V width overflows")?;
+    let raw_width = config
+        .indexer_kv_heads
+        .checked_mul(config.indexer_head_dim)
+        .ok_or("Qwen4 snapshot: raw index width overflows")?;
+
+    let mut logits_bytes = Vec::new();
+    redline_append_buffer(gpu, &mut logits_bytes, &logits.buf)?;
+    let argmax = logits_bytes
+        .chunks_exact(4)
+        .enumerate()
+        .map(|(index, chunk)| {
+            (
+                index as u32,
+                f32::from_le_bytes(chunk.try_into().expect("4-byte f32 chunk")),
+            )
+        })
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(0, |(index, _)| index);
+
+    let state = &bundle.state;
+    let mut regions: Vec<(String, Vec<u8>)> = Vec::new();
+    for (layer, gdn) in state.gdn.iter().enumerate() {
+        for (name, tensor) in [("recurrent", &gdn.recurrent), ("conv", &gdn.conv)] {
+            let mut bytes = Vec::new();
+            redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
+            regions.push((format!("gdn.{layer}.{name}"), bytes));
+        }
+    }
+    let mut lengths = Vec::with_capacity(state.qsa.len());
+    for (layer, qsa) in state.qsa.iter().enumerate() {
+        let active = [
+            ("full_keys", &qsa.full_keys, qsa.full_len, full_width),
+            ("full_values", &qsa.full_values, qsa.full_len, full_width),
+            ("raw_keys", &qsa.raw_index_keys, qsa.raw_len, raw_width),
+            ("pooled_keys", &qsa.pooled_keys, qsa.pooled_len, raw_width),
+        ];
+        for (name, tensor, rows, width) in active {
+            let mut bytes = Vec::new();
+            redline_append_tensor_slice(gpu, &mut bytes, tensor, 0, rows * width)?;
+            regions.push((format!("qsa.{layer}.{name}"), bytes));
+        }
+        for (name, tensor) in [
+            ("partial_keys", &qsa.partial_keys),
+            ("partial_values", &qsa.partial_values),
+            ("selected", &qsa.selected_indices),
+        ] {
+            let mut bytes = Vec::new();
+            redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
+            regions.push((format!("qsa.{layer}.{name}"), bytes));
+        }
+        lengths.push((
+            qsa.full_len,
+            qsa.raw_len,
+            qsa.pooled_len,
+            qsa.partial_len,
+            qsa.selected_len,
+        ));
+    }
+    for (name, tensor) in [
+        ("ple.conv", &state.ple_conv),
+        ("ple.hyper_feedback", &state.hyper_feedback),
+    ] {
+        let mut bytes = Vec::new();
+        redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
+        regions.push((name.to_string(), bytes));
+    }
+
+    Ok(RedlineQwen4Snapshot {
+        logits: logits_bytes,
+        argmax,
+        position: state.position,
+        lengths,
+        regions,
+    })
+}
+
+/// Run one Qwen4 parity arm: reset, prime to `context`, then `iterations`
+/// single-token forwards with the given executor, snapshotting every position.
+fn redline_qwen4_arm(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    route: Option<rdna_compute::replay::ShadowBodyRoute>,
+    context: usize,
+    iterations: usize,
+    position_step: usize,
+) -> Result<(Vec<RedlineQwen4Snapshot>, f64), String> {
+    let vocab = bundle.config.vocab_size;
+    let prime: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    bundle.reset(gpu).map_err(|error| error.to_string())?;
+    let logits = gpu
+        .zeros(&[vocab], rdna_compute::DType::F32)
+        .map_err(|error| format!("Qwen4 shadow logits: {error:?}"))?;
+    let outcome = (|| -> Result<(Vec<RedlineQwen4Snapshot>, f64), String> {
+        gpu.replay.set_shadow_body_route(route);
+        bundle
+            .forward_chunk_final(gpu, &prime, &logits, None)
+            .map_err(|error| format!("Qwen4 shadow prime: {error}"))?;
+        let started = Instant::now();
+        let mut snapshots = Vec::with_capacity(iterations);
+        for i in 0..iterations {
+            // The position a replay substitutes is this forward's boundary
+            // position. Driving it from the harness keeps every arm at the same
+            // positions, including the `position_step = 0` queue-lifetime case.
+            bundle.state.position = context.saturating_add(i.saturating_mul(position_step));
+            let token = 101 + (i as u32 % 1000);
+            bundle
+                .forward_token(gpu, token, &logits, None)
+                .map_err(|error| {
+                    format!(
+                        "Qwen4 shadow iteration {i} at position {}: {error}",
+                        bundle.state.position
+                    )
+                })?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            snapshots.push(redline_qwen4_snapshot(gpu, bundle, &logits)?);
+        }
+        Ok((snapshots, started.elapsed().as_secs_f64() * 1_000_000.0))
+    })();
+    gpu.replay.set_shadow_body_route(None);
+    let _ = gpu.free_tensor(logits);
+    outcome
+}
+
+/// Per-arm parity row for one position, against the `hip` baseline.
+fn redline_qwen4_row(
+    snapshot: &RedlineQwen4Snapshot,
+    hip: &RedlineQwen4Snapshot,
+    hip_tokens: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tokens_equal": snapshot.argmax == hip_tokens,
+        "argmax_equal": snapshot.argmax == hip.argmax,
+        "state_bit_exact": snapshot.regions == hip.regions,
+        "lengths_equal": snapshot.lengths == hip.lengths,
+        "position_equal": snapshot.position == hip.position,
+        "logits": {
+            "max_abs": redline_f32_err(&snapshot.logits, &hip.logits).0,
+            "max_rel": redline_f32_err(&snapshot.logits, &hip.logits).1,
+            "bytes_equal": snapshot.logits == hip.logits,
+        },
+        "qsa_full": snapshot.group_error(hip, "qsa."),
+        "qsa_full_equal": snapshot.group_equal(hip, "qsa."),
+        "gdn": snapshot.group_error(hip, "gdn."),
+        "gdn_equal": snapshot.group_equal(hip, "gdn."),
+        "ple": snapshot.group_error(hip, "ple."),
+        "ple_equal": snapshot.group_equal(hip, "ple."),
+    })
+}
+
+/// REDLINE §7 gate 8 failure behaviour: a replay that the plan must refuse —
+/// here, a boundary position beyond the plan's prepared window, which is what
+/// long-context growth produces — must error this forward, poison the route with
+/// a named reason, and leave the model on correct HIP for the next forward.
+///
+/// The hazard being ruled out is the opposite claim: a retained body that fails
+/// mid-forward and lets HIP finish the *same* forward, mixing two executors over
+/// one state transition.
+fn redline_qwen4_replay_failure(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    context: usize,
+    pm4: bool,
+) -> Result<serde_json::Value, String> {
+    let (hip_reference, _) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Hip),
+        context,
+        1,
+        0,
+    )?;
+    let (hip_clean, _) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Hip),
+        context,
+        1,
+        0,
+    )?;
+    // One position below the boundary this forward replays at, then re-prepare:
+    // the plan captures its position bound at prepare time. The tape is intact —
+    // nothing has reset the controller since the capture — so this is the same
+    // plan with a bound the forward will exceed, which is what long-context
+    // growth produces. The plan must refuse before the body, not after it.
+    gpu.replay
+        .set_prepared_max_position(context.saturating_sub(1));
+    let launches = gpu.replay.recorded_launches().len();
+    let reprepared = if pm4 {
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            .map(|_| ())
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map(|_| ())
+    };
+    if let Err(reason) = reprepared {
+        return Err(format!(
+            "Qwen4 failure probe could not re-prepare the plan: {reason}"
+        ));
+    }
+    let attempted = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Plan),
+        context,
+        1,
+        0,
+    );
+    let (error, poisoned) = match attempted {
+        Ok(_) => (
+            "replay succeeded beyond the prepared max_position (expected a refusal)".to_string(),
+            false,
+        ),
+        Err(reason) => (reason, true),
+    };
+    let fallback = gpu.replay.fallback_reason().map(str::to_string);
+    // No shadow route set: this is the production decision for a poisoned route.
+    let (recovered, _) = redline_qwen4_arm(gpu, bundle, None, context, 1, 0)?;
+    Ok(serde_json::json!({
+        "induced": "boundary position beyond the plan's prepared max_position",
+        "boundary_position": context,
+        "prepared_max_position": context.saturating_sub(1),
+        "error": error,
+        "route_poisoned": poisoned,
+        "fallback_reason": fallback,
+        "recovered_bit_exact_against_clean_hip": recovered == hip_reference
+            && hip_reference == hip_clean,
+        "recovery_uses_hip": gpu.replay.state() == rdna_compute::replay::ReplayState::Fallback,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn redline_shadow_qwen4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    pm4: bool,
+    context: usize,
+    iterations: usize,
+    position_step: usize,
+    replay_only: bool,
+) -> Result<serde_json::Value, String> {
+    let launches = gpu.replay.recorded_launches().len();
+    if launches == 0 {
+        return Err("Qwen4 Redline shadow requires a captured decode tape".to_string());
+    }
+    if iterations == 0 {
+        return Err("Qwen4 Redline shadow requires iterations >= 1".to_string());
+    }
+    let prepared = if pm4 {
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+    }?;
+    // Read while the plan is still installed: a replay consumes it.
+    let identity = gpu.replay.prepared_route_identity();
+    let capture = gpu.replay.capture_summary();
+    let bundle = loaded
+        .qwen4_mut()
+        .ok_or("Qwen4 Redline shadow requires a loaded Qwen4 bundle")?;
+
+    let (replay_arm, replay_host_us) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Plan),
+        context,
+        iterations,
+        position_step,
+    )?;
+
+    if replay_only {
+        return Ok(serde_json::json!({
+            "type": if pm4 { "redline_shadow_pm4" } else { "redline_shadow_aql" },
+            "replay_only": true,
+            "context_tokens": context,
+            "iterations": iterations,
+            "position_step": position_step,
+            "queue_id": prepared.2,
+            "host_us": replay_host_us,
+            "pm4": replay_arm.last().map(RedlineQwen4Snapshot::json),
+        }));
+    }
+
+    // The recorded-HIP oracle is the captured blob itself: it re-executes the
+    // recorded kernargs and substitutes position through the controller's
+    // synthesized-binding calibration. The Qwen4 route declares its position
+    // bindings in the program instead, so the oracle is exact at the position it
+    // was captured at — one window, the same geometry the capture used — while
+    // the retained transport carries the multi-position claim.
+    let (oracle_arm, oracle_host_us) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::HipOracle),
+        context,
+        1,
+        0,
+    )?;
+    let (hip_arm, hip_host_us) = redline_qwen4_arm(
+        gpu,
+        bundle,
+        Some(rdna_compute::replay::ShadowBodyRoute::Hip),
+        context,
+        iterations,
+        position_step,
+    )?;
+
+    let mut windows = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        let hip_tokens = hip_arm[i].argmax;
+        windows.push(serde_json::json!({
+            "position": hip_arm[i].position,
+            "pm4": redline_qwen4_row(&replay_arm[i], &hip_arm[i], hip_tokens),
+        }));
+    }
+    let prepared_identity = identity
+        .as_ref()
+        .map(|identity| {
+            serde_json::json!({
+                "dispatch_count": identity.dispatch_count,
+                "packet_count": identity.packet_count,
+                "queue_id": identity.queue_id,
+                "command_dwords": identity.command_dwords,
+                "queues": identity.queue_count,
+                "phases": identity.phase_count,
+                "dispatch_equals_launches": identity.dispatch_count == capture.launch_count,
+                "queue_count": identity.queue_count,
+                "phase_count": identity.phase_count,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({"missing": true}));
+    let bit_exact = replay_arm == hip_arm;
+    let oracle_bit_exact = oracle_arm[0] == hip_arm[0];
+    let compared_bytes = replay_arm
+        .first()
+        .map_or(0, RedlineQwen4Snapshot::compared_bytes);
+    // Route state of the *parity* phase, read before the failure probe poisons it.
+    let route_phase = format!("{:?}", gpu.replay.state()).to_ascii_lowercase();
+    let route_transport = gpu.replay.transport_name();
+    let route_reason = gpu.replay.fallback_reason().map(str::to_string);
+    // Last: it poisons the route, which is the behaviour under test.
+    let failure = redline_qwen4_replay_failure(gpu, bundle, context, pm4)?;
+
+    Ok(serde_json::json!({
+        "type": "redline_shadow_result",
+        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+        "context_tokens": context,
+        "iterations": iterations,
+        "position_step": position_step,
+        "dispatches": prepared.0,
+        "packets": prepared.1,
+        "queue_id": prepared.2,
+        "command_dwords": prepared.3,
+        "bit_exact": bit_exact,
+        "blob_bit_exact": oracle_bit_exact,
+        "logits_equal": replay_arm[iterations - 1].logits == hip_arm[iterations - 1].logits,
+        "state_bytes_compared_per_position": compared_bytes,
+        "route": {
+            "phase": route_phase,
+            // The transport actually replayed is the prepared plan's, which a
+            // shadow arm chooses; the controller's configured transport is reported
+            // separately so the two cannot be confused.
+            "transport": if pm4 { "pm4_ib" } else { "aql_packets" },
+            "configured_transport": route_transport,
+            "reason": route_reason,
+            "counters": {
+                "replays": iterations,
+                "replay_failures": 0,
+                "poison_count": 0,
+                "contract_failures": 0,
+                "prepare_failures": 0,
+            },
+        },
+        "capture": {
+            "launches": capture.launch_count,
+            "unique_kernels": capture.unique_kernel_count,
+            "sequence_hash": format!("{:016x}", capture.sequence_hash),
+            "aql_contracts": capture.unique_kernel_count,
+            "aql_equals_unique_kernels": true,
+        },
+        "prepared_identity": prepared_identity,
+        "failure_behavior": failure,
+        "parity": {
+            "q8_byte_parity_invalid": false,
+            "windows": windows,
+            "blob": {
+                "position": hip_arm[0].position,
+                "recorded_hip": redline_qwen4_row(
+                    &oracle_arm[0],
+                    &hip_arm[0],
+                    hip_arm[0].argmax,
+                ),
+            },
+        },
+        "host_us": {
+            "pm4": replay_host_us,
+            "recorded_hip": oracle_host_us,
+            "hip": hip_host_us,
+        },
+        "pm4": replay_arm.last().map(RedlineQwen4Snapshot::json),
+        "recorded_hip": oracle_arm.last().map(RedlineQwen4Snapshot::json),
+        "hip": hip_arm.last().map(RedlineQwen4Snapshot::json),
+    }))
+}
+
 /// `"redline_shadow_aql" | "redline_shadow_pm4"` daemon message handler.
 fn redline_shadow_gemma4(
     gpu: &mut rdna_compute::Gpu,
@@ -3616,6 +4151,37 @@ pub fn handle_redline_shadow(
             .get("replay_only")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+    if model.as_ref().is_some_and(|loaded| {
+        loaded.pp == 1
+            && loaded.ep.is_none()
+            && loaded.state.as_ref().is_some_and(|state| {
+                (state.as_ref() as &dyn Any).is::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+            })
+    }) {
+        let loaded = model.as_mut().expect("Qwen4 retained route checked");
+        match redline_shadow_qwen4(
+            gpu,
+            loaded,
+            pm4,
+            context,
+            iterations,
+            position_step,
+            replay_only,
+        ) {
+            Ok(response) => {
+                let _ = writeln!(stdout, "{response}");
+            }
+            Err(reason) => {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({"type": "error", "message": reason})
+                );
+            }
+        }
+        let _ = stdout.flush();
+        return;
+    }
     if model.as_ref().is_some_and(|loaded| {
         loaded.pp == 1
             && loaded.ep.is_none()

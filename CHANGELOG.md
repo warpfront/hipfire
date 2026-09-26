@@ -1,6 +1,134 @@
 # Changelog
 
 ## Unreleased
+
+- Qwen4 prefill on gfx1151: 185 → 1301 tok/s on a 1131-token prompt
+  (TTFT 6.10 → 0.87 s; decode unchanged at ~20 tok/s) for
+  `qwen3.8-flash-next.mq6q8-pleq8`. Routed MoE gate/up (the WMMA kernel from
+  PR #775, @nwoolmer) and down, the BF16 dense projections (through a
+  model-lifetime F16 weight shadow), the HC
+  read, full-window QSA attention and the chunked GDN recurrence run on F16
+  WMMA from 512 tokens; KLD against the BF16 source is 0.073471 against
+  0.074745 bit-exact, not separated. `HIPFIRE_QWEN4_F16_WMMA=0` keeps the
+  bit-exact arms. Every other change is bit-exact. Method, per-run ledger and
+  reusable levers:
+  [the checkpoint](docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md).
+
+- The Qwen4 routes tuned on gfx1151 now dispatch by capability: on by default
+  on the RDNA3.5 APUs (gfx1150/1151/1152), and on every other gfx11 GPU with
+  `HIPFIRE_QWEN4_GFX11=1` (`developer.qwen4_gfx11`). All their kernel sources
+  compile to the same kernels for gfx1100-gfx1152; they are unmeasured off
+  gfx1151. gfx12 and older keep the portable kernels.
+
+- Review follow-up: Qwen4's grouped QT44/QT53 route now carries an
+  architecture-declared geometry/format contract and remains limited to its
+  proven gfx1151 kernel shape. Shared tensor ops use portable HIP fallbacks
+  off the Qwen4-tuned GPUs; pipeline steps are immutable, with QSA bookkeeping owned by
+  the caller and granular MoE stages sharing one step variant. Qwen4 admission
+  is carrier-owned, its HIP source lives under `kernels/src/`, and reference
+  MTP/parity code requires the `reference-parity` feature outside tests.
+
+- Qwen4 Flash-Next MTP now preserves the trained head's final HC mixer and
+  QSA cadence, and keeps routed MoE output separate from shared-expert scratch.
+  On gfx1151 a shared-weight F32 MQ6 verifier matches scalar target rows
+  exactly; recent acceptance selects it for high-agreement windows.
+  Teacher-forced MTP steps omit unused logits, and target prefill computes only
+  its final logit row. The canonical greedy fixtures emit AR-identical tokens;
+  three fresh-process runs per mode reached decode parity on code and prose,
+  not the 80% speculative speedup seen elsewhere.
+
+- Qwen4 decode now runs on the retained PM4 route end to end on gfx1151. The
+  specialized sealed-MoE route is admitted on evidence rather than argument: the
+  capture census reconciles against an independent launch count (2845 recorded plus
+  3 named external input-boundary launches), is stable across positions, and the
+  window contains no device copy, memset or readback — the per-layer `Clear` and the
+  QSA/depthwise device copies are now recorded launches (`zero_f32`,
+  `copy_f32_buffer`). At launch the retained body also proves the expert pointer
+  tables name the live expert tensors and that each table's pointer mapping is the
+  one the tape latched. The eligible-forward boundary moved into the Qwen4 forward
+  so the tape covers only the body, and replay and HIP derive the same per-layer
+  QSA bookkeeping before executing it. Measured: a 116-token
+  greedy prompt decoded through 115 retained PM4 replays produces the byte-identical
+  stream. REDLINE §7 certification (shadow parity, route-proof ledger, serve,
+  long-context, reset) is not claimed by this change; see
+  [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Retained capture now has a diagnostic census for the Qwen4 declarative program
+  (`HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1`, measurement only: it never
+  installs a plan and never routes). It reconciles the retained tape against an
+  independent `hip_bridge` launch count, audits non-launch effects inside the
+  capture window, and names any kernel that escaped the recorder. First use found
+  one such launch (`Gpu::add_f32` was raw while a funnel-based twin existed for the
+  same kernel — now a single funnel path with the twin deleted and its callers
+  migrated), proved the decode body's launch set position-stable across prompt
+  lengths, and quantified the remaining admission blocker: per decode forward the
+  window still contains 48 layer memsets, 13 device-to-device state copies and 2
+  host uploads, none of which a launch tape replays. Admission therefore stays
+  refused. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Retained replay no longer refuses the *whole model* when a family's MoE route has no
+  admitted pointer contract: the specialized sealed-MoE guard is now scoped to the
+  retained body (`is_recording()` or a routed plan), so prefill, ineligible forwards,
+  and an already-poisoned route keep running on HIP. Qwen4 gained the corresponding
+  engine-level retained-body discipline in `hipfire-generate` (prefill ineligible;
+  single-token decode poisons and logs when the route cannot be retained; a body
+  failure inside a capture window poisons instead of failing every later forward; a
+  routed-but-unprepared state fails closed). With the Redline default armed, the
+  `.mq4r` Qwen4 artifact now loads, prefills, and generates on HIP with the refusal
+  reason logged, byte-identical to the explicit HIP baseline; capture stays
+  fail-closed, and `hipfire-arch-qwen4` still carries no replay code. See
+  [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Qwen4 QSA launches now declare position-independent shapes and position-derived
+  fields, so a retained tape cannot bake a capture position into them. The pool
+  grid, the select LDS/symbol, and the attention LDS/symbol come from declared
+  capacities while the active lengths stay scalars; `position_start` and the
+  pooling count are declared at the launch that computes them (the pooling-count
+  declaration is verified against the launched value); and the index-key write
+  passes its row offset as a scalar (`ReplayKernargBinding::PositionMulU32`)
+  instead of a position-shifted device pointer, which required
+  `copy_rows_strided_f32` to bound a row-absolute column offset by the destination
+  extent rather than by one row pitch. Measured on gfx1151: pinned shapes are
+  bit-identical to the position-derived ones (including the batched select symbol
+  at an active count of zero), a 116-token greedy stream is byte-identical across
+  5 interleaved fresh-process pairs with equal tok/s medians, and no route is
+  admitted. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Retained-replay funnel coverage for the Qwen4 declarative program: the shared
+  tensor-op owner (`rdna-compute::tensor_ops`) launched every Qwen4 GDN/QSA/HC
+  op through the raw `launch_kernel_blob` entry, so those launches never reached
+  `ReplayController` and a capture would have been a silently truncated tape.
+  A new `Gpu::launch_blob_recorded` entry joins the same recorder, exact-bytes
+  capture, and HipGraph capture-blob accounting as the params-shaped funnel, and
+  all 31 raw sites migrated to it. Dynamic kernarg fields can now be *declared*
+  at the lowering that computes them (`ReplayKernargBinding::PositionDivU32` /
+  `PositionModU32`, carried on the recorded launch and merged at prepare with
+  one owner per slot); the GDN convolution ring cursor declares the first such
+  binding instead of being discovered by recording differencing. No route is
+  admitted, no PM4 preparation is claimed, and the sealed-MoE pointer-contract
+  refusal for specialized routes still fails closed. See [the plan record](docs/design/qwen4-program-retained-pm4.md).
+- Rename Qwen4 CPU/reference modules to `reference_forward` and `reference_mtp`; production `gpu_forward`/`mtp_gpu` paths remain unchanged, the old public module paths are removed, and the reference modules are test/feature-gated.
+- Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Compact EP gathers expert outputs in global top-k slot layout and runs the ordinary single-device slot-order combine once on root before byte-broadcasting the finished partial, avoiding rank-grouped floating-point reassociation. Existing kernels, ownership, other-family reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
+- Add experimental `qwen3.8:flash-next` registry availability for the uploaded 178 GB HFQ artifact with a conservative 128 GB tested-hardware gate; the runtime minimum is unmeasured, and this does not change product or replay admission.
+- Qwen4's production layer path now binds architecture-owned typed
+  descriptors to neutral shared HyperRead/Write, GDN, QSA, grouped-depthwise,
+  Clear, and sealed-MoE contracts. Composite steps are preflighted before
+  token/embedding/PLE effects, exact row views preserve reusable arena
+  capacity semantics, and QSA scalar metadata publishes only after success.
+  Gfx1151 two-token and full natural `[128,128,35]` scalar/natural smokes are
+  bit-exact; the full oracle also matches the immutable original, frozen HC,
+  and frozen N8 references. Corrected AR and native MTP serve smokes both
+  return `Paris` with `finish=stop`, `saw_done=true`, nonempty output, no
+  runaway, and no stream error; MTP reports `tau=1.0`, one cycle, and
+  `mtp=true`. This is an ownership/correctness seam only: no replay/PM4,
+  throughput, or quality promotion claim. See [the current ownership
+  record](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md).
+- Qwen4's centralized bounded token-batched prefill now carries conservative HC row/grid-Y batching with scalar rows=1 unchanged and exact natural 128/128/35 oracle parity. Explicit marker evidence records frozen-N8 natural HC calls 112,326 versus candidate 1,158; fresh product ABBAAB remains below the requested 500 prefill / 25 decode tok/s thresholds (both open/blocked), with no product throughput or decode-win claim. A deterministic Paris fixture independently passes ordinary AR and native MTP correctness. See [the implementation record](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md) and [the historical measurement](docs/perf-checkpoints/2026-09-19-qwen4-hc-rows-gridy-final-measurement.md).
+- The Qwen4 `gfx1151` prefill tuning lineage is documented across six staged
+  levers: QSA selection-only, QSA selection-plus-attention, the selection
+  sentinel, GDN shared exact-128 BF16 QK norm, the N8 measured-prefill
+  multirow allowlist, and HC rows/grid-Y batching. These remain fixture-bound
+  engineering records rather than six product promotions; see the
+  [six-lever lineage](docs/design/qwen4-shared-token-batched-prefill-progress-20260918.md)
+  and [final HC measurement](docs/perf-checkpoints/2026-09-19-qwen4-hc-rows-gridy-final-measurement.md).
+- Add developer-only `HIPFIRE_EMULATE_GPUS` logical-rank aliasing and a single-gfx1151 Qwen EP4 batch diagnostic exception. Physical-device admission remains unchanged; logical-rank results do not prove physical EP transport, performance, or G5 acceptance.
+- Fix batched MoE lifecycle isolation: shared MQ4V2/MQ6V2 down projections overwrite reused scratch rather than accumulate stale values, and grouped EP outputs are unscattered to canonical token/top-k slots before gathering across ranks.
 - gfx11 W4A4 iu4-direct MMQ prefill (opt-in `HIPFIRE_GFX11_MQ4V2_IU4=1`, exact gfx1100/gfx1151, `kernel.gfx11_mq4v2_iu4`; `=0`/unset keeps the X128 path byte-for-byte). Weight nibbles feed `wmma_i32_16x16x16_iu4` directly (halved A-side LDS, 31744 B) with int4 activations from the `quantize_int4_mmq_ds128` prelude (per-128 MSE-clip grid, f32 single-rounding FMA). Measured on Qwen3.8-27B XT (`qwen3.8-27b.mq4-xt`): XTX pp512 1203.6->1588.8 tok/s (+32%), pp2048 1185.4->1557.0 (+31%), pp8192 1093.9->1405.1 (+28%); Halo pp512 449.9->581.3 (+29%), pp2048 442.0->568.8 (+29%), pp8192 412.5->519.2 (+26%); decode tok/s unchanged (XTX 48.82->48.92, Halo 14.22->14.18). In-model pp512 profile: `full_set_occ3` 272x 581 us/call, `full_add_occ3` 128x 650 us/call (XTX; Halo 1721/1683 us), prelude `quantize_int4_mmq_ds128` 256x 75 us/call (was 370 us f64; Halo 153 us). Gates: int4 pre-pass bit-oracle 4/4 arms on both GPUs, GEMM parity relL2~5e-8, 0 spills on both archs, greedy HumanEval `below_zero` byte-identical off/on (md5 b84c1c19), WT2 KLD 0.057307->0.076078 (+0.0188, ship rule on<=off+0.02), serve battery 5/5 turns finish=stop with 0 runaway/empty/attractor.
 - GQA-fused FA2 prefill attention is now the default (opt-out): `HIPFIRE_GFX12_FA2_PREFILL` default ON on exact gfx1201 (`kernel.gfx12_fa2_prefill`; `=0` restores the incumbent) and `HIPFIRE_GFX11_FA2_PREFILL` default ON on gfx1100/gfx1151 (`kernel.gfx11_fa2_prefill`; `=0` restores the incumbent). Both cover the Qwen NH24/NKV4/HD256 prefill envelope (Q8-K and fwht3-K arms, batch 64..512 step 16, ctx 64..32768, eager only); launchers keep their exact arch/shape/eager predicates.
 

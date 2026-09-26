@@ -42,6 +42,7 @@
  6 hipfire-arch-qwen2
  6 hipfire-arch-lfm2-vl
  6 hipfire-arch-qwen35-vl
+ 6 hipfire-arch-qwen4
  6 hipfire-arch-toy
  6 hipfire-dispatch-tests
  6 hipfire-ds4-parent

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-qwen4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen4/ Qwen3.8-Flash-Next text configuration, PLE hashing, admission, and manifest foundations"
+
+[dependencies]
+serde_json.workspace = true
+hip-bridge = { path = "../hip-bridge" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
+smallvec = { version = "1.15.2", features = ["const_generics"] }
+sha2.workspace = true
+
+[dev-dependencies]
+memmap2.workspace = true
+saddle-quant = { path = "../saddle-quant" }
+
+[features]
+reference-parity = []
+lab = []
+
+[[example]]
+name = "qwen4_parity"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_kld"
+required-features = ["lab"]

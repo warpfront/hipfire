@@ -762,10 +762,23 @@ impl MmqScreenable for LlamaWeights {
     }
 }
 
+#[inline]
+fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
+    if dtype == DType::MQ4G128V2 {
+        Err(hip_bridge::HipError::new(
+            0,
+            "generic llama GPU decode does not consume MQ4G128V2 (qt=53); qt=53 is admitted only by typed Qwen4 sealed/dense consumers",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    reject_mq4g128v2(w.gpu_dtype)?;
     // Calibration tap: PRE-rotation input x (n=1, k=w.k). No-op when unarmed.
     gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
@@ -981,6 +994,7 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
     eps: f32,
     batch_size: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(next_linear.gpu_dtype)?;
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.fused_rmsnorm_rotate_mq_awq_batched(x, norm_weight, awq, x_rot, k, eps, batch_size)
     } else {
@@ -997,6 +1011,7 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
     x_rot_scratch: &'a GpuTensor,
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
+    reject_mq4g128v2(sample_weight.gpu_dtype)?;
     match sample_weight.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
@@ -1058,6 +1073,7 @@ pub fn rotate_x_for_mq<'a>(
     x: &GpuTensor,
     x_rot_scratch: &'a GpuTensor,
 ) -> HipResult<Option<&'a GpuTensor>> {
+    reject_mq4g128v2(sample_weight.gpu_dtype)?;
     match sample_weight.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
@@ -1108,6 +1124,7 @@ pub fn rotate_x_mq_for(
     x_rot: &GpuTensor,
     k: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(next_linear.gpu_dtype)?;
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.rotate_x_mq_awq(x, awq, x_rot, k)
     } else {
@@ -1126,6 +1143,7 @@ pub fn rotate_x_mq_128_for(
     x_rot: &GpuTensor,
     k: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(_next_linear.gpu_dtype)?;
     // NOTE: no AWQ branch for G128. If AWQ support for MQ4G128 is added
     // in a follow-up, mirror the AWQ branch from `rotate_x_mq_for` here.
     gpu.rotate_x_mq_128(x, x_rot, k)
@@ -1166,6 +1184,7 @@ pub fn rotate_x_mq_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(next_linear.gpu_dtype)?;
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.rotate_x_mq_awq_batched(x, awq, x_rot, k, batch_size)
     } else {
@@ -1193,6 +1212,7 @@ pub fn fused_rmsnorm_rotate_mq_f16_batched_for(
     eps: f32,
     batch_size: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(next_linear.gpu_dtype)?;
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.fused_rmsnorm_rotate_mq_awq_f16_batched(
             x,
@@ -1224,6 +1244,7 @@ pub fn fused_silu_mul_rotate_mq_for(
     x_rot: &GpuTensor,
     k: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(down_proj_weight.gpu_dtype)?;
     if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
         gpu.fused_silu_mul_rotate_mq_awq(gate, up, awq, x_rot, k)
     } else {
@@ -1242,6 +1263,7 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(down_proj_weight.gpu_dtype)?;
     if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
         gpu.fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, x_rot, k, batch_size)
     } else {
@@ -1264,6 +1286,7 @@ pub fn fused_silu_mul_rotate_mq_f16_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(down_proj_weight.gpu_dtype)?;
     if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
         gpu.fused_silu_mul_rotate_mq_awq_f16_batched(gate, up, awq, x_rot_f16, k, batch_size)
     } else {
@@ -1287,6 +1310,7 @@ pub fn weight_gemv_prerotated(
     x_rot: Option<&GpuTensor>,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    reject_mq4g128v2(w.gpu_dtype)?;
     // Calibration tap: PRE-rotation input x (n=1, k=w.k). Must fire before any rotation.
     gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::context::DispatchCtx;
@@ -1395,6 +1419,7 @@ pub fn weight_gemv_residual(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    reject_mq4g128v2(w.gpu_dtype)?;
     // Calibration tap: o_proj/out_proj input (residual path). PRE-rotation x.
     gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
@@ -1488,6 +1513,7 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
+    reject_mq4g128v2(w_down.gpu_dtype)?;
     // Calibration tap: down_proj input is ffn_hidden_scratch (post-SiLU), K = w_down.k.
     // For MQ4 this will be rotated inside; we capture PRE-rotation.
     gpu.maybe_capture_activation(&w_down.buf, ffn_hidden_scratch, 1, w_down.k);
@@ -1556,6 +1582,7 @@ pub fn weight_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    reject_mq4g128v2(w.gpu_dtype)?;
     // Calibration tap, batched twin of the four in `weight_gemv*`. Those pass
     // n=1 because they are the decode path; here the real row count goes in, so
     // one prefill call contributes `batch_size` rows to H and Σx² at once.

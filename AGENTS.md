@@ -601,6 +601,63 @@ The only permitted prompt fixtures for this A3B MoE DFlash thread are:
 Runs using any other prompt are exploratory only and must not be compared
 against the A3B MoE DFlash perfmaxx line.
 
+### Pinned Flash-Next bench fixture
+
+The canonical Flash-Next trunk is whichever local artifact byte-matches
+`qwen3.8-flash-next.mq6q8-pleq8` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next`):
+
+- HF repo: `hipfire-models/qwen3.8-flash-next`
+- HF / local file: `qwen3.8-flash-next.mq6q8-pleq8`
+- File size: `125467331096`
+- SHA-256: `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
+- MD5: `d6173f38055aefa7b0065b2a44ee9cda`
+- Recipe: MQ6G256V2 trunk (240 tensors), MQ4G256V2/MQ4G128V2 experts,
+  Q8F16 head/embed/MTP-attention and PLE n-gram rows (128 shards,
+  external-resident, 54,400,261,120 B).
+
+Before reporting Flash-Next results, verify the candidate trunk with
+`sha256sum` and require the digest above.
+
+Caveats that are part of the fixture, not trivia:
+
+- Loading it needs a build whose qwen4 trunk source contract admits **both**
+  packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
+  Older builds refuse at load; that refusal is correct, not a corrupt file.
+- **MTP is enabled by default on this recipe as of `6b9db7774`.** Verification
+  defaults to incremental on every GPU. `HIPFIRE_MTP_INCREMENTAL=0` opts into
+  batched verification; `1` explicitly selects incremental verification.
+  The batched MQ6 trunk uses shared-weight F32 GEMV:
+  the prior F16 WMMA route changed target logits and recurrent state.
+  Teacher-forced prompt and replay steps advance MTP state without computing
+  an unused language-head prediction; prompt target chunks emit only their
+  final logit row while retaining every wide hidden row.
+- **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
+  KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
+  byte-identical committed prompts, median code decode was AR 19.4 versus
+  MTP 20.1 tok/s (end-to-end 17.1 versus 17.2); prose decode was AR 17.9
+  versus MTP 18.0 (end-to-end 15.6 versus 17.1, with large run-to-run
+  spread). Daemon md5 `d09ff1d3220b818c4f4d06a3c60cc85b`; prompt md5s:
+  code `df5dedc8040ce70ba55080c4548e6024`, prose
+  `07a7880965142971dbb3cc7493f8fb94`. All three MTP runs emitted AR's
+  exact 227 code and 256 prose token IDs. Local raw reports:
+  `.codeinsight+research/qwen4/mtp-parity/runs/moe-buffer-fix/perf-v2/`.
+- After fixing routed/shared MoE scratch aliasing, restoring the learned final
+  HC mixer, and reselecting QSA at source-correct boundaries, conditional
+  draft agreement was 0.708/0.532/0.476 for prose and
+  0.922/0.932/0.889 for code at steps 1/2/3. The remaining throughput gap
+  to a claimed 80% gain is verifier/replay cost, not evidence that the
+  trained drafter is defective. Do not extrapolate these fixture-bound
+  measurements to other architectures or prompts.
+- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
+  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
+  `memory.max_seq` forced to 2048), so it fails closed at load and never
+  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
+  bench-side `max_seq` knob — not an MTP change.
+- Decode numbers are not comparable across instruments: the raw decode probe
+  measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
+  Same model, different measurement; never average or compare them across.
+
 ---
 
 ## 6 · Common pitfalls (history of what bit us)
@@ -674,7 +731,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-09-13 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
+*Last updated: 2026-09-23 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
 doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
 

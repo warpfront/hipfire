@@ -106,14 +106,14 @@ fn main() {
     gpus.devices[0].bind_thread().expect("bind warm peer sum");
     if ranks == 3 {
         gpus.devices[0]
-            .add_f32_graph_safe(&sources[1], &sources[2], &result)
+            .add_f32(&sources[1], &sources[2], &result)
             .expect("warm peer sum");
     } else {
         gpus.devices[0]
-            .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
+            .add_f32(&sources[1], &sources[2], &tmp)
             .expect("warm first peer sum");
         gpus.devices[0]
-            .add_f32_graph_safe(&tmp, &sources[3], &result)
+            .add_f32(&tmp, &sources[3], &result)
             .expect("warm second peer sum");
     }
     gpus.devices[0]
@@ -215,14 +215,14 @@ fn main() {
     gpus.devices[0].bind_thread().expect("bind peer sum");
     if ranks == 3 {
         gpus.devices[0]
-            .add_f32_graph_safe(&sources[1], &sources[2], &result)
+            .add_f32(&sources[1], &sources[2], &result)
             .expect("capture peer sum");
     } else {
         gpus.devices[0]
-            .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
+            .add_f32(&sources[1], &sources[2], &tmp)
             .expect("capture first peer sum");
         gpus.devices[0]
-            .add_f32_graph_safe(&tmp, &sources[3], &result)
+            .add_f32(&tmp, &sources[3], &result)
             .expect("capture second peer sum");
     }
 

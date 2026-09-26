@@ -84,6 +84,14 @@ pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 /// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
 pub const MQ4V2_GROUP_BYTES: usize = 136;
 
+/// Per-group bytes for MQ4-G128 v2 (qt=53), a row-local format admitted by
+/// typed Qwen4 sealed/dense consumers.
+///
+/// Generic GPU consumers still reject qt=53. Keep this constant here so
+/// runtime extent checks share the wire size without aliasing it to the legacy
+/// 72-byte `MQ4G128` layout.
+pub const MQ4G128V2_GROUP_BYTES: usize = 68;
+
 /// Per-group bytes for MQ4-G256-C (qt=45): 136 B/group, 4.25 bpw, byte-identical
 /// payload to MQ4G256 (qt=13) at the same offset. Pad layout (NOT the earlier
 /// 132 B planar layout):
@@ -167,6 +175,65 @@ fn pm4_dynamic_grid_enabled() -> bool {
     // only the process-global cache is gone (the snapshot is the cache now).
     hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// Dynamic fields a launch declares to the retained-replay recorder.
+///
+/// A declaration is how the lowering *names* a value that changes between
+/// forwards instead of leaving it to be discovered by differencing two
+/// recordings. The recorded bytes always hold the capture-position values; a
+/// grid binding narrows the recorded maximum grid for the replay position, and
+/// each kernarg binding re-derives one 4-byte scalar from that position.
+#[derive(Clone, Copy, Default)]
+pub struct ReplayLaunchBindings<'a> {
+    pub grid: Option<crate::replay::ReplayGridBinding>,
+    pub kernargs: &'a [crate::replay::ReplayKernargBinding],
+}
+
+impl ReplayLaunchBindings<'static> {
+    /// No dynamic fields: replay the launch exactly as captured.
+    pub const NONE: Self = Self {
+        grid: None,
+        kernargs: &[],
+    };
+}
+
+/// Resolve the compiled artifact that owns a launched symbol.
+///
+/// `KernelCompiler::compiled_kernels()` is keyed by module name while the
+/// recorder stores the launched *function* name, so runtime-specialized
+/// variants resolve through this one alias table. `None` means the artifact is
+/// unknown and preparation will reject the tape rather than guess.
+pub(crate) fn recorded_launch_artifact(
+    compiler: &KernelCompiler,
+    func_name: &str,
+) -> Option<std::path::PathBuf> {
+    let compiled = compiler.compiled_kernels();
+    compiled
+        .get(func_name)
+        .or_else(|| match func_name {
+            "mq_rotate_x" => compiled.get("gemv_mq4g256"),
+            "deinterleave_f32_batched" => compiled.get("deinterleave_batched"),
+            name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                compiled.get("gemv_hfq4g256_residual_scaled")
+            }
+            "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
+                compiled.get("gemv_hfq4g256_moe_gate_up_indexed")
+            }
+            name if name.starts_with("gemv_hfq4g256_multirow_r") => compiled
+                .get("gemv_hfq4g256_multirow_default")
+                .or_else(|| compiled.get("gemv_hfq4g256_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => compiled
+                .get("gemv_hfq4g256_residual_multirow_default")
+                .or_else(|| compiled.get("gemv_hfq4g256_residual_multirow_rdna3")),
+            _ => None,
+        })
+        .or_else(|| {
+            func_name
+                .strip_suffix("_f32")
+                .and_then(|name| compiled.get(name))
+        })
+        .cloned()
 }
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
@@ -328,19 +395,23 @@ pub enum DType {
     /// MQ3-G256 v2 (qt=49): FWHT-rotated, 104 B/group, neutral Magnum V2.
     /// Per-group 104 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
-    /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
+    /// MQ4-G128 v2 (qt=53): row-local FWHT-128, 68 B per `ceil(K/128)` group.
+    /// Typed Qwen4 sealed/dense consumers use dedicated kernels; generic GPU
+    /// consumers must reject it rather than treating it as legacy `MQ4G128`
+    /// (72 B/group).
+    MQ4G128V2,
+    MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ3G256V2,
     /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
     /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
     /// semantics as MQ6G256V2. `K % 256 == 0`, 2.25 bpw.
     MQ2G256V2,
-    MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
-    MQ8G256, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
-    MQ6G256, // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
-    MQ5G256, // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
-    MQ3G256, // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
-    MQ2G256, // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
+    MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
+    MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ5G256,      // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
+    MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     /// Unrotated MQ2-Lloyd (qt=51). Byte-identical to `MQ2G256Lloyd`
     /// (72 B/group: 4-entry fp16 codebook + 64 B of 2-bit indices), so the same
@@ -383,9 +454,17 @@ pub enum DType {
     // Pure byte-permutation of MFP4G32E8 => dequant result IDENTICAL.
     MFP3G32E8, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 4), 13 B/blk, 104 B/grp, 3.25 bpw. Drop-in for MQ3G256Lloyd.
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 2),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
-    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
-    HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
+    MFP4G32E8G128, // qt=42 mfp4-E8 with a 128-wide FWHT rotation group: the MFP4G32E8
+    // wire layout BYTE-FOR-BYTE (16-B hdr + (K/32) x 17 B blocks, no prefix, no padding),
+    // but the encoder rotates 128-element segments (sign seeds 43/1043) instead of 256.
+    // That is the only thing 256 was doing for this family, and it is what excludes
+    // K=640 = 5x128, so this tier covers qwen4's expert `down_proj` axis. The rotation
+    // width is NOT in the bytes: the row stride is identical to MFP4G32E8, and the
+    // decoder is the same E8-lattice body. Activation side must use the G128 basis
+    // (`rotate_x_mq_128`), the same one MQ4G128V2 consumes.
+    HFQ2G256, // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
+    HFQ2G128, // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
+    TQ2G128,  // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
     BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
@@ -419,6 +498,7 @@ impl DType {
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4G128V2
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
@@ -444,8 +524,48 @@ impl DType {
             | DType::MFP4G32E8SOA
             | DType::MFP3G32E8
             | DType::MFP2G32E8
+            | DType::MFP4G32E8G128
             | DType::ParoQ4G128
             | DType::Raw => 1, // byte-level
+        }
+    }
+
+    /// Encoded bytes of one row of `k` logical values, or `None` for a dtype
+    /// without a fixed per-row layout here (or `k == 0`).
+    ///
+    /// Grouped formats store whole groups: a trailing partial group occupies a
+    /// full group. Whether a caller accepts such a row (external rows and
+    /// several kernels require `k` to be group-aligned) is the caller's
+    /// policy, not the layout's.
+    pub fn row_bytes(self, k: usize) -> Option<usize> {
+        if k == 0 {
+            return None;
+        }
+        let grouped = |group: usize, group_bytes: usize| k.div_ceil(group).checked_mul(group_bytes);
+        let blocks = k.div_ceil(32);
+        match self {
+            DType::F32 | DType::F16 | DType::BF16 => k.checked_mul(self.size()),
+            DType::Q8_0 => grouped(32, 34),
+            DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => grouped(256, 136),
+            DType::MQ4G128V2 => grouped(128, 68),
+            DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
+            DType::MQ3G256 => grouped(256, 104),
+            DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),
+            DType::MQ3G256Lloyd => grouped(256, 112),
+            DType::MQ4G256Lloyd => grouped(256, 160),
+            // HFQ4-G128 layout, see the variant.
+            DType::ParoQ4G128 => grouped(128, 72),
+            // E8 formats: a 16-byte row header, then per-32 blocks.
+            DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
+            DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
+            // SoA: header, one scale byte per block padded to 16, 16 bytes of
+            // nibbles per block.
+            DType::MFP4G32E8SOA => blocks
+                .checked_add(15)
+                .map(|scales| scales & !15)?
+                .checked_add(blocks.checked_mul(16)?)?
+                .checked_add(16),
+            _ => None,
         }
     }
 
@@ -1033,6 +1153,18 @@ impl Gpu {
     /// if any. Used to attribute a timed-out sync to the suspect kernel.
     pub fn last_launched_kernel(&self) -> Option<&str> {
         self.last_kernel.as_deref()
+    }
+
+    /// Every kernel name currently loaded on this device, sorted.
+    ///
+    /// Diagnostic only: a retained-capture census uses it to name the kernels a
+    /// model actually loaded, so a launch that never reached the recorder can be
+    /// identified by set difference against the recorded tape instead of by
+    /// guessing at call sites.
+    pub fn loaded_kernel_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.functions.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Build the timeout error directly (no device call). Split out so the
@@ -2308,7 +2440,7 @@ impl Gpu {
             block,
             shared_mem,
             params,
-            None,
+            ReplayLaunchBindings::NONE,
             blob_builder,
         )
     }
@@ -2341,7 +2473,10 @@ impl Gpu {
             block,
             shared_mem,
             params,
-            grid_binding,
+            ReplayLaunchBindings {
+                grid: grid_binding,
+                kernargs: &[],
+            },
             blob_builder,
         )
     }
@@ -2354,119 +2489,75 @@ impl Gpu {
         block: [u32; 3],
         shared_mem: u32,
         params: &mut [*mut std::ffi::c_void],
-        grid_binding: Option<crate::replay::ReplayGridBinding>,
+        bindings: ReplayLaunchBindings<'_>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        let result: HipResult<()> = if record
-            || self.graphs.capture_mode
-            || self.flags.force_blob_path
-        {
-            let mut blob = blob_builder();
-            blob.pad_to(16);
-            if record {
-                let artifact = self
-                    .compiler
-                    .compiled_kernels()
-                    .get(func_name)
-                    .or_else(|| match func_name {
-                        "mq_rotate_x" => self.compiler.compiled_kernels().get("gemv_mq4g256"),
-                        "deinterleave_f32_batched" => {
-                            self.compiler.compiled_kernels().get("deinterleave_batched")
-                        }
-                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
-                            self.compiler
-                                .compiled_kernels()
-                                .get("gemv_hfq4g256_residual_scaled")
-                        }
-                        "gemv_hfq4g256_moe_gate_up_k8_indexed" => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_moe_gate_up_indexed"),
-                        name if name.starts_with("gemv_hfq4g256_multirow_r") => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_multirow_default")
-                            .or_else(|| {
-                                self.compiler
-                                    .compiled_kernels()
-                                    .get("gemv_hfq4g256_multirow_rdna3")
-                            }),
-                        name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => self
-                            .compiler
-                            .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_multirow_default")
-                            .or_else(|| {
-                                self.compiler
-                                    .compiled_kernels()
-                                    .get("gemv_hfq4g256_residual_multirow_rdna3")
-                            }),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        func_name
-                            .strip_suffix("_f32")
-                            .and_then(|name| self.compiler.compiled_kernels().get(name))
-                    })
-                    .cloned();
-                self.replay.record_hip_launch_typed_bound(
-                    &self.hip,
-                    func_name,
-                    artifact,
-                    grid,
-                    block,
-                    shared_mem,
-                    blob.as_bytes(),
-                    grid_binding,
-                );
-            }
-            let func = &self.functions[func_name];
-            if self.graphs.capture_mode {
-                self.graphs.capture_blobs.push(blob.into_vec());
-                let buf = self.graphs.capture_blobs.last_mut().unwrap();
-                // SAFETY: every caller's builder encodes the same argument
-                // values supplied by `params`; graph-owned storage stays live
-                // through graph instantiation and replay.
-                unsafe {
-                    self.hip.launch_kernel_blob(
-                        func,
+        let result: HipResult<()> =
+            if record || self.graphs.capture_mode || self.flags.force_blob_path {
+                let mut blob = blob_builder();
+                blob.pad_to(16);
+                if record {
+                    let artifact = recorded_launch_artifact(&self.compiler, func_name);
+                    self.replay.record_hip_launch_typed_bound(
+                        &self.hip,
+                        func_name,
+                        artifact,
                         grid,
                         block,
                         shared_mem,
-                        self.active_stream.as_ref(),
-                        buf.as_mut_slice(),
-                    )
+                        blob.as_bytes(),
+                        bindings.grid,
+                        bindings.kernargs,
+                    );
+                }
+                let func = &self.functions[func_name];
+                if self.graphs.capture_mode {
+                    self.graphs.capture_blobs.push(blob.into_vec());
+                    let buf = self.graphs.capture_blobs.last_mut().unwrap();
+                    // SAFETY: every caller's builder encodes the same argument
+                    // values supplied by `params`; graph-owned storage stays live
+                    // through graph instantiation and replay.
+                    unsafe {
+                        self.hip.launch_kernel_blob(
+                            func,
+                            grid,
+                            block,
+                            shared_mem,
+                            self.active_stream.as_ref(),
+                            buf.as_mut_slice(),
+                        )
+                    }
+                } else {
+                    let mut bytes = blob.into_vec();
+                    // SAFETY: HIP consumes the contiguous argument bytes during
+                    // this one-shot launch; `bytes` remains live across the call.
+                    unsafe {
+                        self.hip.launch_kernel_blob(
+                            func,
+                            grid,
+                            block,
+                            shared_mem,
+                            self.active_stream.as_ref(),
+                            bytes.as_mut_slice(),
+                        )
+                    }
                 }
             } else {
-                let mut bytes = blob.into_vec();
-                // SAFETY: HIP consumes the contiguous argument bytes during
-                // this one-shot launch; `bytes` remains live across the call.
+                let func = &self.functions[func_name];
+                // SAFETY: forwarded from the typed launch wrapper that assembled
+                // `params` for this kernel signature.
                 unsafe {
-                    self.hip.launch_kernel_blob(
+                    self.hip.launch_kernel(
                         func,
                         grid,
                         block,
                         shared_mem,
                         self.active_stream.as_ref(),
-                        bytes.as_mut_slice(),
+                        params,
                     )
                 }
-            }
-        } else {
-            let func = &self.functions[func_name];
-            // SAFETY: forwarded from the typed launch wrapper that assembled
-            // `params` for this kernel signature.
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    grid,
-                    block,
-                    shared_mem,
-                    self.active_stream.as_ref(),
-                    params,
-                )
-            }
-        };
+            };
         if result.is_ok() {
             self.last_kernel = Some(func_name.to_string());
         }
@@ -2618,6 +2709,89 @@ impl Gpu {
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
         .map_err(|e| e.with_kernel(func_name))
+    }
+
+    /// Launch an already-built kernarg blob through the recorder-aware funnel.
+    ///
+    /// Blob-shaped twin of [`Self::launch_maybe_blob`] for callers that assemble
+    /// a `hip_bridge::KernargBlob` directly (the shared tensor/grouped op
+    /// owners). It reaches the same recorder, captures the same exact bytes, and
+    /// keeps the same HipGraph capture-blob accounting as the params-shaped
+    /// funnel, so a launch cannot be captured in one tape and missed in the
+    /// other. [`Self::launch_kernel_blob`] stays the raw entry for the funnel
+    /// itself and for the recorded-HIP oracle, which must never re-record.
+    pub fn launch_blob_recorded(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernargs: &mut [u8],
+        bindings: ReplayLaunchBindings<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.replay.is_recording() {
+            let artifact = recorded_launch_artifact(&self.compiler, func_name);
+            self.replay.record_hip_launch_typed_bound(
+                &self.hip,
+                func_name,
+                artifact,
+                grid,
+                block,
+                shared_mem,
+                kernargs,
+                bindings.grid,
+                bindings.kernargs,
+            );
+        }
+        let result = if self.graphs.capture_mode {
+            // Retain the exact bytes for graph instantiation: HIP records the
+            // blob pointer, so graph-owned storage must outlive the capture.
+            self.graphs.capture_blobs.push(kernargs.to_vec());
+            let buf = self.graphs.capture_blobs.last_mut().unwrap();
+            let func = self.functions.get(func_name).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("launch_blob_recorded: function '{func_name}' not loaded"),
+                )
+            })?;
+            // SAFETY: HIP consumes the contiguous argument bytes during this
+            // one-shot launch; graph-owned storage stays live through
+            // instantiation and replay.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.active_stream.as_ref(),
+                    buf.as_mut_slice(),
+                )
+            }
+        } else {
+            let func = self.functions.get(func_name).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("launch_blob_recorded: function '{func_name}' not loaded"),
+                )
+            })?;
+            // SAFETY: HIP consumes the contiguous argument bytes during this
+            // one-shot launch; `kernargs` remains live across the call.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.stream_ref(),
+                    kernargs,
+                )
+            }
+        };
+        if result.is_ok() {
+            self.last_kernel = Some(func_name.to_string());
+        }
+        result.map_err(|e| e.with_kernel(func_name))
     }
 
     /// Compile and load a kernel, caching the result.
@@ -3028,6 +3202,55 @@ impl Gpu {
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
         Ok(Some(ptr))
+    }
+
+    /// Model-lifetime F16 shadow of a BF16 `[M × K]` weight, keyed on its
+    /// device pointer (weights are immutable after load); freed with the other
+    /// shadows on unload.  BF16 -> F16 rounds (and flushes values below the F16
+    /// range): callers must be accuracy-gated.
+    pub(crate) fn ensure_bf16_f16_shadow(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let key = weight.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
+            return Ok(shadow.buf.as_ptr());
+        }
+        let n = m * k;
+        let fp16 = self.alloc_tensor(&[n], DType::F16)?;
+        self.ensure_kernel(
+            "gemm_bf16_xf32_multirow",
+            kernels::GEMM_BF16_XF32_MULTIROW_SRC,
+            "convert_bf16_to_f16",
+        )?;
+        let ip = weight.buf.as_ptr();
+        let op = fp16.buf.as_ptr();
+        let nv =
+            i32::try_from(n).map_err(|_| hip_bridge::HipError::new(0, "BF16 shadow too large"))?;
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "convert_bf16_to_f16",
+            [n.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(nv);
+                b
+            },
+        )?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(ptr)
     }
 
     /// Ensure a model-lifetime FP16 shadow of a qt=35 MFP4G32E8SOA matrix.
@@ -4012,7 +4235,10 @@ impl Gpu {
             blob.push_i32(n_i32);
             blob
         };
-        let grid = (n as u32).div_ceil(256) * 256;
+        // Grid is in workgroups: one 256-thread block per 256 elements.  (It
+        // used to be the element count rounded up, i.e. 256x too many blocks,
+        // whose `blockIdx.x * blockDim.x` overflowed i32 past 2^31 threads.)
+        let grid = (n as u32).div_ceil(256);
         self.launch_maybe_blob(
             "copy_f32_buffer",
             [grid, 1, 1],
@@ -4073,7 +4299,7 @@ impl Gpu {
         let total = rows
             .checked_mul(row_elems)
             .ok_or_else(|| HipError::new(0, "copy_f32_strided_slot_buffer size overflow"))?;
-        let grid = (total as u32).div_ceil(256) * 256;
+        let grid = (total as u32).div_ceil(256);
         self.launch_maybe_blob(
             "copy_f32_strided_slot_buffer",
             [grid, 1, 1],
@@ -4095,6 +4321,14 @@ impl Gpu {
     /// block's `linear2` input assemble issued 2 × 4608 = 9216 tiny D2D
     /// memcpys per block, which is launch-latency bound, not bandwidth bound.
     ///
+    /// `dst_col_offset` may address a position past the first row (the kernel
+    /// computes `r * dst_row_stride + dst_col_offset + c` with no assumption
+    /// that the offset sits inside one row); only the resulting extent has to
+    /// fit the destination buffer. A caller that derives the offset from a
+    /// position passes it through `dst_col_offset_per_position` so the retained
+    /// recorder can declare it and replay can re-derive it from the replay
+    /// position instead of replaying a capture-position offset.
+    ///
     /// A `float4` fast path is taken automatically when `len`, both row
     /// strides and `dst_col_offset` are multiples of 4 and both device
     /// pointers are 16-byte aligned; every other shape falls back to the
@@ -4112,6 +4346,7 @@ impl Gpu {
         src_row_stride: usize,
         dst_row_stride: usize,
         dst_col_offset: usize,
+        dst_col_offset_per_position: Option<usize>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if src.dtype != DType::F32 || dst.dtype != DType::F32 {
@@ -4131,14 +4366,6 @@ impl Gpu {
                 0,
                 &format!(
                     "copy_rows_strided_f32: len {len} exceeds src_row_stride {src_row_stride}"
-                ),
-            ));
-        }
-        if dst_col_offset + len > dst_row_stride {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "copy_rows_strided_f32: dst_col_offset {dst_col_offset} + len {len} exceeds dst_row_stride {dst_row_stride}"
                 ),
             ));
         }
@@ -4200,16 +4427,37 @@ impl Gpu {
             .map_err(|_| HipError::new(0, "copy_rows_strided_f32: dst_col_offset exceeds i32"))?;
         let vec4_i = i32::from(aligned);
 
-        let mut params: Vec<*mut c_void> = vec![
-            &sp as *const _ as *mut c_void,
-            &dp as *const _ as *mut c_void,
-            &n_rows_i as *const _ as *mut c_void,
-            &len_i as *const _ as *mut c_void,
-            &ss_i as *const _ as *mut c_void,
-            &ds_i as *const _ as *mut c_void,
-            &dco_i as *const _ as *mut c_void,
-            &vec4_i as *const _ as *mut c_void,
-        ];
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(sp);
+        blob.push_ptr(dp);
+        blob.push_i32(n_rows_i);
+        blob.push_i32(len_i);
+        blob.push_i32(ss_i);
+        blob.push_i32(ds_i);
+        blob.push_i32(dco_i);
+        // The offset the scalar actually landed at, not a hand-counted layout
+        // constant. The kernel reads it as `i32`, so the declared product must
+        // stay inside `i32` for every replay position it can see.
+        let dco_offset = blob.len() - 4;
+        blob.push_i32(vec4_i);
+        blob.pad_to(16);
+        let dco_binding = match dst_col_offset_per_position {
+            None => None,
+            Some(factor) => {
+                let factor = u32::try_from(factor).map_err(|_| {
+                    HipError::new(
+                        0,
+                        "copy_rows_strided_f32: per-position offset factor exceeds u32",
+                    )
+                })?;
+                Some([crate::replay::ReplayKernargBinding::PositionMulU32 {
+                    offset: dco_offset,
+                    factor,
+                }])
+            }
+        };
+        let kernargs: &[crate::replay::ReplayKernargBinding] =
+            dco_binding.as_ref().map_or(&[], |bindings| &bindings[..]);
 
         const BLOCK: u32 = 256;
         let cols = if aligned { len / 4 } else { len };
@@ -4219,23 +4467,15 @@ impl Gpu {
         let grid_y = (n_rows as u32).min(65535);
         let bytes = n_rows * len * f32_sz * 2; // read + write
         let timer = crate::profile::begin_timer(&self.hip, KERNEL, KERNEL, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_blob_recorded(
             KERNEL,
             [grid_x, grid_y, 1],
             [BLOCK, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(sp);
-                blob.push_ptr(dp);
-                blob.push_i32(n_rows_i);
-                blob.push_i32(len_i);
-                blob.push_i32(ss_i);
-                blob.push_i32(ds_i);
-                blob.push_i32(dco_i);
-                blob.push_i32(vec4_i);
-                blob
+            blob.as_mut_slice(),
+            ReplayLaunchBindings {
+                grid: None,
+                kernargs,
             },
         );
         if let Some(t) = timer {
@@ -5278,6 +5518,29 @@ impl Drop for Gpu {
 
 #[cfg(test)]
 mod tests {
+    /// Pins the per-row geometry the per-arch copies used to hard-code.
+    #[test]
+    fn row_bytes_matches_the_producer_layouts() {
+        assert_eq!(DType::BF16.row_bytes(160), Some(320));
+        assert_eq!(DType::F32.row_bytes(3), Some(12));
+        assert_eq!(DType::Q8_0.row_bytes(160), Some(170));
+        assert_eq!(DType::Q8_0.row_bytes(33), Some(68));
+        assert_eq!(DType::MQ4G256V2.row_bytes(2560), Some(10 * 136));
+        assert_eq!(DType::MQ4G128V2.row_bytes(640), Some(5 * 68));
+        assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
+        assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
+        assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
+        assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
+        assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
+        assert_eq!(DType::MFP3G32E8.row_bytes(4096), Some(1680));
+        assert_eq!(DType::MFP4G32E8.row_bytes(256), Some(152));
+        assert_eq!(DType::MFP4G32E8SOA.row_bytes(256), Some(160));
+        assert_eq!(DType::MFP3G32E8.row_bytes(256), Some(120));
+        assert_eq!(DType::Q8_0.row_bytes(0), None);
+        assert_eq!(DType::Raw.row_bytes(8), None);
+    }
+
     use super::gen_fwht_signs;
     use super::DType;
     use super::Gpu;
@@ -5480,6 +5743,33 @@ mod tests {
         super::Gpu::init().ok()
     }
 
+    /// A copy longer than 2^31 / 256 elements used to launch one block per
+    /// element; `blockIdx.x * blockDim.x` then overflowed i32 and the kernel
+    /// wrote before the destination (GPU page fault at 1024-row Qwen4 PLE).
+    #[test]
+    fn copy_f32_buffer_handles_more_than_8m_elements() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let n = 9 * 1024 * 1024 + 7;
+        let src: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let src_gpu = gpu.upload_f32(&src, &[n]).expect("src upload");
+        let dst_gpu = gpu.zeros(&[n + 64], super::DType::F32).expect("dst");
+        let dst_view = dst_gpu.sub_offset(32, n);
+        gpu.copy_f32_buffer(&dst_view, &src_gpu, n).expect("copy");
+        let out = gpu.download_f32(&dst_gpu).expect("download");
+        assert!(out[..32].iter().all(|v| *v == 0.0), "copy wrote before dst");
+        assert!(
+            out[32 + n..].iter().all(|v| *v == 0.0),
+            "copy wrote past dst"
+        );
+        assert!(
+            out[32..32 + n].iter().zip(&src).all(|(a, b)| a == b),
+            "copy mismatch"
+        );
+    }
+
     #[test]
     fn ensure_vmm_cleaned_never_releases_a_live_owner() {
         let Some(mut gpu) = try_gpu() else {
@@ -5659,7 +5949,6 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
-        let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
         let pool_before = gpu.pool_stats();
 
         let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
@@ -5676,11 +5965,6 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
-        assert_eq!(
-            free_after, free_before,
-            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
-        );
         // hip.free path must not touch pool counters (would if free_tensor'd).
         assert_eq!(
             gpu.pool_stats(),

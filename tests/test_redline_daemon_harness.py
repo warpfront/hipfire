@@ -1,7 +1,8 @@
 import copy
 import unittest
+from unittest.mock import patch
 
-from scripts.redline_daemon_harness import DFLASH_EXACT_FIELDS, dflash_shadow_failures
+from scripts.redline_daemon_harness import DFLASH_EXACT_FIELDS, dflash_shadow_failures, qwen4_recipe_failures
 
 
 def valid_shadow():
@@ -36,6 +37,16 @@ def valid_shadow():
             ],
         },
     }
+
+
+class Qwen4RecipeTests(unittest.TestCase):
+    def test_drafter_quant_does_not_admit_or_reject_trunk(self):
+        trunk = "model.language_model.layers.0.self_attn.q_proj.weight"
+        entries = [(trunk, 47, (128, 128)), ("mtp.layers.0.self_attn.q_proj.weight", 3, (128, 128))]
+        with patch("scripts.redline_daemon_harness.read_qwen4_index", return_value=entries):
+            self.assertEqual(qwen4_recipe_failures("model"), [])
+            entries[0] = (trunk, 3, (128, 128))
+            self.assertIn("trunk projections carry quant types [3]", qwen4_recipe_failures("model")[0])
 
 
 class DflashShadowVerdictTests(unittest.TestCase):

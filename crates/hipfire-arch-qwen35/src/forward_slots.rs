@@ -79,15 +79,22 @@
 
 use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
-    moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,
-    q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
-    run_plain_gemm_key, run_residual_gemm_key, DeltaNetLayerWeights, DeltaNetMoeLayerWeights,
-    DeltaNetState, FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights,
-    MoeFfnWeights, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
+    moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
+    run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key, run_plain_gemm_key,
+    run_residual_gemm_key, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState,
+    FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights, MoeFfnWeights,
+    PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
 };
+
 use crate::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for;
+use hipfire_dispatch::families::gemm::residual_gemm_key_for;
+use hipfire_dispatch::families::moe::{
+    gated_moe_prefill_admissible, mq6_batched_admit_enabled_from_env,
+};
+
 use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
@@ -329,18 +336,6 @@ enum AttnProjDtype {
 // against a 0.043776 baseline, bit-identical across both runs) before it was
 // found. Select on the container; never hardcode.
 
-pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
-    match dt {
-        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
-        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
-        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
-        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
-        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
-        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
-        _ => KernelKey::GemmHfq4G256Residual,
-    }
-}
-
 pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
@@ -362,18 +357,6 @@ pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
         DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
         _ => KernelKey::FusedQkvHfq4G256,
-    }
-}
-
-pub(crate) fn fused_gate_up_key_for(dt: DType) -> KernelKey {
-    match dt {
-        DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
-        DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
-        DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
-        DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
-        DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
-        DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
-        _ => KernelKey::FusedGateUpHfq4G256,
     }
 }
 
@@ -483,13 +466,19 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
             .as_deref(),
         arch,
     );
-    if moe_ffn_batched_admissible(ffn, admit_mq6, arch) {
+    let dtypes = moe_prefill_dtypes(ffn).ok_or_else(|| {
+        HipError::new(
+            0,
+            "forward_batch_slots: MoE FFN dtype metadata is unavailable",
+        )
+    })?;
+    if gated_moe_prefill_admissible(&dtypes, admit_mq6, arch) {
         Ok(())
     } else {
         Err(HipError::new(
             0,
             "forward_batch_slots: MoE FFN weight dtypes are not admissible for \
-             the batched prefill path (see moe_ffn_batched_admissible); this \
+             the batched prefill path (see gated_moe_prefill_admissible); this \
              file requires the same admission the reference's own \
              prefill_batch_pbs_eligible checks before entering the batched MoE \
              branches",

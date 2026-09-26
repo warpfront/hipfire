@@ -75,6 +75,24 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         host_position_and_conversation: true,
         eligibility: RetryResetEligibility::Eligible,
     };
+    const QWEN4: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "qwen4",
+        // Qwen4 owns GDN recurrent/conv state, QSA full/indexer caches, and
+        // PLE/HC request state in Qwen4Bundle::reset.
+        recurrent_or_conv: true,
+        s_ef_residual: true, // n/a for Qwen4; covered by the complete state owner
+        kv_or_aux_caches: true,
+        // Qwen4 has no captured decode graph, but the route-level rollback
+        // still invalidates the shared graph/replay state.
+        graphs: true,
+        drafter: true,  // n/a: Qwen4 admission rejects speculative drafters
+        adaptive: true, // n/a: Qwen4 admission rejects adaptive KV
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "qwen4 GPU fault parity pending",
+        },
+    };
+
     const DEEPSEEK4: ResetCoreCoverage = ResetCoreCoverage {
         arch: "deepseek4",
         // No DeltaNet; host n_tokens + mtp_last_hidden + ar_forward_warmed_up.
@@ -242,6 +260,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
     };
     &[
         QWEN35,
+        QWEN4,
         DEEPSEEK4,
         LLAMA,
         QWEN2,
@@ -529,20 +548,17 @@ mod tests {
     #[test]
     fn inventory_covers_every_arch_in_arch_mapping() {
         // Makes a missing inventory row a loud build failure instead of silent
-        // ineligibility. Derives the expected set of arch_keys from the
-        // canonical `MODEL_TYPE_TO_ARCH_ID` table so a new architecture that
-        // adds a `model_type -> arch_id` entry without a curated
-        // `ResetCoreCoverage` row fails this test rather than being quietly
-        // ineligible. Reachable without a crate cycle because `arch_mapping`
-        // lives in this crate; the loader's registry would be the alternative
-        // but would require a dev-dependency and is not needed here.
-        use crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID;
+        // ineligibility. Derives expected keys from the canonical executable
+        // and reserved source tables so a source-only architecture such as
+        // Qwen4 cannot drift out of reset coverage.
+        use crate::arch_mapping::{MODEL_TYPE_TO_ARCH_ID, RESERVED_MODEL_TYPE_TO_ARCH_ID};
         use std::collections::{BTreeMap, BTreeSet};
 
         fn arch_key_for_id(id: u32) -> Option<&'static str> {
             match id {
                 0 | 1 => Some("llama"),
                 5 | 6 => Some("qwen35"),
+                16 => Some("qwen4"),
                 7 => Some("qwen2"),
                 8 => Some("dots-ocr"),
                 9 => Some("deepseek4"),
@@ -562,10 +578,12 @@ mod tests {
         }
 
         let drafters: BTreeSet<u32> = [22, 23].into_iter().collect();
-
         let mut expected_keys = BTreeSet::new();
         let mut id_to_key = BTreeMap::new();
-        for (_, id) in MODEL_TYPE_TO_ARCH_ID.iter() {
+        for (_, id) in MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID.iter())
+        {
             if drafters.contains(id) {
                 continue;
             }
@@ -605,6 +623,16 @@ mod tests {
         // Unknowns must stay ineligible (fail-closed).
         assert!(!is_retry_reset_eligible("unknown-arch"));
         assert!(reset_coverage_for("unknown-arch").is_none());
+        // Qwen4 has a real bundle reset owner but remains retry-ineligible
+        // until GPU fault parity is accepted.
+        let qwen4 = reset_coverage_for("qwen4").expect("qwen4");
+        assert!(!qwen4.is_retry_eligible());
+        assert_eq!(
+            qwen4.eligibility,
+            RetryResetEligibility::Ineligible {
+                reason: "qwen4 GPU fault parity pending"
+            }
+        );
     }
 
     #[test]

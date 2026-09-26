@@ -747,6 +747,8 @@ pub fn truncate_checkpoints(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
+    Qwen4Ar,
+    Qwen4Spec,
     QwenDflash,
     Qwen2Ar,
     Qwen2Spec,
@@ -775,6 +777,8 @@ impl GenerationRoute {
     #[allow(dead_code)]
     pub const ALL: &'static [Self] = &[
         Self::QwenAr,
+        Self::Qwen4Ar,
+        Self::Qwen4Spec,
         Self::QwenDflash,
         Self::Qwen2Ar,
         Self::Qwen2Spec,
@@ -817,6 +821,7 @@ impl GenerationRoute {
         matches!(
             self,
             Self::QwenAr
+                | Self::Qwen4Ar
                 | Self::QwenDflash
                 | Self::Deepseek4Ar
                 | Self::Deepseek4Ep
@@ -830,6 +835,8 @@ impl GenerationRoute {
     pub const fn name(self) -> &'static str {
         match self {
             Self::QwenAr => "qwen_ar",
+            Self::Qwen4Ar => "qwen4_ar",
+            Self::Qwen4Spec => "qwen4_spec",
             Self::QwenDflash => "qwen_dflash",
             Self::Qwen2Ar => "qwen2_ar",
             Self::Qwen2Spec => "qwen2_spec",
@@ -1157,6 +1164,9 @@ macro_rules! define_route_terminal {
 }
 
 define_route_start!(qwen_ar_route_start, 5);
+define_route_start!(qwen4_ar_route_start, 16);
+define_route_start!(qwen4_spec_route_start, 16);
+
 define_route_start!(qwen_dflash_route_start, 5);
 define_route_start!(qwen2_ar_route_start, 7);
 define_route_start!(qwen2_spec_route_start, 7);
@@ -1193,6 +1203,9 @@ define_route_start!(dots_ocr_route_start, 8);
 define_route_start!(unknown_route_start, 255);
 
 define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
+define_route_terminal!(qwen4_ar_route_terminal, GenerationRoute::Qwen4Ar);
+define_route_terminal!(qwen4_spec_route_terminal, GenerationRoute::Qwen4Spec);
+
 define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
 define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
 define_route_terminal!(qwen2_spec_route_terminal, GenerationRoute::Qwen2Spec);
@@ -1230,6 +1243,17 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             start: qwen_ar_route_start,
             terminal: qwen_ar_route_terminal,
         },
+        GenerationRoute::Qwen4Ar => GenerationRouteAdapter {
+            route,
+            start: qwen4_ar_route_start,
+            terminal: qwen4_ar_route_terminal,
+        },
+        GenerationRoute::Qwen4Spec => GenerationRouteAdapter {
+            route,
+            start: qwen4_spec_route_start,
+            terminal: qwen4_spec_route_terminal,
+        },
+
         GenerationRoute::QwenDflash => GenerationRouteAdapter {
             route,
             start: qwen_dflash_route_start,
@@ -1509,6 +1533,26 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
 
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
+        16 => {
+            // Qwen4 native MTP is a strictly greedy, explicitly requested
+            // route. Any sampler control, adaptive state, or force-AR switch
+            // keeps the request on the ordinary Qwen4 producer.
+            let spec_ok = i.has_speculator
+                && i.speculator_is_mtp
+                && i.temp <= 1e-6
+                && !i.user_explicit_sampling
+                && !i.min_p.is_some_and(|p| p > 0.0)
+                && !i.nonneutral_penalties
+                && !i.force_ar_chat
+                && !i.temp_spec_env_off
+                && !i.kv_adaptive;
+            return if spec_ok {
+                GenerationRoute::Qwen4Spec
+            } else {
+                GenerationRoute::Qwen4Ar
+            };
+        }
+
         7 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -1656,6 +1700,333 @@ pub fn llama_prefill_sample_seed(mut seed: u32, token_count: usize, temperature:
         }
     }
     seed
+}
+
+/// Generic single-device AR body for routes whose architecture supplies only
+/// the prefill/token forward callbacks.  Prompt framing and request admission
+/// stay with the route selector; this body owns the invariant lifecycle:
+/// allocate logits, mutate device state before publishing tokens, roll back on
+/// every forward/semantic/terminal failure, and emit exactly one terminal.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_ar_with_forward<Prefill, Decode>(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    route: GenerationRoute,
+    prompt_tokens: &[u32],
+    vocab_size: usize,
+    eos_token: u32,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    started_in_think: bool,
+    stop: &[String],
+    tool_protocol_enabled: bool,
+    mut forward_chunk: Prefill,
+    mut forward_token: Decode,
+) where
+    Prefill: FnMut(
+        &mut LoadedModel,
+        &mut rdna_compute::Gpu,
+        &[u32],
+        &rdna_compute::GpuTensor,
+    ) -> Result<(), String>,
+    Decode: FnMut(
+        &mut LoadedModel,
+        &mut rdna_compute::Gpu,
+        u32,
+        &rdna_compute::GpuTensor,
+    ) -> Result<(), String>,
+{
+    if vocab_size == 0 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "AR route has zero vocabulary",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+    let prompt_logits = match gpu.zeros(&[vocab_size], rdna_compute::DType::F32) {
+        Ok(logits) => logits,
+        Err(error) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("AR prompt logits allocation failed: {error}"),
+                "gpu",
+                true,
+                false,
+            );
+            return;
+        }
+    };
+    let decode_logits = match gpu.zeros(&[vocab_size], rdna_compute::DType::F32) {
+        Ok(logits) => logits,
+        Err(error) => {
+            let _ = gpu.free_tensor(prompt_logits);
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("AR decode logits allocation failed: {error}"),
+                "gpu",
+                true,
+                false,
+            );
+            return;
+        }
+    };
+
+    emit_generation_start(route, stdout, id, started_in_think);
+    let t0 = Instant::now();
+    if let Err(error) = forward_chunk(m, gpu, prompt_tokens, &prompt_logits) {
+        let _ = gpu.free_tensor(prompt_logits);
+        let _ = gpu.free_tensor(decode_logits);
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(
+            stdout,
+            Some(id),
+            &format!("{} forward_chunk prefill failed: {error}", route.name()),
+            "gpu",
+            false,
+            &ep,
+        );
+        return;
+    }
+
+    let first_logits = gpu.download_f32(&prompt_logits);
+    let _ = gpu.free_tensor(prompt_logits);
+    let mut logits = match first_logits {
+        Ok(logits) => logits,
+        Err(error) => {
+            let _ = gpu.free_tensor(decode_logits);
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("{} prefill logits download failed: {error}", route.name()),
+                "gpu",
+                false,
+                &ep,
+            );
+            return;
+        }
+    };
+    m.seq_pos = prompt_tokens.len();
+    m.conversation_tokens.extend_from_slice(prompt_tokens);
+    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let sampler_config = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let mut next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &sampler_config);
+    let mut semantic =
+        QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled);
+    let mut streamed_tokens = Vec::new();
+    let mut generated = 0usize;
+    let mut bytes_fed_to_filter = 0usize;
+    let mut natural_stop = false;
+    let t_decode = Instant::now();
+
+    while generated < max_tokens {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let _ = gpu.free_tensor(decode_logits);
+            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+            return;
+        }
+        if let Err(error) = forward_token(m, gpu, next_token, &decode_logits) {
+            let _ = gpu.free_tensor(decode_logits);
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("{} forward_token decode failed: {error}", route.name()),
+                "gpu",
+                false,
+                &ep,
+            );
+            return;
+        }
+
+        let previous_bytes = bytes_fed_to_filter;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let classify = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            semantic.commit_and_classify(
+                stdout,
+                next_token,
+                || {
+                    let position = qwen_ar_raw_commit_token(
+                        &mut m.conversation_tokens,
+                        &mut streamed_tokens,
+                        &mut m.seq_pos,
+                        next_token,
+                        QwenArRawCommitDisposition::ClassifiedVisible,
+                    );
+                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let new_bytes = all_bytes[previous_bytes.min(all_bytes.len())..].to_vec();
+                    bytes_fed_to_filter = all_bytes.len();
+                    (position, new_bytes)
+                },
+                |position, out| {
+                    emit_committed_event(out, id, next_token, position, elapsed_ms);
+                },
+            )
+        };
+        let filter_stop = match classify {
+            Ok(stop) => stop,
+            Err(error) => {
+                let _ = gpu.free_tensor(decode_logits);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("{} semantic classify failed: {error}", route.name()),
+                    "validation",
+                    false,
+                    &ep,
+                );
+                return;
+            }
+        };
+        generated += 1;
+        if max_think_tokens > 0 && semantic.think_router.in_think() && generated >= max_think_tokens
+        {
+            let _ = gpu.free_tensor(decode_logits);
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("{} think token budget exceeded", route.name()),
+                "validation",
+                false,
+                &ep,
+            );
+            return;
+        }
+        let custom_stop = stop
+            .iter()
+            .any(|value| !value.is_empty() && semantic.visible().ends_with(value));
+        if filter_stop
+            || custom_stop
+            || next_token == eos_token
+            || m.tokenizer
+                .as_ref()
+                .is_some_and(|tokenizer| tokenizer.is_terminator(next_token))
+        {
+            natural_stop = true;
+            break;
+        }
+        if generated >= max_tokens {
+            break;
+        }
+
+        let next_logits = match gpu.download_f32(&decode_logits) {
+            Ok(logits) => logits,
+            Err(error) => {
+                let _ = gpu.free_tensor(decode_logits);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &format!("{} decode logits download failed: {error}", route.name()),
+                    "gpu",
+                    false,
+                    &ep,
+                );
+                return;
+            }
+        };
+        logits = next_logits;
+        next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &sampler_config);
+    }
+
+    let hit_length_cap = generated >= max_tokens && !natural_stop;
+    let (finish, _) = match semantic.finish(stdout, hit_length_cap) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = gpu.free_tensor(decode_logits);
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("{} semantic finish failed: {error}", route.name()),
+                "validation",
+                false,
+                &ep,
+            );
+            return;
+        }
+    };
+    if matches!(finish.cause, QwenArTerminalCause::OpenThink) {
+        let _ = gpu.free_tensor(decode_logits);
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
+        return;
+    }
+    let t_end = Instant::now();
+    let total_ms = t_end.duration_since(t0).as_secs_f64() * 1000.0;
+    let decode_ms = t_end.duration_since(t_decode).as_secs_f64() * 1000.0;
+    let tok_s = if total_ms > 0.0 {
+        generated as f64 / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_ms > 0.0 {
+        prompt_tokens.len() as f64 / (prefill_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_ms > 0.0 {
+        generated as f64 / (decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let mut pending_done = qwen_ar_done_value(
+        id,
+        finish.finish_reason,
+        generated,
+        tok_s,
+        prompt_tokens.len(),
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_ms,
+        0,
+        "",
+    );
+    stage_terminal_tool_calls(
+        &mut pending_done,
+        finish.finish_reason,
+        &finish.wire_tool_calls,
+    );
+    let decision = await_client_terminal_commit(stdout, id, &pending_done);
+    if decision != ClientTerminalDecision::Commit {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        let _ = gpu.free_tensor(decode_logits);
+        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+        return;
+    }
+    let _ = gpu.free_tensor(decode_logits);
+    emit_active_route_done_value(stdout, &pending_done);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1917,6 +2288,94 @@ pub fn generate(
     // miss fallthrough (crate::qwen::generate_dflash → false) stays inside the Spec arm and
     // continues to that arch's AR producer — never an independent re-predicate.
     match selected_route {
+        GenerationRoute::Qwen4Spec => {
+            if crate::qwen::generate_dflash(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                max_tokens,
+                max_think_tokens,
+                assistant_prefix,
+                None, // native Qwen4 MTP owns no PFlash drafter
+                None, // pflash_alpha
+                tools,
+                messages_history,
+                stop,
+                temp,
+                top_p,
+                top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
+                cactus_delta,
+                request_seed as u64,
+                reasoning_effort,
+                enable_thinking,
+            ) {
+                return;
+            }
+            // A speculative context-capacity miss is the sole unhandled
+            // generic-spec result. Fall through to the normal Qwen4 AR
+            // producer without re-predicating route eligibility.
+            crate::qwen::generate_qwen4_ar(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                max_tokens,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                max_think_tokens,
+                assistant_prefix,
+                tools,
+                messages_history,
+                think_mode,
+                stop,
+                reasoning_effort,
+                enable_thinking,
+                request_seed,
+            );
+            return;
+        }
+        GenerationRoute::Qwen4Ar => {
+            crate::qwen::generate_qwen4_ar(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                top_k,
+                min_p,
+                max_tokens,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                max_think_tokens,
+                assistant_prefix,
+                tools,
+                messages_history,
+                think_mode,
+                stop,
+                reasoning_effort,
+                enable_thinking,
+                request_seed,
+            );
+            return;
+        }
+
         GenerationRoute::Deepseek4Ep | GenerationRoute::MiniMaxEp => {
             // EP serve (ds4/minimax): thread the SAME resolved sampling the
             // single-GPU handler computed (request field > m.rec_* > arch-default
@@ -5452,6 +5911,7 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
     match arch_id {
         0 | 1 => "llama",
         5 | 6 => "qwen35",
+        16 => "qwen4",
         7 => "qwen2",
         8 => "dots-ocr",
         9 => "deepseek4",
@@ -5466,10 +5926,9 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
 
 #[cfg(test)]
 pub(crate) fn generation_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -5478,6 +5937,7 @@ mod route_scope_tests {
     use hipfire_engine::terminal::{
         activate_terminal_control, clear_terminal_control, set_active_attempt_id,
     };
+
     fn route_lock() -> std::sync::MutexGuard<'static, ()> {
         super::generation_test_lock()
     }

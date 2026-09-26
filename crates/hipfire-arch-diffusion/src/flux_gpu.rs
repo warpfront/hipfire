@@ -55,7 +55,7 @@ use crate::flux::{
 use crate::manifest::{expected_flux_keys, TS_EMBED_DIM};
 use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::gemm::{GemmEpilogue, LdsTile};
-use rdna_compute::profile;
+use rdna_compute::profile::SpanProfiler;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -131,7 +131,7 @@ pub fn mod_gemv_enabled() -> bool {
 // serialize the whole step and inflate the per-family sum far past the
 // step's real wall time. `is_active()` is a single shared switch — turning
 // it on here would also turn on those other call sites. Instead this uses
-// `rdna_compute::profile::{begin_deferred, resolve_deferred}`, which only
+// `rdna_compute::profile::SpanProfiler` (deferred events), which only
 // enqueue `hipEventRecord` (never a synchronous wait) and resolve the whole
 // step with ONE synchronize at the end.
 //
@@ -147,91 +147,6 @@ pub fn mod_gemv_enabled() -> bool {
 fn step_profile_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| hipfire_config::developer_var_os("HIPFIRE_PROFILE").is_some())
-}
-
-/// One in-flight (start recorded, stop not yet recorded) deferred timer,
-/// tagged with the family it will be attributed to once resolved.
-type PendingFamilyTimer = (&'static str, profile::PendingTimer);
-
-/// Collects one forward's kernel-family attribution. GPU launches are timed
-/// with `rdna_compute::profile::PendingTimer` (see the section doc above for
-/// why, instead of `profile::Timer`) and resolved into a per-family
-/// microsecond map by `resolve`. The `host.sampler`/`host.other` spans this
-/// forward's caller cares about (the per-step scheduler/bookkeeping work in
-/// `pipeline.rs`'s denoise loop) are NOT collected here — they are plain
-/// wall-clock `Instant` spans with nothing to defer, so `pipeline.rs` times
-/// and merges them into the table itself, after `take_step_profile()`.
-struct StepProfiler {
-    enabled: bool,
-    gpu: Vec<PendingFamilyTimer>,
-}
-
-impl StepProfiler {
-    fn new() -> Self {
-        Self {
-            enabled: step_profile_enabled(),
-            gpu: Vec::new(),
-        }
-    }
-
-    /// Begin timing a GPU launch under `family`. Call immediately before the
-    /// launch; pair with `end_gpu` immediately after. No-op when profiling
-    /// is off, or if the event pair could not be created (profiling must
-    /// never fail the forward).
-    fn begin_gpu(
-        &self,
-        hip: &hip_bridge::HipRuntime,
-        stream: Option<&hip_bridge::Stream>,
-        family: &'static str,
-    ) -> Option<PendingFamilyTimer> {
-        if !self.enabled {
-            return None;
-        }
-        profile::begin_deferred(hip, stream)
-            .ok()
-            .map(|t| (family, t))
-    }
-
-    /// Enqueue the stop-event record (non-blocking) and stash the pair for
-    /// `resolve`. No-op if `begin_gpu` returned `None`.
-    fn end_gpu(
-        &mut self,
-        hip: &hip_bridge::HipRuntime,
-        stream: Option<&hip_bridge::Stream>,
-        pending: Option<PendingFamilyTimer>,
-    ) {
-        if let Some((family, t)) = pending {
-            let _ = t.mark_stop(hip, stream);
-            self.gpu.push((family, t));
-        }
-    }
-
-    /// Resolve every deferred GPU span (ONE stream sync, see
-    /// `profile::resolve_deferred`), summed per family in microseconds.
-    fn resolve(
-        self,
-        hip: &hip_bridge::HipRuntime,
-        stream: Option<&hip_bridge::Stream>,
-    ) -> BTreeMap<&'static str, f64> {
-        let mut out = BTreeMap::new();
-        for (family, us) in profile::resolve_deferred(hip, stream, self.gpu) {
-            *out.entry(family).or_insert(0.0) += us;
-        }
-        out
-    }
-}
-
-impl Default for StepProfiler {
-    /// Only used as the placeholder `mem::take` leaves behind when a
-    /// `Gpuf::finish()` pulls the real (accumulated) profiler out — never
-    /// constructed as a working profiler (use `StepProfiler::new()`, which
-    /// reads `HIPFIRE_PROFILE`).
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            gpu: Vec::new(),
-        }
-    }
 }
 
 thread_local! {
@@ -265,7 +180,7 @@ pub fn take_step_profile() -> Option<BTreeMap<&'static str, f64>> {
 /// `arch.as_str()` on every call would otherwise cost an allocation per
 /// attention launch — 57 times per FLUX step — even with profiling off; the
 /// call site in [`Gpuf::attention_into`] also only reaches this when
-/// `self.prof.enabled`, so the cost is paid at most once per process either
+/// `self.prof.enabled()`, so the cost is paid at most once per process either
 /// way). The resolver's error path (an unrecognised `HIPFIRE_FLUX_ATTN`
 /// value) can't reach here first: `Gpuf::attention_into` always resolves the
 /// route via the same function before dispatch, so an invalid override fails
@@ -1300,7 +1215,7 @@ struct Gpuf<'a> {
     kv_dt: DType,
     /// Per-kernel-family attribution for this forward. See the "Per-kernel-
     /// family step profiling" section doc above.
-    prof: StepProfiler,
+    prof: SpanProfiler,
 }
 
 impl<'a> Gpuf<'a> {
@@ -1327,7 +1242,7 @@ impl<'a> Gpuf<'a> {
             } else {
                 DType::F32
             },
-            prof: StepProfiler::new(),
+            prof: SpanProfiler::new(step_profile_enabled()),
         })
     }
 
@@ -1337,14 +1252,18 @@ impl<'a> Gpuf<'a> {
     ///
     /// When `HIPFIRE_PROFILE` is set, also resolves the accumulated
     /// per-family GPU timers (one `hipStreamSynchronize`/`hipEventSynchronize`
-    /// here, not one per launch — see `StepProfiler`) and stashes the result
+    /// here, not one per launch — see `SpanProfiler`) and stashes the result
     /// for `take_step_profile()`. `mem::take` moves the real profiler out of
-    /// `self.prof` (leaving `StepProfiler::default()`, an inert placeholder)
+    /// `self.prof` (leaving `SpanProfiler::default()`, an inert placeholder)
     /// so this can run before the `&mut self` borrows below without cloning.
     fn finish(&mut self) -> Result<(), String> {
         let prof = std::mem::take(&mut self.prof);
-        if prof.enabled {
-            let table = prof.resolve(&self.gpu.hip, self.gpu.active_stream.as_ref());
+        if prof.enabled() {
+            let table = prof
+                .resolve(&self.gpu.hip, self.gpu.active_stream.as_ref())
+                .into_iter()
+                .map(|total| (total.label, total.us))
+                .collect();
             LAST_STEP_PROFILE.with(|p| *p.borrow_mut() = Some(table));
         }
         if let Some((_, gamma, beta)) = self.ln_affine.take() {
@@ -1388,13 +1307,13 @@ impl<'a> Gpuf<'a> {
     fn download(&mut self, t: &GpuTensor) -> Result<Vec<f32>, String> {
         let timer = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
         let r = self
             .gpu
             .download_f32(t)
             .map_err(|e| format!("flux gpu: download: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
         r
     }
 
@@ -1416,7 +1335,7 @@ impl<'a> Gpuf<'a> {
     ) -> Result<(), String> {
         for &(dcol, src, len) in chunks {
             self.gpu
-                .copy_rows_strided_f32(src, dst, n_rows, len, len, dst_row_stride, dcol)
+                .copy_rows_strided_f32(src, dst, n_rows, len, len, dst_row_stride, dcol, None)
                 .map_err(|e| format!("assemble_rows chunk@{dcol}: {e:?}"))?;
         }
         Ok(())
@@ -1535,13 +1454,13 @@ impl<'a> Gpuf<'a> {
             .map_err(|e| format!("flux gpu: alloc act f16: {e:?}"))?;
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.cast");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.cast");
         let r = self
             .gpu
             .cast_f32_to_f16(a, &a_f16)
             .map_err(|e| format!("flux gpu: cast act f16: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r?;
         Ok(a_f16)
     }
@@ -1585,7 +1504,7 @@ impl<'a> Gpuf<'a> {
         // a different kernel selection.
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
         // WMMA: y[batch, m_out] = Σ_k W[m_out, k] · X[batch, k], with
         // W = b [n, k], X = a_f16 [m, k], m_out = n, batch = m.
         //
@@ -1610,7 +1529,7 @@ impl<'a> Gpuf<'a> {
         // not see.
         let lds_enabled = gemm_lds_enabled();
         let wide = gemm_wide_enabled();
-        // Captured instead of `?`-propagated directly so `end_gpu` always
+        // Captured instead of `?`-propagated directly so `end` always
         // runs before this function returns, on every branch — otherwise an
         // early return on a launch error would skip it and leak `t`'s two
         // hipEvents (`PendingTimer` cannot free them itself: destroying a
@@ -1645,7 +1564,7 @@ impl<'a> Gpuf<'a> {
                 })
         };
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r?;
         Ok(y)
     }
@@ -1716,7 +1635,7 @@ impl<'a> Gpuf<'a> {
         }
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
         let r = if gemm_wide_enabled() {
             // Weight at its stored pitch, activation packed — see `gemm_pre`.
             self.gpu.gemm_f16_x_f16_wmma_lds_auto_epi_ld(
@@ -1736,7 +1655,7 @@ impl<'a> Gpuf<'a> {
             )
         };
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r.map_err(|e| format!("flux gpu: wmma lds {epi:?} [{batch}x{k}]·[{m}x{k}]: {e:?}"))
     }
 
@@ -1774,9 +1693,9 @@ impl<'a> Gpuf<'a> {
         // ragged K — not the default path).
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
         // Captured in a closure, rather than `?`-propagated inline, so
-        // `end_gpu` always runs before this function returns — an early
+        // `end` always runs before this function returns — an early
         // return on any one of these launches erroring would otherwise skip
         // it and leak `t`'s two hipEvents (see `gemm_pre`'s comment on why
         // `PendingTimer` cannot free them itself).
@@ -1831,7 +1750,7 @@ impl<'a> Gpuf<'a> {
             Ok(())
         })();
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r?;
         self.free(acc)
     }
@@ -1970,13 +1889,13 @@ impl<'a> Gpuf<'a> {
         let y = dst.sub_offset(off, out);
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "mod.gemv");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "mod.gemv");
         let r = self
             .gpu
             .gemv_f16_bias_xf32(w, dv, bias, &y, out, d)
             .map_err(|e| format!("flux gpu: mod gemv {wname}: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r
     }
 
@@ -2046,13 +1965,13 @@ impl<'a> Gpuf<'a> {
         let out = self.alloc_dt(&[n_rows, d], out_dt)?;
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
         let r = self
             .gpu
             .layernorm_modulate(x, shift, scale, &out, n_rows, d, LN_EPS)
             .map_err(|e| format!("flux gpu: layernorm_modulate: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r?;
         Ok(out)
     }
@@ -2081,7 +2000,7 @@ impl<'a> Gpuf<'a> {
     ) -> Result<(), String> {
         let axes_dim = self.cfg.axes_dim;
         let theta = self.cfg.theta;
-        let t = self.prof.begin_gpu(
+        let t = self.prof.begin(
             &self.gpu.hip,
             self.gpu.active_stream.as_ref(),
             "norm.qk_rope",
@@ -2103,7 +2022,7 @@ impl<'a> Gpuf<'a> {
             )
             .map_err(|e| format!("flux gpu: qk_rmsnorm_rope_flux: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r
     }
 
@@ -2126,10 +2045,10 @@ impl<'a> Gpuf<'a> {
             // `flux_attn_route_family` is cheap once cached (an `OnceLock`
             // read), but only bother resolving/caching it at all when the
             // result will actually be used.
-            let t = if self.prof.enabled {
+            let t = if self.prof.enabled() {
                 let family = flux_attn_route_family(self.gpu);
                 self.prof
-                    .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), family)
+                    .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family)
             } else {
                 None
             };
@@ -2138,10 +2057,10 @@ impl<'a> Gpuf<'a> {
                 .attention_flux_best_f16kv_f32(q, k, v, out, n_q, n_q, heads, heads, hd)
                 .map_err(|e| format!("flux gpu: flux wmma attention: {e:?}"));
             self.prof
-                .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+                .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
             r
         } else {
-            let t = self.prof.begin_gpu(
+            let t = self.prof.begin(
                 &self.gpu.hip,
                 self.gpu.active_stream.as_ref(),
                 "attn.dflash_f32",
@@ -2151,7 +2070,7 @@ impl<'a> Gpuf<'a> {
                 .attention_dflash_f32(q, k, v, out, n_q, n_q, heads, heads, hd)
                 .map_err(|e| format!("flux gpu: dflash f32 attention: {e:?}"));
             self.prof
-                .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+                .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
             r
         }
     }
@@ -2160,12 +2079,12 @@ impl<'a> Gpuf<'a> {
         let out = self.alloc(&x.shape.clone())?;
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.silu");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.silu");
         self.gpu
             .silu_f32(x, &out)
             .map_err(|e| format!("flux gpu: silu: {e:?}"))?;
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         Ok(out)
     }
 
@@ -2226,12 +2145,12 @@ impl<'a> Gpuf<'a> {
         let out = self.alloc(&a.shape.clone())?;
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.add");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.add");
         self.gpu
             .add_f32(a, b, &out)
             .map_err(|e| format!("flux gpu: add: {e:?}"))?;
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         Ok(out)
     }
 
@@ -2242,13 +2161,13 @@ impl<'a> Gpuf<'a> {
         let in_dim = x_host.len();
         let timer = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
         let xg = self
             .gpu
             .upload_f32(x_host, &[1, in_dim])
             .map_err(|e| format!("flux gpu: upload {prefix}: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
         let xg = xg?;
         let lin = self.linear(
             &format!("{prefix}.in_layer.weight"),
@@ -2332,13 +2251,13 @@ impl<'a> Gpuf<'a> {
         // Stream embeddings.
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
         let img_host = self
             .gpu
             .upload_f32(&input.img, &[n_img, patch_in])
             .map_err(|e| format!("upload img: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         let img_host = img_host?;
         // The text stream is either already resident (denoise loop: uploaded
         // once per generation by the conditioning cache) or uploaded here
@@ -2346,15 +2265,15 @@ impl<'a> Gpuf<'a> {
         let txt_host = match txt_dev {
             Some(_) => None,
             None => {
-                let t =
-                    self.prof
-                        .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
+                let t = self
+                    .prof
+                    .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
                 let h = self
                     .gpu
                     .upload_f32(&input.txt, &[n_txt, txt_dim])
                     .map_err(|e| format!("upload txt: {e:?}"));
                 self.prof
-                    .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+                    .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
                 Some(h?)
             }
         };
@@ -3107,13 +3026,13 @@ impl<'a> Gpuf<'a> {
         let out = self.alloc(&[n, f])?;
         let t = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.silu");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.silu");
         let r = self
             .gpu
             .silu_mul_f32(gate, up, &out)
             .map_err(|e| format!("flux gpu: silu_mul: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r?;
         Ok(out)
     }
@@ -3138,7 +3057,7 @@ impl<'a> Gpuf<'a> {
         }
         let axes_dim = self.cfg.axes_dim;
         let theta = self.cfg.theta;
-        let t = self.prof.begin_gpu(
+        let t = self.prof.begin(
             &self.gpu.hip,
             self.gpu.active_stream.as_ref(),
             "norm.qk_rope",
@@ -3158,7 +3077,7 @@ impl<'a> Gpuf<'a> {
             )
             .map_err(|e| format!("flux2 gpu: {what}: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r
     }
 
@@ -3172,13 +3091,13 @@ impl<'a> Gpuf<'a> {
     ) -> Result<GpuTensor, String> {
         let timer = self
             .prof
-            .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "host.io");
         let r = self
             .gpu
             .upload_f32(data, shape)
             .map_err(|e| format!("flux2 gpu: upload {what}: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
         r
     }
 
@@ -3208,15 +3127,15 @@ impl<'a> Gpuf<'a> {
         d: usize,
     ) -> Result<(), String> {
         let view = dst.sub_offset(dst_row * d, n_rows * d);
-        let timer =
-            self.prof
-                .begin_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.copy");
+        let timer = self
+            .prof
+            .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), "elem.copy");
         let r = self
             .gpu
             .copy_d2d(src, &view, n_rows * d * DType::F32.size())
             .map_err(|e| format!("copy_into: {e:?}"));
         self.prof
-            .end_gpu(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
+            .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), timer);
         r
     }
 

@@ -969,6 +969,21 @@ pub fn reset_qwen35_recurrent(
     }
 }
 
+/// Reset Qwen4's complete request owner (PLE epoch plus every recurrent/QSA/
+/// hyper-connection buffer).  Unlike the legacy Qwen3.5 helper this delegates
+/// to the bundle's fallible reset so PLE worker invalidation and GPU state
+/// reset are attested together.  Non-Qwen4 models are a no-op.
+pub fn reset_qwen4_recurrent(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    if let Some(bundle) = m.qwen4_mut() {
+        bundle.reset(gpu).map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
+}
+
 // helper deepseek4_reasoning_prefix 23525..23560
 pub fn deepseek4_reasoning_prefix(mode: ThinkMode) -> &'static str {
     match mode {
@@ -1271,6 +1286,9 @@ pub fn fail_closed_reset_target_and_spec(
         }
     } else {
         // Post-guard / AR paths: reset via the bundle still on `m`.
+        if let Err(e) = reset_qwen4_recurrent(m, gpu) {
+            push_reset_err(&mut first_err, "reset_qwen4_recurrent", e);
+        }
         if let Err(e) = reset_qwen35_recurrent(m, gpu) {
             push_reset_err(&mut first_err, "reset_qwen35_recurrent", e);
         }

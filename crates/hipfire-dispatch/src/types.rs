@@ -124,19 +124,26 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
         | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
         | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
-        // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
-        // falling through to RotationPlan::None leaves x unrotated against weights
-        // that were encoded post-rotation, which is silent garbage, not an error.
-        MQ4G128 => RotationPlan::FwhtG128,
+        // MQ4G128 and MQ4G128V2 carry their own G128 activation basis.  V2
+        // uses the qt53 68-byte row format; it must not fall through to the
+        // natural-basis default.
+        MQ4G128 | MQ4G128V2 => RotationPlan::FwhtG128,
+        // qt=42 mfp4-E8 carries the SAME G128 activation basis as qt=53 —
+        // 128-element FWHT segments, sign seeds 43/1043, rotated by
+        // `rotate_x_mq_128`. Mapping it to FwhtG256 would feed x rotated in
+        // 256-wide segments into weights rotated in 128-wide ones: both are
+        // orthogonal, but they are NOT the same transform, so the result would
+        // be fluent garbage rather than a fault.
+        MFP4G32E8G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
         // in the natural basis, so x must NOT be rotated. Stated explicitly
         // rather than left to the `_` fallthrough below — by the same argument
-        // as the comment above, a dtype that lands on `None` by accident rather
-        // than by intent is precisely the silent-garbage failure mode, and
-        // whoever adds the next Lloyd variant should be forced to decide which
-        // side of this line it belongs on.
+        // as the comment above, a dtype that lands on `None` by accident
+        // rather than by intent is precisely the silent-garbage failure mode,
+        // and whoever adds the next Lloyd variant should be forced to decide
+        // which side of this line it belongs on.
         MQ2G256LloydU => RotationPlan::None,
         _ => RotationPlan::None,
     }
@@ -153,9 +160,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         // prerotated GEMV route.
         MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
         | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
-            GemvVariant::Prerotated
-        }
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 | MFP4G32E8G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -273,6 +279,11 @@ pub enum KernelKey {
     GemvMfp4G32PPrerotated,
     GemvMfp4G32E8Prerotated,
     GemvMfp4G32E8SoaPrerotated,
+    /// qt=42 mfp4-E8, 128-wide rotation group. Same E8 lattice body as the
+    /// MFP4G32E8 keys; only the activation basis and the kernel's coverage
+    /// arithmetic (whole 8-block groups + a masked remainder) differ.
+    GemvMfp4G32E8G128,
+    GemvMfp4G32E8G128Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -723,11 +734,20 @@ impl KernelKey {
             (MFP4G32P, Plain) => Ok(Self::GemvMfp4G32P),
             (MFP4G32E8, Plain) => Ok(Self::GemvMfp4G32E8),
             (MFP4G32E8SOA, Plain) => Ok(Self::GemvMfp4G32E8Soa),
+            (MFP4G32E8G128, Plain) => Ok(Self::GemvMfp4G32E8G128),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
             (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
+            // qt=53 is admitted only by typed Qwen4 sealed/dense consumers;
+            // generic family resolution remains an explicit refusal.
+            (MQ4G128V2, _) => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -760,6 +780,7 @@ impl KernelKey {
             MFP4G32P => Ok(Self::GemvMfp4G32PPrerotated),
             MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             MFP4G32E8SOA => Ok(Self::GemvMfp4G32E8SoaPrerotated),
+            MFP4G32E8G128 => Ok(Self::GemvMfp4G32E8G128Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -773,6 +794,12 @@ impl KernelKey {
             // Q4K/Q6K/HFQ3G256/HFQ6G256/HFQ2G256/HFP4G32). Rotation-needing dtypes not
             // enumerated above (e.g. MQ4G128 = FwhtG128) MUST NOT fall through — the
             // plain path would re-rotate already-rotated input — so they stay an Err.
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -806,6 +833,12 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -833,6 +866,12 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
+            MQ4G128V2 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "mq4g128v2_specialized_route_only",
+                arch: "",
+                quant: "MQ4G128V2",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "swiglu_residual",
@@ -862,7 +901,7 @@ impl KernelKey {
             HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
             | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
-            | MFP4G32E8 | MFP4G32E8SOA
+            | MFP4G32E8 | MFP4G32E8SOA | MFP4G32E8G128
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
@@ -891,6 +930,10 @@ impl KernelKey {
             // inherits the identical arch gating.
             MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            // qt=53 has a typed Qwen4 implementation, but no generic family
+            // implementation; keep it explicit so it cannot inherit a legacy
+            // MQ4G128 route.
+            MQ4G128V2 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

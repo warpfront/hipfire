@@ -174,6 +174,43 @@ Group stride, alignment (8-byte), and `K % 256 == 0` are all unchanged from qt=1
 
 ---
 
+## 2a · MQ4G128V2 (qt=53) row-local wire codec
+
+`MQ4G128V2` (qt=53) is the row-local companion to qt=44 for matrix shapes whose
+logical `K` is not divisible by 256.  It is a distinct format, not a shorter
+encoding of legacy `MQ4G128`: typed Qwen4 sealed/dense consumers admit qt=53
+through dedicated kernels, while generic loaders and GPU consumers MUST reject
+it rather than reinterpret it as the legacy format.
+The Qwen4 producer chooses qt=44 when `K % 256 == 0` and qt=53 otherwise.
+qt=52 remains Qwen4's non-weight raw-I64 metadata record and is not a
+quantized dtype.
+
+Each logical row is tiled independently as `ceil(K / 128)` groups.  A final
+partial group is zero-padded to 128 values before the FWHT-128 transform; the
+padding never consumes values from the next row.  Every group is exactly 68 B:
+
+| offset | size | field |
+|---|---|---|
+| `[0..2)` | fp16 | affine `scale` |
+| `[2..4)` | fp16 | affine `zero` |
+| `[4..68)` | 64 B | 4-bit payload, logical index `i` in low nibble for even `i`, high nibble for odd `i` |
+
+The transform uses the same sign/butterfly/sign sequence as the MQ line,
+normalized by `1/sqrt(128)`, with engine sign seeds **43** and **1043**.
+Quantization fits `w = q * scale + zero`, `q ∈ [0,15]`, against the
+round-tripped fp16 header values.  Constant or fp16-underflow groups encode
+`scale = 0`, `q = 0`, and the finite fp16 zero.  The exact payload extent is
+`rows * ceil(K / 128) * 68`, where `rows` is the product of all shape
+dimensions before the final logical-`K` dimension.
+
+qt=53 has dedicated GPU consumers only in the typed Qwen4 sealed/dense paths;
+generic GEMM/GEMV, llama, and dflash routes do not consume it.  It remains
+accepted for artifact transport and host-side validation, and any generic
+upload or dispatch attempt MUST fail explicitly rather than reinterpret it as
+qt=44, qt=45, or legacy MQ4G128.
+
+---
+
 ## 3 · Encoder
 
 For each 256-weight group, after the format's normal rotation (FWHT-256 for the MQ line,

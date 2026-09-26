@@ -23,6 +23,9 @@ Variant allowlisting:
 | One kernel wants special hipcc flags | §7 Per-kernel hipcc flags |
 | Large-M CDNA prefill | §8 rocBLAS / library GEMM |
 | Multi-wave WG, BW% ≪ peak, barrier in loop | §10 Barrier-free / nosync |
+| Prefill kernel moves bytes its consumer rounds away or reconverts | §11.1 Store what the consumer reads |
+| WMMA kernel with scattered epilogue stores / weight loads not overlapped | §11.2 WMMA structure |
+| SIMT kernel: shuffle-heavy reductions, 64-bit address math, serial scans | §11.3 SIMT kernels |
 | Already tried below | §9 Negative results — new mechanism only |
 
 ---
@@ -244,6 +247,19 @@ RDNA because CDNA won.
   `run_moe_prefill` Path-2 grouped WMMA substrate — do not resurrect from
   memory.
 
+### Qwen4 prefill campaign (gfx1151, 2026-09)
+
+Measured and rejected there (see "What did not work" and Appendix B of
+[`docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md`](../../../docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md)):
+
+- Grouped MoE WMMA: two 16-row blocks per wave, 2-deep group prefetch, 8
+  tiles per wave, `waves_per_eu` 7/8, half-wave decode via `permlanex16`,
+  whole-tile LDS staging with dynamic LDS (occupancy loss, `4ee60d768`).
+- Stacking two GEMMs that share X into one launch (shared gate+up: slower
+  than two launches).
+- More workgroups for a GEMM whose weight operand arrives cold: microbench
+  wins with a warm operand did not survive the pipeline (HC 320×10240 tiles).
+
 ---
 
 ## 10. Barrier-free / nosync (LDS → direct global)
@@ -279,6 +295,68 @@ product impact.
 **Anti-pattern:** "barriers are free on single-wave blocks." A 1-wave
 `__syncthreads` is largely a compiler fence; nosync variants there do not
 apply the multi-wave lesson.
+
+---
+
+## 11. Prefill traffic and structure levers (Qwen4, gfx1151)
+
+From the 2026-09 Qwen3.8-Flash-Next prefill campaign (185 → 1301 tok/s on
+one fixture). Numbers, KLD trail and every commit:
+[`docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md`](../../../docs/perf-checkpoints/2026-09-26-qwen4-prefill-autoresearch-gfx1151.md).
+Everything below except the WMMA route switches was bit-exact.
+
+### 11.1 Store what the consumer reads
+
+- **Narrow the stored type to the consumer's first rounding.** If every
+  reader rounds to BF16 before use, the producer stores RNE BF16 bits: same
+  values, half the bytes (MoE `*_bf16out` `f825e8022`, BF16 residual streams
+  `d134b3e50`).
+- **Producers emit the next GEMM's input format** (rotation/norm → F16:
+  `6ec3c5ee2`, `5bf7f3d80`, `9ece7d891`). Pin the F32 product with
+  `asm volatile("" : "+v"(x))` before the cast so fast-math cannot fold it
+  into an F16 multiply; the bytes then equal produce → convert.
+- **Fuse two-range epilogues by pairing rows in one tile.** Gate rows m..m+7
+  and up rows mi+m..mi+m+7 share a 16-row A tile; a second `permlanex16` pairs
+  them and the epilogue stores SwiGLU (`1dcf81c02`).
+
+### 11.2 WMMA kernel structure (gfx11)
+
+- **Packed epilogue:** in the 16×16 F32 C layout lane l < 16 holds rows 2j,
+  lane l+16 rows 2j+1; one `permlanex16` swap per pair gives 8 contiguous rows
+  per lane → one 16-byte store (`941b3c606`, `90da6b370`).
+- **Stage one quant group at a time, double-buffered in LDS:** group g+1's
+  coalesced loads in flight while group g decodes; small LDS keeps occupancy
+  (`5279f0525`, `c7ca999c3`).
+- **Several tiles per wave when the row operand repeats:** skewed MoE routing
+  lets one wave share each A load + decode across up to four slot tiles of an
+  expert (`908c1a1d3`). Microbench with captured real routing, not uniform.
+- **Nibble decode:** `v_perm` byte copy + AND-OR under 0x6400/0x5400 magic
+  F16 biases + one packed FMA per weight pair (`405469994`).
+- **LDS-only barriers:** `s_waitcnt lgkmcnt(0); s_barrier` instead of
+  `__syncthreads()`, whose WGP-mode fence also drains in-flight global
+  prefetches (`cc650be3a`; gfx11 only, keep `__syncthreads` elsewhere).
+- **Split accumulators across waves** to cut VGPRs (two waves per attention
+  head, each owning half of O^T, `3ee04a14a`).
+- **Tile shape is free when each output keeps its K order.** WMMA sums are
+  K-order dependent (a K permutation changed 74% of outputs), so change tiles,
+  never the K walk, when bit-exactness is the contract (`e9250084f`,
+  `55fea2e4d`).
+- **Algorithmic WMMA routes** (KLD-gated): chunked WY gated-delta recurrence
+  (`85d8fa53a`), dense causal attention when a sparse selection covers the
+  whole window (`97f5d7f2a`), BF16 GEMMs through an F16 weight shadow
+  (`2b4a5819c`).
+
+### 11.3 SIMT kernels
+
+- Exact tree reductions via `permlanex16` + `v_add_f32_dpp` (`bound_ctrl`)
+  instead of `ds_bpermute`; pack two trees per wave.
+- Buffer loads with uniform scalar offsets instead of 64-bit VGPR addresses;
+  scalar loads for block-uniform operands; `v_cvt_f32_ubyteN` for nibbles.
+- Issue the independent loads before the ordered reduction consumes them.
+- Token-parallel chunks for scans whose carried state only chunk 0 touches
+  (`3acdb8809`).
+- Resolve a per-token order once instead of in every consumer thread
+  (`fc94f16d3`).
 
 ---
 

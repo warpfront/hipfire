@@ -83,3 +83,5 @@
 49  MQ3G256V2     passthrough
 50  MQ2G256V2     passthrough
 51  MQ2G256LloydU  passthrough  Maple native-ternary (unrotated MQ2-Lloyd)
+42  MFP4G32E8G128  arch-loaded  mfp4-E8 with a 128-wide FWHT rotation group; wire layout byte-identical to qt=34 (16-B hdr + (K/32)x17 B), loader geometry owned by the model that emits it (qwen4 expert load path). Split out of qt=34 because its 256-wide segmentation cannot tile K=640
+53  MQ4G128V2    passthrough

@@ -13758,6 +13758,52 @@ impl Gpu {
             },
         )
     }
+
+    /// [`Gpu::hc_streams_init_from_embed_batched`] writing BF16 bits (RNE) into
+    /// the F32-typed `streams` buffer (see [`Gpu::qwen4_bf16_streams`]).
+    pub fn hc_streams_init_from_embed_batched_bf16(
+        &mut self,
+        embed: &GpuTensor,
+        streams: &GpuTensor,
+        hidden: i32,
+        hc_mult: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_streams_init_from_embed_batched",
+            kernels::HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC,
+            "hc_streams_init_from_embed_batched_bf16",
+        )?;
+        let ep = embed.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let mut h = hidden;
+        let mut hm = hc_mult;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut hm as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_streams_init_from_embed_batched_bf16",
+            [((hidden + 255) / 256) as u32, batch_size as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(sp);
+                b.push_i32(h);
+                b.push_i32(hm);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
     pub fn indexer_compressed_k_score(
         &mut self,
         q_idx: &GpuTensor,       // [H, D] fp16

@@ -18,11 +18,19 @@ use crate::tables::gemv_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
+fn reject_mq4g128v2() -> Result<(), DispatchError> {
+    Err(DispatchError::UnsupportedVariant {
+        family: "gemv",
+        variant: "mq4g128v2_specialized_route_only",
+        arch: "",
+        quant: "MQ4G128V2",
+    })
+}
 
 // ── Lightweight weight descriptor ──────────────────────
 
 /// Givens rotation metadata for ParoQuant weights (mirrors ParoRotation
-/// fields, which are all rdna_compute::GpuTensor — no circular dep).
+#[derive(Clone, Copy)]
 pub struct GivensRef<'a> {
     pub pairs: &'a GpuTensor,
     pub theta: &'a GpuTensor,
@@ -30,8 +38,7 @@ pub struct GivensRef<'a> {
     pub krot: usize,
 }
 
-/// Minimal weight reference for dispatch. Carries buffer, dtype, shape,
-/// the padded row stride (Q8HFQ), and rotation metadata.
+#[derive(Clone, Copy)]
 pub struct WeightRef<'a> {
     pub buf: &'a GpuTensor,
     pub dtype: DType,
@@ -241,6 +248,9 @@ impl GemvFamily {
         input: RotInput,
         y: &GpuTensor,
     ) -> Result<(), DispatchError> {
+        if w.dtype == DType::MQ4G128V2 {
+            reject_mq4g128v2()?;
+        }
         let x_buf = match input {
             RotInput::Raw(x) => {
                 let plan = crate::types::dtype_rotation_plan(w.dtype);
@@ -303,6 +313,9 @@ impl GemvFamily {
         gpu: &mut Gpu,
         params: &GemvParams,
     ) -> Result<(), DispatchError> {
+        if params.w.dtype == DType::MQ4G128V2 {
+            reject_mq4g128v2()?;
+        }
         let shape = ShapeInfo {
             batch_size: 1,
             head_dim: 0,
@@ -352,6 +365,9 @@ impl GemvFamily {
         x: &GpuTensor,
         inputs: &RotateInputs,
     ) -> Result<RotatedActivation, DispatchError> {
+        if w.dtype == DType::MQ4G128V2 {
+            reject_mq4g128v2()?;
+        }
         let plan = crate::types::dtype_rotation_plan(w.dtype);
         if plan == RotationPlan::None {
             return Err(DispatchError::UnsupportedVariant {
@@ -525,6 +541,11 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvMfp4G32E8Soa | K::GemvMfp4G32E8SoaPrerotated => {
             hip!(gpu.gemv_mfp4g32_e8_soa(w.buf, x, y, m, k))
         }
+        // qt=42. Same E8 lattice body, G128 activation basis, and a kernel that
+        // covers any K%128==0 instead of only K%256==0.
+        K::GemvMfp4G32E8G128 | K::GemvMfp4G32E8G128Prerotated => {
+            hip!(gpu.gemv_mfp4g32_e8g128(w.buf, x, y, m, k))
+        }
         other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }
@@ -557,6 +578,7 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
+        MQ4G128V2 => reject_mq4g128v2(),
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "residual",
@@ -598,6 +620,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
+        MQ4G128V2 => reject_mq4g128v2(),
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "swiglu_residual",

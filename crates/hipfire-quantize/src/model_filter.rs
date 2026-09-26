@@ -392,24 +392,42 @@ impl ProductTier {
 /// flat-routing on a quantized router shifts which experts a token sees — so
 /// prefer keeping `router` in the set unless you are explicitly testing it.
 pub(crate) fn is_q8_tensor(name: &str) -> bool {
-    let Some(class) = q8_class_of(name) else {
+    if q8_class_of(name).is_none() {
         return false;
-    };
+    }
     // A class named in HIPFIRE_FIXED_TIER / --fixed-tier is held above --format
     // even if it is not in HIPFIRE_Q8_CLASSES — including explicit q8.
     if fixed_tier_override_applies(name) {
         return true;
     }
-    match hipfire_config::developer_var("HIPFIRE_Q8_CLASSES") {
-        Ok(list) => {
-            // validated at startup; still handle empty list as no lift.
-            // `attn_full` independently retains self-attention without linear_attn.
-            list.split(',').any(|c| {
-                let c = c.trim();
-                c == class || (c == "attn_full" && is_attn_full_tensor(name))
-            })
-        }
-        Err(_) => true,
+    q8_classes_select(
+        name,
+        hipfire_config::developer_var("HIPFIRE_Q8_CLASSES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The class selection [`is_q8_tensor`] performs, as a pure function of the
+/// `HIPFIRE_Q8_CLASSES` spec: `Some(list)` selects the listed classes, `None`
+/// (unset) lifts every class.
+///
+/// Split out because the env read goes through the *immutable* process snapshot
+/// (`hipfire_config::process_value`, which never reads the ambient environment
+/// again). A test that sets the variable at runtime cannot reach it, so the
+/// contract is pinned here instead of through a process-global side effect.
+pub(crate) fn q8_classes_select(name: &str, spec: Option<&str>) -> bool {
+    let Some(class) = q8_class_of(name) else {
+        return false;
+    };
+    match spec {
+        // validated at startup; still handle empty list as no lift.
+        // `attn_full` independently retains self-attention without linear_attn.
+        Some(list) => list.split(',').any(|c| {
+            let c = c.trim();
+            c == class || (c == "attn_full" && is_attn_full_tensor(name))
+        }),
+        None => true,
     }
 }
 

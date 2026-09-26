@@ -1135,6 +1135,32 @@
         "size_bytes": 927611840
       }
     },
+    "qwen3.8:flash-next": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next.mq6q8-pleq8",
+      "size_gb": 125.5,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung. MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, language head, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. 125.5 GB on disk against 173.5 GB for the same recipe with BF16 PLE rows, and 75,776 device bytes per decoded token against 124,928. 22.7 tok/s decode at ctx128 (gfx1151, graph off, kv q8), the mq6q8 class. Needs a hipfire build whose qwen4 trunk source contract admits both packed trunk tiers and whose PLE admission accepts both row tiers. Native MTP is embedded and enabled by default on this recipe as of 6b9db7774: the interleaved route emits AR's exact tokens (first divergence none over 256 prose and 227 code tokens) and decodes at 95-106% of AR at the pinned fixtures, 92-95% end to end, against 33-48% when the work started. Acceptance is unchanged by the route and still below the same-family reference (per draft step: prose 0.412/0.203/0.071, code 0.735/0.611/0.295); the named remaining candidate is the MTP attention projections' Q8F16 tier. `hipfire bench` cannot measure this model - it fails closed at load on the max_seq contract - so MTP figures come from the serve path. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      }
+    },
+
+    "qwen3.8:flash-next-mq6q8-pleq8": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next.mq6q8-pleq8",
+      "size_gb": 125.5,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung. MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, language head, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. 125.5 GB on disk against 173.5 GB for the same recipe with BF16 PLE rows, and 75,776 device bytes per decoded token against 124,928. 22.7 tok/s decode at ctx128 (gfx1151, graph off, kv q8), the mq6q8 class. Needs a hipfire build whose qwen4 trunk source contract admits both packed trunk tiers and whose PLE admission accepts both row tiers. Native MTP is embedded and enabled by default on this recipe as of 6b9db7774: the interleaved route emits AR's exact tokens (first divergence none over 256 prose and 227 code tokens) and decodes at 95-106% of AR at the pinned fixtures, 92-95% end to end, against 33-48% when the work started. Acceptance is unchanged by the route and still below the same-family reference (per draft step: prose 0.412/0.203/0.071, code 0.735/0.611/0.295); the named remaining candidate is the MTP attention projections' Q8F16 tier. `hipfire bench` cannot measure this model - it fails closed at load on the max_seq contract - so MTP figures come from the serve path. Tested only on 128 GB-class Strix Halo, so the 128 GB catalog gate is conservative rather than a measured minimum.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      }
+    },
+
     "qwen3.5:0.8b-mq6": {
       "repo": "hipfire-models/qwen3.5-0.8b",
       "file": "qwen3.5-0.8b.mq6",

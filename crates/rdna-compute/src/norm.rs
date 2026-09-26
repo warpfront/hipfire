@@ -270,11 +270,15 @@ impl Gpu {
         result
     }
 
-    /// c = a + b (element-wise)
+    /// `c = a + b`, element-wise.
+    ///
+    /// Launched through the shared dispatch funnel so the kernarg pointers survive
+    /// stream capture and the launch reaches the retained recorder. The funnel
+    /// falls back to the ordinary `kernelParams` launch when nothing is capturing
+    /// or recording, so this is the plain path in the steady state.
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-        let func = &self.functions["add_f32"];
 
         let n = a.numel() as i32;
         let mut a_ptr = a.buf.as_ptr();
@@ -290,39 +294,7 @@ impl Gpu {
         ];
 
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
-        }
-    }
-
-    /// HIP-graphs-safe variant of `add_f32`. Uses `launch_maybe_blob` instead of
-    /// raw `launch_kernel` so kernarg pointers survive stream capture.
-    pub fn add_f32_graph_safe(
-        &mut self,
-        a: &GpuTensor,
-        b: &GpuTensor,
-        c: &GpuTensor,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-
-        let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut c_ptr = c.buf.as_ptr();
-        let mut n_val = n;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
-
-        let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        let grid = (n as u32).div_ceil(block);
         self.launch_maybe_blob(
             "add_f32",
             [grid, 1, 1],
@@ -330,12 +302,12 @@ impl Gpu {
             0,
             &mut params,
             || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(a_ptr);
-                bb.push_ptr(b_ptr);
-                bb.push_ptr(c_ptr);
-                bb.push_i32(n_val);
-                bb
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(b_ptr);
+                blob.push_ptr(c_ptr);
+                blob.push_i32(n_val);
+                blob
             },
         )
     }
@@ -611,8 +583,30 @@ impl Gpu {
         up: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
+        self.silu_mul_launch("silu_mul_f32", gate, up, out)
+    }
+
+    /// [`Gpu::silu_mul_f32`] of BF16-round-tripped gate and up, the result
+    /// round-tripped too ([`Gpu::bf16_round_trip_f32`]'s rounding): the
+    /// round trip / silu_mul / round trip sequence in one pass.
+    pub fn silu_mul_bf16_rt_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.silu_mul_launch("silu_mul_bf16_rt_f32", gate, up, out)
+    }
+
+    fn silu_mul_launch(
+        &mut self,
+        kernel: &'static str,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, "silu_mul_f32")?;
+        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, kernel)?;
 
         let n = gate.numel() as i32;
         let mut gate_ptr = gate.buf.as_ptr();
@@ -630,22 +624,16 @@ impl Gpu {
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "silu_mul_f32", bytes);
-        let result = self.launch_maybe_blob(
-            "silu_mul_f32",
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", kernel, bytes);
+        let result =
+            self.launch_maybe_blob(kernel, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(gate_ptr);
                 b.push_ptr(up_ptr);
                 b.push_ptr(out_ptr);
                 b.push_i32(n_val);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -1862,6 +1850,95 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// In-place exact BF16 round-trip over a contiguous slice in each strided
+    /// row. QSA uses this for the index-K half of an interleaved projection;
+    /// keep this on the bit-level round-trip kernel rather than the generic
+    /// tensor-op cast path.
+    pub fn bf16_round_trip_f32_strided(
+        &mut self,
+        x: &GpuTensor,
+        rows: usize,
+        row_offset: usize,
+        row_stride: usize,
+        width: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if x.dtype != DType::F32
+            || rows == 0
+            || width == 0
+            || row_offset
+                .checked_add(width)
+                .map_or(true, |end| end > row_stride)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_round_trip_f32_strided: invalid shape",
+            ));
+        }
+        let last = (rows - 1)
+            .checked_mul(row_stride)
+            .and_then(|base| base.checked_add(row_offset))
+            .and_then(|base| base.checked_add(width))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: shape overflow")
+            })?;
+        if last > x.numel() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_round_trip_f32_strided: buffer too small",
+            ));
+        }
+        let total = rows.checked_mul(width).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent overflow")
+        })?;
+        let rows_i = i32::try_from(rows).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: rows exceed i32")
+        })?;
+        let row_offset_i = i32::try_from(row_offset).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: offset exceeds i32")
+        })?;
+        let row_stride_i = i32::try_from(row_stride).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: stride exceeds i32")
+        })?;
+        let width_i = i32::try_from(width).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: width exceeds i32")
+        })?;
+        let total_i = i32::try_from(total).map_err(|_| {
+            hip_bridge::HipError::new(0, "bf16_round_trip_f32_strided: extent exceeds i32")
+        })?;
+        self.ensure_kernel(
+            "bf16_round_trip",
+            kernels::BF16_ROUND_TRIP_SRC,
+            "bf16_round_trip_f32_strided",
+        )?;
+        let xp = x.buf.as_ptr();
+        let block_size = 256u32;
+        let grid = ((total_i as u32 + block_size - 1) / block_size).max(1);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &rows_i as *const _ as *mut c_void,
+            &row_offset_i as *const _ as *mut c_void,
+            &row_stride_i as *const _ as *mut c_void,
+            &width_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "bf16_round_trip_f32_strided",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(rows_i);
+                b.push_i32(row_offset_i);
+                b.push_i32(row_stride_i);
+                b.push_i32(width_i);
+                b
+            },
+        )
     }
 
     /// Sigmoid activation, in-place.

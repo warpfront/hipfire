@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::e8;
 use crate::e8_gptq;
@@ -34,7 +34,10 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
     about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file. Not used by
+    /// Hugging Face model directory, model ID, or GGUF file. For
+    /// `--qwen4-flash-next`, use a local directory/file or the immutable
+    /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
+    /// `main`, tags, and short revisions are rejected. Not used by
     /// `--flux-pipe`, which names its own input.
     #[arg(
         long,
@@ -42,6 +45,18 @@ pub(crate) struct QuantizeArgs {
         required_unless_present = "flux_pipe"
     )]
     pub input: Option<String>,
+
+    /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
+    /// transactional path always includes typed PLE metadata, all PLE shards,
+    /// and native MTP experts; legacy recipe flags are ignored.
+    #[arg(long, conflicts_with = "flux_pipe")]
+    pub qwen4_flash_next: bool,
+    /// Explicit non-production bounded fixture mode for exercising the full
+    /// transactional writer with a compact local component. Production remains
+    /// the default and keeps the pinned checkpoint admission counts.
+    #[arg(long, value_name = "MODE", default_value = "production",
+          value_parser = ["production", "compact-fixture"])]
+    pub qwen4_component_mode: String,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]

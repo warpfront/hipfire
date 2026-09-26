@@ -2899,9 +2899,21 @@ pub struct RecordedHipLaunch {
     /// contiguous `extra` launch ABI. The model adapter owns the lifetime
     /// contract for pointer values recovered into allocation-wide effects.
     pub kernarg: Vec<u8>,
+    /// Dynamic kernarg fields the engine *named* at record time, each with one
+    /// owning dispatch offset. Replay re-derives every one of them from the
+    /// current position through `apply_kernarg_bindings_for_dispatch`; the
+    /// recorded bytes hold the capture-position values.
+    declared_kernarg_bindings: Vec<ReplayKernargBinding>,
     /// Allocation-wide effects recovered from typed kernel signatures and
     /// `hipMemGetAddressRange`. `None` means the launch must remain serialized.
     accesses: Option<Vec<RecordedResourceAccess>>,
+}
+
+impl RecordedHipLaunch {
+    /// Engine-declared dynamic kernarg fields for this launch.
+    pub(crate) fn declared_kernarg_bindings(&self) -> &[ReplayKernargBinding] {
+        &self.declared_kernarg_bindings
+    }
 }
 
 /// A dynamic retained-grid contract supplied by the engine at capture time.
@@ -2986,41 +2998,159 @@ pub(crate) fn gdn_requant_frames_for_dispatch(kernarg: &[u8], grid_z: u32) -> Re
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayKernargBinding {
-    GdnFrameU32 { offset: usize, frames: u32 },
-    PositionPlusU32 { offset: usize, addend: u32 },
+    GdnFrameU32 {
+        offset: usize,
+        frames: u32,
+    },
+    PositionPlusU32 {
+        offset: usize,
+        addend: u32,
+    },
+    /// Quotient form: `(position + addend) / divisor`. Declared by the lowering
+    /// that computes the same quotient host-side (for example a block count
+    /// derived from the decode position).
+    PositionDivU32 {
+        offset: usize,
+        addend: u32,
+        divisor: u32,
+    },
+    /// Remainder form: `(position + addend) % modulus`. Declared by the
+    /// lowering that computes the same remainder host-side (for example a ring
+    /// cursor into a bounded convolution history). `addend` is the row's offset
+    /// inside a multi-row chunk, so a chunk body stays correct without a
+    /// per-regime tape.
+    PositionModU32 {
+        offset: usize,
+        addend: u32,
+        modulus: u32,
+    },
+    /// Product form: `position * factor`. Declared by a lowering that turns a
+    /// per-row buffer offset into a scalar (`dst_col_offset`) so the tape keeps
+    /// a position-independent pointer.
+    PositionMulU32 {
+        offset: usize,
+        factor: u32,
+    },
 }
 
 impl ReplayKernargBinding {
+    /// The single kernarg byte offset this binding owns. Exactly one binding may
+    /// own an offset on a dispatch; two owners would double-patch one slot.
+    pub(crate) const fn offset(self) -> usize {
+        match self {
+            Self::GdnFrameU32 { offset, .. }
+            | Self::PositionPlusU32 { offset, .. }
+            | Self::PositionDivU32 { offset, .. }
+            | Self::PositionModU32 { offset, .. }
+            | Self::PositionMulU32 { offset, .. } => offset,
+        }
+    }
+
+    /// True when the bound value is a pure function of the decode position, so
+    /// two recordings taken at different positions are *expected* to differ in
+    /// this slot rather than leaving it unexplained.
+    pub(crate) const fn is_position_derived(self) -> bool {
+        matches!(
+            self,
+            Self::PositionPlusU32 { .. }
+                | Self::PositionDivU32 { .. }
+                | Self::PositionModU32 { .. }
+                | Self::PositionMulU32 { .. }
+        )
+    }
+
+    /// Stable encoding of this binding's identity for the tape sequence hash.
+    /// Fixed-size so hashing never allocates.
+    pub(crate) fn identity_bytes(self) -> [u8; 17] {
+        let (tag, param_a, param_b) = match self {
+            Self::GdnFrameU32 { frames, .. } => (0u8, frames, 0u32),
+            Self::PositionPlusU32 { addend, .. } => (1u8, addend, 0u32),
+            Self::PositionDivU32 {
+                addend, divisor, ..
+            } => (2u8, addend, divisor),
+            Self::PositionModU32 {
+                addend, modulus, ..
+            } => (3u8, addend, modulus),
+            Self::PositionMulU32 { factor, .. } => (4u8, factor, 0u32),
+        };
+        let mut bytes = [0u8; 17];
+        bytes[0] = tag;
+        bytes[1..9].copy_from_slice(&(self.offset() as u64).to_le_bytes());
+        bytes[9..13].copy_from_slice(&param_a.to_le_bytes());
+        bytes[13..17].copy_from_slice(&param_b.to_le_bytes());
+        bytes
+    }
+
     fn apply(self, kernarg_bytes: &mut [u8], position: usize) -> Result<(), String> {
-        let len = kernarg_bytes.len();
+        let position_u32 =
+            u32::try_from(position).map_err(|_| "decode position exceeds u32".to_owned())?;
         match self {
             Self::GdnFrameU32 { offset, frames } => {
                 let frame = crate::norm::reserve_gdn_requant_frames(frames);
-                let end = offset
-                    .checked_add(4)
-                    .ok_or_else(|| "kernarg binding offset overflow".to_owned())?;
-                let slot = kernarg_bytes.get_mut(offset..end).ok_or_else(|| {
-                    format!("GDN kernarg binding offset {offset} out of bounds (len {len})")
-                })?;
-                slot.copy_from_slice(&frame.to_le_bytes());
-                Ok(())
+                write_kernarg_u32(kernarg_bytes, offset, frame, "GDN kernarg binding")
             }
             Self::PositionPlusU32 { offset, addend } => {
-                let value = u32::try_from(position)
-                    .map_err(|_| "decode position exceeds u32".to_owned())?
+                let value = position_u32
                     .checked_add(addend)
                     .ok_or_else(|| "PositionPlusU32 overflow".to_owned())?;
-                let end = offset
-                    .checked_add(4)
-                    .ok_or_else(|| "kernarg binding offset overflow".to_owned())?;
-                let slot = kernarg_bytes.get_mut(offset..end).ok_or_else(|| {
-                    format!("kernarg binding offset {offset} out of bounds (len {len})")
-                })?;
-                slot.copy_from_slice(&value.to_ne_bytes());
-                Ok(())
+                write_kernarg_u32(kernarg_bytes, offset, value, "kernarg binding")
+            }
+            Self::PositionDivU32 {
+                offset,
+                addend,
+                divisor,
+            } => {
+                if divisor == 0 {
+                    return Err("PositionDivU32 divisor must be non-zero".to_owned());
+                }
+                let value = position_u32
+                    .checked_add(addend)
+                    .ok_or_else(|| "PositionDivU32 overflow".to_owned())?
+                    / divisor;
+                write_kernarg_u32(kernarg_bytes, offset, value, "kernarg binding")
+            }
+            Self::PositionModU32 {
+                offset,
+                addend,
+                modulus,
+            } => {
+                if modulus == 0 {
+                    return Err("PositionModU32 modulus must be non-zero".to_owned());
+                }
+                let value = position_u32
+                    .checked_add(addend)
+                    .ok_or_else(|| "PositionModU32 overflow".to_owned())?
+                    % modulus;
+                write_kernarg_u32(kernarg_bytes, offset, value, "kernarg binding")
+            }
+            Self::PositionMulU32 { offset, factor } => {
+                let value = position_u32
+                    .checked_mul(factor)
+                    .ok_or_else(|| "PositionMulU32 overflow".to_owned())?;
+                write_kernarg_u32(kernarg_bytes, offset, value, "kernarg binding")
             }
         }
     }
+}
+
+/// Write one 4-byte native-endian kernarg scalar with an explicit range check.
+/// Every binding kind funnels through this, so an out-of-range offset can never
+/// be a per-variant difference.
+fn write_kernarg_u32(
+    kernarg_bytes: &mut [u8],
+    offset: usize,
+    value: u32,
+    label: &str,
+) -> Result<(), String> {
+    let len = kernarg_bytes.len();
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| format!("{label} offset overflow"))?;
+    let slot = kernarg_bytes
+        .get_mut(offset..end)
+        .ok_or_else(|| format!("{label} offset {offset} out of bounds (len {len})"))?;
+    slot.copy_from_slice(&value.to_ne_bytes());
+    Ok(())
 }
 
 /// Opaque snapshot of one completed recording's per-launch kernarg blocks.
@@ -3070,6 +3200,47 @@ pub(crate) fn apply_kernarg_bindings_for_dispatch(
     for (dispatch, binding) in bindings {
         if *dispatch == dispatch_index {
             binding.apply(kernarg_bytes, position)?;
+        }
+    }
+    Ok(())
+}
+
+/// Merge every engine-declared kernarg binding from the retained prefix into the
+/// prepared binding set.
+///
+/// One owner per `(dispatch, offset)`: a second binding for the same slot would
+/// patch it twice, so the collision is rejected rather than resolved by order.
+/// The recorded-HIP oracle does not need this — it reads each launch's declared
+/// bindings directly — but both transports must agree on which slots are
+/// dynamic, and this is where PM4 records that set.
+fn merge_declared_kernarg_bindings(
+    launches: &[RecordedHipLaunch],
+    prefix: usize,
+    bindings: &mut Vec<(usize, ReplayKernargBinding)>,
+) -> Result<(), String> {
+    for (dispatch, launch) in launches.iter().take(prefix).enumerate() {
+        for binding in launch.declared_kernarg_bindings() {
+            // A model lowering may declare position-derived fields only. The GDN
+            // frame counter is derived by this layer from the recorded launch
+            // itself, so declaring it would be a second owner, not a declaration.
+            if !binding.is_position_derived() {
+                return Err(format!(
+                    "{}: declared kernarg binding at offset {} is not position-derived",
+                    launch.kernel,
+                    binding.offset()
+                ));
+            }
+            let offset = binding.offset();
+            if bindings
+                .iter()
+                .any(|(index, existing)| *index == dispatch && existing.offset() == offset)
+            {
+                return Err(format!(
+                    "{}: dynamic kernarg offset {offset} at dispatch {dispatch} already has an owner",
+                    launch.kernel
+                ));
+            }
+            bindings.push((dispatch, *binding));
         }
     }
     Ok(())
@@ -3127,6 +3298,16 @@ fn replay_sequence_hash<'a>(launches: impl IntoIterator<Item = &'a RecordedHipLa
                     hash ^= u64::from(byte);
                     hash = hash.wrapping_mul(0x100000001b3);
                 }
+            }
+        }
+        // Declared dynamic kernarg fields are tape identity: two tapes that
+        // differ only in which slot is position-derived are different contracts.
+        hash ^= launch.declared_kernarg_bindings.len() as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        for binding in &launch.declared_kernarg_bindings {
+            for byte in binding.identity_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
             }
         }
     }
@@ -3929,9 +4110,37 @@ pub struct ReplayController {
     unknown_effect_launches: usize,
     /// Opt-in latch for daemon-owned post-generate route-proof markers.
     route_proof_log: bool,
+    /// Route identities (live expert pointer mappings) the tape was captured
+    /// against, keyed by the route's own stable table identity. A retained plan
+    /// dereferences pointer tables without re-uploading them, so a different
+    /// mapping for the same key means the tape names different tensors. Keyed,
+    /// not single-valued: one model has one mapping per layer.
+    route_identities: BTreeMap<u64, String>,
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
+    /// Shadow-only executor override for the next eligible forward.
+    shadow_body_route: Option<ShadowBodyRoute>,
+}
+
+/// Which executor the retained body uses on the next eligible forward.
+///
+/// Production controllers never set this: the executor follows from the
+/// prepared plan and the request backend. A manual shadow controller sets it so
+/// one prepared tape can be compared across the exact-kernarg HIP oracle, the
+/// retained transport, and ordinary HIP without re-capturing between arms —
+/// which is what the multi-position state-parity gate needs. Identity matters as
+/// much as the transport here: the oracle re-executes the *recorded* HIP launch
+/// sequence (kernargs and all), so a divergence it reports is a divergence
+/// between ordinary HIP and the byte-exact captured dispatch stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShadowBodyRoute {
+    /// Submit the prepared plan over its retained transport.
+    Plan,
+    /// Re-execute the recorded HIP launch prefix (`recorded_hip_prefix_at`).
+    HipOracle,
+    /// Run the ordinary HIP body (the comparison baseline).
+    Hip,
 }
 
 impl ReplayController {
@@ -3982,9 +4191,11 @@ impl ReplayController {
             radiowave_effect_launches: 0,
             fallback_effect_launches: 0,
             route_proof_log: route_proof_log_requested(),
+            route_identities: BTreeMap::new(),
             prepared_max_position: None,
             synthesized_position_bindings: Vec::new(),
             position_bindings_calibrated: false,
+            shadow_body_route: None,
         }
     }
 
@@ -4093,8 +4304,10 @@ impl ReplayController {
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
         self.prepared_max_position = None;
+        self.route_identities.clear();
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
+        self.shadow_body_route = None;
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -4107,6 +4320,30 @@ impl ReplayController {
         let transport = self.transport;
         let auto_lifecycle = self.auto_lifecycle;
         self.reset_for_model(request, transport, auto_lifecycle);
+    }
+
+    /// Set the executor the retained body uses on the next eligible forward.
+    ///
+    /// Only a manual shadow controller may use this: production adoption reads
+    /// the executor from the prepared plan. `None` restores that default.
+    pub fn set_shadow_body_route(&mut self, route: Option<ShadowBodyRoute>) {
+        self.shadow_body_route = route;
+    }
+
+    pub fn shadow_body_route(&self) -> Option<ShadowBodyRoute> {
+        self.shadow_body_route
+    }
+
+    /// Which transport the *currently prepared* plan uses, if any.
+    ///
+    /// A shadow arm prepares its plan itself, so the plan that exists — not the
+    /// controller's configured transport — decides which replay entry submits it.
+    pub fn prepared_pm4_plan_ready(&self) -> bool {
+        self.prepared_pm4.is_some()
+    }
+
+    pub fn prepared_aql_plan_ready(&self) -> bool {
+        self.prepared.is_some() && self.prepared_pm4.is_none()
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -4138,34 +4375,34 @@ impl ReplayController {
             .map(|prepared| (prepared.queue_count(), prepared.phase_count()))
     }
 
+    /// Identity of the installed plan.
+    ///
+    /// The plan that exists decides which transport's identity this is: an
+    /// adapter (or a shadow arm) prepares the transport it chooses, and a
+    /// controller that answered "no identity" while holding an installed plan
+    /// would report an unproven route as an absent one.
     pub fn prepared_route_identity(&self) -> Option<PreparedReplayIdentity> {
-        match self.transport {
-            ReplayTransport::AqlPackets => {
-                self.prepared
-                    .as_ref()
-                    .map(|prepared| PreparedReplayIdentity {
-                        dispatch_count: prepared.dispatch_count(),
-                        packet_count: Some(prepared.packet_count()),
-                        queue_id: prepared.queue_id(),
-                        command_dwords: None,
-                        // Linear AQL is a single-queue, single-phase batch graph.
-                        queue_count: 1,
-                        phase_count: 1,
-                    })
-            }
-            ReplayTransport::Pm4Ib => {
-                self.prepared_pm4
-                    .as_ref()
-                    .map(|prepared| PreparedReplayIdentity {
-                        dispatch_count: prepared.dispatch_count(),
-                        packet_count: pm4_packet_identity(prepared.packet_count()),
-                        queue_id: prepared.queue_id(),
-                        command_dwords: Some(prepared.command_dwords()),
-                        queue_count: prepared.queue_count(),
-                        phase_count: prepared.phase_count(),
-                    })
-            }
+        if let Some(prepared) = self.prepared_pm4.as_ref() {
+            return Some(PreparedReplayIdentity {
+                dispatch_count: prepared.dispatch_count(),
+                packet_count: pm4_packet_identity(prepared.packet_count()),
+                queue_id: prepared.queue_id(),
+                command_dwords: Some(prepared.command_dwords()),
+                queue_count: prepared.queue_count(),
+                phase_count: prepared.phase_count(),
+            });
         }
+        self.prepared
+            .as_ref()
+            .map(|prepared| PreparedReplayIdentity {
+                dispatch_count: prepared.dispatch_count(),
+                packet_count: Some(prepared.packet_count()),
+                queue_id: prepared.queue_id(),
+                command_dwords: None,
+                // Linear AQL is a single-queue, single-phase batch graph.
+                queue_count: 1,
+                phase_count: 1,
+            })
     }
 
     pub fn replay_observation(&self) -> ReplayObservation {
@@ -4701,19 +4938,12 @@ impl ReplayController {
                 dynamic_kernarg_bindings.push((*dispatch, *binding));
             }
         }
-        dynamic_kernarg_bindings.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| {
-                let ao = match a.1 {
-                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
-                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
-                };
-                let bo = match b.1 {
-                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
-                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
-                };
-                ao.cmp(&bo)
-            })
-        });
+        // Engine-declared bindings travel with their launch and merge the same
+        // way. A slot with two owners would be patched twice, so it fails closed.
+        merge_declared_kernarg_bindings(&self.recorded, prefix, &mut dynamic_kernarg_bindings)
+            .map_err(|reason| format!("retained PM4 kernarg bindings: {reason}"))?;
+        dynamic_kernarg_bindings
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.offset().cmp(&b.1.offset())));
 
         let gfx12_gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
@@ -5419,6 +5649,7 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.prepared = None;
         self.prepared_max_position = None;
+        self.route_identities.clear();
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
         Ok(())
@@ -5574,6 +5805,16 @@ impl ReplayController {
                 let earlier_bytes = &earlier_entry.kernarg[offset..offset + 4];
                 let current_bytes = &current_launch.kernarg[offset..offset + 4];
                 if earlier_bytes != current_bytes {
+                    // A named field is not an unexplained difference: the engine
+                    // declared this offset dynamic, so replay re-derives it.
+                    if current_launch
+                        .declared_kernarg_bindings()
+                        .iter()
+                        .any(|binding| binding.offset() == offset)
+                    {
+                        offset += 4;
+                        continue;
+                    }
                     // Skip GDN frame field.
                     if is_gdn && offset == 76 {
                         offset += 4;
@@ -5636,19 +5877,7 @@ impl ReplayController {
             }
         }
         // Order by (dispatch, offset) — already in order, but enforce.
-        new_bindings.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| {
-                let ao = match a.1 {
-                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
-                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
-                };
-                let bo = match b.1 {
-                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
-                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
-                };
-                ao.cmp(&bo)
-            })
-        });
+        new_bindings.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.offset().cmp(&b.1.offset())));
         let count = new_bindings.len();
         self.synthesized_position_bindings = new_bindings;
         self.position_bindings_calibrated = true;
@@ -5665,6 +5894,7 @@ impl ReplayController {
         shared_mem: u32,
         kernarg: &[u8],
         grid_binding: Option<ReplayGridBinding>,
+        declared_kernarg_bindings: &[ReplayKernargBinding],
     ) {
         if !self.is_recording() {
             return;
@@ -5709,6 +5939,7 @@ impl ReplayController {
             shared_mem,
             kernarg,
             grid_binding,
+            declared_kernarg_bindings,
             accesses,
         );
     }
@@ -5724,7 +5955,15 @@ impl ReplayController {
         kernarg: &[u8],
     ) {
         self.record_hip_launch_with_accesses(
-            kernel, artifact, grid, block, shared_mem, kernarg, None, None,
+            kernel,
+            artifact,
+            grid,
+            block,
+            shared_mem,
+            kernarg,
+            None,
+            &[],
+            None,
         );
     }
 
@@ -5737,6 +5976,7 @@ impl ReplayController {
         shared_mem: u32,
         kernarg: &[u8],
         grid_binding: Option<ReplayGridBinding>,
+        declared_kernarg_bindings: &[ReplayKernargBinding],
         accesses: Option<Vec<RecordedResourceAccess>>,
     ) {
         if !self.is_recording() {
@@ -5754,6 +5994,7 @@ impl ReplayController {
             shared_mem,
             grid_binding,
             kernarg: kernarg.to_vec(),
+            declared_kernarg_bindings: declared_kernarg_bindings.to_vec(),
             accesses,
         });
     }
@@ -5802,6 +6043,40 @@ impl ReplayController {
 
     pub fn uses_pm4_transport(&self) -> bool {
         self.transport == ReplayTransport::Pm4Ib
+    }
+
+    /// Whether the *current forward* is inside the retained body: the controller
+    /// would record this forward into the tape, or route it through a prepared
+    /// plan.
+    ///
+    /// This is the scope a launch-level admission guard must use. A forward that
+    /// merely has a replay backend enabled — prefill, an ineligible call, or an
+    /// already-poisoned route — is not in the retained body and must keep running
+    /// on HIP, so a route that cannot be retained degrades the model to HIP
+    /// instead of making every forward fail.
+    pub fn retained_body_active(&self) -> bool {
+        self.is_recording() || self.should_route_aql() || self.should_route_pm4()
+    }
+
+    /// Latch one route identity (a live expert pointer mapping) for the tape
+    /// being recorded, keyed by the route's own stable table identity, and
+    /// require every later observation under that key to match.
+    ///
+    /// Called by a route that knows its pointer mapping while the retained body is
+    /// active. A mismatch means the tape was captured against a different mapping,
+    /// so replaying it would dereference tensors the plan never validated.
+    pub fn note_route_identity(&mut self, key: u64, identity: &str) -> Result<(), String> {
+        match self.route_identities.get(&key) {
+            None => {
+                self.route_identities.insert(key, identity.to_owned());
+                Ok(())
+            }
+            Some(latched) if latched == identity => Ok(()),
+            Some(latched) => Err(format!(
+                "retained route identity for table {key:#x} changed while recording: latched \
+                 {latched}, observed {identity}"
+            )),
+        }
     }
 
     pub fn poison(&mut self, reason: impl Into<String>) {
@@ -6085,6 +6360,7 @@ mod tests {
             block: [32, 1, 1],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: None,
         };
@@ -6450,6 +6726,7 @@ mod tests {
                 block: [32, 1, 1],
                 shared_mem: 0,
                 grid_binding: None,
+                declared_kernarg_bindings: Vec::new(),
                 kernarg: vec![1, 2, 3, 4],
                 accesses: None,
             },
@@ -6460,6 +6737,7 @@ mod tests {
                 block: [64, 1, 1],
                 shared_mem: 128,
                 grid_binding: None,
+                declared_kernarg_bindings: Vec::new(),
                 kernarg: vec![5, 6],
                 accesses: None,
             },
@@ -6525,6 +6803,7 @@ mod tests {
             block: [32, 1, 1],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: None,
         };
@@ -7791,6 +8070,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(vec![access]),
         };
@@ -7846,6 +8126,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(vec![RecordedResourceAccess {
                 allocation_base: base,
@@ -7884,6 +8165,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(vec![RecordedResourceAccess {
                 allocation_base: base,
@@ -7914,6 +8196,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(vec![RecordedResourceAccess {
                 allocation_base: base,
@@ -7979,6 +8262,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(vec![RecordedResourceAccess {
                 allocation_base: 0x1000,
@@ -8044,6 +8328,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(
                 accesses
@@ -8103,6 +8388,7 @@ mod tests {
             block: [1; 3],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: Some(
                 accesses
@@ -8494,6 +8780,309 @@ mod tests {
             frames: 1,
         };
         assert!(bad.apply(&mut small, 0).is_err());
+    }
+
+    #[test]
+    fn position_div_binding_rederives_the_host_quotient() {
+        // `block_count = (position + rows) / compress` is computed host-side in
+        // the lowering; the declared binding must reproduce it for every replay
+        // position, and reject the shapes that would write a wrong slot.
+        let mut kernarg = vec![0u8; 16];
+        let binding = ReplayKernargBinding::PositionDivU32 {
+            offset: 8,
+            addend: 1,
+            divisor: 4,
+        };
+        for (position, expected) in [(1usize, 0u32), (3, 1), (4, 1), (11, 3), (64, 16)] {
+            binding.apply(&mut kernarg, position).unwrap();
+            let value = u32::from_ne_bytes(kernarg[8..12].try_into().unwrap());
+            assert_eq!(value, expected, "position {position}");
+        }
+
+        let zero_divisor = ReplayKernargBinding::PositionDivU32 {
+            offset: 0,
+            addend: 0,
+            divisor: 0,
+        };
+        assert!(zero_divisor.apply(&mut kernarg, 1).is_err());
+        let out_of_range = ReplayKernargBinding::PositionDivU32 {
+            offset: 13,
+            addend: 0,
+            divisor: 4,
+        };
+        assert!(out_of_range.apply(&mut kernarg, 1).is_err());
+        let overflow = ReplayKernargBinding::PositionDivU32 {
+            offset: 0,
+            addend: 1,
+            divisor: 4,
+        };
+        assert!(overflow.apply(&mut kernarg, u32::MAX as usize).is_err());
+    }
+
+    #[test]
+    fn position_mod_binding_rederives_the_ring_cursor() {
+        // GDN convolution cursor: `(position + row_index) % history_rows`.
+        let mut kernarg = vec![0u8; 16];
+        let decode = ReplayKernargBinding::PositionModU32 {
+            offset: 4,
+            addend: 0,
+            modulus: 3,
+        };
+        for (position, expected) in [(0usize, 0u32), (1, 1), (2, 2), (3, 0), (10, 1)] {
+            decode.apply(&mut kernarg, position).unwrap();
+            let value = u32::from_ne_bytes(kernarg[4..8].try_into().unwrap());
+            assert_eq!(value, expected, "position {position}");
+        }
+        // Row 2 of a chunk starting at position 4 has ring slot (4 + 2) % 3 = 0.
+        let chunk_row = ReplayKernargBinding::PositionModU32 {
+            offset: 4,
+            addend: 2,
+            modulus: 3,
+        };
+        chunk_row.apply(&mut kernarg, 4).unwrap();
+        assert_eq!(u32::from_ne_bytes(kernarg[4..8].try_into().unwrap()), 0);
+        chunk_row.apply(&mut kernarg, 1).unwrap();
+        assert_eq!(u32::from_ne_bytes(kernarg[4..8].try_into().unwrap()), 0);
+
+        let zero_modulus = ReplayKernargBinding::PositionModU32 {
+            offset: 0,
+            addend: 0,
+            modulus: 0,
+        };
+        assert!(zero_modulus.apply(&mut kernarg, 1).is_err());
+        let overflow = ReplayKernargBinding::PositionModU32 {
+            offset: 0,
+            addend: 2,
+            modulus: 3,
+        };
+        assert!(overflow
+            .apply(&mut kernarg, (u32::MAX - 1) as usize)
+            .is_err());
+    }
+
+    #[test]
+    fn position_mul_binding_rederives_a_row_offset() {
+        // `dst_col_offset = position * index_kv_width` for the index-key write.
+        let mut kernarg = vec![0u8; 40];
+        let binding = ReplayKernargBinding::PositionMulU32 {
+            offset: 32,
+            factor: 128,
+        };
+        for (position, expected) in [(0usize, 0u32), (1, 128), (17, 2176), (2047, 262_016)] {
+            binding.apply(&mut kernarg, position).unwrap();
+            assert_eq!(
+                u32::from_ne_bytes(kernarg[32..36].try_into().unwrap()),
+                expected,
+                "position {position}"
+            );
+        }
+        let out_of_range = ReplayKernargBinding::PositionMulU32 {
+            offset: 37,
+            factor: 128,
+        };
+        assert!(out_of_range.apply(&mut kernarg, 1).is_err());
+        let overflow = ReplayKernargBinding::PositionMulU32 {
+            offset: 0,
+            factor: u32::MAX,
+        };
+        assert!(overflow.apply(&mut kernarg, 2).is_err());
+    }
+
+    #[test]
+    fn retained_body_scope_is_the_eligible_forward_not_the_backend_choice() {
+        // The scope a launch-level guard must use: recording, or routing a
+        // prepared plan. An armed-but-idle controller, a captured-but-unprepared
+        // one, and a poisoned one are NOT in the retained body, so their forwards
+        // must keep running on HIP.
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        assert_eq!(controller.state(), ReplayState::Armed);
+        assert!(
+            !controller.retained_body_active(),
+            "an armed-but-idle controller must not make HIP forwards fail"
+        );
+
+        controller.begin_capture().expect("open capture window");
+        assert!(
+            controller.retained_body_active(),
+            "recording is the retained body"
+        );
+
+        // An ineligible forward inside the window (prefill, spec, MTP) is not.
+        controller.set_forward_eligible(false);
+        assert!(
+            !controller.retained_body_active(),
+            "an ineligible forward must not be treated as the retained body"
+        );
+        controller.set_forward_eligible(true);
+
+        let summary = controller.finish_capture().expect("close capture window");
+        assert_eq!(summary.launch_count, 0);
+        assert_eq!(controller.state(), ReplayState::Captured);
+        assert!(
+            !controller.retained_body_active(),
+            "a captured-but-unprepared route still runs HIP"
+        );
+
+        controller.poison("test poison");
+        assert_eq!(controller.state(), ReplayState::Fallback);
+        assert!(
+            !controller.retained_body_active(),
+            "a poisoned route must fall back to HIP, not keep failing forwards"
+        );
+    }
+
+    #[test]
+    fn declared_binding_is_not_an_unexplained_kernarg_difference() {
+        // A named dynamic field changes with position by design. Differencing
+        // two recordings must skip it, while still synthesizing the ordinary
+        // affine position scalar sitting next to it.
+        const CURSOR: usize = 4;
+        let mut kernarg = vec![0u8; 16];
+        kernarg[CURSOR..CURSOR + 4].copy_from_slice(&0u32.to_ne_bytes());
+        kernarg[8..12].copy_from_slice(&0u32.to_ne_bytes());
+
+        let declared = [ReplayKernargBinding::PositionModU32 {
+            offset: CURSOR,
+            addend: 0,
+            modulus: 3,
+        }];
+        let mut earlier = ReplayController::new(ReplayBackendRequest::Auto);
+        earlier.record_hip_launch_with_accesses(
+            "gated_delta_conv_bf16_f32",
+            None,
+            [4, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernarg,
+            None,
+            &declared,
+            None,
+        );
+        let snapshot = earlier.snapshot_recorded_kernargs();
+
+        let mut current = ReplayController::new(ReplayBackendRequest::Auto);
+        let mut current_kernarg = kernarg.clone();
+        current_kernarg[CURSOR..CURSOR + 4].copy_from_slice(&1u32.to_ne_bytes());
+        current_kernarg[8..12].copy_from_slice(&4u32.to_ne_bytes());
+        current.record_hip_launch_with_accesses(
+            "gated_delta_conv_bf16_f32",
+            None,
+            [4, 1, 1],
+            [256, 1, 1],
+            0,
+            &current_kernarg,
+            None,
+            &declared,
+            None,
+        );
+
+        let synthesized = current
+            .synthesize_position_bindings(&snapshot, 0, 4)
+            .expect("declared offset must not be treated as unexplained");
+        assert_eq!(synthesized, 1, "only the affine scalar is synthesized");
+        assert_eq!(
+            current.synthesized_position_bindings(),
+            &[(
+                0,
+                ReplayKernargBinding::PositionPlusU32 {
+                    offset: 8,
+                    addend: 0
+                }
+            )],
+            "declared offset {CURSOR} must be skipped, offset 8 discovered"
+        );
+    }
+
+    #[test]
+    fn declared_binding_collision_fails_closed() {
+        // Two owners for one slot would patch it twice; the merge must refuse
+        // instead of letting declaration order decide the result.
+        let declared = [ReplayKernargBinding::PositionModU32 {
+            offset: 4,
+            addend: 0,
+            modulus: 3,
+        }];
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.record_hip_launch_with_accesses(
+            "gated_delta_conv_bf16_f32",
+            None,
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &[0u8; 16],
+            None,
+            &declared,
+            None,
+        );
+        let launches = controller.recorded_launches().to_vec();
+        let mut bindings: Vec<(usize, ReplayKernargBinding)> = vec![(
+            0,
+            ReplayKernargBinding::GdnFrameU32 {
+                offset: 4,
+                frames: 1,
+            },
+        )];
+        let error = merge_declared_kernarg_bindings(&launches, 1, &mut bindings)
+            .expect_err("second owner for one offset must be rejected");
+        assert!(error.contains("already has an owner"), "{error}");
+        assert_eq!(bindings.len(), 1, "the rejected binding is not pushed");
+    }
+
+    #[test]
+    fn a_declared_frame_counter_is_not_a_position_binding() {
+        // The GDN frame counter belongs to the replay layer, which derives it
+        // from the recorded launch. A model lowering must not be able to claim
+        // it as a declared position field.
+        let declared = [ReplayKernargBinding::GdnFrameU32 {
+            offset: 76,
+            frames: 1,
+        }];
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.record_hip_launch_with_accesses(
+            "gated_delta_net_q8_fast",
+            None,
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &[0u8; 80],
+            None,
+            &declared,
+            None,
+        );
+        let launches = controller.recorded_launches().to_vec();
+        let mut bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
+        let error = merge_declared_kernarg_bindings(&launches, 1, &mut bindings)
+            .expect_err("a frame counter is not a position-derived declaration");
+        assert!(error.contains("not position-derived"), "{error}");
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn declared_bindings_are_part_of_tape_identity() {
+        // Two tapes that differ only in which slot is declared dynamic are
+        // different replay contracts, so the sequence hash must separate them.
+        let launch = |declared: &[ReplayKernargBinding]| {
+            let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+            controller.record_hip_launch_with_accesses(
+                "gated_delta_conv_bf16_f32",
+                None,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                &[0u8; 16],
+                None,
+                declared,
+                None,
+            );
+            replay_sequence_hash(controller.recorded_launches())
+        };
+        let plain = launch(&[]);
+        let declared = launch(&[ReplayKernargBinding::PositionModU32 {
+            offset: 4,
+            addend: 0,
+            modulus: 3,
+        }]);
+        assert_ne!(plain, declared);
     }
 
     #[test]
@@ -8941,6 +9530,7 @@ mod tests {
             block: [64, 1, 1],
             shared_mem: 0,
             grid_binding: None,
+            declared_kernarg_bindings: Vec::new(),
             kernarg: Vec::new(),
             accesses: None,
         }

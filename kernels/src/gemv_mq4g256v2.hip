@@ -380,7 +380,11 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_XBATCH_KERNEL(
         float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
         for (int offset = 16; offset > 0; offset >>= 1)
             acc += __shfl_down(acc, offset);
+#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
+        if (tid == 0) y[(long long)b * M + row] += acc;
+#else
         if (tid == 0) y[(long long)b * M + row] = acc;
+#endif
     }
 }
 

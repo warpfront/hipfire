@@ -274,14 +274,10 @@ pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
 #[inline]
 fn mfp_e8_row_bytes(dtype: DType, k: usize) -> usize {
     debug_assert_eq!(k % 256, 0);
-    let n_blocks = k / 32;
     match dtype {
-        DType::MFP4G32E8 => 16 + n_blocks * 17,
-        DType::MFP3G32E8 => 16 + n_blocks * 13,
-        DType::MFP4G32E8SOA => {
-            let scale_bytes_padded = (n_blocks + 15) & !15;
-            16 + scale_bytes_padded + n_blocks * 16
-        }
+        DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP4G32E8SOA => dtype
+            .row_bytes(k)
+            .expect("E8 row geometry is defined for K > 0"),
         _ => unreachable!("mfp_e8_row_bytes called for {dtype:?}"),
     }
 }

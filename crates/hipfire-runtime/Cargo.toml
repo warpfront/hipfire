@@ -103,6 +103,7 @@ minijinja = { workspace = true, features = ["loop_controls", "json", "preserve_o
 # template which uses these throughout.
 minijinja-contrib = { workspace = true, features = ["pycompat"] }
 tracing = "0.1"
+sha2.workspace = true
 
 # Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -111,7 +112,6 @@ tracing = "0.1"
 # despite each arch crate already depending on hipfire-runtime.
 [dev-dependencies]
 # SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
-sha2.workspace = true
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
@@ -610,6 +610,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "tp4_cross_device_graph_barrier"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_qt53_channel"
 required-features = ["lab"]
 
 [[example]]

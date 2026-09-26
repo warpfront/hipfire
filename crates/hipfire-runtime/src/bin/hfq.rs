@@ -14,6 +14,8 @@
 //!                                              — set a metadata JSON key (all tensors
 //!                                                copied), e.g. embed a jinja2 template
 //!   hfq meta-get <file> [--key <k>]            — dump metadata JSON (or one key)
+//!   hfq meta-overlay <file> --metadata-file <f> — append validated metadata
+//!                                                without rewriting tensor bytes
 //!   hfq rearch <in> <out> --arch-id <id>       — rewrite HFQM header arch_id and
 //!                                                numeric metadata.arch_id
 //!
@@ -21,7 +23,8 @@
 //!   hfq extract model.calib.hfq just.hessian.hfq --tensor '*.hessian'
 //!   hfq meta-set model.hfq model+tmpl.hfq --key chat_template --value-file tmpl.jinja
 
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{append_hfq_metadata_overlay, HfqFile};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 
@@ -137,7 +140,41 @@ fn load_all(path: &str) -> (u32, String, Vec<Tensor>) {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let cmd = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+
     match cmd {
+        "meta-overlay" => {
+            let path = argv
+                .get(2)
+                .expect("usage: hfq meta-overlay <file> --metadata-file <f>");
+            let metadata_path = flag(&argv, "--metadata-file").expect("--metadata-file required");
+            let metadata_value: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(metadata_path)
+                    .unwrap_or_else(|error| panic!("read metadata file {metadata_path}: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("parse metadata file {metadata_path}: {error}"));
+            if !metadata_value.is_object() {
+                panic!("metadata file {metadata_path} must contain a complete JSON object");
+            }
+            let metadata = serde_json::to_string(&metadata_value)
+                .expect("validated metadata object serializes");
+            let old_size = std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("stat {path}: {error}"))
+                .len();
+            let digest = Sha256::digest(metadata.as_bytes());
+            append_hfq_metadata_overlay(Path::new(path), &metadata)
+                .unwrap_or_else(|error| panic!("append metadata overlay to {path}: {error}"));
+            let new_size = std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("stat {path} after overlay: {error}"))
+                .len();
+            let digest_hex = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            println!(
+                "metadata overlay committed: path={path} old_size={old_size} \
+                 new_size={new_size} metadata_sha256={digest_hex}"
+            );
+        }
         "list" => {
             let path = argv.get(2).expect("usage: hfq list <file>");
             let hfq = HfqFile::open(Path::new(path)).expect("open");
@@ -262,6 +299,7 @@ fn main() {
                  usage:\n  hfq list <file>\n  hfq extract <in> <out> --tensor <pat>...\n\
                  \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>)\n\
                  \x20 hfq meta-get <file> [--key <k>]\n\
+                 \x20 hfq meta-overlay <file> --metadata-file <f>\n\
                  \x20 hfq rearch <in> <out> --arch-id <id>"
             );
             std::process::exit(1);

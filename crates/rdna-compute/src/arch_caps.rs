@@ -397,6 +397,17 @@ impl ArchCaps {
     pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
         self.has_wmma_w32 || self.has_wmma_w32_gfx12
     }
+    /// Qwen4 routes tuned on gfx1151: the gfx11 wave32 WMMA and SIMT kernels
+    /// selected in place of the portable parity kernels (F16 WMMA prefill,
+    /// MQ6 X-LDS, MoE O4xR8/O8xR16, BF16 r16, GDN/HC/QSA fusions).  Measured
+    /// only on gfx1151, so on by default for the RDNA3.5 APU class that
+    /// shares its memory system; any other gfx11 GPU takes them with
+    /// `HIPFIRE_QWEN4_GFX11=1` (`developer.qwen4_gfx11`) until measured
+    /// there.  Never outside gfx11: the WMMA and `s_waitcnt` kernels do not
+    /// compile for gfx12, and the SIMT ones are unvalidated off gfx11.
+    pub fn qwen4_tuned_routes(&self) -> bool {
+        self.has_wmma_w32 && (self.is_rdna3p5 || self.flags.qwen4_gfx11)
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -710,6 +721,38 @@ mod tests {
             assert!(
                 !make_caps(arch).supports_mq3_lloyd_mb4(),
                 "mq3-lloyd mb4 must NOT admit {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_tuned_routes_default_apus_opt_in_gfx11() {
+        for arch in &["gfx1150", "gfx1151", "gfx1152"] {
+            assert!(make_caps(arch).qwen4_tuned_routes(), "{arch} is default-on");
+        }
+        let off = &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1201", "gfx1030", "gfx942",
+        ];
+        for arch in off {
+            assert!(
+                !make_caps(arch).qwen4_tuned_routes(),
+                "{arch} needs the opt-in"
+            );
+        }
+        let opt_in = Arc::new(FeatureFlags {
+            qwen4_gfx11: true,
+            ..FeatureFlags::for_test("gfx1100")
+        });
+        for arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1151"] {
+            assert!(
+                ArchCaps::new(arch, opt_in.clone()).qwen4_tuned_routes(),
+                "{arch} opted in"
+            );
+        }
+        for arch in &["gfx1200", "gfx1201", "gfx1030", "gfx906", "gfx942"] {
+            assert!(
+                !ArchCaps::new(arch, opt_in.clone()).qwen4_tuned_routes(),
+                "{arch} lacks gfx11 ISA"
             );
         }
     }

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::calibration::*;
 use crate::cli::*;
@@ -39,8 +39,8 @@ use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use hipfire_quantize::hessian_io;
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use hipfire_quantize::vision_sidecar::{
-    is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix, resolve_vision_prefix,
-    vision_dtype, VisionDtype,
+    VisionDtype, is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix,
+    resolve_vision_prefix, vision_dtype,
 };
 
 // ── Per-tensor grouping for disposition helpers ──────────────────────────
@@ -157,6 +157,50 @@ pub(crate) fn run() {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("error: flux pack: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Native Qwen4/Qwen3.8-Flash-Next streaming artifact ──────────────
+    // This is a dedicated transactional producer.  Keep it ahead of the
+    // legacy format handlers so no old Qwen3.5/MTP extraction path can
+    // partially consume the source.
+    if args.qwen4_flash_next {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --qwen4-flash-next");
+        let mode = match args.qwen4_component_mode.as_str() {
+            "production" => crate::qwen4::Qwen4Mode::Production,
+            "compact-fixture" => crate::qwen4::Qwen4Mode::CompactFixture,
+            other => {
+                eprintln!(
+                    "error: --qwen4-component-mode unknown mode '{other}' \
+                     (expected production|compact-fixture)"
+                );
+                std::process::exit(2);
+            }
+        };
+        match crate::qwen4::run_cli_with_mode(Path::new(input), Path::new(&args.output), mode) {
+            Ok(summary) => {
+                eprintln!(
+                    "qwen4: wrote {} ({} entries: {} experts, {} PLE shards; \
+                     resident={} bytes, external PLE={} bytes; \
+                     predicted={} bytes, scratch_high_water={} bytes)",
+                    args.output,
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.ple_shards,
+                    summary.resident_bytes,
+                    summary.external_ple_bytes,
+                    summary.predicted_output_bytes,
+                    summary.scratch_high_water_bytes
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: qwen4 streaming pack: {error}");
                 std::process::exit(2);
             }
         }
@@ -2718,7 +2762,7 @@ pub(crate) fn run() {
                 &st_files,
             );
         } // Release source file page cache after each tensor to prevent
-          // mmap'd pages from starving GPU allocations on UMA systems.
+        // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
     }
 
@@ -4925,10 +4969,10 @@ fn handle_moe_expert_3d(
     };
     let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
     eprintln!(
-                "  {label:>8}: {parent_owned}{{0..{n_out_experts}}}.{base_owned}.weight {:?} (×{n_out_experts} experts of {n_experts} || {:.1} KB/expert, parallel)",
-                inner_shape,
-                bytes_per as f64 / 1024.0
-            );
+        "  {label:>8}: {parent_owned}{{0..{n_out_experts}}}.{base_owned}.weight {:?} (×{n_out_experts} experts of {n_experts} || {:.1} KB/expert, parallel)",
+        inner_shape,
+        bytes_per as f64 / 1024.0
+    );
     hfq_tensors.append(&mut new_tensors);
     // Drop source pages and spill quantized data after each expert batch.
     st_files[file_idx].drop_tensor_pages(name);
@@ -5632,7 +5676,9 @@ fn handle_main_quant(
                             if k % 256 != 0
                                 && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2")
                             {
-                                eprintln!("error: fixed-tier dtype {dt} requires K%256==0 for {name} (K={k})");
+                                eprintln!(
+                                    "error: fixed-tier dtype {dt} requires K%256==0 for {name} (K={k})"
+                                );
                                 std::process::exit(2);
                             }
                             match dt {
@@ -6588,7 +6634,9 @@ fn handle_main_quant(
                             let m = meta.shape[0];
                             let k = meta.shape[1];
                             if k % 128 != 0 {
-                                eprintln!("error: ragged HFQ4-G128 embedding {name} has K={k} not divisible by 128 (no tail-safe kernel)");
+                                eprintln!(
+                                    "error: ragged HFQ4-G128 embedding {name} has K={k} not divisible by 128 (no tail-safe kernel)"
+                                );
                                 std::process::exit(2);
                             }
                             quantize_hfq4g128_2d(&f32_data, m, k)
@@ -6643,7 +6691,7 @@ fn handle_main_quant(
                     (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
                 }
             }; // end K-map outer if-else
-               // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
+            // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
             if qt == QuantType::Q4F16G64 {
                 let is_q4_opt_in = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
                 if !is_q4_opt_in
@@ -6659,19 +6707,19 @@ fn handle_main_quant(
                         n_elements
                     };
                     eprintln!(
-                            "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 \
+                        "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 \
                              legacy fallback) with mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4c={}.\n  \
                              shape={:?} k_dim={} k%256={} kmap_level={:?} is_embed={}",
-                            name,
-                            flags.use_mq4v2,
-                            flags.use_mq4g256,
-                            flags.use_mq4c,
-                            meta.shape,
-                            k_dim_dbg,
-                            k_dim_dbg % 256,
-                            kmap_level,
-                            name.contains("embed_tokens"),
-                        );
+                        name,
+                        flags.use_mq4v2,
+                        flags.use_mq4g256,
+                        flags.use_mq4c,
+                        meta.shape,
+                        k_dim_dbg,
+                        k_dim_dbg % 256,
+                        kmap_level,
+                        name.contains("embed_tokens"),
+                    );
                     std::process::exit(1);
                 }
             }

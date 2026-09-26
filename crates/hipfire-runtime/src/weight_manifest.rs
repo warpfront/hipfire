@@ -169,6 +169,39 @@ pub enum ShardPolicy {
     },
 }
 
+/// Where the bytes for a logical weight live during a model's lifetime.
+///
+/// This is deliberately independent from [`ShardPolicy`] and
+/// [`PlacementHint`]. `Resident` weights are fulfilled into a device tensor;
+/// `ExternalRows` weights remain in a source-backed row store and are only
+/// described in the fulfillment census.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WeightResidency {
+    /// Materialize the logical tensor on its planned device(s).
+    #[default]
+    Resident,
+    /// Keep source rows external to the device weight store.
+    ///
+    /// `row_bytes` describes one physical source row. `valid_rows` is the
+    /// number of rows with meaningful model data; the remaining physical rows
+    /// (when any) are padding and must not be requested by a row reader.
+    ExternalRows { row_bytes: usize, valid_rows: usize },
+}
+
+impl WeightResidency {
+    /// Construct an external-row declaration for a sharded table.
+    pub const fn external_rows(row_bytes: usize, valid_rows: usize) -> Self {
+        Self::ExternalRows {
+            row_bytes,
+            valid_rows,
+        }
+    }
+
+    pub const fn is_external(self) -> bool {
+        matches!(self, Self::ExternalRows { .. })
+    }
+}
+
 /// A logical weight declaration. No source filename or GPU handle belongs
 /// here; architecture carriers resolve those at fulfillment time.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -180,6 +213,9 @@ pub struct WeightEntry {
     pub dtype_constraint: DTypeConstraint,
     pub placement: PlacementHint,
     pub policy: ShardPolicy,
+    /// Source residency is not a placement policy. In particular, external
+    /// rows never imply a device handle or a fake alias in `WeightStore`.
+    pub residency: WeightResidency,
 }
 
 impl WeightEntry {
@@ -213,6 +249,7 @@ impl WeightEntry {
             dtype_constraint,
             placement: PlacementHint::Policy,
             policy,
+            residency: WeightResidency::Resident,
         }
     }
 
@@ -249,12 +286,23 @@ impl WeightEntry {
             dtype_constraint,
             placement: PlacementHint::Policy,
             policy,
+            residency: WeightResidency::Resident,
         }
     }
 
     pub fn with_placement(mut self, placement: PlacementHint) -> Self {
         self.placement = placement;
         self
+    }
+    /// Set the source residency independently of placement.
+    pub fn with_residency(mut self, residency: WeightResidency) -> Self {
+        self.residency = residency;
+        self
+    }
+
+    /// Mark this entry as a source-backed row table.
+    pub fn external_rows(self, row_bytes: usize, valid_rows: usize) -> Self {
+        self.with_residency(WeightResidency::external_rows(row_bytes, valid_rows))
     }
 
     /// Stable identity used by source resolvers and store keys.
@@ -398,6 +446,68 @@ fn validate_shape(entry: &WeightEntry) -> Result<(), String> {
     Ok(())
 }
 
+fn known_source_width(entry: &WeightEntry) -> Option<usize> {
+    fn width(dtype: DType) -> Option<usize> {
+        match dtype {
+            DType::F32 => Some(4),
+            DType::F16 | DType::BF16 => Some(2),
+            _ => None,
+        }
+    }
+
+    match &entry.dtype_constraint.source {
+        SourceDType::Exact(dtype) => width(*dtype),
+        SourceDType::OneOf(values) if !values.is_empty() => {
+            let mut widths = values.iter().copied().map(width);
+            let first = widths.next()??;
+            widths.all(|value| value == Some(first)).then_some(first)
+        }
+        SourceDType::Any | SourceDType::OneOf(_) => None,
+    }
+}
+
+fn validate_residency(entry: &WeightEntry) -> Result<(), String> {
+    let WeightResidency::ExternalRows {
+        row_bytes,
+        valid_rows,
+    } = entry.residency
+    else {
+        return Ok(());
+    };
+    let context = format!("{}[layer {:?}]", entry.name, entry.layer);
+    let physical_rows = entry.logical_shape.first().copied().unwrap_or(0);
+    if row_bytes == 0 {
+        return Err(format!("{context}: external row_bytes must be non-zero"));
+    }
+    if valid_rows == 0 || valid_rows > physical_rows {
+        return Err(format!(
+            "{context}: external valid_rows={valid_rows} must be in 1..={physical_rows}"
+        ));
+    }
+    if let Some(width) = known_source_width(entry) {
+        let row_elements = entry.logical_shape[1..]
+            .iter()
+            .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+            .ok_or_else(|| format!("{context}: external row shape overflows usize"))?;
+        let expected = row_elements
+            .checked_mul(width)
+            .ok_or_else(|| format!("{context}: external row byte count overflows usize"))?;
+        if row_bytes != expected {
+            return Err(format!(
+                "{context}: external row_bytes={row_bytes}, expected {expected} \
+                 from row shape {:?} and source width {width}",
+                &entry.logical_shape[1..]
+            ));
+        }
+    }
+    if matches!(&entry.policy, ShardPolicy::Tied { .. }) {
+        return Err(format!(
+            "{context}: external rows cannot be an alias declaration"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_weight_layers(
     manifest: &[WeightEntry],
     n_layers: usize,
@@ -420,6 +530,7 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
     let mut identities = HashSet::new();
     for entry in manifest {
         validate_shape(entry)?;
+        validate_residency(entry)?;
         if !identities.insert(entry.identity()) {
             return Err(format!(
                 "duplicate manifest identity ('{}', {:?})",
@@ -480,6 +591,11 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                     .ok_or_else(|| {
                         format!("{context}: Tied source '{source}' has no manifest entry in scope")
                     })?;
+                if source_entry.residency.is_external() {
+                    return Err(format!(
+                        "{context}: tied source '{source}' has external rows and cannot be aliased"
+                    ));
+                }
                 if source_entry.identity() == entry.identity() {
                     return Err(format!("{context}: an entry cannot tie to itself"));
                 }
@@ -1313,6 +1429,84 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("source dtype contract"));
     }
+    #[test]
+    fn residency_defaults_to_resident_and_can_mark_external_rows() {
+        let resident = WeightEntry::model("w", vec![4, 3], DType::BF16, ShardPolicy::Replicate);
+        assert_eq!(resident.residency, WeightResidency::Resident);
+        assert_eq!(
+            resident.clone().external_rows(6, 3).residency,
+            WeightResidency::ExternalRows {
+                row_bytes: 6,
+                valid_rows: 3
+            }
+        );
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        assert_eq!(
+            placement_devices(&resident.clone().external_rows(6, 3), &mesh, 1),
+            placement_devices(&resident, &mesh, 1),
+            "residency must not change placement"
+        );
+    }
+
+    #[test]
+    fn external_rows_validate_validity_and_known_source_width() {
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let valid = WeightEntry::model_with_dtype_constraint(
+            "ple",
+            vec![4, 3],
+            DType::BF16,
+            DTypeConstraint::source_exact(DType::BF16),
+            ShardPolicy::Replicate,
+        )
+        .external_rows(6, 3);
+        assert!(validate_manifest(&[valid], &mesh).is_ok());
+
+        let too_many_rows =
+            WeightEntry::model("ple", vec![4, 3], DType::BF16, ShardPolicy::Replicate)
+                .external_rows(6, 5);
+        assert!(validate_manifest(&[too_many_rows], &mesh).is_err());
+
+        let wrong_width = WeightEntry::model_with_dtype_constraint(
+            "ple",
+            vec![4, 3],
+            DType::BF16,
+            DTypeConstraint::source_exact(DType::BF16),
+            ShardPolicy::Replicate,
+        )
+        .external_rows(4, 3);
+        assert!(validate_manifest(&[wrong_width], &mesh).is_err());
+    }
+
+    #[test]
+    fn external_rows_cannot_be_aliases_or_alias_sources() {
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let external = WeightEntry::model("table", vec![4, 3], DType::BF16, ShardPolicy::Replicate)
+            .external_rows(6, 3);
+        let alias = WeightEntry::model(
+            "alias",
+            vec![4, 3],
+            DType::BF16,
+            ShardPolicy::Tied {
+                source: "table".into(),
+            },
+        );
+        assert!(validate_manifest(&[external.clone(), alias], &mesh).is_err());
+        let external_alias = external.with_residency(WeightResidency::ExternalRows {
+            row_bytes: 6,
+            valid_rows: 3,
+        });
+        let alias_policy = WeightEntry::model(
+            "alias",
+            vec![4, 3],
+            DType::BF16,
+            ShardPolicy::Tied {
+                source: "other".into(),
+            },
+        )
+        .with_residency(external_alias.residency);
+        assert!(validate_manifest(&[alias_policy], &mesh).is_err());
+    }
+
     #[test]
     fn expert_resources_have_exact_checked_totals() {
         let first = ExpertProjectionResources {

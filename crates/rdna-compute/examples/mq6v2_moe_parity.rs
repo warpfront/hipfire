@@ -1209,6 +1209,41 @@ fn ninepath_check(gpu: &mut Gpu, rep: &mut Report) {
     println!();
 }
 
+fn dense_f32_rows_check(gpu: &mut Gpu, rep: &mut Report) {
+    let m = 129;
+    for (rows, k) in [(2, 512), (3, 768), (4, 1024)] {
+        let weights = pack_mq6g256v2(&build_disjoint_halves(m, k), m, k);
+        let x: Vec<f32> = (0..rows * k).map(|i| prng(i, 0x5412) * 2.0 - 1.0).collect();
+        let w = gpu.upload_raw(&weights, &[weights.len()]).unwrap();
+        let x = gpu.upload_f32(&x, &[rows * k]).unwrap();
+        let batched = gpu
+            .upload_f32(&vec![f32::NAN; rows * m], &[rows * m])
+            .unwrap();
+        gpu.gemm_mq6g256v2_f32_rows(&w, &x, &batched, m, k, rows)
+            .expect("MQ6 F32 shared-weight rows");
+        gpu.hip.device_synchronize().unwrap();
+        let got = gpu.download_f32(&batched).unwrap();
+        for row in 0..rows {
+            let scalar = gpu.upload_f32(&vec![f32::NAN; m], &[m]).unwrap();
+            gpu.gemv_mq6g256v2(&w, &x.sub_offset(row * k, k), &scalar, m, k)
+                .expect("MQ6 scalar row");
+            gpu.hip.device_synchronize().unwrap();
+            let want = gpu.download_f32(&scalar).unwrap();
+            for (index, (&got, &want)) in got[row * m..(row + 1) * m].iter().zip(&want).enumerate()
+            {
+                if got.to_bits() != want.to_bits() {
+                    eprintln!(
+                        "MQ6 F32 rows={rows} K={k} row={row} output={index}: {got:?} != {want:?}"
+                    );
+                    rep.failures += 1;
+                    return;
+                }
+            }
+        }
+    }
+    println!("MQ6 F32 shared-weight 2–4 rows: scalar bit parity");
+}
+
 fn main() {
     let mut rep = Report { failures: 0 };
     host_self_test(&mut rep);
@@ -1217,6 +1252,7 @@ fn main() {
         Ok(mut gpu) => {
             println!("arch={}\n", gpu.arch);
             gate_up_check(&mut gpu, &mut rep);
+            dense_f32_rows_check(&mut gpu, &mut rep);
             gate_up_batched_check(&mut gpu, &mut rep);
             gate_up_batched_production_check(&mut gpu, &mut rep);
             down_check(&mut gpu, &mut rep);

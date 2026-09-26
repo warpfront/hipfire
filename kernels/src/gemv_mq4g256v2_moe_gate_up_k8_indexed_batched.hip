@@ -37,7 +37,8 @@
 // Dequant math is f32, matching `gemv_mq4g256v2_moe_gate_up_k8_indexed.hip`
 // (the single-token qt44 MoE GEMV): the f16 scale/zero are widened to float
 // and the accumulation is identical to qt13's. Note this differs from the
-// qt44 grouped GEMM, which accumulates the dequant in fp16 — the two paths
+// qt44 grouped WMMA GEMM (`gemm_mq4g256v2_moe_grouped_wmma_k2`), which
+// accumulates the dequant in fp16 — the two paths
 // have always had different precision conventions and are not expected to be
 // bit-identical to each other.
 //

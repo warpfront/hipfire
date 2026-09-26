@@ -95,6 +95,25 @@ hot-path `dyn` forward. **LLaMA exception:** `hipfire-arch-llama` is a facade â€
 canonical dense LLaMA/Mistral/plain-Qwen3 forward and shared transformer types
 still live in `hipfire_runtime::llama`; the arch crate re-exports them.
 
+### Qwen4 typed layer seam
+
+The current Qwen4 ordinary-HIP path keeps family binding in
+`crates/hipfire-arch-qwen4/src/program.rs` and `gpu_forward.rs`: typed
+dimensions/descriptors, resident-resource binding, bounded scratch, row-shaped
+router views, and whole-program preflight live there. Neutral stateful
+operation contracts and execution remain in
+`crates/hipfire-dispatch/src/pipeline/layer_ops.rs` and `steps.rs`; the sealed
+QT44/QT53 MoE route remains shared in `pipeline/sealed_moe.rs`,
+`moe_program.rs`, and `qt44_qt53_prefill.rs`. Fixed Qwen4 HIP helpers are
+registered by `hipfire-arch-qwen4/src/gpu_ops.rs`, while
+`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide neutral wrapper
+contracts. This is an implementation ownership map, not replay/PM4 admission,
+physical-EP proof, or a performance promotion.
+
+With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on
+any AMD GPU for matching wire formats and operands; gfx1151-specific kernel
+optimizations do not gate ordinary-HIP serving.
+
 ## Request lifecycle
 
 ```text

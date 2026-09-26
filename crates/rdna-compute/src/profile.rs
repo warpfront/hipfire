@@ -214,6 +214,121 @@ pub fn resolve_deferred<L>(
     out
 }
 
+/// A labelled GPU span in flight: start event recorded, stop not yet.
+pub struct Span {
+    label: &'static str,
+    timer: PendingTimer,
+    started_unix_us: u64,
+}
+
+/// Total GPU time of every span that shared a label, with the wall-clock
+/// window (unix microseconds) from the first span's start to the last's end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpanTotal {
+    pub label: &'static str,
+    pub us: f64,
+    pub first_start_unix_us: u64,
+    pub last_end_unix_us: u64,
+}
+
+/// Collects labelled GPU spans with [`begin_deferred`] events and resolves
+/// them with ONE synchronize ([`resolve_deferred`]), so instrumenting a long
+/// run of launches never serializes them. The caller owns the on/off switch:
+/// a disabled profiler (also the `Default`) makes every call a no-op, and
+/// profiling never fails the work it measures (event errors drop the span).
+#[derive(Default)]
+pub struct SpanProfiler {
+    enabled: bool,
+    done: Vec<(Span, u64)>,
+}
+
+/// Wall clock in unix microseconds (0 if the clock is before the epoch).
+pub fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+impl SpanProfiler {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            done: Vec::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Start a span; `None` when disabled. Spans may nest or overlap.
+    pub fn begin(
+        &self,
+        hip: &HipRuntime,
+        stream: Option<&Stream>,
+        label: &'static str,
+    ) -> Option<Span> {
+        if !self.enabled {
+            return None;
+        }
+        let started_unix_us = unix_micros();
+        begin_deferred(hip, stream).ok().map(|timer| Span {
+            label,
+            timer,
+            started_unix_us,
+        })
+    }
+
+    /// Record the span's stop event (non-blocking) and keep it for `resolve`.
+    pub fn end(&mut self, hip: &HipRuntime, stream: Option<&Stream>, span: Option<Span>) {
+        if let Some(span) = span {
+            if span.timer.mark_stop(hip, stream).is_ok() {
+                self.done.push((span, unix_micros()));
+            }
+        }
+    }
+
+    /// Resolve every ended span and sum them per label, in first-seen order.
+    pub fn resolve(self, hip: &HipRuntime, stream: Option<&Stream>) -> Vec<SpanTotal> {
+        let mut windows = Vec::with_capacity(self.done.len());
+        let mut timers = Vec::with_capacity(self.done.len());
+        for (span, ended) in self.done {
+            windows.push((span.started_unix_us, ended));
+            timers.push((span.label, span.timer));
+        }
+        sum_by_label(
+            resolve_deferred(hip, stream, timers)
+                .into_iter()
+                .zip(windows),
+        )
+    }
+}
+
+/// Sum resolved `(label, us)` spans with their `(start, end)` wall windows
+/// per label, in first-seen order.
+fn sum_by_label(
+    spans: impl IntoIterator<Item = ((&'static str, f64), (u64, u64))>,
+) -> Vec<SpanTotal> {
+    let mut totals: Vec<SpanTotal> = Vec::new();
+    for ((label, us), (started, ended)) in spans {
+        match totals.iter_mut().find(|total| total.label == label) {
+            Some(total) => {
+                total.us += us;
+                total.first_start_unix_us = total.first_start_unix_us.min(started);
+                total.last_end_unix_us = total.last_end_unix_us.max(ended);
+            }
+            None => totals.push(SpanTotal {
+                label,
+                us,
+                first_start_unix_us: started,
+                last_end_unix_us: ended,
+            }),
+        }
+    }
+    totals
+}
+
 // ─── Byte count formulas for common kernel shapes ──────────────────────────
 //
 // Each helper takes kernel dimensions and returns the number of bytes the
@@ -463,4 +578,23 @@ pub fn kv_cache_write_q8_0_bytes(n_kv_heads: usize, head_dim: usize) -> usize {
 pub fn gated_norm_bytes(n: usize) -> usize {
     // Read x, z, weight. Write out.
     n * 4 * 4
+}
+
+#[cfg(test)]
+mod span_tests {
+    #[test]
+    fn span_totals_sum_per_label_in_first_seen_order() {
+        let totals = super::sum_by_label([
+            (("verify", 10.0), (100, 110)),
+            (("draft", 2.0), (90, 95)),
+            (("verify", 5.0), (120, 130)),
+        ]);
+        assert_eq!(totals.len(), 2);
+        assert_eq!((totals[0].label, totals[0].us), ("verify", 15.0));
+        assert_eq!(
+            (totals[0].first_start_unix_us, totals[0].last_end_unix_us),
+            (100, 130)
+        );
+        assert_eq!((totals[1].label, totals[1].us), ("draft", 2.0));
+    }
 }

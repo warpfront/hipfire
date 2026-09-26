@@ -8,6 +8,11 @@ use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
+use crate::model_source::{
+    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, SourceError,
+    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
+    SourceReader, SourceReaderImpl,
+};
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
     reupload_f16_as_f32, HfqBackend, WeightBackend,
@@ -16,10 +21,205 @@ use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
+
+/// High bit in the legacy HFQM version word indicating an appended metadata
+/// overlay. The low 31 bits remain the base container version, so the updated
+/// generic reader validates the extension and exposes `format_version == 1`.
+/// Strict architecture readers from before this extension compare the raw
+/// version word and intentionally reject overlaid files; that discoverable
+/// rejection is why an updated reader is required for repaired artifacts.
+const HFQ_METADATA_OVERLAY_FLAG: u32 = 1 << 31;
+const HFQ_BASE_FORMAT_VERSION: u32 = 1;
+const HFQ_METADATA_OVERLAY_SCHEMA: u32 = 1;
+const HFQ_METADATA_OVERLAY_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Footer layout: metadata bytes, u64 length, u32 schema, 32-byte SHA-256,
+/// and this eight-byte magic. Its fixed tail lets readers find the overlay
+/// without changing the legacy metadata/data offsets.
+const HFQ_METADATA_OVERLAY_MAGIC: &[u8; 8] = b"HFQMDOV1";
+const HFQ_METADATA_OVERLAY_FOOTER_LEN: usize = 8 + 4 + 32 + 8;
+/// Append one generic metadata overlay without moving the legacy tensor index
+/// or payload. The overlay is fsynced before the version pointer is committed;
+/// readers that see a torn/invalid pointer fail closed instead of silently
+/// falling back to stale metadata. A second committed overlay is rejected:
+/// replacement callers must start from the original artifact, not stack stale
+/// metadata generations.
+pub fn append_hfq_metadata_overlay(path: &Path, metadata_json: &str) -> std::io::Result<()> {
+    if metadata_json.len() > HFQ_METADATA_OVERLAY_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "HFQ metadata overlay is {} bytes, above {}-byte limit",
+                metadata_json.len(),
+                HFQ_METADATA_OVERLAY_MAX_BYTES
+            ),
+        ));
+    }
+    let metadata_value: serde_json::Value =
+        serde_json::from_str(metadata_json).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQ metadata overlay is not valid JSON: {error}"),
+            )
+        })?;
+    if !metadata_value.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HFQ metadata overlay must be a JSON object",
+        ));
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut header = [0_u8; 32];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"HFQM" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: bad HFQ magic", path.display()),
+        ));
+    }
+    let raw_version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if raw_version & !HFQ_METADATA_OVERLAY_FLAG != HFQ_BASE_FORMAT_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{}: unsupported HFQ format version {}",
+                path.display(),
+                raw_version & !HFQ_METADATA_OVERLAY_FLAG
+            ),
+        ));
+    }
+    if raw_version & HFQ_METADATA_OVERLAY_FLAG != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{}: metadata overlay already committed; refusing a second overlay",
+                path.display()
+            ),
+        ));
+    }
+    let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let file_len = file.metadata()?.len();
+    if metadata_offset != 32 || metadata_offset > data_offset || data_offset > file_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{}: invalid HFQ metadata/data offsets {metadata_offset}/{data_offset} \
+                 for {file_len}-byte file",
+                path.display()
+            ),
+        ));
+    }
+    // Validate the complete legacy container before appending. This also
+    // rejects a previously torn overlay pointer rather than stacking another
+    // overlay on an already ambiguous file.
+    let _ = HfqFile::open(path)?;
+
+    let digest = Sha256::digest(metadata_json.as_bytes());
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(metadata_json.as_bytes())?;
+    file.write_all(&(metadata_json.len() as u64).to_le_bytes())?;
+    file.write_all(&HFQ_METADATA_OVERLAY_SCHEMA.to_le_bytes())?;
+    file.write_all(&digest)?;
+    file.write_all(HFQ_METADATA_OVERLAY_MAGIC)?;
+    file.sync_all()?;
+
+    let committed_version = raw_version | HFQ_METADATA_OVERLAY_FLAG;
+    file.seek(SeekFrom::Start(4))?;
+    file.write_all(&committed_version.to_le_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_hfq_metadata_overlay(mmap: &Mmap, payload_end: usize) -> std::io::Result<String> {
+    let file_len = mmap.len();
+    if file_len < HFQ_METADATA_OVERLAY_FOOTER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay footer is truncated",
+        ));
+    }
+    let footer_start = file_len - HFQ_METADATA_OVERLAY_FOOTER_LEN;
+    let metadata_len = u64::from_le_bytes(mmap[footer_start..footer_start + 8].try_into().unwrap());
+    let metadata_len = usize::try_from(metadata_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay length does not fit usize",
+        )
+    })?;
+    if metadata_len == 0 || metadata_len > HFQ_METADATA_OVERLAY_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "HFQ metadata overlay length {metadata_len} is outside 1..={HFQ_METADATA_OVERLAY_MAX_BYTES}"
+            ),
+        ));
+    }
+    let schema = u32::from_le_bytes(
+        mmap[footer_start + 8..footer_start + 12]
+            .try_into()
+            .unwrap(),
+    );
+    if schema != HFQ_METADATA_OVERLAY_SCHEMA {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported HFQ metadata overlay schema {schema}"),
+        ));
+    }
+    if &mmap[footer_start + 44..footer_start + 52] != HFQ_METADATA_OVERLAY_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay magic is missing or corrupt",
+        ));
+    }
+    let metadata_start = footer_start.checked_sub(metadata_len).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay length underflows file bounds",
+        )
+    })?;
+    if metadata_start < payload_end {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "HFQ metadata overlay starts at {metadata_start}, before payload end {payload_end}"
+            ),
+        ));
+    }
+    let bytes = &mmap[metadata_start..footer_start];
+    let expected = Sha256::digest(bytes);
+    if expected.as_slice() != &mmap[footer_start + 12..footer_start + 44] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay checksum mismatch",
+        ));
+    }
+    let metadata = std::str::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQ metadata overlay is not UTF-8: {error}"),
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(metadata).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQ metadata overlay JSON is invalid: {error}"),
+        )
+    })?;
+    if !value.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata overlay JSON must be an object",
+        ));
+    }
+    Ok(metadata.to_string())
+}
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
 /// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
@@ -281,6 +481,30 @@ pub struct HfqSourceIdentity {
     pub metadata_json: String,
     pub manifest: Vec<HfqTensorManifestEntry>,
 }
+/// Positional reader for one HFQ container file. The effective source identity
+/// may contain a base and an overlay, but this reader targets exactly one of
+/// those sealed files.
+struct HfqRangeReader {
+    identity: Arc<SourceIdentity>,
+    file: File,
+    file_identity: SourceFileIdentity,
+}
+
+impl SourceReaderImpl for HfqRangeReader {
+    fn identity(&self) -> &SourceIdentity {
+        self.identity.as_ref()
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        // The effective seal includes every participating file. Check all of
+        // them, not only the selected base/overlay shard, so a changed base
+        // cannot be hidden by a still-readable overlay range.
+        for expected in &self.identity.files {
+            verify_path_identity(expected)?;
+        }
+        read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+}
 
 /// Author-recommended sampling defaults baked into a .hfq's
 /// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
@@ -302,6 +526,9 @@ pub struct HfqFile {
     /// going through this struct (cleanly separates HfqFile's mmap-based
     /// tensor lookup from the pager's pread/io_uring transport).
     path: std::path::PathBuf,
+    /// File identity captured when the container was opened. Range readers
+    /// compare the live file against this seal before every positional read.
+    source_file_identity: SourceFileIdentity,
     /// mmap for tensor data access on discrete-GPU systems where GPU VRAM
     /// is separate from system RAM (no double-buffering cost).
     /// `None` on unified-memory APUs (Strix Halo etc.) where mmap pages
@@ -309,8 +536,11 @@ pub struct HfqFile {
     /// memory consumption. Dropped after header/index parsing via
     /// `drop_mmap()`. When `None`, all tensor reads go through `pread`.
     mmap: Option<Mmap>,
-    pub arch_id: u32,
+    /// HFQM container format version from the immutable header.
+    pub format_version: u32,
+    /// Original metadata JSON from the HFQM container.
     pub metadata_json: String,
+    pub arch_id: u32,
     tensors: Vec<HfqTensorInfo>,
     tensor_map: HashMap<String, usize>,
     /// Reusable read buffer for pread-based tensor reads.
@@ -512,6 +742,8 @@ impl HfqFile {
     /// entry point.
     pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
         let file = File::open(path)?;
+        let source_file_identity = capture_file_identity(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Sequential access hint: helps the kernel readahead and drop pages sooner.
         #[cfg(unix)]
@@ -524,7 +756,12 @@ impl HfqFile {
             }
         }
 
-        let base = base_offset as usize;
+        let base = usize::try_from(base_offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HfqFile: base offset {base_offset} does not fit usize"),
+            )
+        })?;
         let file_len = mmap.len();
         // A truncated or corrupt container must surface as an error instead of
         // panicking on an out-of-bounds slice: open_at_offset advertises a
@@ -542,7 +779,15 @@ impl HfqFile {
                 Ok(())
             }
         };
-        need(base + 32, "the 32-byte header")?;
+        need(
+            base.checked_add(32).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HfqFile: base offset overflows header range",
+                )
+            })?,
+            "the 32-byte header",
+        )?;
 
         // Parse header (32 bytes) at base offset.
         let magic = &mmap[base..base + 4];
@@ -552,15 +797,54 @@ impl HfqFile {
                 format!("HfqFile: not an HFQ container at offset {base}"),
             ));
         }
-        let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let raw_format_version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let has_metadata_overlay = raw_format_version & HFQ_METADATA_OVERLAY_FLAG != 0;
+        let format_version = raw_format_version & !HFQ_METADATA_OVERLAY_FLAG;
+        if format_version != HFQ_BASE_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: unsupported HFQ format version {format_version} \
+                     (raw header word {raw_format_version})"
+                ),
+            ));
+        }
+        if has_metadata_overlay && base_offset != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata overlays are only supported on standalone HFQ files",
+            ));
+        }
         let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
         // Stored offsets are relative to the container start; rebase to absolute
         // file offsets so all the existing mmap slicing below works unchanged.
-        let metadata_offset =
-            u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
-        let data_offset =
-            u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
+        let metadata_rel = u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap());
+        let data_rel = u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap());
+        let metadata_abs = base_offset.checked_add(metadata_rel).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata offset overflows file range",
+            )
+        })?;
+        let data_abs = base_offset.checked_add(data_rel).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: data offset overflows file range",
+            )
+        })?;
+        let metadata_offset = usize::try_from(metadata_abs).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata offset does not fit usize",
+            )
+        })?;
+        let data_offset = usize::try_from(data_abs).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: data offset does not fit usize",
+            )
+        })?;
         // Guard the metadata slice below: a truncated/corrupt container can hold
         // offsets that overrun the file or cross over each other (#578).
         if metadata_offset > data_offset || data_offset > file_len {
@@ -634,11 +918,24 @@ impl HfqFile {
                 ),
             ));
         }
-        let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+        let mut metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
 
         // Parse tensor index (follows metadata JSON)
-        let mut pos = metadata_offset + json_end;
-        need(pos + 4, "the tensor-index count")?;
+        let mut pos = metadata_offset.checked_add(json_end).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HfqFile: metadata/index offset overflows usize",
+            )
+        })?;
+        need(
+            pos.checked_add(4).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HfqFile: tensor-index count offset overflows usize",
+                )
+            })?,
+            "the tensor-index count",
+        )?;
         let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
         if idx_n != n_tensors {
             return Err(std::io::Error::new(
@@ -660,6 +957,12 @@ impl HfqFile {
             pos += 2;
             need(pos + name_len, "a tensor name")?;
             let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+            if tensor_map.contains_key(&name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    SourceError::DuplicateTensor { name },
+                ));
+            }
             pos += name_len;
             need(pos + 2, "a tensor quant type and dimension count")?;
             let quant_type = mmap[pos];
@@ -675,7 +978,16 @@ impl HfqFile {
             need(pos + 12, "a tensor group and data size")?;
             let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            let data_size_u64 = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap());
+            let data_size = usize::try_from(data_size_u64).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    SourceError::Overflow {
+                        offset: cumulative_offset as u64,
+                        length: data_size_u64,
+                    },
+                )
+            })?;
             pos += 8;
 
             // Every indexed payload range must lie within the file: a
@@ -709,10 +1021,15 @@ impl HfqFile {
             });
             cumulative_offset = end;
         }
+        if has_metadata_overlay {
+            metadata_json = read_hfq_metadata_overlay(&mmap, cumulative_offset)?;
+        }
         let me = Self {
             _file: file,
             path: path.to_path_buf(),
+            source_file_identity,
             mmap: Some(mmap),
+            format_version,
             arch_id,
             metadata_json,
             tensors,
@@ -1281,9 +1598,103 @@ impl HfqFile {
         })
     }
 
-    /// Convenience: load the source identity wrapped in an immutable `Arc`.
-    pub fn load_identity_arc(&self) -> HipResult<std::sync::Arc<HfqSourceIdentity>> {
-        self.load_identity().map(std::sync::Arc::new)
+    /// Build an effective source seal for this HFQ file and any attached
+    /// overlay. A nested overlay cannot be represented by one immutable
+    /// descriptor identity and is refused rather than silently dropping a
+    /// layer of shadowing.
+    fn effective_source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
+        let mut files = vec![self.source_file_identity.clone()];
+        let mut metadata_json = self.metadata_json.clone();
+        let mut manifest = self
+            .tensors
+            .iter()
+            .map(|info| SourceRangeIdentity {
+                name: info.name.clone(),
+                file_index: 0,
+                offset: info.data_offset as u64,
+                length: info.data_size as u64,
+                dtype: quant_type_to_dtype(info.quant_type).to_string(),
+                logical_shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(overlay) = &self.overlay {
+            if overlay.overlay.is_some() {
+                return Err(SourceError::MissingEffectiveSeal {
+                    reason: "nested HFQ overlays are not sealable".to_string(),
+                });
+            }
+            files.push(overlay.source_file_identity.clone());
+            metadata_json.push_str("\n--hipfire-effective-overlay--\n");
+            metadata_json.push_str(&overlay.metadata_json);
+            for info in &overlay.tensors {
+                // A shadowed name is one effective logical range, not a
+                // duplicate source tensor. Replace the base manifest entry
+                // with the overlay's range while retaining deterministic order.
+                manifest.retain(|entry| entry.name != info.name);
+                manifest.push(SourceRangeIdentity {
+                    name: info.name.clone(),
+                    file_index: 1,
+                    offset: info.data_offset as u64,
+                    length: info.data_size as u64,
+                    dtype: quant_type_to_dtype(info.quant_type).to_string(),
+                    logical_shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+                });
+            }
+        }
+
+        Ok(Arc::new(SourceIdentity {
+            canonical_path: self.source_file_identity.canonical_path.clone(),
+            format: SourceFormat::Hfq,
+            files,
+            metadata_json,
+            manifest,
+        }))
+    }
+
+    /// Immutable effective source seal used by bounded HFQ descriptors.
+    pub fn source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
+        self.effective_source_identity()
+    }
+
+    /// Open a checked positional descriptor for one tensor. The selected
+    /// tensor may come from the base or its attached overlay; its descriptor
+    /// identity records the complete effective source.
+    pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        let (target, file_index) = match self.overlay.as_deref() {
+            Some(overlay) if overlay.resolve_idx(name).is_some() => (overlay, 1usize),
+            _ => (self, 0usize),
+        };
+        let Some(tensor_idx) = target.resolve_idx(name) else {
+            return Ok(None);
+        };
+        let info = &target.tensors[tensor_idx];
+        let source_identity = self.effective_source_identity()?;
+        let file_identity = source_identity
+            .files
+            .get(file_index)
+            .ok_or_else(|| SourceError::MissingEffectiveSeal {
+                reason: format!("HFQ source file index {file_index} is not sealed"),
+            })?
+            .clone();
+        let file = target._file.try_clone().map_err(|source| SourceError::Io {
+            offset: info.data_offset as u64,
+            source,
+        })?;
+        let reader = SourceReader::from_inner(HfqRangeReader {
+            identity: source_identity.clone(),
+            file,
+            file_identity,
+        });
+        SourceRangeDescriptor::from_parts(
+            source_identity,
+            info.data_offset as u64,
+            info.data_size as u64,
+            quant_type_to_dtype(info.quant_type).to_string(),
+            info.shape.iter().map(|&dim| dim as usize).collect(),
+            reader,
+        )
+        .map(Some)
     }
 
     /// Full tensor index of this HFQ file, in on-disk order.
@@ -1318,6 +1729,9 @@ impl crate::model_source::ModelSource for HfqFile {
 
     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
         None // HFQ uses its own HfqTensorInfo type
+    }
+    fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        HfqFile::tensor_range(self, name)
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -1367,14 +1781,50 @@ impl crate::model_source::ModelSource for HfqFile {
 // mmap. Overlay (REAP) shadowing is not consulted for `tensor_info`; the
 // adapter serves the on-disk index only.
 
-/// Map a packed HFQ `quant_type` byte to the dtype string the arch loaders
-/// dispatch on (F16/F32/BF16). Unknown values map to a marker string the
-/// loaders reject by name.
+/// Map a packed HFQ `quant_type` byte to the source/compute dtype name exposed
+/// by [`crate::model_source::SourceRangeDescriptor`]. Host-decoded records
+/// retain their scalar dtypes; raw records use the canonical [`DType`] variant
+/// name so range fulfillment can validate their format instead of seeing the
+/// old unknown `"?"` marker.
 fn quant_type_to_dtype(quant_type: u8) -> &'static str {
     match quant_type {
+        0 => "Q4F16G64",
         1 => "F16",
         2 => "F32",
+        3 => "Q8_0",
+        4 => "Q4K",
+        5 => "Q8HFQ",
+        6 => "HFQ4G256",
+        7 => "HFQ4G128",
+        8 => "HFQ6G256",
+        9 => "HFQ2G256",
+        10 => "HFQ2G128",
+        11 => "HFQ3G256",
+        12 => "HFQ3G128",
+        13 => "MQ4G256",
+        14 => "MQ8G256",
+        15 => "MQ6G256",
         16 => "BF16",
+        17 => "MQ3G256",
+        18 => "MQ2G256",
+        19 => "MQ2G256Lloyd",
+        20 => "MQ3G256Lloyd",
+        21 => "HFP4G32",
+        24 => "MFP4G32",
+        30 => "MQ4G256Lloyd",
+        38 => "MQ2G256GL",
+        39 => "MQ3G256GL",
+        35 => "MFP4G32E8SOA",
+        42 => "MFP4G32E8G128",
+        44 => "MQ4G256V2",
+        45 => "MQ4CG256",
+        47 => "MQ6G256V2",
+        48 => "MQ5G256V2",
+        49 => "MQ3G256V2",
+        50 => "MQ2G256V2",
+        51 => "MQ2G256LloydU",
+        52 => "I64",
+        53 => "MQ4G128V2",
         _ => "?",
     }
 }
@@ -1412,6 +1862,13 @@ impl HfqModelSource {
             .collect();
         Self { hfq, infos, index }
     }
+    pub fn source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
+        self.hfq.source_identity()
+    }
+
+    pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        self.hfq.tensor_range(name)
+    }
 }
 
 impl crate::model_source::ModelSource for HfqModelSource {
@@ -1435,6 +1892,9 @@ impl crate::model_source::ModelSource for HfqModelSource {
 
     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
         self.index.get(name).map(|&i| &self.infos[i])
+    }
+    fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        HfqModelSource::tensor_range(self, name)
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -2655,6 +3115,674 @@ pub(crate) mod hfq_test_fixture {
         }
         f.flush().unwrap();
     }
+    pub(crate) const COMPACT_PLE_ROW_COUNT: usize = 2;
+    pub(crate) const COMPACT_PLE_ROW_WIDTH: usize = 160;
+    pub(crate) const COMPACT_PLE_ROW_BYTES: usize = COMPACT_PLE_ROW_WIDTH * 2;
+    pub(crate) const COMPACT_PLE_NAMES: [&str; 2] = [
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_10.weight",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_2.weight",
+    ];
+    pub(crate) const COMPACT_I64_NAMES: [&str; 3] = [
+        "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets",
+    ];
+
+    fn qwen4_ple_metadata_json() -> String {
+        serde_json::json!({
+            "format": "hfqm",
+            "format_version": 1,
+            "arch_id": 16,
+            "model_type": "qwen4_exp",
+            "config": {"model_type": "qwen4_exp"},
+            "qwen4_ple": {
+                "version": 1,
+                "multipliers": [
+                    23_703_573_157_769i64,
+                    20_109_073_645_365i64,
+                    8_052_911_324_071i64
+                ],
+                "head_vocab_sizes": [
+                    20_000_003u64, 20_000_023, 20_000_033, 20_000_047,
+                    20_000_059, 20_000_063, 20_000_069, 20_000_077,
+                    20_000_081, 20_000_093, 20_000_107, 20_000_147,
+                    20_000_153, 20_000_159, 20_000_161, 20_000_171
+                ],
+                "head_offsets": [
+                    0u64, 20_000_003, 40_000_026, 60_000_059,
+                    80_000_106, 100_000_165, 120_000_228, 140_000_297,
+                    160_000_374, 180_000_455, 200_000_548, 220_000_655,
+                    240_000_802, 260_000_955, 280_001_114, 300_001_275
+                ],
+                "padded_rows": 320_001_536u64
+            }
+        })
+        .to_string()
+    }
+
+    fn bf16_rows(first: u16, last: u16) -> Vec<u8> {
+        [first, last]
+            .into_iter()
+            .flat_map(|bits| {
+                std::iter::repeat(bits.to_le_bytes())
+                    .take(COMPACT_PLE_ROW_WIDTH)
+                    .flatten()
+            })
+            .collect()
+    }
+
+    fn i64_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    pub(crate) fn write_compact_qwen4_ple_hfq(path: &Path) -> std::io::Result<()> {
+        let tensors = vec![
+            super::HfqMemTensor {
+                name: COMPACT_PLE_NAMES[0].to_string(),
+                quant_type: 16,
+                shape: vec![COMPACT_PLE_ROW_COUNT as u32, COMPACT_PLE_ROW_WIDTH as u32],
+                group_size: 0,
+                data: bf16_rows(0x10, 0x11),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_PLE_NAMES[1].to_string(),
+                quant_type: 16,
+                shape: vec![COMPACT_PLE_ROW_COUNT as u32, COMPACT_PLE_ROW_WIDTH as u32],
+                group_size: 0,
+                data: bf16_rows(0x20, 0x21),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_I64_NAMES[0].to_string(),
+                quant_type: 52,
+                shape: vec![3],
+                group_size: 0,
+                data: i64_bytes(&[23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_I64_NAMES[1].to_string(),
+                quant_type: 52,
+                shape: vec![16],
+                group_size: 0,
+                data: i64_bytes(&[
+                    20_000_003, 20_000_023, 20_000_033, 20_000_047, 20_000_059, 20_000_063,
+                    20_000_069, 20_000_077, 20_000_081, 20_000_093, 20_000_107, 20_000_147,
+                    20_000_153, 20_000_159, 20_000_161, 20_000_171,
+                ]),
+            },
+            super::HfqMemTensor {
+                name: COMPACT_I64_NAMES[2].to_string(),
+                quant_type: 52,
+                shape: vec![16],
+                group_size: 0,
+                data: i64_bytes(&[
+                    0,
+                    20_000_003,
+                    40_000_026,
+                    60_000_059,
+                    80_000_106,
+                    100_000_165,
+                    120_000_228,
+                    140_000_297,
+                    160_000_374,
+                    180_000_455,
+                    200_000_548,
+                    220_000_655,
+                    240_000_802,
+                    260_000_955,
+                    280_001_114,
+                    300_001_275,
+                ]),
+            },
+        ];
+        super::write_hfqm_package_mem(path, 16, &qwen4_ple_metadata_json(), &tensors)
+    }
+}
+
+#[cfg(test)]
+mod compact_qwen4_ple_tests {
+    use super::hfq_test_fixture::{
+        write_compact_qwen4_ple_hfq, COMPACT_I64_NAMES, COMPACT_PLE_NAMES, COMPACT_PLE_ROW_BYTES,
+        COMPACT_PLE_ROW_COUNT, COMPACT_PLE_ROW_WIDTH,
+    };
+    use super::*;
+    use crate::model_source::{ModelSource, SourceError, SourceFormat, SourcePayload};
+
+    fn range(hfq: &HfqFile, name: &str) -> SourceRangeDescriptor {
+        let source: &dyn ModelSource = hfq;
+        match source
+            .tensor_payload(name)
+            .expect("HFQ range lookup")
+            .expect("fixture tensor")
+        {
+            SourcePayload::Range(descriptor) => descriptor,
+            SourcePayload::Borrowed { .. } | SourcePayload::Owned { .. } => {
+                panic!("HFQ source must preserve a lazy range payload")
+            }
+        }
+    }
+
+    fn row(descriptor: &SourceRangeDescriptor, local_row: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; COMPACT_PLE_ROW_BYTES];
+        let offset = descriptor.offset + (local_row * COMPACT_PLE_ROW_BYTES) as u64;
+        descriptor
+            .read_exact_at(offset, &mut bytes)
+            .expect("bounded PLE row read");
+        bytes
+    }
+
+    fn assert_bf16_row(bytes: &[u8], bits: u16) {
+        assert_eq!(bytes.len(), COMPACT_PLE_ROW_BYTES);
+        assert!(bytes
+            .chunks_exact(2)
+            .all(|chunk| chunk == bits.to_le_bytes()));
+        assert_eq!(bytes.len() / 2, COMPACT_PLE_ROW_WIDTH);
+    }
+
+    fn i64_values(descriptor: &SourceRangeDescriptor) -> Vec<i64> {
+        let mut bytes = vec![0u8; descriptor.length as usize];
+        descriptor
+            .read_exact(&mut bytes)
+            .expect("I64 metadata read");
+        bytes
+            .chunks_exact(8)
+            .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("I64 chunk")))
+            .collect()
+    }
+
+    #[test]
+    fn compact_qwen4_ple_round_trip_binds_lazy_ranges_and_metadata() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("qwen4-ple.hfq");
+        write_compact_qwen4_ple_hfq(&path).expect("write compact Qwen4 fixture");
+
+        let hfq = HfqFile::open(&path).expect("reopen compact Qwen4 fixture");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&hfq.metadata_json).expect("canonical metadata JSON");
+        let ple = metadata
+            .get("qwen4_ple")
+            .expect("canonical qwen4_ple object");
+        assert_eq!(
+            ple.get("version").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            ple.get("padded_rows").and_then(serde_json::Value::as_u64),
+            Some(320_001_536)
+        );
+        assert_eq!(
+            ple.get("multipliers")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            ple.get("head_vocab_sizes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(16)
+        );
+        assert_eq!(
+            ple.get("head_offsets")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(16)
+        );
+
+        let source: &dyn ModelSource = &hfq;
+        assert_eq!(
+            source.tensor_names().len(),
+            COMPACT_PLE_NAMES.len() + COMPACT_I64_NAMES.len()
+        );
+        assert_eq!(hfq.pread_buf.borrow().capacity(), 0);
+        let first_index_range = range(&hfq, COMPACT_PLE_NAMES[0]);
+        assert_eq!(first_index_range.dtype(), "BF16");
+        assert_eq!(
+            first_index_range.logical_shape(),
+            &[COMPACT_PLE_ROW_COUNT, COMPACT_PLE_ROW_WIDTH]
+        );
+        assert!(matches!(
+            source
+                .tensor_payload(COMPACT_PLE_NAMES[0])
+                .expect("lazy range payload lookup"),
+            Some(SourcePayload::Range(_))
+        ));
+        assert_eq!(hfq.pread_buf.borrow().capacity(), 0);
+
+        let shard_10 = first_index_range;
+        let shard_2 = range(&hfq, COMPACT_PLE_NAMES[1]);
+        assert_eq!(shard_10.source_identity(), shard_2.source_identity());
+        assert_eq!(shard_10.source_identity().format, SourceFormat::Hfq);
+        assert_eq!(shard_10.source_identity().manifest.len(), 5);
+        assert_eq!(
+            shard_10
+                .source_identity()
+                .manifest
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            COMPACT_PLE_NAMES
+                .iter()
+                .copied()
+                .chain(COMPACT_I64_NAMES.iter().copied())
+                .collect::<Vec<_>>()
+        );
+
+        let mut numeric_order = COMPACT_PLE_NAMES;
+        numeric_order.sort_by_key(|name| {
+            name.rsplit_once("shard_")
+                .and_then(|(_, suffix)| suffix.strip_suffix(".weight"))
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .expect("numeric PLE suffix")
+        });
+        assert_eq!(numeric_order, [COMPACT_PLE_NAMES[1], COMPACT_PLE_NAMES[0]]);
+        assert_bf16_row(&row(&shard_2, 0), 0x20);
+        assert_bf16_row(&row(&shard_2, 1), 0x21);
+        assert_bf16_row(&row(&shard_10, 0), 0x10);
+        assert_bf16_row(&row(&shard_10, 1), 0x11);
+        assert_bf16_row(&row(&shard_2, COMPACT_PLE_ROW_COUNT - 1), 0x21);
+        assert_bf16_row(&row(&shard_10, 0), 0x10);
+
+        assert_eq!(
+            i64_values(&range(&hfq, COMPACT_I64_NAMES[0])),
+            vec![23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071]
+        );
+        assert_eq!(
+            i64_values(&range(&hfq, COMPACT_I64_NAMES[1])),
+            vec![
+                20_000_003, 20_000_023, 20_000_033, 20_000_047, 20_000_059, 20_000_063, 20_000_069,
+                20_000_077, 20_000_081, 20_000_093, 20_000_107, 20_000_147, 20_000_153, 20_000_159,
+                20_000_161, 20_000_171,
+            ]
+        );
+        assert_eq!(
+            i64_values(&range(&hfq, COMPACT_I64_NAMES[2])),
+            vec![
+                0,
+                20_000_003,
+                40_000_026,
+                60_000_059,
+                80_000_106,
+                100_000_165,
+                120_000_228,
+                140_000_297,
+                160_000_374,
+                180_000_455,
+                200_000_548,
+                220_000_655,
+                240_000_802,
+                260_000_955,
+                280_001_114,
+                300_001_275,
+            ]
+        );
+    }
+
+    /// `(rchar, read_bytes)` from `/proc/self/io`: bytes the process asked for
+    /// and bytes the block layer actually delivered for it.
+    fn read_proc_self_io() -> (u64, u64) {
+        let text = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        (field("rchar: "), field("read_bytes: "))
+    }
+
+    /// Disk-only probe: does the container's `POSIX_FADV_SEQUENTIAL` hint cost
+    /// the row-addressed PLE reader anything?
+    ///
+    ///   HIPFIRE_PROBE_MODEL=<artifact.hfq> cargo test -p hipfire-runtime --lib \
+    ///     ple_window_readahead_probe -- --ignored --nocapture
+    ///
+    /// The container fd is opened with `POSIX_FADV_SEQUENTIAL` for the ordered
+    /// model load, and the PLE reader's descriptor is a dup of it, so PLE rows
+    /// are read on a sequentially-advised description. This reads the PLE's
+    /// real 3,840 B windows (and a 128 KiB window, where read-ahead has
+    /// something to spend) from two independently opened descriptions, one
+    /// advised SEQUENTIAL and one advised RANDOM, dropping each window's pages
+    /// with `POSIX_FADV_DONTNEED` first, and reports bytes the block layer
+    /// delivered per read (`/proc/self/io`: `read_bytes`).
+    ///
+    /// Measured 2026-09-22, ext4, kernel 7.0.9-cachyos-lto, 192 windows per arm,
+    /// arms alternating order over 3 repetitions: 7,851 B/read for BOTH arms at
+    /// 3,840 B (the ~1.92 pages a crossing window needs) and 135,168 B/read for
+    /// both arms at 128 KiB (exactly the window, no read-ahead). The advice is
+    /// therefore inert for this access shape on this kernel/filesystem; the
+    /// earlier 1.93x reading was an arm-ordering artifact and was not
+    /// reproducible with alternation. Keep this probe: it is the evidence for
+    /// not carrying a second descriptor flavour. Run it with no build or model
+    /// write in flight — a saturated queue is a confounded number, not a
+    /// measurement.
+    #[test]
+    #[ignore = "disk-only readahead probe; set HIPFIRE_PROBE_MODEL to an HFQ artifact"]
+    fn ple_window_readahead_probe() {
+        let Ok(model) = std::env::var("HIPFIRE_PROBE_MODEL") else {
+            println!("ple-window-probe: skipped, HIPFIRE_PROBE_MODEL is unset");
+            return;
+        };
+        let reads: usize = std::env::var("HIPFIRE_PROBE_READS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(192);
+        // Row width the reader aligns to: 320 B for today's BF16 shards, 170 B
+        // for a Q8F16 shard. Offsets are multiples of this, exactly like the
+        // reader's page offsets.
+        let align: u64 = std::env::var("HIPFIRE_PROBE_ALIGN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(320);
+        // 170/340/680/1360/2040 are 1/2/4/8/12 Q8F16 rows; 3840 is today's
+        // BF16 page (12 x 320); 128 KiB is the control where read-ahead would
+        // have room to spend if the kernel did any.
+        let windows: [u64; 7] = [170, 340, 680, 1_360, 2_040, 3_840, 128 * 1024];
+
+        let hfq = HfqFile::open(Path::new(&model)).expect("open probe artifact");
+        let shards: Vec<(u64, u64)> = hfq
+            .tensor_infos()
+            .iter()
+            .filter(|info| info.name.contains(".ngram_embedding.shard_"))
+            .map(|info| (info.data_offset as u64, info.data_size as u64))
+            .take(8)
+            .collect();
+        assert!(
+            !shards.is_empty(),
+            "probe artifact has no external PLE shards to read"
+        );
+        assert!(
+            shards[0].1 > 256 * 1024,
+            "probe shards are too small for the 128 KiB arm"
+        );
+        #[cfg(unix)]
+        let advised = |advice: libc::c_int| -> File {
+            use std::os::unix::io::AsRawFd;
+            let file = File::open(&model).expect("probe fd");
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice);
+            }
+            file
+        };
+
+        // Read one arm and return bytes fetched from the block layer per read.
+        #[cfg(unix)]
+        let run_arm = |advice: libc::c_int, window: u64, offsets: &[(usize, u64)]| -> f64 {
+            use std::os::unix::fs::FileExt as _;
+            use std::os::unix::io::AsRawFd;
+            let files: Vec<File> = shards.iter().map(|_| advised(advice)).collect();
+            let dropper = File::open(&model).expect("drop fd");
+            let mut buffer = vec![0u8; window as usize];
+            let before = read_proc_self_io().1;
+            for (shard, offset) in offsets {
+                let drop_from = *offset & !4095;
+                unsafe {
+                    libc::posix_fadvise(
+                        dropper.as_raw_fd(),
+                        drop_from as libc::off_t,
+                        (window + 8192) as libc::off_t,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                }
+                files[*shard]
+                    .read_exact_at(&mut buffer, *offset)
+                    .expect("probe read");
+            }
+            read_proc_self_io().1.saturating_sub(before) as f64 / offsets.len() as f64
+        };
+
+        #[cfg(unix)]
+        {
+            let mut report: Vec<(u64, &'static str, f64)> = Vec::new();
+            for window in windows {
+                let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let mut offsets = Vec::with_capacity(reads);
+                for _ in 0..reads {
+                    let shard = (next() as usize) % shards.len();
+                    let (offset, length) = shards[shard];
+                    let span = length.saturating_sub(window).max(1);
+                    // Row-aligned, exactly like the reader's page offsets.
+                    let row = (next() % (span / align).max(1)) * align;
+                    offsets.push((shard, offset + row));
+                }
+                // Alternate arm order per repetition: whichever arm runs second
+                // absorbs any asynchronous read-ahead still in flight.
+                for repetition in 0..3 {
+                    let order = if repetition % 2 == 0 {
+                        [
+                            ("sequential", libc::POSIX_FADV_SEQUENTIAL),
+                            ("random", libc::POSIX_FADV_RANDOM),
+                        ]
+                    } else {
+                        [
+                            ("random", libc::POSIX_FADV_RANDOM),
+                            ("sequential", libc::POSIX_FADV_SEQUENTIAL),
+                        ]
+                    };
+                    for (label, advice) in order {
+                        let bytes_per_read = run_arm(advice, window, &offsets);
+                        println!(
+                            "ple-window-probe window={window}B {label}: rep={repetition} reads={} \
+                             bytes/read={bytes_per_read:.0}",
+                            offsets.len()
+                        );
+                        report.push((window, label, bytes_per_read));
+                    }
+                }
+            }
+
+            let median = |window: u64, label: &str| -> f64 {
+                let mut values: Vec<f64> = report
+                    .iter()
+                    .filter(|(w, l, _)| *w == window && *l == label)
+                    .map(|(_, _, bytes)| *bytes)
+                    .collect();
+                values.sort_by(f64::total_cmp);
+                values[values.len() / 2]
+            };
+            println!(
+                "ple-window-probe page-cost curve (row_aligned={align}B, {reads} reads/arm, \
+                 3 reps, median bytes fetched per read):"
+            );
+            for window in windows {
+                let sequential = median(window, "sequential");
+                let random = median(window, "random");
+                println!(
+                    "ple-window-probe window={window}B sequential={sequential:.0} \
+                     random={random:.0} ratio={:.2}x",
+                    if random > 0.0 {
+                        sequential / random
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_qwen4_ple_range_rejects_identity_change_and_truncation() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("qwen4-ple.hfq");
+        write_compact_qwen4_ple_hfq(&path).expect("write compact Qwen4 fixture");
+        let hfq = HfqFile::open(&path).expect("open compact fixture");
+        let descriptor = range(&hfq, COMPACT_PLE_NAMES[0]);
+
+        let replacement = dir.path().join("replacement.hfq");
+        write_compact_qwen4_ple_hfq(&replacement).expect("write replacement fixture");
+        std::fs::rename(&replacement, &path).expect("replace fixture path");
+        let mut bytes = vec![0u8; COMPACT_PLE_ROW_BYTES];
+        assert!(matches!(
+            descriptor.read_exact_at(descriptor.offset, &mut bytes),
+            Err(SourceError::IdentityChanged { .. })
+        ));
+
+        let truncated = dir.path().join("truncated.hfq");
+        write_compact_qwen4_ple_hfq(&truncated).expect("write truncation fixture");
+        let len = std::fs::metadata(&truncated)
+            .expect("truncation fixture metadata")
+            .len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated)
+            .expect("open truncation fixture")
+            .set_len(len - 1)
+            .expect("truncate payload");
+        let error = match HfqFile::open(&truncated) {
+            Ok(_) => panic!("truncated payload must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+}
+#[cfg(test)]
+mod metadata_overlay_tests {
+    use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn overlay_round_trip_preserves_legacy_offsets_and_payload() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("model.hfq");
+        let payload = b"payload!";
+        write_min_hfq(&path, 16, &[("weight", 3, &[2, 4], payload)]);
+        let legacy = HfqFile::open(&path).expect("open legacy fixture");
+        assert_eq!(legacy.format_version, HFQ_BASE_FORMAT_VERSION);
+        assert_eq!(legacy.metadata_json, "{}");
+        assert_eq!(
+            legacy.tensor_data("weight").expect("legacy payload").1,
+            payload
+        );
+        let before = std::fs::read(&path).expect("read original fixture");
+        let metadata_offset = u64::from_le_bytes(before[16..24].try_into().unwrap());
+        let data_offset = u64::from_le_bytes(before[24..32].try_into().unwrap());
+        let original_payload = before[data_offset as usize..].to_vec();
+
+        let metadata = r#"{"tokenizer":"hf-tokenizer","marker":1}"#;
+        append_hfq_metadata_overlay(&path, metadata).expect("append overlay");
+
+        let after = std::fs::read(&path).expect("read overlaid fixture");
+        assert_eq!(
+            &after[16..24],
+            &metadata_offset.to_le_bytes(),
+            "legacy metadata offset moved"
+        );
+        assert_eq!(
+            &after[24..32],
+            &data_offset.to_le_bytes(),
+            "legacy data offset moved"
+        );
+        assert_eq!(
+            &after[data_offset as usize..data_offset as usize + original_payload.len()],
+            original_payload
+        );
+        assert_eq!(
+            after.len(),
+            before.len() + metadata.len() + HFQ_METADATA_OVERLAY_FOOTER_LEN
+        );
+        let raw_version = u32::from_le_bytes(after[4..8].try_into().unwrap());
+        assert_eq!(
+            raw_version & !HFQ_METADATA_OVERLAY_FLAG,
+            HFQ_BASE_FORMAT_VERSION
+        );
+        assert_ne!(raw_version & HFQ_METADATA_OVERLAY_FLAG, 0);
+
+        let file = HfqFile::open(&path).expect("open overlaid fixture");
+        assert_eq!(file.metadata_json, metadata);
+        assert_eq!(file.tensors()[0].data_offset, data_offset as usize);
+        let (_, bytes) = file.tensor_data("weight").expect("weight payload");
+        assert_eq!(bytes, original_payload.as_slice());
+        assert_eq!(file.format_version, HFQ_BASE_FORMAT_VERSION);
+        drop(file);
+        let error = append_hfq_metadata_overlay(&path, metadata).expect_err("duplicate overlay");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn overlay_rejects_torn_checksum_and_bounds() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+
+        let torn = dir.path().join("torn.hfq");
+        write_min_hfq(&torn, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        append_hfq_metadata_overlay(&torn, r#"{"tokenizer":"x"}"#).expect("append overlay");
+        let torn_len = std::fs::metadata(&torn).expect("torn metadata").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&torn)
+            .expect("open torn fixture")
+            .set_len(torn_len - 1)
+            .expect("truncate footer");
+        assert!(
+            HfqFile::open(&torn).is_err(),
+            "torn footer must fail closed"
+        );
+
+        let corrupt = dir.path().join("corrupt.hfq");
+        write_min_hfq(&corrupt, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        append_hfq_metadata_overlay(&corrupt, r#"{"tokenizer":"x"}"#).expect("append overlay");
+        let corrupt_len = std::fs::metadata(&corrupt).expect("corrupt metadata").len();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&corrupt)
+            .expect("open corrupt fixture");
+        file.seek(SeekFrom::Start(
+            corrupt_len - HFQ_METADATA_OVERLAY_FOOTER_LEN as u64 + 12,
+        ))
+        .expect("seek checksum");
+        file.write_all(&[0xFF]).expect("corrupt checksum");
+        file.sync_all().expect("sync corruption");
+        assert!(
+            HfqFile::open(&corrupt).is_err(),
+            "checksum corruption must fail closed"
+        );
+
+        let bounds = dir.path().join("bounds.hfq");
+        write_min_hfq(&bounds, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&bounds)
+            .expect("open bounds fixture");
+        file.seek(SeekFrom::End(0)).expect("seek bounds footer");
+        file.write_all(&u64::MAX.to_le_bytes())
+            .expect("write huge overlay length");
+        file.write_all(&HFQ_METADATA_OVERLAY_SCHEMA.to_le_bytes())
+            .expect("write overlay schema");
+        file.write_all(&[0u8; 32]).expect("write overlay checksum");
+        file.write_all(HFQ_METADATA_OVERLAY_MAGIC)
+            .expect("write overlay magic");
+        file.seek(SeekFrom::Start(4)).expect("seek version");
+        file.write_all(&(HFQ_BASE_FORMAT_VERSION | HFQ_METADATA_OVERLAY_FLAG).to_le_bytes())
+            .expect("commit malformed pointer");
+        file.sync_all().expect("sync malformed pointer");
+        assert!(
+            HfqFile::open(&bounds).is_err(),
+            "out-of-bounds overlay length must fail closed"
+        );
+    }
+
+    #[test]
+    fn overlay_writer_rejects_non_object_without_mutating_file() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("model.hfq");
+        write_min_hfq(&path, 16, &[("weight", 3, &[2, 4], b"payload!")]);
+        let before = std::fs::read(&path).expect("read fixture");
+        assert!(append_hfq_metadata_overlay(&path, "[]").is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read unchanged fixture"),
+            before
+        );
+    }
 }
 
 // ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
@@ -2664,6 +3792,27 @@ mod overlay_tests {
     use super::hfq_test_fixture::write_min_hfq;
     use super::*;
     use crate::model_source::ModelSource; // for `tensor_names`
+    #[test]
+    fn duplicate_tensor_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.hfq");
+        write_min_hfq(
+            &path,
+            9,
+            &[
+                ("A", 3, &[1, 4], &vec![1u8; 4]),
+                ("A", 3, &[1, 4], &vec![2u8; 4]),
+            ],
+        );
+        let err = match HfqFile::open(&path) {
+            Ok(_) => panic!("duplicate tensor names must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("duplicate source tensor"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn truncated_container_errors_instead_of_panicking() {

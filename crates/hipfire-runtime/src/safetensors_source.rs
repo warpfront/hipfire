@@ -2,20 +2,322 @@
 //!
 //! Supports ParoQuant, AWQ, and unquantized safetensors models.
 //! Reads config.json for architecture detection and quantization config.
-//! Mmaps .safetensors files and serves tensor data by name.
+//! Opens shard headers without mapping payloads; the incumbent borrowed-byte
+//! API maps a shard lazily only when explicitly requested.
 
-use crate::model_source::{ModelSource, QuantConfig, TensorInfo};
+use crate::model_source::{
+    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, QuantConfig,
+    SourceError, SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor,
+    SourceRangeIdentity, SourceReader, SourceReaderImpl, TensorInfo,
+};
 use half::bf16;
 use memmap2::Mmap;
-use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 struct SafetensorsFile {
-    _file: File,
-    mmap: Mmap,
+    file: File,
+    mmap: OnceLock<Result<Mmap, String>>,
+}
+
+impl SafetensorsFile {
+    fn map(&self) -> io::Result<&Mmap> {
+        match self
+            .mmap
+            .get_or_init(|| unsafe { Mmap::map(&self.file).map_err(|error| error.to_string()) })
+        {
+            Ok(mmap) => Ok(mmap),
+            Err(error) => Err(io::Error::new(io::ErrorKind::Other, error.clone())),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_mapped(&self) -> bool {
+        self.mmap.get().is_some()
+    }
+}
+
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+
+struct ParsedSafetensorsTensor {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    data_start: u64,
+    relative_start: u64,
+    relative_end: u64,
+}
+struct UniqueHeader(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for UniqueHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HeaderVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeaderVisitor {
+            type Value = UniqueHeader;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a safetensors header object")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate safetensors header entry {key}"
+                        )));
+                    }
+                    values.insert(key, value);
+                }
+                Ok(UniqueHeader(values))
+            }
+        }
+
+        deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
+fn invalid_source(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn dtype_byte_width(dtype: &str) -> Option<u64> {
+    match dtype {
+        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" => Some(1),
+        "U16" | "I16" | "F16" | "BF16" => Some(2),
+        "U32" | "I32" | "F32" => Some(4),
+        "U64" | "I64" => Some(8),
+        _ => None,
+    }
+}
+
+fn parse_safetensors_header(
+    file: &File,
+    file_identity: &SourceFileIdentity,
+) -> io::Result<Vec<ParsedSafetensorsTensor>> {
+    if file_identity.len < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "safetensors shard is shorter than its header length prefix",
+        ));
+    }
+    let mut length_bytes = [0u8; 8];
+    read_file_exact_at(file, file_identity, 0, &mut length_bytes)
+        .map_err(|error| invalid_source(error.to_string()))?;
+    let header_len = u64::from_le_bytes(length_bytes);
+    if header_len > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(invalid_source(format!(
+            "safetensors header is {header_len} bytes, above the {MAX_SAFETENSORS_HEADER_BYTES}-byte limit"
+        )));
+    }
+    let data_start = 8u64
+        .checked_add(header_len)
+        .ok_or_else(|| invalid_source("safetensors header offset overflow"))?;
+    if data_start > file_identity.len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "safetensors header ends at {data_start}, beyond shard length {}",
+                file_identity.len
+            ),
+        ));
+    }
+    let header_len_usize = usize::try_from(header_len)
+        .map_err(|_| invalid_source("safetensors header is too large"))?;
+    let mut header_bytes = vec![0u8; header_len_usize];
+    read_file_exact_at(file, file_identity, 8, &mut header_bytes)
+        .map_err(|error| invalid_source(error.to_string()))?;
+    let header: UniqueHeader =
+        serde_json::from_slice(&header_bytes).map_err(|error| invalid_source(error.to_string()))?;
+    let header = header.0;
+
+    let payload_len = file_identity
+        .len
+        .checked_sub(data_start)
+        .ok_or_else(|| invalid_source("safetensors data start exceeds shard length"))?;
+    let mut tensors = Vec::with_capacity(header.len());
+    for (name, value) in header {
+        if name == "__metadata__" {
+            if !value.is_object() {
+                return Err(invalid_source("safetensors __metadata__ must be an object"));
+            }
+            continue;
+        }
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid_source(format!("tensor {name} metadata is not an object")))?;
+        let dtype = object
+            .get("dtype")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_source(format!("tensor {name} has no dtype")))?;
+        let element_width = dtype_byte_width(dtype).ok_or_else(|| {
+            invalid_source(format!("tensor {name} has unsupported dtype {dtype}"))
+        })?;
+        let shape_values = object
+            .get("shape")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid_source(format!("tensor {name} has no shape")))?;
+        let mut shape = Vec::with_capacity(shape_values.len());
+        let mut element_count = 1u64;
+        for dimension in shape_values {
+            let dimension = dimension.as_u64().ok_or_else(|| {
+                invalid_source(format!("tensor {name} has a non-integer shape dimension"))
+            })?;
+            if dimension == 0 {
+                return Err(invalid_source(format!(
+                    "tensor {name} has a zero shape dimension"
+                )));
+            }
+            let dimension_usize = usize::try_from(dimension)
+                .map_err(|_| invalid_source(format!("tensor {name} shape is too large")))?;
+            element_count = element_count
+                .checked_mul(dimension)
+                .ok_or_else(|| invalid_source(format!("tensor {name} shape product overflows")))?;
+            shape.push(dimension_usize);
+        }
+        let expected_bytes = element_count
+            .checked_mul(element_width)
+            .ok_or_else(|| invalid_source(format!("tensor {name} shape byte size overflows")))?;
+        let offsets = object
+            .get("data_offsets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid_source(format!("tensor {name} has no data_offsets")))?;
+        if offsets.len() != 2 {
+            return Err(invalid_source(format!(
+                "tensor {name} data_offsets must have two entries"
+            )));
+        }
+        let relative_start = offsets[0]
+            .as_u64()
+            .ok_or_else(|| invalid_source(format!("tensor {name} has an invalid start offset")))?;
+        let relative_end = offsets[1]
+            .as_u64()
+            .ok_or_else(|| invalid_source(format!("tensor {name} has an invalid end offset")))?;
+        if relative_end < relative_start {
+            return Err(invalid_source(format!(
+                "tensor {name} data_offsets are reversed"
+            )));
+        }
+        let byte_len = relative_end - relative_start;
+        if byte_len != expected_bytes {
+            return Err(invalid_source(format!(
+                "tensor {name} shape requires {expected_bytes} bytes but data_offsets span {byte_len}"
+            )));
+        }
+        let absolute_end = data_start
+            .checked_add(relative_end)
+            .ok_or_else(|| invalid_source(format!("tensor {name} offset overflows")))?;
+        if absolute_end > file_identity.len || relative_end > payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "tensor {name} data range [{relative_start}, {relative_end}) exceeds shard payload"
+                ),
+            ));
+        }
+        tensors.push(ParsedSafetensorsTensor {
+            name: name.clone(),
+            dtype: dtype.to_string(),
+            shape,
+            data_start,
+            relative_start,
+            relative_end,
+        });
+    }
+
+    let mut ranges: Vec<_> = tensors
+        .iter()
+        .map(|tensor| {
+            (
+                tensor.relative_start,
+                tensor.relative_end,
+                tensor.name.as_str(),
+            )
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut previous_end = 0u64;
+    for (start, end, name) in ranges {
+        if start < previous_end {
+            return Err(invalid_source(format!(
+                "tensor {name} data range overlaps another tensor"
+            )));
+        }
+        previous_end = previous_end.max(end);
+    }
+    Ok(tensors)
+}
+fn read_safetensors_index(
+    dir: &Path,
+    st_paths: &[PathBuf],
+) -> io::Result<Option<HashMap<String, String>>> {
+    let index_path = dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let index_bytes = std::fs::read(&index_path)?;
+    let index: serde_json::Value =
+        serde_json::from_slice(&index_bytes).map_err(|error| invalid_source(error.to_string()))?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| invalid_source("safetensors index has no weight_map object"))?;
+    let shard_names: HashMap<String, ()> = st_paths
+        .iter()
+        .filter_map(|path| {
+            path.file_name()?
+                .to_str()
+                .map(|name| (name.to_string(), ()))
+        })
+        .collect();
+    let mut result = HashMap::with_capacity(weight_map.len());
+    for (name, shard) in weight_map {
+        let shard = shard.as_str().ok_or_else(|| {
+            invalid_source(format!("safetensors index entry {name} is not a string"))
+        })?;
+        if !shard_names.contains_key(shard) {
+            return Err(invalid_source(format!(
+                "safetensors index maps {name} to missing shard {shard}"
+            )));
+        }
+        result.insert(name.clone(), shard.to_string());
+    }
+    Ok(Some(result))
+}
+
+/// Positional reader for one safetensors shard. The reader retains the
+/// complete source seal but only one file handle: each descriptor identifies
+/// its shard, and every read rechecks that shard's identity before pread.
+struct SafetensorsRangeReader {
+    identity: Arc<SourceIdentity>,
+    file: File,
+    file_identity: SourceFileIdentity,
+}
+
+impl SourceReaderImpl for SafetensorsRangeReader {
+    fn identity(&self) -> &SourceIdentity {
+        self.identity.as_ref()
+    }
+
+    fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        // The source seal covers the whole shard set. A changed non-selected
+        // shard still invalidates descriptors because the source is one
+        // immutable inventory, not an unbound collection of files.
+        for expected in &self.identity.files {
+            verify_path_identity(expected)?;
+        }
+        read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
 }
 
 pub struct SafetensorsSource {
@@ -26,77 +328,154 @@ pub struct SafetensorsSource {
     metadata_json_cached: String,
     arch_id: u32,
     quant_config: Option<QuantConfig>,
+    source_identity: Arc<SourceIdentity>,
+    range_readers: Vec<SourceReader>,
 }
 
 impl SafetensorsSource {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        // Read config.json
+        // Read config.json.
         let config_path = dir.join("config.json");
         let mut config_str = String::new();
         File::open(&config_path)?.read_to_string(&mut config_str)?;
         let config: serde_json::Value = serde_json::from_str(&config_str)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
-        // Derive arch_id from architectures field
         let arch_id = derive_arch_id(&config);
-
-        // Parse quantization config
         let quant_config = parse_quant_config(&config);
-
-        // Build metadata JSON in HFQ-compatible format
         let metadata_json_cached = build_metadata_json(&config, &config_str);
 
-        // Find and open all .safetensors files
+        // Open every shard and parse only its bounded header. Payload mappings
+        // are deferred until an incumbent caller explicitly asks for borrowed
+        // bytes through `tensor_data`.
         let mut st_paths: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .map_or(false, |extension| extension == "safetensors")
+            })
             .collect();
         st_paths.sort();
-
         if st_paths.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("{}: no .safetensors files found", dir.display()),
             ));
         }
+        let indexed_shards = read_safetensors_index(dir, &st_paths)?;
 
-        let mut files = Vec::new();
+        let mut files = Vec::with_capacity(st_paths.len());
+        let mut file_identities = Vec::with_capacity(st_paths.len());
         let mut tensors = Vec::new();
         let mut tensor_map = HashMap::new();
 
         for (file_idx, st_path) in st_paths.iter().enumerate() {
+            let file_identity = capture_file_identity(st_path)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             let file = File::open(st_path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
+            let parsed = parse_safetensors_header(&file, &file_identity)?;
+            let shard_name = st_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid_source("safetensors shard has no UTF-8 file name"))?;
 
-            let parsed = SafeTensors::deserialize(&mmap)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let mmap_start = mmap.as_ptr() as usize;
-            for (name, view) in parsed.iter() {
-                let data_offset = (view.data().as_ptr() as usize)
-                    .checked_sub(mmap_start)
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("safetensors tensor {name} is outside its mmap"),
-                        )
-                    })?;
+            for tensor in parsed {
+                if tensor_map.contains_key(&tensor.name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        SourceError::DuplicateTensor { name: tensor.name },
+                    ));
+                }
+                if let Some(index) = &indexed_shards {
+                    match index.get(&tensor.name) {
+                        Some(indexed_shard) if indexed_shard == shard_name => {}
+                        Some(indexed_shard) => {
+                            return Err(invalid_source(format!(
+                                "safetensors index maps {} to {indexed_shard}, but it is in {shard_name}",
+                                tensor.name
+                            )));
+                        }
+                        None => {
+                            return Err(invalid_source(format!(
+                                "safetensors index has no entry for {}",
+                                tensor.name
+                            )));
+                        }
+                    }
+                }
+                let data_offset_u64 = tensor
+                    .data_start
+                    .checked_add(tensor.relative_start)
+                    .ok_or_else(|| invalid_source("safetensors tensor offset overflows"))?;
+                let data_size_u64 = tensor
+                    .relative_end
+                    .checked_sub(tensor.relative_start)
+                    .ok_or_else(|| invalid_source("safetensors tensor length underflows"))?;
+                let data_offset = usize::try_from(data_offset_u64)
+                    .map_err(|_| invalid_source("safetensors tensor offset is too large"))?;
+                let data_size = usize::try_from(data_size_u64)
+                    .map_err(|_| invalid_source("safetensors tensor is too large"))?;
                 let tensor_idx = tensors.len();
-                let info = TensorInfo {
-                    name: name.to_string(),
-                    dtype: view.dtype().to_string(),
-                    shape: view.shape().to_vec(),
-                    quant_type: 0xFF, // not an HFQ quant_type
+                tensors.push(TensorInfo {
+                    name: tensor.name.clone(),
+                    dtype: tensor.dtype,
+                    shape: tensor.shape,
+                    quant_type: 0xFF,
                     data_offset,
-                    data_size: view.data().len(),
-                };
-                tensors.push(info);
-                tensor_map.insert(name.to_string(), (file_idx, tensor_idx));
+                    data_size,
+                });
+                tensor_map.insert(tensor.name, (file_idx, tensor_idx));
             }
 
-            files.push(SafetensorsFile { _file: file, mmap });
+            file_identities.push(file_identity);
+            files.push(SafetensorsFile {
+                file,
+                mmap: OnceLock::new(),
+            });
+        }
+        if let Some(index) = &indexed_shards {
+            if let Some(name) = index.keys().find(|name| !tensor_map.contains_key(*name)) {
+                return Err(invalid_source(format!(
+                    "safetensors index names missing tensor {name}"
+                )));
+            }
         }
 
+        let source_identity = Arc::new(SourceIdentity {
+            canonical_path: std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            format: SourceFormat::Safetensors,
+            files: file_identities.clone(),
+            metadata_json: metadata_json_cached.clone(),
+            manifest: tensors
+                .iter()
+                .map(|info| {
+                    let &(file_index, _) = tensor_map
+                        .get(&info.name)
+                        .expect("tensor map populated with every tensor");
+                    SourceRangeIdentity {
+                        name: info.name.clone(),
+                        file_index,
+                        offset: info.data_offset as u64,
+                        length: info.data_size as u64,
+                        dtype: info.dtype.clone(),
+                        logical_shape: info.shape.clone(),
+                    }
+                })
+                .collect(),
+        });
+        let range_readers = files
+            .iter()
+            .enumerate()
+            .map(|(file_idx, file)| {
+                let reader_file = file.file.try_clone()?;
+                Ok(SourceReader::from_inner(SafetensorsRangeReader {
+                    identity: source_identity.clone(),
+                    file: reader_file,
+                    file_identity: file_identities[file_idx].clone(),
+                }))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         tracing::debug!(
             model_dir = %dir.display(),
             shard_count = files.len(),
@@ -114,12 +493,23 @@ impl SafetensorsSource {
             metadata_json_cached,
             arch_id,
             quant_config,
+            source_identity,
+            range_readers,
         })
     }
 
+    /// Immutable source seal shared by all descriptors from this shard set.
+    pub fn source_identity(&self) -> &SourceIdentity {
+        self.source_identity.as_ref()
+    }
     /// Public accessor so `loader_api` doesn't need the `ModelSource` trait in scope.
     pub fn arch_id(&self) -> u32 {
         self.arch_id
+    }
+
+    #[cfg(test)]
+    fn mapped_file_count(&self) -> usize {
+        self.files.iter().filter(|file| file.is_mapped()).count()
     }
 }
 
@@ -139,16 +529,35 @@ impl ModelSource for SafetensorsSource {
     fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
         let &(file_idx, tensor_idx) = self.tensor_map.get(name)?;
         let info = &self.tensors[tensor_idx];
-        let mmap = &self.files[file_idx].mmap;
-        Some((
-            info,
-            &mmap[info.data_offset..info.data_offset + info.data_size],
-        ))
+        let mmap = self.files[file_idx].map().ok()?;
+        let end = info.data_offset.checked_add(info.data_size)?;
+        Some((info, &mmap[info.data_offset..end]))
     }
 
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         let &(_file_idx, tensor_idx) = self.tensor_map.get(name)?;
         Some(&self.tensors[tensor_idx])
+    }
+    fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
+        let Some(&(file_idx, tensor_idx)) = self.tensor_map.get(name) else {
+            return Ok(None);
+        };
+        let info = &self.tensors[tensor_idx];
+        SourceRangeDescriptor::from_parts(
+            self.source_identity.clone(),
+            u64::try_from(info.data_offset).map_err(|_| SourceError::Overflow {
+                offset: u64::MAX,
+                length: info.data_size as u64,
+            })?,
+            u64::try_from(info.data_size).map_err(|_| SourceError::Overflow {
+                offset: info.data_offset as u64,
+                length: u64::MAX,
+            })?,
+            info.dtype.clone(),
+            info.shape.clone(),
+            self.range_readers[file_idx].clone(),
+        )
+        .map(Some)
     }
 
     /// `MADV_DONTNEED` over the tensor's mmap range.
@@ -176,7 +585,9 @@ impl ModelSource for SafetensorsSource {
         }
         #[cfg(unix)]
         {
-            let mmap = &self.files[file_idx].mmap;
+            let Some(Ok(mmap)) = self.files[file_idx].mmap.get() else {
+                return;
+            };
             // SAFETY: read-only file mapping, so every page is clean; a
             // discarded page is refaulted from the file with identical bytes.
             let _ = unsafe {
@@ -288,7 +699,10 @@ pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         // Generic table-driven substring match for all other architectures.
         let mut best: Option<(&'static str, u32)> = None;
-        for (k, v) in crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID {
+        for (k, v) in crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .chain(crate::arch_mapping::RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        {
             if arch_lower.contains(*k) {
                 match best {
                     Some((bk, _)) if k.len() <= bk.len() => {}
@@ -495,6 +909,14 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen4_exp" })), 16);
+        assert_eq!(
+            derive_arch_id(&json!({
+                "model_type": "qwen4_exp",
+                "text_config": { "model_type": "qwen4_exp_text" }
+            })),
+            16
+        );
     }
 
     /// A diffusers FLUX transformer component config (`model_type: "flux"`)
@@ -616,14 +1038,8 @@ mod tests {
     /// Minimal hand-rolled safetensors writer: 8-byte LE header length, JSON
     /// header, concatenated little-endian tensor bytes. Keeps the test free of
     /// a writer dependency.
-    fn write_source(dir: &Path, tensors: &[(&str, Vec<u8>, Vec<usize>)]) {
+    fn write_shard(path: &Path, tensors: &[(&str, Vec<u8>, Vec<usize>)]) {
         use std::io::Write as _;
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(
-            dir.join("config.json"),
-            serde_json::json!({ "model_type": "llama" }).to_string(),
-        )
-        .unwrap();
         let mut header = serde_json::Map::new();
         let mut offset = 0usize;
         for (name, data, shape) in tensors {
@@ -641,13 +1057,239 @@ mod tests {
             header.insert((*name).to_string(), meta.into());
         }
         let header_json = serde_json::Value::Object(header).to_string();
-        let mut f = std::fs::File::create(dir.join("model.safetensors")).unwrap();
-        f.write_all(&(header_json.len() as u64).to_le_bytes())
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(header_json.len() as u64).to_le_bytes())
             .unwrap();
-        f.write_all(header_json.as_bytes()).unwrap();
+        file.write_all(header_json.as_bytes()).unwrap();
         for (_, data, _) in tensors {
-            f.write_all(data).unwrap();
+            file.write_all(data).unwrap();
         }
+    }
+
+    fn write_source(dir: &Path, tensors: &[(&str, Vec<u8>, Vec<usize>)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "model_type": "llama" }).to_string(),
+        )
+        .unwrap();
+        write_shard(&dir.join("model.safetensors"), tensors);
+    }
+
+    fn write_raw_shard(path: &Path, header: serde_json::Value, payload: &[u8]) {
+        use std::io::Write as _;
+        let header = header.to_string();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.write_all(payload).unwrap();
+    }
+
+    #[test]
+    fn header_only_open_keeps_multi_shard_payloads_unmapped() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-st-header-only-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "model_type": "llama" }).to_string(),
+        )
+        .unwrap();
+        let a = vec![1u8, 2];
+        let b = vec![3u8, 4];
+        write_shard(
+            &dir.join("model-00001.safetensors"),
+            &[("a", a.clone(), vec![1])],
+        );
+        write_shard(
+            &dir.join("model-00002.safetensors"),
+            &[("b", b.clone(), vec![1])],
+        );
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({
+                "weight_map": {
+                    "a": "model-00001.safetensors",
+                    "b": "model-00002.safetensors"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let source = SafetensorsSource::open(&dir).expect("open multi-shard source");
+        assert_eq!(source.mapped_file_count(), 0);
+        let range = source.tensor_range("a").unwrap().expect("range a");
+        let mut ranged = vec![0u8; a.len()];
+        range.read_exact(&mut ranged).unwrap();
+        assert_eq!(ranged, a);
+        assert_eq!(source.mapped_file_count(), 0);
+
+        assert_eq!(source.tensor_data("a").unwrap().1, &a[..]);
+        assert_eq!(source.mapped_file_count(), 1);
+        assert_eq!(source.tensor_data("b").unwrap().1, &b[..]);
+        assert_eq!(source.mapped_file_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_tensor_names_across_shards_are_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-st-duplicate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "model_type": "llama" }).to_string(),
+        )
+        .unwrap();
+        write_shard(
+            &dir.join("model-00001.safetensors"),
+            &[("same", vec![0, 0], vec![1])],
+        );
+        write_shard(
+            &dir.join("model-00002.safetensors"),
+            &[("same", vec![1, 1], vec![1])],
+        );
+        let error = SafetensorsSource::open(&dir)
+            .err()
+            .expect("duplicate must fail");
+        assert!(error.to_string().contains("duplicate source tensor: same"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_offsets_and_shapes_are_rejected_before_mapping() {
+        let cases = [
+            (
+                "shape",
+                serde_json::json!({
+                    "bad": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 2] }
+                }),
+                vec![0u8, 0, 0, 0],
+                "shape requires 4 bytes",
+            ),
+            (
+                "offset",
+                serde_json::json!({
+                    "bad": { "dtype": "BF16", "shape": [1], "data_offsets": [0, 2] }
+                }),
+                vec![0u8],
+                "exceeds shard payload",
+            ),
+        ];
+        for (label, header, payload, expected) in cases {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-st-malformed-{label}-{}-{}",
+                std::process::id(),
+                line!()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::json!({ "model_type": "llama" }).to_string(),
+            )
+            .unwrap();
+            write_raw_shard(&dir.join("model.safetensors"), header, &payload);
+            let error = SafetensorsSource::open(&dir)
+                .err()
+                .expect("malformed shard must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "{label} error: {error}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn shard_index_membership_and_changed_identity_are_checked() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-st-identity-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "model_type": "llama" }).to_string(),
+        )
+        .unwrap();
+        write_shard(
+            &dir.join("model-00001.safetensors"),
+            &[("a", vec![0, 0], vec![1])],
+        );
+        write_shard(
+            &dir.join("model-00002.safetensors"),
+            &[("b", vec![1, 1], vec![1])],
+        );
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({
+                "weight_map": {
+                    "a": "model-00002.safetensors",
+                    "b": "model-00002.safetensors"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = SafetensorsSource::open(&dir)
+            .err()
+            .expect("index membership must fail");
+        assert!(error
+            .to_string()
+            .contains("maps a to model-00002.safetensors"));
+
+        std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+        let source = SafetensorsSource::open(&dir).expect("open source");
+        let range = source.tensor_range("a").unwrap().expect("range a");
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("model-00002.safetensors"))
+            .unwrap()
+            .write_all(&[9])
+            .unwrap();
+        let mut bytes = vec![0u8; 2];
+        let error = range.read_exact(&mut bytes).unwrap_err();
+        assert!(matches!(error, SourceError::IdentityChanged { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_header_is_rejected_without_allocating_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-st-header-limit-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "model_type": "llama" }).to_string(),
+        )
+        .unwrap();
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(dir.join("model.safetensors")).unwrap();
+        file.write_all(&(MAX_SAFETENSORS_HEADER_BYTES + 1).to_le_bytes())
+            .unwrap();
+        let error = SafetensorsSource::open(&dir)
+            .err()
+            .expect("oversized header must fail");
+        assert!(error.to_string().contains("above the"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `release_tensor_pages` is the crate's only `unsafe` madvise, and its

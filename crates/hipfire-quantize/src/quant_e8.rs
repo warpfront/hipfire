@@ -10,7 +10,7 @@
     non_snake_case,
     clippy::all
 )]
-use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::quant_fwht::{cpu_fwht_128, cpu_fwht_256, gen_fwht_signs};
 use crate::quant_hfp4::{e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
 use std::collections::HashMap;
@@ -677,6 +677,109 @@ pub(crate) fn quantize_mfp4g32_e8_soa_2d(
             dst.copy_from_slice(&soa_row);
         });
     out
+}
+
+/// 128-wide E8-SoA encoder.
+///
+/// Same E8 lattice codec, same SoA wire layout, and the same byte geometry as
+/// [`quantize_mfp4g32_e8_soa_2d`]: `n_blocks = k/32`, scales padded to 16B,
+/// then `n_blocks * 16B` of codewords. The ONLY difference is the FWHT
+/// segmentation — 128 elements instead of 256 — which is what lets a
+/// reduction axis that is not a multiple of 256 be rotated at all. qwen4's
+/// routed-expert `down_proj` is exactly that case: K = 640 = 5 x 128.
+///
+/// The rotation is orthogonal and is applied to both weights and activations,
+/// so this changes the *distribution* the lattice sees, never the decode math.
+/// The activation side must use the matching G128 basis (`rotate_x_mq_128`,
+/// seeds 43/1043 — the same tables MQ4G128V2 already consumes).
+pub(crate) fn quantize_mfp4g32_e8_soa128_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    assert_eq!(f32_data.len(), m * k);
+    assert!(
+        k % 128 == 0,
+        "mfp4-E8-SoA-128 requires k%128==0, got k={}",
+        k
+    );
+    assert!(signs1.len() == 128 && signs2.len() == 128);
+    let n_blocks = k / 32;
+    let scale_padded = ((n_blocks + 15) >> 4) << 4;
+    let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
+    let mut out = vec![0u8; m * soa_row_bytes];
+    out.par_chunks_mut(soa_row_bytes)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            let mut row_buf = f32_data[r * k..(r + 1) * k].to_vec();
+            for seg in 0..(k / 128) {
+                cpu_fwht_128(&mut row_buf[seg * 128..(seg + 1) * 128], signs1, signs2);
+            }
+            let aos_row = quantize_mfp4g32_e8_row(&row_buf);
+            let soa_row = aos_to_soa_row(&aos_row, n_blocks);
+            dst.copy_from_slice(&soa_row);
+        });
+    out
+}
+
+/// 128-wide AoS E8 encoder for reduction axes that 256 cannot tile.
+///
+/// Same E8 lattice codec, same AoS wire layout and the same byte geometry as
+/// [`quantize_mfp4g32_e8_2d`]: `[16 B header][n_blocks x (1 B E4M3 scale + 16 B
+/// codewords)]` with `n_blocks = k/32`. The ONLY difference is the FWHT
+/// segmentation — 128 elements instead of 256 — which is what lets a reduction
+/// axis that 256 cannot tile be rotated at all. qwen4's routed-expert
+/// `down_proj` is exactly that case: K = 640 = 5 x 128.
+///
+/// Because the row layout is unchanged, this format is exactly iso-size with
+/// `MFP4G32E8`/`MFP4G32E8SOA` per 32-weight block, and unlike the SoA sibling it
+/// carries no scale padding. It is NOT header-free: the 16 B row header holds
+/// the f16 row scale, which is 16 B/row beyond what the shipping MQ4 V2 tiers
+/// spend — 4.7% of a K=640 row, 1.2% of a K=2560 row.
+///
+/// The activation side must use the matching G128 basis (`rotate_x_mq_128`,
+/// sign seeds 43/1043) — the same tables `MQ4G128V2` already consumes.
+pub(crate) fn quantize_mfp4g32_e8_g128_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+
+    assert_eq!(f32_data.len(), m * k);
+    assert!(k % 128 == 0, "mfp4-E8-G128 requires k%128==0, got k={}", k);
+    assert!(signs1.len() == 128 && signs2.len() == 128);
+    let row_bytes = mfp4g32_e8_g128_row_bytes(k);
+    let mut out = vec![0u8; m * row_bytes];
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(r, dst)| {
+            let mut row_buf = f32_data[r * k..(r + 1) * k].to_vec();
+            for seg in 0..(k / 128) {
+                cpu_fwht_128(&mut row_buf[seg * 128..(seg + 1) * 128], signs1, signs2);
+            }
+            let aos_row = quantize_mfp4g32_e8_row(&row_buf);
+            dst.copy_from_slice(&aos_row);
+        });
+    out
+}
+
+/// Row stride of the qt=42 AoS layout: `[16 B header][n_blocks x 17 B]`.
+///
+/// Byte-identical to `MFP4G32E8` (qt=34), because the rotation width is not in
+/// the bytes — it is only in which 128-element segments share a FWHT. This is
+/// the loader/GEMM row-stride rule for the new tag; `k % 32 == 0` is the wire
+/// requirement, while the *encoder* additionally needs `k % 128 == 0` to place
+/// whole rotation segments.
+pub(crate) fn mfp4g32_e8_g128_row_bytes(k: usize) -> usize {
+    assert!(k % 32 == 0, "mfp4g32-E8-G128 requires k%32==0, got k={}", k);
+    16 + 17 * (k / 32)
 }
 
 /// SoA E8 with the explicit least-squares row-scale repair above.
@@ -1423,5 +1526,1092 @@ mod hfp4_tests {
             "mfp4L NRMSE {} too high (layout/codebook bug)",
             nrmse
         );
+    }
+}
+
+/// K=640 feasibility probe for the 128-wide E8-SoA tier.
+///
+/// qwen4's routed-expert `down_proj` reduces over K = 640 = 5x128, which is not
+/// a multiple of 256 — so the 256-wide E8-SoA segmentation cannot rotate it and
+/// the 256-wide SoA GEMV group loop cannot cover it. This module measures both
+/// halves of that claim on the CPU: the encoder's round trip at K=640, and the
+/// exact block coverage of each group geometry.
+#[cfg(test)]
+mod e8_soa128_tests {
+    use super::*;
+    use crate::quant_fwht::{
+        cpu_fwht_128, gen_fwht_signs, quantize_mq4g128v2, quantize_mq4g256v2, quantize_mq6g256v2,
+    };
+
+    /// qwen4 routed-expert `down_proj` reduction axis: 5 x 128.
+    const K_DOWN: usize = 640;
+    /// qwen4 routed-expert `gate_up` reduction axis: 10 x 256 = 20 x 128.
+    const K_GATE_UP: usize = 2560;
+    const M: usize = 8;
+
+    /// Deterministic small-magnitude weights (same shape of data as real rows).
+    fn probe_weights(m: usize, k: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..m * k)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let unit = ((state >> 33) & 0xffff) as f32 / 65536.0;
+                (unit - 0.5) * 0.04
+            })
+            .collect()
+    }
+
+    /// Activations are multiples of 1/128 so every value is exact in f16 (the
+    /// prefill WMMA arm stages its input through f16); that rounding must not be
+    /// part of the error being measured.
+    fn probe_activations(rows: usize, k: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..rows * k)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let value = ((state >> 40) % 257) as i32 - 128;
+                value as f32 / 128.0
+            })
+            .collect()
+    }
+
+    /// Same 128-element rotation the runtime applies to the activation
+    /// (`rotate_x_mq_128`, seeds 43/1043).
+    fn rotate128(values: &[f32]) -> Vec<f32> {
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+        let mut rotated = values.to_vec();
+        for segment in rotated.chunks_mut(128) {
+            cpu_fwht_128(segment, &signs1, &signs2);
+        }
+        rotated
+    }
+
+    fn rotate256(values: &[f32]) -> Vec<f32> {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let mut rotated = values.to_vec();
+        for segment in rotated.chunks_mut(256) {
+            cpu_fwht_256(segment, &signs1, &signs2);
+        }
+        rotated
+    }
+
+    fn rel_l2(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len(), "probe length mismatch");
+        let num: f64 = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
+        let den: f64 = expected.iter().map(|b| (*b as f64).powi(2)).sum();
+        (num / den.max(f64::MIN_POSITIVE)).sqrt() as f32
+    }
+
+    /// Blocks the SoA GEMV group loop visits for one row, given a group that
+    /// spans `group_elems` K-elements (= `group_elems/32` 32-weight blocks).
+    ///
+    /// Mirrors `gemv_mfp4g32_e8_soa_gfx1151` exactly: 32 threads, 8 weights per
+    /// thread per group, `pairs = groups/2` then a single `tail` group.
+    fn blocks_covered(k: usize, group_elems: usize) -> Vec<usize> {
+        let blocks_per_group = group_elems / 32;
+        let groups = k / group_elems;
+        let pairs = groups >> 1;
+        let tail = groups & 1;
+        let mut out = Vec::new();
+        for p in 0..pairs {
+            let g = p << 1;
+            out.extend(g * blocks_per_group..(g + 1) * blocks_per_group);
+            out.extend((g + 1) * blocks_per_group..(g + 2) * blocks_per_group);
+        }
+        if tail == 1 {
+            let g = pairs << 1;
+            out.extend(g * blocks_per_group..(g + 1) * blocks_per_group);
+        }
+        out
+    }
+
+    /// The blocking fact: at K=640 the shipped 256-element group geometry stops
+    /// after 512 elements. This is silent in the kernel (no assert, no fault) —
+    /// the last 128 K elements are simply never multiplied.
+    #[test]
+    fn e8_soa_256_wide_group_undercovers_k640() {
+        let covered = blocks_covered(K_DOWN, 256);
+        let missing: Vec<usize> = (0..K_DOWN / 32).filter(|b| !covered.contains(b)).collect();
+        assert_eq!(
+            missing,
+            vec![16, 17, 18, 19],
+            "256-wide groups must miss the last 128 of K=640"
+        );
+        assert_eq!(covered.len(), 16, "512 of 640 elements covered");
+    }
+
+    /// The fix's shape: a 128-element group (16 threads x 8 weights) covers
+    /// K=640 and K=2560 exactly, each block once, with the shipped
+    /// `pairs`/`tail` loop skeleton unchanged.
+    #[test]
+    fn e8_soa_128_wide_group_covers_expert_k_axes_exactly() {
+        for k in [K_DOWN, K_GATE_UP] {
+            let covered = blocks_covered(k, 128);
+            let mut sorted = covered.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..k / 32).collect::<Vec<usize>>(),
+                "128-wide groups must cover every block of K={k} exactly once"
+            );
+            // gate_up keeps working at 256 too, so only down_proj forces 128.
+            if k == K_GATE_UP {
+                assert_eq!(blocks_covered(k, 256).len(), k / 32);
+            }
+        }
+    }
+
+    /// K=640 end-to-end: encode with the 128-wide SoA encoder, decode through
+    /// the CPU SoA decoder (bit-identical to the kernel's lattice decode), and
+    /// compare both the reconstructed weights and the projected
+    /// `down_proj` reduction against the exact f32 reference.
+    #[test]
+    fn e8_soa_128_wide_k640_down_proj_matches_f32_reference() {
+        let weights = probe_weights(M, K_DOWN, 0x5eed_1234_abcd_0001);
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+        let packed = quantize_mfp4g32_e8_soa128_2d(&weights, M, K_DOWN, &signs1, &signs2);
+
+        // Geometry: 20 blocks, scales padded to 32 B, 16 B header.
+        let row_bytes = 16 + 32 + (K_DOWN / 32) * 16;
+        assert_eq!(row_bytes, 368);
+        assert_eq!(packed.len(), M * row_bytes);
+
+        let decoded_rot = dequant_mfp4g32_e8_soa(&packed, M, K_DOWN);
+        let reference_rot = rotate128(&weights);
+
+        // Wiring: the driver must be exactly "rotate in 128-wide segments,
+        // then the shipped E8 row encoder, then the shipped SoA permutation".
+        // Any deviation in segmentation or permutation breaks byte identity.
+        let n_blocks = K_DOWN / 32;
+        for r in 0..M {
+            let mut row_buf = weights[r * K_DOWN..(r + 1) * K_DOWN].to_vec();
+            for seg in 0..(K_DOWN / 128) {
+                cpu_fwht_128(&mut row_buf[seg * 128..(seg + 1) * 128], &signs1, &signs2);
+            }
+            let expected = aos_to_soa_row(&quantize_mfp4g32_e8_row(&row_buf), n_blocks);
+            assert_eq!(
+                &packed[r * row_bytes..(r + 1) * row_bytes],
+                expected.as_slice(),
+                "row {r}: 128-wide SoA bytes must be the shipped row encoder, permuted"
+            );
+        }
+
+        let weight_rel_l2 = rel_l2(&decoded_rot, &reference_rot);
+        let worst_row = (0..M)
+            .map(|r| {
+                rel_l2(
+                    &decoded_rot[r * K_DOWN..(r + 1) * K_DOWN],
+                    &reference_rot[r * K_DOWN..(r + 1) * K_DOWN],
+                )
+            })
+            .fold(0.0f32, f32::max);
+
+        // The FWHT is orthonormal, so `dot(decoded_rot, x_rot) == dot(decoded, x)`
+        // and the gap to the exact natural-basis projection is the tier's own
+        // contribution — exactly what MoE `down_proj` computes.
+        let x = probe_activations(1, K_DOWN, 0x0abc_def0_0000_0002);
+        let x_rot = rotate128(&x);
+        let projected: Vec<f32> = (0..M)
+            .map(|r| {
+                decoded_rot[r * K_DOWN..(r + 1) * K_DOWN]
+                    .iter()
+                    .zip(&x_rot)
+                    .map(|(w, xv)| w * xv)
+                    .sum::<f32>()
+            })
+            .collect();
+        let exact: Vec<f32> = (0..M)
+            .map(|r| {
+                weights[r * K_DOWN..(r + 1) * K_DOWN]
+                    .iter()
+                    .zip(&x)
+                    .map(|(w, xv)| w * xv)
+                    .sum::<f32>()
+            })
+            .collect();
+        let projection_rel_l2 = rel_l2(&projected, &exact);
+        let worst_projection_row = (0..M)
+            .map(|r| ((projected[r] - exact[r]) / exact[r].abs().max(f32::MIN_POSITIVE)).abs())
+            .fold(0.0f32, f32::max);
+
+        // Same projection over many more rows: the 8-row figure above is a
+        // small-sample estimate whose denominator can nearly cancel in one row
+        // (hence the large "worst row relative"), so report the converged value
+        // alongside it rather than reading a trend into 8 samples.
+        const WIDE: usize = 64;
+        let wide_weights = probe_weights(WIDE, K_DOWN, 0x5eed_1234_abcd_0004);
+        let wide_packed =
+            quantize_mfp4g32_e8_soa128_2d(&wide_weights, WIDE, K_DOWN, &signs1, &signs2);
+        let wide_decoded = dequant_mfp4g32_e8_soa(&wide_packed, WIDE, K_DOWN);
+        let wide_projected: Vec<f32> = (0..WIDE)
+            .map(|r| {
+                wide_decoded[r * K_DOWN..(r + 1) * K_DOWN]
+                    .iter()
+                    .zip(&x_rot)
+                    .map(|(w, xv)| w * xv)
+                    .sum::<f32>()
+            })
+            .collect();
+        let wide_exact: Vec<f32> = (0..WIDE)
+            .map(|r| {
+                wide_weights[r * K_DOWN..(r + 1) * K_DOWN]
+                    .iter()
+                    .zip(&x)
+                    .map(|(w, xv)| w * xv)
+                    .sum::<f32>()
+            })
+            .collect();
+        let wide_projection_rel_l2 = rel_l2(&wide_projected, &wide_exact);
+
+        println!(
+            "E8-SoA-128 K={K_DOWN} (M={M}): weight rel_l2 = {weight_rel_l2:.5} \
+             (worst row {worst_row:.5}); down_proj projection rel_l2 = \
+             {projection_rel_l2:.5} (worst row relative {worst_projection_row:.5}); \
+             projection rel_l2 over M={WIDE} = {wide_projection_rel_l2:.5}"
+        );
+        // Tripwire only, matching the "layout/codebook bug" NRMSE ceiling this
+        // file already uses for mfp4L. The tier's real quality number is the
+        // reported figure plus the shared-K control below, not this bound.
+        assert!(
+            weight_rel_l2 < 0.15,
+            "128-wide E8-SoA reconstruction too coarse: {weight_rel_l2}"
+        );
+    }
+
+    /// Control: at a K both segmentations can rotate, the 128-wide tier is not
+    /// worse than the shipped 256-wide one. This is what makes 128-wide a
+    /// format choice rather than a quality regression.
+    #[test]
+    fn e8_soa_128_wide_quality_matches_256_wide_at_shared_k() {
+        const K: usize = 512;
+        let weights = probe_weights(M, K, 0x5eed_1234_abcd_0003);
+        let packed128 = quantize_mfp4g32_e8_soa128_2d(
+            &weights,
+            M,
+            K,
+            &gen_fwht_signs(43, 128),
+            &gen_fwht_signs(1043, 128),
+        );
+        let packed256 = quantize_mfp4g32_e8_soa_2d(
+            &weights,
+            M,
+            K,
+            &gen_fwht_signs(42, 256),
+            &gen_fwht_signs(1042, 256),
+        );
+        let rel128 = rel_l2(
+            &dequant_mfp4g32_e8_soa(&packed128, M, K),
+            &rotate128(&weights),
+        );
+        let rel256 = rel_l2(
+            &dequant_mfp4g32_e8_soa(&packed256, M, K),
+            &rotate256(&weights),
+        );
+        println!(
+            "E8-SoA control K={K}: 128-wide rel_l2 = {rel128:.5}, 256-wide rel_l2 = {rel256:.5}"
+        );
+        assert!(
+            rel128 < rel256 * 1.10,
+            "128-wide tier is materially worse than 256-wide ({rel128} vs {rel256})"
+        );
+    }
+
+    // ── Incumbent MQ-V2 layouts, for the iso-size comparison ────────────────
+    //
+    // CPU mirrors of the shipped decoders. No CPU-side decoder for qt44/qt47
+    // or qt53 exists in the tree, so their layout sanity is asserted rather
+    // than assumed: a wrong nibble order or header offset decodes to noise
+    // (rel_l2 near 1.0), not to a 4-bit tier.
+
+    /// qt53 MQ4G128V2: row-local, `ceil(K/128)` groups of 68 B =
+    /// `[f16 scale][f16 zero][64 B nibbles]`, byte i = q[2i] | q[2i+1] << 4.
+    fn decode_mq4g128v2(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+        const GROUP: usize = 128;
+        const BYTES: usize = 68;
+        let gpr = k.div_ceil(GROUP);
+        assert_eq!(packed.len(), m * gpr * BYTES, "qt53 byte extent");
+        let mut out = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let base = (row * gpr + g) * BYTES;
+                let scale = f16_to_f32(u16::from_le_bytes([packed[base], packed[base + 1]]));
+                let zero = f16_to_f32(u16::from_le_bytes([packed[base + 2], packed[base + 3]]));
+                for i in 0..64usize {
+                    let byte = packed[base + 4 + i];
+                    let at = g * GROUP + 2 * i;
+                    if at < k {
+                        out[row * k + at] = zero + scale * ((byte & 0xF) as f32);
+                    }
+                    if at + 1 < k {
+                        out[row * k + at + 1] = zero + scale * (((byte >> 4) & 0xF) as f32);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// qt44 MQ4G256V2 (`bits`=4) and qt47 MQ6G256V2 (`bits`=6): flat 256-weight
+    /// groups, 8 B header holding two 128-weight halves, payload 128 B or 192 B.
+    /// Both encoders flatten the tensor, so K % 256 == 0 is required for a group
+    /// to stay inside one row — which is exactly why neither can express
+    /// K=640, and why the K=640 table below has only two rows.
+    fn decode_mq256(packed: &[u8], m: usize, k: usize, bits: u32) -> Vec<f32> {
+        assert_eq!(k % 256, 0, "flat-G256 layouts need K%256==0");
+        let group_bytes = if bits == 4 { 136 } else { 200 };
+        assert_eq!(
+            packed.len(),
+            m * (k / 256) * group_bytes,
+            "G256 byte extent"
+        );
+        let mut out = vec![0.0f32; m * k];
+        for b in 0..m * (k / 256) {
+            let base = b * group_bytes;
+            for h in 0..2usize {
+                let scale = f16_to_f32(u16::from_le_bytes([
+                    packed[base + h * 4],
+                    packed[base + h * 4 + 1],
+                ]));
+                let zero = f16_to_f32(u16::from_le_bytes([
+                    packed[base + h * 4 + 2],
+                    packed[base + h * 4 + 3],
+                ]));
+                for i in 0..128usize {
+                    let at = h * 128 + i;
+                    let q = if bits == 4 {
+                        let byte = packed[base + 8 + at / 2];
+                        (if at % 2 == 0 { byte & 0xF } else { byte >> 4 }) as u32
+                    } else {
+                        let bo = base + 8 + (at / 4) * 3;
+                        let b0 = packed[bo] as u32;
+                        let b1 = packed[bo + 1] as u32;
+                        let b2 = packed[bo + 2] as u32;
+                        match at % 4 {
+                            0 => b0 & 63,
+                            1 => ((b0 >> 6) | (b1 << 2)) & 63,
+                            2 => ((b1 >> 4) | (b2 << 4)) & 63,
+                            _ => (b2 >> 2) & 63,
+                        }
+                    };
+                    out[b * 256 + at] = zero + scale * (q as f32);
+                }
+            }
+        }
+        out
+    }
+
+    /// Gaussian sample, sd = 0.02. Real expert weights are far closer to this
+    /// than to a uniform source, and the difference is decisive for a lattice
+    /// codec: a lattice's shaping gain comes from codeword *density*, which a
+    /// uniform source cannot reward and a peaked source can.
+    fn probe_weights_gaussian(m: usize, k: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..m * k)
+            .map(|_| {
+                // Irwin-Hall(12): sum of 12 uniforms, mean 6, variance 1.
+                let sum: f32 = (0..12).map(|_| lcg_unit(&mut state)).sum();
+                (sum - 6.0) * 0.02
+            })
+            .collect()
+    }
+
+    fn lcg_unit(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 33) & 0xffff) as f32 / 65536.0
+    }
+
+    /// One tier's comparison row: bytes/row, weight reconstruction error in the
+    /// tier's own (orthogonal) basis, and the projection against the exact f32
+    /// reference, averaged over independently drawn activations.
+    ///
+    /// The activation average is load-bearing. With a single `x` the projection
+    /// figure is a one-sample estimate whose denominator can nearly cancel in one
+    /// row; for white error the expected ratio is exactly `weight_rel_l2`, so a
+    /// tier that lands far below its own weight error on one `x` is reporting
+    /// sampling luck, not quality. Returns (weight rel_l2, mean projection rel_l2).
+    #[allow(clippy::too_many_arguments)]
+    fn tier_row(
+        name: &str,
+        bytes_per_row: usize,
+        weights: &[f32],
+        rotated_reference: &[f32],
+        decoded_rot: &[f32],
+        activations: &[f32],
+        activations_rot: &[f32],
+        m: usize,
+        k: usize,
+    ) -> (f32, f32) {
+        assert_eq!(activations.len() % k, 0, "activation buffer must tile at K");
+        assert_eq!(activations.len(), activations_rot.len());
+        let n_act = activations.len() / k;
+        let weight_rel_l2 = rel_l2(decoded_rot, rotated_reference);
+        let mut projected = vec![0.0f32; m];
+        let mut exact = vec![0.0f32; m];
+        let mut sum = 0.0f64;
+        let mut worst = 0.0f32;
+        for a in 0..n_act {
+            let x = &activations[a * k..(a + 1) * k];
+            let x_rot = &activations_rot[a * k..(a + 1) * k];
+            for r in 0..m {
+                projected[r] = decoded_rot[r * k..(r + 1) * k]
+                    .iter()
+                    .zip(x_rot)
+                    .map(|(w, v)| w * v)
+                    .sum::<f32>();
+                exact[r] = weights[r * k..(r + 1) * k]
+                    .iter()
+                    .zip(x)
+                    .map(|(w, v)| w * v)
+                    .sum::<f32>();
+            }
+            let rel = rel_l2(&projected, &exact);
+            sum += rel as f64;
+            worst = worst.max(rel);
+        }
+        let projection_rel_l2 = (sum / n_act as f64) as f32;
+
+        // Diagnostics that explain a weight-MSE / projection-MSE split: the
+        // per-row least-squares gain (a systematic gain error is NOT averaged
+        // away by the K-term dot product the way white error is), and the cosine
+        // between the error and the reference (|cos| = 1 fully systematic).
+        let gain: f64 = (0..m)
+            .map(|r| {
+                let row = &decoded_rot[r * k..(r + 1) * k];
+                let reference = &rotated_reference[r * k..(r + 1) * k];
+                let dot: f64 = row
+                    .iter()
+                    .zip(reference)
+                    .map(|(a, b)| (*a as f64) * (*b as f64))
+                    .sum();
+                let norm: f64 = reference.iter().map(|b| (*b as f64).powi(2)).sum();
+                dot / norm.max(f64::MIN_POSITIVE)
+            })
+            .sum::<f64>()
+            / m as f64;
+        let mut dot_er = 0.0f64;
+        let mut norm_e = 0.0f64;
+        let mut norm_r = 0.0f64;
+        for (a, b) in decoded_rot.iter().zip(rotated_reference) {
+            let error = (*a - *b) as f64;
+            dot_er += error * (*b as f64);
+            norm_e += error * error;
+            norm_r += (*b as f64).powi(2);
+        }
+        let alignment = dot_er / (norm_e.sqrt() * norm_r.sqrt()).max(f64::MIN_POSITIVE);
+        println!(
+            "  {name:<12} {bytes_per_row:>5} B/row ({:.5} B/w)  weight rel_l2={weight_rel_l2:.5}  \
+             proj rel_l2 mean={projection_rel_l2:.5} worst={worst:.5}  gain={gain:.5}  \
+             err·ref cos={alignment:+.4}",
+            bytes_per_row as f32 / k as f32
+        );
+        (weight_rel_l2, projection_rel_l2)
+    }
+
+    /// E8-SoA `[16 B header][scales padded to 16 B][n_blocks * 16 B codewords]`.
+    fn e8_soa_row_bytes(k: usize) -> usize {
+        let n_blocks = k / 32;
+        16 + (((n_blocks + 15) >> 4) << 4) + n_blocks * 16
+    }
+
+    /// Every tier representable at `k`, on identical weights and activations.
+    /// qt44/qt47 drop out when K % 256 != 0: their groups are flat and must stay
+    /// inside one row.
+    fn compare_tiers(label: &str, k: usize, m: usize, act: usize, weights: &[f32], seed: u64) {
+        let y = probe_activations(act, k, seed);
+        let y_rot128 = rotate128(&y);
+        let y_rot256 = rotate256(&y);
+        let rotated128 = rotate128(weights);
+        let rotated256 = rotate256(weights);
+        let s1_128 = gen_fwht_signs(43, 128);
+        let s2_128 = gen_fwht_signs(1043, 128);
+        let s1_256 = gen_fwht_signs(42, 256);
+        let s2_256 = gen_fwht_signs(1042, 256);
+        println!("{label}: K={k}, M={m}, {act} activations");
+
+        let packed_e8 = quantize_mfp4g32_e8_soa128_2d(weights, m, k, &s1_128, &s2_128);
+        assert_eq!(packed_e8.len(), m * e8_soa_row_bytes(k));
+        let e8 = tier_row(
+            "E8-SoA-128",
+            e8_soa_row_bytes(k),
+            weights,
+            &rotated128,
+            &dequant_mfp4g32_e8_soa(&packed_e8, m, k),
+            &y,
+            &y_rot128,
+            m,
+            k,
+        );
+
+        let packed_g128 = quantize_mfp4g32_e8_g128_2d(weights, m, k, &s1_128, &s2_128);
+        assert_eq!(packed_g128.len(), m * mfp4g32_e8_g128_row_bytes(k));
+        let e8a = tier_row(
+            "E8-G128-AoS",
+            mfp4g32_e8_g128_row_bytes(k),
+            weights,
+            &rotated128,
+            &dequant_mfp4g32_e8(&packed_g128, m, k),
+            &y,
+            &y_rot128,
+            m,
+            k,
+        );
+
+        let packed53 = quantize_mq4g128v2(weights, m, k, &s1_128, &s2_128).expect("qt53 encode");
+        assert_eq!(packed53.len(), m * (k / 128) * 68);
+        let mq4g128 = tier_row(
+            "MQ4G128V2",
+            (k / 128) * 68,
+            weights,
+            &rotated128,
+            &decode_mq4g128v2(&packed53, m, k),
+            &y,
+            &y_rot128,
+            m,
+            k,
+        );
+        // Layout gate: a wrong nibble order or header offset decodes to noise
+        // (rel_l2 near 1.0) instead of a 4-bit tier.
+        assert!(
+            mq4g128.0 > 0.01 && mq4g128.0 < 0.25,
+            "qt53 decoder layout is wrong: weight rel_l2 {}",
+            mq4g128.0
+        );
+
+        if k % 256 == 0 {
+            let packed44 = quantize_mq4g256v2(weights, m, k, &s1_256, &s2_256);
+            let mq4g256 = tier_row(
+                "MQ4G256V2",
+                (k / 256) * 136,
+                weights,
+                &rotated256,
+                &decode_mq256(&packed44, m, k, 4),
+                &y,
+                &y_rot256,
+                m,
+                k,
+            );
+            let packed47 = quantize_mq6g256v2(weights, m, k, &s1_256, &s2_256);
+            let mq6 = tier_row(
+                "MQ6G256V2",
+                (k / 256) * 200,
+                weights,
+                &rotated256,
+                &decode_mq256(&packed47, m, k, 6),
+                &y,
+                &y_rot256,
+                m,
+                k,
+            );
+            assert!(
+                mq4g256.0 > 0.01 && mq4g256.0 < 0.25,
+                "qt44 decoder layout is wrong: weight rel_l2 {}",
+                mq4g256.0
+            );
+            assert!(
+                mq6.0 > 0.005 && mq6.0 < 0.15,
+                "qt47 decoder layout is wrong: weight rel_l2 {}",
+                mq6.0
+            );
+        }
+
+        assert!(
+            e8.1 < 0.25,
+            "128-wide E8-SoA projection error out of family: {}",
+            e8.1
+        );
+        assert!(
+            e8a.1 < 0.25,
+            "128-wide E8-AoS projection error out of family: {}",
+            e8a.1
+        );
+        // The AoS G128 row is the shipped E8 AoS row, byte for byte: the
+        // rotation width is not in the wire format. Pinned here so a future
+        // "optimisation" of the row stride cannot pass unnoticed.
+        assert_eq!(
+            mfp4g32_e8_g128_row_bytes(k),
+            16 + 17 * (k / 32),
+            "qt=42 row stride must equal qt=34's at K={k}"
+        );
+    }
+
+    /// The tier's acceptance question: at qwen4's two expert reduction axes, on
+    /// identical weights and activations, does 128-wide E8-SoA beat the MQ-V2
+    /// tiers qwen4 ships today (qt53 down_proj, qt44 gate_up)?
+
+    /// Per repo convention a tier's quality is reported from probe data, never
+    /// asserted from it — the layout gates in `compare_tiers` are the tripwires.
+    /// Both weight sources are run because the answer is distribution-dependent:
+    /// a lattice's shaping gain needs a peaked source, which a uniform one
+    /// cannot provide.
+    #[test]
+    fn e8_soa_128_wide_versus_incumbent_tiers_on_uniform_weights() {
+        const M: usize = 64;
+        const ACT: usize = 32;
+        for k in [K_DOWN, K_GATE_UP] {
+            compare_tiers(
+                "uniform probe weights",
+                k,
+                M,
+                ACT,
+                &probe_weights(M, k, 0x5eed_1234_abcd_0004 + k as u64),
+                0x0abc_def0_0000_0002 + k as u64,
+            );
+        }
+    }
+
+    #[test]
+    fn e8_soa_128_wide_versus_incumbent_tiers_on_gaussian_weights() {
+        const M: usize = 64;
+        const ACT: usize = 32;
+        for k in [K_DOWN, K_GATE_UP] {
+            compare_tiers(
+                "gaussian probe weights",
+                k,
+                M,
+                ACT,
+                &probe_weights_gaussian(M, k, 0x5eed_1234_abcd_0007 + k as u64),
+                0x0abc_def0_0000_0008 + k as u64,
+            );
+        }
+    }
+    // ── Device-backed coverage + numerics (gfx1151) ─────────────────────────
+
+    fn as_bytes_f32(values: &[f32]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        }
+    }
+
+    fn download_f32(gpu: &rdna_compute::Gpu, t: &rdna_compute::GpuTensor, n: usize) -> Vec<f32> {
+        let mut host = vec![0f32; n];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                host.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(&host[..]),
+            )
+        };
+        gpu.hip.memcpy_dtoh(bytes, &t.buf).expect("dtoh");
+        host
+    }
+
+    /// qt=42 on device, at both of qwen4's expert reduction axes and through the
+    /// MoE kernels the tier actually needs.
+    ///
+    /// Three things are ASSERTED rather than inferred, because all three failed
+    /// silently elsewhere in this family:
+    ///  1. coverage — `y` is poisoned before the launch and every element must be
+    ///     overwritten. The grid under-launch of 0e0ad47b4 produced exactly the
+    ///     opposite (a stale tail read back as weights-times-activation), and a
+    ///     `groups_per_row = K/256` walk on K=640 produces it again. An unwritten
+    ///     count is the test: `assert_eq!(unwritten, 0)`.
+    ///  2. basis — the device G128 rotation must equal the CPU `cpu_fwht_128`
+    ///     tables the encoder used (seeds 43/1043). A rotation-width mismatch
+    ///     between weights and activation is fluent garbage, not a fault.
+    ///  3. wiring — the kernel must reproduce the CPU decode GEMV, which is the
+    ///     same E8 lattice body the shipped 256-wide kernels run.
+    ///
+    /// The tier's own error against the exact f32 product is printed, not
+    /// asserted: per repo convention that number is settled on a real artifact.
+    #[test]
+    #[ignore = "device-backed: run `cargo test --release -p hipfire-quantize --bin hipfire-quantize -- --ignored e8g128_device --nocapture`"]
+    fn e8g128_device_coverage_and_numerics() {
+        const POISON: f32 = 12345.625;
+        const M: usize = 64;
+        let mut gpu = rdna_compute::Gpu::init().expect("device init");
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+
+        for k in [K_DOWN, K_GATE_UP] {
+            let weights = probe_weights(M, k, 0x5eed_1234_abcd_0009 + k as u64);
+            let packed = quantize_mfp4g32_e8_g128_2d(&weights, M, k, &signs1, &signs2);
+            let x = probe_activations(1, k, 0x0abc_def0_0000_000a + k as u64);
+            let x_rot = rotate128(&x);
+
+            let decoded = dequant_mfp4g32_e8(&packed, M, k);
+            let reference: Vec<f32> = (0..M)
+                .map(|r| {
+                    decoded[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x_rot)
+                        .map(|(w, v)| w * v)
+                        .sum()
+                })
+                .collect();
+            let exact: Vec<f32> = (0..M)
+                .map(|r| {
+                    weights[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x)
+                        .map(|(w, v)| w * v)
+                        .sum()
+                })
+                .collect();
+
+            let w_gpu = gpu
+                .alloc_tensor(&[packed.len()], rdna_compute::DType::Raw)
+                .expect("alloc w");
+            gpu.hip.memcpy_htod(&w_gpu.buf, &packed).expect("htod w");
+            let x_gpu = gpu
+                .alloc_tensor(&[k], rdna_compute::DType::F32)
+                .expect("alloc x");
+            gpu.hip
+                .memcpy_htod(&x_gpu.buf, as_bytes_f32(&x))
+                .expect("htod x");
+            let rot_gpu = gpu
+                .alloc_tensor(&[k], rdna_compute::DType::F32)
+                .expect("alloc rot");
+            let y_gpu = gpu
+                .alloc_tensor(&[M], rdna_compute::DType::F32)
+                .expect("alloc y");
+            gpu.hip
+                .memcpy_htod(&y_gpu.buf, as_bytes_f32(&vec![POISON; M]))
+                .expect("poison y");
+
+            gpu.rotate_x_mq_128(&x_gpu, &rot_gpu, k)
+                .expect("rotate_x_mq_128");
+            gpu.gemv_mfp4g32_e8g128(&w_gpu, &rot_gpu, &y_gpu, M, k)
+                .expect("gemv_mfp4g32_e8g128");
+            gpu.hip.device_synchronize().expect("sync");
+
+            let rot_device = download_f32(&gpu, &rot_gpu, k);
+            let basis_rel = rel_l2(&rot_device, &x_rot);
+            let y = download_f32(&gpu, &y_gpu, M);
+            let unwritten = y.iter().filter(|v| **v == POISON).count();
+            let wiring = rel_l2(&y, &reference);
+            let format = rel_l2(&y, &exact);
+            println!(
+                "qt=42 dense K={k}: unwritten={unwritten}/{M} basis rel_l2={basis_rel:.3e} \
+                 wiring rel_l2={wiring:.3e} format rel_l2={format:.5}"
+            );
+            assert_eq!(
+                unwritten, 0,
+                "K={k}: {unwritten} of {M} outputs never written"
+            );
+            assert!(
+                basis_rel < 1e-5,
+                "K={k}: device G128 rotation disagrees with the encoder's basis: {basis_rel}"
+            );
+            assert!(
+                wiring < 1e-3,
+                "K={k}: kernel disagrees with the CPU decode GEMV: {wiring}"
+            );
+        }
+
+        // MoE down (the projection whose reduction axis is K=640) and MoE gate_up.
+        // These are the kernels the tier needs for the k8-indexed decode path.
+        for k in [K_DOWN, K_GATE_UP] {
+            // k_top = 8 is the production decode width, so the wrapper the decode
+            // call site uses is exercised at its real rank count rather than
+            // through a batch-of-one shortcut.
+            const K_TOP: usize = 8;
+            let weights = probe_weights(M, k, 0x5eed_1234_abcd_000b + k as u64);
+            let packed = quantize_mfp4g32_e8_g128_2d(&weights, M, k, &signs1, &signs2);
+            let x = probe_activations(1, k, 0x0abc_def0_0000_000c + k as u64);
+            let x_rot = rotate128(&x);
+            let decoded = dequant_mfp4g32_e8(&packed, M, k);
+            let reference: Vec<f32> = (0..M)
+                .map(|r| {
+                    decoded[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x_rot)
+                        .map(|(w, v)| w * v)
+                        .sum()
+                })
+                .collect();
+
+            let w_gpu = gpu
+                .alloc_tensor(&[packed.len()], rdna_compute::DType::Raw)
+                .expect("alloc w");
+            gpu.hip.memcpy_htod(&w_gpu.buf, &packed).expect("htod w");
+            let ptrs = gpu
+                .alloc_tensor(&[8], rdna_compute::DType::Raw)
+                .expect("alloc ptrs");
+            let expert_ptr = [w_gpu.buf.as_ptr() as u64];
+            let ptr_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    expert_ptr.as_ptr() as *const u8,
+                    std::mem::size_of_val(&expert_ptr),
+                )
+            };
+            gpu.hip
+                .memcpy_htod(&ptrs.buf, ptr_bytes)
+                .expect("htod ptrs");
+            let topk = gpu
+                .alloc_tensor(&[K_TOP * 4], rdna_compute::DType::Raw)
+                .expect("alloc topk");
+            // All 8 ranks route to the single expert under test, so every rank's
+            // output must equal the same reference.
+            let topk_idx: [i32; K_TOP] = [0; K_TOP];
+            let topk_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    topk_idx.as_ptr() as *const u8,
+                    std::mem::size_of_val(&topk_idx),
+                )
+            };
+            gpu.hip
+                .memcpy_htod(&topk.buf, topk_bytes)
+                .expect("htod topk");
+            let rot_batch = gpu
+                .alloc_tensor(&[K_TOP * k], rdna_compute::DType::F32)
+                .expect("alloc rot_batch");
+            let mut rot_all = Vec::with_capacity(K_TOP * k);
+            for _ in 0..K_TOP {
+                rot_all.extend_from_slice(&x_rot);
+            }
+            gpu.hip
+                .memcpy_htod(&rot_batch.buf, as_bytes_f32(&rot_all))
+                .expect("htod rot_batch");
+            let out = gpu
+                .alloc_tensor(&[K_TOP * M], rdna_compute::DType::F32)
+                .expect("alloc out");
+            gpu.hip
+                .memcpy_htod(&out.buf, as_bytes_f32(&vec![POISON; K_TOP * M]))
+                .expect("poison out");
+
+            gpu.gemv_mfp4g32_e8g128_moe_down_k8_indexed_batched_expanded(
+                &ptrs, &topk, &rot_batch, &out, M, k, K_TOP, 1,
+            )
+            .expect("moe down g128");
+            gpu.hip.device_synchronize().expect("sync");
+            let y = download_f32(&gpu, &out, K_TOP * M);
+            let unwritten = y.iter().filter(|v| **v == POISON).count();
+            let worst_rank = (0..K_TOP)
+                .map(|r| rel_l2(&y[r * M..(r + 1) * M], &reference))
+                .fold(0.0f32, f32::max);
+            println!(
+                "qt=42 MoE down K={k}: unwritten={unwritten}/{} wiring rel_l2 worst-of-{K_TOP}={worst_rank:.3e}",
+                K_TOP * M
+            );
+            assert_eq!(
+                unwritten, 0,
+                "MoE down K={k}: {unwritten} outputs never written"
+            );
+            assert!(
+                worst_rank < 1e-3,
+                "MoE down K={k}: kernel disagrees: {worst_rank}"
+            );
+
+            // gate_up is the gate||up concatenation: the operand has 2M rows and
+            // row < M is gate, row >= M is up. Encoding only M rows here would
+            // make the kernel read past the tensor for the `up` half.
+            let full = 2 * M;
+            let gu_weights = probe_weights(full, k, 0x5eed_1234_abcd_000d + k as u64);
+            let gu_packed = quantize_mfp4g32_e8_g128_2d(&gu_weights, full, k, &signs1, &signs2);
+            let gu_decoded = dequant_mfp4g32_e8(&gu_packed, full, k);
+            let gu_ref: Vec<f32> = (0..full)
+                .map(|r| {
+                    gu_decoded[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x_rot)
+                        .map(|(w, v)| w * v)
+                        .sum()
+                })
+                .collect();
+            let gu_gpu = gpu
+                .alloc_tensor(&[gu_packed.len()], rdna_compute::DType::Raw)
+                .expect("alloc gu");
+            gpu.hip
+                .memcpy_htod(&gu_gpu.buf, &gu_packed)
+                .expect("htod gu");
+            let gu_ptrs = gpu
+                .alloc_tensor(&[8], rdna_compute::DType::Raw)
+                .expect("alloc gu ptrs");
+            let gu_ptr = [gu_gpu.buf.as_ptr() as u64];
+            let gu_ptr_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    gu_ptr.as_ptr() as *const u8,
+                    std::mem::size_of_val(&gu_ptr),
+                )
+            };
+            gpu.hip
+                .memcpy_htod(&gu_ptrs.buf, gu_ptr_bytes)
+                .expect("htod gu ptrs");
+
+            let gate = gpu
+                .alloc_tensor(&[K_TOP * M], rdna_compute::DType::F32)
+                .expect("alloc gate");
+            let up = gpu
+                .alloc_tensor(&[K_TOP * M], rdna_compute::DType::F32)
+                .expect("alloc up");
+            gpu.hip
+                .memcpy_htod(&gate.buf, as_bytes_f32(&vec![POISON; K_TOP * M]))
+                .expect("poison gate");
+            gpu.hip
+                .memcpy_htod(&up.buf, as_bytes_f32(&vec![POISON; K_TOP * M]))
+                .expect("poison up");
+            // The single-token wrapper the decode call site actually uses.
+            gpu.gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed(
+                &gu_ptrs, &topk, &rot_batch, &gate, &up, full, k,
+            )
+            .expect("moe gate_up g128 (single-token wrapper)");
+            gpu.hip.device_synchronize().expect("sync");
+            let gate_v = download_f32(&gpu, &gate, K_TOP * M);
+            let up_v = download_f32(&gpu, &up, K_TOP * M);
+            let unwritten_gate = gate_v.iter().filter(|v| **v == POISON).count();
+            let unwritten_up = up_v.iter().filter(|v| **v == POISON).count();
+            let worst_gate = (0..K_TOP)
+                .map(|r| rel_l2(&gate_v[r * M..(r + 1) * M], &gu_ref[..M]))
+                .fold(0.0f32, f32::max);
+            let worst_up = (0..K_TOP)
+                .map(|r| rel_l2(&up_v[r * M..(r + 1) * M], &gu_ref[M..]))
+                .fold(0.0f32, f32::max);
+            println!(
+                "qt=42 MoE gate_up K={k}: unwritten={}/{} gate rel_l2 worst-of-{K_TOP}={worst_gate:.3e} \
+                 up rel_l2 worst-of-{K_TOP}={worst_up:.3e}",
+                unwritten_gate + unwritten_up,
+                2 * K_TOP * M
+            );
+            assert_eq!(
+                unwritten_gate + unwritten_up,
+                0,
+                "MoE gate_up K={k}: outputs never written"
+            );
+            assert!(
+                worst_gate < 1e-3 && worst_up < 1e-3,
+                "MoE gate_up K={k}: kernel disagrees: gate {worst_gate}, up {worst_up}"
+            );
+        }
+    }
+    /// qt=42 grouped-WMMA prefill on device. The kernel's K loop was flattened
+    /// from `group -> tile` to a single 16-value tile loop, so this asserts the
+    /// two properties that rewrite could break: every output written (poisoned
+    /// buffer, counted) and the flattened order still reproducing the reference.
+    ///
+    /// The reference mirrors the kernel's own operand rounding — the A operand is
+    /// E8-decoded then rounded to f16, the B operand is the activation staged
+    /// through f16 by `ensure_fp16_x` — so the residual is accumulation drift, not
+    /// representation error. One expert, one 16-slot tile, `x_row_div = 1`.
+    #[test]
+    #[ignore = "device-backed: run `cargo test --release -p hipfire-quantize --bin hipfire-quantize -- --ignored e8g128_device_grouped --nocapture`"]
+    fn e8g128_device_grouped_wmma_coverage_and_numerics() {
+        const POISON: f32 = 12345.625;
+        const M: usize = 16;
+        const M_TOTAL: usize = 16;
+        let mut gpu = rdna_compute::Gpu::init().expect("device init");
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+
+        for k in [K_DOWN, K_GATE_UP] {
+            let weights = probe_weights(M, k, 0x5eed_1234_abcd_000e + k as u64);
+            let packed = quantize_mfp4g32_e8_g128_2d(&weights, M, k, &signs1, &signs2);
+            let decoded = dequant_mfp4g32_e8(&packed, M, k);
+            let x = probe_activations(M_TOTAL, k, 0x0abc_def0_0000_000f + k as u64);
+            let x_rot = rotate128(&x);
+
+            // Kernel-side rounding: A goes through f16 after the scale multiply,
+            // B through f16 via ensure_fp16_x.
+            let a_reg: Vec<f32> = decoded.iter().map(|v| f16_to_f32(f32_to_f16(*v))).collect();
+            let x_f16: Vec<f32> = x_rot.iter().map(|v| f16_to_f32(f32_to_f16(*v))).collect();
+            let mut reference = vec![0f32; M_TOTAL * M];
+            for slot in 0..M_TOTAL {
+                for m in 0..M {
+                    reference[slot * M + m] =
+                        (0..k).map(|i| a_reg[m * k + i] * x_f16[slot * k + i]).sum();
+                }
+            }
+
+            let w_gpu = gpu
+                .alloc_tensor(&[packed.len()], rdna_compute::DType::Raw)
+                .expect("alloc w");
+            gpu.hip.memcpy_htod(&w_gpu.buf, &packed).expect("htod w");
+            let ptrs = gpu
+                .alloc_tensor(&[8], rdna_compute::DType::Raw)
+                .expect("alloc ptrs");
+            let expert_ptr = [w_gpu.buf.as_ptr() as u64];
+            let ptr_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    expert_ptr.as_ptr() as *const u8,
+                    std::mem::size_of_val(&expert_ptr),
+                )
+            };
+            gpu.hip
+                .memcpy_htod(&ptrs.buf, ptr_bytes)
+                .expect("htod ptrs");
+
+            let tile_ids: [i32; 1] = [0; 1];
+            let tile_gpu = gpu
+                .alloc_tensor(&[4], rdna_compute::DType::Raw)
+                .expect("alloc tile ids");
+            let tile_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    tile_ids.as_ptr() as *const u8,
+                    std::mem::size_of_val(&tile_ids),
+                )
+            };
+            gpu.hip
+                .memcpy_htod(&tile_gpu.buf, tile_bytes)
+                .expect("htod tile ids");
+
+            let sorted: Vec<i32> = (0..M_TOTAL as i32).collect();
+            let sorted_gpu = gpu
+                .alloc_tensor(&[M_TOTAL * 4], rdna_compute::DType::Raw)
+                .expect("alloc sorted");
+            let sorted_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    sorted.as_ptr() as *const u8,
+                    std::mem::size_of_val(&sorted[..]),
+                )
+            };
+            gpu.hip
+                .memcpy_htod(&sorted_gpu.buf, sorted_bytes)
+                .expect("htod sorted");
+
+            let x_gpu = gpu
+                .alloc_tensor(&[M_TOTAL * k], rdna_compute::DType::F32)
+                .expect("alloc x");
+            gpu.hip
+                .memcpy_htod(&x_gpu.buf, as_bytes_f32(&x_rot))
+                .expect("htod x");
+            let y_gpu = gpu
+                .alloc_tensor(&[M_TOTAL * M], rdna_compute::DType::F32)
+                .expect("alloc y");
+            gpu.hip
+                .memcpy_htod(&y_gpu.buf, as_bytes_f32(&vec![POISON; M_TOTAL * M]))
+                .expect("poison y");
+
+            gpu.gemm_mfp4g32_e8g128_moe_grouped_wmma(
+                &ptrs,
+                &tile_gpu,
+                &sorted_gpu,
+                &x_gpu,
+                &y_gpu,
+                M,
+                k,
+                1,
+                M_TOTAL,
+                M_TOTAL,
+            )
+            .expect("grouped wmma g128");
+            gpu.hip.device_synchronize().expect("sync");
+
+            let y = download_f32(&gpu, &y_gpu, M_TOTAL * M);
+            let unwritten = y.iter().filter(|v| **v == POISON).count();
+            let wiring = rel_l2(&y, &reference);
+            println!(
+                "qt=42 grouped WMMA K={k}: unwritten={unwritten}/{} wiring rel_l2={wiring:.3e}",
+                M_TOTAL * M
+            );
+            assert_eq!(
+                unwritten, 0,
+                "grouped WMMA K={k}: {unwritten} outputs never written"
+            );
+            assert!(
+                wiring < 5e-3,
+                "grouped WMMA K={k}: flattened tile loop disagrees with the reference: {wiring}"
+            );
+        }
     }
 }

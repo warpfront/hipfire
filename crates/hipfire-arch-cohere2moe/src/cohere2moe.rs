@@ -19,9 +19,8 @@
 //! Expert weights ship pre-split (gate_proj/up_proj/down_proj); the loader
 //! byte-fuses gate_proj‖up_proj into the per-expert `gate_up` blob the indexed
 //! GEMV kernels expect. Per-expert buffers are retained (not just a packed
-//! blob) so the forward can take a per-expert `weight_gemv` path for the F16
-//! oracle / Q8 expert tiers (which have no indexed MoE kernel) and the indexed
-//! kernels for the MQ4/MQ6 tiers.
+//! blob) so the shared sealed-MoE executor can select indexed kernels for
+//! MQ4/MQ6 and the host-expert operation for F16/Q8 tiers.
 
 use std::hash::{Hash, Hasher};
 
@@ -165,38 +164,33 @@ fn dtype_for_quant_type(qt: u8) -> Result<DType, String> {
 /// tensors.  Keep the layout formulas here in lockstep with the corresponding
 /// `DType`/quantizer contracts and check every multiplication.
 fn encoded_row_bytes(dtype: DType, k: usize) -> Result<usize, String> {
-    let grouped = |group_k: usize, group_bytes: usize| {
-        if k % group_k != 0 {
-            return Err(format!(
-                "{dtype:?} weights require K divisible by {group_k}, got K={k}"
-            ));
-        }
-        (k / group_k).checked_mul(group_bytes).ok_or_else(|| {
-            format!("{dtype:?} encoded row byte length overflows: (K/{group_k})*{group_bytes}")
-        })
+    // The byte layout is `DType::row_bytes`; this arch only accepts whole
+    // groups. Paro's repacked projection layout is HFQ4-G128 (72 bytes per
+    // 128 columns): `wt_from_raw` is HFQ-only today, but listing it keeps a
+    // future raw Paro entry off one-byte-per-column reasoning.
+    let group_k = match dtype {
+        DType::F32 | DType::F16 | DType::BF16 => 1,
+        DType::Q8_0 => 32,
+        DType::HFQ4G256
+        | DType::MQ4G256
+        | DType::HFQ6G256
+        | DType::MQ6G256
+        | DType::MQ3G256
+        | DType::MQ2G256
+        | DType::MQ2G256Lloyd
+        | DType::MQ3G256Lloyd
+        | DType::MQ4G256Lloyd => 256,
+        DType::ParoQ4G128 => 128,
+        other => return Err(format!("no encoded row byte formula for dtype {other:?}")),
     };
-
-    match dtype {
-        DType::F32 => k
-            .checked_mul(DType::F32.size())
-            .ok_or_else(|| format!("{dtype:?} encoded row byte length overflows: K*4")),
-        DType::F16 | DType::BF16 => k
-            .checked_mul(2)
-            .ok_or_else(|| format!("{dtype:?} encoded row byte length overflows: K*2")),
-        DType::Q8_0 => grouped(32, 34),
-        DType::HFQ4G256 | DType::MQ4G256 => grouped(256, 136),
-        DType::HFQ6G256 | DType::MQ6G256 => grouped(256, 200),
-        DType::MQ3G256 => grouped(256, 104),
-        DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),
-        DType::MQ3G256Lloyd => grouped(256, 112),
-        DType::MQ4G256Lloyd => grouped(256, 160),
-        // Paro's repacked projection layout is HFQ4-G128: 72 bytes per
-        // 128 logical columns.  `wt_from_raw` is HFQ-only today, but keeping
-        // the authoritative row formula here prevents a future raw Paro
-        // entry from falling back to one-byte-per-column reasoning.
-        DType::ParoQ4G128 => grouped(128, 72),
-        other => Err(format!("no encoded row byte formula for dtype {other:?}")),
+    if k % group_k != 0 {
+        return Err(format!(
+            "{dtype:?} weights require K divisible by {group_k}, got K={k}"
+        ));
     }
+    dtype
+        .row_bytes(k)
+        .ok_or_else(|| format!("{dtype:?} encoded row byte length for K={k} overflows"))
 }
 
 /// Validate a raw tensor's dimensions and encoded length before any GPU upload.

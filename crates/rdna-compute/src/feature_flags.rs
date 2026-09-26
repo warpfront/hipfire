@@ -44,6 +44,10 @@ pub struct FeatureFlags {
     /// off everywhere); unset/`=0` keeps the incumbent Q8_1 MMQ route.
     /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
     pub gfx11_mmq_iu4: Option<bool>,
+    /// Qwen4 routes tuned on gfx1151 on every gfx11 GPU (`HIPFIRE_QWEN4_GFX11`,
+    /// `developer.qwen4_gfx11`); without it only the RDNA3.5 APUs take them.
+    /// See [`crate::arch_caps::ArchCaps::qwen4_tuned_routes`].
+    pub qwen4_gfx11: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -463,6 +467,7 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             gfx11_mmq_iu4: parse_bool("HIPFIRE_GFX11_MQ4V2_IU4"),
+            qwen4_gfx11: parse_bool("HIPFIRE_QWEN4_GFX11").unwrap_or(false),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -796,6 +801,7 @@ impl FeatureFlags {
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
             gfx11_mmq_iu4: None,
+            qwen4_gfx11: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

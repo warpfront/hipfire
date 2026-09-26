@@ -10,11 +10,15 @@ use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::device_mesh::DeviceMesh;
+use hipfire_runtime::hfq::HfqModelSource;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::model_source::ModelSource as _;
+use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use std::any::Any;
 
 // The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
@@ -198,6 +202,337 @@ impl Carrier for Qwen2Carrier {
                 meta.chat_template,
             )
         })
+    }
+}
+
+// ─── Qwen4Carrier ────────────────────────────────────────────────────
+
+/// Executable local-path Qwen4 carrier.  Distribution/product admission stays
+/// outside this registry; this route only makes an already admitted HFQM
+/// artifact loadable.
+fn qwen4_use_range_payload(
+    is_uma: bool,
+    residency: hipfire_runtime::weight_manifest::WeightResidency,
+) -> bool {
+    is_uma || residency.is_external()
+}
+
+const QWEN4_DDTREE_DEFAULT_BUDGET: usize = 0;
+const QWEN4_DDTREE_DEFAULT_TOPK: usize = 4;
+
+/// Return whether a Qwen4 load carries an active or non-default DDTree
+/// request. The CLI resolves schema defaults before serializing load params,
+/// so an ordinary AR load arrives as `Some(0)`/`Some(4)` rather than `None`.
+/// A non-default top-K remains unsupported even when the budget is zero.
+const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
+    match (spec.ddtree_budget, spec.ddtree_topk) {
+        (Some(budget), _) if budget != QWEN4_DDTREE_DEFAULT_BUDGET => true,
+        (_, Some(topk)) if topk != QWEN4_DDTREE_DEFAULT_TOPK => true,
+        _ => false,
+    }
+}
+
+pub struct Qwen4Carrier;
+
+impl Carrier for Qwen4Carrier {
+    fn name(&self) -> &'static str {
+        "qwen4"
+    }
+
+    fn spec_target_guard<'m>(
+        &self,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        match state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("qwen4: spec target state mismatch".into()),
+        }
+    }
+
+    fn make_spec_emitter<'a>(
+        &self,
+        ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Ok(Qwen35Emit::from_ctx(ctx))
+    }
+
+    fn claims_arch_id(&self, arch_id: u32, is_dir: bool) -> bool {
+        arch_id == hipfire_arch_qwen4::ARCH_ID && !is_dir
+    }
+
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if is_dir {
+            return Err(
+                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+            );
+        }
+        if pp != 1 {
+            return Err("qwen4: only Single topology is admitted".into());
+        }
+        Ok(())
+    }
+    fn admit_options(
+        &self,
+        draft_path: Option<&str>,
+        options: crate::admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        let spec = options.spec;
+        if draft_path.is_some()
+            || options.eagle_drafter
+            || options.kv_adaptive
+            || spec.dflash.is_some_and(|enabled| enabled)
+            || spec.dspark.is_some_and(|enabled| enabled)
+            || spec.ngram_draft.is_some_and(|enabled| enabled)
+            || qwen4_ddtree_requested(spec)
+            || options.cask
+            || options.state_quant
+            || options.non_single_compute
+            || options.expert_count_override
+            || options.pflash
+        {
+            return Err(
+                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, state-quant, PFlash, or DeepSeek4/non-Single option is unsupported"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: true,
+            spec_excludes_adaptive: true,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+        }
+    }
+
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
+
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        self.admit_topology(
+            hipfire_arch_qwen4::ARCH_ID,
+            src.is_dir(),
+            ctx.pp,
+            ctx.kv_backend,
+        )?;
+        if ctx.kv_backend != KvBackend::Contiguous {
+            return Err(format!(
+                "qwen4: KV backend '{}' is unsupported; only contiguous is admitted",
+                ctx.kv_backend.as_str()
+            ));
+        }
+        if ctx.max_seq != 2048 {
+            return Err(format!(
+                "qwen4: max_seq must be exactly 2048 (got {})",
+                ctx.max_seq
+            ));
+        }
+        // Native execution is opt-in. The validated artifact carries the MTP
+        // tensors for capability discovery, but only `Some(true)` may attach
+        // the GPU head and publish a speculative drafter.
+        let native_mtp = crate::admission::qwen4_native_mtp_requested(ctx.spec);
+        self.admit_options(
+            ctx.draft_path,
+            crate::admission::SourceAdmissionOptions {
+                spec: ctx.spec,
+                kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(
+                    ctx.kv_adaptive_override,
+                ),
+                eagle_drafter: ctx.gemma4_drafter_path.is_some(),
+                cask: ctx.cask.sidecar.is_some(),
+                state_quant: ctx.state_quant_override.is_some(),
+                non_single_compute: !matches!(
+                    &ctx.deepseek4_compute_placement,
+                    hipfire_config::Deepseek4ComputePlacement::Single
+                ),
+                expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
+                pflash: false,
+            },
+        )?;
+        if native_mtp
+            && hipfire_runtime::config::retained_redline_default(
+                &ctx.gpu.arch,
+                "qwen4",
+                ctx.path,
+                ctx.pp,
+                1,
+                true,
+            )
+        {
+            return Err(
+                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
+                    .into(),
+            );
+        }
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let ModelSource::Hfq(mut hfq) = src else {
+            return Err(
+                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+            );
+        };
+        let receipt =
+            hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
+        let config = receipt.config;
+        let manifest = receipt.manifest;
+        let metadata = receipt.ple;
+        let placements = receipt.placements;
+        let use_ranges = ctx.gpu.is_uma();
+        if use_ranges {
+            hfq.drop_mmap();
+        }
+        let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
+        let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
+        let source = HfqModelSource::from_hfq(hfq);
+        let transaction = fulfill_manifest_from_payloads(
+            &manifest.weights,
+            &mesh,
+            config.num_hidden_layers,
+            ctx.gpu,
+            expected,
+            |entry| {
+                if qwen4_use_range_payload(use_ranges, entry.residency) {
+                    return source
+                        .tensor_range(&entry.name)
+                        .map_err(|error| error.to_string())?
+                        .map(SourcePayload::Range)
+                        .ok_or_else(|| {
+                            if entry.residency.is_external() {
+                                format!("missing external tensor '{}'", entry.name)
+                            } else {
+                                format!("missing resident tensor '{}'", entry.name)
+                            }
+                        });
+                }
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                Ok(SourcePayload::Borrowed { info, bytes })
+            },
+        )
+        .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
+        let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
+            config,
+            transaction,
+            &placements,
+            ctx.gpu,
+            ctx.max_seq,
+            metadata,
+        )
+        .map_err(|error| format!("qwen4: bundle assembly failed: {error}"))?;
+        if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
+            let detail = error.to_string();
+            let _ = bundle.free_gpu(ctx.gpu);
+            return Err(format!("qwen4: forward setup failed: {detail}"));
+        }
+        let max_k = ctx
+            .spec
+            .mtp_k
+            .unwrap_or(hipfire_runtime::config::get().mtp_k)
+            .clamp(1, 10);
+        let speculator = if native_mtp {
+            if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: MTP setup failed: {detail}"));
+            }
+            eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+            Some(hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(
+                max_k,
+                ctx.max_seq,
+            ))
+        } else {
+            None
+        };
+        let mut model = LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        };
+        model.mtp_weights_present = native_mtp;
+        if native_mtp {
+            model.mtp_k = max_k;
+            model.mtp_mode = if ctx.spec.mtp == Some(true) {
+                "on".to_string()
+            } else {
+                "auto".to_string()
+            };
+        }
+        Ok(model)
+    }
+
+    /// Bench-decode prime for Qwen4: reset the request state, then run the
+    /// synthetic context through the final-row prefill the AR path uses.
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let bundle = m.qwen4_mut()?;
+        let vocab = bundle.config.vocab_size;
+        if let Err(error) = bundle.reset(gpu) {
+            return Some(Some(format!("qwen4 bench prime reset: {error}")));
+        }
+        let logits = match gpu.zeros(&[vocab], rdna_compute::DType::F32) {
+            Ok(logits) => logits,
+            Err(error) => return Some(Some(format!("qwen4 bench prime logits: {error:?}"))),
+        };
+        let result = bundle
+            .forward_chunk_final(gpu, synthetic, &logits, None)
+            .err()
+            .map(|error| error.to_string());
+        let _ = gpu.free_tensor(logits);
+        Some(result)
+    }
+
+    /// Bench-decode run for Qwen4: one single-token forward per iteration, the
+    /// same call the AR producer makes.
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let bundle = m.qwen4_mut()?;
+        let vocab = bundle.config.vocab_size;
+        let logits = gpu.zeros(&[vocab], rdna_compute::DType::F32).ok()?;
+        let mut ok = true;
+        for i in 0..iterations {
+            let token = 101 + (i as u32 % 1000);
+            if let Err(error) = bundle.forward_token(gpu, token, &logits, None) {
+                *decode_err = Some(format!("iter {i} pos {}: {error}", context + i));
+                ok = false;
+                break;
+            }
+        }
+        let _ = gpu.free_tensor(logits);
+        Some(ok)
     }
 }
 
@@ -2861,5 +3196,100 @@ mod gemma4_route_tests {
         assert!(gemma4_validate_drafter_route(true, true).is_err());
         assert!(gemma4_validate_drafter_route(true, false).is_ok());
         assert!(gemma4_validate_drafter_route(false, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod qwen4_source_policy_tests {
+    use super::qwen4_use_range_payload;
+    use hipfire_runtime::weight_manifest::WeightResidency;
+
+    #[test]
+    fn discrete_resident_payload_stays_borrowed() {
+        assert!(!qwen4_use_range_payload(false, WeightResidency::Resident));
+    }
+
+    #[test]
+    fn uma_resident_payload_uses_ranges() {
+        assert!(qwen4_use_range_payload(true, WeightResidency::Resident));
+    }
+
+    #[test]
+    fn external_payload_uses_ranges_on_discrete() {
+        assert!(qwen4_use_range_payload(
+            false,
+            WeightResidency::external_rows(128, 1)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod qwen4_admission_tests {
+    use super::Qwen4Carrier;
+    use crate::{admission::SourceAdmissionOptions, Carrier};
+    use hipfire_runtime::loader_api::SpecLoadCfg;
+
+    fn resolved_ar_spec() -> SpecLoadCfg {
+        SpecLoadCfg {
+            dflash: Some(false),
+            dspark: Some(false),
+            ngram_draft: Some(false),
+            ddtree_budget: Some(0),
+            ddtree_topk: Some(4),
+            mtp: Some(false),
+            ..SpecLoadCfg::default()
+        }
+    }
+
+    #[test]
+    fn schema_defaults_pass_carrier_gate_but_unsupported_options_refuse() {
+        let defaults = SourceAdmissionOptions {
+            spec: resolved_ar_spec(),
+            ..Default::default()
+        };
+        assert!(Qwen4Carrier.admit_options(None, defaults).is_ok());
+        for (option, options) in [
+            (
+                "adaptive KV",
+                SourceAdmissionOptions {
+                    kv_adaptive: true,
+                    ..defaults
+                },
+            ),
+            (
+                "EAGLE",
+                SourceAdmissionOptions {
+                    eagle_drafter: true,
+                    ..defaults
+                },
+            ),
+            (
+                "PFlash",
+                SourceAdmissionOptions {
+                    pflash: true,
+                    ..defaults
+                },
+            ),
+            (
+                "expert-count override",
+                SourceAdmissionOptions {
+                    expert_count_override: true,
+                    ..defaults
+                },
+            ),
+            (
+                "DeepSeek4 placement",
+                SourceAdmissionOptions {
+                    non_single_compute: true,
+                    ..defaults
+                },
+            ),
+        ] {
+            let error = Qwen4Carrier.admit_options(None, options).expect_err(option);
+            assert!(error.contains("unsupported"), "{option}: {error}");
+        }
+        assert!(Qwen4Carrier
+            .admit_options(Some("draft.hfq"), defaults)
+            .is_err());
     }
 }

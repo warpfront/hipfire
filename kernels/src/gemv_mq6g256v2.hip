@@ -186,4 +186,128 @@ extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
     if (tid == 0) y[row] = acc;
 }
 
-// x-batched variant not needed for MQ6; dense Qwen uses decode + prefill paths above.
+// ─────────────────────────────────────────────────────────────────────────
+// x-batched variant: one weight row decoded ONCE per launch and dotted
+// against B activation rows (x is [B x K], y is [B x M], row-major). Each
+// acc[b] accumulates the same terms in the same order as the scalar kernel
+// above; only the x row changes. The batched path on GPUs without WMMA.
+// Compiled only into its own module, so the scalar kernel's module is
+// unaffected. HIPFIRE_MQ6G256V2_RESIDUAL_EPILOGUE selects y += acc.
+#if defined(HIPFIRE_MQ6G256V2_XBATCH)
+
+#ifndef HIPFIRE_MQ6G256V2_XBATCH_MAX
+#define HIPFIRE_MQ6G256V2_XBATCH_MAX 4
+#endif
+
+// Occupancy 8, not 16: B accumulator sets multiply the live float state.
+__launch_bounds__(32, 8)
+extern "C" __global__ void HIPFIRE_MQ6G256V2_XBATCH_KERNEL(
+    const char* __restrict__ A,
+    const float* __restrict__ x,   // [B x K]
+    float* __restrict__ y,         // [B x M]
+    int M, int K, int B
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+    const int groups_per_row = K / 256;
+    const char* row_ptr = A + (long long)row * groups_per_row * 200;
+    const int boff = tid * 6;
+
+    float acc0[HIPFIRE_MQ6G256V2_XBATCH_MAX];
+    float acc1[HIPFIRE_MQ6G256V2_XBATCH_MAX];
+    float acc2[HIPFIRE_MQ6G256V2_XBATCH_MAX];
+    float acc3[HIPFIRE_MQ6G256V2_XBATCH_MAX];
+    #pragma unroll
+    for (int b = 0; b < HIPFIRE_MQ6G256V2_XBATCH_MAX; b++) {
+        acc0[b] = 0.0f; acc1[b] = 0.0f; acc2[b] = 0.0f; acc3[b] = 0.0f;
+    }
+
+    // Decode one group's header and this lane's eight 6-bit values.
+#define MQ6X_DECODE(gp, sc, zp, q) do { \
+        const unsigned int hA = *(const unsigned int*)(gp); \
+        const unsigned int hB = *(const unsigned int*)((gp) + 4); \
+        const unsigned int hs = (tid < 16) ? hA : hB; \
+        sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+        zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+        const unsigned char* d = (const unsigned char*)((gp) + 8 + boff); \
+        unsigned char b0 = d[0]; unsigned char b1 = d[1]; unsigned char b2 = d[2]; \
+        unsigned char b3 = d[3]; unsigned char b4 = d[4]; unsigned char b5 = d[5]; \
+        q[0] = b0 & 63; \
+        q[1] = (b0 >> 6) | ((b1 & 0xF) << 2); \
+        q[2] = (b1 >> 4) | ((b2 & 3) << 4); \
+        q[3] = b2 >> 2; \
+        q[4] = b3 & 63; \
+        q[5] = (b3 >> 6) | ((b4 & 0xF) << 2); \
+        q[6] = (b4 >> 4) | ((b5 & 3) << 4); \
+        q[7] = b5 >> 2; \
+    } while (0)
+    // Same expression and association as MQ6_DOG in the scalar kernel.
+#define MQ6X_DOT(sc, zp, q, xb, bs, a) \
+        (a) += (sc * (float)q[0] + zp) * xb[(bs)] \
+             + (sc * (float)q[1] + zp) * xb[(bs) + 1] \
+             + (sc * (float)q[2] + zp) * xb[(bs) + 2] \
+             + (sc * (float)q[3] + zp) * xb[(bs) + 3] \
+             + (sc * (float)q[4] + zp) * xb[(bs) + 4] \
+             + (sc * (float)q[5] + zp) * xb[(bs) + 5] \
+             + (sc * (float)q[6] + zp) * xb[(bs) + 6] \
+             + (sc * (float)q[7] + zp) * xb[(bs) + 7]
+
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    for (int qd = 0; qd < quads; qd++) {
+        const int g = qd << 2;
+        const char* gp0 = row_ptr + g * 200;
+        float sc0, zp0, sc1, zp1, sc2, zp2, sc3, zp3;
+        int q0[8], q1[8], q2[8], q3[8];
+        MQ6X_DECODE(gp0, sc0, zp0, q0);
+        MQ6X_DECODE(gp0 + 200, sc1, zp1, q1);
+        MQ6X_DECODE(gp0 + 400, sc2, zp2, q2);
+        MQ6X_DECODE(gp0 + 600, sc3, zp3, q3);
+        const int base = g * 256 + tid * 8;
+        #pragma unroll
+        for (int b = 0; b < HIPFIRE_MQ6G256V2_XBATCH_MAX; b++) {
+            if (b >= B) break;
+            const float* xb = x + (long long)b * K;
+            MQ6X_DOT(sc0, zp0, q0, xb, base, acc0[b]);
+            MQ6X_DOT(sc1, zp1, q1, xb, base + 256, acc1[b]);
+            MQ6X_DOT(sc2, zp2, q2, xb, base + 512, acc2[b]);
+            MQ6X_DOT(sc3, zp3, q3, xb, base + 768, acc3[b]);
+        }
+    }
+
+    // Tail groups accumulate into acc[t], matching the scalar kernel.
+    for (int t = 0; t < tail; t++) {
+        const int g = (quads << 2) + t;
+        float sc, zp;
+        int q[8];
+        MQ6X_DECODE(row_ptr + g * 200, sc, zp, q);
+        const int base = g * 256 + tid * 8;
+        #pragma unroll
+        for (int b = 0; b < HIPFIRE_MQ6G256V2_XBATCH_MAX; b++) {
+            if (b >= B) break;
+            const float* xb = x + (long long)b * K;
+            if (t == 0)      { MQ6X_DOT(sc, zp, q, xb, base, acc0[b]); }
+            else if (t == 1) { MQ6X_DOT(sc, zp, q, xb, base, acc1[b]); }
+            else             { MQ6X_DOT(sc, zp, q, xb, base, acc2[b]); }
+        }
+    }
+#undef MQ6X_DOT
+#undef MQ6X_DECODE
+
+    #pragma unroll
+    for (int b = 0; b < HIPFIRE_MQ6G256V2_XBATCH_MAX; b++) {
+        if (b >= B) break;
+        float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+#if defined(HIPFIRE_MQ6G256V2_RESIDUAL_EPILOGUE)
+        if (tid == 0) y[(long long)b * M + row] += acc;
+#else
+        if (tid == 0) y[(long long)b * M + row] = acc;
+#endif
+    }
+}
+
+#endif  // HIPFIRE_MQ6G256V2_XBATCH

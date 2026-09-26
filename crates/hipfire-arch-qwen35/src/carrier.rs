@@ -8,8 +8,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{self, ResolveResult};
-use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct Qwen35Bundle {
@@ -421,13 +421,15 @@ fn construct_kv_cache(
                 )
                 .map_err(|e| format!("{e}"))?
             }
-            (KvBackend::Contiguous, llama::VMode::Q8) => <KvCache as KvCacheExt>::from_mode_with_backend(
-                mode,
-                KvBackend::Contiguous,
-                KvTarget::Single(ctx.gpu),
-                &plan.dims,
-            )
-            .map_err(|e| format!("{e}"))?,
+            (KvBackend::Contiguous, llama::VMode::Q8) => {
+                <KvCache as KvCacheExt>::from_mode_with_backend(
+                    mode,
+                    KvBackend::Contiguous,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?
+            }
             (KvBackend::Contiguous, vm) => {
                 let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
                     mode,

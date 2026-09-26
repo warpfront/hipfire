@@ -108,6 +108,48 @@ fn main() {
         Ok::<(), String>(())
     });
 
+    test!("MoE down unscatter canonical slots", {
+        let width = 19;
+        let mut grouped_values: Vec<f32> = (0..8 * width)
+            .map(|i| (i as f32 + 1.0) * if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        grouped_values[0] = -0.0;
+        let grouped = gpu
+            .upload_f32(&grouped_values, &[8 * width])
+            .map_err(|e| format!("{e}"))?;
+        let output = gpu
+            .upload_f32(&vec![12345.0; 6 * width], &[6 * width])
+            .map_err(|e| format!("{e}"))?;
+        let mut expected = vec![12345.0f32; 6 * width];
+        // Different rank-local permutations must recover the canonical rows.
+        // Reusing a dirty, oversized destination must touch only live slots.
+        for permutation in [&[5u32, 1, 7, 0][..], &[2u32, 4][..]] {
+            let indices: Vec<f32> = permutation.iter().copied().map(f32::from_bits).collect();
+            let inverse = gpu
+                .upload_f32(&indices, &[indices.len()])
+                .map_err(|e| format!("{e}"))?;
+            gpu.moe_down_unscatter_k8(&grouped, &inverse, &output, width, permutation.len())
+                .map_err(|e| format!("{e}"))?;
+            for (slot, &row) in permutation.iter().enumerate() {
+                let row = row as usize;
+                expected[slot * width..(slot + 1) * width]
+                    .copy_from_slice(&grouped_values[row * width..(row + 1) * width]);
+            }
+            let actual = gpu.download_f32(&output).map_err(|e| format!("{e}"))?;
+            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                if actual.to_bits() != expected.to_bits() {
+                    return Err(format!(
+                        "canonical output element {i}: {actual:?} != {expected:?}"
+                    ));
+                }
+            }
+            gpu.free_tensor(inverse).map_err(|e| format!("{e}"))?;
+        }
+        gpu.free_tensor(grouped).map_err(|e| format!("{e}"))?;
+        gpu.free_tensor(output).map_err(|e| format!("{e}"))?;
+        Ok::<(), String>(())
+    });
+
     eprintln!("\n--- Attention kernels ---");
     for (label, n_heads, n_kv, hd, seq) in [
         ("attention_f32 hd=128 h=8 kv=2", 8, 2, 128, 16),

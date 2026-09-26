@@ -78,6 +78,16 @@ pub trait Carrier: Send + Sync {
         Ok(())
     }
 
+    /// Read-only, per-carrier request-option refusal before GPU allocation.
+    /// The default leaves other architectures' option behavior unchanged.
+    fn admit_options(
+        &self,
+        _draft_path: Option<&str>,
+        _options: admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Declared capabilities for this arch. Default is the conservative
     /// “no capability” set — carriers override to declare what they support.
     fn caps(&self) -> saddle_core::caps::ArchCaps {
@@ -234,6 +244,7 @@ pub enum BenchDecodeRoute {
     Qwen35,
     Gemma4,
     MuseGlimmer,
+    Qwen4,
     Unsupported,
 }
 pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
@@ -243,8 +254,36 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         5 | 6 => BenchDecodeRoute::Qwen35,
         13 => BenchDecodeRoute::Gemma4,
         14 => BenchDecodeRoute::MuseGlimmer,
+        16 => BenchDecodeRoute::Qwen4,
         _ => BenchDecodeRoute::Unsupported,
     }
+}
+
+/// The daemon's stable per-arch label: the retained-Redline config key and
+/// the status `model_arch` field. Unlisted ids read as dense `qwen3`.
+pub fn arch_label(arch_id: u32) -> &'static str {
+    match arch_id {
+        5 => "qwen3_5",
+        6 => "qwen3_5_moe",
+        7 => "qwen2",
+        8 => "dots-ocr",
+        9 => "deepseek4",
+        10 => "minimax_m2",
+        11 => "lfm2moe",
+        12 => "north_mini_code",
+        13 => "gemma4",
+        14 => "muse_glimmer",
+        16 => "qwen4",
+        40 => "flux_mmdit",
+        45 => "flux2_mmdit",
+        _ => "qwen3",
+    }
+}
+
+/// Whether this arch, like every tp>1 load, is fully staged before the prior
+/// model is retired, so a failed load leaves the prior model usable.
+pub fn defers_prior_unload(arch_id: u32) -> bool {
+    arch_id == hipfire_arch_qwen4::ARCH_ID
 }
 
 /// Vision route. `None` = no vision encoder (text-only). The daemon still
@@ -361,6 +400,7 @@ pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
 
 const REGISTRY: &[&dyn Carrier] = &[
     &Qwen2Carrier,
+    &Qwen4Carrier,
     &Qwen35Carrier,
     &LlamaCarrier,
     &DotsOcrCarrier,
@@ -1069,6 +1109,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    }
+
+    /// Qwen4 bundle if this model is arch_id=16, else None.
+    pub fn qwen4(&self) -> Option<&hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_qwen4::bundle::Qwen4Bundle>())
+    }
+
+    pub fn qwen4_mut(&mut self) -> Option<&mut hipfire_arch_qwen4::bundle::Qwen4Bundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        })
     }
 
     pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
@@ -2319,10 +2372,62 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    // Open the source before any VMM/teardown work so Qwen4's complete
+    // source-only boundary can classify it without a destructive side effect.
+    let src = ModelSource::from_path(path)?;
+    if src.arch_id() == Some(hipfire_arch_qwen4::ARCH_ID) {
+        let raw_kv_mode = kv_mode_override.unwrap_or("");
+        kv_mode::resolve_qwen4(raw_kv_mode, 256)?;
+        if pp != 1 || max_seq != 2048 {
+            return Err(format!(
+                "qwen4: only Single topology and max_seq=2048 are admitted (pp={pp}, max_seq={max_seq})"
+            ));
+        }
+        if kv_backend_override
+            .filter(|backend| !backend.is_empty() && *backend != "contiguous")
+            .is_some()
+        {
+            return Err("qwen4: only contiguous KV backend is admitted".into());
+        }
+        carrier_for(hipfire_arch_qwen4::ARCH_ID)
+            .ok_or_else(|| "no carrier for qwen4".to_string())?
+            .admit_options(
+                draft_path,
+                admission::SourceAdmissionOptions {
+                    spec,
+                    kv_adaptive: admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
+                    eagle_drafter: false,
+                    cask: cask.sidecar.is_some(),
+                    state_quant: state_quant_override.is_some(),
+                    non_single_compute: !matches!(
+                        deepseek4_compute_placement,
+                        hipfire_config::Deepseek4ComputePlacement::Single
+                    ),
+                    expert_count_override: deepseek4_experts_per_token.is_some(),
+                    pflash: false,
+                },
+            )?;
+        let native_mtp = admission::qwen4_native_mtp_requested(spec);
+        if native_mtp
+            && hipfire_runtime::config::retained_redline_default(
+                &gpu.arch, "qwen4", path, 1, 1, true,
+            )
+        {
+            return Err(
+                "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
+                    .into(),
+            );
+        }
+        crate::admission::admit_qwen4_source(
+            &src,
+            hipfire_arch_qwen4::EffectiveMesh::single(),
+            hipfire_arch_qwen4::InputModality::Text,
+            native_mtp,
+        )?;
+    }
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
-    let src = ModelSource::from_path(path)?;
     let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
     let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
 
@@ -2502,8 +2607,7 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
-    // Classify once and admit before any side effect (source-aware admission).
-    let admission = crate::admission::admit_source(
+    let admission = crate::admission::admit_source_with_options(
         path,
         1, // this entry serves tp<=1
         pp,
@@ -2513,6 +2617,19 @@ pub fn load_model_with_gemma4_drafter(
         None,
         head_path,
         max_seq,
+        crate::admission::SourceAdmissionOptions {
+            spec,
+            kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
+            eagle_drafter: gemma4_drafter_path.is_some(),
+            cask: cask.sidecar.is_some(),
+            state_quant: state_quant_override.is_some(),
+            non_single_compute: !matches!(
+                deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            ),
+            expert_count_override: deepseek4_experts_per_token.is_some(),
+            pflash: false,
+        },
     )?;
     load_admitted_with_gemma4_drafter(
         admission,
@@ -4965,14 +5082,15 @@ mod registry_tests {
             );
         }
 
-        // ── bench_decode_route: 9, 11, 5|6, 13, 14; everything else Unsupported ──
-        for id in 0u32..=14 {
+        // ── bench_decode_route: 9, 11, 5|6, 13, 14, 16; everything else Unsupported ──
+        for id in 0u32..=16 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
                 5 | 6 => BenchDecodeRoute::Qwen35,
                 13 => BenchDecodeRoute::Gemma4,
                 14 => BenchDecodeRoute::MuseGlimmer,
+                16 => BenchDecodeRoute::Qwen4,
                 _ => BenchDecodeRoute::Unsupported,
             };
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");

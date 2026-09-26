@@ -11,9 +11,12 @@
 //! proves that they agree with the immutable expert contract before a future
 //! executor is allowed to consume them.
 
+use super::moe_program::{self, MoeKernelSelection};
 use crate::context::DispatchCtx;
+use crate::families::gemv::WeightRef;
 use crate::families::moe::{
-    MoeEpMode, MoeParams, MoePrefillParams, MoeResolution, RoutedExpertWeights,
+    MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries, MoePrefillParams, MoeQ8RouterPolicy,
+    MoeRecipe, MoeResolution, MoeRouteCapability, RoutedExpertWeights,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -21,6 +24,110 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEVICE_POINTER_BYTES: usize = 8;
+
+/// Admission of a specialized (route-policy) sealed MoE route to a retained body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecializedRouteAdmission {
+    /// The route may be recorded *and* prepared for a retained body.
+    Admitted,
+    /// A non-default diagnostic capture is requested: the route may be recorded so
+    /// the launch census and tape stability can be observed, but no plan may be
+    /// installed and no forward may route.
+    DiagnosticCapture,
+    /// No contract: the retained body is refused and the model runs on HIP.
+    Refused { reason: &'static str },
+}
+
+/// Admission rule for letting a specialized (route-policy) sealed MoE route enter
+/// a retained body.
+///
+/// Admitted on the evidence in `docs/design/qwen4-program-retained-pm4.md` § G4:
+/// the launch census reconciles against an independent count and is stable across
+/// positions, the window holds no device copy, memset or readback, and the
+/// retained body additionally *proves* at launch time that the expert pointer
+/// tables name the live experts (host entries) and that the pointer mapping is the
+/// one the tape latched (`ReplayController::note_route_identity`). Refusal remains
+/// the answer for any route that cannot supply those proofs — the guard and the
+/// engine-side arming hook read this one answer so both cannot drift apart.
+///
+/// `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE=1` is the one exception, and
+/// it is measurement only: it may not install a plan, may not route a forward, and
+/// any number it produces is discovery evidence, never route proof — the posture
+/// `HIPFIRE_REPLAY_MANUAL_CAPTURE` already has (docs/REDLINE.md §5 stage 5).
+/// Evidence and the option analysis live in
+/// `docs/design/qwen4-program-retained-pm4.md` § G4 (options B1/C2).
+pub fn specialized_sealed_moe_retained_admission() -> SpecializedRouteAdmission {
+    if diagnostic_specialized_capture_requested() {
+        return SpecializedRouteAdmission::DiagnosticCapture;
+    }
+    SpecializedRouteAdmission::Admitted
+}
+
+/// Non-default diagnostic capture for a specialized route (see
+/// [`specialized_sealed_moe_retained_admission`]).
+fn diagnostic_specialized_capture_requested() -> bool {
+    hipfire_config::process_value("HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// What a model adapter's eligible-forward boundary must do with the retained
+/// body on one forward.
+///
+/// The policy lives next to the admission rule so the launch guard, the arming
+/// boundary and the engine-side policy cannot drift apart: the retained body is the
+/// *eligible* forward only (a plain single-token continuation), and a route whose
+/// pointer contract is not admitted is refused up front instead of arming a capture
+/// the route would refuse on every token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedBodyAction {
+    /// Not the eligible forward, or nothing to do: runs on HIP, records nothing and
+    /// routes nothing.
+    Ineligible,
+    /// Eligible, and the route cannot be retained: poison with this reason and run
+    /// this forward on HIP.
+    Refuse { reason: &'static str },
+    /// Open the capture window for this eligible forward. `diagnostic` marks a
+    /// measurement-only capture: the tape may be observed, but no plan may be
+    /// installed and no later forward may route.
+    Arm { diagnostic: bool },
+    /// Submit the prepared plan; the HIP body must not run.
+    Route,
+}
+
+/// Decide the retained-body action for one eligible-forward boundary.
+///
+/// `admission` is [`specialized_sealed_moe_retained_admission`]'s answer for the
+/// route the forward is about to run.
+pub fn retained_body_action(
+    eligible: bool,
+    state: rdna_compute::replay::ReplayState,
+    admission: SpecializedRouteAdmission,
+) -> RetainedBodyAction {
+    use rdna_compute::replay::ReplayState;
+
+    if !eligible {
+        return RetainedBodyAction::Ineligible;
+    }
+    match state {
+        // Nothing to do: either the backend is off, or the route already fell back
+        // and this forward belongs to HIP.
+        ReplayState::Hip | ReplayState::Fallback => RetainedBodyAction::Ineligible,
+        ReplayState::Ready => RetainedBodyAction::Route,
+        ReplayState::Armed => match admission {
+            SpecializedRouteAdmission::Admitted => RetainedBodyAction::Arm { diagnostic: false },
+            SpecializedRouteAdmission::DiagnosticCapture => {
+                RetainedBodyAction::Arm { diagnostic: true }
+            }
+            SpecializedRouteAdmission::Refused { reason } => RetainedBodyAction::Refuse { reason },
+        },
+        // A window is already open (the body records itself), and a captured but
+        // unprepared tape routes nothing yet.
+        ReplayState::RecordingWarmup | ReplayState::Captured | ReplayState::ShadowValidated => {
+            RetainedBodyAction::Ineligible
+        }
+    }
+}
+
 /// Grouped-GEMM rows are emitted in fixed-width tiles. Keep this tied to the
 /// dispatch implementation in `pipeline::mod` rather than letting callers
 /// choose a second alignment policy.
@@ -129,6 +236,17 @@ pub enum MoeProtocol {
     /// Batched tokens, scatter/grouped projections and unscatter.
     GroupedPrefill,
 }
+/// Route authority for a grouped prefill recipe.
+#[derive(Clone, Copy, Debug)]
+pub enum PrefillRouteMode<'a> {
+    Replicated,
+    ProduceRoot {
+        slot: &'a std::cell::Cell<Option<MoePrefillRouteProducerProof>>,
+    },
+    AdoptRoot {
+        proof: &'a MoePrefillRouteProducerProof,
+    },
+}
 
 /// The producer that owns the route buffers used by a sealed call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -137,6 +255,8 @@ pub enum MoeRouterInput {
     SoftmaxTopK,
     /// A softmax/top-k producer already populated the route buffers.
     PrecomputedSoftmaxTopK,
+    /// The sealed decode call owns sigmoid and top-eight production.
+    SigmoidTopK,
     /// A sigmoid/top-k producer already populated the route buffers.
     PrecomputedSigmoidTopK,
 }
@@ -451,7 +571,23 @@ impl ExpertMetadata {
         local_slot: usize,
         resources: ExpertResources,
     ) -> Result<Self, DispatchError> {
-        let mut basis = None;
+        let gate_up_names = resources
+            .gate_up()
+            .map(|resource| vec![resource.source_name().to_owned()])
+            .or_else(|| {
+                Some(
+                    [
+                        resources.gate().map(ExpertResource::source_name),
+                        resources.up().map(ExpertResource::source_name),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect(),
+                )
+            })
+            .unwrap_or_default();
+        let mut gate_up_basis = None;
         for resource in resources.iter() {
             validate_resource_header(
                 resource.source_name(),
@@ -464,14 +600,19 @@ impl ExpertMetadata {
                 resource.basis(),
             )?;
             validate_sidecars(resource.sidecars())?;
-            if let Some(expected) = basis {
-                if expected != resource.basis() {
-                    return Err(invalid(format!(
-                        "expert {global_id} projection sources use different rotation bases"
-                    )));
+            if gate_up_names
+                .iter()
+                .any(|name| name == resource.source_name())
+            {
+                if let Some(expected) = gate_up_basis {
+                    if expected != resource.basis() {
+                        return Err(invalid(format!(
+                            "expert {global_id} gate/up projection sources use different rotation bases"
+                        )));
+                    }
+                } else {
+                    gate_up_basis = Some(resource.basis());
                 }
-            } else {
-                basis = Some(resource.basis());
             }
         }
         Ok(Self {
@@ -1331,7 +1472,7 @@ impl<'a> BoundMoeExperts<'a> {
 /// validated [`MoePrefillRouteProducerProof`] after the ordered device
 /// transfer. A receipt therefore cannot be made by wrapping an arbitrary
 /// pair of device buffers.
-pub struct MoeRouteReceipt<'a> {
+pub(super) struct MoeRouteReceipt<'a> {
     invocation: u64,
     protocol: MoeProtocol,
     router: MoeRouterInput,
@@ -1351,40 +1492,25 @@ pub struct MoeRouteReceipt<'a> {
 }
 
 impl MoeRouteReceipt<'_> {
-    pub fn protocol(&self) -> MoeProtocol {
-        self.protocol
-    }
-
-    pub fn router_input(&self) -> MoeRouterInput {
-        self.router
-    }
-
-    pub fn n_experts(&self) -> usize {
-        self.n_experts
-    }
-
-    pub fn k_top(&self) -> usize {
-        self.k_top
-    }
-
-    /// Root invocation this receipt was adopted from, if any. `None` for
-    /// directly produced receipts.
-    pub fn adopted_from(&self) -> Option<u64> {
+    /// Root invocation this receipt was adopted from, if any.
+    pub(super) fn adopted_from(&self) -> Option<u64> {
         self.adopted_from
     }
 }
 
-/// A fully checked decode or grouped-prefill call.  Its fields are private so
+/// A fully checked decode or grouped-prefill call. Its fields are private so
 /// no caller can inject an alternate expert table, operation order, or combine
 /// policy after validation.
 pub struct SealedMoeCall<'a> {
     invocation: u64,
+    dispatch_ctx: &'a DispatchCtx,
     experts: BoundMoeExperts<'a>,
     protocol: MoeProtocol,
     router: MoeRouterInput,
     contribution: MoeContribution,
     shared: MoeSharedContribution,
     activation: ActivationIdentity,
+    selection: MoeKernelSelection,
     params: SealedParams<'a>,
     route_receipt: Option<MoeRouteReceipt<'a>>,
 }
@@ -1397,6 +1523,13 @@ enum SealedParams<'a> {
 impl SealedMoeCall<'_> {
     pub fn invocation(&self) -> u64 {
         self.invocation
+    }
+    pub(super) fn dispatch_ctx(&self) -> &DispatchCtx {
+        self.dispatch_ctx
+    }
+
+    pub(super) fn kernel_selection(&self) -> &MoeKernelSelection {
+        &self.selection
     }
 
     pub fn protocol(&self) -> MoeProtocol {
@@ -1423,6 +1556,35 @@ impl SealedMoeCall<'_> {
         &self.experts
     }
 
+    /// Fold the gathered per-slot expert outputs into the root partial using
+    /// the same slot-order combine kernel as the single-device path.
+    pub fn execute_ep_slot_combine(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        self.validate_for_gpu(gpu)?;
+        if self.experts.rank_count() <= 1
+            || self.experts.local_rank() != 0
+            || self.contribution != MoeContribution::ZeroedPartial
+            || self.shared == MoeSharedContribution::None
+        {
+            return Err(invalid(
+                "EP slot combine requires a compact root call with a zeroed partial",
+            ));
+        }
+        match (&self.params, self.router) {
+            (SealedParams::Decode(params), MoeRouterInput::SoftmaxTopK)
+                if params.ep_mode == MoeEpMode::RootRoutedPartial
+                    && params.routed_out.is_some() => {}
+            (SealedParams::Prefill(params), MoeRouterInput::SoftmaxTopK)
+                if matches!(params.prelude.route, PrefillRouteMode::ProduceRoot { .. })
+                    && params.routed_out.is_some() => {}
+            _ => {
+                return Err(invalid(
+                    "EP slot combine requires the root-produced route and routed_out",
+                ));
+            }
+        }
+        moe_program::execute_ep_slot_combine(gpu, self)
+    }
+
     pub fn decode_params(&self) -> Option<&MoeParams<'_>> {
         match &self.params {
             SealedParams::Decode(params) => Some(params),
@@ -1435,11 +1597,6 @@ impl SealedMoeCall<'_> {
             SealedParams::Decode(_) => None,
             SealedParams::Prefill(params) => Some(params),
         }
-    }
-
-    /// Whether a producer receipt has been attached to this call.
-    pub fn has_route_receipt(&self) -> bool {
-        self.route_receipt.is_some()
     }
 
     /// Export the decode route-producer proof for this validated root call.
@@ -1498,16 +1655,9 @@ impl SealedMoeCall<'_> {
         })
     }
 
-    /// Export the prefill route-producer proof for this validated root EP
-    /// prefill call. Only admits a sealed root grouped-prefill call whose
-    /// routed contribution targets a zeroed partial (compact EP binding,
-    /// `routed_out=Some`) and whose route was produced through
-    /// [`produce_prefill_route`] and attached: Single (residual-combining)
-    /// calls can never export. The proof carries the static contract
-    /// identity plus the root invocation, token count, route width, expert
-    /// count, and concrete layer — no buffers, no host bytes.
-    pub fn prefill_route_producer_proof(
+    pub(super) fn prefill_route_producer_proof_for_receipt(
         &self,
+        receipt: &MoeRouteReceipt<'_>,
     ) -> Result<MoePrefillRouteProducerProof, DispatchError> {
         let params = self.prefill_params().ok_or_else(|| {
             invalid("prefill route producer proof requires a prefill call; refusing before launch")
@@ -1530,9 +1680,6 @@ impl SealedMoeCall<'_> {
         let contract = self.experts.execution_contract().ok_or_else(|| {
             invalid("prefill route producer proof requires a plan-bound execution contract; refusing before launch")
         })?;
-        let receipt = self.route_receipt.as_ref().ok_or_else(|| {
-            invalid("prefill route producer proof requires a produced route receipt; refusing before launch")
-        })?;
         self.validate_route_receipt(receipt)?;
         let layer = contract.layer().ok_or_else(|| {
             invalid("prefill route producer proof requires a concrete contract layer; refusing before launch")
@@ -1545,6 +1692,76 @@ impl SealedMoeCall<'_> {
             n_exp: params.n_exp,
             layer,
         })
+    }
+
+    pub(super) fn attached_route_stamp(
+        &self,
+    ) -> Option<(
+        u64,
+        MoeProtocol,
+        MoeRouterInput,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+        Option<u64>,
+    )> {
+        self.route_receipt.as_ref().map(|receipt| {
+            (
+                receipt.invocation,
+                receipt.protocol,
+                receipt.router,
+                receipt.n_experts,
+                receipt.k_top,
+                std::ptr::addr_of!(*receipt.indices) as usize,
+                std::ptr::addr_of!(*receipt.weights) as usize,
+                receipt.scores,
+                receipt.normalized,
+                receipt.adopted_from,
+            )
+        })
+    }
+
+    /// Return execution-local metadata for an adopted decode route.  The
+    /// route buffers were checked by the EP proof path before publication, so
+    /// no producer operation is needed during execution.
+    pub(super) fn prebound_route_stamp(
+        &self,
+    ) -> Option<(
+        u64,
+        MoeProtocol,
+        MoeRouterInput,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+        Option<u64>,
+    )> {
+        let router = match self.router {
+            MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK => {
+                self.router
+            }
+            _ => return None,
+        };
+        let SealedParams::Decode(params) = &self.params else {
+            return None;
+        };
+        Some((
+            self.invocation,
+            self.protocol,
+            router,
+            params.n_exp,
+            params.k,
+            std::ptr::addr_of!(*params.topk_indices) as usize,
+            std::ptr::addr_of!(*params.topk_weights) as usize,
+            std::ptr::addr_of!(*params.router_logits) as usize,
+            params.norm_topk_prob,
+            None,
+        ))
     }
 }
 
@@ -1580,7 +1797,7 @@ impl<'a> SealedMoeCall<'a> {
 
     /// Attach the receipt returned by the actual route producer.  A second
     /// producer or a receipt from another invocation is rejected.
-    pub fn attach_route_receipt(
+    pub(super) fn attach_route_receipt(
         &mut self,
         receipt: MoeRouteReceipt<'a>,
     ) -> Result<(), DispatchError> {
@@ -1600,7 +1817,7 @@ impl<'a> SealedMoeCall<'a> {
 
     /// Validate that a producer receipt belongs to this exact invocation and
     /// route-buffer pair.
-    pub fn validate_route_receipt(
+    pub(super) fn validate_route_receipt(
         &self,
         receipt: &MoeRouteReceipt<'_>,
     ) -> Result<(), DispatchError> {
@@ -1616,6 +1833,30 @@ impl<'a> SealedMoeCall<'a> {
         // on their plan-bound compact rank (root or not). The sealer proved
         // the mode/binding combination; this re-checks the rank shape and
         // the executing device before any launch.
+        if self.dispatch_ctx.device_id() != gpu.device_id {
+            return Err(invalid(format!(
+                "sealed MoE dispatch context device mismatch: context={} executing_gpu={}",
+                self.dispatch_ctx.device_id(),
+                gpu.device_id
+            )));
+        }
+        if self.dispatch_ctx.arch.arch() != gpu.arch {
+            return Err(invalid(format!(
+                "sealed MoE dispatch context arch mismatch: context={} executing_gpu={}",
+                self.dispatch_ctx.arch.arch(),
+                gpu.arch
+            )));
+        }
+        if let MoeKernelSelection::Decode(selection) = &self.selection {
+            if !selection.resolution.use_gpu_topk && gpu.graphs.replay.capturing.is_some() {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH_MOE=0)",
+                    arch: "",
+                    quant: "",
+                });
+            }
+        }
         match &self.params {
             SealedParams::Decode(params) => match params.ep_mode {
                 MoeEpMode::None => {
@@ -1689,7 +1930,40 @@ impl<'a> SealedMoeCall<'a> {
                 gpu.device_id
             )));
         }
-        if self.protocol == MoeProtocol::GroupedPrefill {
+        let specialized_route = match &self.params {
+            SealedParams::Decode(params) => params.route_policy.is_some(),
+            SealedParams::Prefill(params) => params.route_policy.is_some(),
+        };
+        // Only the *retained body* is refused: recording this forward into a tape,
+        // or routing it through a prepared plan. A forward that merely has a
+        // replay backend enabled (prefill, an ineligible call, an already-poisoned
+        // route) keeps running on HIP, so an unadmitted route cannot make the
+        // model unservable. `docs/REDLINE.md` §3 keeps prefill out of the tape and
+        // defines the poisoned route as a HIP fallback.
+        if specialized_route && gpu.replay.retained_body_active() {
+            match specialized_sealed_moe_retained_admission() {
+                SpecializedRouteAdmission::Refused { reason } => return Err(invalid(reason)),
+                SpecializedRouteAdmission::Admitted
+                | SpecializedRouteAdmission::DiagnosticCapture => {}
+            }
+            // A replay dereferences this route's pointer tables and expert views
+            // without re-uploading or re-validating them, so the retained body
+            // additionally requires the two proofs capture depends on: the table
+            // contents must name the live experts, and the pointer mapping must be
+            // the one this tape latched.
+            if let SealedParams::Decode(params) = &self.params {
+                if params.expert_ptrs_host.is_none() {
+                    return Err(invalid(
+                        "specialized sealed MoE retained body requires the host expert pointer \
+                         entries (expert_ptrs_host) that the pointer tables were uploaded from",
+                    ));
+                }
+            }
+        }
+
+        if self.protocol == MoeProtocol::GroupedPrefill
+            && self.router == MoeRouterInput::PrecomputedSoftmaxTopK
+        {
             let receipt = self
                 .route_receipt
                 .as_ref()
@@ -1724,18 +1998,18 @@ fn validate_route_receipt_pair(
 /// Run the family-specific prefill router and mint its invocation-bound
 /// receipt.  Qwen's softmax producer and Cohere's sigmoid producer both use
 /// this boundary; model callers must not launch those operations themselves.
-pub fn produce_prefill_route<'a>(
+pub(super) fn produce_prefill_route<'a>(
     call: &SealedMoeCall<'a>,
     gpu: &mut Gpu,
     scores: &GpuTensor,
     normalize: bool,
 ) -> Result<MoeRouteReceipt<'a>, DispatchError> {
-    if call.protocol != MoeProtocol::GroupedPrefill {
-        return Err(invalid("prefill route producer requires GroupedPrefill"));
-    }
     if !matches!(
         call.router,
-        MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK
+        MoeRouterInput::SoftmaxTopK
+            | MoeRouterInput::PrecomputedSoftmaxTopK
+            | MoeRouterInput::SigmoidTopK
+            | MoeRouterInput::PrecomputedSigmoidTopK
     ) {
         return Err(invalid("unsupported prefill route producer"));
     }
@@ -1747,9 +2021,15 @@ pub fn produce_prefill_route<'a>(
         .checked_mul(params.n_exp)
         .ok_or_else(|| invalid("prefill router score capacity overflows"))?;
     require_elements(scores, score_elements, "prefill router scores")?;
+    let route = match call.kernel_selection() {
+        MoeKernelSelection::Prefill(selection) => selection.route,
+        MoeKernelSelection::Decode(_) => {
+            return Err(invalid("prefill producer has decode selection"))
+        }
+    };
 
     match call.router {
-        MoeRouterInput::PrecomputedSoftmaxTopK => {
+        MoeRouterInput::SoftmaxTopK | MoeRouterInput::PrecomputedSoftmaxTopK => {
             if scores.shape.len() != 2
                 || scores.shape[0] != params.batch_size
                 || scores.shape[1] != params.n_exp
@@ -1758,19 +2038,49 @@ pub fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            gpu.softmax_f32(scores)
+            if params.recipe.bf16_round_trip() {
+                gpu.bf16_round_trip_f32(scores)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            if matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+                gpu.moe_router_softmax_top10_f32(
+                    scores,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.batch_size,
+                    normalize,
+                )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gpu.moe_topk_renorm_k8_batched(
-                scores,
-                params.topk_indices,
-                params.topk_weights,
-                params.n_exp,
-                normalize,
-                params.batch_size,
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            } else {
+                gpu.softmax_f32(scores)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                let result = if params.k_top == 10 {
+                    gpu.moe_topk_renorm_top10_batched(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.n_exp,
+                        normalize,
+                        params.batch_size,
+                    )
+                } else {
+                    gpu.moe_topk_renorm_k8_batched(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.n_exp,
+                        normalize,
+                        params.batch_size,
+                    )
+                };
+                result.map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            if params.recipe.bf16_round_trip() {
+                gpu.bf16_round_trip_f32(params.topk_weights)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
         }
-        MoeRouterInput::PrecomputedSigmoidTopK => {
+        MoeRouterInput::SigmoidTopK | MoeRouterInput::PrecomputedSigmoidTopK => {
             #[cfg(feature = "deltanet")]
             {
                 gpu.sigmoid_f32(scores)
@@ -1792,7 +2102,6 @@ pub fn produce_prefill_route<'a>(
                 ));
             }
         }
-        MoeRouterInput::SoftmaxTopK => unreachable!("validated above"),
     }
 
     let expected = call.expected_route_receipt();
@@ -1810,18 +2119,45 @@ pub fn produce_prefill_route<'a>(
     })
 }
 
-/// Execute a validated sealed call.  The arithmetic helpers remain in
-/// `pipeline::mod`; this chokepoint prevents a caller from bypassing the
-/// bound-call checks.
-pub(crate) fn execute_sealed(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    call: &SealedMoeCall<'_>,
-) -> Result<(), DispatchError> {
+/// Execute a validated sealed call. The compute boundary lowers it into the
+/// typed ordered program in `pipeline::moe_program`; this chokepoint preserves
+/// the bound-call checks and prevents callers from bypassing them.
+pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), DispatchError> {
     call.validate_for_gpu(gpu)?;
-    match call.protocol() {
-        MoeProtocol::IndexedDecode => super::run_moe_decode(ctx, gpu, call),
-        MoeProtocol::GroupedPrefill => super::run_moe_prefill(ctx, gpu, call),
+    call.note_retained_route_identity(gpu)?;
+    moe_program::execute(gpu, call)
+}
+
+impl SealedMoeCall<'_> {
+    /// Latch this launch's pointer mapping into the retained tape.
+    ///
+    /// Runs where the launch actually executes rather than in the read-only
+    /// preflight, so the identity belongs to the tape exactly when its dispatches
+    /// are recorded. A replay dereferences the expert pointer tables and per-expert
+    /// views without re-uploading or re-validating them, so a mapping change
+    /// between capture and replay has to be an error instead of a silent
+    /// dereference of tensors the prepared plan never validated.
+    fn note_retained_route_identity(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        if !gpu.replay.retained_body_active() {
+            return Ok(());
+        }
+        let specialized = match &self.params {
+            SealedParams::Decode(params) => params.route_policy.is_some(),
+            SealedParams::Prefill(params) => params.route_policy.is_some(),
+        };
+        if !specialized {
+            return Ok(());
+        }
+        let Some(live) = self.experts.cache.live.as_ref() else {
+            return Err(invalid(
+                "specialized sealed MoE retained body requires a live expert binding",
+            ));
+        };
+        let identity = live.mapping_fingerprint.clone();
+        let key = live.table_identity;
+        gpu.replay
+            .note_route_identity(key, &identity)
+            .map_err(|reason| invalid(reason))
     }
 }
 
@@ -1875,7 +2211,7 @@ pub struct MoePrefillRouteProducerProof {
 /// invocation and buffer identities (carrying the root invocation as
 /// provenance). Launches nothing; the caller attaches the receipt and
 /// executes through the existing sealed path. No host bytes are consulted.
-pub fn adopt_prefill_route<'a>(
+pub(super) fn adopt_prefill_route<'a>(
     call: &SealedMoeCall<'a>,
     proof: &MoePrefillRouteProducerProof,
 ) -> Result<MoeRouteReceipt<'a>, DispatchError> {
@@ -1933,12 +2269,7 @@ pub fn adopt_prefill_route<'a>(
     {
         return Err(invalid(format!(
             "prefill route proof covers [{} tokens x {} x {}], call needs [{} x {} x {}]; refusing before launch",
-            proof.n_tokens,
-            proof.k,
-            proof.n_exp,
-            params.batch_size,
-            params.k_top,
-            params.n_exp
+            proof.n_tokens, proof.k, proof.n_exp, params.batch_size, params.k_top, params.n_exp
         )));
     }
     Ok(MoeRouteReceipt {
@@ -1958,28 +2289,141 @@ pub fn adopt_prefill_route<'a>(
 /// Seal the existing indexed decode parameter record.
 pub fn seal_decode<'a>(
     experts: BoundMoeExperts<'a>,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     params: MoeParams<'a>,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
-    seal_decode_with_router(experts, ctx, params, MoeRouterInput::SoftmaxTopK)
+    let router = match params.recipe {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
+        crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    seal_decode_with_router(experts, ctx, params, router)
 }
 
-/// Checked decode adapter hook. Decode admits only the in-call softmax/top-k
-/// producer on this public entry. The routed contrib (precomputed root-route
-/// IDs) must go through [`seal_ep_routed_contrib`], which binds the
-/// sealer-issued [`MoeRouteProducerProof`] before sealing.
-pub fn seal_decode_with_router<'a>(
+/// Internal checked decode adapter used by the root-routed EP constructor.
+fn seal_decode_with_router<'a>(
     experts: BoundMoeExperts<'a>,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     params: MoeParams<'a>,
     router: MoeRouterInput,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
-    if router != MoeRouterInput::SoftmaxTopK {
+    let expected = match params.recipe {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
+        crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    if router != expected {
         return Err(invalid(
-            "indexed decode requires SoftmaxTopK routing; routed contrib requires seal_ep_routed_contrib with a route-producer proof",
+            "decode router does not match the declared MoE recipe",
         ));
     }
-    seal_indexed_decode(experts, ctx, params, MoeRouterInput::SoftmaxTopK)
+    seal_indexed_decode(experts, ctx, params, router)
+}
+
+fn require_recipe_feature(recipe: MoeRecipe) -> Result<(), DispatchError> {
+    #[cfg(not(feature = "deltanet"))]
+    if recipe == MoeRecipe::SigmoidRoutedNoShared {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "sigmoid-recipe-requires-deltanet",
+            arch: "",
+            quant: "",
+        });
+    }
+    let _ = recipe;
+    Ok(())
+}
+
+fn resolve_decode_normalization(
+    ctx: &DispatchCtx,
+    params: &mut MoeParams<'_>,
+) -> Result<(), DispatchError> {
+    let MoeNormalization::RmsNorm { plain_out, .. } = &params.normalization else {
+        return Ok(());
+    };
+    if !matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
+        params.x_norm = plain_out;
+        params.x_rot_prerotated = false;
+        return Ok(());
+    }
+    let shared = params
+        .shared
+        .as_ref()
+        .ok_or_else(|| invalid("softmax/shared normalization requires shared weights"))?;
+    let prerotated =
+        crate::families::moe::softmax_shared_gate_prerotated(ctx, &params.router, &shared.weights);
+    params.x_norm = if prerotated {
+        params.x_residual
+    } else {
+        plain_out
+    };
+    params.x_rot_prerotated = prerotated;
+    Ok(())
+}
+
+/// Private indexed-decode sealer shared by the public SoftmaxTopK entry and
+/// the proof-validated routed-contrib path. Callers that need
+/// [`MoeRouterInput::PrecomputedSoftmaxTopK`] must go through
+/// [`seal_ep_routed_contrib`] so the route-producer proof cannot be bypassed.
+/// Shared launch-free decode admission used by both the real sealer and
+/// whole-step preflight.  Keeping this resolver single-sourced prevents the
+/// preflight path from drifting from the eventual sealed call.
+fn prepare_decode<'a>(
+    experts: &BoundMoeExperts<'a>,
+    ctx: &DispatchCtx,
+    mut params: MoeParams<'a>,
+    router: MoeRouterInput,
+) -> Result<(MoeParams<'a>, MoeRouterInput), DispatchError> {
+    require_context_device(ctx, experts)?;
+    require_recipe_feature(params.recipe)?;
+    resolve_decode_normalization(ctx, &mut params)?;
+    if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
+        if params.k != 8 {
+            return Err(invalid(format!(
+                "sigmoid MoE decode requires k=8, got {}",
+                params.k
+            )));
+        }
+        if params.ep_mode != MoeEpMode::None {
+            return Err(invalid(
+                "sigmoid MoE decode does not support expert-parallel execution",
+            ));
+        }
+        if params.defer_routed_combine {
+            return Err(invalid(
+                "sigmoid MoE decode does not support deferred combine",
+            ));
+        }
+    }
+    match params.ep_mode {
+        // Single (classic or deferred-combine experiment): exactly one rank,
+        // rank 0, no contract needed.
+        MoeEpMode::None => require_single_binding(experts)?,
+        // Root-routed EP: plan-bound compact owners under the root-routed
+        // execution contract, decode-eligible on this GPU.
+        MoeEpMode::RootRoutedPartial => {
+            if matches!(
+                router,
+                MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK
+            ) {
+                if experts.local_rank() == 0 {
+                    return Err(invalid(
+                        "routed-contrib decode runs on non-root ranks; the root runs the full routing call",
+                    ));
+                }
+            } else {
+                preflight_root_routed_decode(ctx, experts, &params)?;
+            }
+        }
+    }
+    if !matches!(
+        router,
+        MoeRouterInput::SoftmaxTopK
+            | MoeRouterInput::SigmoidTopK
+            | MoeRouterInput::PrecomputedSoftmaxTopK
+            | MoeRouterInput::PrecomputedSigmoidTopK
+    ) {
+        return Err(invalid("unsupported indexed decode router"));
+    }
+    Ok((params, router))
 }
 
 /// Private indexed-decode sealer shared by the public SoftmaxTopK entry and
@@ -1988,41 +2432,18 @@ pub fn seal_decode_with_router<'a>(
 /// [`seal_ep_routed_contrib`] so the route-producer proof cannot be bypassed.
 fn seal_indexed_decode<'a>(
     experts: BoundMoeExperts<'a>,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     params: MoeParams<'a>,
     router: MoeRouterInput,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
-    match params.ep_mode {
-        // Single (classic or deferred-combine experiment): exactly one rank,
-        // rank 0, no contract needed.
-        MoeEpMode::None => require_single_binding(&experts)?,
-        // Root-routed EP: plan-bound compact owners under the root-routed
-        // execution contract, decode-eligible on this GPU. The root runs
-        // the full routing call; non-roots run the precomputed contrib
-        // (proof-bound by `seal_ep_routed_contrib` before entry).
-        MoeEpMode::RootRoutedPartial => {
-            if router == MoeRouterInput::PrecomputedSoftmaxTopK {
-                if experts.local_rank() == 0 {
-                    return Err(invalid(
-                        "routed-contrib decode runs on non-root ranks; the root runs the full routing call",
-                    ));
-                }
-            } else {
-                preflight_root_routed_decode(ctx, &experts, &params)?;
-            }
-        }
-    }
-    if !matches!(
-        router,
-        MoeRouterInput::SoftmaxTopK | MoeRouterInput::PrecomputedSoftmaxTopK
-    ) {
-        return Err(invalid("indexed decode requires SoftmaxTopK routing"));
-    }
+    let (params, router) = prepare_decode(&experts, ctx, params, router)?;
+    let selection = moe_program::select_decode(ctx, &params, router)?;
     validate_decode(ctx, &experts, &params)?;
     let basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
     let (contribution, shared) = decode_combine(&experts, &params)?;
     Ok(SealedMoeCall {
         invocation: NEXT_INVOCATION.fetch_add(1, Ordering::Relaxed),
+        dispatch_ctx: ctx,
         experts,
         protocol: MoeProtocol::IndexedDecode,
         router,
@@ -2036,9 +2457,31 @@ fn seal_indexed_decode<'a>(
             },
             basis,
         ),
+        selection: MoeKernelSelection::Decode(selection),
         params: SealedParams::Decode(params),
         route_receipt: None,
     })
+}
+
+/// Launch-free indexed-decode preflight.  It deliberately shares the same
+/// normalization, grammar, resource validation, and kernel selection resolver
+/// as [`seal_indexed_decode`], but does not mint an invocation or allocate a
+/// sealed call.
+pub fn preflight_decode<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &DispatchCtx,
+    params: MoeParams<'a>,
+) -> Result<(), DispatchError> {
+    let router = match params.recipe {
+        MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
+        MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    let (params, router) = prepare_decode(&experts, ctx, params, router)?;
+    let _selection = moe_program::select_decode(ctx, &params, router)?;
+    validate_decode(ctx, &experts, &params)?;
+    let _basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
+    let _grammar = decode_combine(&experts, &params)?;
+    Ok(())
 }
 
 /// Seal the non-root routed-contrib decode call: indexed experts (plus any
@@ -2052,7 +2495,7 @@ fn seal_indexed_decode<'a>(
 /// path.
 pub fn seal_ep_routed_contrib<'a>(
     experts: BoundMoeExperts<'a>,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     params: MoeParams<'a>,
     proof: &MoeRouteProducerProof,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
@@ -2099,91 +2542,180 @@ pub fn seal_ep_routed_contrib<'a>(
     seal_indexed_decode(experts, ctx, params, MoeRouterInput::PrecomputedSoftmaxTopK)
 }
 
-/// Seal the existing grouped-prefill parameter record using the Qwen softmax
-/// route producer.  The producer must be run through [`produce_prefill_route`]
-/// and attached before the call is executable.
+/// Seal a grouped-prefill parameter record using the router implied by its
+/// declared recipe and prelude route authority.
 pub fn seal_prefill<'a>(
     experts: BoundMoeExperts<'a>,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     params: MoePrefillParams<'a>,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
-    seal_prefill_with_router(experts, ctx, params, MoeRouterInput::PrecomputedSoftmaxTopK)
+    let router = match params.recipe {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
+            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            _ => MoeRouterInput::SoftmaxTopK,
+        },
+        crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    seal_prefill_with_router(experts, ctx, params, router)
 }
 
-/// Checked prefill adapter hook for model families whose route producer has a
-/// different normalized score basis (currently Cohere's sigmoid/top-k path).
-pub fn seal_prefill_with_router<'a>(
-    experts: BoundMoeExperts<'a>,
+/// Shared launch-free prefill admission used by both the real sealer and
+/// whole-step preflight.
+fn prepare_prefill<'a>(
+    experts: &BoundMoeExperts<'a>,
     ctx: &DispatchCtx,
     params: MoePrefillParams<'a>,
     router: MoeRouterInput,
-) -> Result<SealedMoeCall<'a>, DispatchError> {
-    require_single_binding(&experts)?;
-    if router == MoeRouterInput::SoftmaxTopK {
+) -> Result<(MoePrefillParams<'a>, MoeRouterInput), DispatchError> {
+    require_context_device(ctx, experts)?;
+    require_single_binding(experts)?;
+    let expected = match params.recipe {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
+            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            _ => MoeRouterInput::SoftmaxTopK,
+        },
+        crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    if router != expected {
         return Err(invalid(
-            "prefill route buffers must identify a precomputed softmax or sigmoid producer",
+            "prefill router does not match the declared MoE recipe",
         ));
     }
-    validate_prefill(ctx, &experts, &params)?;
+    validate_prefill(ctx, experts, &params)?;
+    Ok((params, router))
+}
+
+/// Internal checked prefill adapter. Public callers select the router from
+/// [`MoePrefillParams::recipe`]; this function remains private so an
+/// architecture cannot bypass the typed recipe declaration.
+fn seal_prefill_with_router<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &'a DispatchCtx,
+    params: MoePrefillParams<'a>,
+    router: MoeRouterInput,
+) -> Result<SealedMoeCall<'a>, DispatchError> {
+    let (params, router) = prepare_prefill(&experts, ctx, params, router)?;
+    let selection = moe_program::select_prefill(ctx, &params)?;
     let basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
     let contribution = if params.routed_out.is_some() {
         MoeContribution::ZeroedPartial
     } else {
         MoeContribution::Residual
     };
-    Ok(SealedMoeCall {
+    let mut call = SealedMoeCall {
         invocation: NEXT_INVOCATION.fetch_add(1, Ordering::Relaxed),
+        dispatch_ctx: ctx,
         experts,
         protocol: MoeProtocol::GroupedPrefill,
         router,
         contribution,
-        // Prefill's shared output is already in each rank's residual and is
-        // deliberately outside the routed reduction.
-        shared: MoeSharedContribution::PerRankResidual,
+        shared: if params.recipe == crate::families::moe::MoeRecipe::SigmoidRoutedNoShared {
+            MoeSharedContribution::None
+        } else {
+            MoeSharedContribution::PerRankResidual
+        },
         activation: ActivationIdentity::new(ActivationInput::PreRotated, basis),
+        selection: MoeKernelSelection::Prefill(selection),
         params: SealedParams::Prefill(params),
         route_receipt: None,
-    })
+    };
+    if let SealedParams::Prefill(params) = &call.params {
+        if let PrefillRouteMode::AdoptRoot { proof } = params.prelude.route {
+            let receipt = adopt_prefill_route(&call, proof)?;
+            call.attach_route_receipt(receipt)?;
+        }
+    }
+    Ok(call)
 }
 
-/// Seal a compact EP grouped-prefill call: the routed combine accumulates
-/// into the zeroed `[batch × dim]` partial (`params.routed_out`, required)
-/// while the shared expert stays replicated in each rank's residual
-/// ([`MoeSharedContribution::PerRankResidual`] — deliberately outside the
-/// reduced partial, so it is contributed exactly once per rank and never
-/// all-reduced). Grouped-prefill Single behavior is untouched:
-/// [`seal_prefill`]/[`seal_prefill_with_router`] keep
-/// `require_single_binding` and never call this. The producer must be run
-/// through [`produce_prefill_route`] and attached before the call is
-/// executable; on non-root ranks the receipt comes from
-/// [`adopt_prefill_route`] after the ordered device copy.
-pub fn seal_prefill_ep<'a>(
+/// Launch-free grouped-prefill preflight.  It shares the same binding,
+/// recipe, resource, and kernel-selection checks as `seal_prefill` without
+/// allocating a sealed call or minting an invocation.
+pub fn preflight_prefill<'a>(
     experts: BoundMoeExperts<'a>,
     ctx: &DispatchCtx,
     params: MoePrefillParams<'a>,
+) -> Result<(), DispatchError> {
+    let router = match params.recipe {
+        crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
+            PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+            _ => MoeRouterInput::SoftmaxTopK,
+        },
+        MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+    };
+    let (params, _router) = prepare_prefill(&experts, ctx, params, router)?;
+    let _selection = moe_program::select_prefill(ctx, &params)?;
+    let _basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
+    Ok(())
+}
+
+/// Seal a compact EP grouped-prefill call. Root-routed EP is a softmax-only
+/// protocol; sigmoid/no-shared recipes are rejected before publication.
+pub fn seal_prefill_ep<'a>(
+    experts: BoundMoeExperts<'a>,
+    ctx: &'a DispatchCtx,
+    params: MoePrefillParams<'a>,
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
+    if !matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. }) {
+        return Err(invalid(
+            "compact EP prefill supports only SoftmaxGatedShared",
+        ));
+    }
+    require_context_device(ctx, &experts)?;
     require_compact_ep_binding(&experts)?;
     if params.routed_out.is_none() {
         return Err(invalid(
             "compact EP prefill requires the zeroed routed partial (routed_out=Some); refusing before launch",
         ));
     }
+    let router = match params.prelude.route {
+        PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
+        PrefillRouteMode::ProduceRoot { .. } => MoeRouterInput::SoftmaxTopK,
+        PrefillRouteMode::Replicated => {
+            return Err(invalid(
+                "compact EP prefill requires ProduceRoot or AdoptRoot route authority",
+            ));
+        }
+    };
+    // Reuse the common binding/selection path without its Single-rank check.
     validate_prefill(ctx, &experts, &params)?;
+    let selection = moe_program::select_prefill(ctx, &params)?;
     let basis = expected_basis(&experts, params.dtypes.routed_gate_up)?;
-    Ok(SealedMoeCall {
+    let mut call = SealedMoeCall {
         invocation: NEXT_INVOCATION.fetch_add(1, Ordering::Relaxed),
+        dispatch_ctx: ctx,
         experts,
         protocol: MoeProtocol::GroupedPrefill,
-        router: MoeRouterInput::PrecomputedSoftmaxTopK,
+        router,
         contribution: MoeContribution::ZeroedPartial,
-        // Prefill's shared output is already in each rank's residual and is
-        // deliberately outside the routed reduction.
         shared: MoeSharedContribution::PerRankResidual,
         activation: ActivationIdentity::new(ActivationInput::PreRotated, basis),
+        selection: MoeKernelSelection::Prefill(selection),
         params: SealedParams::Prefill(params),
         route_receipt: None,
-    })
+    };
+    if let SealedParams::Prefill(params) = &call.params {
+        if let PrefillRouteMode::AdoptRoot { proof } = params.prelude.route {
+            let receipt = adopt_prefill_route(&call, proof)?;
+            call.attach_route_receipt(receipt)?;
+        }
+    }
+    Ok(call)
 }
+fn require_context_device(
+    ctx: &DispatchCtx,
+    experts: &BoundMoeExperts<'_>,
+) -> Result<(), DispatchError> {
+    if ctx.device_id() != experts.physical_device() {
+        return Err(invalid(format!(
+            "sealed MoE dispatch context device {} disagrees with expert binding device {}",
+            ctx.device_id(),
+            experts.physical_device()
+        )));
+    }
+    Ok(())
+}
+
 fn require_single_binding(experts: &BoundMoeExperts<'_>) -> Result<(), DispatchError> {
     if experts.rank_count() != 1 || experts.local_rank() != 0 {
         return Err(invalid(format!(
@@ -2258,6 +2790,187 @@ fn preflight_root_routed_decode(
     }
     Ok(())
 }
+fn validate_weight_ref(
+    weight: &WeightRef<'_>,
+    rows: usize,
+    cols: usize,
+    name: &str,
+) -> Result<(), DispatchError> {
+    if weight.m != rows || weight.k != cols {
+        return Err(invalid(format!(
+            "{name} logical shape [{}, {}] does not match [{rows}, {cols}]",
+            weight.m, weight.k
+        )));
+    }
+    if matches!(weight.dtype, DType::F32 | DType::F16 | DType::BF16) {
+        require_elements(
+            weight.buf,
+            rows.checked_mul(cols)
+                .ok_or_else(|| invalid(format!("{name} shape overflows")))?,
+            name,
+        )
+    } else if weight.buf.buf.size() == 0 {
+        Err(invalid(format!("{name} has an empty encoded buffer")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_normalization(
+    normalization: &MoeNormalization<'_>,
+    hidden: usize,
+    plain_required: usize,
+) -> Result<(), DispatchError> {
+    if let MoeNormalization::RmsNorm {
+        weight,
+        plain_out,
+        eps,
+    } = normalization
+    {
+        if !eps.is_finite() || *eps <= 0.0 {
+            return Err(invalid("RMSNorm epsilon must be finite and positive"));
+        }
+        require_elements(weight, hidden, "MoE RMSNorm weight")?;
+        require_elements(plain_out, plain_required, "MoE RMSNorm output")?;
+    }
+    Ok(())
+}
+
+fn validate_shared_decode(params: &MoeParams<'_>, hidden: usize) -> Result<(), DispatchError> {
+    match (params.recipe, params.shared.as_ref(), params.dtypes.shared) {
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(shared), Some(dtypes)) => {
+            if shared.intermediate == 0 {
+                return Err(invalid("shared decode intermediate dimension is zero"));
+            }
+            validate_weight_ref(
+                &shared.weights.selector,
+                1,
+                hidden,
+                "shared selector weight",
+            )?;
+            validate_weight_ref(
+                &shared.weights.gate,
+                shared.intermediate,
+                hidden,
+                "shared gate weight",
+            )?;
+            validate_weight_ref(
+                &shared.weights.up,
+                shared.intermediate,
+                hidden,
+                "shared up weight",
+            )?;
+            validate_weight_ref(
+                &shared.weights.down,
+                hidden,
+                shared.intermediate,
+                "shared down weight",
+            )?;
+            if [
+                shared.weights.selector.dtype,
+                shared.weights.gate.dtype,
+                shared.weights.up.dtype,
+                shared.weights.down.dtype,
+            ] != [dtypes.selector, dtypes.gate, dtypes.up, dtypes.down]
+            {
+                return Err(invalid(
+                    "shared decode weight dtypes disagree with MoeDtypes",
+                ));
+            }
+            require_elements(shared.scalar, 1, "shared decode scalar")?;
+            require_elements(shared.gate_out, shared.intermediate, "shared decode gate")?;
+            require_elements(shared.up_out, shared.intermediate, "shared decode up")?;
+            Ok(())
+        }
+        (MoeRecipe::SoftmaxGatedShared { .. }, None, _) => {
+            Err(invalid("SoftmaxGatedShared decode requires shared weights"))
+        }
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(_), None) => Err(invalid(
+            "shared decode weights require shared dtype metadata",
+        )),
+        (MoeRecipe::SigmoidRoutedNoShared, None, None) => Ok(()),
+        (MoeRecipe::SigmoidRoutedNoShared, Some(_), _) => Err(invalid(
+            "SigmoidRoutedNoShared decode cannot bind shared weights",
+        )),
+        (MoeRecipe::SigmoidRoutedNoShared, None, Some(_)) => Err(invalid(
+            "SigmoidRoutedNoShared decode cannot bind shared dtypes",
+        )),
+    }
+}
+
+fn validate_shared_prefill(
+    params: &MoePrefillParams<'_>,
+    hidden: usize,
+) -> Result<(), DispatchError> {
+    match (
+        params.recipe,
+        params.prelude.shared.as_ref(),
+        params.dtypes.shared,
+    ) {
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(shared), Some(dtypes)) => {
+            if shared.intermediate == 0 {
+                return Err(invalid("shared prefill intermediate dimension is zero"));
+            }
+            validate_weight_ref(
+                &shared.weights.selector,
+                1,
+                hidden,
+                "shared prefill selector weight",
+            )?;
+            validate_weight_ref(
+                &shared.weights.gate,
+                shared.intermediate,
+                hidden,
+                "shared prefill gate weight",
+            )?;
+            validate_weight_ref(
+                &shared.weights.up,
+                shared.intermediate,
+                hidden,
+                "shared prefill up weight",
+            )?;
+            validate_weight_ref(
+                &shared.weights.down,
+                params.down_m,
+                shared.intermediate,
+                "shared prefill down weight",
+            )?;
+            if [
+                shared.weights.selector.dtype,
+                shared.weights.gate.dtype,
+                shared.weights.up.dtype,
+                shared.weights.down.dtype,
+            ] != [dtypes.selector, dtypes.gate, dtypes.up, dtypes.down]
+            {
+                return Err(invalid(
+                    "shared prefill weight dtypes disagree with MoeDtypes",
+                ));
+            }
+            let rows = params.batch_size;
+            let intermediate = rows
+                .checked_mul(shared.intermediate)
+                .ok_or_else(|| invalid("shared prefill scratch capacity overflows"))?;
+            require_elements(shared.scalar, rows, "shared prefill scalar")?;
+            require_elements(shared.gate_out, intermediate, "shared prefill gate")?;
+            require_elements(shared.up_out, intermediate, "shared prefill up")?;
+            require_elements(shared.rotated, intermediate, "shared prefill activation")?;
+            Ok(())
+        }
+        (MoeRecipe::SoftmaxGatedShared { .. }, None, _) => Err(invalid(
+            "SoftmaxGatedShared prefill requires shared weights",
+        )),
+        (MoeRecipe::SoftmaxGatedShared { .. }, Some(_), None) => Err(invalid(
+            "shared prefill weights require shared dtype metadata",
+        )),
+        (MoeRecipe::SigmoidRoutedNoShared, None, None) => Ok(()),
+        (MoeRecipe::SigmoidRoutedNoShared, Some(_), _) => Err(invalid(
+            "SigmoidRoutedNoShared prefill cannot bind shared weights",
+        )),
+        (MoeRecipe::SigmoidRoutedNoShared, None, Some(_)) => Err(invalid(
+            "SigmoidRoutedNoShared prefill cannot bind shared dtypes",
+        )),
+    }
+}
 
 fn validate_decode(
     _ctx: &DispatchCtx,
@@ -2270,21 +2983,34 @@ fn validate_decode(
             params.batch_size
         )));
     }
-    if params.hidden == 0 || params.mi == 0 || params.smi == 0 {
+    if params.hidden == 0 || params.mi == 0 {
         return Err(invalid("decode dimensions must be nonzero"));
     }
+
     if params.n_exp == 0 || params.k == 0 || params.k > params.n_exp {
         return Err(invalid(format!(
-            "decode route width k={} is outside 1..={} ",
+            "decode route width k={} is outside 1..={}",
             params.k, params.n_exp
         )));
     }
-    // Deferred combine is admitted only without a routed partial (Single
-    // deferred-combine experiment, canonical EP); the mode grammar in
-    // `resolve_decode_grammar` enforces the exact combinations.
     if params.defer_routed_combine && params.routed_out.is_some() {
         return Err(invalid("deferred routed combine requires routed_out=None"));
     }
+    if params.recipe == MoeRecipe::SigmoidRoutedNoShared
+        && (params.k != 8 || params.ep_mode != MoeEpMode::None || params.defer_routed_combine)
+    {
+        return Err(invalid(
+            "sigmoid MoE decode requires k=8, no EP, and no deferred combine",
+        ));
+    }
+    validate_normalization(&params.normalization, params.hidden, params.hidden)?;
+    validate_shared_decode(params, params.hidden)?;
+    validate_weight_ref(
+        &params.router,
+        params.n_exp,
+        params.hidden,
+        "decode router weight",
+    )?;
     let gate_up_rows = params
         .mi
         .checked_mul(2)
@@ -2309,6 +3035,7 @@ fn validate_decode(
         params.expert_down_ptrs,
         params.expert_down_awq_ptrs,
         params.expert_dtype_tags,
+        params.expert_ptrs_host,
     )?;
     validate_dtype_tag_table(
         params.expert_dtype_tags,
@@ -2323,7 +3050,14 @@ fn validate_decode(
     require_elements(params.x_norm, params.hidden, "decode x_norm")?;
     require_elements(params.x_residual, params.hidden, "decode residual")?;
     require_elements(params.router_logits, params.n_exp, "decode router logits")?;
-    require_elements(params.topk_indices, params.k, "decode top-k indices")?;
+    require_bytes(
+        params.topk_indices,
+        params
+            .k
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("decode top-k index capacity overflows"))?,
+        "decode top-k indices",
+    )?;
     require_elements(params.topk_weights, params.k, "decode top-k weights")?;
     require_elements(
         params.x_rot_local,
@@ -2337,34 +3071,19 @@ fn validate_decode(
             .ok_or_else(|| invalid("decode gate/up scratch overflows"))?,
         "decode gate/up scratch",
     )?;
-    require_elements(params.gate_buf, params.mi, "decode gate scratch")?;
-    require_elements(params.up_buf, params.mi, "decode up scratch")?;
-    require_elements(params.ffn_hidden, params.smi, "decode shared activation")?;
-    require_elements(params.ffn_out, params.hidden, "decode shared output")?;
     require_elements(
-        params.gate_batch,
-        params
-            .k
-            .checked_mul(params.mi)
-            .ok_or_else(|| invalid("decode gate batch capacity overflows"))?,
-        "decode gate batch",
+        params.ffn_hidden,
+        params.mi,
+        "decode routed activation scratch",
     )?;
-    require_elements(
-        params.up_batch,
-        params
-            .k
-            .checked_mul(params.mi)
-            .ok_or_else(|| invalid("decode up batch capacity overflows"))?,
-        "decode up batch",
-    )?;
-    require_elements(
-        params.rot_batch,
-        params
-            .k
-            .checked_mul(params.mi)
-            .ok_or_else(|| invalid("decode rotation batch capacity overflows"))?,
-        "decode rotation batch",
-    )?;
+    require_elements(params.ffn_out, params.hidden, "decode output scratch")?;
+    let gate_capacity = params
+        .k
+        .checked_mul(params.mi)
+        .ok_or_else(|| invalid("decode gate batch capacity overflows"))?;
+    require_elements(params.gate_batch, gate_capacity, "decode gate batch")?;
+    require_elements(params.up_batch, gate_capacity, "decode up batch")?;
+    require_elements(params.rot_batch, gate_capacity, "decode rotation batch")?;
     require_elements(
         params.down_expanded,
         params
@@ -2390,17 +3109,83 @@ fn validate_prefill(
     if params.mi == 0 || params.down_m == 0 || params.down_k == 0 || params.gate_up_k == 0 {
         return Err(invalid("prefill dimensions must be nonzero"));
     }
+    require_recipe_feature(params.recipe)?;
     if params.n_exp == 0 || params.k_top == 0 || params.k_top > params.n_exp {
         return Err(invalid(format!(
-            "prefill route width k_top={} is outside 1..={} ",
+            "prefill route width k_top={} is outside 1..={}",
             params.k_top, params.n_exp
         )));
+    }
+    if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
+        if params.k_top != 8 {
+            return Err(invalid(format!(
+                "sigmoid MoE prefill requires k_top=8, got {}",
+                params.k_top
+            )));
+        }
+        if !matches!(params.prelude.route, PrefillRouteMode::Replicated) {
+            return Err(invalid(
+                "sigmoid MoE prefill requires replicated route authority",
+            ));
+        }
     }
     let total_slots = params
         .batch_size
         .checked_mul(params.k_top)
         .ok_or_else(|| invalid("prefill route slot count overflows"))?;
+    let hidden = params.gate_up_k;
+    let batch_hidden = params
+        .batch_size
+        .checked_mul(hidden)
+        .ok_or_else(|| invalid("prefill hidden capacity overflows"))?;
     validate_grouped_m_total_max(total_slots, params.n_exp, params.m_total_max)?;
+    validate_normalization(&params.prelude.normalization, hidden, batch_hidden)?;
+    validate_shared_prefill(params, hidden)?;
+    validate_weight_ref(
+        &params.prelude.router,
+        params.n_exp,
+        hidden,
+        "prefill router weight",
+    )?;
+    let score_shape = [params.batch_size, params.n_exp];
+    let score_elements = params
+        .batch_size
+        .checked_mul(params.n_exp)
+        .ok_or_else(|| invalid("prefill router score capacity overflows"))?;
+    require_elements(
+        params.prelude.router_logits,
+        score_elements,
+        "prefill router logits",
+    )?;
+    if params.prelude.router_scores.shape.as_slice() != score_shape {
+        return Err(invalid(format!(
+            "prefill router scores shape {:?} must be [{}, {}]",
+            params.prelude.router_scores.shape, params.batch_size, params.n_exp
+        )));
+    }
+    require_elements(
+        params.prelude.router_scores,
+        score_elements,
+        "prefill router scores",
+    )?;
+    match params.prelude.q8_router_policy {
+        MoeQ8RouterPolicy::DispatcherEntry => {}
+        MoeQ8RouterPolicy::FreshFp16Wmma { scratch, .. } => {
+            if params.prelude.router.dtype != DType::Q8_0 {
+                return Err(invalid(
+                    "fresh FP16 router projection is only valid for Q8 router weights",
+                ));
+            }
+            require_elements(
+                scratch,
+                params
+                    .batch_size
+                    .checked_mul(params.prelude.router.k)
+                    .ok_or_else(|| invalid("fresh router scratch capacity overflows"))?,
+                "fresh router FP16 scratch",
+            )?;
+        }
+    }
     validate_expert_shape_and_dtype(
         experts,
         params.n_exp,
@@ -2423,6 +3208,7 @@ fn validate_prefill(
         params.expert_down_ptrs,
         params.expert_down_awq_ptrs,
         params.expert_dtype_tags,
+        None,
     )?;
     validate_dtype_tag_table(
         params.expert_dtype_tags,
@@ -2434,7 +3220,13 @@ fn validate_prefill(
     if let Some(table) = params.expert_down_awq_ptrs {
         validate_pointer_table(table, params.n_exp, "prefill down AWQ")?;
     }
-    require_elements(params.topk_indices, total_slots, "prefill top-k indices")?;
+    require_bytes(
+        params.topk_indices,
+        total_slots
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill top-k index capacity overflows"))?,
+        "prefill top-k indices",
+    )?;
     require_elements(params.topk_weights, total_slots, "prefill top-k weights")?;
     require_elements(
         params.x_batch,
@@ -2446,18 +3238,12 @@ fn validate_prefill(
     )?;
     require_elements(
         params.x_norm_batch,
-        params
-            .batch_size
-            .checked_mul(params.gate_up_k)
-            .ok_or_else(|| invalid("prefill norm capacity overflows"))?,
+        batch_hidden,
         "prefill normalized activation",
     )?;
     require_elements(
         params.x_rot_batch,
-        params
-            .batch_size
-            .checked_mul(params.gate_up_k)
-            .ok_or_else(|| invalid("prefill rotated activation capacity overflows"))?,
+        batch_hidden,
         "prefill rotated activation",
     )?;
     let gate_capacity = total_slots
@@ -2473,35 +3259,44 @@ fn validate_prefill(
             .ok_or_else(|| invalid("prefill expanded down capacity overflows"))?,
         "prefill expanded down",
     )?;
-    require_elements(
+    require_bytes(
         params.expert_token_counts,
-        params.n_exp,
+        params
+            .n_exp
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill expert count capacity overflows"))?,
         "prefill expert token counts",
     )?;
-    require_elements(
+    require_bytes(
         params.expert_offsets,
         params
             .n_exp
             .checked_add(1)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
             .ok_or_else(|| invalid("prefill expert offset capacity overflows"))?,
         "prefill expert offsets",
     )?;
-    require_elements(
+    require_bytes(
         params.sorted_slot_index,
-        params.m_total_max,
+        params
+            .m_total_max
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill sorted slot capacity overflows"))?,
         "prefill sorted slots",
     )?;
     let expert_tile_bytes = (params.m_total_max / GROUPED_BLOCK_M)
         .checked_mul(std::mem::size_of::<u32>())
         .ok_or_else(|| invalid("prefill expert tile capacity overflows"))?;
-    require_elements(
+    require_bytes(
         params.expert_tile_ids,
         expert_tile_bytes,
         "prefill expert tiles",
     )?;
-    require_elements(
+    require_bytes(
         params.inverse_perm,
-        total_slots,
+        total_slots
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid("prefill inverse permutation capacity overflows"))?,
         "prefill inverse permutation",
     )?;
     require_elements(
@@ -2633,6 +3428,7 @@ fn validate_expert_shape_and_dtype(
         )));
     }
     let expected_basis = dtype_rotation_plan(representative_gate_up);
+    let expected_down_basis = dtype_rotation_plan(representative_down);
     if mixed {
         if per_gate_up.map_or(true, |values| values.len() != n_experts)
             || per_down.map_or(true, |values| values.len() != n_experts)
@@ -2731,9 +3527,9 @@ fn validate_expert_shape_and_dtype(
                 "expert {index} down dtype differs from the declared source metadata"
             )));
         }
-        if dtype_rotation_plan(down.dtype()) != expected_basis {
+        if dtype_rotation_plan(down.dtype()) != expected_down_basis {
             return Err(invalid(format!(
-                "expert {index} down rotation basis differs from the activation basis"
+                "expert {index} down rotation basis differs from its declared down dtype"
             )));
         }
         validate_logical_shape(down.shape(), down_rows, down_cols, "down", index)?;
@@ -3229,6 +4025,7 @@ fn validate_live_binding(
     down_ptrs: &GpuTensor,
     down_awq_ptrs: Option<&GpuTensor>,
     dtype_tags: Option<&GpuTensor>,
+    host_entries: Option<MoePointerEntries<'_>>,
 ) -> Result<(), DispatchError> {
     let Some(live) = experts.cache.live.as_ref() else {
         return Err(invalid("expert binding cache has no live resource binding"));
@@ -3265,6 +4062,33 @@ fn validate_live_binding(
     live.gate_up_ptrs
         .matches(gate_up_ptrs, "gate/up pointer table")?;
     live.down_ptrs.matches(down_ptrs, "down pointer table")?;
+    // Table *contents*, not just the table tensor: a replay dereferences these
+    // entries without re-uploading them, so each entry must point at the live
+    // expert tensor it claims to name. Mirrors the compact path's check.
+    if let Some(entries) = host_entries {
+        if entries.gate_up.len() != live.experts.len() || entries.down.len() != live.experts.len() {
+            return Err(invalid(format!(
+                "expert pointer entries cover {} gate/up and {} down, expected {}",
+                entries.gate_up.len(),
+                entries.down.len(),
+                live.experts.len()
+            )));
+        }
+        for (index, (expected_gate_up, expected_down)) in live.experts.iter().enumerate() {
+            if entries.gate_up[index] != expected_gate_up.buffer.ptr {
+                return Err(invalid(format!(
+                    "expert {index} gate/up table entry {:x} does not point at its live tensor {:x}",
+                    entries.gate_up[index], expected_gate_up.buffer.ptr
+                )));
+            }
+            if entries.down[index] != expected_down.buffer.ptr {
+                return Err(invalid(format!(
+                    "expert {index} down table entry {:x} does not point at its live tensor {:x}",
+                    entries.down[index], expected_down.buffer.ptr
+                )));
+            }
+        }
+    }
     match (&live.down_awq_ptrs, down_awq_ptrs) {
         (Some(expected), Some(actual)) => expected.matches(actual, "down AWQ pointer table")?,
         (None, None) => {}
@@ -3422,6 +4246,18 @@ fn validate_expert_records(records: &[ExpertMetadata]) -> Result<(), DispatchErr
     Ok(())
 }
 
+fn expected_quant_row_stride(dtype: DType, columns: usize) -> Option<usize> {
+    let (group_bytes, group_width) = match dtype {
+        DType::MQ4G256V2 => (136usize, 256usize),
+        DType::MQ4G128V2 => (68usize, 128usize),
+        _ => return None,
+    };
+    columns
+        .checked_add(group_width - 1)
+        .and_then(|rounded| rounded.checked_div(group_width))
+        .and_then(|groups| groups.checked_mul(group_bytes))
+}
+
 fn validate_resource_header(
     source_name: &str,
     source_fingerprint: &str,
@@ -3462,6 +4298,14 @@ fn validate_resource_header(
             dtype,
             dtype_rotation_plan(dtype)
         )));
+    }
+    if let Some(expected) = expected_quant_row_stride(dtype, shape.last().copied().unwrap_or(0)) {
+        if row_stride != expected {
+            return Err(invalid(format!(
+                "expert source '{source_name}' row_stride {row_stride} does not match {:?} geometry {expected}",
+                dtype
+            )));
+        }
     }
     let rows = checked_product(&shape[..shape.len() - 1], "expert source row count")?;
     let minimum = rows
@@ -3536,6 +4380,16 @@ fn require_elements(tensor: &GpuTensor, required: usize, name: &str) -> Result<(
     if capacity < required {
         return Err(invalid(format!(
             "{name} capacity {capacity} is below required {required}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_bytes(tensor: &GpuTensor, required: usize, name: &str) -> Result<(), DispatchError> {
+    let capacity = tensor_capacity_bytes(tensor)?;
+    if capacity < required {
+        return Err(invalid(format!(
+            "{name} byte capacity {capacity} is below required {required}"
         )));
     }
     Ok(())
@@ -3735,14 +4589,16 @@ mod tests {
 
     fn resource(name: &str, dtype: DType, shape: &[usize]) -> ExpertResource {
         let rows = shape[..shape.len() - 1].iter().product::<usize>();
-        let bytes = rows * shape[shape.len() - 1];
+        let columns = shape[shape.len() - 1];
+        let row_stride = expected_quant_row_stride(dtype, columns).unwrap_or(columns);
+        let bytes = rows * row_stride;
         ExpertResource::new(
             name,
             "fixture-fingerprint",
             shape.to_vec(),
             dtype,
             bytes,
-            shape[shape.len() - 1],
+            row_stride,
             16,
             dtype_rotation_plan(dtype),
         )
@@ -3787,6 +4643,7 @@ mod tests {
             &fixture.down_ptrs,
             None,
             None,
+            None,
         )
         .is_err());
     }
@@ -3806,6 +4663,7 @@ mod tests {
             &fixture.down_ptrs,
             None,
             None,
+            None,
         )
         .is_err());
     }
@@ -3823,6 +4681,7 @@ mod tests {
                 Some(&fixture.routed),
                 &fixture.gate_up_ptrs,
                 &fixture.down_ptrs,
+                None,
                 None,
                 None,
             )
@@ -3850,7 +4709,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_dtype_with_common_basis_is_admitted_and_basis_mismatch_is_rejected() {
+    fn mixed_dtypes_allow_an_independent_down_basis_but_gate_up_basis_must_match() {
         let records = vec![
             ExpertMetadata::new(
                 0,
@@ -3877,24 +4736,125 @@ mod tests {
         ];
         let table = ExpertTable::new(records).unwrap();
         assert_eq!(table.n_experts(), 2);
-        let bad = ExpertResource::new(
-            "bad",
-            "fp:bad",
-            vec![8, 4],
-            DType::F32,
-            32,
+
+        // Qwen4 deliberately uses FWHT-G256 gate/up and FWHT-G128 down.  The
+        // down basis is independent, while gate/up remains one common basis.
+        let qwen_table = ExpertTable::new(vec![ExpertMetadata::new(
+            0,
+            0,
+            0,
+            ExpertResources::fused(
+                resource("qwen_gate_up", DType::MQ4G256V2, &[8, 4]),
+                resource("qwen_down", DType::MQ4G128V2, &[4, 4]),
+            )
+            .unwrap(),
+        )
+        .unwrap()])
+        .unwrap();
+        let mut cache = qwen_table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&qwen_table, 0x90_0000);
+        bind_fixture(&qwen_table, &mut cache, &fixture);
+        let bound = BoundMoeExperts::from_cache(&qwen_table, &cache).unwrap();
+        validate_expert_shape_and_dtype(
+            &bound,
+            1,
+            8,
             4,
-            16,
-            RotationPlan::None,
+            4,
+            4,
+            DType::MQ4G256V2,
+            DType::MQ4G128V2,
+            false,
+            None,
+            None,
         )
         .unwrap();
-        let bad_record = ExpertMetadata::new(
-            0,
-            0,
-            0,
-            ExpertResources::fused(bad, resource("bad_dn", DType::MQ4G256, &[4, 4])).unwrap(),
+
+        let bad_gate = resource("bad_gate", DType::F32, &[4, 4]);
+        let bad_up = resource("bad_up", DType::MQ4G256, &[4, 4]);
+        let bad_down = resource("bad_down", DType::MQ4G256, &[4, 4]);
+        assert!(
+            ExpertMetadata::new(
+                0,
+                0,
+                0,
+                ExpertResources::separate(bad_gate, bad_up, bad_down).unwrap(),
+            )
+            .is_err(),
+            "separate gate/up sources with different bases must be rejected"
         );
-        assert!(bad_record.is_err());
+    }
+
+    #[test]
+    fn qt53_resource_header_requires_exact_stride_extent_and_mixed_tag_capacity() {
+        let qt53 = resource("qt53", DType::MQ4G128V2, &[3, 129]);
+        assert_eq!(qt53.row_stride(), 136);
+        assert_eq!(qt53.encoded_bytes(), 3 * 136);
+
+        assert!(ExpertResource::new(
+            "qt53_bad_stride",
+            "fixture-fingerprint",
+            vec![3, 129],
+            DType::MQ4G128V2,
+            3 * 136,
+            68,
+            16,
+            dtype_rotation_plan(DType::MQ4G128V2),
+        )
+        .is_err());
+        assert!(ExpertResource::new(
+            "qt53_short_extent",
+            "fixture-fingerprint",
+            vec![3, 129],
+            DType::MQ4G128V2,
+            3 * 136 - 1,
+            136,
+            16,
+            dtype_rotation_plan(DType::MQ4G128V2),
+        )
+        .is_err());
+
+        let tags = live_tensor(0xa0_0000, 3, &[3], DType::Raw);
+        assert!(validate_dtype_tag_table(Some(&tags), 3, true).is_ok());
+        assert!(validate_dtype_tag_table(None, 3, true).is_err());
+        assert!(validate_dtype_tag_table(Some(&tags), 3, false).is_err());
+        let short_tags = live_tensor(0xa0_1000, 2, &[2], DType::Raw);
+        assert!(validate_dtype_tag_table(Some(&short_tags), 3, true).is_err());
+    }
+
+    #[test]
+    fn binding_identity_rejects_invalid_rank_and_device_before_launch() {
+        let table = table(2, DType::MQ4G256);
+        assert!(table.prepare_binding(0, 0, 0).is_err());
+        assert!(table.prepare_binding(1, 1, 0).is_err());
+        assert!(table.prepare_binding(0, 1, -1).is_err());
+    }
+
+    #[test]
+    fn decode_shared_policy_is_explicit_and_launch_free() {
+        assert_eq!(
+            resolve_decode_grammar(MoeEpMode::None, false, false, false, 0, 1).unwrap(),
+            (MoeContribution::Residual, MoeSharedContribution::None)
+        );
+        assert_eq!(
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, false, false, 0, 2,)
+                .unwrap(),
+            (
+                MoeContribution::ZeroedPartial,
+                MoeSharedContribution::RootPartial
+            )
+        );
+        assert_eq!(
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, true, false, 1, 2,).unwrap(),
+            (MoeContribution::ZeroedPartial, MoeSharedContribution::None)
+        );
+        assert!(
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, true, true, false, 0, 2,).is_err()
+        );
+        assert!(
+            resolve_decode_grammar(MoeEpMode::RootRoutedPartial, false, false, false, 0, 2,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -4005,9 +4965,10 @@ mod tests {
     }
 
     #[test]
-    fn route_receipt_rejects_another_invocation() {
+    fn route_receipt_rejects_another_invocation_and_buffer_pair() {
         let indices = GpuTensor::null_for_test();
         let weights = GpuTensor::null_for_test();
+        let other_indices = GpuTensor::null_for_test();
         let expected = MoeRouteReceipt {
             invocation: 17,
             protocol: MoeProtocol::GroupedPrefill,
@@ -4033,6 +4994,13 @@ mod tests {
             adopted_from: None,
         };
         assert!(validate_route_receipt_pair(&expected, &other_invocation).is_err());
+        let wrong_buffers = MoeRouteReceipt {
+            invocation: expected.invocation,
+            indices: &other_indices,
+            ..expected
+        };
+        let error = validate_route_receipt_pair(&expected, &wrong_buffers).unwrap_err();
+        assert!(format!("{error:?}").contains("buffers"), "{error:?}");
     }
 
     fn ep_table(n: usize, rank_count: usize, dtype: DType) -> ExpertTable {
@@ -4636,6 +5604,22 @@ mod tests {
             awq_scale: None,
         }
     }
+    fn shaped_weight<'a>(
+        buf: &'a GpuTensor,
+        dtype: DType,
+        m: usize,
+        k: usize,
+    ) -> crate::families::gemv::WeightRef<'a> {
+        crate::families::gemv::WeightRef {
+            buf,
+            dtype,
+            m,
+            k,
+            row_stride: k,
+            rotation: None,
+            awq_scale: None,
+        }
+    }
 
     /// Minimal Single decode params for the public-router rejection path.
     /// All fields beyond layer/k are placeholders; the router gate fires
@@ -4654,10 +5638,12 @@ mod tests {
         MoeParams {
             dtypes: crate::families::moe::MoeDtypes {
                 router: DType::MQ4G256,
-                shared_gate: DType::MQ4G256,
-                shared_expert_gate: DType::MQ4G256,
-                shared_expert_up: DType::MQ4G256,
-                shared_expert_down: DType::MQ4G256,
+                shared: Some(crate::families::moe::MoeSharedDtypes {
+                    selector: DType::MQ4G256,
+                    gate: DType::MQ4G256,
+                    up: DType::MQ4G256,
+                    down: DType::MQ4G256,
+                }),
                 experts_all_gate_up_mq4: true,
                 routed_gate_up: DType::MQ4G256,
                 routed_down: DType::MQ4G256,
@@ -4666,10 +5652,15 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
+            route_policy: None,
+            normalization: crate::families::moe::MoeNormalization::Provided,
             batch_size: 1,
             hidden: 4,
             mi: 4,
-            smi: 4,
             k,
             n_exp,
             norm_topk_prob: false,
@@ -4682,12 +5673,21 @@ mod tests {
             routed_out: None,
             skip_shared: false,
             router: wr,
-            shared_expert_gate: dummy_weight(dummy),
-            shared_gate_w: dummy_weight(dummy),
-            shared_up_w: dummy_weight(dummy),
-            shared_down_w: dummy_weight(dummy),
+            shared: Some(crate::families::moe::MoeSharedDecode {
+                weights: crate::families::moe::MoeSharedWeights {
+                    selector: dummy_weight(dummy),
+                    gate: dummy_weight(dummy),
+                    up: dummy_weight(dummy),
+                    down: dummy_weight(dummy),
+                },
+                intermediate: 4,
+                scalar: dummy,
+                gate_out: dummy,
+                up_out: dummy,
+            }),
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_ptrs_host: None,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             routed_gate_up_k: 4,
@@ -4697,11 +5697,8 @@ mod tests {
             routed_gate_up_paro: None,
             routed_down_paro: None,
             router_logits: dummy,
-            scalar_buf: dummy,
             x_rot_local: dummy,
             gate_up_buf: dummy,
-            gate_buf: dummy,
-            up_buf: dummy,
             ffn_hidden: dummy,
             ffn_out: dummy,
             gate_batch: dummy,
@@ -4776,6 +5773,9 @@ mod tests {
     fn f32_elems(base: usize, elems: usize) -> GpuTensor {
         live_tensor(base, elems * 4, &[elems], DType::F32)
     }
+    fn f32_matrix(base: usize, rows: usize, cols: usize) -> GpuTensor {
+        live_tensor(base, rows * cols * 4, &[rows, cols], DType::F32)
+    }
 
     /// Sized decode scratch for hidden=4/mi=4/smi=4/k=8. Backing pointers are
     /// fake but capacities are exact, so `validate_decode` admits them.
@@ -4801,7 +5801,7 @@ mod tests {
     }
     fn decode_scratch(base: usize) -> DecodeScratch {
         DecodeScratch {
-            backing: f32_elems(base, 1),
+            backing: f32_elems(base, 64),
             x_norm: f32_elems(base + 0x100, 4),
             x_residual: f32_elems(base + 0x200, 4),
             partial: f32_elems(base + 0x300, 4),
@@ -4841,10 +5841,12 @@ mod tests {
         MoeParams {
             dtypes: crate::families::moe::MoeDtypes {
                 router: DType::MQ4G256,
-                shared_gate: DType::MQ4G256,
-                shared_expert_gate: DType::MQ4G256,
-                shared_expert_up: DType::MQ4G256,
-                shared_expert_down: DType::MQ4G256,
+                shared: Some(crate::families::moe::MoeSharedDtypes {
+                    selector: DType::MQ4G256,
+                    gate: DType::MQ4G256,
+                    up: DType::MQ4G256,
+                    down: DType::MQ4G256,
+                }),
                 experts_all_gate_up_mq4: true,
                 routed_gate_up: DType::MQ4G256,
                 routed_down: DType::MQ4G256,
@@ -4853,10 +5855,27 @@ mod tests {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
+            route_policy: None,
+            normalization: crate::families::moe::MoeNormalization::Provided,
             batch_size: 1,
             hidden: 4,
             mi: 4,
-            smi: 4,
+            shared: Some(crate::families::moe::MoeSharedDecode {
+                weights: crate::families::moe::MoeSharedWeights {
+                    selector: shaped_weight(&s.backing, DType::MQ4G256, 1, 4),
+                    gate: shaped_weight(&s.backing, DType::MQ4G256, 4, 4),
+                    up: shaped_weight(&s.backing, DType::MQ4G256, 4, 4),
+                    down: shaped_weight(&s.backing, DType::MQ4G256, 4, 4),
+                },
+                intermediate: 4,
+                scalar: &s.scalar_buf,
+                gate_out: &s.gate_buf,
+                up_out: &s.up_buf,
+            }),
             k,
             n_exp,
             norm_topk_prob: false,
@@ -4868,13 +5887,10 @@ mod tests {
             x_residual: &s.x_residual,
             routed_out: partial,
             skip_shared,
-            router: dummy_weight(&s.backing),
-            shared_expert_gate: dummy_weight(&s.backing),
-            shared_gate_w: dummy_weight(&s.backing),
-            shared_up_w: dummy_weight(&s.backing),
-            shared_down_w: dummy_weight(&s.backing),
+            router: shaped_weight(&s.backing, DType::MQ4G256, n_exp, 4),
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_ptrs_host: None,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             routed_gate_up_k: 4,
@@ -4884,11 +5900,8 @@ mod tests {
             routed_gate_up_paro: None,
             routed_down_paro: None,
             router_logits: &s.router_logits,
-            scalar_buf: &s.scalar_buf,
             x_rot_local: &s.x_rot_local,
             gate_up_buf: &s.gate_up_buf,
-            gate_buf: &s.gate_buf,
-            up_buf: &s.up_buf,
             ffn_hidden: &s.ffn_hidden,
             ffn_out: &s.ffn_out,
             gate_batch: &s.gate_batch,
@@ -4920,7 +5933,7 @@ mod tests {
             2,
             MoeEpMode::None,
         );
-        let err = seal_decode_with_router(
+        let _err = seal_decode_with_router(
             experts,
             &ctx,
             params,
@@ -4928,10 +5941,91 @@ mod tests {
         )
         .err()
         .expect("public PrecomputedSoftmaxTopK must not seal");
-        let msg = format!("{err:?}");
+    }
+
+    #[test]
+    #[cfg(feature = "deltanet")]
+    fn sigmoid_decode_binds_without_shared_resources_and_rejects_ep_or_wrong_k() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe};
+        let table = table(8, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x91_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x92_0000);
+        let params = |k, ep_mode| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                k,
+                8,
+                ep_mode,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params
+        };
+        let call = seal_decode(experts, &ctx, params(8, MoeEpMode::None)).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+        assert_eq!(call.shared_contribution(), MoeSharedContribution::None);
+
+        let error = seal_decode(experts, &ctx, params(7, MoeEpMode::None))
+            .err()
+            .expect("sigmoid k != 8 must fail");
+        assert!(format!("{error:?}").contains("k=8"), "{error:?}");
+        let error = seal_decode(experts, &ctx, params(8, MoeEpMode::RootRoutedPartial))
+            .err()
+            .expect("sigmoid EP must fail");
         assert!(
-            msg.contains("seal_ep_routed_contrib") || msg.contains("SoftmaxTopK"),
-            "{msg}"
+            format!("{error:?}").contains("expert-parallel"),
+            "{error:?}"
+        );
+        let wrong_ctx = DispatchCtx::for_test_device("gfx1151", 1);
+        let error = seal_decode(experts, &wrong_ctx, params(8, MoeEpMode::None))
+            .err()
+            .expect("otherwise-valid binding must reject a different dispatch device");
+        assert!(format!("{error:?}").contains("context device"), "{error:?}");
+    }
+
+    #[cfg(not(feature = "deltanet"))]
+    #[test]
+    fn sigmoid_decode_refuses_before_publication_without_deltanet() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe};
+        let table = table(8, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x93_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x94_0000);
+        let mut params = ep_decode_params(
+            &scratch,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            0,
+            8,
+            8,
+            MoeEpMode::None,
+            None,
+            false,
+        );
+        params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+        params.shared = None;
+        params.dtypes.shared = None;
+        let error = seal_decode(experts, &ctx, params)
+            .err()
+            .expect("sigmoid recipe must not seal without deltanet");
+        assert!(
+            format!("{error:?}").contains("sigmoid-recipe-requires-deltanet"),
+            "{error:?}"
         );
     }
     /// Rank-0/root fixtures for the routed-contrib tests: plan-bound table
@@ -4984,7 +6078,8 @@ mod tests {
     fn routed_contrib_seal_binds_proof_to_nonroot_call() {
         let root_fx = root_fixtures();
         let nonroot_fx = nonroot_fixtures(&root_fx.table);
-        let ctx = DispatchCtx::for_test("gfx1200");
+        let ctx_root = DispatchCtx::for_test_device("gfx1200", 3);
+        let ctx_nonroot = DispatchCtx::for_test_device("gfx1200", 5);
         // Root seals the full routing call: zeroed partial, shared once.
         let root = BoundMoeExperts::from_cache(&root_fx.table, &root_fx.cache0).unwrap();
         let routed0 = compact_routed(&root_fx.table, &root_fx.fix0, DType::MQ4G256);
@@ -5000,7 +6095,7 @@ mod tests {
             Some(&root_fx.s0.partial),
             false,
         );
-        let root_call = seal_decode(root, &ctx, root_params).unwrap();
+        let root_call = seal_decode(root, &ctx_root, root_params).unwrap();
         assert_eq!(root_call.contribution(), MoeContribution::ZeroedPartial);
         assert_eq!(
             root_call.shared_contribution(),
@@ -5023,7 +6118,8 @@ mod tests {
             Some(&nonroot_fx.s1.partial),
             true,
         );
-        let contrib = seal_ep_routed_contrib(non_root, &ctx, contrib_params, &proof).unwrap();
+        let contrib =
+            seal_ep_routed_contrib(non_root, &ctx_nonroot, contrib_params, &proof).unwrap();
         assert_eq!(contrib.contribution(), MoeContribution::ZeroedPartial);
         assert_eq!(contrib.shared_contribution(), MoeSharedContribution::None);
     }
@@ -5032,13 +6128,14 @@ mod tests {
     fn routed_contrib_rejects_role_layer_contract_and_shape_mismatch() {
         let root_fx = root_fixtures();
         let nonroot_fx = nonroot_fixtures(&root_fx.table);
-        let ctx = DispatchCtx::for_test("gfx1200");
+        let ctx_root = DispatchCtx::for_test_device("gfx1200", 3);
+        let ctx_nonroot = DispatchCtx::for_test_device("gfx1200", 5);
         let root = BoundMoeExperts::from_cache(&root_fx.table, &root_fx.cache0).unwrap();
         let routed0 = compact_routed(&root_fx.table, &root_fx.fix0, DType::MQ4G256);
         let s0 = &root_fx.s0;
         let root_call = seal_decode(
             root,
-            &ctx,
+            &ctx_root,
             ep_decode_params(
                 s0,
                 &routed0,
@@ -5072,21 +6169,21 @@ mod tests {
             )
         };
         // Contrib on the root rank never seals.
-        let err = seal_ep_routed_contrib(root, &ctx, params(3, 8, 8), &proof)
+        let err = seal_ep_routed_contrib(root, &ctx_root, params(3, 8, 8), &proof)
             .err()
             .expect("root-rank contrib must not seal");
         assert!(format!("{err:?}").contains("non-root"), "{err:?}");
         // params.layer_idx disagreeing with the proof/contract layer.
-        let err = seal_ep_routed_contrib(non_root, &ctx, params(7, 8, 8), &proof)
+        let err = seal_ep_routed_contrib(non_root, &ctx_nonroot, params(7, 8, 8), &proof)
             .err()
             .expect("layer mismatch must not seal");
         assert!(format!("{err:?}").contains("layer"), "{err:?}");
         // Route width and expert count bound to the proof.
-        let err = seal_ep_routed_contrib(non_root, &ctx, params(3, 4, 8), &proof)
+        let err = seal_ep_routed_contrib(non_root, &ctx_nonroot, params(3, 4, 8), &proof)
             .err()
             .expect("k mismatch must not seal");
         assert!(format!("{err:?}").contains("covers"), "{err:?}");
-        let err = seal_ep_routed_contrib(non_root, &ctx, params(3, 8, 7), &proof)
+        let err = seal_ep_routed_contrib(non_root, &ctx_nonroot, params(3, 8, 7), &proof)
             .err()
             .expect("n_exp mismatch must not seal");
         assert!(format!("{err:?}").contains("covers"), "{err:?}");
@@ -5098,7 +6195,7 @@ mod tests {
             k: 8,
             n_exp: 8,
         };
-        let err = seal_ep_routed_contrib(non_root, &ctx, params(3, 8, 8), &forged)
+        let err = seal_ep_routed_contrib(non_root, &ctx_nonroot, params(3, 8, 8), &forged)
             .err()
             .expect("contract mismatch must not seal");
         assert!(format!("{err:?}").contains("contract"), "{err:?}");
@@ -5115,7 +6212,7 @@ mod tests {
             None,
             false,
         );
-        let err = seal_ep_routed_contrib(non_root, &ctx, single_mode, &proof)
+        let err = seal_ep_routed_contrib(non_root, &ctx_nonroot, single_mode, &proof)
             .err()
             .expect("Single-mode contrib must not seal");
         assert!(format!("{err:?}").contains("RootRoutedPartial"), "{err:?}");
@@ -5124,7 +6221,8 @@ mod tests {
     #[test]
     fn route_producer_proof_rejects_non_root_calls() {
         let root_fx = root_fixtures();
-        let ctx = DispatchCtx::for_test("gfx1200");
+        let ctx_single = DispatchCtx::for_test_device("gfx1200", 0);
+        let ctx_root = DispatchCtx::for_test_device("gfx1200", 3);
         let plan_table = table(2, DType::MQ4G256);
         let mut cache = plan_table.prepare_binding(0, 1, 0).unwrap();
         let fixture = live_fixture(&plan_table, 0xE0_0000);
@@ -5133,7 +6231,7 @@ mod tests {
         let s_single = decode_scratch(0xE1_0000);
         let single_call = seal_decode(
             single,
-            &ctx,
+            &ctx_single,
             ep_decode_params(
                 &s_single,
                 &fixture.routed,
@@ -5161,7 +6259,7 @@ mod tests {
         let s0 = &root_fx.s0;
         let call = seal_decode(
             root,
-            &ctx,
+            &ctx_root,
             ep_decode_params(
                 s0,
                 &routed0,
@@ -5186,6 +6284,13 @@ mod tests {
     /// mi=down_m=down_k=gate_up_k=4. Backing pointers are fake but every
     /// shape product meets `validate_prefill`.
     struct PrefillScratch {
+        router_logits: GpuTensor,
+        router_scores: GpuTensor,
+        shared_scalar: GpuTensor,
+        shared_gate: GpuTensor,
+        shared_up: GpuTensor,
+        shared_rotated: GpuTensor,
+        route_slot: std::cell::Cell<Option<MoePrefillRouteProducerProof>>,
         topk_indices: GpuTensor,
         topk_weights: GpuTensor,
         x_batch: GpuTensor,
@@ -5209,6 +6314,13 @@ mod tests {
     fn prefill_scratch(base: usize) -> PrefillScratch {
         let m_total_max = checked_grouped_m_total_bound(4, 4, GROUPED_BLOCK_M).unwrap();
         PrefillScratch {
+            router_logits: f32_matrix(base + 0x1100, 2, 4),
+            router_scores: f32_matrix(base + 0x1200, 2, 4),
+            shared_scalar: f32_elems(base + 0x1300, 2),
+            shared_gate: f32_elems(base + 0x1400, 8),
+            shared_up: f32_elems(base + 0x1500, 8),
+            shared_rotated: f32_elems(base + 0x1600, 8),
+            route_slot: std::cell::Cell::new(None),
             topk_indices: f32_elems(base, 4),
             topk_weights: f32_elems(base + 0x100, 4),
             x_batch: f32_elems(base + 0x200, 8),
@@ -5243,10 +6355,12 @@ mod tests {
         MoePrefillParams {
             dtypes: crate::families::moe::MoeDtypes {
                 router: DType::MQ4G256,
-                shared_gate: DType::MQ4G256,
-                shared_expert_gate: DType::MQ4G256,
-                shared_expert_up: DType::MQ4G256,
-                shared_expert_down: DType::MQ4G256,
+                shared: Some(crate::families::moe::MoeSharedDtypes {
+                    selector: DType::MQ4G256,
+                    gate: DType::MQ4G256,
+                    up: DType::MQ4G256,
+                    down: DType::MQ4G256,
+                }),
                 experts_all_gate_up_mq4: true,
                 routed_gate_up: DType::MQ4G256,
                 routed_down: DType::MQ4G256,
@@ -5254,6 +6368,39 @@ mod tests {
                 has_paro_shared: false,
                 per_expert_gate_up: None,
                 per_expert_down: None,
+            },
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: false,
+                shared_after_combine: false,
+            },
+            route_policy: None,
+            prelude: crate::families::moe::MoePrefillPrelude {
+                normalization: crate::families::moe::MoeNormalization::RmsNorm {
+                    weight: &s.x_norm_batch,
+                    plain_out: &s.x_norm_batch,
+                    eps: 1e-5,
+                },
+                router: shaped_weight(&s.y_gate_up_grouped, DType::Q8_0, 4, 4),
+                router_logits: &s.router_logits,
+                router_scores: &s.router_scores,
+                norm_topk_prob: false,
+                route: PrefillRouteMode::ProduceRoot {
+                    slot: &s.route_slot,
+                },
+                shared: Some(crate::families::moe::MoeSharedPrefill {
+                    weights: crate::families::moe::MoeSharedWeights {
+                        selector: shaped_weight(&s.y_down_grouped, DType::MQ4G256, 1, 4),
+                        gate: shaped_weight(&s.gate_batch, DType::MQ4G256, 4, 4),
+                        up: shaped_weight(&s.up_batch, DType::MQ4G256, 4, 4),
+                        down: shaped_weight(&s.down_expanded, DType::MQ4G256, 4, 4),
+                    },
+                    intermediate: 4,
+                    scalar: &s.shared_scalar,
+                    gate_out: &s.shared_gate,
+                    up_out: &s.shared_up,
+                    rotated: &s.shared_rotated,
+                }),
+                q8_router_policy: crate::families::moe::MoeQ8RouterPolicy::DispatcherEntry,
             },
             batch_size: 2,
             mi: 4,
@@ -5308,7 +6455,7 @@ mod tests {
     fn prefill_ep_seal_admits_compact_partial_only() {
         let (plan_table, cache, fixture) = ep_prefill_table();
         let experts = BoundMoeExperts::from_cache(&plan_table, &cache).unwrap();
-        let ctx = DispatchCtx::for_test("gfx1200");
+        let ctx = DispatchCtx::for_test_device("gfx1200", 5);
         let routed = compact_routed(&plan_table, &fixture, DType::MQ4G256);
         let s = prefill_scratch(0xE0_0000);
         // Compact + zeroed partial seals: routed into the partial, shared
@@ -5345,9 +6492,10 @@ mod tests {
         let single_fixture = live_fixture(&single_table, 0xE2_0000);
         bind_fixture(&single_table, &mut single_cache, &single_fixture);
         let single = BoundMoeExperts::from_cache(&single_table, &single_cache).unwrap();
+        let single_ctx = DispatchCtx::for_test_device("gfx1200", 0);
         let err = seal_prefill_ep(
             single,
-            &ctx,
+            &single_ctx,
             ep_prefill_params(
                 &s,
                 &single_fixture.routed,
@@ -5365,7 +6513,7 @@ mod tests {
     fn prefill_adopt_binds_nonroot_receipt_with_provenance() {
         let (plan_table, cache, fixture) = ep_prefill_table();
         let experts = BoundMoeExperts::from_cache(&plan_table, &cache).unwrap();
-        let ctx = DispatchCtx::for_test("gfx1200");
+        let ctx = DispatchCtx::for_test_device("gfx1200", 5);
         let routed = compact_routed(&plan_table, &fixture, DType::MQ4G256);
         let s = prefill_scratch(0xE2_0000);
         let mut call = seal_prefill_ep(
@@ -5394,7 +6542,13 @@ mod tests {
         // The adopted receipt attaches to its own call: same invocation,
         // same buffers, provenance carried alongside.
         call.attach_route_receipt(receipt).unwrap();
-        assert!(call.has_route_receipt());
+        assert!(call.attached_route_stamp().is_some());
+        let duplicate = adopt_prefill_route(&call, &proof).unwrap();
+        let error = call.attach_route_receipt(duplicate).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("already attached"),
+            "{error:?}"
+        );
         // Mismatched static contract, shape, or role never adopts.
         let bad_contract = MoePrefillRouteProducerProof {
             contract_id: contract_id.wrapping_add(1),
@@ -5420,64 +6574,77 @@ mod tests {
     }
 
     #[test]
-    fn prefill_proof_export_requires_root_produced_receipt() {
-        let (plan_table, cache, fixture) = ep_prefill_table();
-        let experts = BoundMoeExperts::from_cache(&plan_table, &cache).unwrap();
-        let ctx = DispatchCtx::for_test("gfx1200");
-        let routed = compact_routed(&plan_table, &fixture, DType::MQ4G256);
-        let s = prefill_scratch(0xE4_0000);
-        // Decode calls can never export a prefill proof: seal a Single
-        // decode call, then the export gate fires.
-        let single_table = table(2, DType::MQ4G256);
-        let mut single_cache = single_table.prepare_binding(0, 1, 0).unwrap();
-        let single_fixture = live_fixture(&single_table, 0xE5_0000);
-        bind_fixture(&single_table, &mut single_cache, &single_fixture);
-        let single = BoundMoeExperts::from_cache(&single_table, &single_cache).unwrap();
-        let ds = decode_scratch(0xE6_0000);
-        let decode_call = seal_decode(
-            single,
-            &ctx,
-            ep_decode_params(
-                &ds,
-                &single_fixture.routed,
-                &single_fixture.gate_up_ptrs,
-                &single_fixture.down_ptrs,
-                0,
-                2,
-                2,
-                crate::families::moe::MoeEpMode::None,
-                None,
-                false,
-            ),
-        )
-        .unwrap();
-        let err = decode_call
-            .prefill_route_producer_proof()
-            .err()
-            .expect("decode call must not export a prefill proof");
-        assert!(format!("{err:?}").contains("prefill"), "{err:?}");
-        // A non-root EP prefill call without a produced receipt exports
-        // nothing: only the root produces.
-        let call = seal_prefill_ep(
-            experts,
-            &ctx,
-            ep_prefill_params(
-                &s,
-                &routed,
-                &fixture.gate_up_ptrs,
-                &fixture.down_ptrs,
-                Some(&s.partial),
-            ),
-        )
-        .unwrap();
-        let err = call
-            .prefill_route_producer_proof()
-            .err()
-            .expect("non-root call must not export a prefill proof");
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("root rank") || msg.contains("produced route receipt"),
-            "{msg}"
-        );
+    fn route_receipt_binds_grammar_dimensions_and_buffers_without_gpu_work() {
+        let indices = GpuTensor::null_for_test();
+        let weights = GpuTensor::null_for_test();
+        let other_indices = GpuTensor::null_for_test();
+        let other_weights = GpuTensor::null_for_test();
+        let expected = MoeRouteReceipt {
+            invocation: 19,
+            protocol: MoeProtocol::GroupedPrefill,
+            router: MoeRouterInput::PrecomputedSoftmaxTopK,
+            n_experts: 4,
+            k_top: 2,
+            scores: 0,
+            normalized: false,
+            indices: &indices,
+            weights: &weights,
+            adopted_from: None,
+        };
+        let wrong_protocol = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: MoeProtocol::IndexedDecode,
+            router: expected.router,
+            n_experts: expected.n_experts,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: expected.indices,
+            weights: expected.weights,
+            adopted_from: None,
+        };
+        assert!(validate_route_receipt_pair(&expected, &wrong_protocol).is_err());
+
+        let wrong_router = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: expected.protocol,
+            router: MoeRouterInput::PrecomputedSigmoidTopK,
+            n_experts: expected.n_experts,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: expected.indices,
+            weights: expected.weights,
+            adopted_from: None,
+        };
+        assert!(validate_route_receipt_pair(&expected, &wrong_router).is_err());
+
+        let wrong_dimensions = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: expected.protocol,
+            router: expected.router,
+            n_experts: expected.n_experts + 1,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: expected.indices,
+            weights: expected.weights,
+            adopted_from: None,
+        };
+        assert!(validate_route_receipt_pair(&expected, &wrong_dimensions).is_err());
+
+        let swapped_buffers = MoeRouteReceipt {
+            invocation: expected.invocation,
+            protocol: expected.protocol,
+            router: expected.router,
+            n_experts: expected.n_experts,
+            k_top: expected.k_top,
+            scores: expected.scores,
+            normalized: expected.normalized,
+            indices: &other_indices,
+            weights: &other_weights,
+            adopted_from: None,
+        };
+        assert!(validate_route_receipt_pair(&expected, &swapped_buffers).is_err());
     }
 }

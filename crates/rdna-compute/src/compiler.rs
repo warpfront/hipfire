@@ -805,13 +805,12 @@ impl KernelCompiler {
         let legacy_obj = self.cache_dir.join(format!("{name}.hsaco"));
         let legacy_hash = self.cache_dir.join(format!("{name}.hash"));
         if pair_valid(&legacy_obj, &legacy_hash, &src_hash) {
-            let hit_path = if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true)
-                .is_ok()
-            {
-                obj_path
-            } else {
-                legacy_obj
-            };
+            let hit_path =
+                if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true).is_ok() {
+                    obj_path
+                } else {
+                    legacy_obj
+                };
             if let Some(dir) = self.writeback_dir() {
                 writeback_cold(name, &hit_path, &src_hash, dir, false);
             }
@@ -1858,13 +1857,16 @@ mod tests {
         let dest_path = dest.join(format!("{name}.hsaco"));
 
         // The reader owns its observations locally and returns them through
-        // the scoped join — no shared lock between the threads.
+        // the scoped join — no shared lock between the threads. It samples
+        // until it has seen the writer finish, and the read after that
+        // observation is guaranteed to see the final generation, so the test
+        // does not depend on how the two threads are scheduled.
         let (seen, missings) = std::thread::scope(|scope| {
             let reader = scope.spawn(move || {
                 let mut seen: Vec<Vec<u8>> = Vec::new();
                 let mut missings = 0;
-                let mut samples = 0;
-                while samples < 500 {
+                loop {
+                    let finished = reader_done.load(std::sync::atomic::Ordering::SeqCst);
                     match std::fs::read(&dest_path) {
                         Ok(bytes) => {
                             if !seen.contains(&bytes) {
@@ -1873,8 +1875,7 @@ mod tests {
                         }
                         Err(_) => missings += 1,
                     }
-                    samples += 1;
-                    if reader_done.load(std::sync::atomic::Ordering::SeqCst) && samples >= 100 {
+                    if finished {
                         break;
                     }
                 }

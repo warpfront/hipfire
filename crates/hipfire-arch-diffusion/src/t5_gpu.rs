@@ -861,6 +861,7 @@ impl<'a> TextGpu<'a> {
                 src_row_stride,
                 dst_row_stride,
                 dst_col_offset,
+                None,
             )
             .map_err(|e| format!("text gpu: copy_rows @col {dst_col_offset}: {e:?}"))
     }

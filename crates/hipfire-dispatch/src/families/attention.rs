@@ -670,10 +670,9 @@ fn dispatch_kv_write(
             ))
         }
         KernelKey::KvWriteQ8_0Batched => {
-            // S6-fa-prep-q8-pair: exact gfx1100 fold of the K+V pair into one
-            // launch. Bit-exact vs the two calls below (same per-block
-            // arithmetic and legacy single-arena addressing); every failed
-            // predicate and HIPFIRE_FA_BATCH_FUSE_OFF=1 keep the old path.
+            // S6-fa-prep-q8-pair is built with the DeltaNet feature that owns
+            // its rdna-compute launcher. Default dispatch builds retain the
+            // established two-launch path.
             let pos = io.positions();
             #[cfg(feature = "deltanet")]
             if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {

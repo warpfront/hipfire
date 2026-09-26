@@ -62,6 +62,10 @@ struct Case {
     label: &'static str,
     n_rows: usize,
     dst_row_stride: usize,
+    /// Destination elements beyond `n_rows * dst_row_stride`. A caller may
+    /// address a column offset past its own row pitch (row-absolute), in which
+    /// case only the extent check bounds the write.
+    dst_extra: usize,
     chunks: &'static [Chunk],
     /// True when every chunk is expected to take the float4 path — asserted,
     /// so a future wrapper change that silently drops the fast path is caught.
@@ -74,6 +78,7 @@ const CASES: &[Case] = &[
         label: "flux/single-block",
         n_rows: 4608,
         dst_row_stride: 15360,
+        dst_extra: 0,
         chunks: &[
             Chunk {
                 dcol: 0,
@@ -93,6 +98,7 @@ const CASES: &[Case] = &[
         label: "ragged/len-not-mult4",
         n_rows: 37,
         dst_row_stride: 251,
+        dst_extra: 0,
         chunks: &[
             Chunk {
                 dcol: 0,
@@ -112,6 +118,7 @@ const CASES: &[Case] = &[
         label: "n_rows=1",
         n_rows: 1,
         dst_row_stride: 15360,
+        dst_extra: 0,
         chunks: &[
             Chunk {
                 dcol: 0,
@@ -131,6 +138,7 @@ const CASES: &[Case] = &[
         label: "offset/dcol=128",
         n_rows: 512,
         dst_row_stride: 256,
+        dst_extra: 0,
         chunks: &[Chunk {
             dcol: 128,
             len: 64,
@@ -143,6 +151,7 @@ const CASES: &[Case] = &[
         label: "src-stride>len",
         n_rows: 300,
         dst_row_stride: 1024,
+        dst_extra: 0,
         chunks: &[Chunk {
             dcol: 512,
             len: 256,
@@ -155,12 +164,30 @@ const CASES: &[Case] = &[
         label: "ragged/tiny",
         n_rows: 3,
         dst_row_stride: 11,
+        dst_extra: 0,
         chunks: &[Chunk {
             dcol: 3,
             len: 5,
             src_row_stride: 7,
         }],
         expect_vec4: false,
+    },
+    // 7. Row-absolute column offset: `dcol + len` exceeds `dst_row_stride`, so
+    //    only the destination extent bounds the write. This is the Qwen4
+    //    index-key write (one row at position N into a capacity-sized cache);
+    //    the offset travels as a scalar so the retained tape keeps a
+    //    position-independent pointer.
+    Case {
+        label: "row-absolute/dcol=7*len",
+        n_rows: 1,
+        dst_row_stride: 128,
+        dst_extra: 1664,
+        chunks: &[Chunk {
+            dcol: 896,
+            len: 128,
+            src_row_stride: 128,
+        }],
+        expect_vec4: true,
     },
 ];
 
@@ -201,14 +228,12 @@ fn run_case(gpu: &mut Gpu, c: &Case) -> (usize, usize, usize, usize) {
 
     // Destinations pre-filled with the SAME non-zero pattern, so untouched
     // bytes are compared meaningfully (a stray write shows up as a mismatch).
-    let dst_n = c.n_rows * c.dst_row_stride;
+    let dst_n = c.n_rows * c.dst_row_stride + c.dst_extra;
     let fill = pseudo_random(dst_n, 0xDEAD_0000 ^ c.n_rows as u64);
-    let dst_ref = gpu
-        .upload_f32(&fill, &[c.n_rows, c.dst_row_stride])
-        .expect("upload dst_ref");
-    let dst_new = gpu
-        .upload_f32(&fill, &[c.n_rows, c.dst_row_stride])
-        .expect("upload dst_new");
+    // Allocated flat: the extent may exceed `n_rows * dst_row_stride` (a
+    // row-absolute column offset), and the wrapper's own bound is the extent.
+    let dst_ref = gpu.upload_f32(&fill, &[dst_n]).expect("upload dst_ref");
+    let dst_new = gpu.upload_f32(&fill, &[dst_n]).expect("upload dst_new");
     drop(fill);
 
     let pairs: Vec<(&Chunk, &GpuTensor)> = c.chunks.iter().zip(srcs.iter()).collect();
@@ -224,6 +249,7 @@ fn run_case(gpu: &mut Gpu, c: &Case) -> (usize, usize, usize, usize) {
             ch.src_row_stride,
             c.dst_row_stride,
             ch.dcol,
+            None,
         )
         .expect("copy_rows_strided_f32");
         launches += 1;

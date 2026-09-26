@@ -12,7 +12,7 @@ use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hip_bridge::HipResult;
 use rdna_compute::{
     DType, Gpu, GpuTensor, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES,
-    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
+    MQ4G128V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
 };
 
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
@@ -443,6 +443,13 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 45,
         dtype: DType::MQ4CG256,
     },
+    // MQ4G128V2 (qt=53) is a row-local format admitted by typed Qwen4
+    // sealed/dense consumers. It is registered here for exact payload
+    // validation and verbatim storage; generic consumers reject it explicitly.
+    RawCodec {
+        quant_type: 53,
+        dtype: DType::MQ4G128V2,
+    },
     // Neutral-size Magnum V2 family (qt47-50): same neutral header as qt44
     // (LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1, `[6..8)` fp16 z1,
     // `[8..B)` legacy payload). Half 0 covers q[0..128), half 1 q[128..256);
@@ -514,6 +521,35 @@ pub(crate) fn decode_raw_codec(
                 0,
                 &format!(
                     "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ4G128V2 {
+        let groups_per_row = k
+            .checked_add(127)
+            .and_then(|rounded| rounded.checked_div(128))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("MQ4G128V2 K rounding overflow: K={k} (caller: {name})"),
+                )
+            })?;
+        let expected = m
+            .checked_mul(groups_per_row)
+            .and_then(|groups| groups.checked_mul(MQ4G128V2_GROUP_BYTES))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("MQ4G128V2 blob length overflow: M={m} K={k} (caller: {name})"),
+                )
+            })?;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
                     data.len()
                 ),
             ));
@@ -1252,6 +1288,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
         }
         40 => dequant_tq2_to_f32(data, n),
         41 => dequant_bq1_to_f32(data, n),
+        53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     };
     gpu.upload_f32(&f32_data[..n], &[n])
@@ -1720,6 +1757,9 @@ mod tests {
             // qt=44/45: 136 B/group pad layouts (PR599). MQ4C is NOT 132.
             (44, DType::MQ4G256V2),
             (45, DType::MQ4CG256),
+            // qt=53 is row-local MQ4G128V2 (68 B per ceil(K/128) group), admitted
+            // only by typed Qwen4 sealed/dense consumers; generic paths refuse it.
+            (53, DType::MQ4G128V2),
             // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction;
             // do not alias to legacy MQ2/3/5/6. Each maps one-to-one to its V2 DType.
             (47, DType::MQ6G256V2), // 200 B/G256 6.25bpw
