@@ -314,6 +314,15 @@ fn g12_iu4_b1_image() -> &'static [u8] {
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     }
 }
+/// Physically packed bf16 SiLU h is a separate arm for each producer route.
+/// The default remains the certified f32 handoff until both speed orders pass.
+pub(crate) fn bf16_h_a4_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_BF16_H_A4", false)
+}
+
+pub(crate) fn bf16_h_fp8_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_BF16_H_FP8", false)
+}
 /// Builder fp8 GEMM (F2 Row, bundle 962fe61d with next-K128 W and Rw
 /// prefetch), byte-identical to 1b25e3aa. Default ON for fp8 prefill on
 /// exact gfx1201 (`fp8_f2_row_active` admits N >= 512 only);
@@ -9530,6 +9539,7 @@ impl Gpu {
         let symbol = match epi {
             "set" => "gemm_mq4g256v2_fp8_set_row_b1",
             "add" => "gemm_mq4g256v2_fp8_add_row_b1",
+            "silu" if bf16_h_fp8_enabled() => "gemm_mq4g256v2_fp8_silu_row_b1_bf16",
             "silu" => "gemm_mq4g256v2_fp8_silu_row_b1",
             "qkv" => "gemm_mq4g256v2_fp8_qkv_row_b1",
             "qkvza" => "gemm_mq4g256v2_fp8_qkvza_row_b1",
@@ -9592,7 +9602,8 @@ impl Gpu {
         gemm_params.extend(ys.iter_mut().map(|p| p as *mut _ as *mut c_void));
         gemm_params.extend(ms.iter_mut().map(|m| m as *mut _ as *mut c_void));
         gemm_params.extend([&mut kv as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void]);
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * 4);
+        let output_bytes = if silu && bf16_h_fp8_enabled() { 2 } else { 4 };
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * output_bytes);
         let result = self.launch_maybe_blob(
             symbol, [mt.div_ceil(256) as u32, n.div_ceil(128) as u32, 1],
             [256, 1, 1], 19_456, &mut gemm_params,
@@ -31593,7 +31604,13 @@ impl Gpu {
         // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
         let silu_h = silu_h_requested;
-        let (func_name, ksrc, bv): (&str, &str, usize) = if silu_h {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if silu_h && bf16_h_fp8_enabled() {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h_bf16",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_BF16_SRC,
+                8,
+            )
+        } else if silu_h {
             (
                 "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h",
                 kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_SRC,
@@ -32346,11 +32363,20 @@ impl Gpu {
         // and whole row quads. Route unsupported operands through hipcc K1.
         let isa_requested = self.flags.g12_iu4_isa;
         let isa = isa_requested && g12_iu4_b1_eligible(m, k, h.buf.as_ptr());
+        if bf16_h_a4_enabled() && (!isa || *G12_IU4_B1_CONTROL) {
+            return Err(hip_bridge::HipError::new(
+                0, "bf16 h requires the production gfx1201 IU4 b1 SiLU object",
+            ));
+        }
         let (module, source, kernel) = if isa {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
                 "",
-                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",
+                if bf16_h_a4_enabled() {
+                    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1_bf16"
+                } else {
+                    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1"
+                },
             )
         } else if isa_requested || g12_iu4_v3_enabled() {
             (
@@ -32396,7 +32422,8 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
         ];
-        let bytes = 2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
+        let bytes = 2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + n * m * if bf16_h_a4_enabled() { 2 } else { 4 };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
         // Virtual (gate/up interleaved) row tile on x, token tile on y, as the SET.
         let result = self.launch_maybe_blob(

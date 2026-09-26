@@ -3,6 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#ifdef HIPFIRE_SILU_FP8_H_BF16
+#include <hip/hip_bfloat16.h>
+#endif
 
 // gfx1201 SwiGLU + AWQ/FWHT + MQ4v2 FP8 stream producer.
 //
@@ -20,7 +23,11 @@
 
 extern "C" __launch_bounds__(256, 1) __global__
 void HIPFIRE_SILU_FP8_KERNEL(
+#ifdef HIPFIRE_SILU_FP8_H_BF16
+    const hip_bfloat16* __restrict__ gate,
+#else
     const float* __restrict__ gate,
+#endif
     const float* __restrict__ up,
 #ifdef HIPFIRE_SILU_FP8_AWQ
     const float* __restrict__ awq_scale,
@@ -43,7 +50,11 @@ void HIPFIRE_SILU_FP8_KERNEL(
     const int wave = tid >> 5;
     const int groups_total = K >> 8;
     const long long row_off = (long long)token * K;
+#ifdef HIPFIRE_SILU_FP8_H_BF16
+    const hip_bfloat16* gate_b = gate + row_off;
+#else
     const float* gate_b = gate + row_off;
+#endif
 #ifndef HIPFIRE_SILU_FP8_HIN
     const float* up_b = up + row_off;
 #endif

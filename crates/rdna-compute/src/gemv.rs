@@ -3882,7 +3882,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
-        self.round_h_bf16_quality_only(h, batch_size * k)?;
+        if !crate::gemm::bf16_h_fp8_enabled() {
+            self.round_h_bf16_quality_only(h, batch_size * k)?;
+        }
         self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(h, None, awq, None, k, batch_size)
     }
 
@@ -3929,33 +3931,44 @@ impl Gpu {
         }
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match (awq, inreg, h_input) {
-            (Some(_), true, true) => (
+        let bf16_h = h_input && crate::gemm::bf16_h_fp8_enabled();
+        let (module, source, kernel) = match (awq, inreg, h_input, bf16_h) {
+            (Some(_), true, true, true) => (
+                "fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_BF16_FP8_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12",
+            ),
+            (None, true, true, true) => (
+                "fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_HIN_BF16_FP8_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12",
+            ),
+            (Some(_), true, true, false) => (
                 "fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12",
             ),
-            (None, true, true) => (
+            (None, true, true, false) => (
                 "fused_silu_mul_mq_rotate_hin_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_HIN_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_hin_fp8_gfx12",
             ),
-            (Some(_), true, false) => (
+            (Some(_), true, false, _) => (
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
             ),
-            (None, true, false) => (
+            (None, true, false, _) => (
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_INREG_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12",
             ),
-            (Some(_), false, _) => (
+            (Some(_), false, _, _) => (
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            (None, false, _) => (
+            (None, false, _, _) => (
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
@@ -4026,7 +4039,8 @@ impl Gpu {
                 &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         };
-        let bytes = (k * 4 * 3 + k + (k / 256) * 2 * 4 + 4) * batch_size;
+        let bytes = ((if h_input { if bf16_h { 2 } else { 4 } } else { 8 }) * k
+            + k * 4 + k + (k / 256) * 2 * 4 + 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -4220,9 +4234,17 @@ impl Gpu {
                 "fused_silu_hin_rotate_mq_i4_batched: reservation (k,n) mismatch",
             ));
         }
-        self.round_h_bf16_quality_only(h, batch_size * k)?;
+        let bf16_h = self.arch == "gfx1201" && crate::gemm::bf16_h_a4_enabled();
+        if !bf16_h {
+            self.round_h_bf16_quality_only(h, batch_size * k)?;
+        }
         self.ensure_mq_signs()?;
-        let (source, kernel) = if self.arch == "gfx1201" {
+        let (source, kernel) = if bf16_h {
+            (
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_BF16_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_hin_bf16_gfx12",
+            )
+        } else if self.arch == "gfx1201" {
             (
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12",
@@ -4255,7 +4277,7 @@ impl Gpu {
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ];
-        let bytes = (k * 4 * 2 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
+        let bytes = (k * if bf16_h { 2 } else { 4 } + k * 4 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,

@@ -1,4 +1,7 @@
 #include <hip/hip_runtime.h>
+#ifdef HIPFIRE_SILU_H_BF16
+#include <hip/hip_bfloat16.h>
+#endif
 
 // AWQ-aware variant of `fused_silu_mul_mq_rotate`.
 //
@@ -30,6 +33,9 @@
 #if defined(HIPFIRE_SILU_HIN) && !defined(HIPFIRE_IU4_SIDECAR)
 #error "HIPFIRE_SILU_HIN requires HIPFIRE_IU4_SIDECAR"
 #endif
+#if defined(HIPFIRE_SILU_H_BF16) && !defined(HIPFIRE_SILU_HIN)
+#error "HIPFIRE_SILU_H_BF16 requires HIPFIRE_SILU_HIN"
+#endif
 
 #ifndef HIPFIRE_SILU_MQ_ROTATE_KERNEL
 #define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq
@@ -38,7 +44,11 @@
 extern "C" __launch_bounds__(32, 16)
 __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
 #ifdef HIPFIRE_SILU_HIN
+#ifdef HIPFIRE_SILU_H_BF16
+    const hip_bfloat16* __restrict__ h,   // [N x K] packed RNE bf16 h
+#else
     const float* __restrict__ h,           // [N x K] silu(gate)*up, FP32
+#endif
 #else
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -66,7 +76,11 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
     const long long batch_off = (long long)blockIdx.y * K;
 #ifdef HIPFIRE_SILU_HIN
-    const float* h_b     = h     + batch_off;
+#ifdef HIPFIRE_SILU_H_BF16
+    const hip_bfloat16* h_b = h + batch_off;
+#else
+    const float* h_b = h + batch_off;
+#endif
 #else
     const float* gate_b  = gate  + batch_off;
     const float* up_b    = up    + batch_off;
