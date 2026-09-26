@@ -314,14 +314,15 @@ fn g12_iu4_b1_image() -> &'static [u8] {
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     }
 }
-/// Physically packed bf16 SiLU h is a separate arm for each producer route.
-/// The default remains the certified f32 handoff until both speed orders pass.
+/// Physically packed bf16 SiLU h is independently selectable for each producer route.
+/// A4 stays opt-in after both pp8192 orders regressed; fp8 F2 defaults on after
+/// both orders improved. Each flag restores the f32 handoff when disabled.
 pub(crate) fn bf16_h_a4_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_BF16_H_A4", false)
 }
 
 pub(crate) fn bf16_h_fp8_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_BF16_H_FP8", false)
+    hipfire_config::developer_bool("HIPFIRE_BF16_H_FP8", true)
 }
 /// Builder fp8 GEMM (F2 Row, bundle 962fe61d with next-K128 W and Rw
 /// prefetch), byte-identical to 1b25e3aa. Default ON for fp8 prefill on
