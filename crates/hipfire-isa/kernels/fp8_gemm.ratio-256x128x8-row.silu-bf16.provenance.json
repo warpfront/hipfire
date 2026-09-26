@@ -1,0 +1,31 @@
+{
+  "module": "gemm_mq4g256v2_wmma_fp8_gfx12_b1",
+  "artifact": "kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco",
+  "arch": "gfx1201",
+  "symbol": "gemm_mq4g256v2_fp8_silu_row_b1_bf16",
+  "output_abi": "Y0 is packed bf16 h[N][M], contiguous row-major with stride M * 2 bytes; RNE matches hip_bfloat16::round_to_bfloat16, including NaNs; paired gate/up row mapping unchanged; M is a multiple of 128",
+  "previous_bundle_sha256": "962fe61d136b8bf12fd4d4b914d25c35851ad4c513b4a6599e3f3e5e5168d4a0",
+  "bundle_sha256": "b9fc3ad68fb65c0b8ba521dfcc5445be9f30d96a2e4e0bdb4b77037df3273365",
+  "device_elf_sha256": "8f56327720082749bfdcd43272f09657f3d2ab92a4e11af566315b6dbc4bc554",
+  "assembly_sha256": "56ab2d9d89b8c72886ac1235aead8d11dfe9a3aaa27f28e384e2cb6aece7ca6c",
+  "builder_proof_sha256": "6ac1b9cfdb26b043df8ae167884215936535bfc1302ae260903c6fb403eabc07",
+  "builder_base_commit": "ade6c95d587dd7de4bae2d378f137f393349861d",
+  "rebuild": [
+    "cargo build -p hipfire-isa --features toolchain --bin hipfire-isa --bin peacemaker",
+    "target/debug/hipfire-isa emit --kernel fp8_gemm --scale both --epi all --arch gfx1201 --out /tmp/bf16-fp8-module.s --proof /tmp/bf16-fp8-proof.json",
+    "target/debug/peacemaker custom build --arch gfx1201 --s /tmp/bf16-fp8-module.s --out /tmp/bf16-fp8-bundle.hxaco --manifest /tmp/bf16-fp8-manifest.json --contract crates/hipfire-isa/kernels/fp8_gemm.ratio-256x128x8-row.silu-bf16.contract.json --proof /tmp/bf16-fp8-proof.json"
+  ],
+  "certification": "11/11 symbol contracts pass: parse-back, shape, LDS bounds, wait-ledger replay, wave32, 0 spills, 192 VGPR maximum (unchanged)",
+  "unchanged_symbol_sha256": {
+    "gemm_mq4g256v2_fp8_add_k128_b1": "5b4074d48f9fbb87ac5ed1e6cf12383ae298a641a8f9798ab30fc89dfce973ad",
+    "gemm_mq4g256v2_fp8_add_row_b1": "5c5d2ebbeaaef5c35b03aef5ea34393fc2d9adb0d7dfed9752de2cd5581e2df2",
+    "gemm_mq4g256v2_fp8_qkv_k128_b1": "16c5c999c0ef47bfaaa504b1d2d0c4cb177e5f850993422fc13167e7967c333e",
+    "gemm_mq4g256v2_fp8_qkv_row_b1": "54bc6a39c5145015667754d435c3baff1c71fc9c56c80afdd6ea41a56944afbb",
+    "gemm_mq4g256v2_fp8_qkvza_k128_b1": "257389cb3463b390ca4c9d7f580c282d14644b44ca46ac3b667a476786ef4bce",
+    "gemm_mq4g256v2_fp8_qkvza_row_b1": "973bbb19c877928366b4b5386dfbeeb214739e1e4d5b81f99601551300350c95",
+    "gemm_mq4g256v2_fp8_set_k128_b1": "ca732772968653e3ae82dfa77decf9d2ea02373b28a1e89e0b392ca326d70e61",
+    "gemm_mq4g256v2_fp8_set_row_b1": "e3c77e655382cbc2aec7ee99957daf3d6cac5b0b1c07fba40c756ff319727328",
+    "gemm_mq4g256v2_fp8_silu_k128_b1": "6202ed669558fd0af9e1f68b66d0231da0b7b664927599ee3eda115c37fd7ffc",
+    "gemm_mq4g256v2_fp8_silu_row_b1": "d0279d73598dffcd89ed05dd5d0d08d62eb70f567ff69a3f12966915a9342bc2"
+  }
+}

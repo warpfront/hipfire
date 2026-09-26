@@ -38,7 +38,7 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
     }
     // Mt and ceil(Mt/256), ceil(N/128), both computed once per CTA.
     so(b,"s_add_co_i32 s80, s26, s27",&[80],&[26,27])?;
-    if spec.epi != super::Epi::GateUpSilu {
+    if !matches!(spec.epi,super::Epi::GateUpSilu|super::Epi::GateUpSiluBf16) {
         for n in 28..26+spec.epi.count() as u8 {so(b,format!("s_add_co_i32 s80, s80, s{n}"),&[80],&[80,n])?;}
     }
     so(b,"s_add_co_i32 s80, s80, 0xff",&[80],&[80])?;

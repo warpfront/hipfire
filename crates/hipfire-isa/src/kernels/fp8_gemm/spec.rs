@@ -3,7 +3,7 @@ use crate::{Arch, KernargLayout};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActScale { Row, K128 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Epi { Set, Add, GateUpSilu, Qkv, Qkvza }
+pub enum Epi { Set, Add, GateUpSilu, GateUpSiluBf16, Qkv, Qkvza }
 #[derive(Clone, Copy, Debug)]
 pub struct Spec { pub arch: Arch, pub act_scale: ActScale, pub epi: Epi }
 
@@ -15,17 +15,26 @@ impl ActScale {
     pub fn name(self) -> &'static str { match self { Self::Row => "row", Self::K128 => "k128" } }
 }
 impl Epi {
-    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu => "silu", Self::Qkv => "qkv", Self::Qkvza => "qkvza" } }
-    pub fn count(self) -> usize { match self { Self::Set | Self::Add => 1, Self::GateUpSilu => 2, Self::Qkv => 3, Self::Qkvza => 4 } }
+    pub fn name(self) -> &'static str { match self { Self::Set => "set", Self::Add => "add", Self::GateUpSilu | Self::GateUpSiluBf16 => "silu", Self::Qkv => "qkv", Self::Qkvza => "qkvza" } }
+    pub fn count(self) -> usize { match self { Self::Set | Self::Add => 1, Self::GateUpSilu | Self::GateUpSiluBf16 => 2, Self::Qkv => 3, Self::Qkvza => 4 } }
 }
 impl Spec {
     pub fn validate(self) -> Result<(), String> {
         if self.arch != Arch::Gfx1201 { return Err("fp8 GEMM requires gfx1201 wave32".into()) }
+        if self.epi==Epi::GateUpSiluBf16 && self.act_scale!=ActScale::Row {
+            return Err("bf16 h is only supported for row-scaled SiLU".into());
+        }
         Ok(())
     }
-    pub fn symbol(self) -> String { format!("gemm_mq4g256v2_fp8_{}_{}_b1", self.epi.name(), self.act_scale.name()) }
+    pub fn symbol(self) -> String {
+        let base=format!("gemm_mq4g256v2_fp8_{}_{}_b1", self.epi.name(), self.act_scale.name());
+        if self.epi==Epi::GateUpSiluBf16 {format!("{base}_bf16")} else {base}
+    }
     pub fn module() -> &'static str { "gemm_mq4g256v2_wmma_fp8_gfx12_b1" }
-    pub fn variant(self) -> String { format!("ratio-256x128x8-{}.{}", self.act_scale.name(), self.epi.name()) }
+    pub fn variant(self) -> String {
+        let base=format!("ratio-256x128x8-{}.{}", self.act_scale.name(), self.epi.name());
+        if self.epi==Epi::GateUpSiluBf16 {format!("{base}-bf16")} else {base}
+    }
     pub fn kernargs() -> KernargLayout {
         let mut layout=KernargLayout::new(96);
         for (name,offset) in ["Wf","Rw","Ew","X8","D","Y0","Y1","Y2","Y3"].into_iter().zip((0..9).map(|i|i*8)) {
@@ -112,7 +121,7 @@ pub fn check_lds_access(source:&str,symbol:&str,launch_dynamic:u32)->Result<u32,
     Ok(max_end)
 }
 impl std::str::FromStr for ActScale { type Err=String; fn from_str(s:&str)->Result<Self,String> { match s {"row"=>Ok(Self::Row),"k128"=>Ok(Self::K128),_=>Err(format!("unknown scale layout {s}"))} } }
-impl std::str::FromStr for Epi { type Err=String; fn from_str(s:&str)->Result<Self,String> { match s {"set"=>Ok(Self::Set),"add"=>Ok(Self::Add),"silu"=>Ok(Self::GateUpSilu),"qkv"=>Ok(Self::Qkv),"qkvza"=>Ok(Self::Qkvza),_=>Err(format!("unknown fp8 epilogue {s}"))} } }
+impl std::str::FromStr for Epi { type Err=String; fn from_str(s:&str)->Result<Self,String> { match s {"set"=>Ok(Self::Set),"add"=>Ok(Self::Add),"silu"=>Ok(Self::GateUpSilu),"silu-bf16"=>Ok(Self::GateUpSiluBf16),"qkv"=>Ok(Self::Qkv),"qkvza"=>Ok(Self::Qkvza),_=>Err(format!("unknown fp8 epilogue {s}"))} } }
 
 #[cfg(test)]
 mod tests {

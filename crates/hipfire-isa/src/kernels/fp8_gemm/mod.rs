@@ -105,8 +105,15 @@ pub struct ModuleProof {pub module:String,pub arch:Arch,pub builder_crate_versio
     pub s_text_sha256:String,pub kernels:Vec<BuilderProof>}
 pub fn module(emitted:&[Emitted])->Result<(String,ModuleProof),String>{
     let first=emitted.first().ok_or("empty fp8 module")?;
+    // The existing CLI's "all" selection includes the f32 SiLU control.
+    // Add its bf16-h sibling to the product bundle, without changing any
+    // existing symbol or requiring a second assembly/bundle at runtime.
+    let bf16=if emitted.iter().any(|e| e.proof.variant=="ratio-256x128x8-row.silu") {
+        Some(emit(Spec{arch:first.proof.arch,act_scale:ActScale::Row,epi:Epi::GateUpSiluBf16})?)
+    } else {None};
+    let all:Vec<_>=emitted.iter().chain(bf16.iter()).collect();
     let mut header=String::new();let mut bodies=String::new();let mut kernels=String::new();let mut tail=String::new();
-    for (i,e) in emitted.iter().enumerate(){
+    for (i,e) in all.iter().enumerate(){
         let (code,meta)=e.s_text.split_once(".amdgpu_metadata\n").ok_or("missing metadata")?;
         let (pre,body)=code.split_once(".text\n").ok_or("missing text")?;
         if i==0 {header=pre.into()}else if pre!=header {return Err("target headers differ".into())}
@@ -120,7 +127,7 @@ pub fn module(emitted:&[Emitted])->Result<(String,ModuleProof),String>{
     let text=format!("{header}{bodies}.amdgpu_metadata\n---\namdhsa.kernels:\n{kernels}{tail}");
     let proof=ModuleProof{module:Spec::module().into(),arch:first.proof.arch,
         builder_crate_version:first.proof.builder_crate_version.clone(),builder_git_sha:first.proof.builder_git_sha.clone(),
-        s_text_sha256:format!("{:x}",Sha256::digest(text.as_bytes())),kernels:emitted.iter().map(|e|e.proof.clone()).collect()};
+        s_text_sha256:format!("{:x}",Sha256::digest(text.as_bytes())),kernels:all.iter().map(|e|e.proof.clone()).collect()};
     Ok((text,proof))
 }
 pub fn emit_module(arch:Arch,scale:ActScale,epis:&[Epi])->Result<(Vec<Emitted>,String,ModuleProof),String>{

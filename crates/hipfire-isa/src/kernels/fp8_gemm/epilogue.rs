@@ -1,10 +1,37 @@
 use super::{ActScale, Builder, EPILOGUE, Epi, Spec, mem, op, s, so, sr, v, vo, vr, vload};
 use crate::{insn::MemoryClass, kernels::iu4_gemm::region::{self, Binding, Region}};
 
+/// Match hip_bfloat16::round_to_bfloat16 bit for bit, including infinities
+/// and NaNs whose payload lives entirely in the low 16 f32 mantissa bits.
+/// The converted four f32 values are packed into two consecutive b32 words.
+fn pack_bf16_quad(b:&mut Builder,g:u8)->Result<(),String>{
+    for lane in g..g+4 {
+        vo(b,format!("v_and_b32_e32 v190, 0x7f800000, v{lane}"),&[190],&[lane],&[])?;
+        op(b,"v_cmp_eq_u32_e64 s74, 0x7f800000, v190",&[s(74)],&[v(190)])?;
+        vo(b,format!("v_and_b32_e32 v190, 0xffff, v{lane}"),&[190],&[lane],&[])?;
+        op(b,"v_cmp_ne_u32_e64 s76, 0, v190",&[s(76)],&[v(190)])?;
+        so(b,"s_and_b32 s74, s74, s76",&[74],&[74,76])?;
+        vo(b,format!("v_lshrrev_b32_e32 v190, 16, v{lane}"),&[190],&[lane],&[])?;
+        vo(b,"v_and_b32_e32 v190, 1, v190",&[190],&[190],&[])?;
+        vo(b,"v_add_nc_u32_e32 v190, 0x7fff, v190",&[190],&[190],&[])?;
+        vo(b,format!("v_mov_b32_e32 v191, v{lane}"),&[191],&[lane],&[])?;
+        vo(b,format!("v_add_nc_u32_e32 v{lane}, v{lane}, v190"),&[lane],&[lane,190],&[])?;
+        vo(b,"v_or_b32_e32 v191, 0x10000, v191",&[191],&[191],&[])?;
+        op(b,format!("v_cndmask_b32_e64 v{lane}, v{lane}, v191, s74"),&[v(lane)],&[v(lane),v(191),s(74)])?;
+    }
+    for lane in [g,g+1] {
+        let lo=g+2*(lane-g);
+        vo(b,format!("v_lshrrev_b32_e32 v190, 16, v{lo}"),&[190],&[lo],&[])?;
+        vo(b,format!("v_and_b32_e32 v191, 0xffff0000, v{}",lo+1),&[191],&[lo+1],&[])?;
+        vo(b,format!("v_or_b32_e32 v{lane}, v190, v191"),&[lane],&[190,191],&[])?;
+    }
+    Ok(())
+}
+
 /// Four consecutive row results belong to one output segment (all Mi%4=0).
 /// ADD loads old Y into retired Ew registers, then retains one f32 addition
 /// per element in exactly the scalar path's operand order.
-fn store_quad(b:&mut Builder,seg:usize,row:u8,token:u8,val:u8)->Result<(),String>{
+fn store_quad(b:&mut Builder,seg:usize,row:u8,token:u8,val:u8,bf16:bool)->Result<(),String>{
     let mi=26+seg as u8;
     let desc=52+4*seg as u8;
     so(b,format!("s_add_co_i32 s73, s72, s{mi}"),&[73],&[72,mi])?;
@@ -16,7 +43,7 @@ fn store_quad(b:&mut Builder,seg:usize,row:u8,token:u8,val:u8)->Result<(),String
     vo(b,format!("v_mul_lo_u32 v185, v{token}, s{mi}"),&[185],&[token],&[mi])?;
     vo(b,format!("v_subrev_nc_u32_e32 v186, s72, v{row}"),&[186],&[row],&[72])?;
     vo(b,"v_add_nc_u32_e32 v185, v185, v186",&[185],&[185,186],&[])?;
-    vo(b,"v_lshlrev_b32_e32 v185, 2, v185",&[185],&[185],&[])?;
+    vo(b,format!("v_lshlrev_b32_e32 v185, {}, v185",if bf16 {1}else{2}),&[185],&[185],&[])?;
     op(b,"s_mov_b32 s79, exec_lo",&[s(79)],&[])?;
     op(b,"s_mov_b32 exec_lo, s74",&[],&[s(74)])?;
     let dest=format!("s[{desc}:{}]",desc+3);
@@ -28,7 +55,11 @@ fn store_quad(b:&mut Builder,seg:usize,row:u8,token:u8,val:u8)->Result<(),String
             vo(b,format!("v_add_f32_e32 v{r}, v{old}, v{r}"),&[r],&[old,r],&[])?;
         }
     }
-    mem(b,format!("buffer_store_b128 v[{val}:{}], v185, {dest}, null offen",val+3),&[],&[vr(val,4),v(185),sr(desc,4)],MemoryClass::VmemStore)?;
+    if bf16 {
+        mem(b,format!("buffer_store_b64 v[{val}:{}], v185, {dest}, null offen",val+1),&[],&[vr(val,2),v(185),sr(desc,4)],MemoryClass::VmemStore)?;
+    } else {
+        mem(b,format!("buffer_store_b128 v[{val}:{}], v185, {dest}, null offen",val+3),&[],&[vr(val,4),v(185),sr(desc,4)],MemoryClass::VmemStore)?;
+    }
     op(b,"s_mov_b32 exec_lo, s79",&[],&[s(79)])?;
     Ok(())
 }
@@ -95,7 +126,7 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
     so(b,"s_lshl_b32 s73, s89, 6",&[73],&[89])?;
     so(b,"s_add_co_i32 s73, s73, s82",&[73],&[73,82])?;
     vo(b,"v_add_nc_u32_e32 v183, s73, v183",&[183],&[183],&[73])?;
-    if spec.epi==Epi::GateUpSilu {
+    if matches!(spec.epi,Epi::GateUpSilu|Epi::GateUpSiluBf16) {
         let region=Region::silu()?;
         if region.temps>7||region.masks>2 {return Err("SiLU region exceeds F2 borrowed registers".into())}
         // Ew and D have been consumed by the final two rounded multiplies.
@@ -129,7 +160,9 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
                 vo(b,"v_add_nc_u32_e32 v188, s72, v188",&[188],&[188],&[72])?;
                 vo(b,format!("v_add_nc_u32_e32 v189, {}, v183",tt*16),&[189],&[183],&[])?;
                 so(b,"s_mov_b32 s72, 0",&[72],&[])?;
-                store_quad(b,0,188,189,g)?;
+                let bf16=spec.epi==Epi::GateUpSiluBf16;
+                if bf16 {pack_bf16_quad(b,g)?;}
+                store_quad(b,0,188,189,g,bf16)?;
             }
         }}
     } else if matches!(spec.epi,Epi::Qkv|Epi::Qkvza) {
@@ -175,7 +208,7 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
             vo(b,format!("v_add_nc_u32_e32 v189, {}, v183",tt*16),&[189],&[183],&[])?;
             so(b,"s_mov_b32 s72, 0",&[72],&[])?;
             for seg in 0..spec.epi.count() {
-                store_quad(b,seg,188,189,acc)?;
+                store_quad(b,seg,188,189,acc,false)?;
                 so(b,format!("s_add_co_i32 s72, s72, s{}",26+seg),&[72],&[72,26+seg as u8])?;
             }
         }}}
@@ -186,7 +219,7 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
             vo(b,format!("v_add_nc_u32_e32 v188, {}, v184",i*16+e),&[188],&[184],&[])?;
             vo(b,format!("v_add_nc_u32_e32 v189, {}, v183",tt*16),&[189],&[183],&[])?;
             so(b,"s_mov_b32 s72, 0",&[72],&[])?;
-            store_quad(b,0,188,189,acc)?;
+            store_quad(b,0,188,189,acc,false)?;
         }}}
     }
     op(b,"s_mov_b32 exec_lo, -1",&[],&[])?;
