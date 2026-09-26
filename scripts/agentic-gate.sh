@@ -280,15 +280,9 @@ if [ "$rebuild" -eq 1 ]; then
     fi
 fi
 
-# Concurrency policy: the gate uses the daemon's existing singleton flock
-# at $HOME/.hipfire/daemon.pid (daemon.rs:171). If a user daemon is already
-# running, the gate's daemon will exit with FATAL; we detect that in the
-# per-cell parser and surface it as a hard fail. We do NOT override $HOME
-# or rm the pid file — both would either bypass the singleton (allowing two
-# 35B daemons on one GPU) or break a parallel user daemon's lock. When the
-# gate's daemon dies via SIGKILL (cleanup path), the kernel auto-releases
-# the flock; the stale pid-file content is harmless (next daemon truncates
-# and overwrites at startup).
+# The daemon reserves physical GPU UUIDs independently of HOME. A daemon
+# already using this card makes the gate fail before loading the model;
+# never unlink a GPU lock file (the active inode must remain).
 DAEMON_PID=""
 
 cleanup() {
@@ -410,11 +404,8 @@ for model in "${!MODEL_CELLS[@]}"; do
 
     # Build JSONL: load + (per cell: generate, optional second-turn generate) + unload
     # Each cell gets a unique id ${prefix}_${cellnum}_t1 (and _t2 for multi-turn).
-    # NOTE: never touch $HOME/.hipfire/daemon.pid here. The daemon's lock at
-    # daemon.rs:142 always opens that path under $HOME — we override $HOME
-    # for the daemon child below so its pid lives at $GATE_HIPFIRE_DIR/.hipfire/
-    # daemon.pid instead. Removing the user's pid file would unlink an active
-    # user daemon's flock target.
+    # Private HOME directories isolate config and caches, not GPU reservations.
+    # The daemon's UUID lock still conflicts with any other user on this card.
     JSONL_FILE="$(mktemp /tmp/agentic-gate-jsonl.XXXXXX)"
 
     python3 - "$model" "$JSONL_FILE" <<'PY' >/dev/null
@@ -495,11 +486,8 @@ PY
     mkfifo "$STDIN_FIFO"
 
     # Spawn daemon in background, redirected stdin from FIFO, stdout to file.
-    # The daemon's flock at $HOME/.hipfire/daemon.pid (daemon.rs:171) acts
-    # as the singleton: if another daemon is already running, this child
-    # will exit with "FATAL: hipfire daemon already running" and the
-    # detector picks it up. No HOME override here — that bypasses the
-    # singleton and risks two 35B daemons on one GPU.
+    # Any overlapping physical GPU UUID produces a FATAL contention message
+    # with the holder PID, regardless of HOME.
     env HIPFIRE_KV_MODE=asym3 \
         HIPFIRE_GRAPH=1 \
         "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
@@ -562,11 +550,8 @@ for ev in events:
 panic = any(ev.get("type") == "error" for ev in events)
 panic_msg = next((ev["message"] for ev in events if ev.get("type") == "error"), "")
 
-# Detect singleton-collision FATAL. The Rust daemon emits this as plain
-# text on stderr (now merged into stdout) when another daemon already
-# holds $HOME/.hipfire/daemon.pid (daemon.rs:178-182). It is NOT a JSON
-# event, so it slips past the panic check above.
-fatal_singleton = "FATAL: hipfire daemon already running" in raw_text
+# GPU contention is printed on stderr (merged into stdout), not as a JSON event.
+fatal_singleton = "already reserved by holder PID" in raw_text
 
 def extract_tool_call_body(text):
     # Use minimal regex; the body extraction is the same as coherence-gate.

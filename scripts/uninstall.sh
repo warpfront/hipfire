@@ -111,7 +111,7 @@ remove_tree() {
 remove_file() {
     local target="$1"
     case "$target" in
-        "$HIPFIRE_DIR/serve.pid"|"$HIPFIRE_DIR/daemon.pid"|"$HIPFIRE_DIR/serve.log") ;;
+        "$HIPFIRE_DIR/serve.pid"|"$HIPFIRE_DIR/daemon.pid"|"$HIPFIRE_DIR"/daemon-GPU-*.pid|"$HIPFIRE_DIR/serve.log") ;;
         *)
             echo "ERROR: refusing unexpected file removal target '$target'." >&2
             exit 1
@@ -128,7 +128,8 @@ remove_file() {
 
 stop_installed_processes() {
     if [ "$DRY_RUN" = "1" ]; then
-        if path_exists "$HIPFIRE_DIR/serve.pid" || path_exists "$HIPFIRE_DIR/daemon.pid"; then
+        if path_exists "$HIPFIRE_DIR/serve.pid" || path_exists "$HIPFIRE_DIR/daemon.pid" ||
+            compgen -G "$HIPFIRE_DIR/daemon-GPU-*.pid" >/dev/null; then
             echo "Would stop running hipfire processes owned by this install"
         fi
         return
@@ -144,20 +145,21 @@ stop_installed_processes() {
 
     # A directly launched daemon is not covered by `hipfire stop`. Only signal
     # the PID when /proc proves it is this install's daemon binary.
-    if path_exists "$HIPFIRE_DIR/daemon.pid"; then
-        local daemon_pid expected_exe running_exe attempt
-        daemon_pid="$(tr -d '[:space:]' < "$HIPFIRE_DIR/daemon.pid" 2>/dev/null || true)"
+    local pid_file daemon_pid expected_exe running_exe attempt
+    for pid_file in "$HIPFIRE_DIR"/daemon-GPU-*.pid "$HIPFIRE_DIR/daemon.pid"; do
+        path_exists "$pid_file" || continue
+        daemon_pid="$(tr -d '[:space:]' < "$pid_file" 2>/dev/null || true)"
         case "$daemon_pid" in
-            ""|*[!0-9]*) return ;;
+            ""|*[!0-9]*) continue ;;
         esac
         if ! kill -0 "$daemon_pid" 2>/dev/null; then
-            return
+            continue
         fi
         expected_exe="$(readlink -f "$BIN_DIR/daemon" 2>/dev/null || true)"
         running_exe="$(readlink -f "/proc/$daemon_pid/exe" 2>/dev/null || true)"
         if [ -z "$expected_exe" ] || [ "$running_exe" != "$expected_exe" ]; then
             echo "WARNING: PID $daemon_pid is not $BIN_DIR/daemon; refusing to signal it." >&2
-            return
+            continue
         fi
         kill -TERM "$daemon_pid"
         for ((attempt = 0; attempt < 50; attempt++)); do
@@ -169,7 +171,7 @@ stop_installed_processes() {
         else
             echo "Stopped: hipfire daemon (PID $daemon_pid)"
         fi
-    fi
+    done
 }
 
 profile_has_install_path() {
@@ -325,6 +327,9 @@ else
     remove_managed_source
     remove_file "$HIPFIRE_DIR/serve.pid"
     remove_file "$HIPFIRE_DIR/daemon.pid"
+    for pid_file in "$HIPFIRE_DIR"/daemon-GPU-*.pid; do
+        path_exists "$pid_file" && remove_file "$pid_file"
+    done
     remove_file "$HIPFIRE_DIR/serve.log"
 fi
 

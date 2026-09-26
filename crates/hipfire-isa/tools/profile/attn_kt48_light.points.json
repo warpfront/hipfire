@@ -1,0 +1,33 @@
+{
+  "symbol": "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+  "rules": [
+    {
+      "name": "tile",
+      "label": ".LBB5_60"
+    },
+    {
+      "name": "fill.done",
+      "label": ".LBB5_84"
+    },
+    {
+      "name": "bar.pre_drain",
+      "before": "s_wait_loadcnt_dscnt 0x0"
+    },
+    {
+      "name": "bar.pre_signal",
+      "before": "s_barrier_signal"
+    },
+    {
+      "name": "bar.post_signal",
+      "after": "s_barrier_signal"
+    },
+    {
+      "name": "bar.post_wait",
+      "after": "s_barrier_wait"
+    },
+    {
+      "name": "epilogue",
+      "label": ".LBB5_107"
+    }
+  ]
+}
