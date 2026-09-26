@@ -24,6 +24,7 @@ mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
 mod kernels;
+pub mod kernel_registry;
 pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;
