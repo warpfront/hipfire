@@ -120,8 +120,19 @@ Run `scripts/check-crate-maps.py` after adding files.
    - call `DeltaNetSnapshot::free_gpu` explicitly. It has no `Drop`, so
      skipping this leaks device memory.
 
-Preconditions: refuse to run when KV eviction (CASK) is active. Positional
-rewind is only valid when `compact_offset == 0`.
+Preconditions (409 otherwise):
+
+- `pp == 1` and no expert parallelism (`m.ep` is `None`);
+- no KV eviction (CASK) and no `kv_adaptive`. Positional rewind is only
+  valid with an un-compacted cache.
+
+A client disconnect does not interrupt a decide in v1. The loop is
+sub-second, and mid-loop abort would need the daemon's per-request terminal
+registry; serve simply discards the reply.
+
+A debug request field `_debug_no_snapshot: true` makes the runner reset and
+prefill each question's full prompt from position 0 instead of restoring.
+Gate 1 (§10) compares the two modes.
 
 ## 5. Prompt layout
 
@@ -152,11 +163,15 @@ Answer with the option code only.<|im_end|>
 - **State rendering.** A string is used as-is. An object or array is
   pretty-printed as JSON, so backtick `field` references in instructions
   resolve naturally.
-- **Tokenization.** The prefix and suffix are tokenized separately and
-  concatenated at a newline boundary; the Qwen pre-tokenizer always splits on
-  `\n`. The template comes from the model's own chat template via
-  `JinjaChatFrame` with thinking closed (`ClosedThink`), falling back to
-  `ChatFrame`.
+- **Tokenization.** Each question's full prompt is rendered and tokenized
+  on its own, via `hipfire_engine::prompt::batch_render_prompt_tokens` with
+  `enable_thinking = false` (the model's Jinja chat template; `ChatFrame`
+  fallback).
+  - The snapshot point is the longest common token prefix across all the
+    questions' sequences, capped at `min_len − 1` so every suffix is
+    non-empty.
+  - Every question is therefore evaluated on exactly the tokens of its own
+    full prompt, with no tokenization-boundary assumptions.
 - **Labels:**
   - `choice`: codes `A`–`Z`, then two-letter codes, in criteria order.
   - `score`: levels labelled `0`…`k-1`, with each level's description.
@@ -169,7 +184,10 @@ Answer with the option code only.<|im_end|>
 ## 6. Request lifecycle (serve)
 
 1. `POST /v1/systemone` with `{model, state, questions}`. Serve checks body
-   size and validates the request (§7) before touching the daemon.
+   size and JSON well-formedness only.
+   - The daemon is the single validation authority (§7), as with
+     `img_generate`. `hipfire-cli` does not depend on the GPU crates that
+     own the validation code.
 2. **Model selection.**
    - If `model` names a local hipfire model (registry tag or path), serve
      calls `ensure_model`.
@@ -180,9 +198,14 @@ Answer with the option code only.<|im_end|>
 3. **Admission.** Exclusive gate, the same as a sequential chat request. When
    saturated: 503 + `Retry-After`.
 4. Forward `{"type":"decide","id",state,questions}` to the daemon.
-   - The daemon verifies that state plus the longest suffix fits within
-     `max_seq`. Serve requests a larger context through `ensure_model`'s
-     `min_max_seq`.
+   - The daemon replies with exactly one `decided` message: either
+     `answers`/`usage`/`timing`, or `error: {status, message,
+     required_max_seq?}`.
+   - `decided` is not a lifecycle event type, so `hipfire-client` routes it
+     to the control waiter, and `Engine::request` suffices.
+   - If the longest prompt exceeds `max_seq`, the daemon returns 422 with
+     `required_max_seq`. Serve then reloads once via `ensure_model(…,
+     Some(required_max_seq))` and retries.
 5. Shape Jev's response `{model, answers, usage}`.
    - Per-phase timings (state prefill, per-question suffix, readout) go in an
      `x-hipfire-timing` header and the log. No extra body fields are added.
@@ -226,7 +249,7 @@ All three:
 | Fewer than K valid single-token codes | 422 |
 | Admission saturated | 503 + `Retry-After` |
 | Daemon crash / GPU error | 500; the existing serve restart path |
-| Client disconnect | `abort`; the daemon stops between questions and runs the §4.1 cleanup |
+| Multi-GPU (pipeline or expert parallel), `kv_adaptive` active, slot / continuous-batch lanes active | 409 |
 
 ## 9. Deferred
 
