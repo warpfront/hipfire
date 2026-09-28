@@ -91,6 +91,120 @@ pub(crate) fn render_session_prompt(
     .map_err(render_err)
 }
 
+/// What bounds a session decide's longest render (see [`render_and_admit`]).
+struct SessionLimits {
+    max_seq: usize,
+    eviction_budget: Option<usize>,
+    physical_cap: usize,
+}
+
+/// The admitted renders: per-question label ids and tokens, and E.
+struct SessionRenders {
+    label_ids: Vec<Vec<u32>>,
+    seqs: Vec<Vec<u32>>,
+    conv_end: usize,
+}
+
+/// `required_max_seq` when the conversation alone does not fit `max_seq`,
+/// estimated without rendering every question (each render re-renders and
+/// tokenizes the whole conversation). R_0 is rendered; every other R_i is
+/// R_0 with question 0's turn text swapped for question i's, so it is
+/// estimated as `r0_len - text_lens[0] + text_lens[i]` (each text tokenized
+/// on its own). A template or tokenizer merge at the turn boundary can move
+/// that by a token or two, hence the slack: the value only sizes serve's
+/// reload, and the retry re-checks exactly.
+fn estimate_required_max_seq(probe_len: usize, r0_len: usize, text_lens: &[usize]) -> usize {
+    const SLACK: usize = 16;
+    let longest_text = text_lens.iter().copied().max().unwrap_or(0);
+    let text0 = text_lens.first().copied().unwrap_or(0);
+    let estimate = (r0_len + longest_text).saturating_sub(text0) + SLACK;
+    estimate.max(probe_len) + 1
+}
+
+/// Render every question and admit the request, failing as early as the
+/// checks allow (spec §12.5). A hostile oversized conversation must not
+/// cost up to [`d::MAX_QUESTIONS`] whole-conversation renders under
+/// exclusive admission before its 422, so the order is:
+///
+/// 1. the probe (conversation + a `.` user turn): over the eviction limit is
+///    a 422 before any question renders. A question turn is never shorter
+///    than the probe's `.` turn, so every R_i would fail too.
+/// 2. R_0. If the probe alone is over `max_seq`: 422 with an estimated
+///    `required_max_seq` ([`estimate_required_max_seq`]); no further render.
+/// 3. each R_i as it is rendered: the eviction limit and Jev's per-question
+///    / request limits on the suffixes past a provisional E (the end over
+///    the probe and R_0 only). More renders can only shorten the common
+///    prefix, so the final E is <= the provisional one and every suffix only
+///    grows: an early refusal is one the final check would make too.
+/// 4. after all: E over every render, the exact limits, and `max_seq`
+///    against the longest R_i (the conversation fits, so every render was
+///    bounded by `max_seq` + one question).
+fn render_and_admit(
+    tok: &Tokenizer,
+    questions: &[d::Question],
+    limits: &SessionLimits,
+    mut render: impl FnMut(&str) -> Result<Vec<u32>, DecideError>,
+) -> Result<SessionRenders, DecideError> {
+    let turn_open = tok.special_token_id(TURN_OPEN);
+    let probe = render(PROBE_USER_TEXT)?;
+    check_eviction_limit(probe.len(), limits.eviction_budget, limits.physical_cap)?;
+    let mut label_ids = Vec::with_capacity(questions.len());
+    let mut texts = Vec::with_capacity(questions.len());
+    for q in questions {
+        let (labels, ids) = question_labels(tok, q)?;
+        texts.push(d::build_question_text(q, &labels));
+        label_ids.push(ids);
+    }
+    let mut seqs: Vec<Vec<u32>> = Vec::with_capacity(questions.len());
+    let mut provisional_end = 0;
+    for (i, text) in texts.iter().enumerate() {
+        let r = render(text)?;
+        check_eviction_limit(r.len(), limits.eviction_budget, limits.physical_cap)?;
+        if i == 0 {
+            if probe.len() + 1 > limits.max_seq {
+                let text_lens: Vec<usize> = texts.iter().map(|t| tok.encode(t).len()).collect();
+                let required = estimate_required_max_seq(probe.len(), r.len(), &text_lens);
+                return Err(DecideError {
+                    status: 422,
+                    message: format!(
+                        "conversation needs {} tokens before any question (about {required} \
+                         with the longest question), model max_seq is {}",
+                        probe.len() + 1,
+                        limits.max_seq
+                    ),
+                    required_max_seq: Some(required),
+                });
+            }
+            provisional_end = d::conversation_end(std::slice::from_ref(&r), &probe, turn_open);
+        }
+        seqs.push(r);
+        let lens: Vec<usize> = seqs.iter().map(Vec::len).collect();
+        d::check_session_tokens(&questions[..=i], provisional_end, &lens)
+            .map_err(|e| DecideError::new(422, e))?;
+    }
+    let conv_end = d::conversation_end(&seqs, &probe, turn_open);
+    let lens: Vec<usize> = seqs.iter().map(Vec::len).collect();
+    d::check_session_tokens(questions, conv_end, &lens).map_err(|e| DecideError::new(422, e))?;
+    let longest = lens.iter().copied().max().unwrap_or(0);
+    check_eviction_limit(longest, limits.eviction_budget, limits.physical_cap)?;
+    if longest + 1 > limits.max_seq {
+        return Err(DecideError {
+            status: 422,
+            message: format!(
+                "prompt needs {} tokens, model max_seq is {}",
+                longest + 1,
+                limits.max_seq
+            ),
+            required_max_seq: Some(longest + 1),
+        });
+    }
+    Ok(SessionRenders {
+        label_ids,
+        seqs,
+        conv_end,
+    })
+}
+
 /// Everything [`execute_session`] needs. Computing it leaves KV, recurrent
 /// state, `seq_pos` and `conversation_tokens` untouched; the render may
 /// refresh `asst_turn_cache`'s LRU order, as a chat render does.
@@ -142,51 +256,18 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
         .ok_or_else(|| DecideError::new(400, "model has no tokenizer"))?;
     let cache = &mut m.asst_turn_cache;
     let tools = parsed.tools.as_deref();
-    let mut label_ids = Vec::with_capacity(parsed.questions.len());
-    let mut seqs = Vec::with_capacity(parsed.questions.len());
-    for q in &parsed.questions {
-        let (labels, ids) = question_labels(tok, q)?;
-        let text = d::build_question_text(q, &labels);
-        seqs.push(render_session_prompt(
-            tok,
-            template,
-            cache,
-            &parsed.messages,
-            tools,
-            &text,
-        )?);
-        label_ids.push(ids);
-    }
-    let probe = render_session_prompt(
-        tok,
-        template,
-        cache,
-        &parsed.messages,
-        tools,
-        PROBE_USER_TEXT,
-    )?;
-    let conv_end = d::conversation_end(&seqs, &probe, tok.special_token_id(TURN_OPEN));
-
-    let lens: Vec<usize> = seqs.iter().map(Vec::len).collect();
-    d::check_session_tokens(&parsed.questions, conv_end, &lens)
-        .map_err(|e| DecideError::new(422, e))?;
-    let longest = lens.iter().copied().max().unwrap_or(0);
-    check_eviction_limit(
-        longest,
-        m.eviction.as_ref().map(|e| e.budget()),
-        m.physical_cap,
-    )?;
-    if longest + 1 > m.max_seq {
-        return Err(DecideError {
-            status: 422,
-            message: format!(
-                "prompt needs {} tokens, model max_seq is {}",
-                longest + 1,
-                m.max_seq
-            ),
-            required_max_seq: Some(longest + 1),
-        });
-    }
+    let limits = SessionLimits {
+        max_seq: m.max_seq,
+        eviction_budget: m.eviction.as_ref().map(|e| e.budget()),
+        physical_cap: m.physical_cap,
+    };
+    let SessionRenders {
+        label_ids,
+        seqs,
+        conv_end,
+    } = render_and_admit(tok, &parsed.questions, &limits, |text| {
+        render_session_prompt(tok, template, cache, &parsed.messages, tools, text)
+    })?;
     // The chat path's prompt-cache eligibility (ar.rs:3025-3029): never under
     // eviction or with the cache kill switch. A positional rewind also needs
     // an uncompacted KV cache.
@@ -623,6 +704,136 @@ mod tests {
         let chat_tokens = t.encode(&chat.render_messages(&next, None, None).unwrap());
         assert!(chat_tokens.starts_with(&q[..e]));
         assert!(chat_tokens.len() > e);
+    }
+
+    /// `n` choice questions of varying length over `history()` with a
+    /// `conv_bytes`-byte user turn prepended.
+    fn session_req(n: usize, conv_bytes: usize, long_q: Option<usize>) -> d::SessionRequest {
+        let mut qs = serde_json::Map::new();
+        for i in 0..n {
+            let pad = if long_q == Some(i) {
+                "x".repeat(33_000)
+            } else {
+                "y".repeat(i % 7)
+            };
+            qs.insert(
+                format!("q{i:03}"),
+                json!({"type": "choice", "instructions": format!("Q{i}{pad}?"),
+                       "criteria": {"a": "first", "b": "second"}}),
+            );
+        }
+        d::parse_session_request(&json!({
+            "messages": [{"role": "user", "content": "z".repeat(conv_bytes)},
+                         {"role": "assistant", "content": "ok"},
+                         {"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": "yo"}],
+            "questions": qs,
+        }))
+        .unwrap()
+    }
+
+    /// [`render_and_admit`] over the BARE template, counting renders.
+    fn admit(
+        req: &d::SessionRequest,
+        limits: &SessionLimits,
+    ) -> (Result<SessionRenders, DecideError>, usize) {
+        let t = tok();
+        let mut cache = AsstTurnCache::new_from_env();
+        let mut renders = 0;
+        let r = render_and_admit(&t, &req.questions, limits, |text| {
+            renders += 1;
+            render_session_prompt(&t, BARE, &mut cache, &req.messages, None, text)
+        });
+        (r, renders)
+    }
+
+    fn no_eviction(max_seq: usize) -> SessionLimits {
+        SessionLimits {
+            max_seq,
+            eviction_budget: None,
+            physical_cap: max_seq,
+        }
+    }
+
+    #[test]
+    fn admits_and_matches_the_full_render() {
+        let req = session_req(5, 10, None);
+        let (r, renders) = admit(&req, &no_eviction(1 << 20));
+        let r = r.unwrap();
+        assert_eq!(renders, 6, "probe + one render per question");
+        let t = tok();
+        let mut cache = AsstTurnCache::new_from_env();
+        let probe = render_session_prompt(&t, BARE, &mut cache, &req.messages, None, ".").unwrap();
+        assert_eq!(
+            r.conv_end,
+            d::conversation_end(&r.seqs, &probe, t.special_token_id(TURN_OPEN))
+        );
+        assert_eq!(r.seqs.len(), 5);
+        assert_eq!(r.label_ids.len(), 5);
+    }
+
+    /// A conversation over max_seq is refused after the probe and R_0 only,
+    /// however many questions there are (review: no 128-question render
+    /// stall under exclusive admission), and the estimated
+    /// required_max_seq admits the request on the retry.
+    #[test]
+    fn oversized_conversation_is_refused_before_rendering_the_questions() {
+        let req = session_req(d::MAX_QUESTIONS, 3000, None);
+        let (r, renders) = admit(&req, &no_eviction(512));
+        let e = r.err().expect("over max_seq");
+        assert_eq!(renders, 2, "probe and R_0 only");
+        assert_eq!(e.status, 422);
+        let required = e.required_max_seq.expect("required_max_seq");
+        let (retry, _) = admit(&req, &no_eviction(required));
+        let longest = retry
+            .expect("the estimate admits the retry")
+            .seqs
+            .iter()
+            .map(Vec::len)
+            .max();
+        assert!(
+            required <= longest.unwrap() + 1 + 17,
+            "estimate {required} vs {longest:?}"
+        );
+    }
+
+    #[test]
+    fn probe_over_the_eviction_limit_renders_no_question() {
+        let req = session_req(d::MAX_QUESTIONS, 3000, None);
+        let limits = SessionLimits {
+            max_seq: 1 << 20,
+            eviction_budget: Some(1000),
+            physical_cap: 1 << 20,
+        };
+        let (r, renders) = admit(&req, &limits);
+        let e = r.err().expect("over the eviction limit");
+        assert_eq!(renders, 1, "probe only");
+        assert_eq!(e.status, 422);
+        assert_eq!(e.required_max_seq, None);
+        assert!(e.message.contains("KV eviction"), "{}", e.message);
+    }
+
+    /// Jev's per-question limit fails on the offending question without
+    /// rendering the rest, as v1 does.
+    #[test]
+    fn over_long_question_fails_where_it_is_rendered() {
+        let req = session_req(d::MAX_QUESTIONS, 10, Some(3));
+        let (r, renders) = admit(&req, &no_eviction(1 << 20));
+        let e = r.err().expect("over the per-question limit");
+        assert_eq!(renders, 5, "probe + q0..=q3");
+        assert_eq!(e.status, 422);
+        assert!(e.message.contains("q003"), "{}", e.message);
+        assert!(e.message.contains("per-question limit"), "{}", e.message);
+    }
+
+    #[test]
+    fn required_max_seq_estimate_swaps_question_zero_for_the_longest() {
+        assert_eq!(
+            estimate_required_max_seq(90, 100, &[10, 30, 20]),
+            100 + 20 + 16 + 1
+        );
+        // Never below the probe.
+        assert_eq!(estimate_required_max_seq(500, 100, &[10]), 501);
     }
 
     #[test]
