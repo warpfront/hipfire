@@ -34,6 +34,19 @@ pub enum GgmlType {
     Q6K = 14,
     Q8K = 15,
     BF16 = 30,
+    // IQ-family: the sub-3-bit k-quants llama.cpp emits for mixed-precision
+    // checkpoints (GSQ-RCO / ISTA-DASLab and similar). Ids must match the GGML
+    // enum exactly — they arrive verbatim in the tensor table, and a wrong id
+    // silently misreads every block. Kernels live in `crate::iq_dequant`.
+    IQ2XXS = 16,
+    IQ2XS = 17,
+    IQ3XXS = 18,
+    IQ1S = 19,
+    IQ4NL = 20,
+    IQ3S = 21,
+    IQ2S = 22,
+    IQ4XS = 23,
+    IQ1M = 29,
     Q1_0 = 41,
     Q2_0 = 42,
 }
@@ -58,8 +71,27 @@ impl GgmlType {
             30 => Some(Self::BF16),
             41 => Some(Self::Q1_0),
             42 => Some(Self::Q2_0),
+            // IQ family — see `IqKind::from_ggml_id` for the kernel mapping.
+            16 => Some(Self::IQ2XXS),
+            17 => Some(Self::IQ2XS),
+            18 => Some(Self::IQ3XXS),
+            19 => Some(Self::IQ1S),
+            20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            22 => Some(Self::IQ2S),
+            23 => Some(Self::IQ4XS),
+            29 => Some(Self::IQ1M),
             _ => None,
         }
+    }
+
+    /// The IQ kernel backing this type, or `None` for legacy / float types.
+    ///
+    /// `GgmlType` stays the wire-level table (id ↔ geometry); the kernels and
+    /// their shared dispatch live in `iq_dequant` so this module does not have
+    /// to grow a match arm per IQ variant in three places at once.
+    pub fn iq_kind(self) -> Option<crate::iq_dequant::IqKind> {
+        crate::iq_dequant::IqKind::from_ggml_id(self as u32)
     }
 
     pub fn block_size(self) -> usize {
@@ -67,6 +99,17 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            // IQ4_NL is the only IQ variant on a 32-element block; every other
+            // IQ type is a 256-element super-block.
+            Self::IQ4NL => 32,
+            Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ2S
+            | Self::IQ3XXS
+            | Self::IQ3S
+            | Self::IQ1S
+            | Self::IQ1M
+            | Self::IQ4XS => 256,
             Self::Q1_0 | Self::Q2_0 => 128,
         }
     }
@@ -89,6 +132,18 @@ impl GgmlType {
             Self::Q8K => 290,
             Self::Q1_0 => 18,
             Self::Q2_0 => 34,
+            // sizeof(block_iq*) from ggml-common.h. Kept literal rather than
+            // forwarded from `IqKind::block_bytes` so a drift between the two
+            // shows up as a diff instead of silently agreeing.
+            Self::IQ2XXS => 66,
+            Self::IQ2XS => 74,
+            Self::IQ2S => 82,
+            Self::IQ3XXS => 98,
+            Self::IQ3S => 110,
+            Self::IQ1S => 50,
+            Self::IQ1M => 56,
+            Self::IQ4NL => 18,
+            Self::IQ4XS => 136,
         }
     }
 
@@ -332,16 +387,22 @@ fn dequant_q4_0(data: &[u8], n: usize) -> Vec<f32> {
             break;
         }
         let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        // ggml `dequantize_row_q4_0` 的排布：一个 32-元素块被切成前后两半 ——
+        // 低半字节填前半（j = 0..15），高半字节填后半（j + 16），**不是交错**：
+        //   y[i*qk + j]        = ((qs[j] & 0x0F) - 8) * d;
+        //   y[i*qk + j + qk/2] = ((qs[j] >>   4) - 8) * d;
+        // 之前写成 out[j*2] / out[j*2+1]，整块元素错位（差分台架实测全错）。
         for j in 0..16 {
             let byte = data[off + 2 + j];
             let lo = (byte & 0x0F) as i32 - 8;
             let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-            let idx = b * block_size + j * 2;
-            if idx < n {
-                out[idx] = lo as f32 * scale;
+            let idx_lo = b * block_size + j;
+            let idx_hi = idx_lo + 16;
+            if idx_lo < n {
+                out[idx_lo] = lo as f32 * scale;
             }
-            if idx + 1 < n {
-                out[idx + 1] = hi as f32 * scale;
+            if idx_hi < n {
+                out[idx_hi] = hi as f32 * scale;
             }
         }
     }
@@ -495,8 +556,13 @@ fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
             let m_odd = dmin * mins[sb_odd] as f32;
             for l in 0..32 {
                 let byte = ql[group * 32 + l];
-                let hbit = ((qh[l] >> group) & 1) as u8;
-                let hbit2 = ((qh[l] >> (group + 4)) & 1) as u8;
+                // ggml `dequantize_row_q5_K` 用滚动掩码 u1/u2：
+                //   u1 = 1 << (2 * group)   — 低半字节的第 5 位
+                //   u2 = 2 << (2 * group)   — 高半字节的第 5 位
+                // 即每 64 元素一组吃掉 qh 的**相邻两位**；
+                // 之前写成 `>> group` / `>> (group + 4)`，高位置取错。
+                let hbit = ((qh[l] >> (2 * group)) & 1) as u8;
+                let hbit2 = ((qh[l] >> (2 * group + 1)) & 1) as u8;
                 let idx_even = b * block_size + group * 64 + l;
                 let idx_odd = idx_even + 32;
                 if idx_even < n {
@@ -507,6 +573,68 @@ fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
                     let q = (((byte >> 4) & 0x0F) | (hbit2 << 4)) as f32;
                     out[idx_odd] = q * sc_odd - m_odd;
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Q2_K dequant — port of llama.cpp `dequantize_row_q2_K`.
+///
+/// ggml 0.25.3 layout — `d`/`dmin` sit at the END of the block, not the front:
+/// `block_q2_K { uint8_t scales[QK_K/16]; uint8_t qs[QK_K/4];
+///               union { struct { ggml_half d; ggml_half dmin; }; ggml_half2 dm; }; }`
+///   scales @ 0..16   qs @ 16..80   d @ 80..82   dmin @ 82..84
+///
+/// Q2_K is ASYMMETRIC, unlike the Q4_K/Q5_K/Q6_K kernels above: every 16-element
+/// sub-block carries both a 4-bit scale (low nibble of `scales[]`) AND a 4-bit
+/// min (high nibble), and reconstruction is `dl * q - ml`. Two details are easy
+/// to get wrong and are called out because of it:
+///
+/// * the 32-byte `qs` group is read with a `shift` of 0/2/4/6, advancing once
+///   per 32-element step — both 16-element halves of a step SHARE one shift
+///   (`shift += 2` sits AFTER the part loop in C), so each byte is reused
+///   across four 16-element runs;
+/// * the two halves of each 32-element step come from `q[l]` and `q[l + 16]`,
+///   not from neighbouring bytes.
+fn dequant_q2_k(data: &[u8], n: usize) -> Vec<f32> {
+    let block_size = 256;
+    let block_bytes = 84;
+    let nblocks = (n + block_size - 1) / block_size;
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        // Field order matters: scales/qs first, d/dmin last (see doc comment).
+        let scales = &data[off..off + 16];
+        let qs = &data[off + 16..off + 80];
+        let d = f16_to_f32(u16::from_le_bytes([data[off + 80], data[off + 81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[off + 82], data[off + 83]]));
+        let base = b * block_size;
+        // `scales` and `qs` are consumed serially across both 128-element
+        // halves: scales[0..8] / qs[0..32] for the first, then [8..16] / [32..64].
+        let mut is = 0usize;
+        for half in 0..2 {
+            let mut shift = 0u32;
+            for j in 0..4 {
+                // Two sub-blocks per step: `q[l]` then `q[l + 16]`.
+                for part in 0..2 {
+                    let sc = scales[is];
+                    is += 1;
+                    let dl = d * (sc & 0xF) as f32;
+                    let ml = dmin * (sc >> 4) as f32;
+                    let q = &qs[half * 32 + part * 16..];
+                    let row = base + half * 128 + j * 32 + part * 16;
+                    for l in 0..16 {
+                        let idx = row + l;
+                        if idx < n {
+                            out[idx] = dl * ((q[l] >> shift) & 3) as f32 - ml;
+                        }
+                    }
+                }
+                shift += 2;
             }
         }
     }
@@ -590,13 +718,22 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         GgmlType::Q8_0 => dequant_q8_0(data, n),
         GgmlType::Q2_0 => dequant_q2_0(data, n),
         GgmlType::Q1_0 => dequant_q1_0(data, n),
+        GgmlType::Q2K => dequant_q2_k(data, n),
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
-        other => panic!(
-            "GGUF tensor type {:?} not implemented (tensor: {})",
-            other, info.name
-        ),
+        other => match other.iq_kind() {
+            // IQ-family: forward to the ported llama.cpp kernels.
+            Some(kind) => {
+                let mut out = vec![0.0f32; n];
+                kind.dequantize(data, &mut out);
+                out
+            }
+            None => panic!(
+                "GGUF tensor type {:?} not implemented (tensor: {})",
+                other, info.name
+            ),
+        },
     }
 }
 

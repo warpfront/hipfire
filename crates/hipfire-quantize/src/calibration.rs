@@ -121,7 +121,19 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
         let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+
+        // ── Qwen3.5 / Qwen3.6 hybrid (arch 5 dense, arch 6 MoE) ─────────────
+        // Must run BEFORE the generic `.weight` strip below: `ssm_a` and
+        // `ssm_dt.bias` are emitted without a `.weight` suffix, so the generic
+        // path returns None for them and they would land under their raw GGUF
+        // names — which no loader call site ever looks up.
+        if matches!(arch_id, 5 | 6) {
+            if let Some(rel) = qwen35_hybrid_slot(slot_full) {
+                return Some(format!("model.layers.{layer_idx}.{rel}"));
+            }
+        }
+
+        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
         let slot = slot_full.strip_suffix(".weight")?;
         // Gemma 4 layers carry FOUR sandwich norms plus a per-layer scalar.
         // The generic Llama slot map below assumes two norms and maps
@@ -169,6 +181,73 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
         return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
     }
     None
+}
+
+/// Qwen3.5 / Qwen3.6 hybrid layer slot → hipfire safetensors relative name.
+///
+/// Authoritative source for the target names is the loader's own schema in
+/// `crates/hipfire-arch-qwen35/src/layer_driver.rs` (the `b.proj` / `b.norm` /
+/// `b.raw_f32` call sites). Keep this table in sync with that file, not with
+/// this comment.
+///
+/// Two properties of the GGUF side make a flat slot table sufficient — no
+/// `layer_types` lookup is needed here:
+///
+/// * The linear-attention slots (`attn_qkv`, `attn_gate`, `ssm_*`) appear ONLY
+///   on gated-DeltaNet layers, and the full-attention slots (`attn_q`, `attn_k`,
+///   `attn_v`, `attn_output`) ONLY on full-attention layers. The two slot sets
+///   are disjoint, so a slot name identifies its layer type unambiguously.
+///   (`attn_gate` is the one name that could collide in principle —
+///   `safetensors_to_ggml_name` maps Glimmer's `self_attn.gate_proj` to the same
+///   GGUF spelling — but no qwen35 layer emits both, and the two archs never
+///   reach this branch.)
+/// * `ssm_a` and `ssm_dt.bias` are the only two tensors emitted WITHOUT a
+///   trailing `.weight`; their HF counterparts (`linear_attn.A_log`,
+///   `linear_attn.dt_bias`) likewise have none, so they must bypass the
+///   generic suffix strip entirely.
+///
+/// `slot_full` is the remainder of the GGUF name after `blk.{N}.`, i.e. it may
+/// or may not end in `.weight`. Returns `None` for slots outside the hybrid
+/// schema so the caller falls through to the generic Llama-style map.
+fn qwen35_hybrid_slot(slot_full: &str) -> Option<String> {
+    // Tensors llama.cpp emits with no `.weight` suffix (a raw A_log vector and
+    // a bias). Checked before the suffix strip, not after.
+    match slot_full {
+        "ssm_a" => return Some("linear_attn.A_log".to_string()),
+        "ssm_dt.bias" => return Some("linear_attn.dt_bias".to_string()),
+        _ => {}
+    }
+
+    let slot = slot_full.strip_suffix(".weight")?;
+    let rel = match slot {
+        // FullAttention layers.
+        "attn_q" => "self_attn.q_proj",
+        "attn_k" => "self_attn.k_proj",
+        "attn_v" => "self_attn.v_proj",
+        "attn_output" => "self_attn.o_proj",
+        "attn_q_norm" => "self_attn.q_norm",
+        "attn_k_norm" => "self_attn.k_norm",
+        // LinearAttention / gated-DeltaNet layers.
+        "attn_qkv" => "linear_attn.in_proj_qkv",
+        // `attn_gate` is the DeltaNet z-gate projection, NOT an attention gate:
+        // on linear layers it is `in_proj_z`. Do not confuse it with Glimmer's
+        // `self_attn.gate_proj`, which shares the GGUF spelling but a different
+        // architecture.
+        "attn_gate" => "linear_attn.in_proj_z",
+        "ssm_alpha" => "linear_attn.in_proj_a",
+        "ssm_beta" => "linear_attn.in_proj_b",
+        "ssm_out" => "linear_attn.out_proj",
+        "ssm_conv1d" => "linear_attn.conv1d",
+        "ssm_norm" => "linear_attn.norm",
+        // Present on every layer type.
+        "attn_norm" => "input_layernorm",
+        // llama.cpp spells the pre-FFN norm `post_attention_norm`; HF spells it
+        // `post_attention_layernorm`. Without this arm the generic fallback
+        // keeps the GGUF spelling verbatim, and 64 tensors miss their lookup.
+        "post_attention_norm" => "post_attention_layernorm",
+        _ => return None,
+    };
+    Some(format!("{rel}.weight"))
 }
 
 /// True if the GGUF tensor's name is a 1D norm / RMSNorm scaling vector.
@@ -756,9 +835,185 @@ pub(crate) fn config_json_from_gguf(
     if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
     }
+    if arch_id == 5 || arch_id == 6 {
+        apply_qwen35_fields(gguf, prefix, &mut cfg);
+    }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
     serde_json::Value::Object(cfg)
+}
+
+/// Translate Qwen3.5 / Qwen3.6 hybrid GGUF metadata into the `config` fields
+/// the `hipfire-arch-qwen35` loader expects.
+///
+/// The generic `config_json_from_gguf` path only reads Llama-style scalar keys,
+/// and for this family that is not merely incomplete — it is silently wrong in
+/// two ways that only surface at load time:
+///
+/// * **No `layer_types`.** `qwen35/config.rs` falls back to
+///   `vec![LayerType::FullAttention; n_layers]`. On a hybrid checkpoint that
+///   makes every gated-DeltaNet layer claim a `self_attn` block it does not
+///   have: the load dies with `tensor not found: layers.N.self_attn.q_proj.weight`
+///   while all 48 linear layers' weights sit unread in the file. GGUF carries
+///   the interval, not the array, so the array is derived here.
+/// * **DeltaNet geometry defaults.** `linear_num_value_heads` defaults to 16 in
+///   the serde struct, but this family ships 48; leaving it stale halves
+///   `d_inner` and produces wrong `in_proj_z` / `out_proj` shapes. The GGUF
+///   `ssm.*` names also do not line up 1:1 with the HF field names, so each
+///   mapping below carries its own justification.
+///
+/// Also strips the MTP head from `num_hidden_layers`: llama.cpp's
+/// `block_count` includes the `nextn_predict_layers` extra blocks, while the
+/// trunk loader must not see them.
+///
+/// Field names are taken from `RawQwen35Config` in
+/// `crates/hipfire-arch-qwen35/src/qwen35/config.rs` — keep in sync with that
+/// struct, not with this comment.
+fn apply_qwen35_fields(
+    gguf: &gguf_input::GgufFile,
+    prefix: &str,
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let read_u = |k: &str| -> Option<u64> {
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::U8(x) => Some(*x as u64),
+            gguf_input::MetaValue::I8(x) => Some(*x as u64),
+            gguf_input::MetaValue::U16(x) => Some(*x as u64),
+            gguf_input::MetaValue::I16(x) => Some(*x as u64),
+            gguf_input::MetaValue::U32(x) => Some(*x as u64),
+            gguf_input::MetaValue::I32(x) => Some(*x as u64),
+            gguf_input::MetaValue::U64(x) => Some(*x),
+            gguf_input::MetaValue::I64(x) => Some(*x as u64),
+            _ => None,
+        })
+    };
+    let read_f = |k: &str| -> Option<f64> {
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::F32(x) => Some(*x as f64),
+            gguf_input::MetaValue::F64(x) => Some(*x),
+            _ => None,
+        })
+    };
+
+    // ── Trunk layer count ───────────────────────────────────────────────────
+    // `block_count` covers the trunk PLUS `nextn_predict_layers` MTP blocks
+    // appended after it (Qwen3.8-27B: 65 = 64 + 1). The trunk loader indexes
+    // `layer_types` by trunk index, so both must agree on the trunk length.
+    let block_count = read_u(&format!("{prefix}.block_count"));
+    let nextn = read_u(&format!("{prefix}.nextn_predict_layers")).unwrap_or(0);
+    let n_trunk = block_count.map(|b| b.saturating_sub(nextn));
+    if let Some(n) = n_trunk {
+        cfg.insert("num_hidden_layers".to_string(), serde_json::Value::from(n));
+    }
+
+    // ── layer_types ─────────────────────────────────────────────────────────
+    // GGUF ships `full_attention_interval` (every Ith layer is full attention)
+    // rather than HF's explicit string array. Verified against the reference
+    // HFQ's own `layer_types`: with interval 4 the full layers are indices
+    // 3, 7, 11, ... i.e. `(i + 1) % interval == 0`, one-based.
+    if let Some(n) = n_trunk {
+        let interval = read_u(&format!("{prefix}.full_attention_interval")).unwrap_or(0);
+        if interval == 0 {
+            eprintln!(
+                "warning: {prefix}.full_attention_interval missing; emitting all-full layer_types \
+                 which is wrong for a hybrid checkpoint"
+            );
+        }
+        let types: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let is_full = interval > 0 && (i + 1) % interval == 0;
+                serde_json::Value::from(if is_full {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                })
+            })
+            .collect();
+        cfg.insert(
+            "layer_types".to_string(),
+            serde_json::Value::Array(types),
+        );
+    }
+
+    // ── DeltaNet (gated linear attention) geometry ──────────────────────────
+    // GGUF `ssm.*` → HF `linear_*`. The names do not correspond literally:
+    //   ssm.group_count    → linear_num_key_heads    (16)
+    //   ssm.state_size     → linear_{key,value}_head_dim (128)
+    //   ssm.time_step_rank → linear_num_value_heads  (48)
+    //   ssm.inner_size     → linear_num_value_heads * linear_value_head_dim
+    //   ssm.conv_kernel    → linear_conv_kernel_dim  (4)
+    // Confirmed by shape algebra on a real checkpoint: the loader computes
+    //   qkv_dim = key_heads*key_dim*2 + value_heads*value_dim
+    //           = 16*128*2 + 48*128 = 10240
+    // which is exactly the published `linear_attn.in_proj_qkv.weight` row count,
+    // and `value_heads*value_dim = 6144 = ssm.inner_size`.
+    let ssm = |k: &str| read_u(&format!("{prefix}.ssm.{k}"));
+    let key_heads = ssm("group_count");
+    let head_dim = ssm("state_size");
+    let value_heads = ssm("time_step_rank");
+    let inner = ssm("inner_size");
+    let conv_kernel = ssm("conv_kernel");
+
+    if let Some(v) = key_heads {
+        cfg.insert("linear_num_key_heads".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = head_dim {
+        cfg.insert("linear_key_head_dim".to_string(), serde_json::Value::from(v));
+        cfg.insert(
+            "linear_value_head_dim".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = value_heads {
+        cfg.insert(
+            "linear_num_value_heads".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    if let Some(v) = conv_kernel {
+        cfg.insert(
+            "linear_conv_kernel_dim".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+    // Cross-check the reinterpretation against the redundant `inner_size`.
+    // A mismatch here means the ssm.* → linear_* mapping is wrong for this
+    // checkpoint; the shapes would then be silently wrong at load time, so
+    // make the operator aware instead.
+    if let (Some(vh), Some(hd), Some(inner)) = (value_heads, head_dim, inner) {
+        if vh * hd != inner {
+            eprintln!(
+                "warning: qwen35 ssm geometry inconsistent: time_step_rank({vh}) * \
+                 state_size({hd}) = {} != inner_size({inner}); the ssm.* → linear_* \
+                 mapping may not hold for this checkpoint",
+                vh * hd
+            );
+        }
+    }
+
+    // ── RoPE ────────────────────────────────────────────────────────────────
+    // The loader reads `rope_parameters.rope_theta`, NEVER a flat `rope_theta`
+    // (the generic path writes the flat key, which this struct ignores).
+    if let Some(t) = read_f(&format!("{prefix}.rope.freq_base")) {
+        cfg.insert(
+            "rope_parameters".to_string(),
+            serde_json::json!({ "rope_theta": t }),
+        );
+    }
+    // partial_rotary_factor = rope.dimension_count / attention.key_length
+    // (64 / 256 = 0.25 for this family). Written explicitly rather than relying
+    // on the serde default so a checkpoint with a different ratio loads right.
+    if let (Some(d), Some(k)) = (
+        read_u(&format!("{prefix}.rope.dimension_count")),
+        read_u(&format!("{prefix}.attention.key_length")),
+    ) {
+        if k > 0 {
+            cfg.insert(
+                "partial_rotary_factor".to_string(),
+                serde_json::Value::from(d as f64 / k as f64),
+            );
+        }
+    }
 }
 
 /// Translate gemma4-specific GGUF metadata into the `text_config` fields the

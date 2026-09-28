@@ -1009,6 +1009,8 @@ pub(crate) fn run() {
                 kmap_mode,
                 args.arch_id,
                 args.force_arch_id,
+                !args.no_q8_conv1d,
+                args.mtp_out.as_deref(),
             ) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
