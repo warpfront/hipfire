@@ -3607,6 +3607,50 @@ fn main() {
                 }
             }
 
+            "decide" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let refuse = |status: u16, message: &str| {
+                    hipfire_generate::decide::DecideError {
+                        status,
+                        message: message.to_string(),
+                        required_max_seq: None,
+                    }
+                    .to_reply(&id)
+                };
+                let reply = if slot_backend.as_ref().is_some_and(|s| s.active_count() > 0)
+                    || batch_scheduler
+                        .as_ref()
+                        .is_some_and(|s| s.active_count() > 0)
+                {
+                    refuse(
+                        409,
+                        "decide refused: slot or continuous-batch requests active",
+                    )
+                } else if let Some(m) = &mut model {
+                    let r = hipfire_generate::decide::run_decide(m, &mut gpu, &msg);
+                    // run_decide always resets the model; advance the epoch like `reset`.
+                    state_epoch = state_epoch.saturating_add(1);
+                    match r {
+                        Ok(out) => serde_json::json!({
+                            "type": "decided",
+                            "id": id,
+                            "answers": out.answers,
+                            "usage": out.usage,
+                            "timing": out.timing,
+                        }),
+                        Err(e) => e.to_reply(&id),
+                    }
+                } else {
+                    refuse(503, "no model loaded")
+                };
+                let _ = writeln!(stdout, "{reply}");
+                let _ = stdout.flush();
+            }
+
             "reset" => {
                 // attempt_id is mandatory and must be echoed exactly on the ack.
                 // Reject before mutating host/GPU state.
