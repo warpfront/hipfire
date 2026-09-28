@@ -39,12 +39,12 @@ def public_records(name):
     if name == "openbookqa":
         src = hf_rows("allenai/openbookqa", "main", 500)
         recs = [{"state": s["question_stem"], "type": "choice", "question": "Which option is the correct answer?",
-                 "options": dict(zip(s["choices"]["label"], s["choices"]["text"])), "label": s["answerKey"]}
+                 "options": dict(zip(s["choices"]["label"], s["choices"]["text"])), "label": str(s["answerKey"])}
                 for s in src]
     elif name == "commonsense_qa":
         src = hf_rows("tau/commonsense_qa", "default", 1221)
         recs = [{"state": s["question"], "type": "choice", "question": "Which option is the correct answer?",
-                 "options": dict(zip(s["choices"]["label"], s["choices"]["text"])), "label": s["answerKey"]}
+                 "options": dict(zip(s["choices"]["label"], s["choices"]["text"])), "label": str(s["answerKey"])}
                 for s in src]
     else:
         src = hf_rows("Rowan/hellaswag", "default", 2000)

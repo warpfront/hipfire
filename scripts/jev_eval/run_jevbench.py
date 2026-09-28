@@ -1,11 +1,13 @@
 """Run Running-Dolphins/jev-bench against local hipfire serve.
 
 jevbench.py writes predictions/results under its module ROOT, which would
-overwrite the committed Jev baselines — so ROOT is redirected to --out and the
-dataset cache is symlinked from the clone.
+overwrite the committed Jev baselines — so ROOT is redirected to --out. The
+dataset cache is copied from the clone's data/ directory (if it exists) into
+out/data — cache misses then write only under --out, never into the clone.
 """
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -14,15 +16,32 @@ ap.add_argument("--port", type=int, default=11435)
 ap.add_argument("--model", required=True, help="hipfire model tag, echoed in results")
 ap.add_argument("--out", required=True)
 ap.add_argument("--n", type=int, default=500, help="must be 500 to align with Jev's committed rows")
+ap.add_argument("--allow-misaligned", action="store_true",
+                help="allow --n != 500 (not recommended; Jev's predictions are n=500)")
 ap.add_argument("--workers", type=int, default=1, help="serve serialises decides; >1 only queues")
 ap.add_argument("what", nargs="+", help="task names, 'all', or x-<experiment>")
 a = ap.parse_args()
 
+if a.n != 500 and not a.allow_misaligned:
+    sys.exit(f"--n {a.n} doesn't align with Jev's committed predictions (n=500);\n"
+             "use --allow-misaligned to override, or set --n 500")
+
 bench = Path(os.environ.get("JEVBENCH_DIR", Path.home() / "repos/jev-evals/jev-bench"))
 out = Path(a.out).resolve()
 out.mkdir(parents=True, exist_ok=True)
-if not (out / "data").exists():
-    (out / "data").symlink_to(bench / "data")
+
+# Set up data directory: copy from bench/data (if it exists) into out/data
+data_dir = out / "data"
+if data_dir.is_symlink():
+    # Remove stale symlink from older runs
+    data_dir.unlink()
+if not data_dir.exists():
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bench_data = bench / "data"
+    if bench_data.exists():
+        for json_file in bench_data.glob("*.json"):
+            shutil.copy2(json_file, data_dir)
+
 os.environ.setdefault("TYPESAFE_API_KEY", "local-hipfire")
 os.environ["JEV_WORKERS"] = str(a.workers)
 sys.path.insert(0, str(bench))
@@ -32,6 +51,20 @@ jb.ROOT = out
 jb.API_URL = f"http://127.0.0.1:{a.port}/v1/systemone"
 jb.MODEL = a.model
 jb.WORKERS = a.workers
+
+# Validate task/experiment names
+for w in a.what:
+    if w == "all":
+        continue
+    if w.startswith("x-"):
+        name = w[2:]
+        if name not in jb.EXPERIMENTS:
+            sys.exit(f"unknown experiment {name!r}; see jevbench.py list of EXPERIMENTS\n"
+                     f"valid: {', '.join(sorted(jb.EXPERIMENTS.keys()))}")
+    else:
+        if w not in jb.TASKS:
+            sys.exit(f"unknown task {w!r}; see jevbench.py list of TASKS\n"
+                     f"valid: {', '.join(sorted(jb.TASKS.keys()))}")
 
 for w in a.what:
     if w.startswith("x-"):
