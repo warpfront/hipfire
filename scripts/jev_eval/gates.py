@@ -33,6 +33,17 @@ Gates:
       fallback when fdinfo is unreadable (FAIL if neither is readable).
   5   error replies end to end: 422 + required_max_seq for an over-long
       state, 422 for a malformed request; a normal decide succeeds after each.
+      With --cask the over-long reply is the eviction-limit 422 instead (no
+      required_max_seq; the message names the limit).
+  0   (--cask only, per daemon) CASK is really configured: an over-limit
+      decide gets the eviction-limit 422 (only reachable with eviction on),
+      then a normal decide succeeds.
+
+--cask loads every daemon with the load params `hipfire serve` sends when
+config has cask on (cask, cask_sidecar, cask_budget, cask_beta, cask_core_frac,
+cask_fold_m), defaults read from ~/.hipfire/config.json, so every gate
+(including 1a exact-mode equality) runs with eviction configured. The
+floor probe (1b) loads without CASK.
 
 Why two modes for gate 1: one-call vs split prefill differs by an inherent,
 deterministic precision property of kernels whose route or rounding depends
@@ -311,16 +322,49 @@ def gate_leak(d, n):
     return ok, f"device memory growth over {n} decides: {basis} (<64); {sys_s}"
 
 
-def gate_errors(d, max_seq):
-    notes, ok = [], True
-    # (i) state longer than the loaded max_seq -> 422 + required_max_seq.
-    long_state = "lorem ipsum dolor sit amet " * (max_seq // 2)
-    r = d.decide(long_state, QUESTIONS)
+def cask_limit(cask):
+    """Decide's eviction-safe limit: min(cask_budget, physical_cap). The load
+    requires max_seq >= budget + beta + 4 and physical_cap is clamped to at
+    least that, so the budget always binds."""
+    return cask["cask_budget"]
+
+
+def check_cask_over_limit(d, cask):
+    """Over the eviction limit: 422, no required_max_seq, message names the limit."""
+    limit = cask_limit(cask)
+    # >= 5 tokens per repetition, so well over the limit.
+    r = d.decide("lorem ipsum dolor sit amet " * limit, QUESTIONS)
     e = r.get("error") or {}
-    req = e.get("required_max_seq")
-    ok_i = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
-            and req > max_seq)
-    notes.append(f"over-long: status={e.get('status')} required_max_seq={req} (> {max_seq}) -> {ok_i}")
+    ok = (e.get("status") == 422 and "required_max_seq" not in e
+          and f"limited to {limit} tokens" in e.get("message", ""))
+    return ok, (f"over eviction limit: status={e.get('status')} "
+                f"required_max_seq={e.get('required_max_seq')} (absent) "
+                f"message={e.get('message')!r} (names limit {limit}) -> {ok}")
+
+
+def gate_cask_configured(d, cask):
+    ok, note = check_cask_over_limit(d, cask)
+    r = d.decide(STATE, QUESTIONS)
+    after = "answers" in r
+    return ok and after, (f"{note}; normal decide succeeds={after}"
+                          + ("" if after else f" reply={r}"))
+
+
+def gate_errors(d, max_seq, cask=None):
+    notes, ok = [], True
+    if cask:
+        # (i) under CASK: over the eviction limit -> 422, no required_max_seq.
+        ok_i, note = check_cask_over_limit(d, cask)
+        notes.append(note)
+    else:
+        # (i) state longer than the loaded max_seq -> 422 + required_max_seq.
+        long_state = "lorem ipsum dolor sit amet " * (max_seq // 2)
+        r = d.decide(long_state, QUESTIONS)
+        e = r.get("error") or {}
+        req = e.get("required_max_seq")
+        ok_i = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
+                and req > max_seq)
+        notes.append(f"over-long: status={e.get('status')} required_max_seq={req} (> {max_seq}) -> {ok_i}")
     ok &= ok_i
     after_i = "answers" in d.decide(STATE, QUESTIONS)
     notes.append(f"decide after={after_i}")
@@ -352,24 +396,48 @@ def run(name, fn, *args):
     return name, res
 
 
-def with_daemon(model, max_seq, log, env, body):
+def with_daemon(model, max_seq, log, env, body, cask=None):
     d = Daemon(stderr=log, env=env)
     try:
-        info = d.load(model, max_seq=max_seq)
+        info = d.load(model, max_seq=max_seq, params=cask)
         print(f"loaded {model}: arch={info.get('arch')} max_seq={max_seq}"
-              f"{' env=' + json.dumps(env) if env else ''}", flush=True)
-        return body(d)
+              f"{' env=' + json.dumps(env) if env else ''}"
+              f"{' cask=' + json.dumps(cask) if cask else ''}", flush=True)
+        pre = [run("0 CASK configured", gate_cask_configured, d, cask)] if cask else []
+        return pre + body(d)
     finally:
         d.close()
+
+
+def serve_cask_params(args):
+    """The cask* load params `hipfire serve` sends (crates/hipfire-cli/src/main.rs
+    load params), defaults from ~/.hipfire/config.json."""
+    cfg_path = Path.home() / ".hipfire/config.json"
+    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    sidecar = args.cask_sidecar or cfg.get("cask_sidecar", "")
+    if not sidecar or not Path(sidecar).is_file():
+        raise SystemExit(f"--cask needs a sidecar file (got {sidecar!r}); pass --cask-sidecar")
+    return {"cask": True, "cask_sidecar": sidecar,
+            "cask_budget": int(cfg.get("cask_budget", 16384)),
+            "cask_beta": int(cfg.get("cask_beta", 128)),
+            "cask_core_frac": float(cfg.get("cask_core_frac", 0.5)),
+            "cask_fold_m": int(cfg.get("cask_fold_m", 2))}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--max-seq", type=int, default=8192)
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="default 8192; with --cask the serve config max_seq (131072)")
+    ap.add_argument("--cask", action="store_true",
+                    help="load every daemon with CASK eviction configured as serve does")
+    ap.add_argument("--cask-sidecar", help="override config.json cask_sidecar")
     ap.add_argument("--leak-n", type=int, default=1000)
     ap.add_argument("--daemon-log", help="redirect daemon/probe stderr to this file prefix")
     a = ap.parse_args()
+    cask = serve_cask_params(a) if a.cask else None
+    if a.max_seq is None:
+        a.max_seq = 131072 if cask else 8192
     logs = []
 
     def log(suffix):
@@ -394,7 +462,7 @@ def main():
             print(f"FAIL         gate 1b default-mode noise floor: floor probe failed: {ex}", flush=True)
 
         results += with_daemon(a.model, a.max_seq, log("exact"), EXACT_ENV, lambda d: [
-            run("1a exact-mode bit-exactness", gate_exact_mode, d)])
+            run("1a exact-mode bit-exactness", gate_exact_mode, d)], cask)
 
         def default_body(d):
             r = []
@@ -404,9 +472,9 @@ def main():
                   run("2 question isolation", gate_isolation, d),
                   run("3 model left clean", gate_clean, d),
                   run("4 no leak", gate_leak, d, a.leak_n),
-                  run("5 error replies", gate_errors, d, a.max_seq)]
+                  run("5 error replies", gate_errors, d, a.max_seq, cask)]
             return r
-        results += with_daemon(a.model, a.max_seq, log("default"), None, default_body)
+        results += with_daemon(a.model, a.max_seq, log("default"), None, default_body, cask)
     finally:
         for f in logs:
             f.close()

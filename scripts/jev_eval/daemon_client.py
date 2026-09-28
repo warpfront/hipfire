@@ -64,8 +64,11 @@ class Daemon:
             if v.get("type") in types:
                 return v
 
-    def load(self, model, max_seq=8192):
-        self.send({"type": "load", "model": str(model), "params": {"max_seq": max_seq}})
+    def load(self, model, max_seq=8192, params=None):
+        """`params`: extra load params merged over `max_seq` (e.g. the cask*
+        keys `hipfire serve` sends)."""
+        self.send({"type": "load", "model": str(model),
+                   "params": {"max_seq": max_seq, **(params or {})}})
         v = self.recv_until({"loaded", "error"})
         if v["type"] != "loaded":
             raise RuntimeError(f"load failed: {v}")
