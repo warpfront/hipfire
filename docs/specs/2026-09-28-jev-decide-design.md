@@ -1,6 +1,7 @@
 # Jev-style decide endpoint — Design Spec
 
-> Status: **DRAFT — awaiting review** · Date: 2026-09-28
+> Status: **DRAFT — awaiting review** · Date: 2026-09-28 · Addendum §12
+> (session mode, v1.1; design approved 2026-09-28)
 > Author: nwoolmer
 >
 > A local, Jev-compatible decision endpoint: unstructured state plus typed
@@ -124,8 +125,8 @@ Run `scripts/check-crate-maps.py` after adding files.
    - clear `conversation_tokens` and the prefill checkpoints, so the AR
      prompt cache can't match decide tokens.
 
-   A decide does not preserve a cached chat conversation; it behaves like
-   serve's existing per-request reset.
+   A plain decide does not preserve a cached chat conversation; it behaves
+   like serve's existing per-request reset. Session mode (§12) keeps it.
    - call `DeltaNetSnapshot::free_gpu` explicitly. It has no `Drop`, so
      skipping this leaks device memory.
 
@@ -460,3 +461,349 @@ align row-for-row with examples rebuilt locally.
 **v1 is done when** all four GPU gates pass and the evaluation report exists.
 There is no accuracy bar; accuracy is a property of the model, and calibration
 is the later phase's job.
+
+## 12. Session mode (v1.1)
+
+> Addendum, 2026-09-28. The shape was approved by the human; this section
+> fixes the details. §1–§11 still hold for plain (`state`) requests.
+
+A plain decide resets the model before and after (§4.1), which destroys the
+chat conversation the daemon has cached. An agent that asks a routing
+question mid-conversation pays twice: the decide prefills the conversation
+as `state`, then the next chat turn re-prefills the whole conversation. In
+session mode the conversation itself is the state, and the cache survives.
+
+### 12.1 API
+
+`POST /v1/systemone` accepts a hipfire extension:
+
+```json
+{"model": "…", "messages": […], "tools": […], "tool_choice": "…", "questions": {…}}
+```
+
+- `messages`, `tools`, `tool_choice`: exactly what the agent sends to
+  `/v1/chat/completions`. Send the same values the chat requests use. They
+  change the rendered tokens (a Qwen template renders `tools` into the
+  system turn), and any difference turns a cache hit into a miss.
+- `questions`: unchanged (§7).
+- Exactly one of `state` / `messages`; both or neither is a 422. `state`
+  requests keep v1 behaviour, including the reset.
+- The response is unchanged: `{model, answers, usage}`.
+  - `usage.input_tokens` = E + Σ(len_i − E), where E is the conversation
+    length in tokens (§12.3).
+  - The `x-hipfire-timing` header adds:
+    - `mode: "session"`;
+    - `start`: `extend`, `resume` or `cold`;
+    - `cached_tokens`: conversation tokens reused, not prefilled;
+    - `conversation_prefill_tokens`;
+    - `committed`.
+  - `prefix_tokens` = E.
+- Daemon wire:
+  `{"type":"decide","id","messages","tools"?,"questions","_debug_no_snapshot"?}`.
+  The reply is unchanged. The daemon arm is unchanged too:
+  `handle_decide_message` dispatches on the mode.
+
+### 12.2 What the chat path caches
+
+These findings shaped the design.
+
+- **Contents after a Qwen AR generate.** `m.conversation_tokens` holds:
+  - the rendered prompt (`ar.rs:3937`);
+  - every generated token, thinking tokens included, through the raw
+    commit (`ar.rs:315-340`);
+  - `<|im_end|>` plus the `\n` trailer, when the turn ended on EOS
+    (`ar.rs:4824-4868`). A length-capped turn has neither.
+
+  With no eviction, `seq_pos == conversation_tokens.len()` and the
+  DeltaNet state is at that position.
+- **Next turn: render.** The next turn renders the full `messages` through
+  `build_cached_history_jinja`. It splices each assistant turn's verbatim
+  generated tokens from `asst_turn_cache` and re-supplies the generation
+  primer when the template renders history turns bare
+  (`ar.rs:3055-3135`).
+- **Next turn: LCP.** It then compares the render with
+  `conversation_tokens` (`ar.rs:3171-3176`):
+  - a strict forward extension sets `seq_pos = lcp` and prefills the rest
+    (`ar.rs:3438-3449`);
+  - otherwise it resumes from the latest prefill checkpoint ≤ lcp, on
+    qwen35 only (`ar.rs:3290-3390`). Checkpoints are taken at the first
+    prefill chunk and then every `ckpt_interval()` (2,048) tokens, at most
+    8 (`ar.rs:704-723`, `3880`, `4301`);
+  - failing that, a cold reset that keeps `asst_turn_cache`
+    (`ar.rs:3391-3434`).
+
+  The `done` event's `cached_tokens` is the reused length
+  (`ar.rs:380-404`).
+- **Eligibility** (`ar.rs:3025-3029`): `messages` present, no eviction,
+  `HIPFIRE_QWEN_PROMPT_CACHE` not `0`, and a non-empty conversation. Under
+  eviction every Jinja chat turn cold-resets (`ar.rs:3465-3470`).
+- **Serve** sends `reset` before a chat request only when the model is
+  neither `cache_capable` nor `continuous_batch_capable`
+  (`complete.rs:1668`).
+  - `cache_capable` means arch 5|6|9|10|12|14 (`daemon main.rs:2093`).
+  - Qwen3.5/3.6 (`Qwen35Carrier`, arch 5/6) therefore keeps the
+    conversation between turns.
+  - Llama-carrier archs 0/1 are reset before every chat turn. Session mode
+    works for them, correctly but cold every time.
+- **Templates.**
+  - They always render a generation prompt (`add_generation_prompt =>
+    true`, `prompt_frame.rs:1438`), so `messages` cannot be rendered on its
+    own.
+  - They may render a history turn differently depending on what follows:
+    Qwen drops past reasoning before the last user query.
+  - Qwen3.5 renders history assistant turns bare, while Qwen3.8 re-emits
+    the empty think block (`prompt_frame.rs:1540-1556`).
+- **v1's rollback** also clears `asst_turn_cache` (`common.rs:1265`).
+
+### 12.3 Rendering and the conversation end
+
+**Rendering.** For each question, R_i is the chat path's cached render of
+`messages + [user: question text]`, produced the same way the chat path
+renders a turn:
+
+- the same Jinja template and `tools`;
+- the same per-message normalisation (`maybe_normalize_prompt`, as the
+  daemon's `generate` arm applies it);
+- assistant turns spliced from `asst_turn_cache`, with the chat path's
+  primer rule;
+- `enable_thinking = false`.
+
+The question text is v1's question block with no state: `Question: …`,
+`Options:`, the labelled options, then `Answer with the option code only.`.
+No decide system prompt is added; the conversation's own system turn
+stands.
+
+R_i is a full render of the longer conversation, so any history rewrite
+the template applies when a user turn follows is already in it. The next
+chat turn renders it the same way. Nothing assumes that a render of
+`messages` alone is a prefix of R_i.
+
+**Conversation end E.**
+
+1. L = the longest common prefix of every R_i and a probe render (user turn
+   `.`), capped at min len − 1.
+2. E = the position of the last `<|im_start|>` in R_0[..L], which is the
+   opener of the appended turn.
+3. With no `<|im_start|>` token, E = L. The committed conversation then
+   includes the user-turn header, which costs at most a later cache miss.
+
+Every R_i shares R_0[..E]. The suffix R_i[E..] is the question turn plus the
+closed-think assistant opener.
+
+E stops before the opener so that the common agent case is an exact match:
+
+- the cached conversation ends with `<|im_end|>\n`;
+- the decide prefills nothing;
+- the next chat turn prefills exactly what it would have without the
+  decide.
+
+**Open assistant turns.** The template closes every turn it renders. Suppose
+the cached conversation ended mid-turn: a length cap left no `<|im_end|>`,
+and that turn was not stored in `asst_turn_cache`. The render then
+re-tokenizes the turn and adds the terminator. If the tokens agree, that is
+a delta; otherwise it is a resume or cold start. Either way the result is
+correct.
+
+**Cost.** Every question renders and tokenizes the whole conversation, as
+v1 does the state. That is O(questions × conversation) CPU.
+
+### 12.4 Lifecycle (daemon)
+
+1. **Plan.** This step is read-only on KV, DeltaNet, `seq_pos` and
+   `conversation_tokens`. Like a chat render, it may refresh
+   `asst_turn_cache`'s LRU order. It parses the request, checks the
+   preconditions and limits, renders, computes E, and picks the start.
+   Reuse is eligible only when all of these hold:
+   - no eviction;
+   - `HIPFIRE_QWEN_PROMPT_CACHE` is not `0`;
+   - `compact_offset == 0`;
+   - `conversation_tokens` is non-empty and
+     `seq_pos == conversation_tokens.len()`.
+
+   The start is then one of:
+   - **extend**, when `conversation_tokens` is a prefix of R_0[..E]. This
+     includes an exact match. Unlike the chat path's exact-match edge, an
+     exact match is safe here: every question suffix has at least one
+     token, so no token is re-applied to the DeltaNet state;
+   - **resume** from the latest prefill checkpoint ≤ lcp. This needs
+     checkpoint resume on and no speculator. The checkpoint is restored
+     through `decide_restore`, and later checkpoints and tokens are dropped,
+     as in the chat path;
+   - **cold**, otherwise. This is the attested rollback with
+     `asst_turn_cache` moved out and back. The chat path's own cold start
+     keeps that cache too, and its entries are keyed by content, not
+     position.
+2. Prefill the delta R_0[from..E] without logits. In the normal agent case
+   it is empty.
+3. Snapshot at E (`decide_save`).
+4. Per question: restore (except for the first question), prefill R_i[E..]
+   at E, and read the labels as in v1.
+5. Restore to E and commit:
+   - `conversation_tokens` = R_0[..E], and
+     `seq_pos = E = conversation_tokens.len()`;
+   - DeltaNet is at E;
+   - prefill checkpoints ≤ E are kept, and the decide takes none;
+   - `asst_turn_cache` is untouched;
+   - KV past E holds the last question's suffix. It is never read
+     (attention reads [0, pos]) and the next prefill overwrites it, just as
+     after a chat checkpoint resume.
+6. Free every snapshot on every path.
+
+**Speculator loaded** (DFlash/MTP, `m.speculator`). The drafter keeps its
+own context and checkpoint ring, which the decide hooks do not advance, so
+the decide never commits:
+
+- **extend:** take an extra snapshot at the cached end first, and restore
+  it last. The cache is left exactly as found, and the next chat turn
+  re-prefills the delta.
+- **resume:** not used.
+- **cold:** end with the attested rollback. The cache did not match
+  anyway.
+
+**Failure.** Any error after planning fails closed with the attested
+rollback, then returns 500. This is the chat path's invariant that a
+retained cache never holds uncommitted state (`ar.rs:3317-3324`).
+
+**Rollbacks.** Session mode never resets a reusable conversation. The only
+rollbacks are:
+
+- the cold start, when the cache does not match (the chat path would have
+  reset too);
+- speculator + non-extend;
+- fail-closed after an error.
+
+`handle_decide_message` reports each one, so the daemon bumps
+`state_epoch`.
+
+**Debug path.** `_debug_no_snapshot` renders as above, then runs v1's
+full-prefill path over each R_i: reset, one full prefill per question,
+reset. It is the S2 reference and ends reset, like v1.
+
+### 12.5 Preconditions, limits, eviction, thinking
+
+**Preconditions.** The v1 409s and 400s apply unchanged: pp/EP,
+`kv_adaptive`, multi-slot, active lanes, unsupported arch. Session mode also
+returns 400 when no Jinja chat template is available (none in the model, or
+`HIPFIRE_JINJA_CHAT=0`). Session mode must render exactly like the chat
+path, and that is Jinja.
+
+**Limits.**
+
+- Jev's limits apply to the question part only: each suffix R_i[E..] ≤
+  32,000 tokens and the suffixes together ≤ 64,000. Over either, 422 naming
+  the limit.
+- The conversation is bounded by context: longest R_i + 1 ≤ `max_seq`,
+  else 422 + `required_max_seq`. Serve then reloads, which drops the cache,
+  so the retry starts cold.
+
+**CASK / eviction.** Session mode never reuses under eviction. The chat
+cache is off there (`ar.rs:3025-3029`) and every chat turn cold-starts
+(`ar.rs:3465`), so there is nothing to keep. The rule:
+
+- always start cold; the rollback zeroes `compact_offset`;
+- the decide never calls `maybe_evict`;
+- the limit is v1's: longest R_i + 1 ≤ min(budget, `physical_cap`), else
+  422 without `required_max_seq`.
+
+Without eviction there is no compaction. `compact_offset == 0` is also
+required for reuse, as a defensive check.
+
+**Thinking.** Question turns render with `enable_thinking = false`, because
+the readout needs a closed think block. Reuse assumes the conversation
+renders the same under that setting.
+
+- This holds for Qwen3.5 templates. Their history rendering does not read
+  `enable_thinking`, and stored thinking turns replay as whole envelopes.
+- It fails for a template whose history rendering reads `enable_thinking`,
+  or for a thinking-on turn stored without reasoning. Those get a different
+  primer and fall back to resume or cold: correct, but slower.
+
+### 12.6 Serve
+
+When `messages` is present, serve projects `messages`, `tools` and
+`tool_choice` with the chat projection (`project_request_contract`):
+
+- `normalize_openai_messages`, with `reasoning_content` for Qwen3.5/3.6;
+- the default system prompt;
+- the `tool_choice` projection.
+
+It then forwards `messages` and `tools`. When the caller also sent `state`,
+serve forwards it too, so the daemon returns the 422. A projection error,
+such as an invalid `tool_choice`, is a 422. There is no reset. Model
+selection, admission, the `required_max_seq` retry, keep-warm and response
+shaping are as in §6.
+
+### 12.7 Errors (additions to §8)
+
+| Condition | Response |
+|---|---|
+| Both or neither of `state` / `messages` (with a model loaded) | 422 |
+| `messages` not a non-empty array of chat messages; `tools` not an array; bad `tool_choice` (serve) | 422 |
+| Chat template render fails (e.g. the template raises on the message order) | 422 |
+| Session mode without a Jinja chat template | 400 |
+| A question suffix > 32,000 tokens, or all suffixes > 64,000 | 422 naming the limit, no `required_max_seq` |
+| Conversation + longest question > `max_seq` | 422 + `required_max_seq` |
+| Under eviction: conversation + longest question + 1 > min(budget, `physical_cap`) | 422, no `required_max_seq` |
+| GPU error mid-session | 500; the model is rolled back and the cache lost |
+
+### 12.8 Gates
+
+These are added to `scripts/jev_eval/gates.py`, alongside the v1 gates.
+
+**What "equal" means.** A session answer is compared with a one-call full
+prefill of the identical token sequence R_i from a reset model
+(`_debug_no_snapshot` in session mode). A plain decide whose `state` is the
+rendered conversation is not comparable: it wraps the state in the v1
+system prompt and `State:` block, so its tokens differ.
+
+- **S1 cache reuse.** Chat turn 1 from reset. The baseline is turn 2 with
+  no decide; the test repeats turn 1 from reset, runs a session decide,
+  then turn 2.
+  - **(a) No delta, default kernels.** The decide's `messages` end with the
+    assistant reply. Pass requires:
+    - turn 2 greedy text bit-identical to the baseline;
+    - decide `start = extend` and `conversation_prefill_tokens = 0`;
+    - turn 2 `cached_tokens` == the decide's `prefix_tokens` (== the
+      baseline's).
+  - **(b) Delta, exact env.** The decide's `messages` include the next user
+    turn. The split point moves, so this runs in exact mode. Pass requires:
+    - identical text;
+    - `conversation_prefill_tokens > 0`;
+    - turn 2 `cached_tokens` == E, which is greater than the baseline's.
+  - S1 is INCONCLUSIVE, not FAIL, when the baseline itself gets no cache
+    hit (Llama carrier, `--cask`). It must PASS on Qwen3.5.
+- **S2 exactness (exact env).** Per question, Δ = 0 between the session
+  answer and the reference, both for a warm start (`extend`) and for a
+  start with another conversation cached (not `extend`).
+- **S3 no leak.** 1,000 session decides alternating two conversations in
+  pairs, so `extend` and `cold` both run and are counted. The daemon's
+  fdinfo growth must be < 64 MiB (gate 4's measure).
+- **S4 stale cache (exact env).** Conversation C, with its own conversation
+  cached, gives answers W. Then:
+  - with an unrelated conversation cached (`start = cold`), the answers
+    must equal W;
+  - with a conversation sharing a ~2.5k-token prefix cached
+    (`start = resume`), the answers must equal W (Δ = 0);
+  - the next chat turn on C must reuse the decide's conversation
+    (`cached_tokens` == E).
+
+  S4 is INCONCLUSIVE if no checkpoint precedes the shared prefix, since the
+  resume path is then not exercised.
+- **S5 error replies.** Both, neither, an empty `messages` and a
+  non-list `messages` each return 422. After them, a session decide on the
+  committed conversation must start `extend` with zero delta, proving the
+  refusals left the cache untouched.
+- **`--cask`.** Every start is `cold`. S1 reports INCONCLUSIVE, S2 and S4
+  compare answers only, and S3 and S5 expect `cold`.
+
+**v1.1 is done when** S1–S5 pass on Qwen3.5-4B and the v1 gates still pass.
+On a Llama-carrier model S1 may be INCONCLUSIVE and the rest must pass.
+
+### 12.9 Deferred
+
+- Taking DeltaNet checkpoints during the decide's conversation prefill, so
+  that a later divergent chat turn can resume inside it.
+- Tokenizing only the question tail at the `<|im_start|>` boundary, instead
+  of the whole conversation per question.
+- Reasoning controls for session questions (thinking-on agents), and a
+  commit that also advances a loaded speculator.
