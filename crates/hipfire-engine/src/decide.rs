@@ -190,6 +190,55 @@ pub fn shared_prefix_len(seqs: &[Vec<u32>]) -> usize {
     n.min(min_len.saturating_sub(1))
 }
 
+/// Numerically stable softmax in f64.
+pub fn softmax(logits: &[f32]) -> Vec<f64> {
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let exps: Vec<f64> = logits.iter().map(|&x| (x as f64 - max).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    exps.into_iter().map(|e| e / sum).collect()
+}
+
+fn argmax(p: &[f64]) -> usize {
+    let mut best = 0;
+    for i in 1..p.len() {
+        if p[i] > p[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// Jev answer JSON for one question. `label_logits` follows `labels_for`
+/// order. Probabilities are not rounded.
+pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
+    let p = softmax(label_logits);
+    let k = p.len() as f64;
+    let top = argmax(&p);
+    match &q.kind {
+        QuestionKind::Choice { keys, .. } => {
+            let probs: serde_json::Map<String, Value> =
+                keys.iter().cloned().zip(p.iter().map(|&x| json!(x))).collect();
+            let confidence = (p[top] - 1.0 / k) / (1.0 - 1.0 / k);
+            json!({"type": "choice", "choice": keys[top], "probabilities": probs,
+                   "confidence": confidence})
+        }
+        QuestionKind::Score { .. } => {
+            let probs: serde_json::Map<String, Value> =
+                p.iter().enumerate().map(|(i, &x)| (i.to_string(), json!(x))).collect();
+            let score: f64 = p.iter().enumerate().map(|(i, &x)| i as f64 * x).sum();
+            json!({"type": "score", "score": score, "probabilities": probs,
+                   "confidence": p[top]})
+        }
+        QuestionKind::Noul { .. } => json!({"type": "noul", "noul": p[0]}),
+    }
+}
+
+/// Additive accounting observed for Jev: shared prefix once, each suffix once.
+pub fn usage_json(prefix_len: usize, seq_lens: &[usize]) -> Value {
+    let input: usize = prefix_len + seq_lens.iter().map(|l| l - prefix_len).sum::<usize>();
+    json!({"input_tokens": input, "output_tokens": 0})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +377,80 @@ mod tests {
         assert_eq!(shared_prefix_len(&[vec![1, 2, 3], vec![1, 2, 3]]), 2);
         assert_eq!(shared_prefix_len(&[vec![5, 6, 7]]), 2);
         assert_eq!(shared_prefix_len(&[vec![1], vec![2]]), 0);
+    }
+
+    fn choice_q(keys: &[&str]) -> Question {
+        Question { name: "q".into(), instructions: "i".into(),
+            kind: QuestionKind::Choice { keys: keys.iter().map(|s| s.to_string()).collect(),
+                descriptions: keys.iter().map(|s| s.to_string()).collect() } }
+    }
+
+    #[test]
+    fn softmax_is_normalised_and_stable() {
+        let p = softmax(&[1000.0, 1000.0]);
+        assert!((p[0] - 0.5).abs() < 1e-12 && (p[1] - 0.5).abs() < 1e-12);
+        let p = softmax(&[0.0, (3.0f32).ln()]);
+        assert!((p[1] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn choice_confidence_matches_jev_formula_on_committed_rows() {
+        // Probabilities + confidences copied from Jev's committed answers:
+        // jev-ood-calibration results/jev_openbookqa.jsonl row 0 (K=4) and
+        // jev-bench predictions/banking77.jsonl row 1 (K=77, top only).
+        let q = choice_q(&["A", "B", "C", "D"]);
+        let probs = [1e-9_f32, 0.69, 0.31, 1e-9];
+        let logits: Vec<f32> = probs.iter().map(|p| p.ln()).collect();
+        let a = assemble_answer(&q, &logits);
+        assert_eq!(a["type"], "choice");
+        assert_eq!(a["choice"], "B");
+        let conf = a["confidence"].as_f64().unwrap();
+        assert!((conf - 0.58).abs() <= 0.02, "conf {conf}");
+        // K=77 with p_top=0.44 → Jev reported 0.42.
+        let k = 77;
+        let pm = 0.44_f64;
+        assert!(((pm - 1.0 / k as f64) / (1.0 - 1.0 / k as f64) - 0.42).abs() <= 0.02);
+    }
+
+    #[test]
+    fn choice_uniform_has_zero_confidence_and_probs_keyed_by_user_keys() {
+        let q = choice_q(&["billing", "shipping", "general"]);
+        let a = assemble_answer(&q, &[0.0, 0.0, 0.0]);
+        assert!(a["confidence"].as_f64().unwrap().abs() < 1e-12);
+        let probs = a["probabilities"].as_object().unwrap();
+        assert_eq!(probs.len(), 3);
+        assert!((probs["shipping"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn score_mean_and_confidence() {
+        let q = Question { name: "s".into(), instructions: "i".into(),
+            kind: QuestionKind::Score { levels: vec!["a".into(), "b".into(), "c".into(), "d".into()] } };
+        // Jev synth score row: probs [0, .05, .89, .06], confidence .89.
+        let probs = [1e-9_f32, 0.05, 0.89, 0.06];
+        let logits: Vec<f32> = probs.iter().map(|p| p.ln()).collect();
+        let a = assemble_answer(&q, &logits);
+        assert_eq!(a["type"], "score");
+        let score = a["score"].as_f64().unwrap();
+        assert!((score - (0.05 + 2.0 * 0.89 + 3.0 * 0.06)).abs() < 1e-4, "score {score}");
+        assert!((a["confidence"].as_f64().unwrap() - 0.89).abs() < 1e-4);
+        assert!(a["probabilities"].get("2").is_some());
+    }
+
+    #[test]
+    fn noul_is_p_yes_without_confidence() {
+        let q = Question { name: "n".into(), instructions: "i".into(),
+            kind: QuestionKind::Noul { true_desc: None, false_desc: None } };
+        let a = assemble_answer(&q, &[(3.0f32).ln(), 0.0]);
+        assert_eq!(a["type"], "noul");
+        assert!((a["noul"].as_f64().unwrap() - 0.75).abs() < 1e-6);
+        assert!(a.get("confidence").is_none());
+    }
+
+    #[test]
+    fn usage_is_additive() {
+        let u = usage_json(100, &[110, 125]);
+        assert_eq!(u["input_tokens"], 135);
+        assert_eq!(u["output_tokens"], 0);
     }
 }
