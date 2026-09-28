@@ -24,6 +24,7 @@ use std::any::Any;
 // root glue, not an arch→arch dependency (those arch crates never name it). A
 // future cleanup could hoist the emitter + grammar into the runtime.
 use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
+use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 
 // ─── Source-only metadata (tokenizer / chat_template / arch_id) ───────
 //
@@ -745,6 +746,83 @@ impl Carrier for Qwen35Carrier {
             }
         }
     }
+    fn decide_supported(&self) -> bool {
+        true
+    }
+    fn decide_prefill_logits(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let Some(b) = m.qwen35_mut() else {
+            return Some(Err("decide: qwen35 bundle missing".into()));
+        };
+        let r = hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+            gpu,
+            &b.weights,
+            &b.config,
+            tokens,
+            start_pos,
+            &mut b.kv_cache,
+            &mut b.dn_state,
+            &b.scratch,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| format!("decide prefill: {e:?}"))
+        .and_then(|()| {
+            gpu.download_f32(&b.scratch.logits)
+                .map_err(|e| format!("decide logits: {e:?}"))
+        });
+        if r.is_ok() {
+            m.seq_pos = start_pos + tokens.len();
+        }
+        Some(r)
+    }
+    fn decide_save(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Option<Result<crate::decide::DecideSnapshot, String>> {
+        let seq_pos = m.seq_pos;
+        let Some(b) = m.qwen35_mut() else {
+            return Some(Err("decide: qwen35 bundle missing".into()));
+        };
+        let mut snap = match DeltaNetSnapshot::new_for(gpu, &b.dn_state) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(format!("decide snapshot alloc: {e:?}"))),
+        };
+        if let Err(e) = snap.save_from(&b.dn_state, gpu) {
+            snap.free_gpu(gpu);
+            return Some(Err(format!("decide snapshot save: {e:?}")));
+        }
+        Some(Ok(crate::decide::DecideSnapshot {
+            seq_pos,
+            recurrent: Some(snap),
+        }))
+    }
+    fn decide_restore(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        snap: &crate::decide::DecideSnapshot,
+    ) -> Option<Result<(), String>> {
+        let Some(b) = m.qwen35_mut() else {
+            return Some(Err("decide: qwen35 bundle missing".into()));
+        };
+        let Some(rec) = snap.recurrent.as_ref() else {
+            return Some(Err("decide: qwen35 snapshot has no recurrent state".into()));
+        };
+        if let Err(e) = rec.restore_to(&mut b.dn_state, gpu) {
+            return Some(Err(format!("decide restore: {e:?}")));
+        }
+        m.seq_pos = snap.seq_pos;
+        Some(Ok(()))
+    }
 }
 
 // ─── LlamaCarrier ────────────────────────────────────────────────────
@@ -1056,6 +1134,52 @@ impl Carrier for LlamaCarrier {
                 meta.chat_template,
             )
         })
+    }
+    fn decide_supported(&self) -> bool {
+        true
+    }
+    fn decide_prefill_logits(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let Some(b) = m.llama_mut() else {
+            return Some(Err("decide: llama bundle missing".into()));
+        };
+        let r = hipfire_runtime::llama::forward_prefill_batch(
+            gpu, &b.weights, &b.config, tokens, start_pos, &mut b.kv, &b.scratch, None,
+        )
+        .map_err(|e| format!("decide prefill: {e:?}"))
+        .and_then(|()| {
+            gpu.download_f32(&b.scratch.logits)
+                .map_err(|e| format!("decide logits: {e:?}"))
+        });
+        if r.is_ok() {
+            m.seq_pos = start_pos + tokens.len();
+        }
+        Some(r)
+    }
+    fn decide_save(
+        &self,
+        m: &mut crate::LoadedModel,
+        _gpu: &mut rdna_compute::Gpu,
+    ) -> Option<Result<crate::decide::DecideSnapshot, String>> {
+        // Pure-attention: KV is positional, the cursor is the whole state.
+        Some(Ok(crate::decide::DecideSnapshot {
+            seq_pos: m.seq_pos,
+            recurrent: None,
+        }))
+    }
+    fn decide_restore(
+        &self,
+        m: &mut crate::LoadedModel,
+        _gpu: &mut rdna_compute::Gpu,
+        snap: &crate::decide::DecideSnapshot,
+    ) -> Option<Result<(), String>> {
+        m.seq_pos = snap.seq_pos;
+        Some(Ok(()))
     }
 }
 
