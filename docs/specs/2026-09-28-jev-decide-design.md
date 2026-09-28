@@ -281,19 +281,60 @@ All three:
 - route tests for the 422 paths, `jev-latest` → loaded model, 503 with no
   model loaded, and the timing header.
 
-**GPU correctness gates** (all must pass to merge):
+**GPU correctness gates** (`scripts/jev_eval/gates.py`; none may FAIL to
+merge; run on Qwen3.5 (DeltaNet restore) and a Llama-family model):
 
-1. **Snapshot exactness.** For each question, decide's label log-probabilities
-   equal a from-scratch prefill of that question's full prompt (no snapshot),
-   within tolerance. Run on Qwen3.5 (DeltaNet restore) and a Llama-family
-   model.
-2. **Isolation.** The "secret code" probe: a fact in a sibling question does
-   not raise another question's probability; the same fact in the state does.
+Prefilling a prompt in one call and prefilling it as prefix + suffix give
+slightly different logits. This drift is deterministic and is an inherent
+precision property of kernels whose route or rounding depends on the batch
+composition. It is not a decide defect
+(`.superpowers/sdd/split-prefill-investigation.md`). The kernels involved:
+
+- the int8-activation MMQ GEMM routes: HFQ4G128 on 16-aligned batches on
+  gfx1151, and the generic MQ4 route at batch ≥ 128;
+- the Q8 GatedDeltaNet state, which is requantised once per launch rather
+  than per token;
+- the f16 WMMA flash-prefill attention, which is not bit-row-invariant at
+  head dim 128.
+
+Suffixes of 1–3 tokens also take the per-token path. Gate 1 therefore runs
+in two modes.
+
+1. **Snapshot exactness.**
+   - **(a) Exact mode.** The daemon is launched with those routes pinned to
+     their row-invariant alternatives: `HIPFIRE_HFQ4G128_MMQ=0`,
+     `HIPFIRE_MMQ=0`, `HIPFIRE_DN_REQUANT_PER_TOKEN=1`,
+     `HIPFIRE_FLASH_PREFILL=0`. The following must hold bit for bit
+     (Δ = 0):
+     - the snapshot decide equals the `_debug_no_snapshot` decide for every
+       question;
+     - each question of a multi-question request equals a single-question
+       full-prefill decide of that question alone, so restore leaves no
+       residue.
+   - **(b) Default mode.** The max |Δ log p| between the snapshot and
+     full-prefill label distributions must not exceed the model's path-noise
+     floor. The floor is one-call prefill vs token-by-token prefill of the
+     same prompts, measured each run by the `split_prefill_probe` example.
+   - **(c) Order invariance.** Every ordering of the questions gives
+     identical answers, at a fixed split point.
+   - The decide must not return the 400 "cannot disable thinking" error.
+2. **Isolation.** The "secret code" probe, judged relative to a baseline
+   with no code anywhere:
+   - the gate passes iff |P(code | code in a sibling question) − P(code | no
+     code)| ≤ 0.05 and P(code | code in the state) − P(code | no code)
+     ≥ 0.3;
+   - if only the sensitivity half fails, the model cannot do the probe, and
+     the result is INCONCLUSIVE. That is not a failure, but it is reported.
 3. **Model left clean.** A greedy `generate` after a decide yields exactly
    the same tokens as a `generate` after a plain `reset`. This covers both a
    prompt that shares a prefix with the decide state (must not hit a stale
    LCP cache) and one that doesn't.
 4. **No leak.** Device memory is flat over 1,000 decides.
+5. **Error replies.** Two requests are sent, and a normal decide must still
+   succeed after each:
+   - a state longer than the loaded `max_seq` returns 422 with an integer
+     `required_max_seq` greater than `max_seq`;
+   - a malformed request returns 422.
 
 ## 11. Evaluation
 

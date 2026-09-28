@@ -26,6 +26,14 @@
 //! skips the KV-cache byte diff; `PROBE_SEGS=c1,c2` overrides segment sizes;
 //! `PROBE_KV_MODE` (default q8) and `PROBE_STATE_QUANT` (qwen35 DeltaNet
 //! state: q8|fp32|q4) pass through to `load_model`.
+//!
+//! Decide noise-floor mode: `PROBE_DECIDE_REQUEST=<file.json>` (a decide
+//! request `{"state":..,"questions":..}`) renders every question's prompt
+//! exactly as `run_decide` does, runs it as A (one call) and C (token by
+//! token), and prints one line `DECIDE_FLOOR {json}` with, per question, the
+//! max |Δ log p| between A's and C's label distributions (softmax over the
+//! option-code logits, the quantity decide answers are built from). Used by
+//! `scripts/jev_eval/gates.py` gate 1b as the per-model path-noise floor.
 
 use hipfire_loader::{Carrier, LoadedModel};
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
@@ -200,6 +208,12 @@ fn main() {
     let carrier = hipfire_loader::carrier_for(m.arch_id).expect("carrier");
     assert!(carrier.decide_supported(), "carrier has no decide hooks");
 
+    if let Ok(req_path) = std::env::var("PROBE_DECIDE_REQUEST") {
+        decide_floor(carrier, &mut m, &mut gpu, &req_path);
+        rollback(&mut m, &mut gpu);
+        return;
+    }
+
     let mut toks = m.tokenizer.as_ref().expect("tokenizer").encode(TEXT);
     // Repeat the text if short, then truncate to N.
     while toks.len() < want_n {
@@ -340,4 +354,72 @@ fn main() {
         );
     }
     rollback(&mut m, &mut gpu);
+}
+
+/// Decide noise floor: per question, A (one call) vs C (token by token) on the
+/// exact prompt `run_decide` renders, compared over the label distribution.
+fn decide_floor(
+    carrier: &dyn Carrier,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    req_path: &str,
+) {
+    use hipfire_engine::decide as d;
+    let req: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(req_path).expect("read request"))
+            .expect("request json");
+    let parsed = d::parse_request(&req).expect("parse_request");
+    // Same rendering as hipfire_generate::decide::run_decide.
+    let mut prompts: Vec<(String, Vec<u32>, Vec<u32>)> = Vec::new();
+    {
+        let tok = m.tokenizer.as_ref().expect("tokenizer");
+        let single = |s: &str| tok.encode(s).len() == 1;
+        for q in &parsed.questions {
+            let labels = d::labels_for(q, single).expect("labels_for");
+            let ids: Vec<u32> = labels.iter().map(|l| tok.encode(l)[0]).collect();
+            let user = d::build_user_text(&parsed.state_text, q, &labels);
+            let (tokens, started_in_think) = hipfire_engine::prompt::batch_render_prompt_tokens(
+                &user,
+                Some(d::SYSTEM_PROMPT),
+                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                tok,
+                m.chat_template.as_ref(),
+                0,
+                None,
+                false,
+                None,
+            )
+            .expect("render");
+            assert!(!started_in_think, "template cannot close thinking");
+            prompts.push((q.name.clone(), ids, tokens));
+        }
+    }
+    let mut per = serde_json::Map::new();
+    let mut worst = 0.0f64;
+    for (name, ids, toks) in &prompts {
+        let n = toks.len();
+        let pick = |l: &[f32]| ids.iter().map(|&i| l[i as usize]).collect::<Vec<f32>>();
+        let a = d::softmax(&pick(&run_segments(carrier, m, gpu, toks, &[n])));
+        let c = d::softmax(&pick(&run_segments(
+            carrier,
+            m,
+            gpu,
+            toks,
+            &vec![1usize; n],
+        )));
+        let dl = a
+            .iter()
+            .zip(&c)
+            .map(|(p, q)| (p.max(1e-12).ln() - q.max(1e-12).ln()).abs())
+            .fold(0.0, f64::max);
+        worst = worst.max(dl);
+        per.insert(
+            name.clone(),
+            serde_json::json!({"tokens": n, "a_vs_c": dl, "a_dist": a, "c_dist": c}),
+        );
+    }
+    println!(
+        "DECIDE_FLOOR {}",
+        serde_json::json!({"arch_id": m.arch_id, "max": worst, "per_question": per})
+    );
 }

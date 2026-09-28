@@ -1,5 +1,6 @@
 """Minimal JSONL driver for target/release/daemon (decide gates + evals)."""
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -7,11 +8,12 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 class Daemon:
-    def __init__(self, binary=None, stderr=None):
+    def __init__(self, binary=None, stderr=None, env=None):
+        """`env`: extra environment variables for the daemon process."""
         self.p = subprocess.Popen(
             [str(binary or REPO / "target/release/daemon")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
-            text=True, bufsize=1)
+            env={**os.environ, **(env or {})}, text=True, bufsize=1)
         self.attempt = 0
 
     def send(self, msg):
