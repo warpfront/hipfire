@@ -57,6 +57,14 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+/// Unwraps a Carrier decide hook result. `None` means the carrier claimed
+/// `decide_supported()` but didn't actually provide this hook — an internal
+/// carrier contract violation, hence 500 (not a client-facing 4xx).
+fn hook<T>(r: Option<Result<T, String>>) -> Result<T, DecideError> {
+    r.ok_or_else(|| DecideError::new(500, "decide hook returned None despite decide_supported()"))?
+        .map_err(|e| DecideError::new(500, e))
+}
+
 pub fn run_decide(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -99,14 +107,15 @@ pub fn run_decide(
 
         let mut label_ids: Vec<Vec<u32>> = Vec::new();
         let mut seqs: Vec<Vec<u32>> = Vec::new();
+        let mut any_started_in_think = false;
         for q in &parsed.questions {
             let labels = d::labels_for(q, single).map_err(|e| DecideError::new(422, e))?;
             label_ids.push(labels.iter().map(|l| tok.encode(l)[0]).collect());
             let user = d::build_user_text(&parsed.state_text, q, &labels);
-            let (tokens, _) = hipfire_engine::prompt::batch_render_prompt_tokens(
+            let (tokens, started_in_think) = hipfire_engine::prompt::batch_render_prompt_tokens(
                 &user,
                 Some(d::SYSTEM_PROMPT),
-                hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
                 tok,
                 m.chat_template.as_ref(),
                 0,
@@ -115,7 +124,14 @@ pub fn run_decide(
                 None,
             )
             .map_err(|e| DecideError::new(500, format!("prompt render: {e}")))?;
+            any_started_in_think |= started_in_think;
             seqs.push(tokens);
+        }
+        if any_started_in_think {
+            return Err(DecideError::new(
+                400,
+                "model chat template cannot disable thinking; decide needs a closed-think assistant turn",
+            ));
         }
         (label_ids, seqs)
     };
@@ -144,30 +160,18 @@ pub fn run_decide(
     let mut per_q_logits: Vec<Vec<f32>> = Vec::with_capacity(seqs.len());
 
     let result: Result<(), DecideError> = (|| {
-        let hook_err = |r: Option<Result<(), String>>| -> Result<(), DecideError> {
-            r.ok_or_else(|| DecideError::new(400, "decide hook unsupported"))?
-                .map_err(|e| DecideError::new(500, e))
-        };
         let mut snapshot: Option<hipfire_loader::decide::DecideSnapshot> = None;
         if prefix_len > 0 {
             let t = Instant::now();
-            carrier
-                .decide_prefill_logits(m, gpu, &seqs[0][..prefix_len], 0)
-                .ok_or_else(|| DecideError::new(400, "decide hook unsupported"))?
-                .map_err(|e| DecideError::new(500, e))?;
-            snapshot = Some(
-                carrier
-                    .decide_save(m, gpu)
-                    .ok_or_else(|| DecideError::new(400, "decide hook unsupported"))?
-                    .map_err(|e| DecideError::new(500, e))?,
-            );
+            hook(carrier.decide_prefill_logits(m, gpu, &seqs[0][..prefix_len], 0))?;
+            snapshot = Some(hook(carrier.decide_save(m, gpu))?);
             timing["state_prefill_ms"] = json!(ms(t));
         }
         let loop_result: Result<(), DecideError> = (|| {
             for (i, seq) in seqs.iter().enumerate() {
                 let t = Instant::now();
                 match &snapshot {
-                    Some(s) if i > 0 => hook_err(carrier.decide_restore(m, gpu, s))?,
+                    Some(s) if i > 0 => hook(carrier.decide_restore(m, gpu, s))?,
                     Some(_) => {} // first question continues straight from the snapshot point
                     None => {
                         if i > 0 {
@@ -175,11 +179,23 @@ pub fn run_decide(
                         }
                     }
                 }
-                let logits = carrier
-                    .decide_prefill_logits(m, gpu, &seq[prefix_len..], prefix_len)
-                    .ok_or_else(|| DecideError::new(400, "decide hook unsupported"))?
-                    .map_err(|e| DecideError::new(500, e))?;
-                per_q_logits.push(label_ids[i].iter().map(|&id| logits[id as usize]).collect());
+                let logits =
+                    hook(carrier.decide_prefill_logits(m, gpu, &seq[prefix_len..], prefix_len))?;
+                let label_logits: Result<Vec<f32>, DecideError> = label_ids[i]
+                    .iter()
+                    .map(|&id| {
+                        logits.get(id as usize).copied().ok_or_else(|| {
+                            DecideError::new(
+                                500,
+                                format!(
+                                    "decide: label token id {id} outside logits (len {})",
+                                    logits.len()
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                per_q_logits.push(label_logits?);
                 timing["question_ms"]
                     .as_array_mut()
                     .unwrap()
@@ -233,5 +249,17 @@ mod tests {
             required_max_seq: None,
         };
         assert!(e.to_reply("d2")["error"].get("required_max_seq").is_none());
+    }
+
+    #[test]
+    fn hook_unwraps_carrier_results() {
+        let e = hook::<u32>(None).unwrap_err();
+        assert_eq!(e.status, 500);
+
+        let e = hook::<u32>(Some(Err("x".to_string()))).unwrap_err();
+        assert_eq!(e.status, 500);
+        assert_eq!(e.message, "x");
+
+        assert_eq!(hook(Some(Ok(7))).unwrap(), 7);
     }
 }
