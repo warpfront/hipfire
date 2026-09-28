@@ -545,6 +545,10 @@ These findings shaped the design.
     conversation between turns.
   - Llama-carrier archs 0/1 are reset before every chat turn. Session mode
     works for them, correctly but cold every time.
+  - With `continuous_batch_size > 1`, chat turns run in batch lanes that
+    keep their own caches, not `m.conversation_tokens`. A session decide
+    then never finds the conversation cached: reuse is effectively never
+    available and every start is cold. That is correct, only slower.
 - **Templates.**
   - They always render a generation prompt (`add_generation_prompt =>
     true`, `prompt_frame.rs:1438`), so `messages` cannot be rendered on its
@@ -695,6 +699,21 @@ path, and that is Jinja.
 - The conversation is bounded by context: longest R_i + 1 ≤ `max_seq`,
   else 422 + `required_max_seq`. Serve then reloads, which drops the cache,
   so the retry starts cold.
+- **Fail-fast order.** Every render re-renders and tokenizes the whole
+  conversation, and up to 128 questions run under exclusive admission, so a
+  hostile oversized conversation must be refused before the questions
+  render. The probe (§12.3) renders first:
+  - over the eviction limit (below): 422 before any question renders;
+  - over `max_seq`: 422 after R_0 only. `required_max_seq` is estimated as
+    R_0's length with question 0's text swapped for the longest question's
+    (each text tokenized alone) plus 16 tokens of slack. It only sizes
+    serve's reload; the retry re-checks exactly.
+
+  Then each R_i is checked as it is rendered: the eviction limit, and Jev's
+  limits on the suffixes past a provisional E computed from the probe and
+  R_0. The final E can only be shorter, so every early refusal is one the
+  final check would also make. The exact limits and `max_seq` are checked
+  once every R_i is rendered.
 
 **CASK / eviction.** Session mode never reuses under eviction. The chat
 cache is off there (`ar.rs:3025-3029`) and every chat turn cold-starts
@@ -707,6 +726,16 @@ cache is off there (`ar.rs:3025-3029`) and every chat turn cold-starts
 
 Without eviction there is no compaction. `compact_offset == 0` is also
 required for reuse, as a defensive check.
+
+**Multimodal content.** Session decide is text-only. Serve returns 422 for a
+`messages` content part that is not `text` (e.g. `image_url`), instead of
+letting the chat projection flatten it to its text parts and drop the image.
+A direct daemon request with array content fails to parse (422).
+
+**Security.** `cached_tokens` and `start` in `x-hipfire-timing` show whether
+a prefix of the request is in the daemon's cache, so a caller can learn
+whether another client's conversation shares that prefix. Chat's own
+`cached_tokens` already reveals the same.
 
 **Thinking.** Question turns render with `enable_thinking = false`, because
 the readout needs a closed think block. Reuse assumes the conversation
@@ -727,6 +756,12 @@ When `messages` is present, serve projects `messages`, `tools` and
 - the default system prompt;
 - the `tool_choice` projection.
 
+Before projecting, serve refuses (422) a `messages` that is not a non-empty
+array, one in which no message has a role the projection keeps (it would
+reach the daemon as only the injected default system message, which the
+daemon accepts), and non-text content parts (§12.5). The message is the
+daemon's: `messages must be a non-empty array of chat messages`.
+
 It then forwards `messages` and `tools`. When the caller also sent `state`,
 serve forwards it too, so the daemon returns the 422. A projection error,
 such as an invalid `tool_choice`, is a 422. There is no reset. Model
@@ -738,7 +773,8 @@ shaping are as in §6.
 | Condition | Response |
 |---|---|
 | Both or neither of `state` / `messages` (with a model loaded) | 422 |
-| `messages` not a non-empty array of chat messages; `tools` not an array; bad `tool_choice` (serve) | 422 |
+| `messages` not a non-empty array of chat messages, or none with a chat role; `tools` not an array; bad `tool_choice` (serve) | 422 |
+| A non-text `messages` content part, e.g. `image_url` (serve) | 422 |
 | Chat template render fails (e.g. the template raises on the message order) | 422 |
 | Session mode without a Jinja chat template | 400 |
 | A question suffix > 32,000 tokens, or all suffixes > 64,000 | 422 naming the limit, no `required_max_seq` |
@@ -802,7 +838,9 @@ system prompt and `State:` block, so its tokens differ.
 - **S3 no leak.** 1,000 session decides cycling three conversations, two of
   which share a long prefix. A chat turn per cycle re-creates the prefill
   checkpoints, so `extend`, `resume` and `cold` all run and are counted.
-  The daemon's fdinfo growth must be < 64 MiB (gate 4's measure).
+  The daemon's fdinfo growth must be < 64 MiB (gate 4's measure). On an
+  arch without prefill checkpoints (the Llama carrier) resume cannot run:
+  S3 passes on `extend` and `cold` alone.
 - **S4 stale cache (exact env).** Conversation C, with its own chat turn
   cached, gives answers W (decode-built). Then:
   - with an unrelated conversation cached (`start = cold`), the answers
@@ -815,17 +853,29 @@ system prompt and `State:` block, so its tokens differ.
     (`cached_tokens` == E).
 
   S4 is INCONCLUSIVE if no checkpoint precedes the shared prefix, since the
-  resume path is then not exercised.
+  resume path is then not exercised. On an arch without prefill checkpoints
+  (the Llama carrier) it compares the answers only and is PASS or FAIL.
 - **S5 error replies.** Both, neither, an empty `messages` and a
-  non-list `messages` each return 422. After them, a session decide on the
-  committed conversation must start `extend` with zero delta, proving the
-  refusals left the cache untouched.
+  non-list `messages` each return 422. An over-long conversation (over
+  `max_seq`; with `--cask` over the eviction limit) with 128 questions
+  returns 422 (+ `required_max_seq` > `max_seq` without `--cask`) within 4×
+  the time of the same refusal with one question + 0.25 s, proving the
+  fail-fast order (§12.5). After them, a session decide on the committed
+  conversation must start `extend` with zero delta, proving the refusals
+  left the cache untouched.
 - **`--cask`.** Every start is `cold`. S1 reports INCONCLUSIVE, and S2 and
   S4 compare answers only. Every leg is prefill-built there, so every Δ must
   be 0. S3 and S5 expect `cold`.
 
 **v1.1 is done when** S1–S5 pass on Qwen3.5-4B and the v1 gates still pass.
-On a Llama-carrier model S1 may be INCONCLUSIVE and the rest must pass.
+On a Llama-carrier model S1 may be INCONCLUSIVE and the rest must pass (S3
+on `extend` + `cold`, S4 on answers only).
+
+**S6a (speculator) evidence.** The next-turn text identity is weak evidence:
+speculative decoding is lossless, so the greedy text would match even if the
+decide had disturbed the drafter. The meaningful check is `cached_tokens`
+equality with the no-decide baseline. Only a DFlash drafter is gated; MTP is
+not.
 
 ### 12.9 Deferred
 
@@ -835,3 +885,18 @@ On a Llama-carrier model S1 may be INCONCLUSIVE and the rest must pass.
   of the whole conversation per question.
 - Reasoning controls for session questions (thinking-on agents), and a
   commit that also advances a loaded speculator.
+- The DFlash chat path's cache ends at `<|im_end|>` without the `\n`
+  trailer the render has, so a session decide after a DFlash chat turn
+  prefills one token (S6a tolerates it). Store the trailer there as the AR
+  path does.
+- `split_prefill_probe` loads with a hard-coded `max_seq` 512. A longer
+  prompt used to be an illegal GPU memory access; it is now refused with a
+  message before the prefill. Sizing `max_seq` from the input would let the
+  floor be measured on S4's ~2k-token conversation instead of reusing
+  CONV_C's.
+- A thinking-on S1a variant: the chat turns run with thinking on, the
+  decide renders thinking off, and the next turn must still reuse the
+  cache (§12.5 "Thinking").
+- An end-to-end serve GPU test: `/v1/systemone` session requests through
+  `hipfire serve` with a real daemon (the route tests use a fake daemon; the
+  gates talk to the daemon directly).
