@@ -12,9 +12,17 @@ pub const MAX_SCORE_LEVELS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuestionKind {
-    Choice { keys: Vec<String>, descriptions: Vec<String> },
-    Score { levels: Vec<String> },
-    Noul { true_desc: Option<String>, false_desc: Option<String> },
+    Choice {
+        keys: Vec<String>,
+        descriptions: Vec<String>,
+    },
+    Score {
+        levels: Vec<String>,
+    },
+    Noul {
+        true_desc: Option<String>,
+        false_desc: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,9 +77,9 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
         let criteria = q.get("criteria");
         let kind = match ty {
             "choice" => {
-                let obj = criteria
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| format!("{name}.criteria must be an object of option -> description"))?;
+                let obj = criteria.and_then(Value::as_object).ok_or_else(|| {
+                    format!("{name}.criteria must be an object of option -> description")
+                })?;
                 if !(2..=MAX_CHOICE_OPTIONS).contains(&obj.len()) {
                     return Err(format!(
                         "{name}.criteria must have 2..={MAX_CHOICE_OPTIONS} options, got {}",
@@ -84,23 +92,25 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
                 }
             }
             "score" => {
-                let arr = criteria
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| format!("{name}.criteria must be an array of level descriptions"))?;
+                let arr = criteria.and_then(Value::as_array).ok_or_else(|| {
+                    format!("{name}.criteria must be an array of level descriptions")
+                })?;
                 if !(2..=MAX_SCORE_LEVELS).contains(&arr.len()) {
                     return Err(format!(
                         "{name}.criteria must have 2..={MAX_SCORE_LEVELS} levels, got {}",
                         arr.len()
                     ));
                 }
-                QuestionKind::Score { levels: arr.iter().map(desc_string).collect() }
+                QuestionKind::Score {
+                    levels: arr.iter().map(desc_string).collect(),
+                }
             }
             "noul" => {
                 let (mut t, mut f) = (None, None);
                 if let Some(c) = criteria {
-                    let obj = c
-                        .as_object()
-                        .ok_or_else(|| format!("{name}.criteria must be an object {{true, false}}"))?;
+                    let obj = c.as_object().ok_or_else(|| {
+                        format!("{name}.criteria must be an object {{true, false}}")
+                    })?;
                     for (k, val) in obj {
                         let s = val
                             .as_str()
@@ -113,7 +123,10 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
                         }
                     }
                 }
-                QuestionKind::Noul { true_desc: t, false_desc: f }
+                QuestionKind::Noul {
+                    true_desc: t,
+                    false_desc: f,
+                }
             }
             other => {
                 return Err(format!(
@@ -121,9 +134,16 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
                 ))
             }
         };
-        questions.push(Question { name: name.clone(), instructions, kind });
+        questions.push(Question {
+            name: name.clone(),
+            instructions,
+            kind,
+        });
     }
-    Ok(DecideRequest { state_text: render_state(state), questions })
+    Ok(DecideRequest {
+        state_text: render_state(state),
+        questions,
+    })
 }
 
 pub const SYSTEM_PROMPT: &str =
@@ -131,13 +151,20 @@ pub const SYSTEM_PROMPT: &str =
 
 /// `A`..`Z`, then `AA`..`ZZ`, keeping only candidates the model's tokenizer
 /// encodes as exactly one token. Deterministic order.
-pub fn assign_codes(k: usize, is_single_token: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+pub fn assign_codes(
+    k: usize,
+    is_single_token: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
     let letters: Vec<char> = ('A'..='Z').collect();
     let singles = letters.iter().map(|c| c.to_string());
     let doubles = letters
         .iter()
         .flat_map(|a| letters.iter().map(move |b| format!("{a}{b}")));
-    let codes: Vec<String> = singles.chain(doubles).filter(|c| is_single_token(c)).take(k).collect();
+    let codes: Vec<String> = singles
+        .chain(doubles)
+        .filter(|c| is_single_token(c))
+        .take(k)
+        .collect();
     if codes.len() < k {
         return Err(format!(
             "model tokenizer supplies only {} single-token option codes, need {k}",
@@ -147,14 +174,20 @@ pub fn assign_codes(k: usize, is_single_token: impl Fn(&str) -> bool) -> Result<
     Ok(codes)
 }
 
-pub fn labels_for(q: &Question, is_single_token: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+pub fn labels_for(
+    q: &Question,
+    is_single_token: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
     let labels: Vec<String> = match &q.kind {
         QuestionKind::Choice { keys, .. } => return assign_codes(keys.len(), is_single_token),
         QuestionKind::Score { levels } => (0..levels.len()).map(|i| i.to_string()).collect(),
         QuestionKind::Noul { .. } => vec!["Yes".into(), "No".into()],
     };
     if let Some(bad) = labels.iter().find(|l| !is_single_token(l)) {
-        return Err(format!("{}: label {bad:?} is not a single token for this model", q.name));
+        return Err(format!(
+            "{}: label {bad:?} is not a single token for this model",
+            q.name
+        ));
     }
     Ok(labels)
 }
@@ -165,12 +198,18 @@ pub fn build_user_text(state_text: &str, q: &Question, labels: &[String]) -> Str
     let descs: Vec<String> = match &q.kind {
         QuestionKind::Choice { descriptions, .. } => descriptions.clone(),
         QuestionKind::Score { levels } => levels.clone(),
-        QuestionKind::Noul { true_desc, false_desc } => vec![
+        QuestionKind::Noul {
+            true_desc,
+            false_desc,
+        } => vec![
             true_desc.clone().unwrap_or_else(|| "yes".into()),
             false_desc.clone().unwrap_or_else(|| "no".into()),
         ],
     };
-    let mut s = format!("State:\n{state_text}\n\nQuestion: {}\nOptions:\n", q.instructions);
+    let mut s = format!(
+        "State:\n{state_text}\n\nQuestion: {}\nOptions:\n",
+        q.instructions
+    );
     for (label, desc) in labels.iter().zip(descs.iter()) {
         s.push_str(&format!("{label}. {desc}\n"));
     }
@@ -211,21 +250,30 @@ fn argmax(p: &[f64]) -> usize {
 /// Jev answer JSON for one question. `label_logits` follows `labels_for`
 /// order. Probabilities are not rounded.
 pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
-    debug_assert!(label_logits.len() >= 2, "assemble_answer: need at least 2 labels");
+    debug_assert!(
+        label_logits.len() >= 2,
+        "assemble_answer: need at least 2 labels"
+    );
     let p = softmax(label_logits);
     let k = p.len() as f64;
     let top = argmax(&p);
     match &q.kind {
         QuestionKind::Choice { keys, .. } => {
-            let probs: serde_json::Map<String, Value> =
-                keys.iter().cloned().zip(p.iter().map(|&x| json!(x))).collect();
+            let probs: serde_json::Map<String, Value> = keys
+                .iter()
+                .cloned()
+                .zip(p.iter().map(|&x| json!(x)))
+                .collect();
             let confidence = (p[top] - 1.0 / k) / (1.0 - 1.0 / k);
             json!({"type": "choice", "choice": keys[top], "probabilities": probs,
                    "confidence": confidence})
         }
         QuestionKind::Score { .. } => {
-            let probs: serde_json::Map<String, Value> =
-                p.iter().enumerate().map(|(i, &x)| (i.to_string(), json!(x))).collect();
+            let probs: serde_json::Map<String, Value> = p
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| (i.to_string(), json!(x)))
+                .collect();
             let score: f64 = p.iter().enumerate().map(|(i, &x)| i as f64 * x).sum();
             json!({"type": "score", "score": score, "probabilities": probs,
                    "confidence": p[top]})
@@ -237,8 +285,15 @@ pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
 /// Additive accounting observed for Jev: shared prefix once, each suffix once.
 /// Precondition: every `seq_lens[i] >= prefix_len`.
 pub fn usage_json(prefix_len: usize, seq_lens: &[usize]) -> Value {
-    debug_assert!(seq_lens.iter().all(|&l| l >= prefix_len), "usage_json: sequence shorter than prefix_len");
-    let input: usize = prefix_len + seq_lens.iter().map(|l| l.saturating_sub(prefix_len)).sum::<usize>();
+    debug_assert!(
+        seq_lens.iter().all(|&l| l >= prefix_len),
+        "usage_json: sequence shorter than prefix_len"
+    );
+    let input: usize = prefix_len
+        + seq_lens
+            .iter()
+            .map(|l| l.saturating_sub(prefix_len))
+            .sum::<usize>();
     json!({"input_tokens": input, "output_tokens": 0})
 }
 
@@ -267,14 +322,23 @@ mod tests {
         match &c.kind {
             QuestionKind::Choice { keys, descriptions } => {
                 assert_eq!(keys, &vec!["billing".to_string(), "shipping".to_string()]);
-                assert_eq!(descriptions, &vec!["money".to_string(), "parcels".to_string()]);
+                assert_eq!(
+                    descriptions,
+                    &vec!["money".to_string(), "parcels".to_string()]
+                );
             }
             _ => panic!("wrong kind"),
         }
         let s = r.questions.iter().find(|q| q.name == "q_score").unwrap();
         assert!(matches!(&s.kind, QuestionKind::Score { levels } if levels.len() == 3));
         let n = r.questions.iter().find(|q| q.name == "q_noul").unwrap();
-        assert!(matches!(&n.kind, QuestionKind::Noul { true_desc: None, false_desc: None }));
+        assert!(matches!(
+            &n.kind,
+            QuestionKind::Noul {
+                true_desc: None,
+                false_desc: None
+            }
+        ));
     }
 
     #[test]
@@ -295,22 +359,32 @@ mod tests {
         assert!(err_of(json!({"questions": {}})).contains("state"));
         assert!(err_of(json!({"state": 5, "questions": {"q": {}}})).contains("state"));
         assert!(err_of(json!({"state": "s", "questions": {}})).contains("questions"));
-        assert!(err_of(q(json!({"type": "choice", "criteria": {"a": "x", "b": "y"}})))
-            .contains("q.instructions"));
-        assert!(err_of(q(json!({"type": "choice", "instructions": "i", "criteria": {"a": "x"}})))
-            .contains("2..=255"));
+        assert!(err_of(q(
+            json!({"type": "choice", "criteria": {"a": "x", "b": "y"}})
+        ))
+        .contains("q.instructions"));
+        assert!(err_of(q(
+            json!({"type": "choice", "instructions": "i", "criteria": {"a": "x"}})
+        ))
+        .contains("2..=255"));
         let many: serde_json::Map<String, serde_json::Value> =
             (0..256).map(|i| (format!("k{i}"), json!("d"))).collect();
-        assert!(err_of(q(json!({"type": "choice", "instructions": "i", "criteria": many})))
-            .contains("2..=255"));
-        assert!(err_of(q(json!({"type": "score", "instructions": "i", "criteria": ["a"]})))
-            .contains("2..=10"));
+        assert!(err_of(q(
+            json!({"type": "choice", "instructions": "i", "criteria": many})
+        ))
+        .contains("2..=255"));
+        assert!(err_of(q(
+            json!({"type": "score", "instructions": "i", "criteria": ["a"]})
+        ))
+        .contains("2..=10"));
         assert!(err_of(q(json!({"type": "score", "instructions": "i",
                                 "criteria": ["a","b","c","d","e","f","g","h","i","j","k"]})))
-            .contains("2..=10"));
+        .contains("2..=10"));
         assert!(err_of(q(json!({"type": "boolean", "instructions": "i"}))).contains("q.type"));
-        assert!(err_of(q(json!({"type": "noul", "instructions": "i", "criteria": {"true": 1}})))
-            .contains("q.criteria"));
+        assert!(err_of(q(
+            json!({"type": "noul", "instructions": "i", "criteria": {"true": 1}})
+        ))
+        .contains("q.criteria"));
     }
 
     #[test]
@@ -342,40 +416,76 @@ mod tests {
     #[test]
     fn labels_per_type() {
         let all = |_: &str| true;
-        let score = Question { name: "s".into(), instructions: "i".into(),
-            kind: QuestionKind::Score { levels: vec!["a".into(), "b".into(), "c".into()] } };
+        let score = Question {
+            name: "s".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Score {
+                levels: vec!["a".into(), "b".into(), "c".into()],
+            },
+        };
         assert_eq!(labels_for(&score, all).unwrap(), vec!["0", "1", "2"]);
-        let noul = Question { name: "n".into(), instructions: "i".into(),
-            kind: QuestionKind::Noul { true_desc: None, false_desc: None } };
+        let noul = Question {
+            name: "n".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Noul {
+                true_desc: None,
+                false_desc: None,
+            },
+        };
         assert_eq!(labels_for(&noul, all).unwrap(), vec!["Yes", "No"]);
     }
 
     #[test]
     fn labels_error_when_digit_or_yes_no_is_not_single_token() {
-        let score = Question { name: "s".into(), instructions: "i".into(),
-            kind: QuestionKind::Score { levels: vec!["a".into(), "b".into()] } };
+        let score = Question {
+            name: "s".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Score {
+                levels: vec!["a".into(), "b".into()],
+            },
+        };
         assert!(labels_for(&score, |s: &str| s != "1").is_err());
-        let noul = Question { name: "n".into(), instructions: "i".into(),
-            kind: QuestionKind::Noul { true_desc: None, false_desc: None } };
+        let noul = Question {
+            name: "n".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Noul {
+                true_desc: None,
+                false_desc: None,
+            },
+        };
         assert!(labels_for(&noul, |s: &str| s != "Yes").is_err());
     }
 
     #[test]
     fn user_text_layout() {
-        let q = Question { name: "q".into(), instructions: "Which queue?".into(),
-            kind: QuestionKind::Choice { keys: vec!["billing".into(), "shipping".into()],
-                descriptions: vec!["money".into(), "parcels".into()] } };
+        let q = Question {
+            name: "q".into(),
+            instructions: "Which queue?".into(),
+            kind: QuestionKind::Choice {
+                keys: vec!["billing".into(), "shipping".into()],
+                descriptions: vec!["money".into(), "parcels".into()],
+            },
+        };
         let t = build_user_text("the state", &q, &["A".into(), "B".into()]);
         assert_eq!(t, "State:\nthe state\n\nQuestion: Which queue?\nOptions:\nA. money\nB. parcels\n\nAnswer with the option code only.");
-        let n = Question { name: "n".into(), instructions: "Angry?".into(),
-            kind: QuestionKind::Noul { true_desc: Some("shouting".into()), false_desc: None } };
+        let n = Question {
+            name: "n".into(),
+            instructions: "Angry?".into(),
+            kind: QuestionKind::Noul {
+                true_desc: Some("shouting".into()),
+                false_desc: None,
+            },
+        };
         let t = build_user_text("s", &n, &["Yes".into(), "No".into()]);
         assert!(t.ends_with("Options:\nYes. shouting\nNo. no\n\nAnswer with the option code only."));
     }
 
     #[test]
     fn shared_prefix_is_lcp_capped_below_shortest() {
-        assert_eq!(shared_prefix_len(&[vec![1, 2, 3, 9], vec![1, 2, 3, 8, 7]]), 3);
+        assert_eq!(
+            shared_prefix_len(&[vec![1, 2, 3, 9], vec![1, 2, 3, 8, 7]]),
+            3
+        );
         // Identical sequences: cap at len - 1 so each suffix is non-empty.
         assert_eq!(shared_prefix_len(&[vec![1, 2, 3], vec![1, 2, 3]]), 2);
         assert_eq!(shared_prefix_len(&[vec![5, 6, 7]]), 2);
@@ -383,9 +493,14 @@ mod tests {
     }
 
     fn choice_q(keys: &[&str]) -> Question {
-        Question { name: "q".into(), instructions: "i".into(),
-            kind: QuestionKind::Choice { keys: keys.iter().map(|s| s.to_string()).collect(),
-                descriptions: keys.iter().map(|s| s.to_string()).collect() } }
+        Question {
+            name: "q".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Choice {
+                keys: keys.iter().map(|s| s.to_string()).collect(),
+                descriptions: keys.iter().map(|s| s.to_string()).collect(),
+            },
+        }
     }
 
     #[test]
@@ -427,23 +542,37 @@ mod tests {
 
     #[test]
     fn score_mean_and_confidence() {
-        let q = Question { name: "s".into(), instructions: "i".into(),
-            kind: QuestionKind::Score { levels: vec!["a".into(), "b".into(), "c".into(), "d".into()] } };
+        let q = Question {
+            name: "s".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Score {
+                levels: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            },
+        };
         // Jev synth score row: probs [0, .05, .89, .06], confidence .89.
         let probs = [1e-9_f32, 0.05, 0.89, 0.06];
         let logits: Vec<f32> = probs.iter().map(|p| p.ln()).collect();
         let a = assemble_answer(&q, &logits);
         assert_eq!(a["type"], "score");
         let score = a["score"].as_f64().unwrap();
-        assert!((score - (0.05 + 2.0 * 0.89 + 3.0 * 0.06)).abs() < 1e-4, "score {score}");
+        assert!(
+            (score - (0.05 + 2.0 * 0.89 + 3.0 * 0.06)).abs() < 1e-4,
+            "score {score}"
+        );
         assert!((a["confidence"].as_f64().unwrap() - 0.89).abs() < 1e-4);
         assert!(a["probabilities"].get("2").is_some());
     }
 
     #[test]
     fn noul_is_p_yes_without_confidence() {
-        let q = Question { name: "n".into(), instructions: "i".into(),
-            kind: QuestionKind::Noul { true_desc: None, false_desc: None } };
+        let q = Question {
+            name: "n".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Noul {
+                true_desc: None,
+                false_desc: None,
+            },
+        };
         let a = assemble_answer(&q, &[(3.0f32).ln(), 0.0]);
         assert_eq!(a["type"], "noul");
         assert!((a["noul"].as_f64().unwrap() - 0.75).abs() < 1e-6);
@@ -466,9 +595,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "need at least 2 labels")]
     fn assemble_rejects_single_label() {
-        let q = Question { name: "q".into(), instructions: "i".into(),
-            kind: QuestionKind::Choice { keys: vec!["A".into()],
-                descriptions: vec!["only".into()] } };
+        let q = Question {
+            name: "q".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Choice {
+                keys: vec!["A".into()],
+                descriptions: vec!["only".into()],
+            },
+        };
         assemble_answer(&q, &[0.0]);
     }
 }
