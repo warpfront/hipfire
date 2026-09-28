@@ -53,6 +53,10 @@ launch post, and three open reimplementations):
 - **Confidence formulas.** Verified against Jev's committed answers:
   `choice` confidence = (p_max − 1/K)/(1 − 1/K), with |err| ≤ 0.02, i.e.
   rounding. `score` confidence ≈ p_max (mean err 0.006).
+- **Jev's published input limits** are about 64,000 tokens for the shared state
+  plus all questions, and about 32,000 tokens for the state plus the longest
+  single question (source: Flavio Copes, "A deep dive into Jev",
+  https://flaviocopes.com/jev/).
 
 Open reimplementations (open-alternative-jev, openjev) read single-token
 **letter** labels at one position, capped at about 26 options. Jev accepts up
@@ -261,12 +265,15 @@ Request validation, returning 422 with the question and field named:
   - `score`: `criteria` is an array of 2–10 level descriptions, low → high;
   - `noul`: optional `criteria` `{true, false}`.
 
-Token limits (Jev's, §3), checked by the daemon after rendering, 422 naming
-the limit and without `required_max_seq`:
+Token limits (hipfire bounds chosen to match Jev's published limits, §3),
+checked by the daemon after rendering, 422 naming the limit and without
+`required_max_seq`:
 
 - state + the longest question (that question's full rendered prompt) ≤
   32,000 tokens; checked per question as it is rendered, so an over-long
-  state fails on the first question;
+  state fails on the first question; these bounds are counted in the loaded
+  model's tokens including chat-template overhead, so a state Jev accepts
+  near the limit may be refused here;
 - shared state + all questions (the `usage.input_tokens` accounting, shared
   prefix counted once) ≤ 64,000 tokens.
 

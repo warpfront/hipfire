@@ -12,11 +12,15 @@ pub const MAX_SCORE_LEVELS: usize = 10;
 /// Upper bound on questions per request (serve-side DoS bound; each question
 /// costs one suffix prefill).
 pub const MAX_QUESTIONS: usize = 128;
-/// Jev's token limits (spec §3/§7): the shared state plus every question
-/// suffix, counted additively as in `usage_json`, must be at most this.
+/// hipfire bounds chosen to match Jev's published limits (spec §3/§7): the
+/// shared state plus every question suffix, counted additively as in `usage_json`,
+/// must be at most this. These bounds are counted in the loaded model's tokens
+/// including chat-template overhead.
 pub const MAX_TOTAL_TOKENS: usize = 64_000;
-/// Jev's per-question limit: state + the longest question (that question's
-/// full rendered prompt) must be at most this.
+/// hipfire per-question bound matching Jev's limit: state + the longest question
+/// (that question's full rendered prompt) must be at most this. Counted in the
+/// loaded model's tokens including chat-template overhead, so a state Jev accepts
+/// near the limit may be refused here.
 pub const MAX_QUESTION_TOKENS: usize = 32_000;
 
 #[derive(Debug, Clone, PartialEq)]

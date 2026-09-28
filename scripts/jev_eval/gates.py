@@ -374,8 +374,17 @@ def gate_errors(d, max_seq, cask=None):
         notes.append(note)
     else:
         # (i) state longer than the loaded max_seq -> 422 + required_max_seq.
-        # max_seq/4 reps x 5-7 tokens: over max_seq, under Jev's limits.
-        long_state = LOREM * (max_seq // 4)
+        # max_seq/4 reps x 5-7 tokens: over max_seq, under Jev's per-question
+        # limit (32000). Guard against exceeding the per-question limit.
+        reps = max_seq // 4
+        long_state = LOREM * reps
+        # Rough estimate: 5-7 tokens per LOREM rep; verify not exceeding 32k.
+        # If it would, skip the test (clear sign max_seq is too large).
+        estimated_tokens = reps * 7 + len(QUESTIONS) * 100  # rough full-prompt estimate
+        if estimated_tokens >= JEV_QUESTION_LIMIT:
+            raise AssertionError(f"max_seq {max_seq} too large: over-length test would hit "
+                                 f"Jev's per-question limit ({JEV_QUESTION_LIMIT}) instead of "
+                                 f"required_max_seq, making the gate ineffective")
         r = d.decide(long_state, QUESTIONS)
         e = r.get("error") or {}
         req = e.get("required_max_seq")
