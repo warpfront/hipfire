@@ -96,10 +96,17 @@ Run `scripts/check-crate-maps.py` after adding files.
 
 ### 4.1 GPU runner (`hipfire-generate/src/decide.rs`)
 
-1. Render and tokenize the shared prefix (§5). Prefill it in
-   `prefill_max_batch(gpu)` chunks via `qwen35::forward_prefill_batch`
-   (Llama: `llama::forward_prefill_batch`), starting from position 0 of a
-   reset model.
+1. Render and tokenize every question's full prompt (§5), checking Jev's
+   per-question token limit as each is rendered (§7), so an over-long
+   state fails on the first question. Prefill the shared prefix via
+   `qwen35::forward_prefill_batch` (Llama: `llama::forward_prefill_batch`),
+   starting from position 0 of a reset model. The prefix's own logits are
+   never read, so this prefill skips the full-vocab download
+   (`decide_prefill_logits(…, want_logits = false)`).
+
+   A single-question request has nothing to share: it is one plain full
+   prefill of that question's prompt (`prefix_len = 0`), with no snapshot
+   allocation and no restore.
 2. Snapshot: record `P = seq_pos`. On Qwen3.5, also
    `DeltaNetSnapshot::new_for` + `save_from(&dn_state)`.
 3. For each question, in request order:
@@ -107,8 +114,6 @@ Run `scripts/check-crate-maps.py` after adding files.
    2. prefill the question suffix;
    3. download `scratch.logits`;
    4. gather the logits of that question's label token ids.
-
-   Between questions, check the out-of-band `abort` flag.
 4. Cleanup:
    - leave the model reset: `seq_pos = 0`, recurrent state reset via
      `common::reset_qwen35_recurrent`;
@@ -141,8 +146,12 @@ slot = position, and the cache holds only `m.physical_cap` slots (by default
 in the prefill. So with eviction configured the longest question prompt + 1
 must be <= min(`Eviction::budget()`, `m.physical_cap`), else 422 naming the
 limit and without `required_max_seq` (a larger `max_seq` does not raise it).
-Decide prompts (hundreds to a few thousand tokens) are far below the usual
-budgets.
+Under the current `CaskConfig` the load requires `max_seq >= budget + beta +
+4` and `physical_cap >= budget`, so `physical_cap` never binds and the limit
+is the budget; the `min` is defensive. Likewise the 409 compacted-cache check
+below is defensive: the pre-decide rollback resets `compact_offset`, so it
+cannot fire today. Decide prompts (hundreds to a few thousand tokens) are far
+below the usual budgets.
 
 A client disconnect does not interrupt a decide in v1. The loop is
 sub-second, and mid-loop abort would need the daemon's per-request terminal
@@ -150,7 +159,12 @@ registry; serve simply discards the reply.
 
 A debug request field `_debug_no_snapshot: true` makes the runner reset and
 prefill each question's full prompt from position 0 instead of restoring.
-Gate 1 (§10) compares the two modes.
+Gate 1 (§10) compares the two modes. It is a daemon-level knob only:
+`gates.py` talks to the daemon directly, and serve does **not** forward it
+(serve forwards only `state` and `questions`).
+
+Multi-slot mode (the experimental slot backend owns the weights) is refused
+with 409 `decide unsupported in multi-slot mode`.
 
 ## 5. Prompt layout
 
@@ -194,10 +208,12 @@ Answer with the option code only.<|im_end|>
   - `choice`: codes `A`–`Z`, then two-letter codes, in criteria order.
   - `score`: levels labelled `0`…`k-1`, with each level's description.
   - `noul`: `Yes`/`No`, with the criteria descriptions when provided.
-- **Code check.** At model load, and cached per model, every candidate code is
-  checked with `tokenizer.encode(code).len() == 1` in its readout form. Codes
-  that fail are skipped. If fewer than K valid codes remain, the request gets
-  a 422.
+- **Code check.** Per request (not cached), every candidate code is checked
+  to encode to exactly one token, after stripping a leading BOS that
+  tokenizers with `add_bos_token` (Llama / Mistral style) prepend in
+  `Tokenizer::encode`; the same BOS-stripped encoding supplies the label's
+  token id. Codes that fail are skipped. If fewer than K valid codes remain,
+  the request gets a 422.
 
 ## 6. Request lifecycle (serve)
 
@@ -212,7 +228,9 @@ Answer with the option code only.<|im_end|>
    - Any other value, including Jev's `jev-latest`, means the currently loaded
      model.
    - If no model is loaded, return 503 with an explanatory message.
-   - The response `model` field is the hipfire model actually used.
+   - The response `model` field is the hipfire model actually used, named
+     as chat and `/health` report it (the registry tag when a tag was
+     requested); the filesystem path only when no served name is known.
 3. **Admission.** Exclusive gate, the same as a sequential chat request. When
    saturated: 503 + `Retry-After`.
 4. Forward `{"type":"decide","id",state,questions}` to the daemon.
@@ -223,7 +241,11 @@ Answer with the option code only.<|im_end|>
      to the control waiter, and `Engine::request` suffices.
    - If the longest prompt exceeds `max_seq`, the daemon returns 422 with
      `required_max_seq`. Serve then reloads once via `ensure_model(…,
-     Some(required_max_seq))` and retries.
+     Some(required_max_seq))` and retries, up to the same context ceiling
+     chat stops at (`MAX_SEQ_CEILING` = 393,216 + 1,024). Above it serve
+     returns the daemon's 422 as-is, `required_max_seq` included, without
+     reloading. (Jev's 32,000-token per-question limit, checked first, keeps
+     `required_max_seq` far below the ceiling in practice.)
 5. Shape Jev's response `{model, answers, usage}`.
    - Per-phase timings (state prefill, per-question suffix, readout) go in an
      `x-hipfire-timing` header and the log. No extra body fields are added.
@@ -233,11 +255,23 @@ Answer with the option code only.<|im_end|>
 Request validation, returning 422 with the question and field named:
 
 - `state`: string, JSON object or JSON array.
-- `questions`: non-empty map, name → question. Each question needs
-  `instructions` (string) and a `type`:
+- `questions`: non-empty map, name → question, at most 128 questions. Each
+  question needs `instructions` (string) and a `type`:
   - `choice`: `criteria` is an object with 2–255 keys (key → description);
   - `score`: `criteria` is an array of 2–10 level descriptions, low → high;
   - `noul`: optional `criteria` `{true, false}`.
+
+Token limits (Jev's, §3), checked by the daemon after rendering, 422 naming
+the limit and without `required_max_seq`:
+
+- state + the longest question (that question's full rendered prompt) ≤
+  32,000 tokens; checked per question as it is rendered, so an over-long
+  state fails on the first question;
+- shared state + all questions (the `usage.input_tokens` accounting, shared
+  prefix counted once) ≤ 64,000 tokens.
+
+Criteria keys (and question names) keep request order: `hipfire-engine`
+enables serde_json `preserve_order` itself.
 
 Answers:
 
@@ -259,16 +293,18 @@ All three:
 
 | Condition | Response |
 |---|---|
-| Malformed request / limits exceeded | 422, naming question and field |
+| Malformed request / limits exceeded (incl. > 128 questions) | 422, naming question and field |
+| State + longest question > 32,000 tokens, or state + all questions > 64,000 tokens | 422 naming the limit, no `required_max_seq` |
 | Model architecture has no snapshot path (neither Qwen3.5 nor Llama family) | 400 `decide not supported for <arch>` |
 | No model loaded and `model` not a local model | 503 |
 | KV eviction configured and the longest prompt + 1 exceeds min(eviction budget, `physical_cap`) | 422 naming the limit, no `required_max_seq` |
 | KV cache compacted (`compact_offset != 0`) after the pre-decide reset | 409 |
-| Prompt exceeds the maximum `max_seq` | 422 (+ `required_max_seq` when eviction is off) |
+| Prompt exceeds the loaded `max_seq` | 422 + `required_max_seq`; serve reloads once up to `MAX_SEQ_CEILING`, above it returns the 422 as-is |
 | Fewer than K valid single-token codes | 422 |
 | Admission saturated | 503 + `Retry-After` |
 | Daemon crash / GPU error | 500; the existing serve restart path |
-| Multi-GPU (pipeline or expert parallel), `kv_adaptive` active, slot / continuous-batch lanes active | 409 |
+| Multi-GPU (pipeline or expert parallel), `kv_adaptive` active, continuous-batch lanes active | 409 |
+| Multi-slot mode (experimental slot backend) | 409 `decide unsupported in multi-slot mode` |
 
 ## 9. Deferred
 
@@ -328,8 +364,12 @@ in two modes.
      - the snapshot decide equals the `_debug_no_snapshot` decide for every
        question;
      - each question of a multi-question request equals a single-question
-       full-prefill decide of that question alone, so restore leaves no
-       residue.
+       decide of that question alone (a single-question decide is one plain
+       full prefill, `prefix_tokens == 0`), so restore leaves no residue.
+
+     `EXACT_ENV` in `gates.py` pins today's batch-composition-dependent
+     routes; when PR #768's default-on gfx1151 routes land it must be
+     extended with their disable switches.
    - **(b) Default mode.** This is checked per question:
      - drift_q is the |Δ log p| between that question's snapshot and
        full-prefill label distributions;
@@ -372,7 +412,10 @@ in two modes.
      `required_max_seq` greater than `max_seq` (with `--cask`: a state over
      the eviction limit returns 422 naming the limit, without
      `required_max_seq`);
-   - a malformed request returns 422.
+   - a malformed request returns 422;
+   - a state over Jev's 32,000-token per-question limit, and four long
+     questions over the 64,000-token request limit, each return 422 naming
+     the limit, without `required_max_seq`.
 
    `gates.py --cask` configures every daemon with the cask* params serve
    sends (defaults from `~/.hipfire/config.json`), so all gates, including

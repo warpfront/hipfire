@@ -7,8 +7,14 @@ git clone https://github.com/Running-Dolphins/jev-bench ~/repos/jev-evals/jev-be
 git clone https://github.com/scienthoon/jev-ood-calibration ~/repos/jev-evals/jev-ood-calibration
 ```
 
-1. GPU gates (must all PASS before merge):
-   `python3 scripts/jev_eval/gates.py --model ~/.hipfire/models/qwen3.5-4b.mq4`
+1. GPU gates (must all PASS before merge). Build the daemon, CLI and the
+   gate 1b noise-floor probe first:
+   ```bash
+   cargo build --release -p hipfire-daemon -p hipfire-cli
+   cargo build --release -p hipfire-generate --features lab --example split_prefill_probe
+   python3 scripts/jev_eval/gates.py --model ~/.hipfire/models/qwen3.5-4b.mq4
+   python3 scripts/jev_eval/gates.py --model ~/.hipfire/models/qwen3.5-4b.mq4 --cask
+   ```
 2. Start serve on the repo daemon (one daemon per machine):
    `HIPFIRE_DAEMON_BIN=$PWD/target/release/daemon target/release/hipfire serve`
 3. jev-bench, all 12 tasks and 6 experiments, at n=500 (aligned with Jev's committed rows):

@@ -10,6 +10,7 @@ cargo check --workspace --examples
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
 cargo test -p hipfire-engine --lib decide
+cargo test -p hipfire-generate --lib decide
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
 

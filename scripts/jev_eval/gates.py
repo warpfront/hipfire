@@ -8,8 +8,10 @@ Gates:
       routes pinned to their row-invariant alternatives (EXACT_ENV). There,
       snapshot decide == `_debug_no_snapshot` decide bit for bit (Δ == 0.0),
       and each question of the 3-question request == a single-question
-      full-prefill decide of it alone (Δ == 0.0: restore leaves no residue).
-      Also checks the template closed thinking (no 400).
+      decide of it alone (Δ == 0.0: restore leaves no residue). A
+      single-question decide is one plain full prefill (prefix_tokens == 0,
+      no snapshot), which is checked too. Also checks the template closed
+      thinking (no 400).
   1b  default mode, per question: |Δlogp| snapshot vs full prefill
       (drift_q) <= 2 x floor_q, where floor_q is that question's path-noise
       floor = one-call prefill vs token-by-token prefill (A vs C) of the same
@@ -32,9 +34,11 @@ Gates:
       sysfs gtt + vram sum over all cards is printed alongside and is the
       fallback when fdinfo is unreadable (FAIL if neither is readable).
   5   error replies end to end: 422 + required_max_seq for an over-long
-      state, 422 for a malformed request; a normal decide succeeds after each.
-      With --cask the over-long reply is the eviction-limit 422 instead (no
-      required_max_seq; the message names the limit).
+      state, 422 for a malformed request, 422 naming Jev's per-question
+      (32000) and request (64000) token limits, without required_max_seq; a
+      normal decide succeeds after each. With --cask the over-long reply is
+      the eviction-limit 422 instead (no required_max_seq; the message names
+      the limit).
   0   (--cask only, per daemon) CASK is really configured: an over-limit
       decide gets the eviction-limit 422 (only reachable with eviction on),
       then a normal decide succeeds.
@@ -58,9 +62,13 @@ on the batch composition, not by a decide defect
     with HIPFIRE_DN_REQUANT_PER_TOKEN=1;
   - the f16 WMMA flash-prefill attention is not bit-row-invariant at hd=128,
     legacy f32 kernel with HIPFIRE_FLASH_PREFILL=0.
-Suffixes of 1-3 tokens take the per-token path (different kernels), so a
-single-question snapshot decide (1-token suffix) is never bit-exact; the
-exact-mode single-question reference is therefore the full-prefill decide.
+Suffixes of 1-3 tokens take the per-token path (different kernels); a
+single-question decide never splits (it is one full prefill), so it is the
+exact-mode single-question reference directly.
+
+EXACT_ENV pins today's batch-composition-dependent routes. When PR #768's
+default-on gfx1151 routes land, EXACT_ENV must be extended with their
+disable switches or gate 1a's Δ == 0 checks will fail on those routes.
 """
 import argparse
 import json
@@ -132,21 +140,20 @@ def gate_exact_mode(d):
     sa = need_answers(snap, "snapshot")
     fa = need_answers(d.decide(STATE, QUESTIONS, _debug_no_snapshot=True), "full-prefill")
     snap_d = {n: dlogp(sa[n], fa[n]) for n in QUESTIONS}
-    single_d, single_snap_d = {}, {}
+    single_d, single_prefix = {}, set()
     for name, q in QUESTIONS.items():
-        sf = need_answers(d.decide(STATE, {name: q}, _debug_no_snapshot=True), f"single-full {name}")
-        single_d[name] = dlogp(sa[name], sf[name])
-        # Informational: the single-question snapshot decide has a 1-token
-        # suffix, which takes the per-token path, so it is not bit-exact.
-        ss = need_answers(d.decide(STATE, {name: q}), f"single-snap {name}")
-        single_snap_d[name] = dlogp(sa[name], ss[name])
+        # A single-question decide is one plain full prefill (no snapshot).
+        r1 = d.decide(STATE, {name: q})
+        s1 = need_answers(r1, f"single {name}")
+        single_prefix.add(r1["timing"]["prefix_tokens"])
+        single_d[name] = dlogp(sa[name], s1[name])
     ok = (max(snap_d.values()) == 0.0 and max(single_d.values()) == 0.0
-          and snap["timing"]["prefix_tokens"] > 0)
+          and snap["timing"]["prefix_tokens"] > 0 and single_prefix == {0})
     f = lambda m: ", ".join(f"{k}={v:.3g}" for k, v in m.items())  # noqa: E731
     return ok, (f"exact env {EXACT_ENV}: snapshot vs full-prefill Δ [{f(snap_d)}] (==0), "
-                f"multi-question vs single-question full-prefill Δ [{f(single_d)}] (==0), "
-                f"prefix_tokens={snap['timing']['prefix_tokens']}, closed-think template OK (no 400); "
-                f"info: multi vs single-question snapshot (1-token suffix, per-token path) [{f(single_snap_d)}]")
+                f"multi-question vs single-question (plain full prefill) Δ [{f(single_d)}] (==0), "
+                f"prefix_tokens multi={snap['timing']['prefix_tokens']} (>0) "
+                f"single={sorted(single_prefix)} (==[0]), closed-think template OK (no 400)")
 
 
 def measure_floor(model, log_path):
@@ -329,11 +336,20 @@ def cask_limit(cask):
     return cask["cask_budget"]
 
 
+LOREM = "lorem ipsum dolor sit amet "   # 5-7 tokens per repetition
+JEV_QUESTION_LIMIT = 32000
+JEV_REQUEST_LIMIT = 64000
+
+
 def check_cask_over_limit(d, cask):
     """Over the eviction limit: 422, no required_max_seq, message names the limit."""
     limit = cask_limit(cask)
-    # >= 5 tokens per repetition, so well over the limit.
-    r = d.decide("lorem ipsum dolor sit amet " * limit, QUESTIONS)
+    if limit >= JEV_QUESTION_LIMIT * 4 // 7:
+        raise AssertionError(f"cask_budget {limit} too large: an over-limit state would hit "
+                             f"Jev's {JEV_QUESTION_LIMIT}-token per-question limit first")
+    # limit/4 reps x 5-7 tokens = 1.25-1.75 x limit: over the eviction limit,
+    # under Jev's per-question limit (checked before it).
+    r = d.decide(LOREM * (limit // 4), QUESTIONS)
     e = r.get("error") or {}
     ok = (e.get("status") == 422 and "required_max_seq" not in e
           and f"limited to {limit} tokens" in e.get("message", ""))
@@ -358,7 +374,8 @@ def gate_errors(d, max_seq, cask=None):
         notes.append(note)
     else:
         # (i) state longer than the loaded max_seq -> 422 + required_max_seq.
-        long_state = "lorem ipsum dolor sit amet " * (max_seq // 2)
+        # max_seq/4 reps x 5-7 tokens: over max_seq, under Jev's limits.
+        long_state = LOREM * (max_seq // 4)
         r = d.decide(long_state, QUESTIONS)
         e = r.get("error") or {}
         req = e.get("required_max_seq")
@@ -378,6 +395,25 @@ def gate_errors(d, max_seq, cask=None):
     after_ii = "answers" in d.decide(STATE, QUESTIONS)
     notes.append(f"decide after={after_ii}")
     ok &= after_ii
+    # (iii) Jev's per-question limit: state alone >= 40000 tokens.
+    r = d.decide(LOREM * 8000, QUESTIONS)
+    e3 = r.get("error") or {}
+    ok_iii = (e3.get("status") == 422 and "required_max_seq" not in e3
+              and f"per-question limit of {JEV_QUESTION_LIMIT}" in e3.get("message", ""))
+    notes.append(f"state >32000 tokens: status={e3.get('status')} message={e3.get('message')!r} -> {ok_iii}")
+    ok &= ok_iii
+    # (iv) Jev's request limit: 4 questions of 20000-28000 tokens each (each
+    # under 32000, together over 64000 with a short shared state).
+    long_q = {f"q{i}": {"type": "noul", "instructions": f"{i} " + LOREM * 4000} for i in range(4)}
+    r = d.decide("s", long_q)
+    e4 = r.get("error") or {}
+    ok_iv = (e4.get("status") == 422 and "required_max_seq" not in e4
+             and f"request limit of {JEV_REQUEST_LIMIT}" in e4.get("message", ""))
+    notes.append(f"questions >64000 tokens: status={e4.get('status')} message={e4.get('message')!r} -> {ok_iv}")
+    ok &= ok_iv
+    after_iv = "answers" in d.decide(STATE, QUESTIONS)
+    notes.append(f"decide after={after_iv}")
+    ok &= after_iv
     return ok, "; ".join(notes)
 
 
