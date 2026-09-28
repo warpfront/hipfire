@@ -354,7 +354,8 @@ fn run_session(
 /// Leave the conversation cache. Without a speculator: commit
 /// `conversation_tokens = conv[..E]` (seq_pos is already E). With one
 /// (read-only): an extend restores the cached end exactly; any other start
-/// ends with the attested rollback.
+/// ends with the attested rollback, keeping `asst_turn_cache` (global
+/// constraint: a cold start keeps it).
 fn finish_session(
     plan: &SessionPlan,
     m: &mut LoadedModel,
@@ -378,7 +379,11 @@ fn finish_session(
         }
         _ => {
             *reset = true;
-            rollback(m, gpu)
+            // Global constraint: a cold start keeps `asst_turn_cache`. This
+            // arm is reached after a cold start too (speculator loaded, then
+            // a non-Extend end), so use the cache-preserving reset here as
+            // well, not the plain attested rollback (which clears it).
+            cold_reset_keep_turn_cache(m, gpu)
         }
     }
 }
