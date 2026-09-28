@@ -10806,6 +10806,58 @@ mod tests {
         assert_eq!(status, 422, "{body}");
     }
 
+    /// Serve refuses a session `messages` that is not a non-empty array, that
+    /// the chat projection would reduce to only the injected default system
+    /// message, or that carries an image part (spec §12.6), all as 422 and
+    /// before any daemon round trip. The harness model gets a per-model
+    /// `prompt.system` override, so the default system message really is
+    /// injected (the control request shows it).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_refuses_messages_the_projection_would_empty() {
+        let harness = Task11HttpHarness::spawn("systemone-session-empty");
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set_cli("prompt.system", "injected default system")
+            .unwrap();
+        let mut catalog = hipfire_config::ModelCatalog::default();
+        catalog.models.insert(
+            "t11-session".into(),
+            hipfire_config::LocalModelConfig {
+                path: Some(PathBuf::from(harness.model())),
+                registry_tag: None,
+                overrides,
+            },
+        );
+        write_catalog_toml(&harness.paths.config, &catalog).unwrap();
+        let mut body = session_body(harness.model(), None);
+        let (status, headers, text) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 200, "{text}");
+        let roles = timing_header(&headers)["session_roles"].clone();
+        assert_eq!(roles, serde_json::json!(["system", "user", "assistant"]));
+        let image = serde_json::json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}]}]);
+        let cases = [
+            serde_json::json!([]),
+            serde_json::json!("hi"),
+            serde_json::json!([{"role": "bogus", "content": "x"}]),
+            image,
+        ];
+        for messages in cases {
+            body["messages"] = messages.clone();
+            let (status, _, text) = post_systemone(harness.port(), &body);
+            assert_eq!(status, 422, "{messages}: {text}");
+            assert!(text.contains("messages"), "{messages}: {text}");
+        }
+        let log = harness.read_requests_log();
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "only the control request reached the daemon; log={log:?}"
+        );
+    }
+
     /// A daemon `required_max_seq` hint on a 422 triggers exactly one
     /// `ensure_model` reload with a bumped `max_seq`, then a transparent
     /// retry that succeeds. The fake daemon's `t-needs-ctx` sentinel refuses

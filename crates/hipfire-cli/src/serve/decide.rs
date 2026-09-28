@@ -20,6 +20,45 @@ fn is_local_model(runtime: &super::ServeRuntime, model: &str) -> bool {
         || crate::find_model_path(&runtime.paths, &runtime.registry, model).is_some()
 }
 
+/// The daemon's message for a `messages` that is not a non-empty array of
+/// chat messages (hipfire-engine `parse_session_request`).
+const SESSION_MESSAGES_ERROR: &str = "messages must be a non-empty array of chat messages";
+
+/// Serve's own check of a session request's raw `messages` before the chat
+/// projection (spec §12.6), `Some(422 message)` when it must be refused:
+/// - not a non-empty array: the projection would turn it into `[]`, or into
+///   just the injected default system message, which the daemon accepts;
+/// - no message the projection keeps (every role unknown): same outcome;
+/// - a non-text content part (e.g. `image_url`): the projection flattens
+///   content to its text parts, so the decide would silently answer about a
+///   conversation without the image.
+fn session_messages_error(messages: &serde_json::Value) -> Option<String> {
+    let Some(list) = messages.as_array().filter(|a| !a.is_empty()) else {
+        return Some(SESSION_MESSAGES_ERROR.to_string());
+    };
+    for m in list {
+        let parts = m.get("content").and_then(|c| c.as_array());
+        for part in parts.into_iter().flatten() {
+            let kind = part.get("type").and_then(|t| t.as_str());
+            if kind != Some("text") {
+                return Some(format!(
+                    "messages: session decide accepts text content only, got a content part \
+                     of type {}",
+                    kind.map_or_else(|| "(none)".to_string(), |k| format!("{k:?}"))
+                ));
+            }
+        }
+    }
+    let projected = super::complete::normalize_openai_messages(Some(messages), false);
+    if projected.as_array().is_none_or(|a| a.is_empty()) {
+        return Some(format!(
+            "{SESSION_MESSAGES_ERROR}: no message has a chat role \
+             (system, developer, user, assistant, tool)"
+        ));
+    }
+    None
+}
+
 /// Outcome of the synchronous decide attempt loop, handed back to the async
 /// caller over a oneshot channel. Plain data (not `Response<BoxBody>`) so the
 /// blocking side never has to reason about HTTP framing.
@@ -78,6 +117,13 @@ fn run_decide(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if let Some(message) = body.get("messages").and_then(session_messages_error) {
+        return DecideOutcome::Err {
+            status: 422,
+            message,
+            required_max_seq: None,
+        };
+    }
 
     for attempt in 0..2 {
         let (engine, model_echo, session) = {
@@ -290,5 +336,42 @@ pub(crate) async fn handle_decide(
             required_max_seq,
         }) => decide_error_response(&message, status, required_max_seq),
         Err(_) => openai_error("decide worker disconnected", 500),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn session_messages_must_be_a_non_empty_array() {
+        for bad in [json!([]), json!("hi"), json!({"role": "user"}), json!(null)] {
+            assert_eq!(
+                session_messages_error(&bad).as_deref(),
+                Some(SESSION_MESSAGES_ERROR),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_messages_the_projection_would_drop_are_refused() {
+        let e = session_messages_error(&json!([{"role": "bogus", "content": "x"}]))
+            .expect("every message dropped");
+        assert!(e.starts_with(SESSION_MESSAGES_ERROR), "{e}");
+        assert!(session_messages_error(&json!([{"role": "user", "content": "x"}])).is_none());
+        assert!(session_messages_error(&json!([{"role": "developer", "content": "x"}])).is_none());
+    }
+
+    #[test]
+    fn session_messages_with_non_text_parts_are_refused() {
+        let img = json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}]}]);
+        let e = session_messages_error(&img).expect("image part");
+        assert!(e.contains("\"image_url\""), "{e}");
+        let text = json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
+        assert!(session_messages_error(&text).is_none());
     }
 }
