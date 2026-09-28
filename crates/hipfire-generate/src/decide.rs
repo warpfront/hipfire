@@ -226,6 +226,56 @@ pub fn run_decide(
     })
 }
 
+/// Full dispatch for a `decide` JSONL message: refuses with 409 while
+/// `lanes_active` (a slot or continuous-batch request is in flight), refuses
+/// with 503 when no model is loaded, otherwise runs [`run_decide`] and builds
+/// the `decided` reply. Returns `(reply, ran_decide)` so the caller can
+/// advance `state_epoch` only when `run_decide` actually ran -- the same rule
+/// the daemon applies to `reset`.
+pub fn handle_decide_message(
+    model: Option<&mut LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+    msg: &Value,
+    lanes_active: bool,
+) -> (Value, bool) {
+    let id = msg
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let refuse = |status: u16, message: &str| {
+        DecideError {
+            status,
+            message: message.to_string(),
+            required_max_seq: None,
+        }
+        .to_reply(&id)
+    };
+    if lanes_active {
+        (
+            refuse(
+                409,
+                "decide refused: slot or continuous-batch requests active",
+            ),
+            false,
+        )
+    } else if let Some(m) = model {
+        let reply = match run_decide(m, gpu, msg) {
+            Ok(out) => json!({
+                "type": "decided",
+                "id": id,
+                "answers": out.answers,
+                "usage": out.usage,
+                "timing": out.timing,
+            }),
+            Err(e) => e.to_reply(&id),
+        };
+        (reply, true)
+    } else {
+        (refuse(503, "no model loaded"), false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +311,37 @@ mod tests {
         assert_eq!(e.message, "x");
 
         assert_eq!(hook(Some(Ok(7))).unwrap(), 7);
+    }
+
+    // Non-GPU branches of `handle_decide_message`: both short-circuit before
+    // touching the model or GPU, so a real `Gpu` handle is only needed to
+    // satisfy the signature. Skip gracefully where no GPU is available,
+    // matching the `let Ok(mut gpu) = rdna_compute::Gpu::init() else { return; }`
+    // convention used elsewhere in the tree.
+    #[test]
+    fn handle_decide_message_lanes_active_refuses_without_running() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        let msg = json!({"type": "decide", "id": "lanes-1", "state": "x", "questions": {}});
+        let (reply, ran) = handle_decide_message(None, &mut gpu, &msg, true);
+        assert!(!ran);
+        assert_eq!(reply["type"], "decided");
+        assert_eq!(reply["id"], "lanes-1");
+        assert_eq!(reply["error"]["status"], 409);
+    }
+
+    #[test]
+    fn handle_decide_message_no_model_refuses_without_running() {
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            return;
+        };
+        let msg = json!({"type": "decide", "id": "nomodel-1", "state": "x", "questions": {}});
+        let (reply, ran) = handle_decide_message(None, &mut gpu, &msg, false);
+        assert!(!ran);
+        assert_eq!(reply["type"], "decided");
+        assert_eq!(reply["id"], "nomodel-1");
+        assert_eq!(reply["error"]["status"], 503);
+        assert_eq!(reply["error"]["message"], "no model loaded");
     }
 }

@@ -142,7 +142,7 @@ def measure_floor(model, log_path):
     """A (one call) vs C (token by token) on the decide prompts, default env."""
     if not PROBE.exists():
         raise RuntimeError(f"{PROBE} missing: cargo build --release -p hipfire-generate "
-                           "--example split_prefill_probe")
+                           "--features lab --example split_prefill_probe")
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump({"state": STATE, "questions": QUESTIONS}, fh)
         req = fh.name
