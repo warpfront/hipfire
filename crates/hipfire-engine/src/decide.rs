@@ -211,6 +211,7 @@ fn argmax(p: &[f64]) -> usize {
 /// Jev answer JSON for one question. `label_logits` follows `labels_for`
 /// order. Probabilities are not rounded.
 pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
+    debug_assert!(label_logits.len() >= 2, "assemble_answer: need at least 2 labels");
     let p = softmax(label_logits);
     let k = p.len() as f64;
     let top = argmax(&p);
@@ -234,8 +235,10 @@ pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
 }
 
 /// Additive accounting observed for Jev: shared prefix once, each suffix once.
+/// Precondition: every `seq_lens[i] >= prefix_len`.
 pub fn usage_json(prefix_len: usize, seq_lens: &[usize]) -> Value {
-    let input: usize = prefix_len + seq_lens.iter().map(|l| l - prefix_len).sum::<usize>();
+    debug_assert!(seq_lens.iter().all(|&l| l >= prefix_len), "usage_json: sequence shorter than prefix_len");
+    let input: usize = prefix_len + seq_lens.iter().map(|l| l.saturating_sub(prefix_len)).sum::<usize>();
     json!({"input_tokens": input, "output_tokens": 0})
 }
 
@@ -452,5 +455,20 @@ mod tests {
         let u = usage_json(100, &[110, 125]);
         assert_eq!(u["input_tokens"], 135);
         assert_eq!(u["output_tokens"], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sequence shorter than prefix_len")]
+    fn usage_rejects_seq_shorter_than_prefix() {
+        usage_json(10, &[5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "need at least 2 labels")]
+    fn assemble_rejects_single_label() {
+        let q = Question { name: "q".into(), instructions: "i".into(),
+            kind: QuestionKind::Choice { keys: vec!["A".into()],
+                descriptions: vec!["only".into()] } };
+        assemble_answer(&q, &[0.0]);
     }
 }
