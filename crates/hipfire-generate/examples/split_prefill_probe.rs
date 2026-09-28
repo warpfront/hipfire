@@ -195,7 +195,7 @@ fn main() {
     println!("kv_mode={kv_mode} state_quant={state_quant:?}");
     let mut m = hipfire_loader::load_model(
         path,
-        512,
+        PROBE_MAX_SEQ,
         None,
         Some(kv_mode.as_str()),
         None,
@@ -223,6 +223,7 @@ fn main() {
     }
     toks.truncate(want_n);
     let n = toks.len();
+    check_fits(n);
     println!(
         "model={path} arch_id={} carrier={} N={n}",
         m.arch_id,
@@ -357,6 +358,18 @@ fn main() {
     rollback(&mut m, &mut gpu);
 }
 
+/// The probe loads with this `max_seq`. The carriers' prefill has no bounds
+/// check, so a longer prompt is an illegal GPU memory access, not an error.
+const PROBE_MAX_SEQ: usize = 512;
+
+/// Refuse a prompt the probe's KV cannot hold, before it reaches the GPU.
+fn check_fits(n: usize) {
+    assert!(
+        n < PROBE_MAX_SEQ,
+        "prompt is {n} tokens; the probe loads with max_seq {PROBE_MAX_SEQ} (needs n + 1 <= max_seq)"
+    );
+}
+
 /// Decide noise floor: per question, A (one call) vs C (token by token) on the
 /// exact prompt `run_decide` renders, compared over the label distribution.
 fn decide_floor(
@@ -381,6 +394,7 @@ fn decide_floor(
     let prompts = parsed.questions.iter().zip(&rendered.label_ids);
     for ((q, ids), toks) in prompts.zip(&rendered.seqs) {
         let n = toks.len();
+        check_fits(n);
         let pick = |l: &[f32]| ids.iter().map(|&i| l[i as usize]).collect::<Vec<f32>>();
         let la = pick(&run_segments(carrier, m, gpu, toks, &[n]));
         let lc = pick(&run_segments(carrier, m, gpu, toks, &vec![1usize; n]));
