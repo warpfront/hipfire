@@ -42,6 +42,46 @@ Gates:
   0   (--cask only, per daemon) CASK is really configured: an over-limit
       decide gets the eviction-limit 422 (only reachable with eviction on),
       then a normal decide succeeds.
+  S1  session cache reuse: a session decide between two chat turns leaves
+      the chat prompt cache usable. (a) no delta, default env: turn 2 text
+      bit-identical to a run without the decide, decide start=extend with 0
+      conversation prefill, turn 2 cached_tokens == decide prefix_tokens.
+      (b) delta (decide includes the next user turn), exact env: same text,
+      conversation prefill > 0, turn 2 cached_tokens == E. INCONCLUSIVE when
+      the no-decide baseline gets no cache hit (no chat cache: Llama
+      carrier, --cask).
+  S2  session exactness (exact env): per question Δ == 0 vs a one-call full
+      prefill of the same session tokens (`_debug_no_snapshot`), warm
+      (extend) and with another conversation cached. The reference ends
+      reset and clears the assistant-turn cache, so it runs last.
+  S3  session no leak: N session decides cycling three conversations (two
+      share a ~2.5k-token system prefix; a chat turn per cycle re-creates the
+      prefill checkpoints a cold start drops), so extend, resume and cold are
+      all exercised and counted; fdinfo growth < 64 MiB. INCONCLUSIVE if the
+      memory criterion passes but resume never ran.
+  S4  session stale cache (exact env): with an unrelated conversation
+      cached (cold) and with one sharing a long prefix cached (resume), the
+      answers equal the warm answers (Δ == 0) and the next chat turn reuses
+      the decide's conversation. INCONCLUSIVE if resume was not exercised;
+      then S4r reruns it with a shared prefix longer than the first prefill
+      chunk + 2048 tokens, so a checkpoint lies inside it.
+  S5  session error replies: both / neither / empty / non-list messages ->
+      422, then a session decide still extends with zero delta.
+  S1-S5 are INCONCLUSIVE when the model has no Jinja chat template (session
+  mode's spec §12.5 400). On an arch that is not `cache_capable` (the Llama
+  carrier) the chat path keeps no conversation: S1 is INCONCLUSIVE, S2 and
+  S4 compare answers only (as under --cask; S4 INCONCLUSIVE, no resume), and
+  S3/S5 still expect the decide's own extend.
+  S6  (--draft only: a daemon loaded with a DFlash drafter; runs S6 alone,
+      with HIPFIRE_QWEN_CACHE_TRACE=1) session decide with a speculator is
+      read-only. (a) on the active conversation: timing committed=false,
+      start=extend reusing the whole cached conversation, and the next chat
+      turn's greedy text and cached_tokens equal a no-decide baseline. (b) on an unrelated
+      conversation (start=cold, rollback): the next chat turn over a history
+      holding the earlier assistant turn still splices it (every
+      `jinja lookup` trace line in daemon stderr says hit=true). (c) no leak
+      over N session decides (extend and cold, a chat turn re-establishing
+      the cache after each cold).
 
 --cask loads every daemon with the load params `hipfire serve` sends when
 config has cask on (cask, cask_sidecar, cask_budget, cask_beta, cask_core_frac,
@@ -298,12 +338,14 @@ def process_mem(pid):
     return (tot["gtt"], tot["vram"]) if seen else None
 
 
-def gate_leak(d, n):
-    need_answers(d.decide(STATE, QUESTIONS), "warmup")
+def measure_leak(d, n, step, what):
+    """Run step(i) n times. Growth of the daemon's own amdgpu GTT + VRAM
+    (fdinfo) must stay < 64 MiB; the device-wide sysfs sum is printed
+    alongside and is the fallback when fdinfo is unreadable."""
     g0, v0 = device_mem()
     p0 = process_mem(d.p.pid)
     for i in range(n):
-        need_answers(d.decide(STATE, QUESTIONS), f"leak iter {i}")
+        step(i)
     g1, v1 = device_mem()
     p1 = process_mem(d.p.pid)
     mib = lambda x: f"{x / 2**20:.1f}"  # noqa: E731
@@ -326,7 +368,13 @@ def gate_leak(d, n):
         grew = dg + dv
         basis = "daemon fdinfo unreadable, using system-wide"
     ok = grew < 64 * 1024 * 1024
-    return ok, f"device memory growth over {n} decides: {basis} (<64); {sys_s}"
+    return ok, f"device memory growth over {n} {what}: {basis} (<64); {sys_s}"
+
+
+def gate_leak(d, n):
+    need_answers(d.decide(STATE, QUESTIONS), "warmup")
+    return measure_leak(
+        d, n, lambda i: need_answers(d.decide(STATE, QUESTIONS), f"leak iter {i}"), "decides")
 
 
 def cask_limit(cask):
@@ -339,6 +387,297 @@ def cask_limit(cask):
 LOREM = "lorem ipsum dolor sit amet "   # 5-7 tokens per repetition
 JEV_QUESTION_LIMIT = 32000
 JEV_REQUEST_LIMIT = 64000
+
+# ---- session mode (spec §12.8) ---------------------------------------------
+SESSION_SYS = "You are a customer support agent for an online shop."
+CONV_C = [{"role": "system", "content": SESSION_SYS},
+          {"role": "user", "content": "Order #3527 was placed 21 days ago and tracking has not "
+                                      "updated. Reply in one short sentence."}]
+CONV_U = [{"role": "system", "content": "You are a poet."},
+          {"role": "user", "content": "Write one short line about rain."}]
+X_USER = {"role": "user", "content": "Name three primary colours in one short sentence."}
+# A 2-3k-token system turn shared by CONV_L and CONV_X: the chat prefill of
+# one leaves a DeltaNet checkpoint inside the prefix the other shares (the
+# first checkpoint lands at the first prefill chunk, ar.rs:3880).
+LONG_SYS = SESSION_SYS + " Policy notes: " + LOREM * 400
+# S4r: a shared prefix longer than the first prefill chunk (256-512 tokens)
+# + ckpt_interval (2048), for a rerun when S4 found no checkpoint inside it.
+LONG_SYS_RERUN = SESSION_SYS + " Policy notes: " + LOREM * 900
+CONV_L = [{"role": "system", "content": LONG_SYS}, CONV_C[1]]
+CONV_X = [{"role": "system", "content": LONG_SYS}, X_USER]
+FOLLOW = {"role": "user", "content": "Thanks. What should I do next? Reply in one short sentence."}
+SESSION_Q = {
+    "escalate": {"type": "noul",
+                 "instructions": "Should this conversation be escalated to a human agent?"},
+    "topic": {"type": "choice", "instructions": "What is the conversation about?",
+              "criteria": {"shipping": "Delivery, tracking, lost parcels",
+                           "billing": "Payments, refunds", "other": "Anything else"}},
+    "mood": {"type": "score", "instructions": "How frustrated is the customer?",
+             "criteria": ["Calm", "Mildly annoyed", "Frustrated", "Furious"]},
+}
+
+
+def chat_turn(d, messages, max_tokens=1024):
+    """One greedy chat turn; returns the conversation extended by the reply.
+    The chat path does not store a length-capped turn in its prompt cache,
+    which would make the reuse gates vacuous, so that fails the setup. The
+    Llama-carrier generate route reports no `finish_reason` (nor
+    `cached_tokens`); there a turn that stopped short of `max_tokens` ended
+    on EOS."""
+    text, done = d.chat(messages, max_tokens=max_tokens)
+    reason = done.get("finish_reason")
+    ended = reason == "stop" if reason is not None else done.get("tokens", max_tokens) < max_tokens
+    if not ended:
+        raise AssertionError(f"setup: chat turn finish_reason={reason!r} tokens="
+                             f"{done.get('tokens')} (need 'stop', or < {max_tokens} tokens)")
+    return messages + [{"role": "assistant", "content": text}]
+
+
+def session(d, messages, what, **extra):
+    r = d.session_decide(messages, SESSION_Q, **extra)
+    return need_answers(r, what), r.get("timing", {})
+
+
+def session_unavailable(d):
+    """The spec §12.5 400 for a model without a Jinja chat template (e.g. an
+    HFQ file with none embedded and no override): session mode cannot run,
+    so the session gates are INCONCLUSIVE rather than FAIL. Returns the
+    message, or None when session mode is available."""
+    d.reset()
+    r = d.session_decide(CONV_C, {"escalate": SESSION_Q["escalate"]})
+    e = r.get("error") or {}
+    if e.get("status") == 400 and "chat template" in e.get("message", ""):
+        return e["message"]
+    return None
+
+
+def run_session_gates(d, gates):
+    """Run [(name, fn, *args)] session gates, or report each INCONCLUSIVE
+    when the loaded model has no chat template for session mode."""
+    why = session_unavailable(d)
+    if why is None:
+        return [run(name, fn, *args) for name, fn, *args in gates]
+    res = []
+    for name, *_ in gates:
+        detail = f"session mode unavailable on this model: 400 {why!r}"
+        print(f"{LABEL[INCONCLUSIVE]:<12} gate {name}: {detail}", flush=True)
+        res.append((name, (INCONCLUSIVE, detail)))
+    return res
+
+
+def max_dlogp(a, b):
+    return max(dlogp(a[n], b[n]) for n in a)
+
+
+def gate_session_reuse(d, with_delta, reuse=True):
+    d.reset()
+    conv = chat_turn(d, CONV_C)
+    nxt = conv + [FOLLOW]
+    base_text, base_done = d.chat(nxt)
+    base_cached = base_done.get("cached_tokens", 0)
+    if not reuse or base_cached == 0:
+        return INCONCLUSIVE, (f"no-decide baseline cached_tokens={base_cached}: no chat prompt "
+                              f"cache to preserve on this arch/config")
+    d.reset()
+    if chat_turn(d, CONV_C) != conv:
+        return False, "setup: greedy turn 1 is not reproducible after reset"
+    _, t = session(d, nxt if with_delta else conv, "session decide")
+    text, done = d.chat(nxt)
+    cached = done.get("cached_tokens", 0)
+    cpt = t.get("conversation_prefill_tokens")
+    delta_ok = (cpt or 0) > 0 if with_delta else cpt == 0
+    ok = (text == base_text and len(text) > 0 and t.get("start") == "extend" and delta_ok
+          and cached == t.get("prefix_tokens") and cached >= base_cached)
+    return ok, (f"{'delta' if with_delta else 'no delta'}: next-turn text identical="
+                f"{text == base_text}; decide start={t.get('start')} (extend), "
+                f"conversation_prefill_tokens={cpt} ({'>0' if with_delta else '==0'}); "
+                f"next turn cached_tokens={cached} (== decide prefix_tokens "
+                f"{t.get('prefix_tokens')}, >= no-decide {base_cached}); "
+                f"texts {base_text[:40]!r} / {text[:40]!r}")
+
+
+def gate_session_exact(d, reuse=True):
+    d.reset()
+    conv = chat_turn(d, CONV_C)
+    warm, tw = session(d, conv, "warm session")
+    # Cache a different conversation (the chat path's cold start keeps the
+    # assistant-turn cache, so conv's reply still splices).
+    chat_turn(d, CONV_U)
+    other, to = session(d, conv, "session with another conversation cached")
+    # Diagnostic leg (not part of the criterion): extend over a conversation
+    # the cold decide above committed, i.e. KV/DeltaNet built by prefill
+    # rather than by the chat turn's decode steps.
+    warm_p, tp = session(d, conv, "warm session over a decide-committed conversation")
+    # The reference last: it ends reset (v1 semantics) and clears the
+    # assistant-turn cache, so it must not precede a warm-session answer.
+    ref, _ = session(d, conv, "full-prefill reference", _debug_no_snapshot=True)
+    dw, do, dp = max_dlogp(warm, ref), max_dlogp(other, ref), max_dlogp(warm_p, ref)
+    starts_ok = (tw.get("start") == "extend" and to.get("start") != "extend") if reuse else True
+    ok = dw == 0.0 and do == 0.0 and starts_ok
+    return ok, (f"exact env: max |Δlogp| vs one-call full prefill of the same tokens: warm "
+                f"(start={tw.get('start')}) = {dw:.3g}, another conversation cached "
+                f"(start={to.get('start')}) = {do:.3g} (both ==0; reference ran last); "
+                f"diagnostic: extend over the decide-committed (prefill-built) conversation "
+                f"(start={tp.get('start')}, conversation_prefill_tokens="
+                f"{tp.get('conversation_prefill_tokens')}) = {dp:.3g}")
+
+
+def gate_session_stale(d, reuse=True, long_sys=LONG_SYS, decide_reuse=True):
+    conv_l = [{"role": "system", "content": long_sys}, CONV_C[1]]
+    conv_x = [{"role": "system", "content": long_sys}, X_USER]
+    d.reset()
+    conv = chat_turn(d, conv_l)
+    ref, tw = session(d, conv, "own conversation cached")
+    chat_turn(d, CONV_U)
+    cold, tc = session(d, conv, "unrelated conversation cached")
+    chat_turn(d, conv_x)
+    res, tr = session(d, conv, "shared-prefix conversation cached")
+    _, done = d.chat(conv + [FOLLOW], max_tokens=16)
+    dc, dr = max_dlogp(cold, ref), max_dlogp(res, ref)
+    ok = dc == 0.0 and dr == 0.0
+    if reuse:
+        ok = ok and tc.get("start") == "cold" and done.get("cached_tokens") == tr.get("prefix_tokens")
+    detail = (f"exact env, E={tw.get('prefix_tokens')} tokens: unrelated cache start={tc.get('start')} "
+              f"Δ={dc:.3g}; shared-prefix cache start={tr.get('start')} "
+              f"(cached_tokens={tr.get('cached_tokens')}) Δ={dr:.3g} (==0); "
+              f"diagnostic: resume vs cold Δ={max_dlogp(res, cold):.3g}, W start={tw.get('start')}; "
+              f"next chat cached_tokens={done.get('cached_tokens')} (== {tr.get('prefix_tokens')})")
+    if ok and reuse and tr.get("start") != "resume":
+        return INCONCLUSIVE, detail + " — no checkpoint inside the shared prefix: resume not exercised"
+    if ok and decide_reuse and not reuse and tr.get("start") != "resume":
+        return INCONCLUSIVE, detail + (" — no chat prompt cache on this arch (answers compared only): "
+                                       "resume not exercised")
+    return ok, detail
+
+
+S3_CYCLE = 6   # session decides per S3 cycle
+
+
+def gate_session_leak(d, n, reuse=True):
+    """Cycles of: a chat turn on CONV_X (re-creates the prefill checkpoints
+    in the shared LONG_SYS prefix that a cold start drops), then decides on
+    X (extend), L (resume from a checkpoint in the shared prefix), L
+    (extend), X (resume), U (cold), U (extend). A cycle ends in the state it
+    started in, so whole cycles are measured after one warmup cycle."""
+    d.reset()
+    conv_l = chat_turn(d, CONV_L)
+    conv_u = chat_turn(d, CONV_U)
+    starts = {}
+
+    def cycle(i, count=True):
+        conv_x = chat_turn(d, CONV_X)
+        for j, c in enumerate([conv_x, conv_l, conv_l, conv_x, conv_u, conv_u]):
+            _, t = session(d, c, f"leak cycle {i} decide {j}")
+            if count:
+                starts[t.get("start")] = starts.get(t.get("start"), 0) + 1
+
+    cycle(-1, count=False)
+    cycles = max(1, -(-n // S3_CYCLE))
+    ok, detail = measure_leak(d, cycles, cycle,
+                              f"cycles ({cycles * S3_CYCLE} session decides + {cycles} chat turns)")
+    detail = f"{detail}; starts={starts}"
+    if not reuse:
+        return ok and set(starts) == {"cold"}, detail + " (need only cold)"
+    if not ok or not {"extend", "cold"} <= set(starts):
+        return False, detail + " (need extend, cold and resume)"
+    if "resume" not in starts:
+        return INCONCLUSIVE, detail + " — resume not exercised"
+    return True, detail + " (need extend, cold and resume)"
+
+
+def gate_session_errors(d, reuse=True):
+    d.reset()
+    conv = chat_turn(d, CONV_C)
+    session(d, conv, "commit")
+    notes, ok = [], True
+    for label, fields in [("state and messages", {"state": "s", "messages": conv}),
+                          ("neither", {}),
+                          ("empty messages", {"messages": []}),
+                          ("messages not a list", {"messages": "hi"})]:
+        d.send({"type": "decide", "id": "e", "questions": SESSION_Q, **fields})
+        e = d.recv_until({"decided", "error"}).get("error") or {}
+        ok_i = e.get("status") == 422
+        notes.append(f"{label}: status={e.get('status')} message={e.get('message')!r} -> {ok_i}")
+        ok &= ok_i
+    _, t = session(d, conv, "after refusals")
+    want = "extend" if reuse else "cold"
+    after_ok = t.get("start") == want and (not reuse or t.get("conversation_prefill_tokens") == 0)
+    notes.append(f"session decide after: start={t.get('start')} (=={want}), "
+                 f"conversation_prefill_tokens={t.get('conversation_prefill_tokens')}")
+    return ok and after_ok, "; ".join(notes)
+
+
+# ---- S6: session decide with a DFlash speculator loaded (read-only) --------
+def gate_spec_active(d):
+    d.reset()
+    conv = chat_turn(d, CONV_C)
+    nxt = conv + [FOLLOW]
+    base_text, base_done = d.chat(nxt)
+    base_cached = base_done.get("cached_tokens", 0)
+    d.reset()
+    if chat_turn(d, CONV_C) != conv:
+        return False, "setup: greedy turn 1 is not reproducible after reset"
+    _, t = session(d, conv, "session decide, speculator loaded")
+    text, done = d.chat(nxt)
+    cached = done.get("cached_tokens", 0)
+    # The decide reuses exactly the cached conversation (its `cached_tokens`
+    # == the baseline's). Its delta need not be 0: the DFlash chat path's
+    # cache ends at `<|im_end|>` without the `\n` trailer the render has,
+    # so E is one token past it (qwen-cache ids trace).
+    ok = (t.get("committed") is False and t.get("start") == "extend"
+          and t.get("cached_tokens") == base_cached
+          and text == base_text and len(text) > 0 and cached == base_cached and cached > 0)
+    return ok, (f"decide committed={t.get('committed')} (false), start={t.get('start')} (extend), "
+                f"decide cached_tokens={t.get('cached_tokens')} (== no-decide next-turn "
+                f"{base_cached}), conversation_prefill_tokens={t.get('conversation_prefill_tokens')}, "
+                f"prefix_tokens={t.get('prefix_tokens')}; next turn text identical="
+                f"{text == base_text}, cached_tokens={cached} (== no-decide {base_cached}, >0); "
+                f"texts {base_text[:40]!r} / {text[:40]!r}")
+
+
+LOOKUP_RE = re.compile(r"\[qwen-cache jinja lookup[^\]]*\].*?\bhit=(true|false)")
+
+
+def gate_spec_cold_keeps_turns(d, log_path):
+    if not log_path:
+        return False, "needs the daemon stderr log (HIPFIRE_QWEN_CACHE_TRACE lines)"
+    d.reset()
+    conv = chat_turn(d, CONV_C)
+    _, t = session(d, CONV_U, "session decide on an unrelated conversation")
+    off = os.path.getsize(log_path)
+    text, done = d.chat(conv + [FOLLOW])
+    with open(log_path, errors="replace") as fh:
+        fh.seek(off)
+        hits = LOOKUP_RE.findall(fh.read())
+    ok = (t.get("start") == "cold" and t.get("committed") is False and len(hits) > 0
+          and all(h == "true" for h in hits) and len(text) > 0)
+    return ok, (f"unrelated decide start={t.get('start')} (cold), committed={t.get('committed')}; "
+                f"next chat turn jinja lookups hit={hits} (all true, >=1), "
+                f"cached_tokens={done.get('cached_tokens')}, text {text[:40]!r}")
+
+
+def gate_spec_leak(d, n):
+    """Pairs of decides on the cached conversation (extend, read-only) and
+    one on an unrelated conversation (cold: the rollback empties the cache),
+    then a chat turn re-establishes the cache. 3 decides per cycle."""
+    d.reset()
+    conv_c = chat_turn(d, CONV_C)
+    starts = {}
+
+    def cycle(i, count=True):
+        for j, c in enumerate([conv_c, conv_c, CONV_U]):
+            _, t = session(d, c, f"leak cycle {i} decide {j}")
+            if count:
+                starts[t.get("start")] = starts.get(t.get("start"), 0) + 1
+        if chat_turn(d, CONV_C) != conv_c:
+            raise AssertionError(f"leak cycle {i}: re-established turn 1 differs")
+
+    cycle(-1, count=False)
+    cycles = max(1, -(-n // 3))
+    ok, detail = measure_leak(d, cycles, cycle,
+                              f"cycles ({cycles * 3} session decides + {cycles} chat turns)")
+    covered = {"extend", "cold"} <= set(starts)
+    return ok and covered, f"{detail}; starts={starts} (need extend and cold)"
 
 
 def check_cask_over_limit(d, cask):
@@ -441,13 +780,16 @@ def run(name, fn, *args):
     return name, res
 
 
-def with_daemon(model, max_seq, log, env, body, cask=None):
+def with_daemon(model, max_seq, log, env, body, cask=None, params=None):
     d = Daemon(stderr=log, env=env)
     try:
-        info = d.load(model, max_seq=max_seq, params=cask)
+        info = d.load(model, max_seq=max_seq, params={**(cask or {}), **(params or {})})
+        d.info = info
         print(f"loaded {model}: arch={info.get('arch')} max_seq={max_seq}"
               f"{' env=' + json.dumps(env) if env else ''}"
-              f"{' cask=' + json.dumps(cask) if cask else ''}", flush=True)
+              f"{' cask=' + json.dumps(cask) if cask else ''}"
+              f"{' params=' + json.dumps(params) if params else ''}"
+              f" cache_capable={info.get('cache_capable')}", flush=True)
         pre = [run("0 CASK configured", gate_cask_configured, d, cask)] if cask else []
         return pre + body(d)
     finally:
@@ -479,10 +821,14 @@ def main():
     ap.add_argument("--cask-sidecar", help="override config.json cask_sidecar")
     ap.add_argument("--leak-n", type=int, default=1000)
     ap.add_argument("--daemon-log", help="redirect daemon/probe stderr to this file prefix")
+    ap.add_argument("--draft", help="DFlash drafter path: run only gate S6 on a daemon loaded "
+                                    "with it (load param `draft`)")
     a = ap.parse_args()
     cask = serve_cask_params(a) if a.cask else None
     if a.max_seq is None:
         a.max_seq = 131072 if cask else 8192
+    if a.draft:
+        return main_draft(a)
     logs = []
 
     def log(suffix):
@@ -506,8 +852,29 @@ def main():
             results.append(("1b default-mode noise floor", (False, f"floor probe failed: {ex}")))
             print(f"FAIL         gate 1b default-mode noise floor: floor probe failed: {ex}", flush=True)
 
-        results += with_daemon(a.model, a.max_seq, log("exact"), EXACT_ENV, lambda d: [
-            run("1a exact-mode bit-exactness", gate_exact_mode, d)], cask)
+        # Two notions of reuse (spec §12.2, §12.5): the decide's own (off under
+        # eviction: every start cold), and the chat path's prompt cache (also
+        # needs a `cache_capable` arch; the Llama carrier's chat path keeps no
+        # conversation, so there a chat turn is never extended and the gates
+        # that need one compare answers only, as under --cask).
+        decide_reuse = cask is None
+
+        def chat_cache(d):
+            return decide_reuse and bool(d.info.get("cache_capable"))
+
+        def exact_body(d):
+            cc = chat_cache(d)
+            r = [run("1a exact-mode bit-exactness", gate_exact_mode, d)]
+            r += run_session_gates(d, [
+                ("S1b session reuse with delta (exact)", gate_session_reuse, d, True, cc),
+                ("S2 session exactness (exact)", gate_session_exact, d, cc),
+                ("S4 session stale cache (exact)", gate_session_stale, d, cc, LONG_SYS,
+                 decide_reuse)])
+            if cc and r[-1][1][0] == INCONCLUSIVE and "resume not exercised" in r[-1][1][1]:
+                r.append(run("S4r session stale cache, longer shared prefix (exact)",
+                              gate_session_stale, d, cc, LONG_SYS_RERUN, decide_reuse))
+            return r
+        results += with_daemon(a.model, a.max_seq, log("exact"), EXACT_ENV, exact_body, cask)
 
         def default_body(d):
             r = []
@@ -518,16 +885,45 @@ def main():
                   run("3 model left clean", gate_clean, d),
                   run("4 no leak", gate_leak, d, a.leak_n),
                   run("5 error replies", gate_errors, d, a.max_seq, cask)]
+            r += run_session_gates(d, [
+                ("S1a session reuse, no delta", gate_session_reuse, d, False, chat_cache(d)),
+                ("S3 session no leak", gate_session_leak, d, a.leak_n, decide_reuse),
+                ("S5 session error replies", gate_session_errors, d, decide_reuse)])
             return r
         results += with_daemon(a.model, a.max_seq, log("default"), None, default_body, cask)
     finally:
         for f in logs:
             f.close()
+    return summarize(results)
+
+
+def summarize(results):
     counts = {lab: sum(LABEL[ok] == lab for _, (ok, _) in results) for lab in LABEL.values()}
     print(f"summary: {counts['PASS']} PASS, {counts['FAIL']} FAIL, {counts['INCONCLUSIVE']} INCONCLUSIVE "
           f"(INCONCLUSIVE does not fail the run)", flush=True)
-    sys.exit(1 if counts["FAIL"] or not results else 0)
+    return 1 if counts["FAIL"] or not results else 0
+
+
+def main_draft(a):
+    """Gate S6 only: one default-env daemon with the DFlash drafter loaded and
+    the prompt-cache trace on (S6b reads it from the daemon stderr log)."""
+    if a.cask:
+        raise SystemExit("--draft does not combine with --cask")
+    if a.daemon_log:
+        log_path = f"{a.daemon_log}.draft"
+    else:
+        fd, log_path = tempfile.mkstemp(prefix="jev-gates-draft-", suffix=".log")
+        os.close(fd)
+    with open(log_path, "w") as log:
+        results = with_daemon(a.model, a.max_seq, log, {"HIPFIRE_QWEN_CACHE_TRACE": "1"}, lambda d: [
+            run("S6a speculator: session decide on the active conversation", gate_spec_active, d),
+            run("S6b speculator: cold session decide keeps assistant turns",
+                gate_spec_cold_keeps_turns, d, log_path),
+            run("S6c speculator: session no leak", gate_spec_leak, d, a.leak_n)],
+            params={"draft": a.draft})
+    print(f"daemon stderr: {log_path}", flush=True)
+    return summarize(results)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

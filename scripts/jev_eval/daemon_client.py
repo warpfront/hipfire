@@ -104,6 +104,41 @@ class Daemon:
             else:
                 raise RuntimeError(f"generate failed: {v}")
 
+    def chat(self, messages, max_tokens=64):
+        """One greedy chat turn over OpenAI-shaped `messages`, the way serve
+        forwards /v1/chat/completions (messages + last user text as prompt).
+        Returns (visible text, done event).
+
+        The daemon stages the turn and emits `commit_ready`, then waits for a
+        matching `commit` before it stores the turn in its prompt cache and
+        sends `done` (terminal.rs `await_client_terminal_commit`; without it
+        the turn aborts after 30 s and is rolled back). Serve acks it, so the
+        chat turns here do too."""
+        self.attempt += 1
+        rid = f"chat{self.attempt}"
+        prompt = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        self.send({"type": "generate", "id": rid, "attempt_id": self.attempt,
+                   "prompt": prompt, "messages": messages, "temperature": 0.0,
+                   "max_tokens": max_tokens, "thinking_enabled": False})
+        text = []
+        while True:
+            v = self.recv_until({"token", "commit_ready", "done", "error"})
+            if v["type"] == "token":
+                text.append(v.get("text", ""))
+            elif v["type"] == "commit_ready":
+                self.send({"type": "commit", "id": v.get("id", rid),
+                           "attempt_id": v.get("attempt_id", self.attempt)})
+            elif v["type"] == "done":
+                return "".join(text), v
+            else:
+                raise RuntimeError(f"chat failed: {v}")
+
+    def session_decide(self, messages, questions, **extra):
+        """Session-mode decide (spec §12): the conversation is the state."""
+        self.send({"type": "decide", "id": "s", "messages": messages,
+                   "questions": questions, **extra})
+        return self.recv_until({"decided", "error"})
+
     def close(self, timeout=120.0):
         """Unload (accepting `unloaded`, an `error` reply or a timeout), then
         always terminate; kill if the process does not exit."""
