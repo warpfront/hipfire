@@ -65,7 +65,8 @@ Gates:
       share a ~2.5k-token system prefix; a chat turn per cycle re-creates the
       prefill checkpoints a cold start drops), so extend, resume and cold are
       all exercised and counted; fdinfo growth < 64 MiB. INCONCLUSIVE if the
-      memory criterion passes but resume never ran.
+      memory criterion passes but resume never ran (on an arch with prefill
+      checkpoints; see below).
   S4  session stale cache (exact env): with an unrelated conversation
       cached (cold) and with one sharing a long prefix cached (resume), the
       answers equal a one-call full prefill (Δ == 0, so resume == cold
@@ -75,17 +76,26 @@ Gates:
       then S4r reruns it with a shared prefix longer than the first prefill
       chunk + 2048 tokens, so a checkpoint lies inside it.
   S5  session error replies: both / neither / empty / non-list messages ->
-      422, then a session decide still extends with zero delta.
+      422; an over-long conversation (over max_seq, or over the eviction
+      limit with --cask) with 128 questions -> 422 (+ required_max_seq >
+      max_seq without --cask) in <= 4x the time of the same refusal with 1
+      question + 0.25 s (refused after the probe and one question render,
+      not 128); then a session decide still extends with zero delta.
   S1-S5 are INCONCLUSIVE when the model has no Jinja chat template (session
   mode's spec §12.5 400). On an arch that is not `cache_capable` (the Llama
   carrier) the chat path keeps no conversation: S1 is INCONCLUSIVE, S2 and
-  S4 compare answers only (as under --cask; S4 INCONCLUSIVE, no resume), and
-  S3/S5 still expect the decide's own extend.
+  S4 compare answers only (as under --cask), and S3/S5 still expect the
+  decide's own extend. An arch without prefill checkpoints (not in
+  CHECKPOINT_ARCHES: the Llama carrier) cannot resume, so there S3 passes on
+  extend + cold and S4 is PASS/FAIL on the answers, never INCONCLUSIVE for
+  a missing resume.
   S6  (--draft only: a daemon loaded with a DFlash drafter; runs S6 alone,
       with HIPFIRE_QWEN_CACHE_TRACE=1) session decide with a speculator is
       read-only. (a) on the active conversation: timing committed=false,
       start=extend reusing the whole cached conversation, and the next chat
-      turn's greedy text and cached_tokens equal a no-decide baseline. (b) on an unrelated
+      turn's greedy text and cached_tokens equal a no-decide baseline (the
+      text is weak evidence, spec verification being lossless; the
+      cached_tokens equality is the check; MTP is not gated). (b) on an unrelated
       conversation (start=cold, rollback): the next chat turn over a history
       holding the earlier assistant turn still splices it (every
       `jinja lookup` trace line in daemon stderr says hit=true). (c) no leak
@@ -127,6 +137,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -462,6 +473,16 @@ def session_unavailable(d):
     return None
 
 
+# Archs whose chat path takes DeltaNet prefill checkpoints (Qwen35Carrier,
+# arch 5/6), the only ones a session decide can resume from (spec §12.2).
+# The Llama carrier keeps none: its starts are extend or cold only.
+CHECKPOINT_ARCHES = {"qwen3_5", "qwen3_5_moe"}
+
+
+def resumable(d):
+    return d.info.get("arch") in CHECKPOINT_ARCHES
+
+
 def run_session_gates(d, gates):
     """Run [(name, fn, *args)] session gates, or report each INCONCLUSIVE
     when the loaded model has no chat template for session mode."""
@@ -576,13 +597,15 @@ def gate_session_exact(d, reuse=True, floor=None, floor_src="n/a"):
 
 
 def gate_session_stale(d, reuse=True, long_sys=LONG_SYS, decide_reuse=True, floor=None,
-                       floor_src="n/a"):
+                       floor_src="n/a", resumable=True):
     """W = answers with the conversation's own chat turn cached (decode-built
     when there is a chat cache). (a) prefill-built: the cold start (unrelated
     conversation cached) and the resume (shared-prefix conversation cached)
     each Δ == 0 vs the one-call full prefill, so resume == cold exactly.
     (b) W vs that reference: drift <= 2 x floor per question (Δ == 0 when W
-    started cold). The reference runs last."""
+    started cold). The reference runs last. On an arch without prefill
+    checkpoints (`resumable` false: the Llama carrier) resume cannot run, so
+    the answers are compared only and the verdict is PASS/FAIL."""
     conv_l = [{"role": "system", "content": long_sys}, CONV_C[1]]
     conv_x = [{"role": "system", "content": long_sys}, X_USER]
     d.reset()
@@ -614,7 +637,7 @@ def gate_session_stale(d, reuse=True, long_sys=LONG_SYS, decide_reuse=True, floo
               f"next chat cached_tokens={done.get('cached_tokens')} (== {tr.get('prefix_tokens')})")
     if ok and reuse and tr.get("start") != "resume":
         return INCONCLUSIVE, detail + " — no checkpoint inside the shared prefix: resume not exercised"
-    if ok and decide_reuse and not reuse and tr.get("start") != "resume":
+    if ok and decide_reuse and resumable and not reuse and tr.get("start") != "resume":
         return INCONCLUSIVE, detail + (" — no chat prompt cache on this arch (answers compared only): "
                                        "resume not exercised")
     return ok, detail
@@ -623,12 +646,14 @@ def gate_session_stale(d, reuse=True, long_sys=LONG_SYS, decide_reuse=True, floo
 S3_CYCLE = 6   # session decides per S3 cycle
 
 
-def gate_session_leak(d, n, reuse=True):
+def gate_session_leak(d, n, reuse=True, resumable=True):
     """Cycles of: a chat turn on CONV_X (re-creates the prefill checkpoints
     in the shared LONG_SYS prefix that a cold start drops), then decides on
     X (extend), L (resume from a checkpoint in the shared prefix), L
     (extend), X (resume), U (cold), U (extend). A cycle ends in the state it
-    started in, so whole cycles are measured after one warmup cycle."""
+    started in, so whole cycles are measured after one warmup cycle. On an
+    arch without prefill checkpoints (`resumable` false: the Llama carrier)
+    resume cannot run, so extend and cold suffice."""
     d.reset()
     conv_l = chat_turn(d, CONV_L)
     conv_u = chat_turn(d, CONV_U)
@@ -648,6 +673,9 @@ def gate_session_leak(d, n, reuse=True):
     detail = f"{detail}; starts={starts}"
     if not reuse:
         return ok and set(starts) == {"cold"}, detail + " (need only cold)"
+    if not resumable:
+        return ok and {"extend", "cold"} <= set(starts), detail + (
+            " (need extend and cold; no prefill checkpoints on this arch, so no resume)")
     if not ok or not {"extend", "cold"} <= set(starts):
         return False, detail + " (need extend, cold and resume)"
     if "resume" not in starts:
@@ -655,11 +683,49 @@ def gate_session_leak(d, n, reuse=True):
     return True, detail + " (need extend, cold and resume)"
 
 
-def gate_session_errors(d, reuse=True):
+def session_oversized(d, max_seq, cask):
+    """An over-long conversation (over max_seq; with --cask over the eviction
+    limit) is refused after the probe and R_0 only, however many questions
+    (spec §12.5): the 128-question refusal must take about as long as the
+    1-question one, well below 128 whole-conversation renders."""
+    limit = cask_limit(cask) if cask else max_seq
+    big = [{"role": "system", "content": SESSION_SYS + " Policy notes: " + LOREM * (limit // 4)},
+           CONV_C[1]]
+    many = {f"q{i:03}": SESSION_Q["escalate"] for i in range(128)}
+    times, errs = [], []
+    for qs in ({"q000": SESSION_Q["escalate"]}, many):
+        t0 = time.monotonic()
+        r = d.session_decide(big, qs)
+        times.append(time.monotonic() - t0)
+        errs.append(r.get("error") or {})
+    e1, e = errs
+    if cask:
+        shape = (e.get("status") == 422 and "required_max_seq" not in e
+                 and f"limited to {limit} tokens" in e.get("message", ""))
+    else:
+        req = e.get("required_max_seq")
+        shape = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
+                 and req > max_seq)
+    shape = shape and e1.get("status") == 422
+    fast = times[1] <= FAST_REFUSAL_FACTOR * times[0] + 0.25
+    return shape and fast, (f"over-long conversation x128 questions: status={e.get('status')} "
+                            f"required_max_seq={e.get('required_max_seq')} "
+                            f"({'absent' if cask else f'> {max_seq}'}) message={e.get('message')!r}; "
+                            f"{times[1]:.3f}s vs 1 question {times[0]:.3f}s "
+                            f"(<= {FAST_REFUSAL_FACTOR}x + 0.25s) -> {shape and fast}")
+
+
+FAST_REFUSAL_FACTOR = 4
+
+
+def gate_session_errors(d, reuse=True, max_seq=8192, cask=None):
     d.reset()
     conv = chat_turn(d, CONV_C)
     session(d, conv, "commit")
     notes, ok = [], True
+    ok_o, note = session_oversized(d, max_seq, cask)
+    notes.append(note)
+    ok &= ok_o
     for label, fields in [("state and messages", {"state": "s", "messages": conv}),
                           ("neither", {}),
                           ("empty messages", {"messages": []}),
@@ -679,6 +745,14 @@ def gate_session_errors(d, reuse=True):
 
 # ---- S6: session decide with a DFlash speculator loaded (read-only) --------
 def gate_spec_active(d):
+    """Read-only session decide with a DFlash speculator loaded. The
+    next-turn text identity is weak evidence: speculative decoding is
+    lossless (every drafted token is verified by the target model), so the
+    greedy text would match even if the decide had disturbed the drafter's
+    context. The meaningful check is `cached_tokens` equality: the decide's
+    reuse and the next turn's cache hit both equal the no-decide baseline,
+    so the target cache was left exactly as found. MTP speculators are not
+    gated (only a DFlash drafter is loaded here)."""
     d.reset()
     conv = chat_turn(d, CONV_C)
     nxt = conv + [FOLLOW]
@@ -961,12 +1035,13 @@ def main():
                 ("S1b session reuse with delta (exact)", gate_session_reuse, d, True, cc),
                 ("S2 session exactness (exact)", gate_session_exact, d, cc, *fl_short),
                 ("S4 session stale cache (exact)", gate_session_stale, d, cc, LONG_SYS,
-                 decide_reuse, *fl_long)])
+                 decide_reuse, *fl_long, resumable(d))])
             if cc and r[-1][1][0] == INCONCLUSIVE and "resume not exercised" in r[-1][1][1]:
-                # The long floor was measured on the LONG_SYS conversation;
-                # the rerun's prefix is longer (stated in the detail).
+                # fl_long is the CONV_C floor (the probe cannot host the long
+                # conversation; stated in the detail), reused for the rerun.
                 r.append(run("S4r session stale cache, longer shared prefix (exact)",
-                              gate_session_stale, d, cc, LONG_SYS_RERUN, decide_reuse, *fl_long))
+                              gate_session_stale, d, cc, LONG_SYS_RERUN, decide_reuse, *fl_long,
+                              resumable(d)))
             return r
         results += with_daemon(a.model, a.max_seq, log("exact"), EXACT_ENV, exact_body, cask)
 
@@ -981,8 +1056,10 @@ def main():
                   run("5 error replies", gate_errors, d, a.max_seq, cask)]
             r += run_session_gates(d, [
                 ("S1a session reuse, no delta", gate_session_reuse, d, False, chat_cache(d)),
-                ("S3 session no leak", gate_session_leak, d, a.leak_n, decide_reuse),
-                ("S5 session error replies", gate_session_errors, d, decide_reuse)])
+                ("S3 session no leak", gate_session_leak, d, a.leak_n, decide_reuse,
+                 resumable(d)),
+                ("S5 session error replies", gate_session_errors, d, decide_reuse, a.max_seq,
+                 cask)])
             return r
         results += with_daemon(a.model, a.max_seq, log("default"), None, default_body, cask)
     finally:
