@@ -80,7 +80,7 @@ fn run_decide(
         .to_string();
 
     for attempt in 0..2 {
-        let (engine, model_echo) = {
+        let (engine, model_echo, session) = {
             let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
             let target = if !requested.is_empty() && is_local_model(&runtime, &requested) {
                 requested.clone()
@@ -98,13 +98,36 @@ fn run_decide(
                     }
                 }
             };
-            if let Err(e) = runtime.ensure_model(&target, &shared.meta, None) {
-                return DecideOutcome::Err {
-                    status: 500,
-                    message: format!("{e:#}"),
-                    required_max_seq: None,
-                };
-            }
+            let resolved = match runtime.ensure_model(&target, &shared.meta, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    return DecideOutcome::Err {
+                        status: 500,
+                        message: format!("{e:#}"),
+                        required_max_seq: None,
+                    }
+                }
+            };
+            // Session mode (spec §12.6): project `messages` / `tools` /
+            // `tool_choice` exactly as a chat request is projected, so the
+            // daemon renders the conversation the chat path cached.
+            let session = match body.get("messages") {
+                None => None,
+                Some(_) => match super::complete::project_request_contract(
+                    &body,
+                    &resolved,
+                    super::complete::include_reasoning_content(runtime.current_arch.as_deref()),
+                ) {
+                    Ok(c) => Some((c.messages, c.forwarded_tools)),
+                    Err(e) => {
+                        return DecideOutcome::Err {
+                            status: 422,
+                            message: format!("{e:#}"),
+                            required_max_seq: None,
+                        }
+                    }
+                },
+            };
             // Echo the model the way chat and `/health` report it (the tag
             // when one was requested); the filesystem path only as fallback.
             let echo = shared
@@ -120,16 +143,23 @@ fn run_decide(
                         .map(|p| p.display().to_string())
                 })
                 .unwrap_or(target);
-            (runtime.engine.clone(), echo)
+            (runtime.engine.clone(), echo, session)
         };
 
         let id = request_id();
         let mut msg = serde_json::json!({"type": "decide", "id": id});
         // `_debug_no_snapshot` is deliberately not forwarded: it is a daemon-
         // level gate knob (gates.py talks to the daemon directly), not API.
+        // messages / tools are forwarded projected (below), never raw.
         for key in ["state", "questions"] {
             if let Some(v) = body.get(key) {
                 msg[key] = v.clone();
+            }
+        }
+        if let Some((messages, tools)) = &session {
+            msg["messages"] = messages.clone();
+            if let Some(tools) = tools {
+                msg["tools"] = tools.clone();
             }
         }
         let reply = match engine.request(&msg) {

@@ -10727,6 +10727,85 @@ mod tests {
         assert_eq!(status, 422, "{body}");
     }
 
+    #[cfg(unix)]
+    fn timing_header(headers: &str) -> serde_json::Value {
+        let raw = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-hipfire-timing")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("x-hipfire-timing header");
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn session_body(model: &str, tool_choice: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": "yo"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "description": "d",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+        if let Some(tc) = tool_choice {
+            body["tool_choice"] = serde_json::json!(tc);
+        }
+        body
+    }
+
+    /// Session mode (spec §12.6): serve forwards the chat projection of
+    /// `messages` and `tools`, and the Jev body shape is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_forwards_projected_messages_and_tools() {
+        let harness = Task11HttpHarness::spawn("systemone-session");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), None));
+        assert_eq!(status, 200, "{body}");
+        let t = timing_header(&headers);
+        assert_eq!(t["mode"], "session", "{t}");
+        let roles: Vec<&str> = t["session_roles"]
+            .as_array()
+            .expect("session_roles")
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(roles.ends_with(&["user", "assistant"]), "{roles:?}");
+        assert_eq!(t["session_tools"], 1, "{t}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "noul");
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["answers", "model", "usage"], "{body}");
+    }
+
+    /// `tool_choice: "none"` drops tools exactly as the chat projection
+    /// does, proving serve projects rather than passes `tools` through.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_applies_tool_choice_projection() {
+        let harness = Task11HttpHarness::spawn("systemone-session-tc");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), Some("none")));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(timing_header(&headers)["session_tools"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_state_and_messages_together_is_422() {
+        let harness = Task11HttpHarness::spawn("systemone-both");
+        let mut body = session_body(harness.model(), None);
+        body["state"] = serde_json::json!("s");
+        let (status, _, body) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 422, "{body}");
+    }
+
     /// A daemon `required_max_seq` hint on a 422 triggers exactly one
     /// `ensure_model` reload with a bumped `max_seq`, then a transparent
     /// retry that succeeds. The fake daemon's `t-needs-ctx` sentinel refuses

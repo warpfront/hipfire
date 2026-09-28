@@ -573,9 +573,20 @@ for line in sys.stdin:
     elif ty == "decide":
         qs = req.get("questions") or {}
         state = req.get("state")
-        if not isinstance(state, (str, dict, list)) or not qs:
+        messages = req.get("messages")
+        # Spec §12.1: exactly one of state / messages.
+        if (state is None) == (messages is None):
             out({"type": "decided", "id": req.get("id"),
-                 "error": {"status": 422, "message": "state/questions invalid"}})
+                 "error": {"status": 422,
+                           "message": "exactly one of state or messages is required"}})
+            continue
+        if messages is not None:
+            valid = isinstance(messages, list) and bool(messages) and bool(qs)
+        else:
+            valid = isinstance(state, (str, dict, list)) and bool(qs)
+        if not valid:
+            out({"type": "decided", "id": req.get("id"),
+                 "error": {"status": 422, "message": "state/messages/questions invalid"}})
             continue
         # Task 8 review round 1: exercise the serve-side required_max_seq
         # reload-and-retry. Refuses until a `load` has raised this session's
@@ -613,9 +624,15 @@ for line in sys.stdin:
                                  "confidence": 1.0 / n}
             else:
                 answers[name] = {"type": "noul", "noul": 0.5}
+        timing = {"prefix_tokens": 8, "total_ms": 1.0}
+        if messages is not None:
+            # Echo what serve forwarded so route tests can see the projection.
+            timing.update({"mode": "session",
+                           "session_roles": [m.get("role") for m in messages],
+                           "session_tools": len(req.get("tools") or [])})
         out({"type": "decided", "id": req.get("id"), "answers": answers,
              "usage": {"input_tokens": 10 * len(qs), "output_tokens": 0},
-             "timing": {"prefix_tokens": 8, "total_ms": 1.0}})
+             "timing": timing})
     elif ty == "unload":
         out({"type": "unloaded"})
         sys.exit(0)
