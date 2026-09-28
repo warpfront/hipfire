@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Decide runner: render every question's full prompt, prefill the longest
-//! common token prefix once, snapshot, then per question restore → prefill
-//! suffix → gather label logits. Leaves the model reset.
-//! Spec: `docs/specs/2026-09-28-jev-decide-design.md` §4.1.
+//! Decide runner. Plain mode (`state`): render every question's full prompt,
+//! prefill the longest common token prefix once, snapshot, then per question
+//! restore → prefill suffix → gather label logits; leaves the model reset
+//! (spec §4.1). Session mode (`messages`, [`session`]): the cached chat
+//! conversation is the state and is kept (spec §12).
 
 use hipfire_engine::decide as d;
 use hipfire_loader::LoadedModel;
 use serde_json::{json, Value};
 use std::time::Instant;
+
+mod session;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecideError {
@@ -132,6 +135,55 @@ fn single_token_id(encode: impl Fn(&str) -> Vec<u32>, bos: Option<u32>, s: &str)
     }
 }
 
+/// Option labels for one question and their single-token ids (leading BOS
+/// stripped), shared by plain and session mode.
+fn question_labels(
+    tok: &hipfire_runtime::tokenizer::Tokenizer,
+    q: &d::Question,
+) -> Result<(Vec<String>, Vec<u32>), DecideError> {
+    let bos = tok.add_bos.then_some(tok.bos_id);
+    let encode = |s: &str| tok.encode(s);
+    let single = |s: &str| single_token_id(encode, bos, s).is_some();
+    let labels = d::labels_for(q, single).map_err(|e| DecideError::new(422, e))?;
+    let ids = labels
+        .iter()
+        .map(|l| {
+            single_token_id(encode, bos, l).ok_or_else(|| {
+                DecideError::new(500, format!("label {l:?} lost its single-token id"))
+            })
+        })
+        .collect::<Result<Vec<u32>, _>>()?;
+    Ok((labels, ids))
+}
+
+/// The logits of `ids`, in order.
+fn gather_labels(ids: &[u32], logits: &[f32]) -> Result<Vec<f32>, DecideError> {
+    ids.iter()
+        .map(|&id| {
+            logits.get(id as usize).copied().ok_or_else(|| {
+                DecideError::new(
+                    500,
+                    format!(
+                        "decide: label token id {id} outside logits (len {})",
+                        logits.len()
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The success reply for either mode.
+fn decided_reply(id: &str, out: DecideOutcome) -> Value {
+    json!({
+        "type": "decided",
+        "id": id,
+        "answers": out.answers,
+        "usage": out.usage,
+        "timing": out.timing,
+    })
+}
+
 /// Every question's rendered prompt: option labels' token ids and the full
 /// token sequence, in request order.
 pub struct RenderedQuestions {
@@ -151,23 +203,12 @@ pub fn render_question_prompts(
     chat_template: Option<&String>,
     parsed: &d::DecideRequest,
 ) -> Result<RenderedQuestions, DecideError> {
-    let bos = tok.add_bos.then_some(tok.bos_id);
-    let encode = |s: &str| tok.encode(s);
-    let single = |s: &str| single_token_id(encode, bos, s).is_some();
     let mut out = RenderedQuestions {
         label_ids: Vec::with_capacity(parsed.questions.len()),
         seqs: Vec::with_capacity(parsed.questions.len()),
     };
     for q in &parsed.questions {
-        let labels = d::labels_for(q, single).map_err(|e| DecideError::new(422, e))?;
-        let ids = labels
-            .iter()
-            .map(|l| {
-                single_token_id(encode, bos, l).ok_or_else(|| {
-                    DecideError::new(500, format!("label {l:?} lost its single-token id"))
-                })
-            })
-            .collect::<Result<Vec<u32>, _>>()?;
+        let (labels, ids) = question_labels(tok, q)?;
         let user = d::build_user_text(&parsed.state_text, q, &labels);
         let (tokens, started_in_think) = hipfire_engine::prompt::batch_render_prompt_tokens(
             &user,
@@ -363,21 +404,7 @@ fn run_questions(
         }
         let logits =
             hook(carrier.decide_prefill_logits(m, gpu, &seq[prefix_len..], prefix_len, true))?;
-        let label_logits = label_ids[i]
-            .iter()
-            .map(|&id| {
-                logits.get(id as usize).copied().ok_or_else(|| {
-                    DecideError::new(
-                        500,
-                        format!(
-                            "decide: label token id {id} outside logits (len {})",
-                            logits.len()
-                        ),
-                    )
-                })
-            })
-            .collect::<Result<Vec<f32>, DecideError>>()?;
-        per_q_logits.push(label_logits);
+        per_q_logits.push(gather_labels(&label_ids[i], &logits)?);
         timing["question_ms"]
             .as_array_mut()
             .expect("question_ms is an array")
@@ -417,13 +444,14 @@ pub fn precheck(
     Some(DecideError::new(status, message).to_reply(id))
 }
 
-/// Full dispatch for a `decide` JSONL message: [`precheck`] refusals, then
-/// [`plan_decide`] (validation, rendering, admission; read-only), then
-/// [`execute_decide`], building the `decided` reply. Returns `(reply,
-/// reset)`: `reset` is true only when `execute_decide` ran, i.e. the model
-/// was actually rolled back, so the caller advances `state_epoch` exactly
-/// when model state was reset -- the rule the daemon applies to `reset`.
-/// Refusals and validation errors (422 etc.) return `false`.
+/// Full dispatch for a `decide` JSONL message: [`precheck`] refusals, the
+/// mode check (both or neither of `state` / `messages`: 422), then plain
+/// mode ([`plan_decide`] + [`execute_decide`]) or session mode
+/// ([`session::handle_session`]). Returns `(reply, reset)`: `reset` is true
+/// exactly when the model was rolled back -- every plain decide that ran, and
+/// a session decide's cold start, speculator-mode end or fail-closed error --
+/// so the caller advances `state_epoch` by the rule the daemon applies to
+/// `reset`. Refusals and validation errors (422 etc.) return `false`.
 pub fn handle_decide_message(
     model: Option<&mut LoadedModel>,
     gpu: &mut rdna_compute::Gpu,
@@ -438,18 +466,17 @@ pub fn handle_decide_message(
     let Some(m) = model else {
         unreachable!("precheck refuses when no model is present");
     };
+    match d::request_mode(msg) {
+        Err(e) => return (DecideError::new(422, e).to_reply(id), false),
+        Ok(d::DecideMode::Session) => return session::handle_session(m, gpu, msg, id),
+        Ok(d::DecideMode::Plain) => {}
+    }
     let plan = match plan_decide(m, msg) {
         Ok(p) => p,
         Err(e) => return (e.to_reply(id), false),
     };
     let reply = match execute_decide(m, gpu, plan) {
-        Ok(out) => json!({
-            "type": "decided",
-            "id": id,
-            "answers": out.answers,
-            "usage": out.usage,
-            "timing": out.timing,
-        }),
+        Ok(out) => decided_reply(id, out),
         Err(e) => e.to_reply(id),
     };
     (reply, true)
@@ -581,5 +608,16 @@ mod tests {
         // Only a *leading* BOS is stripped.
         let trailing = |_: &str| -> Vec<u32> { vec![65, 1] };
         assert_eq!(single_token_id(trailing, Some(1), "A"), None);
+    }
+
+    #[test]
+    fn gather_labels_picks_ids_and_rejects_out_of_range() {
+        assert_eq!(
+            gather_labels(&[2, 0], &[0.5, 1.5, 2.5]).unwrap(),
+            vec![2.5, 0.5]
+        );
+        let e = gather_labels(&[3], &[0.0; 3]).unwrap_err();
+        assert_eq!(e.status, 500);
+        assert!(e.message.contains("label token id 3"), "{}", e.message);
     }
 }
