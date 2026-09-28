@@ -10661,6 +10661,18 @@ mod tests {
             headers.to_ascii_lowercase().contains("x-hipfire-timing:"),
             "{headers}"
         );
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("Jev body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["answers", "model", "usage"],
+            "Jev body must carry exactly {{model, answers, usage}}, no extras: {body}"
+        );
     }
 
     #[cfg(unix)]
@@ -10683,7 +10695,9 @@ mod tests {
         let harness = Task11HttpHarness::spawn("systemone-loaded");
         let named = serde_json::json!({"model": harness.model(), "state": "s",
             "questions": {"q": {"type": "noul", "instructions": "i"}}});
-        assert_eq!(post_systemone(harness.port(), &named).0, 200);
+        let (named_status, _, named_body) = post_systemone(harness.port(), &named);
+        assert_eq!(named_status, 200, "{named_body}");
+        let named_v: serde_json::Value = serde_json::from_str(&named_body).unwrap();
         let (status, _, body) = post_systemone(
             harness.port(),
             &serde_json::json!({
@@ -10694,6 +10708,10 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_ne!(v["model"], "jev-latest");
+        assert_eq!(
+            v["model"], named_v["model"],
+            "jev-latest must echo the same model the named request loaded"
+        );
     }
 
     #[cfg(unix)]
@@ -10707,6 +10725,161 @@ mod tests {
             }),
         );
         assert_eq!(status, 422, "{body}");
+    }
+
+    /// A daemon `required_max_seq` hint on a 422 triggers exactly one
+    /// `ensure_model` reload with a bumped `max_seq`, then a transparent
+    /// retry that succeeds. The fake daemon's `t-needs-ctx` sentinel refuses
+    /// until a `load` has raised its tracked max_seq to >= 40000 — comfortably
+    /// above the default `memory.max_seq` config of 32768, so this only
+    /// passes if a real second `load` round trip actually happened.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_required_max_seq_reloads_then_retries() {
+        let harness = Task11HttpHarness::spawn("systemone-reload");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "t-needs-ctx",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "noul");
+
+        let log = harness.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert!(
+            loads.len() >= 2,
+            "expected an initial load plus a required_max_seq reload; log={log:?}"
+        );
+        let reloaded_max_seq = loads
+            .iter()
+            .filter_map(|l| {
+                l.get("params")
+                    .and_then(|p| p.get("max_seq"))
+                    .and_then(|v| v.as_u64())
+            })
+            .max()
+            .expect("at least one load carries params.max_seq");
+        assert!(
+            reloaded_max_seq >= 40_000,
+            "expected a reload with max_seq >= 40000, got {reloaded_max_seq}; loads={loads:?}"
+        );
+    }
+
+    /// Write a `/v1/systemone` request and return the live TCP stream
+    /// without reading the response — mirrors `open_nonstream_request`.
+    #[cfg(unix)]
+    fn open_systemone_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/systemone HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    /// A client disconnect mid-decide must not release the admission slot
+    /// before the daemon's (deliberately slow) `decided` reply lands.
+    /// Decide's daemon round trip (`Engine::request`) has no cancellation
+    /// hook, so releasing the slot the instant hyper notices the client is
+    /// gone would let a second decide race the daemon while the first is
+    /// still, invisibly, in flight — corrupting the single-daemon
+    /// serialisation `Admission` exists to guarantee.
+    ///
+    /// This checks `harness.shared.admission.inflight()` directly (the same
+    /// technique `nonstream_client_disconnect_aborts_and_releases_admission`
+    /// uses), not the fake daemon's request log: the fake daemon is a
+    /// single-threaded Python script blocked in `time.sleep(1)` while
+    /// processing the slow decide, so it would not read/log a second
+    /// request's bytes until it finishes regardless of when serve released
+    /// admission — log-ordering alone cannot distinguish early-release from
+    /// held-to-completion here, only `inflight()` can.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_disconnect_does_not_release_admission_early() {
+        let harness = Task11HttpHarness::spawn("systemone-disconnect");
+        let port = harness.port();
+        let slow_body = serde_json::json!({
+            "model": harness.model(), "state": "t-slow",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+
+        let stream = open_systemone_request(port, &slow_body);
+
+        // Wait for the daemon to actually receive the slow decide (proving
+        // the request is admitted and dispatched) before disconnecting, so
+        // the guard is provably held mid-flight.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let slow_decide_seen = |harness: &Task11HttpHarness| {
+            Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "decide")
+                .iter()
+                .any(|row| row.get("state").and_then(|v| v.as_str()) == Some("t-slow"))
+        };
+        while Instant::now() < ready_deadline && !slow_decide_seen(&harness) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            slow_decide_seen(&harness),
+            "slow decide never reached the fake daemon within 5s; log={:?}",
+            harness.read_requests_log()
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            1,
+            "precondition: exactly one decide holds admission"
+        );
+
+        drop(stream);
+
+        // Poll admission for up to 300ms right after disconnecting. If the
+        // guard were released the instant hyper notices the client is gone
+        // (the bug), inflight would drop to 0 within this short window, well
+        // before the fake daemon's 1s sleep can possibly have elapsed.
+        let short_deadline = Instant::now() + Duration::from_millis(300);
+        let mut dropped_early = false;
+        while Instant::now() < short_deadline {
+            if harness.shared.admission.inflight() == 0 {
+                dropped_early = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !dropped_early,
+            "admission released within 300ms of disconnect — the slot must stay held for the \
+             full ~1s daemon round trip, not release the instant the client vanishes"
+        );
+
+        // It must still release once the daemon's slow decide actually
+        // completes, within a generous bound past the 1s sleep.
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < release_deadline && harness.shared.admission.inflight() != 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must eventually release once the slow daemon call completes"
+        );
     }
 
     /// Silent non-stream client disconnect aborts the correlated daemon txn,

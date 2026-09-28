@@ -717,7 +717,24 @@ async fn handle_request(
                     return openai_error(&msg, status);
                 }
             };
-            crate::serve::decide::handle_decide(shared, body_val).await
+
+            // Same exclusive admission as non-batch chat: the single-daemon
+            // backend serialises decide against chat traffic. The
+            // CancellationToken lets a client disconnect while queued abort
+            // the wait promptly; once acquired, `guard` moves into
+            // `handle_decide`'s spawn_blocking and is held until the daemon
+            // call(s) finish, not merely until this future is dropped.
+            let mut cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.token();
+            let cancelled = cancel_guard.cancelled();
+            let guard = match shared.admission.acquire_async(cancel.clone()).await {
+                Ok(g) => g,
+                Err(e) => return admission_error_response(&e),
+            };
+            let response =
+                crate::serve::decide::handle_decide(shared, body_val, guard, cancelled).await;
+            cancel_guard.disarm();
+            response
         }
         _ => openai_error("not found", 404),
     }
