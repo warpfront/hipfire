@@ -772,18 +772,45 @@ system prompt and `State:` block, so its tokens differ.
     - turn 2 `cached_tokens` == E, which is greater than the baseline's.
   - S1 is INCONCLUSIVE, not FAIL, when the baseline itself gets no cache
     hit (Llama carrier, `--cask`). It must PASS on Qwen3.5.
-- **S2 exactness (exact env).** Per question, Δ = 0 between the session
-  answer and the reference, both for a warm start (`extend`) and for a
-  start with another conversation cached (not `extend`).
-- **S3 no leak.** 1,000 session decides alternating two conversations in
-  pairs, so `extend` and `cold` both run and are counted. The daemon's
-  fdinfo growth must be < 64 MiB (gate 4's measure).
-- **S4 stale cache (exact env).** Conversation C, with its own conversation
-  cached, gives answers W. Then:
+- **Prefill-built vs decode-built state (human ruling).** S2 and S4 are
+  split like gate 1:
+  - **Prefill-built** conversations must be exact: Δ = 0 against the
+    reference. This covers a cold start, a checkpoint resume, and an extend
+    over a conversation a decide committed.
+  - **Decode-built** conversations are held to a noise bound instead. This
+    is a session decide that extends right after a chat turn, whose reply
+    tokens the model generated token by token.
+  - **Why the split.** The KV and DeltaNet state the decode steps leave is
+    not bit-identical to a one-call prefill of the same tokens, even with
+    the exact env pinned. This is the same precision property as §10's
+    gate 1b: per-token kernels differ from batched prefill.
+  - **The bound.** Per question, the drift against the reference must be at
+    most 2 × that question's one-call vs token-by-token floor. The floor is
+    measured on every run by `split_prefill_probe` in the env the gate runs
+    in (exact), on a v1 decide over the short conversation's text with the
+    session questions. The probe loads with `max_seq` 512, so S4's ~2k-token
+    conversation reuses this floor.
+  - **Reporting.** The detail line prints each question's drift and 2 ×
+    floor, and names the floor's source.
+- **S2 exactness (exact env).** The reference runs last, because it ends
+  reset and clears `asst_turn_cache`.
+  - **(a) Prefill-built.** Δ = 0 per question in two cases: a start with
+    another conversation cached (not `extend`), and an `extend` over the
+    conversation that decide committed.
+  - **(b) Decode-built.** A warm `extend` right after the chat turn stays
+    within 2 × the floor per question.
+- **S3 no leak.** 1,000 session decides cycling three conversations, two of
+  which share a long prefix. A chat turn per cycle re-creates the prefill
+  checkpoints, so `extend`, `resume` and `cold` all run and are counted.
+  The daemon's fdinfo growth must be < 64 MiB (gate 4's measure).
+- **S4 stale cache (exact env).** Conversation C, with its own chat turn
+  cached, gives answers W (decode-built). Then:
   - with an unrelated conversation cached (`start = cold`), the answers
-    must equal W;
+    must equal the one-call reference (Δ = 0);
   - with a conversation sharing a ~2.5k-token prefix cached
-    (`start = resume`), the answers must equal W (Δ = 0);
+    (`start = resume`), the answers must also equal the reference (Δ = 0),
+    so resume == cold exactly;
+  - W must be within 2 × the floor per question of the reference;
   - the next chat turn on C must reuse the decide's conversation
     (`cached_tokens` == E).
 
@@ -793,8 +820,9 @@ system prompt and `State:` block, so its tokens differ.
   non-list `messages` each return 422. After them, a session decide on the
   committed conversation must start `extend` with zero delta, proving the
   refusals left the cache untouched.
-- **`--cask`.** Every start is `cold`. S1 reports INCONCLUSIVE, S2 and S4
-  compare answers only, and S3 and S5 expect `cold`.
+- **`--cask`.** Every start is `cold`. S1 reports INCONCLUSIVE, and S2 and
+  S4 compare answers only. Every leg is prefill-built there, so every Δ must
+  be 0. S3 and S5 expect `cold`.
 
 **v1.1 is done when** S1–S5 pass on Qwen3.5-4B and the v1 gates still pass.
 On a Llama-carrier model S1 may be INCONCLUSIVE and the rest must pass.

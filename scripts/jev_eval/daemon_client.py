@@ -90,15 +90,21 @@ class Daemon:
     def generate_greedy(self, prompt, max_tokens=32):
         # Field names match the daemon "generate" arm (prompt, max_tokens,
         # temperature, thinking_enabled, mandatory attempt_id).
+        # The daemon stages the turn and waits for a matching `commit` after
+        # `commit_ready` (see `chat`); without it the turn aborts after 30 s.
         self.attempt += 1
-        self.send({"type": "generate", "id": f"gen{self.attempt}", "attempt_id": self.attempt,
+        rid = f"gen{self.attempt}"
+        self.send({"type": "generate", "id": rid, "attempt_id": self.attempt,
                    "prompt": prompt, "temperature": 0.0, "max_tokens": max_tokens,
                    "thinking_enabled": False})
         text = []
         while True:
-            v = self.recv_until({"token", "done", "error"})
+            v = self.recv_until({"token", "commit_ready", "done", "error"})
             if v["type"] == "token":
                 text.append(v.get("text", ""))
+            elif v["type"] == "commit_ready":
+                self.send({"type": "commit", "id": v.get("id", rid),
+                           "attempt_id": v.get("attempt_id", self.attempt)})
             elif v["type"] == "done":
                 return "".join(text)
             else:
