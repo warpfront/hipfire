@@ -33,6 +33,10 @@
 /// each other.
 pub mod common;
 
+/// Jev-compatible "decide": typed classification questions answered by
+/// next-token logit readout, orchestrated over the `Carrier` decide hooks.
+pub mod decide;
+
 /// The generic autoregressive generate path — the fallback every model
 /// without a specialised route takes, and the last daemon code that
 /// manipulates architecture types directly.
