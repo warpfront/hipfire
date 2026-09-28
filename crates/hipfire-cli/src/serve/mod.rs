@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) mod metrics;
 
 pub mod complete;
+pub(crate) mod decide;
 pub mod http;
 
 #[derive(Debug)]

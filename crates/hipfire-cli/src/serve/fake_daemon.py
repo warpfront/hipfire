@@ -566,6 +566,30 @@ for line in sys.stdin:
         })
     elif ty == "generate":
         handle_generate(req)
+    elif ty == "decide":
+        qs = req.get("questions") or {}
+        if not isinstance(req.get("state"), (str, dict, list)) or not qs:
+            out({"type": "decided", "id": req.get("id"),
+                 "error": {"status": 422, "message": "state/questions invalid"}})
+            continue
+        answers = {}
+        for name, q in qs.items():
+            t = q.get("type")
+            if t == "choice":
+                keys = list((q.get("criteria") or {}).keys())
+                p = 1.0 / len(keys)
+                answers[name] = {"type": "choice", "choice": keys[0],
+                                 "probabilities": {k: p for k in keys}, "confidence": 0.0}
+            elif t == "score":
+                n = len(q.get("criteria") or [])
+                answers[name] = {"type": "score", "score": (n - 1) / 2,
+                                 "probabilities": {str(i): 1.0 / n for i in range(n)},
+                                 "confidence": 1.0 / n}
+            else:
+                answers[name] = {"type": "noul", "noul": 0.5}
+        out({"type": "decided", "id": req.get("id"), "answers": answers,
+             "usage": {"input_tokens": 10 * len(qs), "output_tokens": 0},
+             "timing": {"prefix_tokens": 8, "total_ms": 1.0}})
     elif ty == "unload":
         out({"type": "unloaded"})
         sys.exit(0)

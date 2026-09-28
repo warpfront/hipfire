@@ -10615,6 +10615,100 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn post_systemone(port: u16, body: &serde_json::Value) -> (u16, String, String) {
+        let payload = serde_json::to_vec(body).unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "POST /v1/systemone HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&payload).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status: u16 = response[9..12].parse().unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        (status, headers.to_string(), body.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_named_model_returns_jev_shape() {
+        let harness = Task11HttpHarness::spawn("systemone-named");
+        let (status, headers, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(),
+                "state": "hello",
+                "questions": {"q": {"type": "choice", "instructions": "i",
+                                    "criteria": {"a": "x", "b": "y"}}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "choice");
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(
+            v.get("timing").is_none(),
+            "timing must not leak into the Jev body"
+        );
+        assert!(
+            headers.to_ascii_lowercase().contains("x-hipfire-timing:"),
+            "{headers}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_without_loaded_model_is_503() {
+        let harness = Task11HttpHarness::spawn("systemone-unloaded");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 503, "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_uses_loaded_model() {
+        let harness = Task11HttpHarness::spawn("systemone-loaded");
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        assert_eq!(post_systemone(harness.port(), &named).0, 200);
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(v["model"], "jev-latest");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_daemon_validation_error_maps_to_422() {
+        let harness = Task11HttpHarness::spawn("systemone-422");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": 5, "questions": {}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+    }
+
     /// Silent non-stream client disconnect aborts the correlated daemon txn,
     /// drains done/aborted before Admission releases, then admits a follow-up.
     #[cfg(unix)]
