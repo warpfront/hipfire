@@ -408,10 +408,7 @@ pub fn precheck(
     let (status, message) = if slot_mode {
         (409, "decide unsupported in multi-slot mode")
     } else if lanes_active {
-        (
-            409,
-            "decide refused: continuous-batch requests active",
-        )
+        (409, "decide refused: continuous-batch requests active")
     } else if !model_present {
         (503, "no model loaded")
     } else {
