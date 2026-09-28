@@ -7,6 +7,8 @@
 
 use serde_json::{json, Value};
 
+use hipfire_runtime::prompt_frame::Message;
+
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 pub const MAX_SCORE_LEVELS: usize = 10;
 /// Upper bound on questions per request (serve-side DoS bound; each question
@@ -67,12 +69,9 @@ fn desc_string(v: &Value) -> String {
     }
 }
 
-/// Validate a Jev request. Every `Err` is a 422 message naming the field.
-pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
-    let state = v.get("state").ok_or("state is required")?;
-    if !(state.is_string() || state.is_object() || state.is_array()) {
-        return Err("state must be a string, JSON object or JSON array".into());
-    }
+/// Validate the `questions` map (shared by plain and session requests).
+/// Every `Err` is a 422 message naming the question and field.
+pub fn parse_questions(v: &Value) -> Result<Vec<Question>, String> {
     let qs = v
         .get("questions")
         .and_then(Value::as_object)
@@ -159,9 +158,78 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
             kind,
         });
     }
+    Ok(questions)
+}
+
+/// Validate a Jev request. Every `Err` is a 422 message naming the field.
+pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
+    let state = v.get("state").ok_or("state is required")?;
+    if !(state.is_string() || state.is_object() || state.is_array()) {
+        return Err("state must be a string, JSON object or JSON array".into());
+    }
+    let questions = parse_questions(v)?;
     Ok(DecideRequest {
         state_text: render_state(state),
         questions,
+    })
+}
+
+/// Which decide mode a request selects (spec §12.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecideMode {
+    /// Jev wire: `state` + `questions`; the model is reset around the decide.
+    Plain,
+    /// hipfire extension: `messages` (+ `tools`) + `questions`; the
+    /// conversation is the state and the chat prompt cache is kept.
+    Session,
+}
+
+/// Exactly one of `state` / `messages`. `Err` is a 422 message.
+pub fn request_mode(v: &Value) -> Result<DecideMode, String> {
+    match (v.get("state").is_some(), v.get("messages").is_some()) {
+        (true, false) => Ok(DecideMode::Plain),
+        (false, true) => Ok(DecideMode::Session),
+        (true, true) => Err("exactly one of state or messages is allowed, got both".into()),
+        (false, false) => Err("state is required (or messages, for session mode)".into()),
+    }
+}
+
+/// A validated session-mode request (spec §12.1).
+#[derive(Debug, Clone)]
+pub struct SessionRequest {
+    /// Chat messages, content normalised exactly as the daemon's `generate`
+    /// arm normalises `messages`, so the render matches what chat cached.
+    pub messages: Vec<Message>,
+    /// OpenAI tool definitions; `None` when absent or empty (as `generate`).
+    pub tools: Option<Vec<Value>>,
+    pub questions: Vec<Question>,
+}
+
+/// Validate a session request. Every `Err` is a 422 message.
+pub fn parse_session_request(v: &Value) -> Result<SessionRequest, String> {
+    let raw = v
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or("messages must be a non-empty array of chat messages")?;
+    let mut messages: Vec<Message> =
+        serde_json::from_value(Value::Array(raw.clone())).map_err(|e| format!("messages: {e}"))?;
+    for m in &mut messages {
+        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&m.content);
+        if matches!(normalized, std::borrow::Cow::Owned(_)) {
+            m.content = normalized.into_owned();
+        }
+    }
+    let tools = match v.get("tools") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(a)) if a.is_empty() => None,
+        Some(Value::Array(a)) => Some(a.clone()),
+        Some(_) => return Err("tools must be an array of tool definitions".into()),
+    };
+    Ok(SessionRequest {
+        messages,
+        tools,
+        questions: parse_questions(v)?,
     })
 }
 
@@ -211,9 +279,9 @@ pub fn labels_for(
     Ok(labels)
 }
 
-/// The user-turn text for one question. The state block comes first so every
-/// question's rendered prompt shares the longest possible token prefix.
-pub fn build_user_text(state_text: &str, q: &Question, labels: &[String]) -> String {
+/// The question block (instructions, labelled options, answer line). Plain
+/// mode prefixes the state block; session mode sends it as its own turn.
+pub fn build_question_text(q: &Question, labels: &[String]) -> String {
     let descs: Vec<String> = match &q.kind {
         QuestionKind::Choice { descriptions, .. } => descriptions.clone(),
         QuestionKind::Score { levels } => levels.clone(),
@@ -225,15 +293,18 @@ pub fn build_user_text(state_text: &str, q: &Question, labels: &[String]) -> Str
             false_desc.clone().unwrap_or_else(|| "no".into()),
         ],
     };
-    let mut s = format!(
-        "State:\n{state_text}\n\nQuestion: {}\nOptions:\n",
-        q.instructions
-    );
+    let mut s = format!("Question: {}\nOptions:\n", q.instructions);
     for (label, desc) in labels.iter().zip(descs.iter()) {
         s.push_str(&format!("{label}. {desc}\n"));
     }
     s.push_str("\nAnswer with the option code only.");
     s
+}
+
+/// The user-turn text for one plain-mode question. The state block comes
+/// first so every question's rendered prompt shares the longest prefix.
+pub fn build_user_text(state_text: &str, q: &Question, labels: &[String]) -> String {
+    format!("State:\n{state_text}\n\n{}", build_question_text(q, labels))
 }
 
 /// Longest common prefix of all sequences, capped at `min_len - 1` so each
@@ -274,6 +345,99 @@ pub fn check_total_tokens(prefix_len: usize, seq_lens: &[usize]) -> Result<(), S
         return Err(format!(
             "state + all questions is {total} tokens, over the request limit of \
              {MAX_TOTAL_TOKENS} tokens"
+        ));
+    }
+    Ok(())
+}
+
+/// End of the conversation inside the session renders (spec §12.3): the
+/// position where the appended question turn starts. `seqs` are the
+/// question renders, `probe` the same conversation with a one-character
+/// user turn, `turn_open` the tokenizer's `<|im_start|>` id if it has one.
+/// The shared prefix of all of them runs through the question turn's header;
+/// the last opener inside it is that turn's. Without an opener token, the
+/// shared prefix itself. Capped so every question suffix is non-empty.
+pub fn conversation_end(seqs: &[Vec<u32>], probe: &[u32], turn_open: Option<u32>) -> usize {
+    let Some(first) = seqs.first() else { return 0 };
+    let min_q = seqs.iter().map(Vec::len).min().unwrap_or(0);
+    let min_all = min_q.min(probe.len());
+    let mut n = 0;
+    while n < min_all && seqs.iter().all(|s| s[n] == first[n]) && probe[n] == first[n] {
+        n += 1;
+    }
+    let n = n.min(min_q.saturating_sub(1));
+    turn_open
+        .and_then(|id| first[..n].iter().rposition(|&t| t == id))
+        .unwrap_or(n)
+}
+
+/// Where a session decide starts (spec §12.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStart {
+    /// The cached conversation is a prefix of the request's: prefill only
+    /// `conv[from..]` (nothing on an exact match).
+    Extend { from: usize },
+    /// Restore prefill checkpoint `ckpt_idx` (at `pos` <= LCP) and prefill
+    /// `conv[pos..]`.
+    Resume { ckpt_idx: usize, pos: usize },
+    /// Reset (keeping the assistant-turn cache) and prefill `conv` whole.
+    Cold,
+}
+
+/// Pick the start from the cached `prior` tokens and the request's
+/// conversation `conv`. `ckpt_positions` is ascending (as
+/// `take_dn_checkpoint` appends them).
+pub fn plan_session_start(
+    prior: &[u32],
+    conv: &[u32],
+    seq_pos: usize,
+    reuse_eligible: bool,
+    ckpt_positions: &[usize],
+    resume_enabled: bool,
+) -> SessionStart {
+    if !reuse_eligible || prior.is_empty() || seq_pos != prior.len() {
+        return SessionStart::Cold;
+    }
+    let lcp = prior.iter().zip(conv).take_while(|(a, b)| a == b).count();
+    if lcp == prior.len() {
+        return SessionStart::Extend { from: lcp };
+    }
+    if resume_enabled {
+        if let Some(idx) = ckpt_positions.iter().rposition(|&p| p > 0 && p <= lcp) {
+            return SessionStart::Resume {
+                ckpt_idx: idx,
+                pos: ckpt_positions[idx],
+            };
+        }
+    }
+    SessionStart::Cold
+}
+
+/// Jev's limits applied to the question part of a session request: each
+/// question's tokens past the conversation <= `MAX_QUESTION_TOKENS`, all of
+/// them together <= `MAX_TOTAL_TOKENS`. The conversation itself is bounded
+/// by `max_seq` (checked by the runner).
+pub fn check_session_tokens(
+    questions: &[Question],
+    conv_len: usize,
+    seq_lens: &[usize],
+) -> Result<(), String> {
+    let mut total = 0usize;
+    for (q, &len) in questions.iter().zip(seq_lens) {
+        let suffix = len.saturating_sub(conv_len);
+        if suffix > MAX_QUESTION_TOKENS {
+            return Err(format!(
+                "{}: question is {suffix} tokens beyond the conversation, over the \
+                 per-question limit of {MAX_QUESTION_TOKENS} tokens",
+                q.name
+            ));
+        }
+        total += suffix;
+    }
+    if total > MAX_TOTAL_TOKENS {
+        return Err(format!(
+            "questions are {total} tokens beyond the conversation, over the request \
+             limit of {MAX_TOTAL_TOKENS} tokens"
         ));
     }
     Ok(())
@@ -727,5 +891,182 @@ mod tests {
             },
         };
         assemble_answer(&q, &[0.0]);
+    }
+
+    #[test]
+    fn request_mode_requires_exactly_one_of_state_or_messages() {
+        assert_eq!(request_mode(&json!({"state": "s"})), Ok(DecideMode::Plain));
+        assert_eq!(
+            request_mode(&json!({"messages": []})),
+            Ok(DecideMode::Session)
+        );
+        assert!(request_mode(&json!({"state": "s", "messages": []}))
+            .unwrap_err()
+            .contains("both"));
+        assert!(request_mode(&json!({"questions": {}}))
+            .unwrap_err()
+            .contains("state"));
+    }
+
+    fn session_err(v: Value) -> String {
+        match parse_session_request(&v) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn parses_session_request_and_normalises_like_generate() {
+        let raw = "a\n\n\n\nb";
+        let r = parse_session_request(&json!({
+            "messages": [{"role": "system", "content": "sys"},
+                         {"role": "user", "content": raw},
+                         {"role": "assistant", "content": "ok"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        }))
+        .unwrap();
+        assert_eq!(r.messages.len(), 3);
+        // Same normalisation the daemon's generate arm applies to messages.
+        assert_eq!(
+            r.messages[1].content,
+            hipfire_runtime::tokenizer::maybe_normalize_prompt(raw)
+        );
+        assert_eq!(r.tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(r.questions.len(), 1);
+        let no_tools = parse_session_request(&json!({
+            "messages": [{"role": "user", "content": "u"}], "tools": [],
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        }))
+        .unwrap();
+        assert!(
+            no_tools.tools.is_none(),
+            "empty tools == no tools, as generate"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_session_shapes() {
+        let q = json!({"q": {"type": "noul", "instructions": "i"}});
+        assert!(session_err(json!({"messages": [], "questions": q})).contains("messages"));
+        assert!(session_err(json!({"messages": "hi", "questions": q})).contains("messages"));
+        assert!(session_err(json!({
+            "messages": [{"role": "robot", "content": "x"}], "questions": q
+        }))
+        .contains("messages"));
+        assert!(session_err(json!({
+            "messages": [{"role": "user", "content": "x"}], "tools": {}, "questions": q
+        }))
+        .contains("tools"));
+        assert!(session_err(json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "questions": {"q": {"type": "noul"}}
+        }))
+        .contains("q.instructions"));
+    }
+
+    #[test]
+    fn user_text_is_state_block_plus_question_text() {
+        let q = choice_q(&["a", "b"]);
+        let labels = vec!["A".to_string(), "B".to_string()];
+        let qt = build_question_text(&q, &labels);
+        assert_eq!(
+            build_user_text("S", &q, &labels),
+            format!("State:\nS\n\n{qt}")
+        );
+        assert!(
+            qt.starts_with("Question: i\nOptions:\nA. a\nB. b\n"),
+            "{qt}"
+        );
+        assert!(qt.ends_with("\nAnswer with the option code only."), "{qt}");
+    }
+
+    #[test]
+    fn conversation_end_is_the_question_turn_opener() {
+        const OPEN: u32 = 0;
+        // [conversation: 1 2][question turn: OPEN 5 7 …]
+        let seqs = vec![vec![1, 2, OPEN, 5, 7, 9, 9], vec![1, 2, OPEN, 5, 7, 8, 8]];
+        let probe = vec![1, 2, OPEN, 5, 7, 3];
+        assert_eq!(conversation_end(&seqs, &probe, Some(OPEN)), 2);
+        // A single question: the probe alone bounds the shared prefix.
+        assert_eq!(conversation_end(&seqs[..1], &probe, Some(OPEN)), 2);
+        // Openers inside the conversation are not the question turn's.
+        let s2 = vec![vec![OPEN, 4, 1, OPEN, 5, 9]];
+        assert_eq!(
+            conversation_end(&s2, &[OPEN, 4, 1, OPEN, 5, 3], Some(OPEN)),
+            3
+        );
+        // No ChatML opener in the tokenizer: the shared prefix itself.
+        assert_eq!(conversation_end(&seqs, &probe, None), 5);
+        // Capped so every question keeps a non-empty suffix.
+        assert_eq!(conversation_end(&[vec![1, 2, 3]], &[1, 2, 3, 4], None), 2);
+    }
+
+    #[test]
+    fn session_start_extends_a_cached_prefix() {
+        use SessionStart::*;
+        let conv = [1, 2, 3, 4];
+        assert_eq!(
+            plan_session_start(&[1, 2, 3], &conv, 3, true, &[], true),
+            Extend { from: 3 }
+        );
+        // Exact match (the usual agent case): nothing to prefill.
+        assert_eq!(
+            plan_session_start(&conv, &conv, 4, true, &[], true),
+            Extend { from: 4 }
+        );
+    }
+
+    #[test]
+    fn session_start_resumes_or_goes_cold() {
+        use SessionStart::*;
+        let conv = [1, 2, 9, 9];
+        // Divergence at 2: the latest checkpoint at or before the LCP.
+        assert_eq!(
+            plan_session_start(&[1, 2, 3, 4], &conv, 4, true, &[1, 2, 3], true),
+            Resume {
+                ckpt_idx: 1,
+                pos: 2
+            }
+        );
+        assert_eq!(
+            plan_session_start(&[1, 2, 3, 4], &conv, 4, true, &[3], true),
+            Cold
+        );
+        assert_eq!(
+            plan_session_start(&[1, 2, 3, 4], &conv, 4, true, &[1], false),
+            Cold
+        );
+        // Cached conversation runs past the request's: rewind by checkpoint.
+        assert_eq!(
+            plan_session_start(&[1, 2, 9, 9, 5], &conv, 5, true, &[2, 4], true),
+            Resume {
+                ckpt_idx: 1,
+                pos: 4
+            }
+        );
+        // Not reusable: ineligible, empty, or cursor out of step with tokens.
+        assert_eq!(
+            plan_session_start(&[1, 2], &conv, 2, false, &[], true),
+            Cold
+        );
+        assert_eq!(plan_session_start(&[], &conv, 0, true, &[], true), Cold);
+        assert_eq!(plan_session_start(&[1, 2], &conv, 7, true, &[], true), Cold);
+    }
+
+    #[test]
+    fn session_limits_count_tokens_beyond_the_conversation() {
+        let qs = vec![choice_q(&["a", "b"]), choice_q(&["c", "d"])];
+        // A long conversation is bounded by max_seq, not Jev's limits.
+        assert!(check_session_tokens(&qs, 100_000, &[100_010, 100_020]).is_ok());
+        let e = check_session_tokens(&qs, 10, &[10 + MAX_QUESTION_TOKENS + 1, 20]).unwrap_err();
+        assert!(
+            e.contains("q:") && e.contains("per-question limit of 32000"),
+            "{e}"
+        );
+        let qs3 = vec![choice_q(&["a", "b"]); 3];
+        let e = check_session_tokens(&qs3, 5, &[5 + 30_000, 5 + 30_000, 5 + 4_001]).unwrap_err();
+        assert!(e.contains("request limit of 64000"), "{e}");
+        assert!(check_session_tokens(&qs3, 5, &[5 + 30_000, 5 + 30_000, 5 + 4_000]).is_ok());
     }
 }
