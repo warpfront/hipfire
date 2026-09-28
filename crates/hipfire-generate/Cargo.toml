@@ -52,6 +52,8 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 serve-fault-inject = [
     "hipfire-runtime/serve-fault-inject",
     "hipfire-dispatch/serve-fault-inject",
@@ -60,3 +62,13 @@ serve-fault-inject = [
 # decode straight to device patches, skipping CPU decode and upload.
 # Default off; the CPU path below is unchanged when disabled.
 vcn-jpeg = ["hipfire-arch-qwen35-vl/vcn-jpeg"]
+
+# ---------------------------------------------------------------------------
+# Archived research probes (same convention as crates/hipfire-loader/Cargo.toml).
+# Gated so they are not type-checked on every build; they pin internal kernel
+# signatures. Run on demand:  cargo build -p hipfire-generate --examples --features lab
+# split_prefill_probe stays UNGATED: scripts/jev_eval/gates.py runs it.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "attn_wmma_row_probe"
+required-features = ["lab"]

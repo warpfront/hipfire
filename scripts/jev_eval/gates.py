@@ -10,19 +10,27 @@ Gates:
       and each question of the 3-question request == a single-question
       full-prefill decide of it alone (Δ == 0.0: restore leaves no residue).
       Also checks the template closed thinking (no 400).
-  1b  default mode: max |Δlogp| snapshot vs full prefill <= the model's
-      path-noise floor on the same prompts = one-call prefill vs
-      token-by-token prefill (A vs C), measured per run by the
-      `split_prefill_probe` example in PROBE_DECIDE_REQUEST mode.
+  1b  default mode, per question: |Δlogp| snapshot vs full prefill
+      (drift_q) <= 2 x floor_q, where floor_q is that question's path-noise
+      floor = one-call prefill vs token-by-token prefill (A vs C) of the same
+      prompt, measured per run by the `split_prefill_probe` example in
+      PROBE_DECIDE_REQUEST mode. The probe's A must reproduce the daemon's
+      full-prefill answer (Δ <= 1e-6), else the floor is not comparable: FAIL.
+      1a proves exactness; 1b only guards against gross regressions of the
+      default kernels, and the floor is a different noise source (per-token
+      path) than the drift (split point), hence the factor 2.
   1c  restore order-invariance (default mode): each question's answer is
-      identical whether it runs first (no restore) or after restores, at a
-      fixed split point.
+      bit-identical (Δ == 0) whether it runs first (no restore) or after
+      restores, at a fixed split point.
   2   question isolation, baseline-relative: PASS iff
       |P(code | code in sibling) - P(code | no code)| <= 0.05 and
       P(code | code in state) - P(code | no code) >= 0.3. If only the
       sensitivity half fails, the model cannot do the probe: INCONCLUSIVE.
   3   model left clean: greedy generate identical before/after a decide.
-  4   no device-memory leak over N decides.
+  4   no device-memory leak over N decides: growth of the daemon's own
+      amdgpu GTT + VRAM (/proc/<pid>/fdinfo) < 64 MiB; the device-wide
+      sysfs gtt + vram sum over all cards is printed alongside and is the
+      fallback when fdinfo is unreadable (FAIL if neither is readable).
   5   error replies end to end: 422 + required_max_seq for an over-long
       state, 422 for a malformed request; a normal decide succeeds after each.
 
@@ -47,6 +55,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -70,19 +79,24 @@ QUESTIONS = {
                  "criteria": ["Low", "Normal", "High", "Critical"]},
     "angry": {"type": "noul", "instructions": "The customer sounds angry."},
 }
-TOL = 0.05  # max |Δ log p|, shared by gates 1 and 1b
 
 
 def dist(a):
+    """Answer -> {key: probability}, keyed so comparisons never depend on
+    dict/value order."""
     if a["type"] == "noul":
-        return [a["noul"], 1 - a["noul"]]
-    return list(a["probabilities"].values())
+        return {"true": a["noul"], "false": 1 - a["noul"]}
+    return dict(a["probabilities"])
 
 
 def dlogp(a, b):
+    """max |Δ log p| between two answers, aligned by key."""
+    da, db = dist(a), dist(b)
+    if set(da) != set(db):
+        raise AssertionError(f"answer keys differ: {sorted(da)} vs {sorted(db)}")
     worst = 0.0
-    for p, q in zip(dist(a), dist(b)):
-        worst = max(worst, abs(math.log(max(p, 1e-12)) - math.log(max(q, 1e-12))))
+    for k in sorted(da):
+        worst = max(worst, abs(math.log(max(da[k], 1e-12)) - math.log(max(db[k], 1e-12))))
     return worst
 
 
@@ -144,24 +158,30 @@ def measure_floor(model, log_path):
     raise RuntimeError(f"probe printed no DECIDE_FLOOR line:\n{out}")
 
 
+FLOOR_FACTOR = 2.0   # human ruling: per question, drift_q <= 2 x floor_q
+FLOOR_CONSISTENCY = 1e-6
+
+
 def gate_noise_floor(d, floor):
     snap = need_answers(d.decide(STATE, QUESTIONS), "snapshot")
     full = need_answers(d.decide(STATE, QUESTIONS, _debug_no_snapshot=True), "full-prefill")
-    per = {n: dlogp(snap[n], full[n]) for n in QUESTIONS}
-    worst = max(per.values())
-    fl = floor["max"]
-    # Consistency (informational): the probe's one-call A must reproduce the
-    # daemon's full-prefill answer, i.e. the floor was measured on the same
-    # prompt tokens and label codes.
-    same = max(max(abs(math.log(max(p, 1e-12)) - math.log(max(q, 1e-12)))
-                   for p, q in zip(floor["per_question"][n]["a_dist"], dist(full[n])))
-               for n in QUESTIONS)
-    ok = worst <= fl
-    per_s = ", ".join(f"{k}={v:.4f}" for k, v in per.items())
-    fl_s = ", ".join(f"{k}={v['a_vs_c']:.4f}" for k, v in floor["per_question"].items())
-    return ok, (f"max |Δlogp| snapshot vs full-prefill = {worst:.4f} [{per_s}] <= noise floor "
-                f"(one-call vs token-by-token, split_prefill_probe, this run) = {fl:.4f} [{fl_s}]; "
-                f"probe A vs daemon full-prefill Δ = {same:.3g}")
+    pq = floor["per_question"]
+    # The probe's one-call A must reproduce the daemon's full-prefill answer:
+    # otherwise the floor was measured on a different prompt or kernel route.
+    same = max(dlogp(pq[n]["a_answer"], full[n]) for n in QUESTIONS)
+    rows, ok = [], same <= FLOOR_CONSISTENCY
+    for n in QUESTIONS:
+        drift = dlogp(snap[n], full[n])
+        fl = dlogp(pq[n]["a_answer"], pq[n]["c_answer"])
+        q_ok = drift <= FLOOR_FACTOR * fl
+        ok &= q_ok
+        rows.append(f"{n}: drift={drift:.4f} floor={fl:.4f} 2xfloor={FLOOR_FACTOR * fl:.4f} "
+                    f"{'ok' if q_ok else 'OVER'}")
+    cons = (f"probe A vs daemon full-prefill Δ = {same:.3g} (<= {FLOOR_CONSISTENCY:g})"
+            + ("" if same <= FLOOR_CONSISTENCY else
+               " — FLOOR MEASURED ON A DIFFERENT PROMPT/ROUTE, not comparable"))
+    return ok, (f"per question, snapshot vs full-prefill drift <= {FLOOR_FACTOR:g} x floor "
+                f"(one-call vs token-by-token, split_prefill_probe, this run): [{'; '.join(rows)}]; {cons}")
 
 
 def gate_restore_order(d):
@@ -181,8 +201,8 @@ def gate_restore_order(d):
             ref = a
         for n in names:
             worst = max(worst, dlogp(ref[n], a[n]))
-    ok = worst < TOL and len(prefixes) == 1
-    return ok, (f"max |Δlogp| across all {math.factorial(len(names))} question orderings = {worst:.6f} (<{TOL}), "
+    ok = worst == 0.0 and len(prefixes) == 1
+    return ok, (f"max |Δlogp| across all {math.factorial(len(names))} question orderings = {worst:.3g} (==0), "
                 f"prefix_tokens={sorted(prefixes)}")
 
 
@@ -228,25 +248,67 @@ def gate_clean(d):
                 f"texts: {after_reset[:60]!r} / {base2[:60]!r}")
 
 
-def gtt_used():
-    for p in Path("/sys/class/drm").glob("card*/device/mem_info_gtt_used"):
-        return int(p.read_text())
-    for p in Path("/sys/class/drm").glob("card*/device/mem_info_vram_used"):
-        return int(p.read_text())
-    return None
+def device_mem():
+    """(gtt_used, vram_used) summed over every /sys/class/drm/card*/device
+    node, each None if no node exposes it."""
+    tot = {"gtt": None, "vram": None}
+    for kind in tot:
+        for p in sorted(Path("/sys/class/drm").glob(f"card*/device/mem_info_{kind}_used")):
+            try:
+                v = int(p.read_text())
+            except (OSError, ValueError):
+                continue
+            tot[kind] = (tot[kind] or 0) + v
+    return tot["gtt"], tot["vram"]
+
+
+def process_mem(pid):
+    """(gtt, vram) bytes held by this process's amdgpu DRM clients, from
+    /proc/<pid>/fdinfo `drm-memory-*`; None if no amdgpu fd is visible."""
+    unit = {"": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+    tot, seen = {"gtt": 0, "vram": 0}, False
+    for f in Path(f"/proc/{pid}/fdinfo").glob("*"):
+        try:
+            t = f.read_text()
+        except OSError:
+            continue
+        if "drm-driver:\tamdgpu" not in t:
+            continue
+        seen = True
+        for kind, val, u in re.findall(r"drm-memory-(gtt|vram):\s+(\d+)\s*([KMG]iB)?", t):
+            tot[kind] += int(val) * unit[u or ""]
+    return (tot["gtt"], tot["vram"]) if seen else None
 
 
 def gate_leak(d, n):
     need_answers(d.decide(STATE, QUESTIONS), "warmup")
-    before = gtt_used()
+    g0, v0 = device_mem()
+    p0 = process_mem(d.p.pid)
     for i in range(n):
         need_answers(d.decide(STATE, QUESTIONS), f"leak iter {i}")
-    after = gtt_used()
-    if before is None:
-        return False, "no mem_info_gtt_used / mem_info_vram_used sysfs node — cannot measure"
-    grew = after - before
+    g1, v1 = device_mem()
+    p1 = process_mem(d.p.pid)
+    mib = lambda x: f"{x / 2**20:.1f}"  # noqa: E731
+    if g0 is None and v0 is None:
+        return False, "no mem_info_gtt_used / mem_info_vram_used sysfs node readable — cannot measure"
+    dg = (g1 - g0) if g0 is not None and g1 is not None else 0
+    dv = (v1 - v0) if v0 is not None and v1 is not None else 0
+    sys_s = (f"system-wide (sysfs, all cards) {mib(dg + dv)} MiB "
+             f"[gtt {mib(dg) if g0 is not None else 'n/a'} + vram {mib(dv) if v0 is not None else 'n/a'}]")
+    # The sysfs counters are device-wide: on a shared workstation other
+    # processes move them by tens of MiB over a 1000-decide run (observed
+    # -101.6 and +64.3 MiB while the daemon's own fdinfo total moved 2 MiB).
+    # When the daemon's own DRM fdinfo is readable it is the criterion; the
+    # device-wide sum is printed alongside and is the fallback.
+    if p0 is not None and p1 is not None:
+        pg, pv = p1[0] - p0[0], p1[1] - p0[1]
+        grew = pg + pv
+        basis = f"daemon process (fdinfo) {mib(grew)} MiB [gtt {mib(pg)} + vram {mib(pv)}]"
+    else:
+        grew = dg + dv
+        basis = "daemon fdinfo unreadable, using system-wide"
     ok = grew < 64 * 1024 * 1024
-    return ok, f"device memory growth over {n} decides = {grew / 2**20:.1f} MiB (<64)"
+    return ok, f"device memory growth over {n} decides: {basis} (<64); {sys_s}"
 
 
 def gate_errors(d, max_seq):

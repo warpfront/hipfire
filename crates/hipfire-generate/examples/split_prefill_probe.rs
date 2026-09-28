@@ -32,7 +32,8 @@
 //! exactly as `run_decide` does, runs it as A (one call) and C (token by
 //! token), and prints one line `DECIDE_FLOOR {json}` with, per question, the
 //! max |Δ log p| between A's and C's label distributions (softmax over the
-//! option-code logits, the quantity decide answers are built from). Used by
+//! option-code logits, the quantity decide answers are built from) and A's and
+//! C's answers assembled exactly as the daemon's (`a_answer`, `c_answer`). Used by
 //! `scripts/jev_eval/gates.py` gate 1b as the per-model path-noise floor.
 
 use hipfire_loader::{Carrier, LoadedModel};
@@ -370,7 +371,7 @@ fn decide_floor(
             .expect("request json");
     let parsed = d::parse_request(&req).expect("parse_request");
     // Same rendering as hipfire_generate::decide::run_decide.
-    let mut prompts: Vec<(String, Vec<u32>, Vec<u32>)> = Vec::new();
+    let mut prompts: Vec<(&d::Question, Vec<u32>, Vec<u32>)> = Vec::new();
     {
         let tok = m.tokenizer.as_ref().expect("tokenizer");
         let single = |s: &str| tok.encode(s).len() == 1;
@@ -391,31 +392,33 @@ fn decide_floor(
             )
             .expect("render");
             assert!(!started_in_think, "template cannot close thinking");
-            prompts.push((q.name.clone(), ids, tokens));
+            prompts.push((q, ids, tokens));
         }
     }
     let mut per = serde_json::Map::new();
     let mut worst = 0.0f64;
-    for (name, ids, toks) in &prompts {
+    for (q, ids, toks) in &prompts {
         let n = toks.len();
         let pick = |l: &[f32]| ids.iter().map(|&i| l[i as usize]).collect::<Vec<f32>>();
-        let a = d::softmax(&pick(&run_segments(carrier, m, gpu, toks, &[n])));
-        let c = d::softmax(&pick(&run_segments(
-            carrier,
-            m,
-            gpu,
-            toks,
-            &vec![1usize; n],
-        )));
+        let la = pick(&run_segments(carrier, m, gpu, toks, &[n]));
+        let lc = pick(&run_segments(carrier, m, gpu, toks, &vec![1usize; n]));
+        let (a, c) = (d::softmax(&la), d::softmax(&lc));
         let dl = a
             .iter()
             .zip(&c)
             .map(|(p, q)| (p.max(1e-12).ln() - q.max(1e-12).ln()).abs())
             .fold(0.0, f64::max);
         worst = worst.max(dl);
+        // Assembled exactly as the daemon's answers, so gates.py can compare
+        // them by answer key against the daemon's full-prefill reply.
         per.insert(
-            name.clone(),
-            serde_json::json!({"tokens": n, "a_vs_c": dl, "a_dist": a, "c_dist": c}),
+            q.name.clone(),
+            serde_json::json!({
+                "tokens": n,
+                "a_vs_c": dl,
+                "a_answer": d::assemble_answer(q, &la),
+                "c_answer": d::assemble_answer(q, &lc),
+            }),
         );
     }
     println!(

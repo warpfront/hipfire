@@ -311,12 +311,24 @@ in two modes.
      - each question of a multi-question request equals a single-question
        full-prefill decide of that question alone, so restore leaves no
        residue.
-   - **(b) Default mode.** The max |Δ log p| between the snapshot and
-     full-prefill label distributions must not exceed the model's path-noise
-     floor. The floor is one-call prefill vs token-by-token prefill of the
-     same prompts, measured each run by the `split_prefill_probe` example.
+   - **(b) Default mode.** This is checked per question:
+     - drift_q is the |Δ log p| between that question's snapshot and
+       full-prefill label distributions;
+     - floor_q is the same question's path-noise floor: one-call prefill vs
+       token-by-token prefill of the same prompt, measured each run by the
+       `split_prefill_probe` example;
+     - the gate requires drift_q ≤ 2 × floor_q.
+
+     The probe's one-call answer must reproduce the daemon's full-prefill
+     answer (Δ ≤ 1e-6). Otherwise the floor was measured on a different
+     prompt or kernel route, and the gate fails.
+
+     Why this rule: (a) is the exactness proof, and (b) only guards the
+     default kernels against gross regressions. The floor comes from a
+     different noise source (the per-token path) than the drift does (the
+     split point), so it is a scale, not a bound, hence the factor 2.
    - **(c) Order invariance.** Every ordering of the questions gives
-     identical answers, at a fixed split point.
+     bit-identical answers (Δ = 0), at a fixed split point.
    - The decide must not return the 400 "cannot disable thinking" error.
 2. **Isolation.** The "secret code" probe, judged relative to a baseline
    with no code anywhere:
@@ -329,7 +341,12 @@ in two modes.
    the same tokens as a `generate` after a plain `reset`. This covers both a
    prompt that shares a prefix with the decide state (must not hit a stale
    LCP cache) and one that doesn't.
-4. **No leak.** Device memory is flat over 1,000 decides.
+4. **No leak.** The daemon's own device memory (GTT + VRAM, from its amdgpu
+   DRM fdinfo) grows by less than 64 MiB over 1,000 decides.
+   - The device-wide sysfs sum over all cards is reported alongside, and is
+     used as the fallback when fdinfo can't be read.
+   - It isn't the criterion because other processes on a shared machine move
+     it.
 5. **Error replies.** Two requests are sent, and a normal decide must still
    succeed after each:
    - a state longer than the loaded `max_seq` returns 422 with an integer

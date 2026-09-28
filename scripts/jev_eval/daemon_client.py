@@ -1,29 +1,61 @@
 """Minimal JSONL driver for target/release/daemon (decide gates + evals)."""
 import json
 import os
+import queue
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+DEFAULT_TIMEOUT = 600.0  # seconds; first-use kernel JIT can take minutes
+_EOF = object()
+
+
+class DaemonTimeout(RuntimeError):
+    pass
 
 
 class Daemon:
-    def __init__(self, binary=None, stderr=None, env=None):
-        """`env`: extra environment variables for the daemon process."""
+    def __init__(self, binary=None, stderr=None, env=None, timeout=DEFAULT_TIMEOUT):
+        """`env`: extra environment variables for the daemon process.
+        `timeout`: default deadline (s) for each `recv_until`."""
+        self.timeout = timeout
         self.p = subprocess.Popen(
             [str(binary or REPO / "target/release/daemon")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
             env={**os.environ, **(env or {})}, text=True, bufsize=1)
         self.attempt = 0
+        # A reader thread feeds stdout lines into a queue so recv_until can
+        # wait with a deadline (select() on a buffered text pipe can miss
+        # lines already sitting in the Python-side buffer).
+        self._lines = queue.Queue()
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
+
+    def _pump(self):
+        try:
+            for line in self.p.stdout:
+                self._lines.put(line)
+        finally:
+            self._lines.put(_EOF)
 
     def send(self, msg):
         self.p.stdin.write(json.dumps(msg) + "\n")
         self.p.stdin.flush()
 
-    def recv_until(self, types):
+    def recv_until(self, types, timeout=None):
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while True:
-            line = self.p.stdout.readline()
-            if not line:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DaemonTimeout(f"no {sorted(types)} reply within deadline")
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                raise DaemonTimeout(f"no {sorted(types)} reply within deadline") from None
+            if line is _EOF:
+                self._lines.put(_EOF)  # keep EOF visible to later calls
                 raise RuntimeError("daemon exited")
             try:
                 v = json.loads(line)
@@ -49,7 +81,7 @@ class Daemon:
     def decide(self, state, questions, **extra):
         self.send({"type": "decide", "id": "g", "state": state, "questions": questions, **extra})
         # "error" covers uncorrelated daemon envelopes so a protocol slip fails
-        # loudly instead of blocking forever waiting for "decided".
+        # loudly instead of waiting for "decided" until the deadline.
         return self.recv_until({"decided", "error"})
 
     def generate_greedy(self, prompt, max_tokens=32):
@@ -69,11 +101,15 @@ class Daemon:
             else:
                 raise RuntimeError(f"generate failed: {v}")
 
-    def close(self):
+    def close(self, timeout=120.0):
+        """Unload (accepting `unloaded`, an `error` reply or a timeout), then
+        always terminate; kill if the process does not exit."""
         try:
             if self.p.poll() is None:
                 self.send({"type": "unload"})
-                self.recv_until({"unloaded"})
+                self.recv_until({"unloaded", "error"}, timeout=timeout)
+        except Exception:  # noqa: BLE001 - shutdown must always proceed
+            pass
         finally:
             self.p.terminate()
             try:
