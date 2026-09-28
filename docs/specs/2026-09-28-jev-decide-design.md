@@ -123,8 +123,26 @@ Run `scripts/check-crate-maps.py` after adding files.
 Preconditions (409 otherwise):
 
 - `pp == 1` and no expert parallelism (`m.ep` is `None`);
-- no KV eviction (CASK) and no `kv_adaptive`. Positional rewind is only
-  valid with an un-compacted cache.
+- no `kv_adaptive`;
+- an un-compacted KV cache after the pre-decide reset
+  (`KvCache::compact_offset == 0`, read through the carrier hook
+  `decide_kv_compact_offset`). Positional rewind is only valid on an
+  un-compacted cache.
+
+KV eviction (CASK / TriAttention, `m.eviction`) may be configured; `hipfire
+serve` loads every model with it when config has `cask` on. It is safe
+because eviction cannot run inside a decide: `Eviction::maybe_evict` is only
+called by the generate loops (`ar.rs`, `qwen.rs`, `vision.rs`), never by
+`qwen35::forward_prefill_batch` / `llama::forward_prefill_batch`, which are
+the only model calls the decide hooks make. What bounds a decide under
+eviction is the KV buffer: with `compact_offset == 0` the prefill writes KV
+slot = position, and the cache holds only `m.physical_cap` slots (by default
+`cask_budget + cask_beta + 256`, clamped to `max_seq`), with no bounds check
+in the prefill. So with eviction configured the longest question prompt + 1
+must be <= min(`Eviction::budget()`, `m.physical_cap`), else 422 naming the
+limit and without `required_max_seq` (a larger `max_seq` does not raise it).
+Decide prompts (hundreds to a few thousand tokens) are far below the usual
+budgets.
 
 A client disconnect does not interrupt a decide in v1. The loop is
 sub-second, and mid-loop abort would need the daemon's per-request terminal
@@ -244,8 +262,9 @@ All three:
 | Malformed request / limits exceeded | 422, naming question and field |
 | Model architecture has no snapshot path (neither Qwen3.5 nor Llama family) | 400 `decide not supported for <arch>` |
 | No model loaded and `model` not a local model | 503 |
-| KV eviction active | 409 |
-| Prompt exceeds the maximum `max_seq` | 422 |
+| KV eviction configured and the longest prompt + 1 exceeds min(eviction budget, `physical_cap`) | 422 naming the limit, no `required_max_seq` |
+| KV cache compacted (`compact_offset != 0`) after the pre-decide reset | 409 |
+| Prompt exceeds the maximum `max_seq` | 422 (+ `required_max_seq` when eviction is off) |
 | Fewer than K valid single-token codes | 422 |
 | Admission saturated | 503 + `Retry-After` |
 | Daemon crash / GPU error | 500; the existing serve restart path |
@@ -350,8 +369,16 @@ in two modes.
 5. **Error replies.** Two requests are sent, and a normal decide must still
    succeed after each:
    - a state longer than the loaded `max_seq` returns 422 with an integer
-     `required_max_seq` greater than `max_seq`;
+     `required_max_seq` greater than `max_seq` (with `--cask`: a state over
+     the eviction limit returns 422 naming the limit, without
+     `required_max_seq`);
    - a malformed request returns 422.
+
+   `gates.py --cask` configures every daemon with the cask* params serve
+   sends (defaults from `~/.hipfire/config.json`), so all gates, including
+   1a exact-mode equality, run with eviction configured; it adds gate 0
+   (per daemon: the over-limit 422 is returned, proving eviction is on, and a
+   normal decide succeeds).
 
 ## 11. Evaluation
 

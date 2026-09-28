@@ -219,6 +219,12 @@ pub trait Carrier: Send + Sync {
     ) -> Option<Result<(), String>> {
         None
     }
+    /// KV compaction offset (`KvCache::compact_offset`) of the model's
+    /// positional KV cache: 0 means uncompacted, so a positional rewind of
+    /// `seq_pos` is valid. `None` = hook not provided.
+    fn decide_kv_compact_offset(&self, _m: &LoadedModel) -> Option<usize> {
+        None
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the

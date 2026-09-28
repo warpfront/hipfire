@@ -823,6 +823,9 @@ impl Carrier for Qwen35Carrier {
         m.seq_pos = snap.seq_pos;
         Some(Ok(()))
     }
+    fn decide_kv_compact_offset(&self, m: &crate::LoadedModel) -> Option<usize> {
+        m.qwen35().map(|b| b.kv_cache.compact_offset)
+    }
 }
 
 // ─── LlamaCarrier ────────────────────────────────────────────────────
@@ -1180,6 +1183,9 @@ impl Carrier for LlamaCarrier {
     ) -> Option<Result<(), String>> {
         m.seq_pos = snap.seq_pos;
         Some(Ok(()))
+    }
+    fn decide_kv_compact_offset(&self, m: &crate::LoadedModel) -> Option<usize> {
+        m.llama().map(|b| b.kv.compact_offset)
     }
 }
 
