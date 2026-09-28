@@ -126,6 +126,70 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
     Ok(DecideRequest { state_text: render_state(state), questions })
 }
 
+pub const SYSTEM_PROMPT: &str =
+    "You answer classification questions about the state. Reply with one option code.";
+
+/// `A`..`Z`, then `AA`..`ZZ`, keeping only candidates the model's tokenizer
+/// encodes as exactly one token. Deterministic order.
+pub fn assign_codes(k: usize, is_single_token: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+    let letters: Vec<char> = ('A'..='Z').collect();
+    let singles = letters.iter().map(|c| c.to_string());
+    let doubles = letters
+        .iter()
+        .flat_map(|a| letters.iter().map(move |b| format!("{a}{b}")));
+    let codes: Vec<String> = singles.chain(doubles).filter(|c| is_single_token(c)).take(k).collect();
+    if codes.len() < k {
+        return Err(format!(
+            "model tokenizer supplies only {} single-token option codes, need {k}",
+            codes.len()
+        ));
+    }
+    Ok(codes)
+}
+
+pub fn labels_for(q: &Question, is_single_token: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+    let labels: Vec<String> = match &q.kind {
+        QuestionKind::Choice { keys, .. } => return assign_codes(keys.len(), is_single_token),
+        QuestionKind::Score { levels } => (0..levels.len()).map(|i| i.to_string()).collect(),
+        QuestionKind::Noul { .. } => vec!["Yes".into(), "No".into()],
+    };
+    if let Some(bad) = labels.iter().find(|l| !is_single_token(l)) {
+        return Err(format!("{}: label {bad:?} is not a single token for this model", q.name));
+    }
+    Ok(labels)
+}
+
+/// The user-turn text for one question. The state block comes first so every
+/// question's rendered prompt shares the longest possible token prefix.
+pub fn build_user_text(state_text: &str, q: &Question, labels: &[String]) -> String {
+    let descs: Vec<String> = match &q.kind {
+        QuestionKind::Choice { descriptions, .. } => descriptions.clone(),
+        QuestionKind::Score { levels } => levels.clone(),
+        QuestionKind::Noul { true_desc, false_desc } => vec![
+            true_desc.clone().unwrap_or_else(|| "yes".into()),
+            false_desc.clone().unwrap_or_else(|| "no".into()),
+        ],
+    };
+    let mut s = format!("State:\n{state_text}\n\nQuestion: {}\nOptions:\n", q.instructions);
+    for (label, desc) in labels.iter().zip(descs.iter()) {
+        s.push_str(&format!("{label}. {desc}\n"));
+    }
+    s.push_str("\nAnswer with the option code only.");
+    s
+}
+
+/// Longest common prefix of all sequences, capped at `min_len - 1` so each
+/// question keeps a non-empty suffix whose last token yields the readout.
+pub fn shared_prefix_len(seqs: &[Vec<u32>]) -> usize {
+    let Some(first) = seqs.first() else { return 0 };
+    let min_len = seqs.iter().map(Vec::len).min().unwrap_or(0);
+    let mut n = 0;
+    while n < min_len && seqs.iter().all(|s| s[n] == first[n]) {
+        n += 1;
+    }
+    n.min(min_len.saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +259,74 @@ mod tests {
         assert!(err_of(q(json!({"type": "boolean", "instructions": "i"}))).contains("q.type"));
         assert!(err_of(q(json!({"type": "noul", "instructions": "i", "criteria": {"true": 1}})))
             .contains("q.criteria"));
+    }
+
+    #[test]
+    fn codes_single_letters_first_then_two_letter() {
+        let all = |_: &str| true;
+        let c = assign_codes(28, all).unwrap();
+        assert_eq!(&c[..3], &["A", "B", "C"]);
+        assert_eq!(c[25], "Z");
+        assert_eq!(&c[26..], &["AA", "AB"]);
+    }
+
+    #[test]
+    fn codes_skip_multi_token_candidates() {
+        // Pretend "B" and "AA" tokenize to more than one token.
+        let c = assign_codes(27, |s: &str| s != "B" && s != "AA").unwrap();
+        assert!(!c.contains(&"B".to_string()));
+        assert!(!c.contains(&"AA".to_string()));
+        assert_eq!(c.len(), 27);
+        let uniq: std::collections::HashSet<_> = c.iter().collect();
+        assert_eq!(uniq.len(), 27);
+    }
+
+    #[test]
+    fn codes_error_when_tokenizer_cannot_supply_k() {
+        let e = assign_codes(5, |s: &str| s.len() == 1 && s < "C").unwrap_err();
+        assert!(e.contains("single-token"));
+    }
+
+    #[test]
+    fn labels_per_type() {
+        let all = |_: &str| true;
+        let score = Question { name: "s".into(), instructions: "i".into(),
+            kind: QuestionKind::Score { levels: vec!["a".into(), "b".into(), "c".into()] } };
+        assert_eq!(labels_for(&score, all).unwrap(), vec!["0", "1", "2"]);
+        let noul = Question { name: "n".into(), instructions: "i".into(),
+            kind: QuestionKind::Noul { true_desc: None, false_desc: None } };
+        assert_eq!(labels_for(&noul, all).unwrap(), vec!["Yes", "No"]);
+    }
+
+    #[test]
+    fn labels_error_when_digit_or_yes_no_is_not_single_token() {
+        let score = Question { name: "s".into(), instructions: "i".into(),
+            kind: QuestionKind::Score { levels: vec!["a".into(), "b".into()] } };
+        assert!(labels_for(&score, |s: &str| s != "1").is_err());
+        let noul = Question { name: "n".into(), instructions: "i".into(),
+            kind: QuestionKind::Noul { true_desc: None, false_desc: None } };
+        assert!(labels_for(&noul, |s: &str| s != "Yes").is_err());
+    }
+
+    #[test]
+    fn user_text_layout() {
+        let q = Question { name: "q".into(), instructions: "Which queue?".into(),
+            kind: QuestionKind::Choice { keys: vec!["billing".into(), "shipping".into()],
+                descriptions: vec!["money".into(), "parcels".into()] } };
+        let t = build_user_text("the state", &q, &["A".into(), "B".into()]);
+        assert_eq!(t, "State:\nthe state\n\nQuestion: Which queue?\nOptions:\nA. money\nB. parcels\n\nAnswer with the option code only.");
+        let n = Question { name: "n".into(), instructions: "Angry?".into(),
+            kind: QuestionKind::Noul { true_desc: Some("shouting".into()), false_desc: None } };
+        let t = build_user_text("s", &n, &["Yes".into(), "No".into()]);
+        assert!(t.ends_with("Options:\nYes. shouting\nNo. no\n\nAnswer with the option code only."));
+    }
+
+    #[test]
+    fn shared_prefix_is_lcp_capped_below_shortest() {
+        assert_eq!(shared_prefix_len(&[vec![1, 2, 3, 9], vec![1, 2, 3, 8, 7]]), 3);
+        // Identical sequences: cap at len - 1 so each suffix is non-empty.
+        assert_eq!(shared_prefix_len(&[vec![1, 2, 3], vec![1, 2, 3]]), 2);
+        assert_eq!(shared_prefix_len(&[vec![5, 6, 7]]), 2);
+        assert_eq!(shared_prefix_len(&[vec![1], vec![2]]), 0);
     }
 }
