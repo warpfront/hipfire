@@ -1,0 +1,22 @@
+# Decide (Jev-compatible) evaluation
+
+External benchmarks are cloned outside the repo:
+
+```bash
+git clone https://github.com/Running-Dolphins/jev-bench ~/repos/jev-evals/jev-bench
+git clone https://github.com/scienthoon/jev-ood-calibration ~/repos/jev-evals/jev-ood-calibration
+```
+
+1. GPU gates (must all PASS before merge):
+   `python3 scripts/jev_eval/gates.py --model ~/.hipfire/models/qwen3.5-4b.mq4`
+2. Start serve on the repo daemon (one daemon per machine):
+   `HIPFIRE_DAEMON_BIN=$PWD/target/release/daemon target/release/hipfire serve`
+3. jev-bench, all 12 tasks and 6 experiments, at n=500 (aligned with Jev's committed rows):
+   `python3 scripts/jev_eval/run_jevbench.py --model qwen3.5:4b --out bench/jev/qwen3.5-4b/jevbench all x-oos x-language x-options x-order x-repeat x-descriptions`
+4. Calibration sets:
+   `python3 scripts/jev_eval/run_calibration.py --model qwen3.5:4b --out bench/jev/qwen3.5-4b/calibration synth openbookqa commonsense_qa hellaswag`
+5. Report: `python3 scripts/jev_eval/report.py --out bench/jev/qwen3.5-4b`
+
+Jev's own latencies include the network and are not comparable. Compare
+decide latency against the same model generating the answer via
+`/v1/chat/completions` (see "Latency" in the PR description).
