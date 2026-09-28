@@ -1575,6 +1575,13 @@ pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
         || lower.contains("qwen3_6")
 }
 
+/// Largest `max_tokens` a chat request may ask for.
+pub(crate) const MAX_TOKENS_CEILING: u64 = 393_216;
+/// Largest `max_seq` serve will reload a model with on a request's behalf:
+/// chat's `required_max_seq = max_tokens + 1024` at `MAX_TOKENS_CEILING`.
+/// Decide's `required_max_seq` reload-and-retry is capped at the same value.
+pub(crate) const MAX_SEQ_CEILING: u64 = MAX_TOKENS_CEILING + 1024;
+
 pub(crate) fn project_request_contract(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
@@ -1585,7 +1592,7 @@ pub(crate) fn project_request_contract(
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(config_u64(resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 393_216 {
+    if max_tokens == 0 || max_tokens > MAX_TOKENS_CEILING {
         bail!("max_tokens must be between 1 and 393216");
     }
     let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);

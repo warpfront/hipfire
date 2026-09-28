@@ -6,6 +6,7 @@
 //! validation authority; this layer selects the model, serialises against
 //! chat traffic, and shapes Jev's response. Spec §6.
 
+use super::complete::MAX_SEQ_CEILING;
 use super::http::{json_response, openai_error, request_id, BoxBody};
 use super::{AdmissionGuard, ServeShared};
 use hyper::{header, Response};
@@ -60,8 +61,9 @@ fn decide_error_response(
 /// The whole decide attempt loop, synchronous end to end: model resolution,
 /// `ensure_model` (which can block on a GPU load), the daemon round trip via
 /// `Engine::request` (a blocking `mpsc::Receiver::recv`), and the one-shot
-/// `required_max_seq` reload-and-retry. Must run entirely off the tokio
-/// executor (inside `spawn_blocking`) and must own `guard` for its whole
+/// `required_max_seq` reload-and-retry (only up to `MAX_SEQ_CEILING`). Must
+/// run entirely off the tokio executor (inside `spawn_blocking`) and must
+/// own `guard` for its whole
 /// duration: the admission slot has to stay held until the daemon call(s)
 /// actually finish, not merely until hyper drops the handler future on a
 /// client disconnect. `_guard` is intentionally unused past being held.
@@ -103,17 +105,29 @@ fn run_decide(
                     required_max_seq: None,
                 };
             }
-            let echo = runtime
-                .current_path
-                .as_ref()
-                .map(|p| p.display().to_string())
+            // Echo the model the way chat and `/health` report it (the tag
+            // when one was requested); the filesystem path only as fallback.
+            let echo = shared
+                .meta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .current_model
+                .clone()
+                .or_else(|| {
+                    runtime
+                        .current_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                })
                 .unwrap_or(target);
             (runtime.engine.clone(), echo)
         };
 
         let id = request_id();
         let mut msg = serde_json::json!({"type": "decide", "id": id});
-        for key in ["state", "questions", "_debug_no_snapshot"] {
+        // `_debug_no_snapshot` is deliberately not forwarded: it is a daemon-
+        // level gate knob (gates.py talks to the daemon directly), not API.
+        for key in ["state", "questions"] {
             if let Some(v) = body.get(key) {
                 msg[key] = v.clone();
             }
@@ -156,8 +170,10 @@ fn run_decide(
                 .to_string();
             let required_max_seq = err.get("required_max_seq").and_then(|v| v.as_u64());
 
+            // Above the context ceiling chat also stops at, return the
+            // daemon's 422 (with its required_max_seq) as-is, no reload.
             if attempt == 0 && !cancelled.load(Ordering::Relaxed) {
-                if let Some(n) = required_max_seq {
+                if let Some(n) = required_max_seq.filter(|&n| n <= MAX_SEQ_CEILING) {
                     let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
                     let target = runtime
                         .current_path

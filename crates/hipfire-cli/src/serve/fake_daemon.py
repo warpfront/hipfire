@@ -586,6 +586,13 @@ for line in sys.stdin:
                  "error": {"status": 422, "message": "prompt needs 40000 tokens",
                            "required_max_seq": 40000}})
             continue
+        # A required_max_seq past serve's reload ceiling (MAX_SEQ_CEILING):
+        # serve must return this 422 as-is without reloading.
+        if state == "t-needs-huge-ctx":
+            out({"type": "decided", "id": req.get("id"),
+                 "error": {"status": 422, "message": "prompt needs 10000000 tokens",
+                           "required_max_seq": 10000000}})
+            continue
         # Task 8 review round 1: delays the reply so a test can prove the
         # HTTP-side admission guard is held for the full daemon round trip,
         # not released the instant the client disconnects.

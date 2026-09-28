@@ -10769,6 +10769,98 @@ mod tests {
         );
     }
 
+    /// A `required_max_seq` above `MAX_SEQ_CEILING` (the ceiling chat's own
+    /// context growth stops at) is returned to the client as the daemon's
+    /// 422, `required_max_seq` included, without any reload.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_required_max_seq_above_ceiling_returns_422_without_reload() {
+        let harness = Task11HttpHarness::spawn("systemone-huge-ctx");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "t-needs-huge-ctx",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["required_max_seq"], 10_000_000u64, "{body}");
+        assert!(
+            10_000_000 > crate::serve::complete::MAX_SEQ_CEILING,
+            "fixture must exceed the ceiling"
+        );
+        let log = harness.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(
+            loads.len(),
+            1,
+            "only the initial load; no reload past the ceiling; log={log:?}"
+        );
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "no retry past the ceiling; log={log:?}"
+        );
+    }
+
+    /// `_debug_no_snapshot` is a daemon-only gate knob: serve must not
+    /// forward it, only `state` and `questions`.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_does_not_forward_debug_no_snapshot() {
+        let harness = Task11HttpHarness::spawn("systemone-no-debug");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "s", "_debug_no_snapshot": true,
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        assert_eq!(decides.len(), 1, "log={log:?}");
+        assert!(
+            decides[0].get("_debug_no_snapshot").is_none(),
+            "serve forwarded _debug_no_snapshot: {:?}",
+            decides[0]
+        );
+        assert_eq!(decides[0]["state"], "s");
+    }
+
+    /// The response `model` is the served model name chat and `/health`
+    /// report (`meta.current_model`, the tag when a tag was requested), not
+    /// the resolved filesystem path.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_model_echo_is_served_model_name() {
+        let harness = Task11HttpHarness::spawn("systemone-echo");
+        let req = |model: &str| {
+            serde_json::json!({"model": model, "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}})
+        };
+        let (status, _, body) = post_systemone(harness.port(), &req(harness.model()));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let served = harness
+            .shared
+            .meta
+            .lock()
+            .unwrap()
+            .current_model
+            .clone()
+            .expect("a model is loaded");
+        assert_eq!(v["model"], served.as_str());
+        // Stand in a tag-style served name for the loaded model (what a tag
+        // request records): the echo must follow it, not the path.
+        harness.shared.meta.lock().unwrap().current_model = Some("qwen3.5:4b".to_owned());
+        let (status, _, body) = post_systemone(harness.port(), &req("jev-latest"));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "qwen3.5:4b", "{body}");
+    }
+
     /// Write a `/v1/systemone` request and return the live TCP stream
     /// without reading the response — mirrors `open_nonstream_request`.
     #[cfg(unix)]
