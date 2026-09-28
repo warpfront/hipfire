@@ -111,7 +111,7 @@ fn run_segments(
     let mut logits = Vec::new();
     for &len in seg_lens {
         logits = carrier
-            .decide_prefill_logits(m, gpu, &toks[pos..pos + len], pos)
+            .decide_prefill_logits(m, gpu, &toks[pos..pos + len], pos, true)
             .expect("hook")
             .expect("prefill");
         pos += len;
@@ -370,34 +370,16 @@ fn decide_floor(
         serde_json::from_str(&std::fs::read_to_string(req_path).expect("read request"))
             .expect("request json");
     let parsed = d::parse_request(&req).expect("parse_request");
-    // Same rendering as hipfire_generate::decide::run_decide.
-    let mut prompts: Vec<(&d::Question, Vec<u32>, Vec<u32>)> = Vec::new();
-    {
+    // Exactly the daemon's rendering (shared with run_decide).
+    let rendered = {
         let tok = m.tokenizer.as_ref().expect("tokenizer");
-        let single = |s: &str| tok.encode(s).len() == 1;
-        for q in &parsed.questions {
-            let labels = d::labels_for(q, single).expect("labels_for");
-            let ids: Vec<u32> = labels.iter().map(|l| tok.encode(l)[0]).collect();
-            let user = d::build_user_text(&parsed.state_text, q, &labels);
-            let (tokens, started_in_think) = hipfire_engine::prompt::batch_render_prompt_tokens(
-                &user,
-                Some(d::SYSTEM_PROMPT),
-                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-                tok,
-                m.chat_template.as_ref(),
-                0,
-                None,
-                false,
-                None,
-            )
-            .expect("render");
-            assert!(!started_in_think, "template cannot close thinking");
-            prompts.push((q, ids, tokens));
-        }
-    }
+        hipfire_generate::decide::render_question_prompts(tok, m.chat_template.as_ref(), &parsed)
+            .expect("render_question_prompts")
+    };
     let mut per = serde_json::Map::new();
     let mut worst = 0.0f64;
-    for (q, ids, toks) in &prompts {
+    let prompts = parsed.questions.iter().zip(&rendered.label_ids);
+    for ((q, ids), toks) in prompts.zip(&rendered.seqs) {
         let n = toks.len();
         let pick = |l: &[f32]| ids.iter().map(|&i| l[i as usize]).collect::<Vec<f32>>();
         let la = pick(&run_segments(carrier, m, gpu, toks, &[n]));

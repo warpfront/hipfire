@@ -3608,18 +3608,18 @@ fn main() {
             }
 
             "decide" => {
-                let lanes_active = slot_backend.as_ref().is_some_and(|s| s.active_count() > 0)
-                    || batch_scheduler
-                        .as_ref()
-                        .is_some_and(|s| s.active_count() > 0);
-                let (reply, ran) = hipfire_generate::decide::handle_decide_message(
+                let lanes_active = batch_scheduler
+                    .as_ref()
+                    .is_some_and(|s| s.active_count() > 0);
+                let (reply, reset) = hipfire_generate::decide::handle_decide_message(
                     model.as_mut(),
                     &mut gpu,
                     &msg,
                     lanes_active,
+                    slot_backend.is_some(),
                 );
-                // run_decide always resets the model; advance the epoch like `reset`.
-                if ran {
+                // `reset`: the decide ran and rolled the model back; bump like `reset`.
+                if reset {
                     state_epoch = state_epoch.saturating_add(1);
                 }
                 let _ = writeln!(stdout, "{reply}");

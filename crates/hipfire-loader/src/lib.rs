@@ -191,14 +191,18 @@ pub trait Carrier: Send + Sync {
     fn decide_supported(&self) -> bool {
         false
     }
-    /// Prefill `tokens` at `start_pos`, set `m.seq_pos = start_pos +
-    /// tokens.len()`, return the last position's full-vocab logits.
+    /// Prefill `tokens` at `start_pos` and set `m.seq_pos = start_pos +
+    /// tokens.len()`. With `want_logits` the last position's full-vocab
+    /// logits are downloaded and returned; without it (the decide runner's
+    /// shared-prefix prefill, whose logits are never read) the device→host
+    /// copy is skipped and an empty `Vec` is returned.
     fn decide_prefill_logits(
         &self,
         _m: &mut LoadedModel,
         _gpu: &mut Gpu,
         _tokens: &[u32],
         _start_pos: usize,
+        _want_logits: bool,
     ) -> Option<Result<Vec<f32>, String>> {
         None
     }

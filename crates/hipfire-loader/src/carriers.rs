@@ -755,6 +755,7 @@ impl Carrier for Qwen35Carrier {
         gpu: &mut rdna_compute::Gpu,
         tokens: &[u32],
         start_pos: usize,
+        want_logits: bool,
     ) -> Option<Result<Vec<f32>, String>> {
         let Some(b) = m.qwen35_mut() else {
             return Some(Err("decide: qwen35 bundle missing".into()));
@@ -775,6 +776,9 @@ impl Carrier for Qwen35Carrier {
         )
         .map_err(|e| format!("decide prefill: {e:?}"))
         .and_then(|()| {
+            if !want_logits {
+                return Ok(Vec::new());
+            }
             gpu.download_f32(&b.scratch.logits)
                 .map_err(|e| format!("decide logits: {e:?}"))
         });
@@ -1147,6 +1151,7 @@ impl Carrier for LlamaCarrier {
         gpu: &mut rdna_compute::Gpu,
         tokens: &[u32],
         start_pos: usize,
+        want_logits: bool,
     ) -> Option<Result<Vec<f32>, String>> {
         let Some(b) = m.llama_mut() else {
             return Some(Err("decide: llama bundle missing".into()));
@@ -1156,6 +1161,9 @@ impl Carrier for LlamaCarrier {
         )
         .map_err(|e| format!("decide prefill: {e:?}"))
         .and_then(|()| {
+            if !want_logits {
+                return Ok(Vec::new());
+            }
             gpu.download_f32(&b.scratch.logits)
                 .map_err(|e| format!("decide logits: {e:?}"))
         });
