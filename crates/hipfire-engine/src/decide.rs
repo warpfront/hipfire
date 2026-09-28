@@ -9,6 +9,15 @@ use serde_json::{json, Value};
 
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 pub const MAX_SCORE_LEVELS: usize = 10;
+/// Upper bound on questions per request (serve-side DoS bound; each question
+/// costs one suffix prefill).
+pub const MAX_QUESTIONS: usize = 128;
+/// Jev's token limits (spec §3/§7): the shared state plus every question
+/// suffix, counted additively as in `usage_json`, must be at most this.
+pub const MAX_TOTAL_TOKENS: usize = 64_000;
+/// Jev's per-question limit: state + the longest question (that question's
+/// full rendered prompt) must be at most this.
+pub const MAX_QUESTION_TOKENS: usize = 32_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuestionKind {
@@ -65,6 +74,12 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
         .and_then(Value::as_object)
         .filter(|m| !m.is_empty())
         .ok_or("questions must be a non-empty object of name -> question")?;
+    if qs.len() > MAX_QUESTIONS {
+        return Err(format!(
+            "questions must have at most {MAX_QUESTIONS} entries, got {}",
+            qs.len()
+        ));
+    }
     let mut questions = Vec::with_capacity(qs.len());
     for (name, q) in qs {
         let instructions = q
@@ -229,6 +244,37 @@ pub fn shared_prefix_len(seqs: &[Vec<u32>]) -> usize {
     n.min(min_len.saturating_sub(1))
 }
 
+/// Jev's per-question token limit on one question's full rendered prompt
+/// (state + that question). Checked per question as it is rendered, so an
+/// over-long state fails on the first question without rendering the rest.
+pub fn check_question_tokens(name: &str, len: usize) -> Result<(), String> {
+    if len > MAX_QUESTION_TOKENS {
+        return Err(format!(
+            "{name}: state + question is {len} tokens, over the per-question limit of \
+             {MAX_QUESTION_TOKENS} tokens"
+        ));
+    }
+    Ok(())
+}
+
+/// Jev's request token limit: shared prefix once plus every suffix (the
+/// `usage_json` accounting at `prefix_len`) must be at most
+/// `MAX_TOTAL_TOKENS`. Precondition: every `seq_lens[i] >= prefix_len`.
+pub fn check_total_tokens(prefix_len: usize, seq_lens: &[usize]) -> Result<(), String> {
+    let total = prefix_len
+        + seq_lens
+            .iter()
+            .map(|l| l.saturating_sub(prefix_len))
+            .sum::<usize>();
+    if total > MAX_TOTAL_TOKENS {
+        return Err(format!(
+            "state + all questions is {total} tokens, over the request limit of \
+             {MAX_TOTAL_TOKENS} tokens"
+        ));
+    }
+    Ok(())
+}
+
 /// Numerically stable softmax in f64.
 pub fn softmax(logits: &[f32]) -> Vec<f64> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -385,6 +431,79 @@ mod tests {
             json!({"type": "noul", "instructions": "i", "criteria": {"true": 1}})
         ))
         .contains("q.criteria"));
+    }
+
+    #[test]
+    fn rejects_more_than_max_questions() {
+        let qs = |n: usize| -> serde_json::Map<String, serde_json::Value> {
+            (0..n)
+                .map(|i| {
+                    (
+                        format!("q{i}"),
+                        json!({"type": "noul", "instructions": "i"}),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            parse_request(&json!({"state": "s", "questions": qs(MAX_QUESTIONS)}))
+                .unwrap()
+                .questions
+                .len(),
+            MAX_QUESTIONS
+        );
+        let e = err_of(json!({"state": "s", "questions": qs(MAX_QUESTIONS + 1)}));
+        assert!(e.contains("at most 128"), "{e}");
+    }
+
+    #[test]
+    fn choice_keys_and_questions_keep_request_order() {
+        // serde_json `preserve_order` (enabled in this crate's manifest):
+        // criteria order = request order, independent of feature unification,
+        // so option codes A, B, C map to keys in the order the caller wrote.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"state": "s", "questions": {
+                "zeta": {"type": "noul", "instructions": "i"},
+                "alpha": {"type": "choice", "instructions": "i",
+                          "criteria": {"shipping": "x", "billing": "y", "general": "z"}}}}"#,
+        )
+        .unwrap();
+        let r = parse_request(&v).unwrap();
+        let names: Vec<&str> = r.questions.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, vec!["zeta", "alpha"]);
+        match &r.questions[1].kind {
+            QuestionKind::Choice { keys, descriptions } => {
+                assert_eq!(keys, &vec!["shipping", "billing", "general"]);
+                assert_eq!(descriptions, &vec!["x", "y", "z"]);
+            }
+            other => panic!("wrong kind {other:?}"),
+        }
+        let a = assemble_answer(&r.questions[1], &[0.0, 1.0, 0.0]);
+        let keys: Vec<&String> = a["probabilities"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["shipping", "billing", "general"]);
+        assert_eq!(a["choice"], "billing");
+    }
+
+    #[test]
+    fn question_token_limit() {
+        assert!(check_question_tokens("q", MAX_QUESTION_TOKENS).is_ok());
+        let e = check_question_tokens("q", MAX_QUESTION_TOKENS + 1).unwrap_err();
+        assert!(e.starts_with("q: "), "{e}");
+        assert!(e.contains("per-question limit of 32000"), "{e}");
+    }
+
+    #[test]
+    fn total_token_limit_counts_prefix_once() {
+        // 3 x 30000-token prompts sharing a 25000-token prefix:
+        // 25000 + 3 x 5000 = 40000 <= 64000.
+        assert!(check_total_tokens(25_000, &[30_000; 3]).is_ok());
+        // Exactly at the limit.
+        assert!(check_total_tokens(4_000, &[34_000, 34_000]).is_ok());
+        let e = check_total_tokens(4_000, &[34_000, 34_001]).unwrap_err();
+        assert!(e.contains("64001 tokens"), "{e}");
+        assert!(e.contains("request limit of 64000"), "{e}");
+        // No shared prefix: every prompt counts in full.
+        assert!(check_total_tokens(0, &[32_000, 32_001]).is_err());
     }
 
     #[test]
