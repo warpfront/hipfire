@@ -30,6 +30,7 @@
 //!
 //! Weight manifests and device placement stay out (PR #527).
 
+pub mod decide;
 pub mod emit;
 pub mod prompt;
 pub mod redline;
