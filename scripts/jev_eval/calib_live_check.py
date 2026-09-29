@@ -7,8 +7,10 @@ calibrated decide equals the offline apply_t of the raw decide, an explicit
 T = 1 is bit-identical to no calibration, the timing echoes the temperatures,
 and a malformed calibration is a 422. One model, held-out examples only.
 
-Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE (the raw readout does not repeat bit for
-bit, so two runs cannot be compared).
+Exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE — either the raw readout does not repeat
+bit for bit (two runs cannot be compared), or the session-mode precondition
+(cold, then extend, extend) did not hold. INCONCLUSIVE is never reported as
+PASS.
 
 Only licence-clear sources are asked (licences.py, human decision)."""
 import argparse
@@ -53,11 +55,12 @@ def check_pair(raw, cal, keys, t):
 
 def run(d, picked):
     fails, worst = [], 0.0
+    session_inconclusive = False
     name, r = picked[0]
     qs = {"q": r["question"]}
     if d.decide(r["state"], qs).get("answers") != d.decide(r["state"], qs).get("answers"):
         print(f"INCONCLUSIVE: a repeated raw decide ({name}) is not bit-identical")
-        return None, worst
+        return None, worst, session_inconclusive
     for name, r in picked:
         qs = {"q": r["question"]}
         raw = d.decide(r["state"], qs)
@@ -88,6 +91,7 @@ def run(d, picked):
         starts = [v["timing"].get("start") for v in replies]
         if starts[1:] != ["extend", "extend"]:
             print(f"INCONCLUSIVE (session part): starts {starts}, expected [cold, extend, extend]")
+            session_inconclusive = True
         else:
             bad, delta = check_pair(replies[1]["answers"]["q"], replies[2]["answers"]["q"], r["keys"], CAL["choice"])
             worst = max(worst, delta)
@@ -100,7 +104,7 @@ def run(d, picked):
             fails.append(f"malformed calibration {bad_cal!r}: {v}")
     if "error" in d.decide(r["state"], qs):
         fails.append("a normal decide after the 422s failed")
-    return fails, worst
+    return fails, worst, session_inconclusive
 
 
 def main():
@@ -119,7 +123,7 @@ def main():
     d = Daemon()
     try:
         d.load(a.model, max_seq=a.max_seq)
-        fails, worst = run(d, picked)
+        fails, worst, session_inconclusive = run(d, picked)
     finally:
         d.close()
     if fails is None:
@@ -127,8 +131,17 @@ def main():
     print(f"L1 live equivalence: {len(picked)} examples, worst |dp| {worst:.3g} (tolerance {TOL})")
     for f in fails:
         print("FAIL", f)
-    print("PASS" if not fails else f"FAIL ({len(fails)})")
-    return 1 if fails else 0
+    if fails:
+        print(f"FAIL ({len(fails)})")
+        return 1
+    if session_inconclusive:
+        # Not PASS: the session part above already printed which precondition
+        # failed. A distinct code (2, same as the full-run INCONCLUSIVE path)
+        # keeps a CI step from reading this as green.
+        print("INCONCLUSIVE (session part) — not PASS")
+        return 2
+    print("PASS")
+    return 0
 
 
 if __name__ == "__main__":
