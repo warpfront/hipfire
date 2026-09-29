@@ -1221,16 +1221,16 @@ fn evict(rig: &mut Rig, victim: SessionId) -> bool {
     match snap {
         Ok(snap) => match rig.swap.park(victim.0, snap) {
             Ok(()) => {
-                rig.sessions.mark_swapped(&mut rig.pool, victim);
+                rig.sessions.mark_swapped(&mut rig.pool, &mut rig.adm, victim);
                 true
             }
             Err(_) => {
-                rig.sessions.mark_cold(&mut rig.pool, victim);
+                rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
                 true
             }
         },
         Err(_) => {
-            rig.sessions.mark_cold(&mut rig.pool, victim);
+            rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
             true
         }
     }
@@ -1239,6 +1239,14 @@ fn evict(rig: &mut Rig, victim: SessionId) -> bool {
 /// Restore a previously swapped session into `slot`. Any failure marks it
 /// `Cold` so the caller re-prefills from tokens.
 fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
+    // A swapped session gave its VRAM admission back on eviction; take it
+    // again before its state re-enters the GPU. If the budget cannot cover it
+    // the snapshot is dropped and the session goes Cold (re-prefill path).
+    if rig.sessions.readmit(&mut rig.adm, id).is_err() {
+        rig.swap.forget(id.0);
+        rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
+        return false;
+    }
     match rig.swap.unpark(id.0) {
         Ok(snap) => {
             let dn_refs = dn_buffers(&rig.dn_states[slot.0]);
@@ -1259,13 +1267,13 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
                     true
                 }
                 Err(_) => {
-                    rig.sessions.mark_cold(&mut rig.pool, id);
+                    rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
                     false
                 }
             }
         }
         Err(_) => {
-            rig.sessions.mark_cold(&mut rig.pool, id);
+            rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
             false
         }
     }
