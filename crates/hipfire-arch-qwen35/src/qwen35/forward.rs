@@ -1118,6 +1118,27 @@ fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
     dim.max(hidden_dim).max(v_dim)
 }
 
+/// Number of F32 elements needed by the shared flash-attention partials buffer.
+///
+/// Single-token Q8 decode and batched prefill use different tile geometries.
+/// They are mutually exclusive users of this buffer, so capacity is the larger
+/// of their requirements, not `batch_mult` times the smaller tile's requirement.
+fn qwen35_flash_partials_len(
+    n_heads: usize,
+    head_dim: usize,
+    kv_max_seq: usize,
+    q8_decode_tile: usize,
+    batched_tile: usize,
+    batch_mult: usize,
+) -> usize {
+    let stride = 2 + head_dim;
+    let decode_tiles = kv_max_seq.div_ceil(q8_decode_tile);
+    let batched_tiles = kv_max_seq.div_ceil(batched_tile);
+    let decode_elems = n_heads * decode_tiles * stride;
+    let batched_elems = batch_mult * n_heads * batched_tiles * stride;
+    decode_elems.max(batched_elems)
+}
+
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
         // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
@@ -1241,10 +1262,12 @@ impl Qwen35Scratch {
                 DType::F32,
             )),
 
-            // Flash attention partials: enough for the smallest tile used by
-            // Q8 decode experiments and the fixed tile_size=128 paths.
-            // n_heads * max_tiles * (2 + head_dim) floats per batched query
-            // position; total buffer = batch_mult × per-position-bytes.
+            // Flash attention partials shared by single-token Q8 decode and
+            // batched prefill. Their tile geometries can differ: gfx1100 Q8
+            // decode uses tile32 through 8K while batched attention defaults
+            // to tile128. Since the two routes never use the buffer
+            // concurrently, allocate the max of (one decode row at q8_tile)
+            // and (prefill rows at batched_tile).
             //
             // batch_mult is the maximum query positions a single FA dispatch
             // can fit; the dispatcher (`launch_asym_flash_batched`) reads the
@@ -1254,39 +1277,43 @@ impl Qwen35Scratch {
             // prefill (PREFILL_MAX_BATCH=256 → ceil(256/batch_mult) calls per
             // FA layer) for ~linearly less VRAM at long context.
             //
-            // The per-position size scales with kv_max_seq (= physical_cap
-            // post-eviction), and that scaling is what made #85 visible: at
-            // max_seq=170k, no CASK, 27B (n_heads=24, head_dim=256) the old
-            // batch_mult=64 → 2.1 GB just for these partials, exceeding VRAM
-            // headroom on 24 GB cards. Cutting batch_mult by 4× (16) keeps
-            // the prefill chunking moderate while saving 1.6 GB at that
-            // worst-case shape; CASK-on workloads (small physical_cap) are
-            // unaffected because the buffer is already tiny there.
+            // On that gfx1100 tile32/tile128 split, the legacy allocation
+            // happened to provide 64 batched rows. Directly shrinking it to
+            // 16 rows saves more memory but materially regresses prefill.
+            // Keep 32 rows by default on this measured route: it preserves
+            // prefill throughput while halving the legacy partials capacity.
+            // Long-context gfx1100 and other architectures retain 16 rows.
             //
             // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
             // two preferred (matches FA dispatcher chunking).
             flash_partials: {
-                let tile_size = rdna_compute::attention::q8_flash_tile_size(
+                let q8_decode_tile = rdna_compute::attention::q8_flash_tile_size(
                     &gpu.arch,
                     config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
                     kv_max_seq,
-                )
-                .min(128)
-                // See llama.rs: also floor against the batched-attention tile,
-                // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
-                // would undersize this same buffer.
-                .min(gpu.attn_tile_size());
-                let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                let batch_mult = hipfire_runtime::config::get()
+                );
+                let batched_tile = gpu.attn_tile_size();
+                let configured_batch = hipfire_runtime::config::get()
                     .flash_partials_batch
-                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
-                    .unwrap_or(16);
-                tracked_tensor!(gpu.alloc_tensor(
-                    &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
-                    DType::F32,
-                ))
+                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH);
+                let batch_mult = configured_batch.unwrap_or_else(|| {
+                    if gpu.arch == "gfx1100" && q8_decode_tile < batched_tile {
+                        32
+                    } else {
+                        16
+                    }
+                });
+                let n = qwen35_flash_partials_len(
+                    config.n_heads,
+                    config.head_dim,
+                    kv_max_seq,
+                    q8_decode_tile,
+                    batched_tile,
+                    batch_mult,
+                );
+                tracked_tensor!(gpu.alloc_tensor(&[n], DType::F32))
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -1580,7 +1607,11 @@ pub fn forward_scratch(
     // Grow before any possible AR graph capture/replay. Stable virtual
     // addresses keep existing graph pointer arguments valid.
     super::prefill::release_widened_pbs_for_kv_growth(
-        gpu, kv_cache, config, scratch, required_tokens,
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
@@ -1905,7 +1936,11 @@ pub fn forward_scratch_with_hidden(
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
     super::prefill::release_widened_pbs_for_kv_growth(
-        gpu, kv_cache, config, scratch, required_tokens,
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
@@ -1957,7 +1992,11 @@ pub fn forward_scratch_embed(
 ) -> HipResult<()> {
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed")?;
     super::prefill::release_widened_pbs_for_kv_growth(
-        gpu, kv_cache, config, scratch, required_tokens,
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let pos_i32 = pos as i32;
@@ -5552,7 +5591,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
-                                None, // commit_stride: TP ranks keep legacy cadence
+                                None,  // commit_stride: TP ranks keep legacy cadence
                                 false, // Chunk scan is single-GPU ordinary prefill only
                             ) {
                                 process_res = Err(e);
@@ -7515,13 +7554,37 @@ mod tests {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
     }
+
+    #[test]
+    fn flash_partials_size_separates_decode_and_batched_tiles() {
+        // gfx1100 Qwen3.8-27B at 8K: decode is one tile32 row, while the
+        // measured default keeps 32 tile128 prefill rows. The latter
+        // dominates at 48.4 MiB; the legacy `16 * tile32` formula allocated
+        // 96.7 MiB while incidentally exposing 64 batched rows.
+        let elems = qwen35_flash_partials_len(24, 256, 8_192, 32, 128, 32);
+        assert_eq!(elems * 4, 50_724_864);
+
+        // With only one batched row, the finer-grained decode route dominates.
+        let decode_dominated = qwen35_flash_partials_len(24, 256, 8_192, 32, 128, 1);
+        assert_eq!(decode_dominated * 4, 6_340_608);
+
+        // Equal tile geometries retain the previous batch-multiplied capacity.
+        let equal_tiles = qwen35_flash_partials_len(24, 256, 65_536, 128, 128, 16);
+        assert_eq!(equal_tiles * 4, 202_899_456);
+    }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
         assert!(qwen35_fa_epilogue_route_supported(true, true, false, false));
         assert!(qwen35_fa_epilogue_route_supported(true, false, false, true));
-        assert!(!qwen35_fa_epilogue_route_supported(true, false, true, false));
-        assert!(qwen35_fa_epilogue_route_supported(false, false, true, false));
-        assert!(!qwen35_fa_epilogue_route_supported(true, false, false, false));
+        assert!(!qwen35_fa_epilogue_route_supported(
+            true, false, true, false
+        ));
+        assert!(qwen35_fa_epilogue_route_supported(
+            false, false, true, false
+        ));
+        assert!(!qwen35_fa_epilogue_route_supported(
+            true, false, false, false
+        ));
     }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
