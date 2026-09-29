@@ -1,0 +1,62 @@
+{
+ "model_id": "qwen3.5-4b.mq4",
+ "build": "237bb7bba",
+ "types": {
+  "choice": {
+   "n": 2400,
+   "sources": {
+    "banking77": 300,
+    "clinc150": 300,
+    "commonsense_qa": 300,
+    "ledgar": 300,
+    "massive-en": 300,
+    "massive-it": 300,
+    "openbookqa": 300,
+    "synth-choice": 300
+   },
+   "t": 1.653,
+   "t_ci95": [
+    1.596,
+    1.705
+   ],
+   "nll_raw": 1.9775676342917508,
+   "nll_cal": 1.7049441084968442,
+   "ship": true
+  },
+  "score": {
+   "n": 300,
+   "sources": {
+    "synth-score": 300
+   },
+   "t": 1.48,
+   "t_ci95": [
+    1.218,
+    1.791
+   ],
+   "nll_raw": 1.2345487683049579,
+   "nll_cal": 1.2061529081902898,
+   "ship": true
+  },
+  "noul": {
+   "n": 900,
+   "sources": {
+    "doc-yesno": 300,
+    "sms-spam": 300,
+    "synth-noul": 300
+   },
+   "t": 1.363,
+   "t_ci95": [
+    1.178,
+    1.621
+   ],
+   "nll_raw": 0.3964934543249799,
+   "nll_cal": 0.38379284035279415,
+   "ship": true
+  }
+ },
+ "decide_calibration": {
+  "choice": 1.653,
+  "score": 1.48,
+  "noul": 1.363
+ }
+}

@@ -11,9 +11,10 @@ Some jev-bench tasks and calibration sets are not committed to this repo:
 their source datasets' licence terms do not clearly permit redistributing
 derived per-row data (label + served probabilities, no text). See
 bench/jev/DATA-LICENSES.md. Their rows are simply absent from a fresh
-checkout's <out>/probs/ (calibrate.py freeze still produces them locally,
-gitignored, from the read-only eval worktree), and the tables below skip a
-source with no frozen file, committed or local."""
+checkout's <out>/probs/, and a restricted source (licences.py, the single
+choke point) is skipped even when `calibrate.py freeze` has also produced it
+locally (gitignored) from the read-only eval worktree — a withheld dataset
+must not appear in any report, committed or not (human decision)."""
 import argparse
 import json
 import os
@@ -21,6 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import calibrate as cb
+import licences
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True, help="bench/jev/<model>")
@@ -62,8 +64,10 @@ L = ["# hipfire decide vs Jev", "",
      "Not every jev-bench task or calibration set is committed to this repository: a source dataset's own "
      "licence terms have to clearly permit redistributing derived per-row data (label + served "
      "probabilities, no text) before its frozen rows are staged into git — see "
-     "`bench/jev/DATA-LICENSES.md` for the per-dataset decision and sources. A row missing below either "
-     "was not evaluated for this model, or is withheld for that reason.", ""]
+     "`bench/jev/DATA-LICENSES.md` for the per-dataset decision and sources. A withheld source (ag-news, "
+     "duplicates, yelp-stars, offensive, sentiment-it, hellaswag) is never in this table, even when this "
+     "checkout has also frozen it locally. A row missing below either was not evaluated for this model, or "
+     "is withheld for that reason.", ""]
 if fit:
     L += [f"## Fit (held-out rows only, build {fit['build']}, spec §13.4)", "",
           "| type | n | T | 95% interval | held-out NLL raw | held-out NLL cal | shipped |",
@@ -81,6 +85,8 @@ L += ["## jev-bench (500 fixed-seed rows per task)", "",
      "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
 score = []
 for name, p in sorted(cb.find_rows(out / "probs", "jevbench_").items()):
+    if licences.is_restricted(name):
+        continue  # withheld dataset: never in a report, committed or local (human decision)
     s = cb.summarize(cb.read_jsonl(p), temps)
     jacc, je = jev_bench(name)
     L.append(f"| {name} | {s['n']} | {f3(jacc)} | " + cells(s).format(je=f3(je)))
@@ -90,6 +96,8 @@ L += ["", "## jev-ood-calibration", "",
       "| set | type | n | Jev acc | hipfire acc | Jev ECE | ECE raw | ECE cal | NLL raw | NLL cal |",
       "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
 for name, p in sorted(cb.find_rows(out / "probs", "cal_").items()):
+    if licences.is_restricted(name):
+        continue  # withheld dataset: never in a report, committed or local (human decision)
     by = defaultdict(list)
     for r in cb.read_jsonl(p):
         by[r["type"]].append(r)

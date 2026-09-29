@@ -1,6 +1,6 @@
 # Jev-style decide endpoint — Design Spec
 
-> Status: **IMPLEMENTED — v1 + v1.1 session mode** · **DESIGN — v1.2 calibration (§13)** · Date: 2026-09-28 · Addenda §12, §13 · Results: `bench/jev/`
+> Status: **IMPLEMENTED — v1 + v1.1 session mode** · **IMPLEMENTED — v1.2 calibration (§13)** · Date: 2026-09-28 · Addenda §12, §13 · Results: `bench/jev/`
 > (session mode, v1.1; design approved 2026-09-28) (calibration, v1.2; shape approved 2026-09-29)
 > Author: nwoolmer
 >

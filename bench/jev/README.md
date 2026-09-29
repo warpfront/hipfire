@@ -62,5 +62,38 @@ answers, the medians are close.
   build's default-on gfx1151 prefill routes do not give the same result
   regardless of batching (spec §10, gate 1a note). The numbers above are
   what that build serves.
-- hipfire's probabilities are raw model probabilities. No calibration
-  fitting was applied.
+- Calibration (spec §13): each report's "Fit" table gives the per-type
+  temperatures fitted on held-out rows only (`heldout/`, answered by the
+  same eval build; `../heldout/manifest.json` lists the sources and proves
+  no overlap). The "ECE cal" / "NLL cal" columns apply them to the saved
+  reported answers (`probs/`); nothing was re-run. The raw columns are the
+  served probabilities.
+
+## Applying calibration
+
+`calibrate.py fit` printed these `models.toml` snippets (`docs/CONFIG.md`
+has the general key shape and range). **Neither is written to
+`~/.hipfire/models.toml` by anything in this branch** — applying one is a
+separate, human step, because a hipfire binary built before
+`decide.calibration.*` existed refuses to load a catalog that contains it
+(spec §13.9). Paste a snippet only once every hipfire that reads that
+catalog — the installed `~/.hipfire/bin` included — is at or past this
+branch.
+
+```toml
+[models."qwen3.5-4b.mq4".overrides.decide.calibration]
+choice = 1.653
+score = 1.48
+noul = 1.363
+```
+
+```toml
+[models."qwen3.8-27b.mq4-xts".overrides.decide.calibration]
+choice = 1.391
+```
+
+`qwen3.8-27b.mq4-xts`'s `score` and `noul` did not clear the ship rule
+(§13.4: held-out NLL improves ≥ 1% relative, and the bootstrap 95%
+interval for T excludes 1) on licence-clear held-out data, so both stay at
+T = 1 and are omitted from its snippet; see that model's `calibration.json`
+and `report.md` "Fit" table for the numbers.

@@ -1,0 +1,60 @@
+{
+ "model_id": "qwen3.8-27b.mq4-xts",
+ "build": "237bb7bba",
+ "types": {
+  "choice": {
+   "n": 2400,
+   "sources": {
+    "banking77": 300,
+    "clinc150": 300,
+    "commonsense_qa": 300,
+    "ledgar": 300,
+    "massive-en": 300,
+    "massive-it": 300,
+    "openbookqa": 300,
+    "synth-choice": 300
+   },
+   "t": 1.391,
+   "t_ci95": [
+    1.336,
+    1.437
+   ],
+   "nll_raw": 0.7146692865118169,
+   "nll_cal": 0.647142456306409,
+   "ship": true
+  },
+  "score": {
+   "n": 300,
+   "sources": {
+    "synth-score": 300
+   },
+   "t": 1.231,
+   "t_ci95": [
+    1.062,
+    1.389
+   ],
+   "nll_raw": 1.0583197441374539,
+   "nll_cal": 1.0479907403502426,
+   "ship": false
+  },
+  "noul": {
+   "n": 900,
+   "sources": {
+    "doc-yesno": 300,
+    "sms-spam": 300,
+    "synth-noul": 300
+   },
+   "t": 1.134,
+   "t_ci95": [
+    1.022,
+    1.249
+   ],
+   "nll_raw": 0.25552048284426426,
+   "nll_cal": 0.2532918322374167,
+   "ship": false
+  }
+ },
+ "decide_calibration": {
+  "choice": 1.391
+ }
+}

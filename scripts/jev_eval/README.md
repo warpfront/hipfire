@@ -36,6 +36,22 @@ git clone https://github.com/scienthoon/jev-ood-calibration ~/repos/jev-evals/je
    `python3 scripts/jev_eval/calibrate.py freeze --src bench/jev/qwen3.5-4b --out bench/jev/qwen3.5-4b/probs`
 6. Report (raw vs calibrated, from the frozen rows and `calibration.json`
    if fitted): `python3 scripts/jev_eval/report.py --out bench/jev/qwen3.5-4b`
+7. Calibration (spec §13; CPU unless noted). Held-out rows never overlap
+   the reported rows, and the fit never reads reported rows.
+   ```bash
+   # once: freeze the reported rows (text-free) from the eval run's raw answers
+   python3 scripts/jev_eval/calibrate.py freeze --src ~/repos/hipfire-jev-eval/bench/jev/qwen3.5-4b --out bench/jev/qwen3.5-4b/probs
+   # once: build the held-out set (network); text stays in ~/.cache/hipfire-jev-calib
+   python3 scripts/jev_eval/heldout.py build && python3 scripts/jev_eval/heldout.py verify
+   # GPU: answer it on the build that served the reported rows (serve on :11435, raw)
+   python3 scripts/jev_eval/heldout.py run --model ~/.hipfire/models/qwen3.5-4b.mq4 --out bench/jev/qwen3.5-4b/heldout
+   # fit per question type, then report raw vs calibrated on the reported rows
+   python3 scripts/jev_eval/calibrate.py fit --heldout bench/jev/qwen3.5-4b/heldout --model-id qwen3.5-4b.mq4 --build <sha> --out bench/jev/qwen3.5-4b/calibration.json
+   python3 scripts/jev_eval/report.py --out bench/jev/qwen3.5-4b
+   ```
+   The fit prints the `models.toml` snippet (`decide.calibration.*`; see
+   `docs/CONFIG.md`). GPU check that the daemon applies T exactly as the
+   fitter does: `python3 scripts/jev_eval/calib_live_check.py --model ~/.hipfire/models/qwen3.5-4b.mq4`.
 
 Not every frozen source is committed: a source dataset's own licence has to
 clearly permit redistributing derived per-row data first — see
