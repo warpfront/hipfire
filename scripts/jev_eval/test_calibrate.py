@@ -131,6 +131,26 @@ class Freeze(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cb.main(["freeze", "--src", str(src), "--out", str(out)])
 
+    def test_sources_json_paths_are_relative_to_src(self):
+        # Regression: SOURCES.json must carry no local filesystem layout
+        # (bench/jev/DATA-LICENSES.md, "What SOURCES.json is").
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "some" / "deep" / "checkout" / "m"
+            (src / "jevbench/raw").mkdir(parents=True)
+            (src / "jevbench/predictions").mkdir()
+            (src / "calibration").mkdir()
+            raw = {"state": "s", "label": "true", "prob": {"true": 0.8, "false": 0.2}}
+            (src / "jevbench/raw/sms-spam.jsonl").write_text(json.dumps(raw) + "\n")
+            (src / "jevbench/predictions/sms-spam.jsonl").write_text(
+                json.dumps({"i": 0, "p_top": 0.8, "correct": 1}) + "\n")
+            out = Path(d) / "probs"
+            cb.main(["freeze", "--src", str(src), "--out", str(out)])
+            sources = json.loads((out / "SOURCES.json").read_text())
+            self.assertEqual(set(sources), {"jevbench/raw/sms-spam.jsonl", "jevbench/predictions/sms-spam.jsonl"})
+            for key in sources:
+                self.assertFalse(Path(key).is_absolute(), key)
+                self.assertNotIn(str(d), key)
+
 
 class FitCommand(unittest.TestCase):
     def test_fit_refuses_anything_but_heldout(self):

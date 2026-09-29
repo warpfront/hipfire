@@ -49,11 +49,13 @@ adding a new source.
 ## What SOURCES.json is
 
 `bench/jev/<model>/probs/SOURCES.json` (committed) lists, for every source
-`freeze` processed (including the withheld ones), the file path in the
-read-only eval worktree and a SHA-256 of its contents. A hash is not
-reversible and a local path reveals no dataset content, so this manifest is
-committed in full regardless of a source's licence outcome — it is
-provenance metadata, not derived data.
+`freeze` processed (including the withheld ones), the file's path *relative
+to `--src`* (the eval worktree's `bench/jev/<model>` directory, e.g.
+`jevbench/raw/banking77.jsonl`) and a SHA-256 of its contents — never an
+absolute path, so the manifest carries no local filesystem layout. A hash is
+not reversible and a relative path reveals no dataset content, so this
+manifest is committed in full regardless of a source's licence outcome — it
+is provenance metadata, not derived data.
 
 ## How to keep this honest
 

@@ -21,6 +21,10 @@ bench/jev/DATA-LICENSES.md. `read_jsonl` and the report reader transparently
 accept a `.jsonl.gz` in place of a `.jsonl` (the form committed rows take),
 and silently skip a source with neither, so a repo checkout with only the
 licence-clear subset still reports correctly.
+
+`freeze` records each source file's path in `SOURCES.json` relative to
+`--src` (the eval worktree's `bench/jev/<model>` directory), never absolute,
+so the committed manifest carries no local filesystem layout.
 """
 import argparse
 import gzip
@@ -281,12 +285,12 @@ def cmd_freeze(a):
             if abs(r["probs"][top] - pr["p_top"]) > 5e-5 or int(top == r["gold"]) != pr["correct"]:
                 sys.exit(f"{p.stem} row {pr['i']}: raw row does not match the saved prediction")
         write_rows(out / f"jevbench_{p.stem}.jsonl", rows)
-        sources[str(p)] = sha256_file(p)
-        sources[str(pred_path)] = sha256_file(pred_path)
+        sources[str(p.relative_to(src))] = sha256_file(p)
+        sources[str(pred_path.relative_to(src))] = sha256_file(pred_path)
     for p in sorted((src / "calibration").glob("hipfire_*.jsonl")):
         name = p.stem.removeprefix("hipfire_")
         write_rows(out / f"cal_{name}.jsonl", [slim_cal_row(name, r) for r in read_jsonl(p)])
-        sources[str(p)] = sha256_file(p)
+        sources[str(p.relative_to(src))] = sha256_file(p)
     (out / "SOURCES.json").write_text(json.dumps(sources, indent=1, sort_keys=True) + "\n")
     print(f"froze {len(sources)} source files -> {out}")
 
