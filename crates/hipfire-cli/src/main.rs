@@ -10960,6 +10960,78 @@ mod tests {
         assert_eq!(decides[0]["state"], "s");
     }
 
+    /// Spec §13.2: write a per-model `decide.calibration` override for the
+    /// harness fixture into the harness's own models.toml.
+    #[cfg(unix)]
+    fn write_decide_calibration(harness: &Task11HttpHarness, table: &str) {
+        let catalog = format!(
+            "schema_version = 1\n\n[models.\"fixture\"]\npath = {:?}\n\n\
+             [models.\"fixture\".overrides.decide.calibration]\n{table}\n",
+            harness.model()
+        );
+        fs::write(&harness.paths.config.models_toml, catalog).unwrap();
+    }
+
+    /// POST a decide (must succeed) and return the message serve forwarded.
+    #[cfg(unix)]
+    fn forwarded_decide(
+        harness: &Task11HttpHarness,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (status, _, text) = post_systemone(harness.port(), body);
+        assert_eq!(status, 200, "{text}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        (*decides.last().expect("a forwarded decide")).clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_the_per_model_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal");
+        write_decide_calibration(&harness, "choice = 1.5\nnoul = 0.8");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.5, "score": 1.0, "noul": 0.8})
+        );
+        // Session mode forwards it too.
+        let d = forwarded_decide(&harness, &session_body(harness.model(), None));
+        assert_eq!(d["calibration"]["choice"], 1.5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_sends_no_calibration_without_an_override() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-none");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(d.get("calibration").is_none(), "{d}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_cannot_set_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-client");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "calibration": {"choice": 9.0},
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(
+            d.get("calibration").is_none(),
+            "client calibration forwarded: {d}"
+        );
+        write_decide_calibration(&harness, "noul = 0.8");
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8})
+        );
+    }
+
     /// The response `model` is the served model name chat and `/health`
     /// report (`meta.current_model`, the tag when a tag was requested), not
     /// the resolved filesystem path.

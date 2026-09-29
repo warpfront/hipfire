@@ -524,6 +524,37 @@ and `HIPFIRE_DEFAULT_CHATML` remain legacy one-shot aliases.
 
 ---
 
+## Decide calibration
+
+Per-model temperatures for `POST /v1/systemone` answers (spec
+`docs/specs/2026-09-28-jev-decide-design.md` §13). An answer's
+probabilities are `softmax(label logits / T)`, with one `T` per question
+type.
+
+| Key | Default | Range | Scope |
+|---|---|---|---|
+| `decide.calibration.choice` | `1.0` | 0.05–20 | request (per-model overlay) |
+| `decide.calibration.score` | `1.0` | 0.05–20 | request (per-model overlay) |
+| `decide.calibration.noul` | `1.0` | 0.05–20 | request (per-model overlay) |
+
+`1.0` is the raw readout. T > 1 makes answers less confident and T < 1 more
+confident; the chosen option never changes. Set them per model, from a fit
+(`scripts/jev_eval/calibrate.py fit`):
+
+```toml
+[models."qwen3.5-4b.mq4".overrides.decide.calibration]
+choice = 1.3
+noul = 0.7
+```
+
+or `hipfire config qwen3.5-4b.mq4 set decide.calibration.choice 1.3`. Serve
+resolves them on every decide, so a change applies without a reload. They
+are not in the Jev response body; a non-identity calibration shows in the
+`x-hipfire-timing` header. A hipfire binary built before these keys existed
+refuses a `models.toml` that contains them.
+
+---
+
 ## Per-model overlay
 
 ```bash

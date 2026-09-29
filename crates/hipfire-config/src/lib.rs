@@ -777,6 +777,54 @@ pub static FIELDS: &[ConfigField] = &[
         "Sampling temperature."
     ),
     field!(
+        "decide.calibration.choice",
+        "decide_calibration_choice",
+        Generation,
+        Request,
+        DefaultValue::Float(1.0),
+        ValueRule::Float {
+            min: 0.05,
+            max: 20.0,
+            min_inclusive: true
+        },
+        false,
+        false,
+        None,
+        "Decide (/v1/systemone) temperature T for choice answers: probabilities are softmax(label logits / T); 1 = raw. Set per model from a fit (docs/specs/2026-09-28-jev-decide-design.md section 13)."
+    ),
+    field!(
+        "decide.calibration.score",
+        "decide_calibration_score",
+        Generation,
+        Request,
+        DefaultValue::Float(1.0),
+        ValueRule::Float {
+            min: 0.05,
+            max: 20.0,
+            min_inclusive: true
+        },
+        false,
+        false,
+        None,
+        "Decide (/v1/systemone) temperature T for score answers: probabilities are softmax(label logits / T); 1 = raw. Set per model from a fit (docs/specs/2026-09-28-jev-decide-design.md section 13)."
+    ),
+    field!(
+        "decide.calibration.noul",
+        "decide_calibration_noul",
+        Generation,
+        Request,
+        DefaultValue::Float(1.0),
+        ValueRule::Float {
+            min: 0.05,
+            max: 20.0,
+            min_inclusive: true
+        },
+        false,
+        false,
+        None,
+        "Decide (/v1/systemone) temperature T for noul (yes/no) answers: p(yes) = sigmoid(log-odds / T); 1 = raw. Set per model from a fit (docs/specs/2026-09-28-jev-decide-design.md section 13)."
+    ),
+    field!(
         "generation.top_p",
         "top_p",
         Generation,
@@ -4951,6 +4999,72 @@ mod tests {
                 .validate(&field.default.to_value())
                 .unwrap_or_else(|error| panic!("invalid default {}: {error}", field.key));
         }
+    }
+
+    #[test]
+    fn decide_calibration_fields_are_per_model_request_temperatures() {
+        for kind in ["choice", "score", "noul"] {
+            let key = format!("decide.calibration.{kind}");
+            let f = field(&key).unwrap_or_else(|| panic!("{key} missing"));
+            assert!(matches!(f.scope, ConfigScope::Request), "{key}");
+            assert!(f.env_compat.is_none() && !f.registry_allowed, "{key}");
+            assert_eq!(f.default.to_value(), ConfigValue::Float(1.0));
+            for ok in [
+                ConfigValue::Float(0.05),
+                ConfigValue::Integer(2),
+                ConfigValue::Float(20.0),
+            ] {
+                assert!(f.validate(&ok).is_ok(), "{key} {ok:?}");
+            }
+            for bad in [
+                ConfigValue::Float(0.0),
+                ConfigValue::Float(0.04),
+                ConfigValue::Float(20.5),
+            ] {
+                assert!(f.validate(&bad).is_err(), "{key} {bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn models_toml_accepts_and_round_trips_decide_calibration() {
+        let root = temp_root("decide-calibration");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(
+            &paths.models_toml,
+            r#"schema_version = 1
+
+[models."qwen3.5-4b.mq4"]
+path = "/models/qwen3.5-4b.mq4"
+overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } } }
+"#,
+        )
+        .unwrap();
+        let loaded = load_catalog(&paths).unwrap();
+        let (_, model) = loaded.catalog.model("qwen3.5-4b.mq4").unwrap();
+        assert_eq!(
+            model.overrides.get("decide.calibration.choice"),
+            Some(&ConfigValue::Float(1.3))
+        );
+        assert_eq!(
+            model.overrides.get("decide.calibration.score"),
+            Some(&ConfigValue::Integer(2))
+        );
+        write_catalog_toml(&paths, &loaded.catalog).unwrap();
+        let written = fs::read_to_string(&paths.models_toml).unwrap();
+        assert!(written.contains("decide.calibration"), "{written}");
+        assert_eq!(
+            load_catalog_toml(&paths.models_toml).unwrap(),
+            loaded.catalog
+        );
+        fs::write(
+            &paths.models_toml,
+            "schema_version = 1\n[models.m]\npath = \"/m\"\n\
+             [models.m.overrides.decide.calibration]\nchoice = 0\n",
+        )
+        .unwrap();
+        assert!(load_catalog(&paths).is_err(), "T = 0 must be refused");
     }
 
     #[test]

@@ -97,6 +97,23 @@ fn decide_error_response(
     json_response(serde_json::json!({ "error": error }), status)
 }
 
+/// Per-model decide calibration (spec §13.2): the resolved
+/// `decide.calibration.{choice,score,noul}` temperatures, sent to the
+/// daemon only when one differs from 1, so an uncalibrated model's decide
+/// message is unchanged. Never taken from the request body.
+fn calibration_message(
+    resolved: &hipfire_config::ResolvedConfig,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut out = serde_json::Map::new();
+    let mut identity = true;
+    for kind in ["choice", "score", "noul"] {
+        let t = crate::config_f64(resolved, &format!("decide.calibration.{kind}"))?;
+        identity &= t == 1.0;
+        out.insert(kind.to_string(), serde_json::json!(t));
+    }
+    Ok((!identity).then_some(serde_json::Value::Object(out)))
+}
+
 /// The whole decide attempt loop, synchronous end to end: model resolution,
 /// `ensure_model` (which can block on a GPU load), the daemon round trip via
 /// `Engine::request` (a blocking `mpsc::Receiver::recv`), and the one-shot
@@ -126,7 +143,7 @@ fn run_decide(
     }
 
     for attempt in 0..2 {
-        let (engine, model_echo, session) = {
+        let (engine, model_echo, session, calibration) = {
             let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
             let target = if !requested.is_empty() && is_local_model(&runtime, &requested) {
                 requested.clone()
@@ -174,6 +191,16 @@ fn run_decide(
                     }
                 },
             };
+            let calibration = match calibration_message(&resolved) {
+                Ok(c) => c,
+                Err(e) => {
+                    return DecideOutcome::Err {
+                        status: 500,
+                        message: format!("decide calibration config: {e:#}"),
+                        required_max_seq: None,
+                    }
+                }
+            };
             // Echo the model the way chat and `/health` report it (the tag
             // when one was requested); the filesystem path only as fallback.
             let echo = shared
@@ -189,7 +216,7 @@ fn run_decide(
                         .map(|p| p.display().to_string())
                 })
                 .unwrap_or(target);
-            (runtime.engine.clone(), echo, session)
+            (runtime.engine.clone(), echo, session, calibration)
         };
 
         let id = request_id();
@@ -207,6 +234,9 @@ fn run_decide(
             if let Some(tools) = tools {
                 msg["tools"] = tools.clone();
             }
+        }
+        if let Some(c) = &calibration {
+            msg["calibration"] = c.clone();
         }
         let reply = match engine.request(&msg) {
             Ok(v) => v,
@@ -373,5 +403,30 @@ mod tests {
         assert!(e.contains("\"image_url\""), "{e}");
         let text = json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
         assert!(session_messages_error(&text).is_none());
+    }
+
+    #[test]
+    fn calibration_message_only_when_a_temperature_differs_from_one() {
+        let none = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        assert_eq!(calibration_message(&none).unwrap(), None);
+        let mut layer = hipfire_config::ConfigLayer::default();
+        layer
+            .set(
+                "decide.calibration.choice",
+                hipfire_config::ConfigValue::Float(1.5),
+            )
+            .unwrap();
+        let resolved = hipfire_config::resolve(vec![hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::ModelUser {
+                model: "m".into(),
+                path: "/x/models.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        assert_eq!(
+            calibration_message(&resolved).unwrap(),
+            Some(json!({"choice": 1.5, "score": 1.0, "noul": 1.0}))
+        );
     }
 }
