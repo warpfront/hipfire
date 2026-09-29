@@ -41,6 +41,9 @@ class RestrictedSources(unittest.TestCase):
             self.assertNotIn("| ag-news |", report)
             self.assertNotIn("| hellaswag |", report)
             self.assertNotIn("| hellaswag ", report)
+            # Each table carries the withheld note (both tables have a
+            # restricted source: ag-news in jev-bench, hellaswag in calibration).
+            self.assertEqual(report.count("../DATA-LICENSES.md"), 2)
 
 
 if __name__ == "__main__":

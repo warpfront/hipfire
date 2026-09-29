@@ -33,6 +33,8 @@ cal = Path(os.environ.get("JEVCAL_DIR", Path.home() / "repos/jev-evals/jev-ood-c
 cfile = out / "calibration.json"
 fit = json.loads(cfile.read_text()) if cfile.exists() else None
 temps = fit["decide_calibration"] if fit else {}
+WITHHELD_NOTE = ("Rows for datasets whose licences restrict redistributing derived results are withheld; "
+                 "see ../DATA-LICENSES.md.")
 
 
 def jev_bench(name):
@@ -92,6 +94,7 @@ for name, p in sorted(cb.find_rows(out / "probs", "jevbench_").items()):
     L.append(f"| {name} | {s['n']} | {f3(jacc)} | " + cells(s).format(je=f3(je)))
     if "mae_raw" in s:
         score.append(f"| {name} | {s['n']} | {f3(s['mae_raw'])} | {f3(s['mae_cal'])} |")
+L += ["", WITHHELD_NOTE]
 L += ["", "## jev-ood-calibration", "",
       "| set | type | n | Jev acc | hipfire acc | Jev ECE | ECE raw | ECE cal | NLL raw | NLL cal |",
       "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
@@ -110,6 +113,7 @@ for name, p in sorted(cb.find_rows(out / "probs", "cal_").items()):
         L.append(f"| {name} | {t} | {s['n']} | {f3(jacc)} | " + cells(s).format(je=f3(je)))
         if "mae_raw" in s:
             score.append(f"| {name} ({t}) | {s['n']} | {f3(s['mae_raw'])} | {f3(s['mae_cal'])} |")
+L += ["", WITHHELD_NOTE]
 if score:
     L += ["", "## score answers: mean |E[score] - gold|", "",
           "| rows | n | raw | calibrated |", "|---|---:|---:|---:|"] + score
