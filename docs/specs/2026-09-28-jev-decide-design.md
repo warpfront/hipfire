@@ -1,7 +1,7 @@
 # Jev-style decide endpoint — Design Spec
 
-> Status: **IMPLEMENTED — v1 + v1.1 session mode** · Date: 2026-09-28 · Addendum §12 · Results: `bench/jev/`
-> (session mode, v1.1; design approved 2026-09-28)
+> Status: **IMPLEMENTED — v1 + v1.1 session mode** · **DESIGN — v1.2 calibration (§13)** · Date: 2026-09-28 · Addenda §12, §13 · Results: `bench/jev/`
+> (session mode, v1.1; design approved 2026-09-28) (calibration, v1.2; shape approved 2026-09-29)
 > Author: nwoolmer
 >
 > A local, Jev-compatible decision endpoint: unstructured state plus typed
@@ -322,8 +322,8 @@ All three:
 - **Batched question suffixes** via `forward_batch_slots`. It supports
   multi-token prefill per slot but has no slot-fork API. Needs a D2D copy of
   the arena range and DN buffers.
-- **Calibration layer.** A per-model, per-type temperature file, then trained
-  calibration.
+- **Calibration layer.** The per-model, per-type temperature is specified in
+  §13 (v1.2). Trained calibration stays deferred (§13.9).
 - **Dedicated classifier model.** Blocked by the one-daemon-per-machine
   `flock` invariant.
 
@@ -903,3 +903,449 @@ not.
 - An end-to-end serve GPU test: `/v1/systemone` session requests through
   `hipfire serve` with a real daemon (the route tests use a fake daemon; the
   gates talk to the daemon directly).
+
+## 13. Calibration (v1.2)
+
+> Addendum, 2026-09-29. The shape was approved by the human; this section
+> fixes the details. §1–§12 still hold. With no calibration configured,
+> every answer is bit-identical to v1.1.
+
+### 13.1 What and why
+
+v1 returns the model's raw probabilities, and they are miscalibrated in
+both directions. On the reported rows (`bench/jev/`), Qwen3.5-4B's
+banking77 top-probability ECE is 0.188 against Jev's 0.099, while its
+synthetic `score` ECE is 0.091 against Jev's 0.306.
+
+v1.2 adds **temperature scaling**: one scalar T per (model, question
+type), applied to the label logits before the softmax. It is the first half
+of §9's deferred calibration layer and the smallest fitted calibration
+there is:
+
+- one parameter per type;
+- it can never change which answer wins (§13.3);
+- it is fitted in seconds from answers the endpoint already returns, so it
+  needs no new endpoint and no logit dump.
+
+Trained calibration (Jev's RLCD) stays deferred.
+
+### 13.2 API and configuration
+
+**The Jev wire is unchanged.** Request, response, answer shapes and
+confidence formulas are exactly §7's. A client can neither select nor see
+calibration in the body. A `calibration` field in an HTTP request body is
+ignored: serve never forwards it.
+
+**Config keys.** Three request-scoped keys in the `hipfire-config` schema,
+set in the per-model overlay (`~/.hipfire/models.toml`):
+
+| Key | Type | Default | Range | Scope |
+|---|---|---|---|---|
+| `decide.calibration.choice` | number | `1.0` | 0.05–20 | `Request` |
+| `decide.calibration.score` | number | `1.0` | 0.05–20 | `Request` |
+| `decide.calibration.noul` | number | `1.0` | 0.05–20 | `Request` |
+
+They are not registry-backed (`registry_allowed = false`) and have no
+environment alias, so they are not part of the daemon's process config.
+Legacy JSON spellings are `decide_calibration_{choice,score,noul}`.
+
+```toml
+[models."qwen3.5-4b.mq4".overrides.decide.calibration]
+choice = 1.3
+score = 1.9
+noul = 0.7
+```
+
+- The inline form `overrides = { decide = { calibration = { choice = 1.3 } } }`
+  is equivalent.
+- CLI: `hipfire config qwen3.5-4b.mq4 set decide.calibration.choice 1.3`.
+  For a model with no catalog record yet (a path-only model such as
+  `qwen3.8-27b.mq4-xts`) this creates the record with its path, as for any
+  per-model key.
+- A key that is not set means T = 1 (raw) for that type.
+- The schema also accepts the keys in the global `config.toml`, as it does
+  every request key. That would apply one T to every model, which is wrong
+  for calibration; the docs say to set them per model.
+
+**Serve.** After `ensure_model`, serve reads the three values from the
+config resolved for the model actually used. That is the same
+`resolved_for_model` layering chat uses for `generation.temperature`
+(registry card < global < per-model < env).
+
+- If any value differs from 1, serve adds
+  `"calibration": {"choice": Tc, "score": Ts, "noul": Tn}` (all three) to the
+  daemon `decide` message.
+- Otherwise it adds nothing, so an uncalibrated model's daemon message is
+  byte-identical to v1.1.
+- This applies to plain and session requests alike. A `required_max_seq`
+  reload re-resolves the config.
+- Serve resolves the config on every request, so `hipfire config … set` takes
+  effect on the next decide without a reload.
+
+**Daemon wire.** `{"type":"decide", …, "calibration"?: {"choice"?, "score"?, "noul"?}}`.
+
+- Absent or `null` means the identity. Each key is optional and defaults to 1.
+- Values must be numbers in [0.05, 20].
+- A non-object, an unknown key or an out-of-range value gets a 422 naming
+  `calibration.<key>` (§13.8).
+- `hipfire-daemon/src/main.rs` does not change:
+  `handle_decide_message` already receives the whole message.
+  (`daemon_lines` sits exactly at its 4882 ceiling.)
+
+**Timing header.** When the applied calibration is not the identity, the
+daemon's `timing`, and so `x-hipfire-timing`, carries
+`"calibration": {choice, score, noul}`. It is diagnostic and never appears
+in the Jev body.
+
+**Why the request path and not `LoadedModel`.** Both were considered; the
+request path is the consistent and cleaner one.
+
+- **Consistency.** Per-model settings that shape a request's *output*, such
+  as `generation.temperature`, `top_p` and `prompt.system`, are resolved by
+  serve per request and sent in the daemon message. Only settings that change
+  what the load *allocates* (`kv_cache`, `speculation`, CASK) travel as load
+  params into `LoadedModel`. Calibration is an output setting.
+- **No reload.** A changed T applies to the next request. On `LoadedModel`
+  it would need a reload of the weights.
+- **Ratchet.** `LoadedModel` would need a new load parameter parsed in the
+  daemon's load arm, which sits at the `daemon_lines` ceiling. The request
+  path adds no daemon lines.
+- **Gates stay raw.** Direct daemon clients (`gates.py`, the eval harness)
+  choose calibration per message and are raw by default, so the v1/v1.1
+  gates keep testing the raw readout.
+- **Backend-agnostic.** Nothing is tied to a loaded LLM. The engine applies
+  T to whatever label scores a decide backend produces (§13.3).
+
+### 13.3 Math
+
+Let z₁…z_K be the question's label scores: the gathered next-token logits,
+in `labels_for` order. The answer uses
+
+  p = softmax(z / T), computed in f64 as exp((zᵢ − max z)/T) / Σⱼ exp((zⱼ − max z)/T).
+
+Everything downstream is §7's formula applied to the calibrated p:
+
+- `choice`: `probabilities` = p; `choice` = argmax; confidence =
+  (p_max − 1/K)/(1 − 1/K);
+- `score`: `probabilities` = p; `score` = Σ i·pᵢ; confidence = p_max;
+- `noul`: `noul` = p_Yes = σ((z_Yes − z_No)/T).
+
+Invariants:
+
+1. **T = 1 is bit-identical to v1.1.** Division by 1 is exact in IEEE 754,
+   so the f64 values are the same bits.
+2. **T > 0 preserves order.** The argmax and the ranking are unchanged, so
+   `choice`, the `noul` ≥ 0.5 decision and accuracy do not move. The
+   probabilities, confidences and the `score` mean do.
+3. **Direction.** T > 1 flattens (less confident); T < 1 sharpens.
+4. **Shift invariance.** softmax((z + c)/T) = softmax(z/T). Recorded
+   probabilities give back the label scores up to a constant:
+   log pᵢ = zᵢ − logsumexp(z), so softmax(log p / T) = softmax(z / T)
+   exactly. Fitting and evaluation therefore work from the answers the
+   endpoint already returns (§13.4, §13.6).
+
+**Backend-agnostic.** The engine API is
+`assemble_answer(question, label_scores, T)` plus `assemble_answers(questions,
+per_question_scores, &Calibration)`. By invariant 4 the scores may be
+logits or log-probabilities.
+
+- A future decide backend, such as the Laya ModernBERT decision model under
+  research, hands its per-label scores to the same functions.
+- Its temperatures are fitted by the same protocol (§13.4) on its own
+  answers, and stored under its own model id.
+
+### 13.4 Fitting protocol
+
+- **Unit.** One T per (model artifact, build, question type), pooled over
+  every held-out source of that type.
+- **Data.** Held-out rows only (§13.5). They are answered raw (no
+  calibration configured), one question per request, by the same build and
+  serve configuration as the reported rows:
+  - build: `eval/jev-decide-mq4-lloyd` at 237bb7bba, i.e. `feat/jev-decide`
+    plus PR #768;
+  - config: KV q8, CASK on, budget 16384.
+- **Row.** `{source, type, probs, gold}`: `probs` as served, in
+  answer-key order, `gold` an index into them, ℓ = log p. There is no text,
+  and no option keys, which would dominate the file size.
+- **Objective.** Mean negative log-likelihood (log loss):
+  NLL(T) = −(1/N) Σₙ log softmax(ℓₙ / T)[yₙ].
+- **Pooling.** At most 300 rows per source (the first 300, in the order the
+  held-out builder kept them), so no source dominates a type.
+- **Optimiser.** NLL is convex in β = 1/T.
+  - The derivative is dNLL/dβ = mean(E_q[ℓ] − ℓ_y), and it is monotone,
+    since the second derivative is mean Var_q[ℓ] ≥ 0.
+  - Safeguarded Newton on it, with β bracketed in [1/20, 1/0.05].
+  - A fit that lands on a bracket end is an error and is not shipped.
+- **Uncertainty.** 100 bootstrap resamples of the pooled rows
+  (`random.Random(0)`) give a 95% interval for T.
+- **Ship rule.** Decided on held-out rows only. A type ships its T iff:
+  - the held-out NLL drops by ≥ 1% relative, and
+  - the 95% interval excludes 1.
+
+  Otherwise the type stays at T = 1, and its key is omitted. T is rounded
+  to 3 decimals.
+- **Output.** `bench/jev/<model>/calibration.json` holds:
+  - per type: T, its interval, n per source, raw and calibrated held-out
+    NLL, and `ship`;
+  - the `decide_calibration` object to configure.
+
+  The fitter also prints the `models.toml` snippet.
+- **Reported rows never feed the fit.**
+  - `calibrate.py fit` only accepts a directory named `heldout/`, and the
+    ship rule reads nothing else.
+  - The reported rows are only ever *evaluated* (§13.6), after T is fixed.
+- **Build pinning.** T belongs to a build's numerics. The PR #768 prefill
+  routes move 27B answers by up to about 1 log-prob (§11 caveats). Refit
+  when the serving build's decide numerics change, for example when #768
+  merges, is dropped, or its routes change defaults.
+
+### 13.5 Held-out data and row selection
+
+**Reported set R** is every state that appears in a reported row:
+
+- (a) the 12 jev-bench tasks' fixed-seed rows: each task constructor at
+  n = 500 with `jevbench.SEED` = 0, served from the same dataset cache;
+- (b) every row of both reported runs' saved raw answers
+  (`jevbench/raw/*.jsonl`), including the six experiments. `x-oos` adds
+  CLINC out-of-scope test rows;
+- (c) jev-ood-calibration's `data/val.jsonl` (300 tickets × 3 questions);
+- (d) OpenBookQA, CommonsenseQA and HellaSwag validation rows as the harness
+  rebuilds them: the first 500, 1,221 and 2,000 rows.
+
+**State identity.** `state_hash` is the SHA-256 of the state text after
+`strip()`:
+
+- a string state is used as-is;
+- an object or array is JSON with sorted keys, `(",", ":")` separators and
+  non-ASCII kept (`ensure_ascii=False`), UTF-8 encoded.
+
+R is committed as `bench/jev/heldout/reported_state_sha256.txt` (sorted,
+unique). The build fails if (b) is missing for either reported model, so R
+can never silently shrink.
+
+**Candidates.**
+
+- jev-bench candidates come from each task's *own* constructor, with its
+  loader redirected (`hf_rows` → the held-out split, n = 400, seed 1;
+  banking77's CSV URL `test.csv` → `train.csv`). Field and label mapping
+  are therefore the reported code's.
+- Every candidate is asked the *reported* question, with the same
+  instructions and the same criteria in the same order.
+- A candidate whose label is not among the reported criteria is dropped,
+  for example a MASSIVE intent absent from its test split.
+
+| Source | Type | Reported rows from | Held-out candidates from |
+|---|---|---|---|
+| banking77 | choice | `test.csv` | `train.csv` (same repo), constructor order, first 400 |
+| massive-en, massive-it | choice | test | validation, `hf_rows` seed 1, 400 |
+| clinc150 | choice | test (`plus`) | validation (`plus`), seed 1, 400, in-scope only |
+| ledgar | choice | test | validation, seed 1, 400 |
+| ag-news | choice | test | train, seed 1, 400 |
+| sms-spam | noul | train (its only split) | train, seed 1, 400; disjoint by R-exclusion only |
+| duplicates (QQP) | noul | validation | train, seed 1, 400 |
+| doc-yesno (BoolQ) | noul | validation | train, seed 1, 400 |
+| offensive | noul | test | validation, seed 1, 400 |
+| yelp-stars | score | test | train, seed 1, 400 |
+| sentiment-it | score | test | validation (324 rows), seed 1 |
+| synth-choice, synth-score, synth-noul | choice, score, noul | `val.jsonl` (`generate.py` seed 0) | `generate.build_synthetic(400 tickets, label_noise 0.05, seed 7)`; disjoint by R-exclusion only |
+| openbookqa | choice | validation (first 500) | train: first 400 rows, filtered, `Random(1)` shuffle, as the harness builds validation |
+| commonsense_qa | choice | validation (all 1,221) | train: as openbookqa |
+
+HellaSwag's train split is not used. The approved public held-out sources
+are the OpenBookQA and CommonsenseQA train splits, and `choice` already has
+nine sources. HellaSwag's reported validation rows are still in R.
+
+**Selection, per source, in candidate order.**
+
+1. Drop every candidate whose `state_hash` ∈ R.
+2. Drop repeats within the source (the same `state_hash` again).
+3. Keep the first 300.
+
+This gives 17 sources: 2,700 choice, 900 score and 1,500 noul rows per
+model. A CPU dry run of the builder on 2026-09-29 kept 300 from every source
+and found R to have 10,253 states. Its losses were:
+
+- **sms-spam: 66 of 400.** Both draws sample 100-row pages of the one split,
+  so pages overlap.
+- **massive-it: 2.** Short utterances whose Italian text also occurs in the
+  test split.
+- **each synth type: 15 of 400 tickets.** They are identical to a
+  `val.jsonl` ticket, from the placeholder-free templates. Held-out synth
+  therefore slightly under-represents those templates. This is accepted.
+- **Label filter:** 1 MASSIVE row each (EN, IT).
+- **Every other source: none.**
+
+**Proof of no overlap.**
+
+1. **By construction.** H ∩ R = ∅, because rule 1 drops every candidate in
+   R. `heldout.py build` asserts it per source, and `heldout.py verify`
+   re-checks it from committed files alone:
+   - the R hash list;
+   - the manifest, which pins each source's examples file by SHA-256;
+   - the work-dir examples.
+2. **Different splits support it, but do not replace it.** 11 of 12
+   jev-bench sources and both public QA sets come from a split that holds no
+   reported row. Only sms-spam and synth share a split or generator with
+   reported rows. A different split still does not guarantee different
+   text: massive-it's validation split repeats two test utterances. That is
+   why rule 1 runs on every source.
+3. **By the fitter.** Labels as well as rows: `calibrate.py fit` refuses any
+   directory but `heldout/`, so no reported label reaches the fit.
+
+**What is committed.** Held-out text stays out of the repo, the way
+jev-bench keeps its own `raw/` and `data/` out. It lives in the work dir
+`~/.cache/hipfire-jev-calib/`. Committed:
+
+- `bench/jev/heldout/manifest.json`: per source, the type, split, seed,
+  counts drawn / label-filtered / excluded / kept, and the examples SHA-256;
+- the R hash list;
+- per model, `bench/jev/<model>/heldout/<source>.jsonl` answer rows, which
+  hold no text.
+
+### 13.6 Evaluation protocol
+
+**Do the saved predictions suffice? Yes. No re-scoring, no GPU rerun.**
+
+- jev-bench's committed-style `predictions/*.jsonl` are **not** enough.
+  They keep `p_top` (4 dp) and `correct` only. `p_top` alone cannot be
+  rescaled, because the rest of the distribution sets the normaliser of
+  softmax(log p / T).
+- `jevbench.save` also writes `raw/*.jsonl`, which holds each row's full
+  `prob` distribution at full precision. The calibration-set adapter's rows
+  keep full `probs` too.
+- Both reported runs have these files, in the eval worktree
+  (`~/repos/hipfire-jev-eval/bench/jev/<model>/`, untracked). There are 12
+  jev-bench tasks + 6 experiments + 4 sets for 27B, and 3 tasks + synth for
+  4B.
+- Every saved probability is > 0 (minimum 7.9e-12), so log p is finite.
+
+**Freeze.** `calibrate.py freeze` copies the reported rows into the repo as
+text-free rows, `bench/jev/<model>/probs/`, with probabilities kept to 12
+significant digits. It checks each jev-bench row against that task's saved
+prediction: the top probability within 5e-5 of `p_top`, and the same
+correctness. This proves they are the reported rows. It records the source
+files' SHA-256 in `probs/SOURCES.json`. After the freeze, the evaluation no
+longer depends on the throwaway eval worktree.
+
+**Report.** `report.py` reads the frozen rows and `calibration.json` and
+reports, per jev-bench task and per calibration set × type:
+
+- n;
+- Jev accuracy, hipfire accuracy, Jev ECE;
+- hipfire ECE raw and calibrated;
+- hipfire NLL raw and calibrated;
+- for `score` rows, the mean |E[score] − gold| raw and calibrated.
+
+Details:
+
+- "Calibrated" applies each type's shipped T (T = 1 for a type not
+  shipped) with the same `apply_t` the fitter uses.
+- The report asserts that no row's argmax moved.
+- ECE is jevbench's 10-bin top-probability ECE.
+- The raw column is recomputed from full-precision probabilities, so it can
+  differ in the third decimal from the v1 report, which used `p_top` rounded
+  to 4 dp, when a value sits on a bin edge.
+
+**No bar.** The numbers are reported as found. A type whose calibrated ECE
+is worse on the reported rows is reported that way, not refitted: refitting
+to reported rows would leak them into the fit.
+
+### 13.7 Gates and tests
+
+**Unit, no GPU** (`scripts/no-gpu-ci.sh`):
+
+- `hipfire-engine`:
+  - `parse_calibration`: absent / `null` / partial / unknown key /
+    non-object / out of range;
+  - T = 1 bit-identical to the v1 formula;
+  - T scales the scores before the softmax;
+  - shift invariance, i.e. recovery from log p;
+  - flatten / sharpen with the argmax kept;
+  - the choice confidence formula on the calibrated p;
+  - noul = σ(log-odds / T);
+  - the score mean on the calibrated p;
+  - `assemble_answers` applies each question type's T;
+  - plain and session requests carry `calibration`.
+- `hipfire-generate`: the timing echo appears only for a non-identity
+  calibration.
+- `hipfire-config`: the keys' scope, default, range and flags; nested and
+  inline `models.toml` overrides load and round-trip; out of range is
+  refused.
+- serve (fake daemon):
+  - a per-model override is forwarded with all three values;
+  - with no override, no `calibration` key is sent;
+  - a client's body `calibration` is never forwarded.
+- Python (`scripts/jev_eval/test_*.py`):
+  - `apply_t` identity and shift invariance;
+  - the fit recovers a known T on synthetic data, and the NLL is minimal at
+    the fit;
+  - a fit at a bound raises;
+  - ECE matches jevbench's binning;
+  - `summarize` keeps the argmax;
+  - freeze row shapes;
+  - the fit refuses a non-`heldout/` directory;
+  - `state_hash` normalisation;
+  - selection drops R members and repeats and caps at 300;
+  - `verify` catches an overlap and a changed examples file.
+
+**GPU:**
+
+- **L1 live equivalence.** Calibration-branch build, Qwen3.5-4B, daemon
+  driven directly.
+  - Precondition: the same raw request repeated is bit-identical. If it is
+    not, the result is INCONCLUSIVE, reported with the Δ.
+  - For 5 held-out examples per source, and for one session-mode pair
+    (cold, then extend):
+    - the calibrated answer equals `apply_t(raw answer)` within 1e-9 per
+      probability;
+    - `choice` is unchanged;
+    - confidence and score follow §7 on the calibrated p;
+    - `timing.calibration` echoes the temperatures.
+  - An explicit `{"choice":1,"score":1,"noul":1}` is bit-identical to no
+    calibration.
+  - A malformed `calibration` gets a 422, and a normal decide succeeds after
+    it.
+- **v1 and v1.1 gates.** `gates.py` (raw) still passes on Qwen3.5-4B with
+  the calibration-branch build.
+- **`heldout.py verify`** passes.
+
+**v1.2 is done when:**
+
+- every unit test, L1 and the gates pass;
+- both models have `calibration.json`, regenerated reports (raw vs
+  calibrated) and a `models.toml` snippet.
+
+Writing the snippet into the user's `~/.hipfire/models.toml` is a separate,
+human-approved step (§13.9).
+
+### 13.8 Errors (additions to §8 and §12.7)
+
+| Condition | Response |
+|---|---|
+| `calibration` present but not an object (daemon wire) | 422 `calibration must be an object {choice, score, noul}` |
+| `calibration` has a key other than `choice` / `score` / `noul` | 422 naming the key |
+| A `calibration` value that is not a number in [0.05, 20] | 422 `calibration.<key> must be a number in [0.05, 20]` |
+| `decide.calibration.*` invalid in `models.toml` / `config.toml` | config load error: `hipfire config … set` refuses it; serve's `ensure_model` fails (500) |
+
+Serve never sends an invalid value, because the schema validates on load.
+The 422s guard direct daemon clients.
+
+### 13.9 Caveats and deferred
+
+- **Older binaries reject the new keys.** `load_catalog_toml` refuses any
+  unknown override key. Once `~/.hipfire/models.toml` carries
+  `decide.calibration.*`, every hipfire built before this change fails to
+  load the catalog and stops at startup or model resolution. That includes:
+  - the installed `~/.hipfire/bin`;
+  - other worktrees' builds;
+  - the eval build.
+
+  Write the keys only once every hipfire that reads that catalog is at or
+  past this change, or point older binaries at another `HIPFIRE_HOME`.
+- **Deferred:**
+  - per-task or per-K temperatures, vector or matrix scaling, and trained
+    calibration (RLCD);
+  - shipping stable temperatures through the registry
+    (`registry_allowed`), once a fit holds across builds;
+  - a separate session-mode fit. Session answers use the plain-mode T,
+    since the question block is the same text; only the context differs.
