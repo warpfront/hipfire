@@ -10,6 +10,7 @@ dataset cache is copied from the clone's data/ directory (if it exists) into
 out/data — cache misses then write only under --out, never into the clone.
 """
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -70,11 +71,25 @@ _real_urlopen = urllib.request.urlopen
 
 def _guarded_urlopen(*args, **kwargs):
     resp = _real_urlopen(*args, **kwargs)
-    check_raw(resp.headers.get)
+    try:
+        check_raw(resp.headers.get)
+    except Exception:
+        resp.close()
+        raise
     return resp
 
 
 urllib.request.urlopen = _guarded_urlopen
+
+# Fail loudly, now, if jevbench no longer resolves urllib.request.urlopen at
+# call time (e.g. it switched to `from urllib.request import urlopen`) —
+# rather than silently letting calibrated answers through the unpatched
+# original. jb.urllib is the same module object this file imported, so a
+# mismatch here (or a missing `urllib` attribute, raising AttributeError)
+# means the patch above no longer covers jevbench's calls.
+assert jb.urllib.request.urlopen is _guarded_urlopen, (
+    "jevbench no longer calls urllib.request.urlopen the way this guard "
+    "assumes; the raw-answer guard would not run. Adapt the patch.")
 
 # Validate task/experiment names
 for w in a.what:
@@ -89,6 +104,24 @@ for w in a.what:
         if w not in jb.TASKS:
             sys.exit(f"unknown task {w!r}; see jevbench.py list of TASKS\n"
                      f"valid: {', '.join(sorted(jb.TASKS.keys()))}")
+
+# Preflight: one trivial decide request built here, straight from this
+# script rather than through jevbench, so a calibrated server is refused
+# before the task loop runs even if jevbench's internals stop going through
+# the urlopen patch above (spec §13.2, §13.6).
+_preflight_body = json.dumps({
+    "state": "preflight",
+    "model": a.model,
+    "questions": {"q": {"type": "noul", "instructions": "Answer yes or no."}},
+}).encode()
+_preflight_req = urllib.request.Request(
+    jb.API_URL, data=_preflight_body, method="POST",
+    headers={"Content-Type": "application/json"})
+_preflight_resp = _real_urlopen(_preflight_req, timeout=60)
+try:
+    check_raw(_preflight_resp.headers.get)
+finally:
+    _preflight_resp.close()
 
 for w in a.what:
     if w.startswith("x-"):
