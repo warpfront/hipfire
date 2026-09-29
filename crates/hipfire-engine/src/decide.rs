@@ -563,7 +563,7 @@ pub fn assemble_answer(q: &Question, label_logits: &[f32], t: f64) -> Value {
         label_logits.len() >= 2,
         "assemble_answer: need at least 2 labels"
     );
-    debug_assert!(
+    assert!(
         t.is_finite() && t > 0.0,
         "assemble_answer: temperature must be positive"
     );
