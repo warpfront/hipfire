@@ -1,6 +1,6 @@
 # Jev-style decide endpoint — Design Spec
 
-> Status: **DRAFT — awaiting review** · Date: 2026-09-28 · Addendum §12
+> Status: **IMPLEMENTED — v1 + v1.1 session mode** · Date: 2026-09-28 · Addendum §12 · Results: `bench/jev/`
 > (session mode, v1.1; design approved 2026-09-28)
 > Author: nwoolmer
 >
