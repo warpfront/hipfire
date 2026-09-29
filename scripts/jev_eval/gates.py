@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Decide GPU correctness gates (spec §10). Exit 0 iff no gate FAILs.
 
 Each gate prints PASS, FAIL or INCONCLUSIVE; INCONCLUSIVE does not fail the

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Decide calibration (spec §13): freeze the reported predictions, fit one
 temperature per question type on held-out rows, apply it.
 

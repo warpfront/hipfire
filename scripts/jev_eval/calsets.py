@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Record builders shared by run_calibration.py and heldout.py: the
 scienthoon/jev-ood-calibration sets (synthetic tickets, public QA) and their
 decide questions. The validation rebuild mirrors that repo's convert.py

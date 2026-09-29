@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Held-out labelled rows for fitting decide calibration (spec §13.5).
 
   build   draw candidates, drop every one whose state is a reported row's,

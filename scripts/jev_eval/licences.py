@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """The one licence choke point for decide calibration (bench/jev/DATA-LICENSES.md).
 
 Human decision (2026-09-29): every temperature is fitted on licence-clear

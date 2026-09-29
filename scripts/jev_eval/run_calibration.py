@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Run the scienthoon/jev-ood-calibration sets against local hipfire serve,
 writing rows in that repo's result schema (type, option_keys, probs, target,
 pred, gold, confidence, source, usage)."""

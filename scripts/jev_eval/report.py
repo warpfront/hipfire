@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """hipfire decide vs Jev: accuracy, top-probability ECE and log loss, raw vs
 calibrated (spec §13.6). Reads the frozen reported rows (<out>/probs/) and the
 fitted temperatures (<out>/calibration.json; without it every T is 1). No GPU,

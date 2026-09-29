@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """GPU check L1 (spec §13.7): with the repo daemon driven directly, a
 calibrated decide equals the offline apply_t of the raw decide, an explicit
 T = 1 is bit-identical to no calibration, the timing echoes the temperatures,

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """CPU tests for calibrate.py (spec §13.7).
 Run: python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'"""
 import gzip

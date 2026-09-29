@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Decide vs generate latency on identical jev-bench examples, against a running serve.
 
 For each example, time (a) one `POST /v1/systemone` decide and (b) the same model
