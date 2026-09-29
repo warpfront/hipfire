@@ -85,11 +85,13 @@ answers, the medians are close.
     (yelp-stars, sentiment-it) is withheld from the fit, so `score` T comes
     from synth-score alone — one source, not a pool across several.
   - The bootstrap resamples *rows*, not sources (`calibrate.py
-    bootstrap_ci`). A pooled type's 300-or-900 rows come from up to three
-    sources, and a resample can still draw disproportionately from one of
-    them; the reported 95% interval for T is therefore narrower than the
-    true cross-domain uncertainty, which row-level resampling cannot
-    capture.
+    bootstrap_ci`). A pooled type's rows come from several sources —
+    2,400 `choice` rows from 8 sources, 900 `noul` rows from 3 sources
+    (`score` is a single source, synth-score, and is not pooled; spec §13
+    "Licence-clear fitting") — and a resample can still draw
+    disproportionately from one of them; the reported 95% interval for T is
+    therefore narrower than the true cross-domain uncertainty, which
+    row-level resampling cannot capture.
   - No bar (spec §13.6 "No bar"): a shipped T can make a set's ECE worse
     than raw, and that is reported as found rather than refitted. As
     measured here: qwen3.8-27b.mq4-xts's clinc150 ECE goes 0.044 (raw) →

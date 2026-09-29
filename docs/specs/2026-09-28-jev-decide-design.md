@@ -1164,8 +1164,9 @@ with both excluded, score-type T is fitted on `synth-score` alone.
 HellaSwag's train split is not used. The approved public held-out sources
 are the OpenBookQA and CommonsenseQA train splits, and `choice` already has
 nine sources. HellaSwag's reported validation rows are still in R. (HellaSwag
-is also licence-restricted, per the table in §DATA-LICENSES.md, but that is
-moot for fitting: it was never a held-out candidate source to begin with.)
+is also licence-restricted, per the table in `bench/jev/DATA-LICENSES.md`, but
+that is moot for fitting: it was never a held-out candidate source to begin
+with.)
 
 **Selection, per source, in candidate order.**
 
@@ -1340,7 +1341,13 @@ to reported rows would leak them into the fit.
   - the fit refuses a non-`heldout/` directory;
   - `state_hash` normalisation;
   - selection drops R members and repeats and caps at 300;
-  - `verify` catches an overlap and a changed examples file.
+  - `verify` catches an overlap and a changed examples file;
+  - the raw-answer guard raises on a response whose timing echoes
+    calibration (`test_raw_guard.py`);
+  - `resume_point` refuses to resume from an incomplete `.gz`;
+  - `bootstrap_ci`'s nearest-rank percentiles;
+  - the `ship_decision` edge case where the CI excludes 1 but the NLL gain
+    is under 1%.
 
 **GPU:**
 

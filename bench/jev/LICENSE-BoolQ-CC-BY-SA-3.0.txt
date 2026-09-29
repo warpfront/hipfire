@@ -34,6 +34,8 @@ CC BY-SA 3.0, with attribution to BoolQ (Clark et al., 2019) as given above.
 Scope
 -----
 
-This notice covers only the two files (per model) listed above. Everything
-else in this repository remains licensed under Apache-2.0 (see LICENSE and
-NOTICE in the project root).
+This notice covers only the files matching the patterns above. Not every
+model has both: qwen3.5-4b, for instance, has no
+`probs/jevbench_doc-yesno.jsonl.gz` (see `git ls-files bench/jev | grep -i
+yesno`). Everything else in this repository remains licensed under
+Apache-2.0 (see LICENSE and NOTICE in the project root).
