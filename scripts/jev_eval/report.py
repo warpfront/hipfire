@@ -1,58 +1,105 @@
-"""Accuracy + top-probability ECE (10 bins) for hipfire vs Jev's committed answers."""
+"""hipfire decide vs Jev: accuracy, top-probability ECE and log loss, raw vs
+calibrated (spec §13.6). Reads the frozen reported rows (<out>/probs/) and the
+fitted temperatures (<out>/calibration.json; without it every T is 1). No GPU,
+no dataset text.
+
+Some jev-bench tasks and calibration sets are not committed to this repo:
+their source datasets' licence terms do not clearly permit redistributing
+derived per-row data (label + served probabilities, no text). See
+bench/jev/DATA-LICENSES.md. Their rows are simply absent from a fresh
+checkout's <out>/probs/ (calibrate.py freeze still produces them locally,
+gitignored, from the read-only eval worktree), and the tables below skip a
+source with no frozen file, committed or local."""
 import argparse
-import glob
 import json
 import os
 from collections import defaultdict
 from pathlib import Path
 
+import calibrate as cb
+
 ap = argparse.ArgumentParser()
-ap.add_argument("--out", required=True, help="same --out used by run_jevbench/run_calibration")
+ap.add_argument("--out", required=True, help="bench/jev/<model>")
 a = ap.parse_args()
 out = Path(a.out)
 bench = Path(os.environ.get("JEVBENCH_DIR", Path.home() / "repos/jev-evals/jev-bench"))
 cal = Path(os.environ.get("JEVCAL_DIR", Path.home() / "repos/jev-evals/jev-ood-calibration"))
+cfile = out / "calibration.json"
+fit = json.loads(cfile.read_text()) if cfile.exists() else None
+temps = fit["decide_calibration"] if fit else {}
 
 
-def ece(pairs, bins=10):
-    e = 0.0
-    for b in range(bins):
-        lo, hi = b / bins, (b + 1) / bins
-        ins = [(p, c) for p, c in pairs if lo < p <= hi or (b == 0 and p == 0)]
-        if ins:
-            e += len(ins) / len(pairs) * abs(sum(p for p, _ in ins) / len(ins) - sum(c for _, c in ins) / len(ins))
-    return e
+def jev_bench(name):
+    rows = cb.read_jsonl(bench / "predictions" / f"{name}.jsonl")
+    return sum(r["correct"] for r in rows) / len(rows), cb.ece([(r["p_top"], r["correct"]) for r in rows])
 
 
-def bench_stats(path):
-    rows = [json.loads(l) for l in open(path)]
-    return len(rows), sum(r["correct"] for r in rows) / len(rows), ece([(r["p_top"], r["correct"]) for r in rows])
-
-
-def cal_stats(path):
+def jev_cal(name):
     g = defaultdict(list)
-    for r in map(json.loads, open(path)):
+    for r in cb.read_jsonl(cal / "results" / f"jev_{name}.jsonl"):
         if "probs" in r:
             g[r["type"]].append((max(r["probs"]), int(r["pred"] == r["gold"])))
-    return {t: (len(v), sum(c for _, c in v) / len(v), ece(v)) for t, v in g.items()}
+    return {t: (sum(c for _, c in v) / len(v), cb.ece(v)) for t, v in g.items()}
 
 
-L = ["# hipfire decide vs Jev", "", "## jev-bench (500 fixed-seed rows per task)", "",
-     "| task | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |", "|---|---:|---:|---:|---:|---:|"]
-for p in sorted(glob.glob(str(out / "jevbench/predictions/*.jsonl"))):
-    name = Path(p).stem
-    if name.startswith("x-"):
-        continue
-    n, acc, e = bench_stats(p)
-    jn, jacc, je = bench_stats(bench / "predictions" / f"{name}.jsonl")
-    L.append(f"| {name} | {n} | {jacc:.3f} | {acc:.3f} | {je:.3f} | {e:.3f} |")
-L += ["", "## jev-ood-calibration", "", "| set | type | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |",
-      "|---|---|---:|---:|---:|---:|---:|"]
-for p in sorted(glob.glob(str(out / "calibration/hipfire_*.jsonl"))):
-    s = Path(p).stem.removeprefix("hipfire_")
-    mine, jev = cal_stats(p), cal_stats(cal / "results" / f"jev_{s}.jsonl")
-    for t, (n, acc, e) in mine.items():
-        jn, jacc, je = jev.get(t, (0, float("nan"), float("nan")))
-        L.append(f"| {s} | {t} | {n} | {jacc:.3f} | {acc:.3f} | {je:.3f} | {e:.3f} |")
+def f3(x):
+    return f"{x:.3f}"
+
+
+def cells(s):
+    return f"{f3(s['acc'])} | {{je}} | {f3(s['ece_raw'])} | {f3(s['ece_cal'])} | {f3(s['nll_raw'])} | {f3(s['nll_cal'])} |"
+
+
+applied = ", ".join(f"{t} T={temps.get(t, 1.0):g}" for t in cb.TYPES)
+L = ["# hipfire decide vs Jev", "",
+     f"Calibration applied: {applied} "
+     f"({'from calibration.json' if fit else 'no calibration.json, so calibrated = raw'}). "
+     "Calibrated = softmax(log p / T) per question type (spec §13.3); accuracy cannot change.", "",
+     "Not every jev-bench task or calibration set is committed to this repository: a source dataset's own "
+     "licence terms have to clearly permit redistributing derived per-row data (label + served "
+     "probabilities, no text) before its frozen rows are staged into git — see "
+     "`bench/jev/DATA-LICENSES.md` for the per-dataset decision and sources. A row missing below either "
+     "was not evaluated for this model, or is withheld for that reason.", ""]
+if fit:
+    L += [f"## Fit (held-out rows only, build {fit['build']}, spec §13.4)", "",
+          "| type | n | T | 95% interval | held-out NLL raw | held-out NLL cal | shipped |",
+          "|---|---:|---:|---|---:|---:|---|"]
+    for t, v in fit["types"].items():
+        if "error" in v:
+            L.append(f"| {t} | {v['n']} | - | {v['error']} | - | - | no |")
+            continue
+        lo, hi = v["t_ci95"]
+        L.append(f"| {t} | {v['n']} | {v['t']:.3f} | {lo:.3f}-{hi:.3f} | {f3(v['nll_raw'])} | "
+                 f"{f3(v['nll_cal'])} | {'yes' if v['ship'] else 'no'} |")
+    L.append("")
+L += ["## jev-bench (500 fixed-seed rows per task)", "",
+     "| task | n | Jev acc | hipfire acc | Jev ECE | ECE raw | ECE cal | NLL raw | NLL cal |",
+     "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+score = []
+for name, p in sorted(cb.find_rows(out / "probs", "jevbench_").items()):
+    s = cb.summarize(cb.read_jsonl(p), temps)
+    jacc, je = jev_bench(name)
+    L.append(f"| {name} | {s['n']} | {f3(jacc)} | " + cells(s).format(je=f3(je)))
+    if "mae_raw" in s:
+        score.append(f"| {name} | {s['n']} | {f3(s['mae_raw'])} | {f3(s['mae_cal'])} |")
+L += ["", "## jev-ood-calibration", "",
+      "| set | type | n | Jev acc | hipfire acc | Jev ECE | ECE raw | ECE cal | NLL raw | NLL cal |",
+      "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+for name, p in sorted(cb.find_rows(out / "probs", "cal_").items()):
+    by = defaultdict(list)
+    for r in cb.read_jsonl(p):
+        by[r["type"]].append(r)
+    jev = jev_cal(name)
+    for t in cb.TYPES:
+        if t not in by:
+            continue
+        s = cb.summarize(by[t], temps)
+        jacc, je = jev.get(t, (float("nan"), float("nan")))
+        L.append(f"| {name} | {t} | {s['n']} | {f3(jacc)} | " + cells(s).format(je=f3(je)))
+        if "mae_raw" in s:
+            score.append(f"| {name} ({t}) | {s['n']} | {f3(s['mae_raw'])} | {f3(s['mae_cal'])} |")
+if score:
+    L += ["", "## score answers: mean |E[score] - gold|", "",
+          "| rows | n | raw | calibrated |", "|---|---:|---:|---:|"] + score
 (out / "report.md").write_text("\n".join(L) + "\n")
 print((out / "report.md").read_text())

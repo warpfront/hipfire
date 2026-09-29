@@ -182,3 +182,10 @@ dist_test/
 *.hipfb
 /*-hip-amdgcn-amd-amdhsa-*.s
 /*-host-x86_64-unknown-linux-gnu.s
+
+# calibrate.py freeze's plain-text working copies of the frozen reported
+# rows (label + served probabilities, no dataset text). Only the gzipped
+# form of a licence-clear source (bench/jev/DATA-LICENSES.md) is committed,
+# by explicit path; a source with restrictive or unclear redistribution
+# terms stays here, local-only.
+bench/jev/*/probs/*.jsonl

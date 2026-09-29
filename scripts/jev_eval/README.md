@@ -31,7 +31,17 @@ git clone https://github.com/scienthoon/jev-ood-calibration ~/repos/jev-evals/je
    `python3 scripts/jev_eval/run_jevbench.py --model qwen3.5:4b --out bench/jev/qwen3.5-4b/jevbench all x-oos x-language x-options x-order x-repeat x-descriptions`
 4. Calibration sets:
    `python3 scripts/jev_eval/run_calibration.py --model qwen3.5:4b --out bench/jev/qwen3.5-4b/calibration synth openbookqa commonsense_qa hellaswag`
-5. Report: `python3 scripts/jev_eval/report.py --out bench/jev/qwen3.5-4b`
+5. Freeze the reported rows into text-free `{source, type, probs, gold}`
+   files (spec §13.6), checked against the saved predictions:
+   `python3 scripts/jev_eval/calibrate.py freeze --src bench/jev/qwen3.5-4b --out bench/jev/qwen3.5-4b/probs`
+6. Report (raw vs calibrated, from the frozen rows and `calibration.json`
+   if fitted): `python3 scripts/jev_eval/report.py --out bench/jev/qwen3.5-4b`
+
+Not every frozen source is committed: a source dataset's own licence has to
+clearly permit redistributing derived per-row data first — see
+`bench/jev/DATA-LICENSES.md`. `report.py` and `calibrate.py fit` work from
+whatever is present, committed or local, and simply skip a source that is
+neither.
 
 Jev's own latencies include the network and are not comparable. Compare
 decide latency against the same model generating the answer via
