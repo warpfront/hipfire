@@ -8,9 +8,9 @@ Not every jev-bench task or calibration set is committed to this repository: a s
 
 | type | n | T | 95% interval | held-out NLL raw | held-out NLL cal | shipped |
 |---|---:|---:|---|---:|---:|---|
-| choice | 2400 | 1.391 | 1.336-1.437 | 0.715 | 0.647 | yes |
-| score | 300 | 1.231 | 1.062-1.389 | 1.058 | 1.048 | no |
-| noul | 900 | 1.134 | 1.022-1.249 | 0.256 | 0.253 | no |
+| choice | 2400 | 1.391 | 1.336-1.444 | 0.715 | 0.647 | yes |
+| score | 300 | 1.231 | 1.062-1.390 | 1.058 | 1.048 | no |
+| noul | 900 | 1.134 | 1.022-1.273 | 0.256 | 0.253 | no |
 
 ## jev-bench (500 fixed-seed rows per task)
 
