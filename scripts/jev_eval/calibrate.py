@@ -247,10 +247,12 @@ def write_rows(path, rows):
 
 def find_rows(out, prefix):
     """{name: path} for <prefix><name>.jsonl or .jsonl.gz under `out`, matching
-    calibrate.py freeze's own naming. A committed repo may hold only the
-    `.jsonl.gz` for a source (licence-clear ones, §DATA-LICENSES.md); a full
-    local freeze holds the plain `.jsonl` for every source. When both exist,
-    the `.gz` (the committed one) wins."""
+    freeze's naming (prefix "jevbench_" / "cal_") or, with prefix="", a
+    heldout/ directory's <source>.jsonl(.gz) files, which `cmd_fit` reads this
+    way too. A committed repo may hold only the `.jsonl.gz` for a source
+    (licence-clear ones, §DATA-LICENSES.md, gzip -n for reproducibility); a
+    full local freeze or held-out run also holds the plain `.jsonl`. When
+    both exist, the `.gz` (the committed one) wins."""
     found = {}
     for p in sorted(Path(out).glob(f"{prefix}*.jsonl")) + sorted(Path(out).glob(f"{prefix}*.jsonl.gz")):
         name = p.name.removeprefix(prefix).removesuffix(".gz").removesuffix(".jsonl")
@@ -296,7 +298,7 @@ def cmd_fit(a):
     src = Path(a.heldout)
     if src.name != "heldout":
         sys.exit("fit reads only a heldout/ directory: reported rows never feed the fit (spec §13.4)")
-    rows = load_rows(sorted(src.glob("*.jsonl")))
+    rows = load_rows(sorted(find_rows(src, "").values()))
     try:
         refuse_restricted(rows)
     except ValueError as e:

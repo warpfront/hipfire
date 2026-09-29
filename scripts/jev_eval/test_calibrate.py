@@ -1,5 +1,6 @@
 """CPU tests for calibrate.py (spec §13.7).
 Run: python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'"""
+import gzip
 import json
 import math
 import random
@@ -148,6 +149,23 @@ class FitCommand(unittest.TestCase):
             self.assertEqual(list(doc["decide_calibration"]), ["choice"])
             self.assertIn('[models."m".overrides.decide.calibration]',
                           cb.toml_snippet("m", doc["decide_calibration"]))
+
+    def test_fit_reads_gzipped_heldout_rows(self):
+        # Regression: a heldout/ directory holding only the committed
+        # .jsonl.gz form (bench/jev/*/heldout/*.jsonl.gz) must fit exactly as
+        # a plain .jsonl directory would.
+        with tempfile.TemporaryDirectory() as d:
+            h = Path(d) / "heldout"
+            h.mkdir()
+            rows = synthetic_rows(2.0, n=1200)
+            with gzip.open(h / "syn.jsonl.gz", "wt") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+            cb.main(["fit", "--heldout", str(h), "--model-id", "m", "--build", "b",
+                     "--out", str(Path(d) / "c.json")])
+            doc = json.loads((Path(d) / "c.json").read_text())
+            self.assertEqual(doc["types"]["choice"]["sources"], {"syn": 300})
+            self.assertEqual(list(doc["decide_calibration"]), ["choice"])
 
 
 class Licences(unittest.TestCase):

@@ -24,7 +24,9 @@ provenance metadata rather than derived data (the same rule
 bench/jev/DATA-LICENSES.md already applies to probs/SOURCES.json). The
 per-model answer rows `run` writes under bench/jev/<model>/heldout/ are
 derived data (probs + gold) and follow probs/'s committed-iff-licence-clear
-rule; see the .gitignore entry next to this file's probs/ counterpart.
+rule; see the .gitignore entry next to this file's probs/ counterpart. A
+committed source's rows are gzip-compressed (gzip -n, for a reproducible
+archive), `<source>.jsonl.gz`; `read_jsonl` accepts either suffix.
 
 `run` asks only licence-clear sources by default (licences.py, the single
 choke point); build/verify still cover all 17 so the disjointness proof and
@@ -35,6 +37,7 @@ calsets-built ones ["yes", "no"]. Both put the true answer at index 0, and
 the answer rows never store keys: probs is [noul, 1 - noul] and gold is 0 for
 a true statement either way (see test_heldout.NoulKeys)."""
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -82,7 +85,12 @@ def sha256_file(path):
 
 
 def read_jsonl(path):
-    with open(path) as f:
+    """Transparently accepts a `.jsonl.gz` in place of a `.jsonl` (the form
+    committed per-model heldout/ rows take, §DATA-LICENSES.md); work-dir
+    examples are always plain."""
+    path = Path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
@@ -276,7 +284,13 @@ def cmd_run(a):
     for name in run_sources(manifest, a.sources, a.allow_restricted):
         rows = read_jsonl(WORK / "examples" / f"{name}.jsonl")
         path = out / f"{name}.jsonl"
-        done = len(read_jsonl(path)) if path.exists() else 0  # resumable
+        gz = out / f"{name}.jsonl.gz"
+        # resumable: a committed source may already be complete as .jsonl.gz.
+        existing = gz if gz.exists() else path
+        done = len(read_jsonl(existing)) if existing.exists() else 0
+        if done >= len(rows):
+            print(f"{name}: {len(rows)} rows -> {existing} (already complete)", flush=True)
+            continue
         with open(path, "a") as f:
             for i in range(done, len(rows)):
                 r = rows[i]

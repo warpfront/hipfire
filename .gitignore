@@ -191,8 +191,9 @@ dist_test/
 bench/jev/*/probs/*.jsonl
 
 # heldout.py run's per-model answer rows (probs + gold, no dataset text).
-# Same rule as probs/ above: a licence-clear source's file is committed by
-# explicit path; ag-news, duplicates, yelp-stars, offensive, sentiment-it
-# and hellaswag (bench/jev/DATA-LICENSES.md) stay here, local-only, never
+# Same rule as probs/ above: a licence-clear source's file is committed
+# gzip-compressed (gzip -n), by explicit path; ag-news, duplicates,
+# yelp-stars, offensive, sentiment-it and hellaswag
+# (bench/jev/DATA-LICENSES.md) stay here as plain .jsonl, local-only, never
 # staged even incidentally by a wildcard add.
 bench/jev/*/heldout/*.jsonl
