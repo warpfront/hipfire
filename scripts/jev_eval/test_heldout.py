@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import calsets
 import heldout as h
+import licences
 
 
 class StateHash(unittest.TestCase):
@@ -95,6 +97,48 @@ class AnswerRow(unittest.TestCase):
                          {"type": "choice", "probabilities": {"a": 0.4, "b": 0.6}, "confidence": 0.2})
         self.assertEqual(c["probs"], [0.6, 0.4])
         self.assertNotIn("state", c)
+
+
+class Licences(unittest.TestCase):
+    MANIFEST = {"banking77": {}, "ag-news": {}, "sms-spam": {}, "duplicates": {}, "yelp-stars": {},
+                "sentiment-it": {}, "offensive": {}, "synth-score": {}, "openbookqa": {}}
+
+    def test_default_run_is_licence_clear_only(self):
+        self.assertEqual(h.run_sources(self.MANIFEST, []),
+                         ["banking77", "sms-spam", "synth-score", "openbookqa"])
+
+    def test_real_manifest_default_excludes_every_restricted_source(self):
+        manifest = json.loads((h.OUT / "manifest.json").read_text())
+        got = h.run_sources(manifest, [])
+        self.assertFalse(set(got) & licences.RESTRICTED_SOURCES)
+        self.assertEqual(set(got) | (licences.RESTRICTED_SOURCES & set(manifest)), set(manifest))
+        self.assertEqual([n for n in got if manifest[n]["type"] == "score"], ["synth-score"])
+
+    def test_a_named_restricted_source_needs_the_opt_in(self):
+        with self.assertRaises(SystemExit):
+            h.run_sources(self.MANIFEST, ["banking77", "ag-news"])
+        self.assertEqual(h.run_sources(self.MANIFEST, ["ag-news", "banking77"], allow_restricted=True),
+                         ["banking77", "ag-news"])
+        self.assertEqual(h.run_sources(self.MANIFEST, ["sms-spam"]), ["sms-spam"])
+        with self.assertRaises(SystemExit):
+            h.run_sources(self.MANIFEST, ["nope"])
+
+    def test_the_restricted_set_is_the_documented_one(self):
+        self.assertEqual(licences.RESTRICTED_SOURCES, {"ag-news", "duplicates", "yelp-stars", "offensive",
+                                                       "sentiment-it", "hellaswag"})
+
+
+class NoulKeys(unittest.TestCase):
+    """jev-bench noul examples use keys ["true", "false"], calsets-built ones
+    ["yes", "no"]; neither reaches a row, and both put true at index 0."""
+
+    def test_both_vocabularies_give_the_same_row(self):
+        _, keys, target = calsets.to_question({"type": "noul", "question": "q", "label": True})
+        self.assertEqual((keys, target.index(1.0)), (["yes", "no"], 0))
+        bench_keys = h.keys_for({"type": "noul"})
+        self.assertEqual(bench_keys.index("true"), 0)
+        ans = {"type": "noul", "noul": 0.8}
+        self.assertEqual(h.answer_row("s", "noul", keys, 0, ans), h.answer_row("s", "noul", bench_keys, 0, ans))
 
 
 if __name__ == "__main__":

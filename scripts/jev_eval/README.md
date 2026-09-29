@@ -43,6 +43,13 @@ clearly permit redistributing derived per-row data first — see
 whatever is present, committed or local, and simply skip a source that is
 neither.
 
+Calibration temperatures are fitted on licence-clear held-out sources only
+(human decision). `licences.py` holds the one restricted-source list
+(ag-news, duplicates, yelp-stars, offensive, sentiment-it, hellaswag):
+`heldout.py run` skips those by default (naming one needs
+`--allow-restricted`), and `calibrate.py fit` refuses any row from them.
+Score-type T therefore comes from synth-score alone.
+
 Jev's own latencies include the network and are not comparable. Compare
 decide latency against the same model generating the answer via
 `/v1/chat/completions` (see "Latency" in the PR description).

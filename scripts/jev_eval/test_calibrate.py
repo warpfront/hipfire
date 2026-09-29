@@ -150,5 +150,27 @@ class FitCommand(unittest.TestCase):
                           cb.toml_snippet("m", doc["decide_calibration"]))
 
 
+class Licences(unittest.TestCase):
+    def test_pool_refuses_a_restricted_row(self):
+        for src in ("yelp-stars", "hellaswag", "duplicates"):
+            rows = synthetic_rows(1.0, n=20, source="synth-score") + synthetic_rows(1.0, n=5, source=src)
+            with self.assertRaises(ValueError):
+                cb.pool(rows, "choice")
+            with self.assertRaises(ValueError):  # even when asked for another type
+                cb.pool(rows, "noul")
+
+    def test_fit_refuses_a_heldout_dir_with_restricted_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = Path(d) / "heldout"
+            h.mkdir()
+            cb.write_rows(h / "syn.jsonl", synthetic_rows(2.0, n=600, source="syn"))
+            cb.write_rows(h / "ag-news.jsonl", synthetic_rows(2.0, n=10, source="ag-news"))
+            with self.assertRaises(SystemExit) as e:
+                cb.main(["fit", "--heldout", str(h), "--model-id", "m", "--build", "b",
+                         "--out", str(Path(d) / "c.json")])
+            self.assertIn("ag-news", str(e.exception.code))
+            self.assertFalse((Path(d) / "c.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

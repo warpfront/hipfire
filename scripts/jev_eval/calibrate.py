@@ -28,6 +28,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import licences
+
 TYPES = ("choice", "score", "noul")
 T_MIN, T_MAX = 0.05, 20.0
 PER_SOURCE_CAP = 300
@@ -150,8 +152,17 @@ def bootstrap_ci(data, n=BOOTSTRAP, seed=0):
     return ts[int(0.025 * n)], ts[int(0.975 * n) - 1]
 
 
+def refuse_restricted(rows):
+    """A fit never sees a restricted source's row (licences.py, human decision)."""
+    bad = licences.restricted_in(r["source"] for r in rows)
+    if bad:
+        raise ValueError(f"restricted sources {bad} (bench/jev/DATA-LICENSES.md) never feed a fit")
+
+
 def pool(rows, qtype):
-    """Rows of one type, at most PER_SOURCE_CAP per source (first ones)."""
+    """Rows of one type, at most PER_SOURCE_CAP per source (first ones).
+    Raises on any restricted-source row."""
+    refuse_restricted(rows)
     by = defaultdict(list)
     for r in rows:
         if r["type"] == qtype:
@@ -286,6 +297,10 @@ def cmd_fit(a):
     if src.name != "heldout":
         sys.exit("fit reads only a heldout/ directory: reported rows never feed the fit (spec §13.4)")
     rows = load_rows(sorted(src.glob("*.jsonl")))
+    try:
+        refuse_restricted(rows)
+    except ValueError as e:
+        sys.exit(str(e))
     types = fit_types(rows)
     ship = {t: v["t"] for t, v in types.items() if v["ship"]}
     doc = {"model_id": a.model_id, "build": a.build, "types": types, "decide_calibration": ship}

@@ -24,7 +24,16 @@ provenance metadata rather than derived data (the same rule
 bench/jev/DATA-LICENSES.md already applies to probs/SOURCES.json). The
 per-model answer rows `run` writes under bench/jev/<model>/heldout/ are
 derived data (probs + gold) and follow probs/'s committed-iff-licence-clear
-rule; see the .gitignore entry next to this file's probs/ counterpart."""
+rule; see the .gitignore entry next to this file's probs/ counterpart.
+
+`run` asks only licence-clear sources by default (licences.py, the single
+choke point); build/verify still cover all 17 so the disjointness proof and
+the committed manifest are unchanged.
+
+noul keys: jev-bench noul rows carry keys ["true", "false"] (keys_for) and
+calsets-built ones ["yes", "no"]. Both put the true answer at index 0, and
+the answer rows never store keys: probs is [noul, 1 - noul] and gold is 0 for
+a true statement either way (see test_heldout.NoulKeys)."""
 import argparse
 import hashlib
 import json
@@ -37,6 +46,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 import calsets  # noqa: E402  (scripts/jev_eval is sys.path[0])
+import licences  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 BENCH = Path(os.environ.get("JEVBENCH_DIR", Path.home() / "repos/jev-evals/jev-bench"))
@@ -240,6 +250,20 @@ def answer_row(name, qtype, keys, gold, ans):
     return {"source": name, "type": qtype, "probs": [float(f"{p:.12g}") for p in probs], "gold": gold}
 
 
+def run_sources(manifest, named, allow_restricted=False):
+    """Sources `run` asks, in manifest order. The default is the licence-clear
+    ones only (licences.py); a restricted source must be named and opted into."""
+    unknown = sorted(set(named or ()) - set(manifest))
+    if unknown:
+        sys.exit(f"not in the manifest: {unknown}")
+    if not named:
+        return [n for n in manifest if not licences.is_restricted(n)]
+    bad = licences.restricted_in(named)
+    if bad and not allow_restricted:
+        sys.exit(f"restricted sources {bad} (bench/jev/DATA-LICENSES.md) need --allow-restricted")
+    return [n for n in manifest if n in set(named)]
+
+
 def cmd_run(a):
     manifest = json.loads((OUT / "manifest.json").read_text())
     out = Path(a.out)
@@ -249,7 +273,7 @@ def cmd_run(a):
     verify_dirs(OUT, WORK)
     wait_health(a.port)
     url = f"http://127.0.0.1:{a.port}/v1/systemone"
-    for name in a.sources or list(manifest):
+    for name in run_sources(manifest, a.sources, a.allow_restricted):
         rows = read_jsonl(WORK / "examples" / f"{name}.jsonl")
         path = out / f"{name}.jsonl"
         done = len(read_jsonl(path)) if path.exists() else 0  # resumable
@@ -277,7 +301,9 @@ def main(argv=None):
     r.add_argument("--port", type=int, default=11435)
     r.add_argument("--model", required=True, help="model as the reported runs named it (the file path)")
     r.add_argument("--out", required=True, help="bench/jev/<model>/heldout")
-    r.add_argument("sources", nargs="*", help="default: every source in the manifest")
+    r.add_argument("--allow-restricted", action="store_true",
+                   help="permit a named restricted source (licences.py); never the default")
+    r.add_argument("sources", nargs="*", help="default: every licence-clear source in the manifest")
     a = ap.parse_args(argv)
     {"build": cmd_build, "verify": cmd_verify, "run": cmd_run}[a.cmd](a)
 
