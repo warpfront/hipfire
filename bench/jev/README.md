@@ -10,7 +10,7 @@ own committed files. Harness and instructions: `scripts/jev_eval/README.md`.
 | Directory | Model | Coverage |
 |---|---|---|
 | `qwen3.5-4b/` | `qwen3.5-4b.mq4` | Short run: jev-bench banking77 (n=500) plus the 900 synthetic tickets |
-| `qwen3.8-27b-mq4-xts/` | `qwen3.8-27b.mq4-xts` | Full run: all 12 jev-bench tasks at n=500, the 6 experiments, and all four jev-ood-calibration sets |
+| `qwen3.8-27b-mq4-xts/` | `qwen3.8-27b.mq4-xts` | Full run: all 12 jev-bench tasks, 6 experiments and 4 calibration sets were run; published here: 7 tasks and 3 sets (the rest withheld — see Licences; experiments not frozen) |
 
 ### Build
 
@@ -79,6 +79,23 @@ answers, the medians are close.
   no overlap). The "ECE cal" / "NLL cal" columns apply them to the saved
   reported answers (`probs/`); nothing was re-run. The raw columns are the
   served probabilities.
+  - Temperatures are fitted on licence-clear held-out sources only
+    (`scripts/jev_eval/licences.py`; see Licences above and
+    `scripts/jev_eval/README.md`). Every restricted `score` source
+    (yelp-stars, sentiment-it) is withheld from the fit, so `score` T comes
+    from synth-score alone — one source, not a pool across several.
+  - The bootstrap resamples *rows*, not sources (`calibrate.py
+    bootstrap_ci`). A pooled type's 300-or-900 rows come from up to three
+    sources, and a resample can still draw disproportionately from one of
+    them; the reported 95% interval for T is therefore narrower than the
+    true cross-domain uncertainty, which row-level resampling cannot
+    capture.
+  - No bar (spec §13.6 "No bar"): a shipped T can make a set's ECE worse
+    than raw, and that is reported as found rather than refitted. As
+    measured here: qwen3.8-27b.mq4-xts's clinc150 ECE goes 0.044 (raw) →
+    0.074 (calibrated) and its openbookqa ECE 0.015 → 0.046; qwen3.5-4b.mq4's
+    synth-score ECE goes 0.091 → 0.125. All three still ship under §13.4's
+    rule, which is scored on NLL, not ECE.
 
 ## Applying calibration
 

@@ -539,15 +539,18 @@ type.
 
 `1.0` is the raw readout. T > 1 makes answers less confident and T < 1 more
 confident; the chosen option never changes. Set them per model, from a fit
-(`scripts/jev_eval/calibrate.py fit`):
+(`scripts/jev_eval/calibrate.py fit`). This is the actual shipped fit for
+`qwen3.5-4b.mq4` (`bench/jev/qwen3.5-4b/calibration.json`; all three question
+types cleared the ship rule, spec §13.4):
 
 ```toml
 [models."qwen3.5-4b.mq4".overrides.decide.calibration]
-choice = 1.3
-noul = 0.7
+choice = 1.653
+score = 1.48
+noul = 1.363
 ```
 
-or `hipfire config qwen3.5-4b.mq4 set decide.calibration.choice 1.3`. Serve
+or `hipfire config qwen3.5-4b.mq4 set decide.calibration.choice 1.653`. Serve
 resolves them on every decide, so a change applies without a reload. They
 are not in the Jev response body; a non-identity calibration shows in the
 `x-hipfire-timing` header. A hipfire binary built before these keys existed
