@@ -79,6 +79,39 @@ class Fit(unittest.TestCase):
         self.assertEqual(cb.pool(rows, "noul"), {})
 
 
+class ShipDecision(unittest.TestCase):
+    """Spec §13.4 ship rule: NLL gain >= 1% relative AND the 95% CI for T
+    excludes 1 — either alone is not enough."""
+
+    def test_ci_excludes_one_but_gain_under_one_percent_is_not_shipped(self):
+        # A large, low-variance pool can pin T away from 1 (tight CI) while
+        # the fit still buys under 1% NLL.
+        self.assertFalse(cb.ship_decision(nll_raw=1.000, nll_cal=0.998, lo=1.01, hi=1.02))
+
+    def test_gain_and_ci_both_clear_the_bar_ships(self):
+        self.assertTrue(cb.ship_decision(nll_raw=1.000, nll_cal=0.980, lo=1.05, hi=1.10))
+
+    def test_big_gain_but_ci_includes_one_is_not_shipped(self):
+        self.assertFalse(cb.ship_decision(nll_raw=1.000, nll_cal=0.900, lo=0.95, hi=1.05))
+
+
+class BootstrapCi(unittest.TestCase):
+    def test_nearest_rank_indices_for_n_100(self):
+        # Regression: the upper bound must be the 97.5th-percentile
+        # nearest-rank index (ts[97] of 100 sorted values), not ts[96].
+        self.assertEqual(cb._nearest_rank(100, 0.025), 2)
+        self.assertEqual(cb._nearest_rank(100, 0.975), 97)
+
+    def test_bootstrap_ci_upper_bound_is_ts_97_of_100(self):
+        rows = synthetic_rows(1.6, n=1500, seed=5)
+        data = cb._prep(rows)
+        rng = random.Random(0)
+        rng_ts = sorted(cb._fit(rng.choices(data, k=len(data)), strict=False) for _ in range(cb.BOOTSTRAP))
+        lo, hi = cb.bootstrap_ci(data, n=cb.BOOTSTRAP, seed=0)
+        self.assertEqual((lo, hi), (rng_ts[2], rng_ts[97]))
+        self.assertNotEqual(hi, rng_ts[96], "upper bound regressed to the old off-by-one index")
+
+
 class Metrics(unittest.TestCase):
     def test_ece_matches_jevbench_binning(self):
         pairs = [(0.95, 1), (0.95, 0), (0.55, 1), (0.0, 0)]

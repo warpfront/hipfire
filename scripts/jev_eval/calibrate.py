@@ -153,11 +153,18 @@ def fit_temperature(rows):
     return _fit(_prep(rows))
 
 
+def _nearest_rank(n, p):
+    """0-based index of the nearest-rank p-th percentile of n sorted values
+    (rank = ceil(p * n), 1-based); e.g. n=100 gives index 2 for p=0.025 and
+    index 97 for p=0.975."""
+    return min(n, max(1, math.ceil(p * n))) - 1
+
+
 def bootstrap_ci(data, n=BOOTSTRAP, seed=0):
     """95% interval of T over n resamples (a resample at a bound counts at the bound)."""
     rng = random.Random(seed)
     ts = sorted(_fit(rng.choices(data, k=len(data)), strict=False) for _ in range(n))
-    return ts[int(0.025 * n)], ts[int(0.975 * n) - 1]
+    return ts[_nearest_rank(n, 0.025)], ts[_nearest_rank(n, 0.975)]
 
 
 def refuse_restricted(rows):
@@ -178,6 +185,16 @@ def pool(rows, qtype):
     return {s: rs[:PER_SOURCE_CAP] for s, rs in sorted(by.items())}
 
 
+def ship_decision(nll_raw, nll_cal, lo, hi):
+    """Spec §13.4 ship rule: BOTH must hold, on held-out rows only —
+    the NLL drops by >= 1% relative, and the bootstrap 95% interval for T
+    excludes 1. A tight CI that excludes 1 is not enough on its own (a huge,
+    low-variance pool can narrow the CI around a T that barely moves NLL);
+    nor is a big NLL gain on its own (a CI still straddling 1 means the
+    sample can't tell T = 1 apart from the fit)."""
+    return (nll_raw - nll_cal) / nll_raw >= MIN_NLL_GAIN and not lo <= 1.0 <= hi
+
+
 def fit_types(rows):
     """Per type: T, its 95% interval, held-out NLL raw / calibrated, ship rule (spec §13.4)."""
     out = {}
@@ -195,7 +212,7 @@ def fit_types(rows):
         lo, hi = bootstrap_ci(data)
         raw, cal = _nll(data, 1.0), _nll(data, t)
         out[qtype] = {**entry, "t": t, "t_ci95": [round(lo, 3), round(hi, 3)], "nll_raw": raw,
-                      "nll_cal": cal, "ship": (raw - cal) / raw >= MIN_NLL_GAIN and not lo <= 1.0 <= hi}
+                      "nll_cal": cal, "ship": ship_decision(raw, cal, lo, hi)}
     return out
 
 
