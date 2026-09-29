@@ -24,7 +24,10 @@ Gates:
   1c  restore order-invariance (default mode): each question's answer is
       bit-identical (Δ == 0) whether it runs first (no restore) or after
       restores, at a fixed split point.
-  2   question isolation, baseline-relative: PASS iff
+  2   question isolation, baseline-relative, exact mode (a sibling question
+      shifts the default-mode split point, and split-point drift alone can
+      move answers by up to the noise floor -- see 1b -- which would swamp
+      the 0.05 threshold): PASS iff
       |P(code | code in sibling) - P(code | no code)| <= 0.05 and
       P(code | code in state) - P(code | no code) >= 0.3. If only the
       sensitivity half fails, the model cannot do the probe: INCONCLUSIVE.
@@ -298,7 +301,8 @@ def gate_isolation(d):
                                      {"probe": q}), "in-state")["probe"]["noul"]
     leak_ok = abs(sib - none) <= 0.05
     sens_ok = in_state - none >= 0.3
-    detail = (f"P(code): no code anywhere = {none:.3f}, code in sibling question = {sib:.3f} "
+    detail = (f"exact env {EXACT_ENV}: P(code): no code anywhere = {none:.3f}, "
+              f"code in sibling question = {sib:.3f} "
               f"(|Δ|={abs(sib - none):.3f} <=0.05: {leak_ok}), code in state = {in_state:.3f} "
               f"(Δ={in_state - none:.3f} >=0.3: {sens_ok})")
     if not leak_ok:
@@ -1030,7 +1034,8 @@ def main():
 
         def exact_body(d):
             cc = chat_cache(d)
-            r = [run("1a exact-mode bit-exactness", gate_exact_mode, d)]
+            r = [run("1a exact-mode bit-exactness", gate_exact_mode, d),
+                 run("2 question isolation", gate_isolation, d)]
             r += run_session_gates(d, [
                 ("S1b session reuse with delta (exact)", gate_session_reuse, d, True, cc),
                 ("S2 session exactness (exact)", gate_session_exact, d, cc, *fl_short),
@@ -1050,7 +1055,6 @@ def main():
             if floor is not None:
                 r.append(run("1b default-mode noise floor", gate_noise_floor, d, floor))
             r += [run("1c restore order-invariance", gate_restore_order, d),
-                  run("2 question isolation", gate_isolation, d),
                   run("3 model left clean", gate_clean, d),
                   run("4 no leak", gate_leak, d, a.leak_n),
                   run("5 error replies", gate_errors, d, a.max_seq, cask)]

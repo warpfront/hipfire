@@ -398,7 +398,10 @@ in two modes.
      bit-identical answers (Δ = 0), at a fixed split point.
    - The decide must not return the 400 "cannot disable thinking" error.
 2. **Isolation.** The "secret code" probe, judged relative to a baseline
-   with no code anywhere:
+   with no code anywhere. This runs in exact mode (`EXACT_ENV`, §10.1a),
+   because in default mode a sibling question shifts the shared-prefix
+   split point, and split-point drift alone can move answers by up to the
+   noise floor (§10.1b), which would swamp the 0.05 threshold:
    - the gate passes iff |P(code | code in a sibling question) − P(code | no
      code)| ≤ 0.05 and P(code | code in the state) − P(code | no code)
      ≥ 0.3;
