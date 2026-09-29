@@ -13,7 +13,10 @@ import argparse
 import os
 import shutil
 import sys
+import urllib.request
 from pathlib import Path
+
+from raw_guard import check_raw
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=11435)
@@ -55,6 +58,23 @@ jb.ROOT = out
 jb.API_URL = f"http://127.0.0.1:{a.port}/v1/systemone"
 jb.MODEL = a.model
 jb.WORKERS = a.workers
+
+# jevbench.call() makes the HTTP request itself (urllib.request.urlopen), so
+# there is no per-call hook to pass raw_guard's check into. Wrap urlopen
+# instead: jevbench does `import urllib.request` and calls
+# `urllib.request.urlopen(...)`, looking the name up on the module at call
+# time, so patching the module attribute here is picked up by its calls too.
+# Every reported row this writes must be a raw answer (spec §13.2, §13.6).
+_real_urlopen = urllib.request.urlopen
+
+
+def _guarded_urlopen(*args, **kwargs):
+    resp = _real_urlopen(*args, **kwargs)
+    check_raw(resp.headers.get)
+    return resp
+
+
+urllib.request.urlopen = _guarded_urlopen
 
 # Validate task/experiment names
 for w in a.what:

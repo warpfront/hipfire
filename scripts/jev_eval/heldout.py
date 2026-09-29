@@ -54,6 +54,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 import calsets  # noqa: E402  (scripts/jev_eval is sys.path[0])
 import licences  # noqa: E402
+from raw_guard import check_raw  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 BENCH = Path(os.environ.get("JEVBENCH_DIR", Path.home() / "repos/jev-evals/jev-bench"))
@@ -276,6 +277,25 @@ def run_sources(manifest, named, allow_restricted=False):
     return [n for n in manifest if n in set(named)]
 
 
+def resume_point(path, gz, total):
+    """Where a resumed `run` should start writing rows for one source, out of
+    `total` expected. A complete `.jsonl.gz` (a committed, licence-clear
+    source) needs no more work. An *incomplete* one is refused rather than
+    silently resumed into the plain `.jsonl`: the two files would then hold
+    disjoint row ranges under different names, and appending to `path` would
+    not include the rows already sitting in `gz`. Resolve it by hand
+    (decompress `gz` to `path` to resume from its row count, or delete it to
+    restart the source) before running again."""
+    if gz.exists():
+        done = len(read_jsonl(gz))
+        if done >= total:
+            return done
+        sys.exit(f"{gz} is incomplete ({done}/{total} rows). This does not merge a partial "
+                 f".jsonl.gz into {path}: decompress {gz} to {path} to resume from row {done}, "
+                 f"or remove {gz} to restart this source from scratch.")
+    return len(read_jsonl(path)) if path.exists() else 0
+
+
 def cmd_run(a):
     manifest = json.loads((OUT / "manifest.json").read_text())
     out = Path(a.out)
@@ -289,11 +309,9 @@ def cmd_run(a):
         rows = read_jsonl(WORK / "examples" / f"{name}.jsonl")
         path = out / f"{name}.jsonl"
         gz = out / f"{name}.jsonl.gz"
-        # resumable: a committed source may already be complete as .jsonl.gz.
-        existing = gz if gz.exists() else path
-        done = len(read_jsonl(existing)) if existing.exists() else 0
+        done = resume_point(path, gz, len(rows))
         if done >= len(rows):
-            print(f"{name}: {len(rows)} rows -> {existing} (already complete)", flush=True)
+            print(f"{name}: {len(rows)} rows -> {gz if gz.exists() else path} (already complete)", flush=True)
             continue
         with open(path, "a") as f:
             for i in range(done, len(rows)):
@@ -301,6 +319,7 @@ def cmd_run(a):
                 body = json.dumps({"model": a.model, "state": r["state"], "questions": {"q": r["question"]}})
                 req = urllib.request.Request(url, data=body.encode(), headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=900) as resp:
+                    check_raw(resp.headers.get)
                     ans = json.load(resp)["answers"]["q"]
                 f.write(json.dumps(answer_row(name, manifest[name]["type"], r["keys"], r["gold"], ans)) + "\n")
                 f.flush()

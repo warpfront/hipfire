@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 
 from calsets import load_synth, public_records, to_question
+from raw_guard import check_raw
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=11435)
@@ -31,6 +32,7 @@ def ask(r):
     body = json.dumps({"model": a.model, "state": r["state"], "questions": {"q": q}}).encode()
     req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as resp:
+        check_raw(resp.headers.get)
         v = json.load(resp)
     ans = v["answers"]["q"]
     probs = [ans["noul"], 1 - ans["noul"]] if r["type"] == "noul" else [ans["probabilities"][k] for k in keys]

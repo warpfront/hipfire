@@ -4,6 +4,7 @@
 
 """CPU tests for heldout.py (spec §13.5, §13.7). No network.
 Run: python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'"""
+import gzip
 import json
 import tempfile
 import unittest
@@ -130,6 +131,39 @@ class Licences(unittest.TestCase):
     def test_the_restricted_set_is_the_documented_one(self):
         self.assertEqual(licences.RESTRICTED_SOURCES, {"ag-news", "duplicates", "yelp-stars", "offensive",
                                                        "sentiment-it", "hellaswag"})
+
+
+class ResumePoint(unittest.TestCase):
+    def test_complete_gz_needs_no_resume(self):
+        with tempfile.TemporaryDirectory() as d:
+            gz = Path(d) / "s.jsonl.gz"
+            with gzip.open(gz, "wt") as f:
+                f.write(json.dumps({"a": 1}) + "\n")
+            self.assertEqual(h.resume_point(Path(d) / "s.jsonl", gz, 1), 1)
+
+    def test_incomplete_gz_refuses_to_resume(self):
+        # Regression: an incomplete committed .jsonl.gz must not be silently
+        # resumed into the plain .jsonl (it would start the plain file from
+        # the gz's row count, dropping those rows from either file).
+        with tempfile.TemporaryDirectory() as d:
+            gz = Path(d) / "s.jsonl.gz"
+            with gzip.open(gz, "wt") as f:
+                f.write(json.dumps({"a": 1}) + "\n")
+            path = Path(d) / "s.jsonl"
+            with self.assertRaises(SystemExit) as e:
+                h.resume_point(path, gz, 5)
+            self.assertIn("incomplete", str(e.exception))
+            self.assertFalse(path.exists())
+
+    def test_resumes_from_plain_jsonl_when_no_gz_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.jsonl"
+            path.write_text(json.dumps({"a": 1}) + "\n")
+            self.assertEqual(h.resume_point(path, Path(d) / "s.jsonl.gz", 5), 1)
+
+    def test_no_files_starts_from_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(h.resume_point(Path(d) / "s.jsonl", Path(d) / "s.jsonl.gz", 5), 0)
 
 
 class NoulKeys(unittest.TestCase):
