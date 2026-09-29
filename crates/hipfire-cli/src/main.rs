@@ -11032,6 +11032,57 @@ mod tests {
         );
     }
 
+    /// A `jev-latest`-style request (no local match, spec §12.5's "use
+    /// whatever is loaded" fallback) resolves `runtime.current_path` — the
+    /// path `find_model_path` returned for the originally named request —
+    /// back to the per-model catalog record for a PATH-ONLY model (no
+    /// registry tag). The override is written through the real `hipfire
+    /// config <model> set` code path (`config_command`), not hand-rolled
+    /// TOML, so the catalog's `path` field and table key are exactly what
+    /// production writes. The harness label deliberately avoids "jev" and
+    /// "latest": `find_model_path`'s separator-stripped fuzzy match would
+    /// otherwise resolve the literal string "jev-latest" straight to a
+    /// same-labelled fixture file and never exercise the fallback branch
+    /// at all (caught empirically while writing this test).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_calibration_for_jev_latest_on_a_path_only_model() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-fallback");
+        config_command(
+            &harness.paths,
+            ConfigArgs {
+                model: Some(harness.model().to_string()),
+                action: Some(ConfigAction::Set {
+                    key: "decide.calibration.noul".to_string(),
+                    value: "0.8".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+
+        // A named request first, so the model actually loads and
+        // `runtime.current_path` is populated.
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &named);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "named request must resolve the override: {d}"
+        );
+
+        // `jev-latest` is not itself a local model: is_local_model is
+        // false, so run_decide falls back to runtime.current_path.
+        let latest = serde_json::json!({"model": "jev-latest", "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &latest);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "jev-latest fallback must resolve the same per-model override: {d}"
+        );
+    }
+
     /// The response `model` is the served model name chat and `/health`
     /// report (`meta.current_model`, the tag when a tag was requested), not
     /// the resolved filesystem path.
