@@ -5,9 +5,9 @@
 
 | task | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |
 |---|---:|---:|---:|---:|---:|
-| ag-news | 500 | 0.910 | 0.882 | 0.057 | 0.063 |
 | banking77 | 500 | 0.782 | 0.546 | 0.099 | 0.188 |
-| yelp-stars | 500 | 0.704 | 0.558 | 0.147 | 0.164 |
+
+Rows for datasets whose licences restrict redistributing derived results are withheld; see ../DATA-LICENSES.md.
 
 ## jev-ood-calibration
 

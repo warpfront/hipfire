@@ -5,26 +5,24 @@
 
 | task | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |
 |---|---:|---:|---:|---:|---:|
-| ag-news | 500 | 0.910 | 0.894 | 0.057 | 0.071 |
 | banking77 | 500 | 0.782 | 0.718 | 0.099 | 0.138 |
 | clinc150 | 500 | 0.914 | 0.888 | 0.028 | 0.044 |
 | doc-yesno | 500 | 0.930 | 0.886 | 0.026 | 0.028 |
-| duplicates | 500 | 0.834 | 0.816 | 0.051 | 0.077 |
 | ledgar | 500 | 0.740 | 0.752 | 0.138 | 0.121 |
 | massive-en | 500 | 0.844 | 0.838 | 0.061 | 0.069 |
 | massive-it | 500 | 0.836 | 0.810 | 0.057 | 0.089 |
-| offensive | 500 | 0.766 | 0.806 | 0.072 | 0.090 |
-| sentiment-it | 500 | 0.824 | 0.794 | 0.054 | 0.066 |
 | sms-spam | 500 | 0.986 | 0.972 | 0.058 | 0.014 |
-| yelp-stars | 500 | 0.704 | 0.708 | 0.147 | 0.106 |
+
+Rows for datasets whose licences restrict redistributing derived results are withheld; see ../DATA-LICENSES.md.
 
 ## jev-ood-calibration
 
 | set | type | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |
 |---|---|---:|---:|---:|---:|---:|
 | commonsense_qa | choice | 1221 | 0.881 | 0.849 | 0.030 | 0.049 |
-| hellaswag | choice | 2000 | 0.861 | 0.843 | 0.029 | 0.015 |
 | openbookqa | choice | 500 | 0.942 | 0.908 | 0.028 | 0.015 |
 | synth | choice | 300 | 0.890 | 0.953 | 0.084 | 0.046 |
 | synth | score | 300 | 0.447 | 0.547 | 0.306 | 0.134 |
 | synth | noul | 300 | 0.917 | 0.917 | 0.072 | 0.037 |
+
+Rows for datasets whose licences restrict redistributing derived results are withheld; see ../DATA-LICENSES.md.

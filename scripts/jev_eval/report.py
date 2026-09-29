@@ -13,6 +13,12 @@ out = Path(a.out)
 bench = Path(os.environ.get("JEVBENCH_DIR", Path.home() / "repos/jev-evals/jev-bench"))
 cal = Path(os.environ.get("JEVCAL_DIR", Path.home() / "repos/jev-evals/jev-ood-calibration"))
 
+# Human decision: these sources' licences restrict redistribution of derived
+# statistics, or are currently unclear (bench/jev/DATA-LICENSES.md). Excluded
+# from the generated report so a regeneration can't silently re-add them.
+WITHHELD = {"ag-news", "duplicates", "yelp-stars", "offensive", "sentiment-it", "hellaswag"}
+WITHHELD_NOTE = "Rows for datasets whose licences restrict redistributing derived results are withheld; see ../DATA-LICENSES.md."
+
 
 def ece(pairs, bins=10):
     e = 0.0
@@ -39,20 +45,32 @@ def cal_stats(path):
 
 L = ["# hipfire decide vs Jev", "", "## jev-bench (500 fixed-seed rows per task)", "",
      "| task | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |", "|---|---:|---:|---:|---:|---:|"]
+bench_withheld = False
 for p in sorted(glob.glob(str(out / "jevbench/predictions/*.jsonl"))):
     name = Path(p).stem
     if name.startswith("x-"):
         continue
+    if name in WITHHELD:
+        bench_withheld = True
+        continue
     n, acc, e = bench_stats(p)
     jn, jacc, je = bench_stats(bench / "predictions" / f"{name}.jsonl")
     L.append(f"| {name} | {n} | {jacc:.3f} | {acc:.3f} | {je:.3f} | {e:.3f} |")
+if bench_withheld:
+    L += ["", WITHHELD_NOTE]
 L += ["", "## jev-ood-calibration", "", "| set | type | n | Jev acc | hipfire acc | Jev ECE | hipfire ECE |",
       "|---|---|---:|---:|---:|---:|---:|"]
+cal_withheld = False
 for p in sorted(glob.glob(str(out / "calibration/hipfire_*.jsonl"))):
     s = Path(p).stem.removeprefix("hipfire_")
+    if s in WITHHELD:
+        cal_withheld = True
+        continue
     mine, jev = cal_stats(p), cal_stats(cal / "results" / f"jev_{s}.jsonl")
     for t, (n, acc, e) in mine.items():
         jn, jacc, je = jev.get(t, (0, float("nan"), float("nan")))
         L.append(f"| {s} | {t} | {n} | {jacc:.3f} | {acc:.3f} | {je:.3f} | {e:.3f} |")
+if cal_withheld:
+    L += ["", WITHHELD_NOTE]
 (out / "report.md").write_text("\n".join(L) + "\n")
 print((out / "report.md").read_text())

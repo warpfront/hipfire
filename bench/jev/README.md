@@ -9,7 +9,7 @@ own committed files. Harness and instructions: `scripts/jev_eval/README.md`.
 
 | Directory | Model | Coverage |
 |---|---|---|
-| `qwen3.5-4b/` | `qwen3.5-4b.mq4` | Short run: jev-bench ag-news, banking77, yelp-stars (n=500 each) plus the 900 synthetic tickets |
+| `qwen3.5-4b/` | `qwen3.5-4b.mq4` | Short run: jev-bench banking77 (n=500) plus the 900 synthetic tickets |
 | `qwen3.8-27b-mq4-xts/` | `qwen3.8-27b.mq4-xts` | Full run: all 12 jev-bench tasks at n=500, the 6 experiments, and all four jev-ood-calibration sets |
 
 ### Build
@@ -21,6 +21,15 @@ was `eval/jev-decide-mq4-lloyd` at 237bb7bba. Serve ran with the user's
 normal config: KV q8, CASK on with budget 16384. Every request carried one
 question, so the answers come from one plain prefill per question.
 
+## Licences
+
+Results for six datasets are withheld from this repo because their licences
+restrict redistribution of derived statistics or are currently unclear: AG
+News, Quora Question Pairs (`duplicates`), Yelp Review Full (`yelp-stars`),
+TweetEval offensive (`offensive`), CardiffNLP Italian tweet sentiment
+(`sentiment-it`), and HellaSwag (`hellaswag`; source repo DMCA-blocked). See
+`DATA-LICENSES.md` for the per-dataset review.
+
 ## Latency: decide vs generate (`latency/`)
 
 These timings compare a decide (`POST /v1/systemone`, one question) with the
@@ -28,7 +37,9 @@ same model answering the same question through `/v1/chat/completions`
 (greedy, thinking off, `max_tokens` 12, prompt asks for the option name).
 Both use the same examples and the same build. Requests were sequential,
 with one warm-up request excluded. Figures are wall-clock at the HTTP
-client, in ms (script: `scripts/jev_eval/latency.py`).
+client, in ms (script: `scripts/jev_eval/latency.py`). The AG News inputs
+here are used only to measure request timing; no AG News labels or accuracy
+figures are published (see Licences above).
 
 | Model | Task (n) | decide p50 / p95 | generate p50 / p95 |
 |---|---|---:|---:|
