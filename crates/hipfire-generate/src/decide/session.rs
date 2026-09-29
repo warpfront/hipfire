@@ -10,7 +10,8 @@
 
 use super::{
     check_eviction_limit, check_uncompacted, decided_reply, execute_decide, gather_labels, hook,
-    ms, question_labels, rollback, DecideError, DecideOutcome, DecidePlan, RenderedQuestions,
+    ms, note_calibration, question_labels, rollback, DecideError, DecideOutcome, DecidePlan,
+    RenderedQuestions,
 };
 use hipfire_engine::decide as d;
 use hipfire_loader::decide::DecideSnapshot;
@@ -210,6 +211,7 @@ fn render_and_admit(
 /// refresh `asst_turn_cache`'s LRU order, as a chat render does.
 pub(crate) struct SessionPlan {
     questions: Vec<d::Question>,
+    calibration: d::Calibration,
     carrier: &'static dyn hipfire_loader::Carrier,
     label_ids: Vec<Vec<u32>>,
     seqs: Vec<Vec<u32>>,
@@ -291,6 +293,7 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
     };
     Ok(SessionPlan {
         questions: parsed.questions,
+        calibration: parsed.calibration,
         carrier,
         label_ids,
         seqs,
@@ -481,6 +484,7 @@ pub(crate) fn execute_session(
         // tokens, i.e. each question one full prefill from a reset model.
         let SessionPlan {
             questions,
+            calibration,
             carrier,
             label_ids,
             seqs,
@@ -490,6 +494,7 @@ pub(crate) fn execute_session(
             parsed: d::DecideRequest {
                 state_text: String::new(),
                 questions,
+                calibration,
             },
             carrier,
             rendered: RenderedQuestions { label_ids, seqs },
@@ -531,14 +536,12 @@ pub(crate) fn execute_session(
         return (Err(err), true);
     }
     let lens: Vec<usize> = plan.seqs.iter().map(Vec::len).collect();
-    let mut answers = serde_json::Map::new();
-    for (q, ll) in plan.questions.iter().zip(&per_q) {
-        answers.insert(q.name.clone(), d::assemble_answer(q, ll));
-    }
+    let answers = d::assemble_answers(&plan.questions, &per_q, &plan.calibration);
+    note_calibration(&mut timing, &plan.calibration);
     timing["total_ms"] = json!(ms(t_total));
     (
         Ok(DecideOutcome {
-            answers: Value::Object(answers),
+            answers,
             usage: d::usage_json(e, &lens),
             timing,
         }),

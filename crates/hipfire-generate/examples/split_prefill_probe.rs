@@ -412,8 +412,8 @@ fn decide_floor(
             serde_json::json!({
                 "tokens": n,
                 "a_vs_c": dl,
-                "a_answer": d::assemble_answer(q, &la),
-                "c_answer": d::assemble_answer(q, &lc),
+                "a_answer": d::assemble_answer(q, &la, 1.0),
+                "c_answer": d::assemble_answer(q, &lc, 1.0),
             }),
         );
     }

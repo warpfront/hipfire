@@ -60,6 +60,14 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+/// Echo a non-identity calibration into the timing (spec §13.2). It is
+/// diagnostic only and never reaches the Jev body.
+fn note_calibration(timing: &mut Value, cal: &d::Calibration) {
+    if !cal.is_identity() {
+        timing["calibration"] = cal.to_json();
+    }
+}
+
 /// Unwraps a Carrier decide hook result. `None` means the carrier claimed
 /// `decide_supported()` but didn't actually provide this hook — an internal
 /// carrier contract violation, hence 500 (not a client-facing 4xx).
@@ -359,14 +367,12 @@ pub fn execute_decide(
     result?;
     cleanup?;
 
-    let mut answers = serde_json::Map::new();
-    for (q, ll) in parsed.questions.iter().zip(per_q_logits.iter()) {
-        answers.insert(q.name.clone(), d::assemble_answer(q, ll));
-    }
+    let answers = d::assemble_answers(&parsed.questions, &per_q_logits, &parsed.calibration);
+    note_calibration(&mut timing, &parsed.calibration);
     let lens: Vec<usize> = seqs.iter().map(Vec::len).collect();
     timing["total_ms"] = json!(ms(t_total));
     Ok(DecideOutcome {
-        answers: Value::Object(answers),
+        answers,
         usage: d::usage_json(prefix_len, &lens),
         timing,
     })
@@ -619,5 +625,22 @@ mod tests {
         let e = gather_labels(&[3], &[0.0; 3]).unwrap_err();
         assert_eq!(e.status, 500);
         assert!(e.message.contains("label token id 3"), "{}", e.message);
+    }
+
+    #[test]
+    fn timing_echoes_only_a_non_identity_calibration() {
+        let mut t = serde_json::json!({"prefix_tokens": 0});
+        note_calibration(&mut t, &d::Calibration::IDENTITY);
+        assert!(t.get("calibration").is_none());
+        let c = d::Calibration {
+            choice: 1.3,
+            score: 1.0,
+            noul: 0.7,
+        };
+        note_calibration(&mut t, &c);
+        assert_eq!(
+            t["calibration"],
+            serde_json::json!({"choice": 1.3, "score": 1.0, "noul": 0.7})
+        );
     }
 }

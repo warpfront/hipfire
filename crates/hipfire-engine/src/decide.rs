@@ -51,6 +51,8 @@ pub struct Question {
 pub struct DecideRequest {
     pub state_text: String,
     pub questions: Vec<Question>,
+    /// Readout temperatures from the daemon message (spec §13.2).
+    pub calibration: Calibration,
 }
 
 /// String state verbatim; object/array pretty-printed so backtick `field`
@@ -171,6 +173,7 @@ pub fn parse_request(v: &Value) -> Result<DecideRequest, String> {
     Ok(DecideRequest {
         state_text: render_state(state),
         questions,
+        calibration: parse_calibration(v)?,
     })
 }
 
@@ -203,6 +206,7 @@ pub struct SessionRequest {
     /// OpenAI tool definitions; `None` when absent or empty (as `generate`).
     pub tools: Option<Vec<Value>>,
     pub questions: Vec<Question>,
+    pub calibration: Calibration,
 }
 
 /// Validate a session request. Every `Err` is a 422 message.
@@ -230,6 +234,7 @@ pub fn parse_session_request(v: &Value) -> Result<SessionRequest, String> {
         messages,
         tools,
         questions: parse_questions(v)?,
+        calibration: parse_calibration(v)?,
     })
 }
 
@@ -443,12 +448,99 @@ pub fn check_session_tokens(
     Ok(())
 }
 
-/// Numerically stable softmax in f64.
-pub fn softmax(logits: &[f32]) -> Vec<f64> {
+/// Readout temperature per question type (spec §13). `T = 1` is the raw
+/// readout; an answer's probabilities are `softmax(label_scores / T)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calibration {
+    pub choice: f64,
+    pub score: f64,
+    pub noul: f64,
+}
+
+/// Accepted temperature range (spec §13.2); the config schema enforces the
+/// same bounds for `decide.calibration.*`.
+pub const MIN_CALIBRATION_T: f64 = 0.05;
+pub const MAX_CALIBRATION_T: f64 = 20.0;
+
+impl Calibration {
+    pub const IDENTITY: Calibration = Calibration {
+        choice: 1.0,
+        score: 1.0,
+        noul: 1.0,
+    };
+
+    pub fn temperature(&self, kind: &QuestionKind) -> f64 {
+        match kind {
+            QuestionKind::Choice { .. } => self.choice,
+            QuestionKind::Score { .. } => self.score,
+            QuestionKind::Noul { .. } => self.noul,
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({"choice": self.choice, "score": self.score, "noul": self.noul})
+    }
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+/// The decide message's optional `calibration` (spec §13.2): absent or
+/// `null` is the identity; `choice` / `score` / `noul` are each optional
+/// (default 1) and must be numbers in [0.05, 20]. `Err` is a 422 message.
+pub fn parse_calibration(v: &Value) -> Result<Calibration, String> {
+    let obj = match v.get("calibration") {
+        None | Some(Value::Null) => return Ok(Calibration::IDENTITY),
+        Some(Value::Object(o)) => o,
+        Some(_) => return Err("calibration must be an object {choice, score, noul}".into()),
+    };
+    let mut c = Calibration::IDENTITY;
+    for (key, val) in obj {
+        let slot = match key.as_str() {
+            "choice" => &mut c.choice,
+            "score" => &mut c.score,
+            "noul" => &mut c.noul,
+            other => {
+                return Err(format!(
+                    "calibration keys must be choice, score or noul, got {other:?}"
+                ))
+            }
+        };
+        *slot = val
+            .as_f64()
+            .filter(|t| (MIN_CALIBRATION_T..=MAX_CALIBRATION_T).contains(t))
+            .ok_or_else(|| {
+                format!(
+                    "calibration.{key} must be a number in \
+                     [{MIN_CALIBRATION_T}, {MAX_CALIBRATION_T}]"
+                )
+            })?;
+    }
+    Ok(c)
+}
+
+/// Numerically stable softmax of `logits / t` in f64 (spec §13.3). At
+/// `t = 1` the division is exact, so the result is v1's bit for bit.
+pub fn softmax_t(logits: &[f32], t: f64) -> Vec<f64> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let exps: Vec<f64> = logits.iter().map(|&x| (x as f64 - max).exp()).collect();
+    let exps: Vec<f64> = logits
+        .iter()
+        .map(|&x| ((x as f64 - max) / t).exp())
+        .collect();
     let sum: f64 = exps.iter().sum();
     exps.into_iter().map(|e| e / sum).collect()
+}
+
+/// Numerically stable softmax in f64: the raw readout (T = 1).
+pub fn softmax(logits: &[f32]) -> Vec<f64> {
+    softmax_t(logits, 1.0)
 }
 
 fn argmax(p: &[f64]) -> usize {
@@ -462,13 +554,19 @@ fn argmax(p: &[f64]) -> usize {
 }
 
 /// Jev answer JSON for one question. `label_logits` follows `labels_for`
-/// order. Probabilities are not rounded.
-pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
+/// order (logits or log-probabilities: only differences matter); `t` is the
+/// question type's calibration temperature (spec §13.3; 1 = raw).
+/// Probabilities are not rounded.
+pub fn assemble_answer(q: &Question, label_logits: &[f32], t: f64) -> Value {
     debug_assert!(
         label_logits.len() >= 2,
         "assemble_answer: need at least 2 labels"
     );
-    let p = softmax(label_logits);
+    debug_assert!(
+        t.is_finite() && t > 0.0,
+        "assemble_answer: temperature must be positive"
+    );
+    let p = softmax_t(label_logits, t);
     let k = p.len() as f64;
     let top = argmax(&p);
     match &q.kind {
@@ -494,6 +592,23 @@ pub fn assemble_answer(q: &Question, label_logits: &[f32]) -> Value {
         }
         QuestionKind::Noul { .. } => json!({"type": "noul", "noul": p[0]}),
     }
+}
+
+/// Every question's answer, in request order, each at its type's
+/// temperature (spec §13.3). The one assembly both decide modes use.
+pub fn assemble_answers(
+    questions: &[Question],
+    per_question_logits: &[Vec<f32>],
+    calibration: &Calibration,
+) -> Value {
+    let mut answers = serde_json::Map::new();
+    for (q, ll) in questions.iter().zip(per_question_logits) {
+        answers.insert(
+            q.name.clone(),
+            assemble_answer(q, ll, calibration.temperature(&q.kind)),
+        );
+    }
+    Value::Object(answers)
 }
 
 /// Additive accounting observed for Jev: shared prefix once, each suffix once.
@@ -646,7 +761,7 @@ mod tests {
             }
             other => panic!("wrong kind {other:?}"),
         }
-        let a = assemble_answer(&r.questions[1], &[0.0, 1.0, 0.0]);
+        let a = assemble_answer(&r.questions[1], &[0.0, 1.0, 0.0], 1.0);
         let keys: Vec<&String> = a["probabilities"].as_object().unwrap().keys().collect();
         assert_eq!(keys, vec!["shipping", "billing", "general"]);
         assert_eq!(a["choice"], "billing");
@@ -806,7 +921,7 @@ mod tests {
         let q = choice_q(&["A", "B", "C", "D"]);
         let probs = [1e-9_f32, 0.69, 0.31, 1e-9];
         let logits: Vec<f32> = probs.iter().map(|p| p.ln()).collect();
-        let a = assemble_answer(&q, &logits);
+        let a = assemble_answer(&q, &logits, 1.0);
         assert_eq!(a["type"], "choice");
         assert_eq!(a["choice"], "B");
         let conf = a["confidence"].as_f64().unwrap();
@@ -820,7 +935,7 @@ mod tests {
     #[test]
     fn choice_uniform_has_zero_confidence_and_probs_keyed_by_user_keys() {
         let q = choice_q(&["billing", "shipping", "general"]);
-        let a = assemble_answer(&q, &[0.0, 0.0, 0.0]);
+        let a = assemble_answer(&q, &[0.0, 0.0, 0.0], 1.0);
         assert!(a["confidence"].as_f64().unwrap().abs() < 1e-12);
         let probs = a["probabilities"].as_object().unwrap();
         assert_eq!(probs.len(), 3);
@@ -839,7 +954,7 @@ mod tests {
         // Jev synth score row: probs [0, .05, .89, .06], confidence .89.
         let probs = [1e-9_f32, 0.05, 0.89, 0.06];
         let logits: Vec<f32> = probs.iter().map(|p| p.ln()).collect();
-        let a = assemble_answer(&q, &logits);
+        let a = assemble_answer(&q, &logits, 1.0);
         assert_eq!(a["type"], "score");
         let score = a["score"].as_f64().unwrap();
         assert!(
@@ -860,7 +975,7 @@ mod tests {
                 false_desc: None,
             },
         };
-        let a = assemble_answer(&q, &[(3.0f32).ln(), 0.0]);
+        let a = assemble_answer(&q, &[(3.0f32).ln(), 0.0], 1.0);
         assert_eq!(a["type"], "noul");
         assert!((a["noul"].as_f64().unwrap() - 0.75).abs() < 1e-6);
         assert!(a.get("confidence").is_none());
@@ -890,7 +1005,206 @@ mod tests {
                 descriptions: vec!["only".into()],
             },
         };
-        assemble_answer(&q, &[0.0]);
+        assemble_answer(&q, &[0.0], 1.0);
+    }
+
+    #[test]
+    fn calibration_absent_or_null_is_identity() {
+        assert_eq!(
+            parse_calibration(&json!({})).unwrap(),
+            Calibration::IDENTITY
+        );
+        assert_eq!(
+            parse_calibration(&json!({"calibration": null})).unwrap(),
+            Calibration::IDENTITY
+        );
+        assert!(Calibration::default().is_identity());
+    }
+
+    #[test]
+    fn calibration_parses_partial_objects() {
+        let c = parse_calibration(&json!({"calibration": {"choice": 1.3, "noul": 0.7}})).unwrap();
+        assert_eq!(
+            c,
+            Calibration {
+                choice: 1.3,
+                score: 1.0,
+                noul: 0.7
+            }
+        );
+        assert!(!c.is_identity());
+        assert_eq!(
+            c.to_json(),
+            json!({"choice": 1.3, "score": 1.0, "noul": 0.7})
+        );
+        let b = parse_calibration(&json!({"calibration": {"choice": 0.05, "score": 20}})).unwrap();
+        assert_eq!((b.choice, b.score), (0.05, 20.0));
+    }
+
+    #[test]
+    fn calibration_rejects_bad_shapes() {
+        let e = |v: Value| parse_calibration(&json!({ "calibration": v })).unwrap_err();
+        assert!(e(json!(1.3)).contains("calibration must be an object"));
+        assert!(e(json!({"bogus": 1.0})).contains("choice, score or noul"));
+        for bad in [
+            json!(0.0),
+            json!(0.049),
+            json!(20.5),
+            json!(-1.0),
+            json!("1.3"),
+            json!(null),
+        ] {
+            let m = e(json!({ "choice": bad.clone() }));
+            assert!(
+                m.contains("calibration.choice must be a number in [0.05, 20]"),
+                "{bad}: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn temperature_one_is_bit_identical_to_the_v1_readout() {
+        let z = [3.25f32, -1.5, 0.125, 7.0, -40.0];
+        // v1's softmax, verbatim.
+        let max = z.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let e: Vec<f64> = z.iter().map(|&x| (x as f64 - max).exp()).collect();
+        let s: f64 = e.iter().sum();
+        let v1: Vec<f64> = e.into_iter().map(|x| x / s).collect();
+        let t1 = softmax_t(&z, 1.0);
+        assert!(v1.iter().zip(&t1).all(|(a, b)| a.to_bits() == b.to_bits()));
+        let q = choice_q(&["a", "b", "c", "d", "e"]);
+        let all = assemble_answers(
+            std::slice::from_ref(&q),
+            &[z.to_vec()],
+            &Calibration::IDENTITY,
+        );
+        assert_eq!(all["q"], assemble_answer(&q, &z, 1.0));
+    }
+
+    #[test]
+    fn temperature_scales_label_logits_before_the_softmax() {
+        let z = [2.0f32, 0.0, -1.0];
+        for t in [0.5, 1.7, 4.0] {
+            let p = softmax_t(&z, t);
+            let e: Vec<f64> = z.iter().map(|&x| (x as f64 / t).exp()).collect();
+            let s: f64 = e.iter().sum();
+            for (a, b) in p.iter().zip(e.iter().map(|x| x / s)) {
+                assert!((a - b).abs() < 1e-12, "t={t}");
+            }
+        }
+        // Log-probabilities give back the logits up to a constant, so
+        // softmax(log p / T) == softmax(z / T) (spec §13.3 invariant 4).
+        let lp: Vec<f32> = softmax(&z).iter().map(|p| p.ln() as f32).collect();
+        for (x, y) in softmax_t(&z, 2.5).iter().zip(&softmax_t(&lp, 2.5)) {
+            assert!((x - y).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn calibrated_choice_keeps_the_argmax_and_moves_the_confidence() {
+        let q = choice_q(&["a", "b", "c", "d"]);
+        let z = [0.5f32, 2.0, 1.0, -1.0];
+        let (raw, flat, sharp) = (
+            assemble_answer(&q, &z, 1.0),
+            assemble_answer(&q, &z, 2.0),
+            assemble_answer(&q, &z, 0.5),
+        );
+        for a in [&raw, &flat, &sharp] {
+            assert_eq!(a["choice"], "b");
+        }
+        let conf = |a: &Value| a["confidence"].as_f64().unwrap();
+        assert!(conf(&flat) < conf(&raw) && conf(&raw) < conf(&sharp));
+        let p = softmax_t(&z, 2.0);
+        assert!((conf(&flat) - (p[1] - 0.25) / 0.75).abs() < 1e-12);
+        assert_eq!(flat["probabilities"]["b"].as_f64().unwrap(), p[1]);
+    }
+
+    #[test]
+    fn calibrated_noul_is_a_sigmoid_of_the_scaled_log_odds() {
+        let n = Question {
+            name: "n".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Noul {
+                true_desc: None,
+                false_desc: None,
+            },
+        };
+        // log-odds ln 3 at T = 2: p = sqrt(3) / (sqrt(3) + 1).
+        let a = assemble_answer(&n, &[(3.0f32).ln(), 0.0], 2.0);
+        let want = 3f64.sqrt() / (3f64.sqrt() + 1.0);
+        assert!((a["noul"].as_f64().unwrap() - want).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calibrated_score_mean_follows_the_calibrated_distribution() {
+        let q = Question {
+            name: "s".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Score {
+                levels: vec!["a".into(), "b".into(), "c".into()],
+            },
+        };
+        let z = [0.0f32, 1.0, 3.0];
+        let a = assemble_answer(&q, &z, 3.0);
+        let p = softmax_t(&z, 3.0);
+        let score = a["score"].as_f64().unwrap();
+        assert!((score - (p[1] + 2.0 * p[2])).abs() < 1e-12);
+        assert!((a["confidence"].as_f64().unwrap() - p[2]).abs() < 1e-12);
+        // Flatter than raw: the mean moves toward the middle level.
+        assert!(score < assemble_answer(&q, &z, 1.0)["score"].as_f64().unwrap());
+    }
+
+    #[test]
+    fn assemble_answers_uses_each_question_type_temperature() {
+        let cal = Calibration {
+            choice: 2.0,
+            score: 0.5,
+            noul: 4.0,
+        };
+        let s = Question {
+            name: "s".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Score {
+                levels: vec!["x".into(), "y".into()],
+            },
+        };
+        let n = Question {
+            name: "n".into(),
+            instructions: "i".into(),
+            kind: QuestionKind::Noul {
+                true_desc: None,
+                false_desc: None,
+            },
+        };
+        let qs = vec![choice_q(&["a", "b"]), s, n];
+        let z = vec![vec![1.0f32, 0.0]; 3];
+        let out = assemble_answers(&qs, &z, &cal);
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["q", "s", "n"]);
+        assert_eq!(out["q"], assemble_answer(&qs[0], &z[0], 2.0));
+        assert_eq!(out["s"], assemble_answer(&qs[1], &z[1], 0.5));
+        assert_eq!(out["n"], assemble_answer(&qs[2], &z[2], 4.0));
+    }
+
+    #[test]
+    fn requests_carry_their_calibration_in_both_modes() {
+        let qs = json!({"q": {"type": "noul", "instructions": "i"}});
+        let cal = json!({"choice": 1.5});
+        let plain =
+            parse_request(&json!({"state": "s", "questions": qs, "calibration": cal})).unwrap();
+        assert_eq!(plain.calibration.choice, 1.5);
+        assert!(parse_request(&json!({"state": "s", "questions": qs}))
+            .unwrap()
+            .calibration
+            .is_identity());
+        let sess = parse_session_request(&json!({
+            "messages": [{"role": "user", "content": "u"}], "questions": qs, "calibration": cal
+        }))
+        .unwrap();
+        assert_eq!(sess.calibration.choice, 1.5);
+        let e = parse_request(&json!({"state": "s", "questions": qs, "calibration": {"noul": 99}}))
+            .unwrap_err();
+        assert!(e.contains("calibration.noul"), "{e}");
     }
 
     #[test]
