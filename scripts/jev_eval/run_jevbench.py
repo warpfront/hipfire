@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Run Running-Dolphins/jev-bench against local hipfire serve.
 
 jevbench.py writes predictions/results under its module ROOT, which would

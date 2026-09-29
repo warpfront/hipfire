@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Accuracy + top-probability ECE (10 bins) for hipfire vs Jev's committed answers."""
 import argparse
 import glob
