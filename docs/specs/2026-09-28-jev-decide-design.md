@@ -1057,7 +1057,9 @@ logits or log-probabilities.
 ### 13.4 Fitting protocol
 
 - **Unit.** One T per (model artifact, build, question type), pooled over
-  every held-out source of that type.
+  every *licence-clear* held-out source of that type (§13.5's "Licence-clear
+  fitting" — not every held-out source: six are restricted and never reach
+  a fit).
 - **Data.** Held-out rows only (§13.5). They are answered raw (no
   calibration configured), one question per request, by the same build and
   serve configuration as the reported rows:
@@ -1140,20 +1142,30 @@ can never silently shrink.
 | massive-en, massive-it | choice | test | validation, `hf_rows` seed 1, 400 |
 | clinc150 | choice | test (`plus`) | validation (`plus`), seed 1, 400, in-scope only |
 | ledgar | choice | test | validation, seed 1, 400 |
-| ag-news | choice | test | train, seed 1, 400 |
+| ag-news† | choice | test | train, seed 1, 400 |
 | sms-spam | noul | train (its only split) | train, seed 1, 400; disjoint by R-exclusion only |
-| duplicates (QQP) | noul | validation | train, seed 1, 400 |
+| duplicates† (QQP) | noul | validation | train, seed 1, 400 |
 | doc-yesno (BoolQ) | noul | validation | train, seed 1, 400 |
-| offensive | noul | test | validation, seed 1, 400 |
-| yelp-stars | score | test | train, seed 1, 400 |
-| sentiment-it | score | test | validation (324 rows), seed 1 |
+| offensive† | noul | test | validation, seed 1, 400 |
+| yelp-stars† | score | test | train, seed 1, 400 |
+| sentiment-it† | score | test | validation (324 rows), seed 1 |
 | synth-choice, synth-score, synth-noul | choice, score, noul | `val.jsonl` (`generate.py` seed 0) | `generate.build_synthetic(400 tickets, label_noise 0.05, seed 7)`; disjoint by R-exclusion only |
 | openbookqa | choice | validation (first 500) | train: first 400 rows, filtered, `Random(1)` shuffle, as the harness builds validation |
 | commonsense_qa | choice | validation (all 1,221) | train: as openbookqa |
 
+† Licence-restricted (`scripts/jev_eval/licences.py`; see "Licence-clear
+fitting" below). `heldout.py build`/`verify` still cover these five sources
+— they are held out and proven disjoint from R exactly like the other 12 —
+but `heldout.py run` skips them by default and `calibrate.py fit` refuses
+any row from them, so **none of the five feeds a fit**. In particular
+`yelp-stars` and `sentiment-it` are the table's only `score` sources, so
+with both excluded, score-type T is fitted on `synth-score` alone.
+
 HellaSwag's train split is not used. The approved public held-out sources
 are the OpenBookQA and CommonsenseQA train splits, and `choice` already has
-nine sources. HellaSwag's reported validation rows are still in R.
+nine sources. HellaSwag's reported validation rows are still in R. (HellaSwag
+is also licence-restricted, per the table in §DATA-LICENSES.md, but that is
+moot for fitting: it was never a held-out candidate source to begin with.)
 
 **Selection, per source, in candidate order.**
 
@@ -1161,9 +1173,13 @@ nine sources. HellaSwag's reported validation rows are still in R.
 2. Drop repeats within the source (the same `state_hash` again).
 3. Keep the first 300.
 
-This gives 17 sources: 2,700 choice, 900 score and 1,500 noul rows per
-model. A CPU dry run of the builder on 2026-09-29 kept 300 from every source
-and found R to have 10,253 states. Its losses were:
+This gives 17 built sources: 2,700 choice, 900 score and 1,500 noul rows per
+model — the universe `heldout.py build`/`verify` cover and prove disjoint
+from R. Five of those 17 are licence-restricted (marked † in the table
+above) and never reach a fit; §13.4's actual fitted pools are smaller (see
+"Licence-clear fitting" below). A CPU dry run of the builder on 2026-09-29
+kept 300 from every source and found R to have 10,253 states. Its losses
+were:
 
 - **sms-spam: 66 of 400.** Both draws sample 100-row pages of the one split,
   so pages overlap.
@@ -1191,6 +1207,44 @@ and found R to have 10,253 states. Its losses were:
    why rule 1 runs on every source.
 3. **By the fitter.** Labels as well as rows: `calibrate.py fit` refuses any
    directory but `heldout/`, so no reported label reaches the fit.
+
+**Licence-clear fitting.** Human decision (2026-09-29): every temperature
+is fitted on licence-clear held-out sources only, never on the full
+17-source built/verified universe above.
+
+- **The restricted list** is ag-news, duplicates, yelp-stars, offensive,
+  sentiment-it and hellaswag — six sources whose dataset licence does not
+  clearly permit redistributing derived per-row data (labels + served
+  probabilities), per `bench/jev/DATA-LICENSES.md`'s per-dataset review.
+  Five of them (all but hellaswag) are held-out candidate sources (marked †
+  in the table above); hellaswag is restricted from reports (§13.6) but was
+  never a held-out candidate source to begin with (HellaSwag's train split
+  is not used).
+- **`scripts/jev_eval/licences.py` is the single choke point.** It is the
+  one place the restricted list is spelled out. `heldout.py run` collects
+  only the licence-clear sources by default — naming a restricted one
+  explicitly needs `--allow-restricted` — and `calibrate.py`'s `pool()` /
+  `fit` refuse any row whose source is restricted, regardless of how it got
+  there.
+- **`heldout.py build`/`verify` still cover all 17 sources.** The
+  disjointness proof above and the committed manifest do not shrink: every
+  source, restricted or not, is drawn, checked against R and proven
+  disjoint. Only *running* the model (`heldout.py run`, to collect answers)
+  and *fitting* (`calibrate.py fit`) narrow to the 12 licence-clear sources.
+- **The real pooled counts** a fit sees are therefore smaller than the
+  17-source universe: **2,400 choice** rows (8 licence-clear choice sources
+  × 300: banking77, massive-en, massive-it, clinc150, ledgar, synth-choice,
+  openbookqa, commonsense_qa), **300 score** rows (synth-score alone — both
+  `score` sources in the table, yelp-stars and sentiment-it, are
+  restricted), and **900 noul** rows (3 licence-clear noul sources × 300:
+  sms-spam, doc-yesno, synth-noul).
+- **Score-type T therefore comes from synth-score alone**, not a pool
+  across several sources the way `choice` and `noul` are. This is a direct
+  consequence of yelp-stars and sentiment-it both being restricted, not a
+  separate design choice.
+- **Restricted sources are withheld from all reports** (§13.6): `report.py`
+  skips a restricted source unconditionally, whether or not this checkout
+  has also frozen it locally.
 
 **What is committed.** Held-out text stays out of the repo, the way
 jev-bench keeps its own `raw/` and `data/` out. It lives in the work dir
