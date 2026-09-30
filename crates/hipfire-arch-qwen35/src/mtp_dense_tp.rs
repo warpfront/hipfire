@@ -76,6 +76,14 @@ impl Qwen35DenseTpTarget {
     }
 }
 
+/// `SpecTarget` here is a carrier, not a substitutable target. The MTP route
+/// receives this object through the speculator's `SpecTarget` slot and
+/// downcasts it (`as_any_mut`) back to `Qwen35DenseTpTarget` to drive the
+/// mesh verify directly. Every block-verify entry point (`new_spec_scratch`,
+/// `verify_block`, `commit_prefix`) returns `BLOCK_VERIFY_UNSUPPORTED`, so a
+/// block-verify speculator (n-gram, DFlash, DSpark) routed at this target
+/// fails at admission instead of running; wiring them needs a mesh
+/// `verify_block` on top of `forward_prefill_dense_tp_verify_capture`.
 impl SpecTarget for Qwen35DenseTpTarget {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
