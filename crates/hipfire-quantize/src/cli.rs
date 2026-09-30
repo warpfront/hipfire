@@ -164,6 +164,14 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "PATH")]
     pub imatrix: Option<PathBuf>,
 
+    /// Pack the checkpoint's MTP (nextn) head into a separate hipfire `.mtp`
+    /// sidecar (arch_id = 21, `QWEN35_MTP_HEAD`) — GGUF input only. The head
+    /// stays out of the trunk file either way; with this flag it is also
+    /// written out instead of just being skipped. Bundle the two with
+    /// `mq4_merge_mtp` if you want a single `.mq4-mtp` file.
+    #[arg(long, value_name = "PATH")]
+    pub mtp_out: Option<PathBuf>,
+
     /// Per-tensor Hessian directory used by GPTQ-E8 recipes.
     #[arg(long, value_name = "DIR")]
     pub hessian_dir: Option<PathBuf>,

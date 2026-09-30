@@ -20,6 +20,8 @@ mod e8;
 mod e8_gptq;
 mod gguf_input;
 mod hfq;
+mod iq_dequant;
+mod iq_tables;
 mod maple;
 mod model_filter;
 mod pipeline;
