@@ -329,7 +329,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 |---|---|---|---|
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
-| `dflash_adaptive_b` | `true` | bool | Adaptive draft block size. |
+| `dflash_adaptive_b` | `true` | bool | Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads; `HIPFIRE_DFLASH_ADAPTIVE_B=0` forces fixed. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when weights present (DeepSeek path primary). Separate Qwen35 MTP env gate may apply — see env doc. |
 | `mtp_k` | `3` | int 1–10 | |

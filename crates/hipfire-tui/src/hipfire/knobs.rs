@@ -260,14 +260,14 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "dflash_adaptive_b",
         title: "DFlash adaptive batch",
-        summary: "Lets DFlash adapt its draft batch size to recent acceptance.",
-        effect: "Can improve spec-decode throughput by sizing drafts to how well they're accepted. No correctness effect.",
+        summary: "Lets DFlash adapt its draft verify-block width to recent acceptance.",
+        effect: "Follows the trailing 8-cycle acceptance depth (τ̂+2 rows), shrunk only past 2k context where the fixed full block loses throughput. This is not output-identical: realized tokens can differ from fixed-B (observed even at temp 0) because a narrower verify window moves window boundaries; per-position sampling stays target-lossless.",
         default: "true",
-        when: "Leave on; only relevant when dflash_mode is active.",
-        note: None,
+        when: "Leave on for long-context DFlash sessions. Mutually exclusive with the retained PM4 verify route (PM4 loads keep the fixed B=16 shape).",
+        note: Some("HIPFIRE_DFLASH_ADAPTIVE_B=0 forces the fixed block. Short contexts always get the full block."),
         options: &[
-            ("true", "Size the draft batch to recent acceptance."),
-            ("false", "Fixed draft batch size."),
+            ("true", "Size the draft batch to recent acceptance (context-gated, seeded at full)."),
+            ("false", "Fixed draft batch size (pre-adaptive behavior)."),
         ],
     },
     KnobInfo {

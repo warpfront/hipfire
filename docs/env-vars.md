@@ -111,6 +111,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
+| `HIPFIRE_DFLASH_ADAPTIVE_B` | unused; `0` forces the fixed full block | Overrides the `dflash_adaptive_b` load param/setting. Adaptive is also auto-suppressed on retained-PM4 verify loads (replay needs the fixed B=16 shape). |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |

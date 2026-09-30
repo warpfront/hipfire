@@ -33,6 +33,7 @@ use std::{
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
+    time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -292,6 +293,59 @@ impl ResponseChunk {
             ack: None,
             fail: true,
         }
+    }
+}
+
+/// Interval between SSE keepalive comments while a request is pre-filling.
+///
+/// Kept well under common client/proxy idle timeouts (undici defaults to 300s,
+/// nginx `proxy_read_timeout` to 60s) while costing ~15 bytes per tick.
+const PREFILL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Emits SSE comment frames on a response channel until dropped.
+///
+/// A cold prefill writes nothing to the wire for minutes, which clients that
+/// enforce an idle-between-chunks timeout treat as a dead connection: undici
+/// (Node's fetch, and pi's client) aborts at its 300s `bodyTimeout`. Comment
+/// frames are ignored by conforming SSE parsers, so they keep the connection
+/// alive without appearing in model output.
+///
+/// Holds a sender clone, and the response body only ends once every sender is
+/// gone, so the task MUST be stopped for the response to finish. `Drop` aborts
+/// it, which drops that sender.
+struct PrefillHeartbeat {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl PrefillHeartbeat {
+    fn spawn(tx: tokio::sync::mpsc::Sender<ResponseChunk>) -> Self {
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PREFILL_KEEPALIVE_INTERVAL);
+            // A busy GPU prefill can hold a runtime thread past a tick; skip
+            // missed ticks rather than bursting keepalives afterwards.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // the first tick resolves immediately: consume it
+            loop {
+                ticker.tick().await;
+                // `try_send`, never blocking: a full queue means real chunks are
+                // already flowing, and a closed channel means the response ended
+                // (client disconnected, or the body was dropped).
+                if tx
+                    .try_send(ResponseChunk::plain(b": keepalive\n\n".to_vec()))
+                    .is_err()
+                    && tx.is_closed()
+                {
+                    break;
+                }
+            }
+        });
+        Self { handle }
+    }
+}
+
+impl Drop for PrefillHeartbeat {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -1098,12 +1152,22 @@ async fn handle_streaming(
     });
     let _ = tx.try_send(ResponseChunk::plain(sse_data(&first)));
 
+    // Hold the client's idle-between-chunks timer open across the (silent)
+    // prefill; see PrefillHeartbeat.
+    let heartbeat_guard = PrefillHeartbeat::spawn(tx.clone());
+
     let tx_clone = tx.clone();
     let shared_clone = Arc::clone(&shared);
     let id_clone = id.clone();
     let model_clone = model.clone();
     let body_cancelled = Arc::clone(&cancelled);
     tokio::task::spawn_blocking(move || {
+        // Dropped on every exit path, including an unwind, so a finished or
+        // panicked request can never keep the response body open. Taken and
+        // dropped inside the terminal callback BEFORE the terminal ack is
+        // delivered, so no `: keepalive` comment can follow the acked
+        // `[DONE]` frame (finish_sse_stream's no-post-commit-bytes contract).
+        let mut heartbeat = Some(heartbeat_guard);
         let result = complete_request_cancellable(
             &shared_clone,
             &body,
@@ -1111,8 +1175,14 @@ async fn handle_streaming(
             Some((id_clone.clone(), created)),
             &cancelled,
             |event| forward_sse_stream_event(&tx_clone, &id_clone, created, &model_clone, event),
-            |completion| deliver_sse_terminal_ack(&tx_clone, completion, include_usage),
+            |completion| {
+                if let Some(hb) = heartbeat.take() {
+                    drop(hb);
+                }
+                deliver_sse_terminal_ack(&tx_clone, completion, include_usage)
+            },
         );
+        drop(heartbeat); // unwind or early-exit safety: aborted heartbeat closes the body
         finish_sse_stream(tx_clone, result);
     });
 
