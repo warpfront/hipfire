@@ -186,11 +186,11 @@ impl Arm {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
-    if !gpu.arch_caps.is_gfx1100() {
-        eprintln!("SKIP: test_dflash_gdn_pre_gfx1100 requires exact gfx1100");
+    if !gpu.arch_caps.supports_dflash_gdn_pre_fusions() {
+        eprintln!("SKIP: architecture is not in the validated S5 fleet");
         return;
     }
-    eprintln!("=== dflash_gdn_pre parity (gfx1100) ===");
+    eprintln!("=== dflash_gdn_pre parity ({}) ===", gpu.arch);
 
     // Shared inputs, uploaded identically into both arms.
     let qkv_in = gpu
@@ -301,7 +301,7 @@ fn main() {
                     EPS,
                 )
                 .expect("new capture");
-            assert!(fused, "capture must take the fused route on gfx1100");
+            assert!(fused, "capture must take the admitted fused route");
 
             for (name, o, w) in [
                 ("beta", &old.beta, &new.beta),
@@ -414,7 +414,7 @@ fn main() {
                             EPS,
                         )
                         .expect("new replay");
-                    assert!(fused, "replay must take the fused route on gfx1100");
+                    assert!(fused, "replay must take the admitted fused route");
 
                     for (name, o, w) in [
                         ("replay_q_raw", &old.q_raw, &new.q_raw),

@@ -132,8 +132,8 @@ fn run() -> i32 {
         }
     };
     let arch = gpu.arch.clone();
-    if !(gpu.arch_caps.is_gfx1100() && arch == "gfx1100") {
-        eprintln!("SKIP: arch {arch} is not exact gfx1100");
+    if !gpu.arch_caps.supports_dflash_hidden_scatter_fusions() {
+        eprintln!("SKIP: arch {arch} is outside the validated hidden-scatter fleet");
         return 0;
     }
     if gpu.active_capture.is_some() {

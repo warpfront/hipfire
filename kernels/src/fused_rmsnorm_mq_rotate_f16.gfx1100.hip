@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Exact-FP16 variants of the fused RMSNorm + FWHT rotation producers for
-// S3-f16-projection-inputs (DFlash launch fusion, gfx1100 only).
+// S3-f16-projection-inputs (DFlash launch fusion, gfx1100/gfx1201).
 //
 // CONTRACT: each kernel below is an operation-order-exact clone of its F32
 // baseline, differing ONLY in the final store, which converts with the same
@@ -19,14 +19,13 @@
 //   stride sum-of-squares, first-group float4 prefetch under the reduction,
 //   warp-shuffle reduction tree, rsqrt, `((x*w)*rms)*s1`, local +
 //   ds_swizzle butterflies, `(v*s)*s2` stores.
-// - `fused_rmsnorm_mq_rotate_awq_f16` clones the retired LDS-staged AWQ
-//   kernel's op order: scalar stride sum-of-squares, descending-offset LDS
-//   reduction tree, rsqrt, `((x*w)*rms/awq)*s1`, identical butterflies,
-//   `(v*scale)*s2` stores. The F32 AWQ symbol is now derived from
-//   `fused_rmsnorm_mq_rotate.hip` via `-DHIPFIRE_RMSNORM_AWQ` (shuffle
-//   reduction tree, same value op order; the retired gfx1100-only
-//   `*_awq_direct` fork / `HIPFIRE_GFX1100_AWQ_NORM_DIRECT` are gone); the
-//   two can differ in the last ulp of `rms` only.
+// - `fused_rmsnorm_mq_rotate_awq_f16` clones the live F32 AWQ symbol derived
+//   from `fused_rmsnorm_mq_rotate.hip` via `-DHIPFIRE_RMSNORM_AWQ`: scalar
+//   stride sum-of-squares, the same two-level wave-shuffle reduction tree,
+//   rsqrt, `((x*w)*rms/awq)*s1`, identical butterflies, and
+//   `(v*scale)*s2` stores. Matching the live reduction tree is load-bearing:
+//   the retired descending-offset LDS tree can move `rms` by one ULP and
+//   occasionally cross an F16 rounding boundary on gfx1201.
 //
 // Grid: [batch_size, 1, 1]. Block: [256]. The plain kernel takes the same
 // oversized `(K+256)*4` dynamic-shared reservation as its baseline launcher
@@ -187,11 +186,9 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_f16(
     }
 }
 
-// AWQ exact-FP16 producer. Clones the gfx1100 AWQ value operation order
-// (scalar stride sum, descending-offset LDS reduction tree, IEEE divide
-// before the FWHT, float4 group loop) of the retired LDS-staged
-// fused_rmsnorm_mq_rotate_awq; the live F32 symbol shares the value op order
-// but reduces with the uniform kernel's shuffle tree.
+// AWQ exact-FP16 producer. Clones the live F32 AWQ value operation order:
+// scalar stride sum, two-level wave-shuffle reduction tree, IEEE divide
+// before the FWHT, and the same float4 group loop.
 //
 // Grid: [batch]. Block: [256]. LDS: 256 floats for the exact RMS tree.
 __launch_bounds__(256, 1)
@@ -215,19 +212,33 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_awq_f16(
     const float* x_b = x + batch_off;
     _Float16* x_rot_f16_b = x_rot_f16 + batch_off;
 
-    // Keep the baseline's scalar accumulation and descending-offset LDS tree.
+    // Keep the live F32 baseline's scalar accumulation and two-level
+    // wave-shuffle reduction tree. The retired descending-offset LDS tree is
+    // mathematically equivalent but not floating-point-order equivalent.
     float local_sum = 0.0f;
     for (int i = tid; i < K; i += blockDim.x) {
         const float v = x_b[i];
         local_sum += v * v;
     }
-    reduce[tid] = local_sum;
+
+    float warp_sum = local_sum;
+    warp_sum += __shfl_down(warp_sum, 16);
+    warp_sum += __shfl_down(warp_sum, 8);
+    warp_sum += __shfl_down(warp_sum, 4);
+    warp_sum += __shfl_down(warp_sum, 2);
+    warp_sum += __shfl_down(warp_sum, 1);
+    if (lane_id == 0) reduce[warp_id] = warp_sum;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) reduce[tid] += reduce[tid + s];
-        __syncthreads();
+
+    if (tid < 32) {
+        warp_sum = (tid < num_warps) ? reduce[tid] : 0.0f;
+        warp_sum += __shfl_down(warp_sum, 4);
+        warp_sum += __shfl_down(warp_sum, 2);
+        warp_sum += __shfl_down(warp_sum, 1);
+        if (tid == 0) reduce[0] = rsqrtf(warp_sum / (float)K + eps);
     }
-    const float rms = rsqrtf(reduce[0] / (float)K + eps);
+    __syncthreads();
+    const float rms = reduce[0];
 
     const int groups_total = K / 256;
     const int groups_per_warp = (groups_total + num_warps - 1) / num_warps;

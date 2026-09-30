@@ -6023,7 +6023,7 @@ pub(crate) fn batch_chunk_upload_positions(
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
     matches!(fusion, DflashFusionCtx::ChainVerify)
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_projection_fusions()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
         && n <= 16
@@ -6889,7 +6889,7 @@ fn s4_residual_fast(
 ) -> bool {
     fusion == DflashFusionCtx::ChainVerify
         && !gpu.flags.mq_f16_residual_off
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
         && matches!(epilogue, BatchEpilogue::Residual)
         && (1..=16).contains(&n)
@@ -8761,6 +8761,25 @@ fn batch_chunk_full_attn_input_projection(
     Ok(())
 }
 
+/// Shared admission for the S6 DFlash prep and paired Q8 K/V-write folds.
+fn dflash_fa_batch_fusion_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> bool {
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    fusion == DflashFusionCtx::ChainVerify
+        && gpu.arch_caps.supports_dflash_fa_batch_fusions()
+        && !gpu.flags.fa_batch_fuse_off
+        && !gpu.flags.rope_interleaved_legacy
+        && !hipfire_runtime::triattn::tap_enabled()
+        && matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
+        && config.head_dim == 256
+        && n_rot == 64
+        && n >= 1
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Prescaffold (behavior-only) extraction for S6-fa-prep-q8-pair.
 ///
@@ -8819,15 +8838,15 @@ fn batch_chunk_full_attn_prepare(
     let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
-    let fa_prep_fused_ok = (fusion == DflashFusionCtx::ChainVerify
-        || (fusion == DflashFusionCtx::Off
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true)))
-        && gpu.arch_caps.is_gfx1100()
-        && !gpu.flags.fa_batch_fuse_off
-        && !gpu.flags.rope_interleaved_legacy
-        && !hipfire_runtime::triattn::tap_enabled()
-        && fa_prep_shape_ok
-        && n >= 1;
+    let fa_prep_fused_ok = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n)
+        || ((fusion == DflashFusionCtx::Off
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true))
+            && gpu.arch_caps.is_gfx1100()
+            && !gpu.flags.fa_batch_fuse_off
+            && !gpu.flags.rope_interleaved_legacy
+            && !hipfire_runtime::triattn::tap_enabled()
+            && fa_prep_shape_ok
+            && n >= 1);
     // gfx1151 twin (`qwen35_fa_prep_batched_gfx1151`, same source) in
     // ordinary prefill, bit-exact against the three-launch chain on the
     // Halo; HIPFIRE_GFX1151_FA_PREP=0 restores the chain.
@@ -9255,6 +9274,7 @@ fn batch_chunk_fa_attend(
     multirow: bool,
     commit_stride: Option<usize>,
     gfx12_fa_prep_fp8q: bool,
+    pair_q8_writes: bool,
 ) -> HipResult<()> {
     if let BatchSemantics::Independent {
         lane_capacity,
@@ -9429,22 +9449,35 @@ fn batch_chunk_fa_attend(
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
-        gpu.kv_cache_write_q8_0_batched(
-            &kv_cache.k_gpu[layer_idx],
-            &pbs.fa_k_batch,
-            &pbs.positions,
-            config.n_kv_heads,
-            config.head_dim,
-            n,
-        )?;
-        gpu.kv_cache_write_q8_0_batched(
-            &kv_cache.v_gpu[layer_idx],
-            &pbs.fa_v_batch,
-            &pbs.positions,
-            config.n_kv_heads,
-            config.head_dim,
-            n,
-        )?;
+        if pair_q8_writes {
+            gpu.kv_cache_write_q8_0_pair_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+        } else {
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &pbs.fa_k_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+        }
         if gpu.attention_flash_q8_0_rows_masked(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
@@ -9659,6 +9692,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         && (commit_stride.is_none()
             || (commit_stride == Some(WIDENED_COMMIT_ROWS)
                 && n % WIDENED_COMMIT_ROWS == 0));
+    let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n);
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
     // the output projection will select a sigmoid producer that reads the
@@ -9739,6 +9773,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
                 fa_attn_multirow,
                 commit_stride,
                 gfx12_fa_prep_fp8q,
+                pair_q8_writes,
             )?;
             None
         }
@@ -11751,6 +11786,7 @@ fn batch_chunk_full_attn_moe_finish(
         layer_idx,
         fa_attn_multirow,
         None, // commit_stride: MoE finish keeps legacy cadence
+        false,
         false,
     )?;
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;

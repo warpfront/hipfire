@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! S6-fa-prep-q8-pair parity gate (gfx1100 only):
+//! S6-fa-prep-q8-pair parity gate (validated wave32 devices):
 //! `qwen35_fa_prep_batched_gfx1100` vs deinterleave + Q/K rmsnorm + halfsplit
 //! RoPE, and `kv_cache_write_q8_0_pair_batched_gfx1100` vs the two Q8 batched
 //! writes. Requires q/gate/k F32 bit-equality and K/V cache byte equality
@@ -12,7 +12,7 @@
 //!
 //! Run: `cargo run --release -p hipfire-arch-qwen35
 //!         --example test_qwen35_fa_batch_fusion_gfx1100`
-//! (hipfire-arch-qwen35 enables `deltanet` by default; needs a gfx1100 GPU.)
+//! (hipfire-arch-qwen35 enables `deltanet` by default.)
 
 use rdna_compute::Gpu;
 
@@ -225,11 +225,11 @@ fn test_kv_pair(gpu: &mut Gpu, n: usize, nk: usize) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
-    if !gpu.arch_caps.is_gfx1100() {
-        eprintln!("SKIP: test_qwen35_fa_batch_fusion_gfx1100 needs gfx1100");
+    if !gpu.arch_caps.supports_dflash_fa_batch_fusions() {
+        eprintln!("SKIP: S6 FA batch fusion is not certified on {}", gpu.arch);
         return;
     }
-    println!("FA batch fusion parity (gfx1100):");
+    println!("FA batch fusion parity ({}):", gpu.arch);
     for &(nq, nk) in &[(16usize, 2usize), (24, 4)] {
         for &n in &[1usize, 2, 8, 16] {
             test_prep(&mut gpu, n, nq, nk);

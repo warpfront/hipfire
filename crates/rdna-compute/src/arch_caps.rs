@@ -397,6 +397,38 @@ impl ArchCaps {
     pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
         self.has_wmma_w32 || self.has_wmma_w32_gfx12
     }
+    /// DFlash exact-F16 projection producer/consumer admission.
+    ///
+    /// The producer is wave32 portable. The consumers select distinct gfx11
+    /// and gfx12 WMMA sources, so keep this on the hardware validated by the
+    /// projection parity harness.
+    pub fn supports_dflash_f16_projection_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash direct-F16 residual producer/consumer admission.
+    pub fn supports_dflash_f16_residual_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash GDN pre/tape fusion admission.
+    pub fn supports_dflash_gdn_pre_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash hidden-ring commit/scatter fusion admission.
+    ///
+    /// This is deliberately separate from snapshot bulk-copy admission: the
+    /// routes have different validation histories and must not widen each
+    /// other implicitly.
+    pub fn supports_dflash_hidden_scatter_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash batched FA preparation and paired Q8 K/V-write admission.
+    ///
+    /// Both kernels use portable wave32 reductions and no generation-specific
+    /// WMMA intrinsics. Keep admission limited to architectures covered by the
+    /// end-to-end parity harness.
+    pub fn supports_dflash_fa_batch_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -573,6 +605,42 @@ mod tests {
         assert!(!caps.has_wmma_w32());
         assert!(!caps.is_rdna3());
         assert!(caps.supports_ds4_f16_compressor_cache());
+    }
+
+    #[test]
+    fn dflash_launch_fusions_cover_validated_fleet_only() {
+        let gates: [(&str, fn(&ArchCaps) -> bool); 5] = [
+            (
+                "f16 projection",
+                ArchCaps::supports_dflash_f16_projection_fusions,
+            ),
+            (
+                "f16 residual",
+                ArchCaps::supports_dflash_f16_residual_fusions,
+            ),
+            ("gdn pre", ArchCaps::supports_dflash_gdn_pre_fusions),
+            (
+                "hidden scatter",
+                ArchCaps::supports_dflash_hidden_scatter_fusions,
+            ),
+            ("fa batch", ArchCaps::supports_dflash_fa_batch_fusions),
+        ];
+
+        for (arch, expected) in [
+            ("gfx1030", false),
+            ("gfx1100", true),
+            ("gfx1101", false),
+            ("gfx1150", false),
+            ("gfx1151", false),
+            ("gfx1200", false),
+            ("gfx1201", true),
+            ("gfx942", false),
+        ] {
+            let caps = make_caps(arch);
+            for (name, gate) in gates {
+                assert_eq!(gate(&caps), expected, "{name}: {arch}");
+            }
+        }
     }
 
     #[test]

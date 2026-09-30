@@ -3,8 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! S5 (launch-fusion): `Gpu` launchers for the single-launch GDN preambles
-//! (`dflash_gdn_pre_capture_gfx1100` / `dflash_gdn_pre_replay_gfx1100`,
-//! gfx1100-only).
+//! (`dflash_gdn_pre_capture_gfx1100` / `dflash_gdn_pre_replay_gfx1100`).
+//! The historical symbols are ABI-stable; admission covers the validated
+//! gfx1100/gfx1201 fleet.
 //!
 //! The kernel source is self-contained here via `include_str!` so no shared
 //! registry (`kernels.rs` / `replay.rs`) changes are needed. Both launchers
@@ -13,7 +14,7 @@
 //! replace — so the fused launches are capture-safe wherever the old ones
 //! were.
 //!
-//! Eligibility is strict and host-side: exact gfx1100, head_dim == 128,
+//! Eligibility is strict and host-side: validated architecture, head_dim == 128,
 //! consistent k/v dims, sequential N (capture) / n_steps (replay) in
 //! 1..=16, and GQA ratio > 1 on capture (the interleave branch the fixture
 //! takes) / >= 1 on replay (ratio == 1 matches the old memcpy path
@@ -74,7 +75,7 @@ impl Gpu {
         n: usize,
         need_gqa: bool,
     ) -> HipResult<Option<(u32, u32, u32)>> {
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_gdn_pre_fusions() {
             return Ok(None);
         }
         if head_dim != DFLASH_GDN_PRE_HEAD_DIM {
