@@ -10615,6 +10615,619 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn post_systemone(port: u16, body: &serde_json::Value) -> (u16, String, String) {
+        let payload = serde_json::to_vec(body).unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "POST /v1/systemone HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&payload).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status: u16 = response[9..12].parse().unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        (status, headers.to_string(), body.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_named_model_returns_jev_shape() {
+        let harness = Task11HttpHarness::spawn("systemone-named");
+        let (status, headers, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(),
+                "state": "hello",
+                "questions": {"q": {"type": "choice", "instructions": "i",
+                                    "criteria": {"a": "x", "b": "y"}}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "choice");
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(
+            v.get("timing").is_none(),
+            "timing must not leak into the Jev body"
+        );
+        assert!(
+            headers.to_ascii_lowercase().contains("x-hipfire-timing:"),
+            "{headers}"
+        );
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("Jev body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["answers", "model", "usage"],
+            "Jev body must carry exactly {{model, answers, usage}}, no extras: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_without_loaded_model_is_503() {
+        let harness = Task11HttpHarness::spawn("systemone-unloaded");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 503, "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_uses_loaded_model() {
+        let harness = Task11HttpHarness::spawn("systemone-loaded");
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let (named_status, _, named_body) = post_systemone(harness.port(), &named);
+        assert_eq!(named_status, 200, "{named_body}");
+        let named_v: serde_json::Value = serde_json::from_str(&named_body).unwrap();
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(v["model"], "jev-latest");
+        assert_eq!(
+            v["model"], named_v["model"],
+            "jev-latest must echo the same model the named request loaded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_daemon_validation_error_maps_to_422() {
+        let harness = Task11HttpHarness::spawn("systemone-422");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": 5, "questions": {}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+    }
+
+    #[cfg(unix)]
+    fn timing_header(headers: &str) -> serde_json::Value {
+        let raw = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-hipfire-timing")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("x-hipfire-timing header");
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn session_body(model: &str, tool_choice: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": "yo"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "description": "d",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+        if let Some(tc) = tool_choice {
+            body["tool_choice"] = serde_json::json!(tc);
+        }
+        body
+    }
+
+    /// Session mode (spec §12.6): serve forwards the chat projection of
+    /// `messages` and `tools`, and the Jev body shape is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_forwards_projected_messages_and_tools() {
+        let harness = Task11HttpHarness::spawn("systemone-session");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), None));
+        assert_eq!(status, 200, "{body}");
+        let t = timing_header(&headers);
+        assert_eq!(t["mode"], "session", "{t}");
+        let roles: Vec<&str> = t["session_roles"]
+            .as_array()
+            .expect("session_roles")
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(roles.ends_with(&["user", "assistant"]), "{roles:?}");
+        assert_eq!(t["session_tools"], 1, "{t}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "noul");
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["answers", "model", "usage"], "{body}");
+    }
+
+    /// `tool_choice: "none"` drops tools exactly as the chat projection
+    /// does, proving serve projects rather than passes `tools` through.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_applies_tool_choice_projection() {
+        let harness = Task11HttpHarness::spawn("systemone-session-tc");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), Some("none")));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(timing_header(&headers)["session_tools"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_state_and_messages_together_is_422() {
+        let harness = Task11HttpHarness::spawn("systemone-both");
+        let mut body = session_body(harness.model(), None);
+        body["state"] = serde_json::json!("s");
+        let (status, _, body) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 422, "{body}");
+    }
+
+    /// Serve refuses a session `messages` that is not a non-empty array, that
+    /// the chat projection would reduce to only the injected default system
+    /// message, or that carries an image part (spec §12.6), all as 422 and
+    /// before any daemon round trip. The harness model gets a per-model
+    /// `prompt.system` override, so the default system message really is
+    /// injected (the control request shows it).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_refuses_messages_the_projection_would_empty() {
+        let harness = Task11HttpHarness::spawn("systemone-session-empty");
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set_cli("prompt.system", "injected default system")
+            .unwrap();
+        let mut catalog = hipfire_config::ModelCatalog::default();
+        catalog.models.insert(
+            "t11-session".into(),
+            hipfire_config::LocalModelConfig {
+                path: Some(PathBuf::from(harness.model())),
+                registry_tag: None,
+                overrides,
+            },
+        );
+        write_catalog_toml(&harness.paths.config, &catalog).unwrap();
+        let mut body = session_body(harness.model(), None);
+        let (status, headers, text) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 200, "{text}");
+        let roles = timing_header(&headers)["session_roles"].clone();
+        assert_eq!(roles, serde_json::json!(["system", "user", "assistant"]));
+        let image = serde_json::json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}]}]);
+        let cases = [
+            serde_json::json!([]),
+            serde_json::json!("hi"),
+            serde_json::json!([{"role": "bogus", "content": "x"}]),
+            image,
+        ];
+        for messages in cases {
+            body["messages"] = messages.clone();
+            let (status, _, text) = post_systemone(harness.port(), &body);
+            assert_eq!(status, 422, "{messages}: {text}");
+            assert!(text.contains("messages"), "{messages}: {text}");
+        }
+        let log = harness.read_requests_log();
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "only the control request reached the daemon; log={log:?}"
+        );
+    }
+
+    /// A daemon `required_max_seq` hint on a 422 triggers exactly one
+    /// `ensure_model` reload with a bumped `max_seq`, then a transparent
+    /// retry that succeeds. The fake daemon's `t-needs-ctx` sentinel refuses
+    /// until a `load` has raised its tracked max_seq to >= 40000 — comfortably
+    /// above the default `memory.max_seq` config of 32768, so this only
+    /// passes if a real second `load` round trip actually happened.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_required_max_seq_reloads_then_retries() {
+        let harness = Task11HttpHarness::spawn("systemone-reload");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "t-needs-ctx",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "noul");
+
+        let log = harness.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert!(
+            loads.len() >= 2,
+            "expected an initial load plus a required_max_seq reload; log={log:?}"
+        );
+        let reloaded_max_seq = loads
+            .iter()
+            .filter_map(|l| {
+                l.get("params")
+                    .and_then(|p| p.get("max_seq"))
+                    .and_then(|v| v.as_u64())
+            })
+            .max()
+            .expect("at least one load carries params.max_seq");
+        assert!(
+            reloaded_max_seq >= 40_000,
+            "expected a reload with max_seq >= 40000, got {reloaded_max_seq}; loads={loads:?}"
+        );
+    }
+
+    /// A `required_max_seq` above `MAX_SEQ_CEILING` (the ceiling chat's own
+    /// context growth stops at) is returned to the client as the daemon's
+    /// 422, `required_max_seq` included, without any reload.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_required_max_seq_above_ceiling_returns_422_without_reload() {
+        let harness = Task11HttpHarness::spawn("systemone-huge-ctx");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "t-needs-huge-ctx",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["required_max_seq"], 10_000_000u64, "{body}");
+        assert!(
+            10_000_000 > crate::serve::complete::MAX_SEQ_CEILING,
+            "fixture must exceed the ceiling"
+        );
+        let log = harness.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(
+            loads.len(),
+            1,
+            "only the initial load; no reload past the ceiling; log={log:?}"
+        );
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "no retry past the ceiling; log={log:?}"
+        );
+    }
+
+    /// `_debug_no_snapshot` is a daemon-only gate knob: serve must not
+    /// forward it, only `state` and `questions`.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_does_not_forward_debug_no_snapshot() {
+        let harness = Task11HttpHarness::spawn("systemone-no-debug");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "s", "_debug_no_snapshot": true,
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        assert_eq!(decides.len(), 1, "log={log:?}");
+        assert!(
+            decides[0].get("_debug_no_snapshot").is_none(),
+            "serve forwarded _debug_no_snapshot: {:?}",
+            decides[0]
+        );
+        assert_eq!(decides[0]["state"], "s");
+    }
+
+    /// Spec §13.2: write a per-model `decide.calibration` override for the
+    /// harness fixture into the harness's own models.toml.
+    #[cfg(unix)]
+    fn write_decide_calibration(harness: &Task11HttpHarness, table: &str) {
+        let catalog = format!(
+            "schema_version = 1\n\n[models.\"fixture\"]\npath = {:?}\n\n\
+             [models.\"fixture\".overrides.decide.calibration]\n{table}\n",
+            harness.model()
+        );
+        fs::write(&harness.paths.config.models_toml, catalog).unwrap();
+    }
+
+    /// POST a decide (must succeed) and return the message serve forwarded.
+    #[cfg(unix)]
+    fn forwarded_decide(
+        harness: &Task11HttpHarness,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (status, _, text) = post_systemone(harness.port(), body);
+        assert_eq!(status, 200, "{text}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        (*decides.last().expect("a forwarded decide")).clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_the_per_model_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal");
+        write_decide_calibration(&harness, "choice = 1.5\nnoul = 0.8");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.5, "score": 1.0, "noul": 0.8})
+        );
+        // Session mode forwards it too.
+        let d = forwarded_decide(&harness, &session_body(harness.model(), None));
+        assert_eq!(d["calibration"]["choice"], 1.5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_sends_no_calibration_without_an_override() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-none");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(d.get("calibration").is_none(), "{d}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_cannot_set_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-client");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "calibration": {"choice": 9.0},
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(
+            d.get("calibration").is_none(),
+            "client calibration forwarded: {d}"
+        );
+        write_decide_calibration(&harness, "noul = 0.8");
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8})
+        );
+    }
+
+    /// A `jev-latest`-style request (no local match, spec §12.5's "use
+    /// whatever is loaded" fallback) resolves `runtime.current_path` — the
+    /// path `find_model_path` returned for the originally named request —
+    /// back to the per-model catalog record for a PATH-ONLY model (no
+    /// registry tag). The override is written through the real `hipfire
+    /// config <model> set` code path (`config_command`), not hand-rolled
+    /// TOML, so the catalog's `path` field and table key are exactly what
+    /// production writes. The harness label deliberately avoids "jev" and
+    /// "latest": `find_model_path`'s separator-stripped fuzzy match would
+    /// otherwise resolve the literal string "jev-latest" straight to a
+    /// same-labelled fixture file and never exercise the fallback branch
+    /// at all (caught empirically while writing this test).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_calibration_for_jev_latest_on_a_path_only_model() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-fallback");
+        config_command(
+            &harness.paths,
+            ConfigArgs {
+                model: Some(harness.model().to_string()),
+                action: Some(ConfigAction::Set {
+                    key: "decide.calibration.noul".to_string(),
+                    value: "0.8".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+
+        // A named request first, so the model actually loads and
+        // `runtime.current_path` is populated.
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &named);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "named request must resolve the override: {d}"
+        );
+
+        // `jev-latest` is not itself a local model: is_local_model is
+        // false, so run_decide falls back to runtime.current_path.
+        let latest = serde_json::json!({"model": "jev-latest", "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &latest);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "jev-latest fallback must resolve the same per-model override: {d}"
+        );
+    }
+
+    /// The response `model` is the served model name chat and `/health`
+    /// report (`meta.current_model`, the tag when a tag was requested), not
+    /// the resolved filesystem path.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_model_echo_is_served_model_name() {
+        let harness = Task11HttpHarness::spawn("systemone-echo");
+        let req = |model: &str| {
+            serde_json::json!({"model": model, "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}})
+        };
+        let (status, _, body) = post_systemone(harness.port(), &req(harness.model()));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let served = harness
+            .shared
+            .meta
+            .lock()
+            .unwrap()
+            .current_model
+            .clone()
+            .expect("a model is loaded");
+        assert_eq!(v["model"], served.as_str());
+        // Stand in a tag-style served name for the loaded model (what a tag
+        // request records): the echo must follow it, not the path.
+        harness.shared.meta.lock().unwrap().current_model = Some("qwen3.5:4b".to_owned());
+        let (status, _, body) = post_systemone(harness.port(), &req("jev-latest"));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "qwen3.5:4b", "{body}");
+    }
+
+    /// Write a `/v1/systemone` request and return the live TCP stream
+    /// without reading the response — mirrors `open_nonstream_request`.
+    #[cfg(unix)]
+    fn open_systemone_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/systemone HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    /// A client disconnect mid-decide must not release the admission slot
+    /// before the daemon's (deliberately slow) `decided` reply lands.
+    /// Decide's daemon round trip (`Engine::request`) has no cancellation
+    /// hook, so releasing the slot the instant hyper notices the client is
+    /// gone would let a second decide race the daemon while the first is
+    /// still, invisibly, in flight — corrupting the single-daemon
+    /// serialisation `Admission` exists to guarantee.
+    ///
+    /// This checks `harness.shared.admission.inflight()` directly (the same
+    /// technique `nonstream_client_disconnect_aborts_and_releases_admission`
+    /// uses), not the fake daemon's request log: the fake daemon is a
+    /// single-threaded Python script blocked in `time.sleep(1)` while
+    /// processing the slow decide, so it would not read/log a second
+    /// request's bytes until it finishes regardless of when serve released
+    /// admission — log-ordering alone cannot distinguish early-release from
+    /// held-to-completion here, only `inflight()` can.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_disconnect_does_not_release_admission_early() {
+        let harness = Task11HttpHarness::spawn("systemone-disconnect");
+        let port = harness.port();
+        let slow_body = serde_json::json!({
+            "model": harness.model(), "state": "t-slow",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+
+        let stream = open_systemone_request(port, &slow_body);
+
+        // Wait for the daemon to actually receive the slow decide (proving
+        // the request is admitted and dispatched) before disconnecting, so
+        // the guard is provably held mid-flight.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let slow_decide_seen = |harness: &Task11HttpHarness| {
+            Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "decide")
+                .iter()
+                .any(|row| row.get("state").and_then(|v| v.as_str()) == Some("t-slow"))
+        };
+        while Instant::now() < ready_deadline && !slow_decide_seen(&harness) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            slow_decide_seen(&harness),
+            "slow decide never reached the fake daemon within 5s; log={:?}",
+            harness.read_requests_log()
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            1,
+            "precondition: exactly one decide holds admission"
+        );
+
+        drop(stream);
+
+        // Poll admission for up to 300ms right after disconnecting. If the
+        // guard were released the instant hyper notices the client is gone
+        // (the bug), inflight would drop to 0 within this short window, well
+        // before the fake daemon's 1s sleep can possibly have elapsed.
+        let short_deadline = Instant::now() + Duration::from_millis(300);
+        let mut dropped_early = false;
+        while Instant::now() < short_deadline {
+            if harness.shared.admission.inflight() == 0 {
+                dropped_early = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !dropped_early,
+            "admission released within 300ms of disconnect — the slot must stay held for the \
+             full ~1s daemon round trip, not release the instant the client vanishes"
+        );
+
+        // It must still release once the daemon's slow decide actually
+        // completes, within a generous bound past the 1s sleep.
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < release_deadline && harness.shared.admission.inflight() != 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must eventually release once the slow daemon call completes"
+        );
+    }
+
     /// Silent non-stream client disconnect aborts the correlated daemon txn,
     /// drains done/aborted before Admission releases, then admits a follow-up.
     #[cfg(unix)]

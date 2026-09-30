@@ -1,0 +1,189 @@
+{
+ "banking77": {
+  "type": "choice",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "11a12e126e3203f6d19ff94b8e2d118c428c2d06ee7250de8f5eb59512963f5c"
+ },
+ "massive-en": {
+  "type": "choice",
+  "split": "validation",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 1,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "c6aa091d36cf6c61b34282045b011588e8dfa4666f9c56f5e018b0b2a8b8ccc3"
+ },
+ "massive-it": {
+  "type": "choice",
+  "split": "validation",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 1,
+  "excluded_reported": 2,
+  "repeats": 1,
+  "kept": 300,
+  "sha256": "57f67220ee5436f5d5f54b2c5299d5c117b9124ec79877c41f1a6b1add251fb9"
+ },
+ "clinc150": {
+  "type": "choice",
+  "split": "validation",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "76231c7a535343be0d310658b0900ba9595df2cebc70318a53d569d188160477"
+ },
+ "ledgar": {
+  "type": "choice",
+  "split": "validation",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "669d2018ab92fe182dd239d4b5a06a231cf19ee848c32d59f4ab79e2f0757d92"
+ },
+ "ag-news": {
+  "type": "choice",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "b2d795f5b832aa003aeb4e0dcc05df67404624141d8363a0e651da0436a5ab9c"
+ },
+ "sms-spam": {
+  "type": "noul",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 66,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "7ca917f47121c3df410db384f94d4d0832a928fbb80ee97d79d3e78b0c36b7ba"
+ },
+ "duplicates": {
+  "type": "noul",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "a05f5baedde78d0c0ba3981b8dffaa7862c80b5d6ef54c0a3ab6a0bf4874433f"
+ },
+ "doc-yesno": {
+  "type": "noul",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "7c7d392b35e478fc552c9addfc7288612c75a859bff383b17f07475c04a60bca"
+ },
+ "offensive": {
+  "type": "noul",
+  "split": "validation",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "c4824b156c4565330935a556eb33d57a6b14b686fb6c1f5afb1df65037f05ac3"
+ },
+ "yelp-stars": {
+  "type": "score",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "aefb08717b8b8b3b3a20aac799e74cab17ba99467011ff79b682e617563c0832"
+ },
+ "sentiment-it": {
+  "type": "score",
+  "split": "validation",
+  "seed": 1,
+  "drawn": 324,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "3ed1141b2475a6a8981800e7f8aa82436078b3bf8944b2aae70cdf642ae6af64"
+ },
+ "synth-choice": {
+  "type": "choice",
+  "split": "generate.py seed 7",
+  "seed": 7,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 15,
+  "repeats": 7,
+  "kept": 300,
+  "sha256": "35a80e51b7ae642ae8cde342ce4821ef76a65a0db56d8fb1d43d5a54968ce5c8"
+ },
+ "synth-score": {
+  "type": "score",
+  "split": "generate.py seed 7",
+  "seed": 7,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 15,
+  "repeats": 7,
+  "kept": 300,
+  "sha256": "eb07f3657039db7323c9e54fde09ec52f83fdff8fd0c5b3bf0d964a9fd7ad03a"
+ },
+ "synth-noul": {
+  "type": "noul",
+  "split": "generate.py seed 7",
+  "seed": 7,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 15,
+  "repeats": 7,
+  "kept": 300,
+  "sha256": "43427f655a58525d3fce933b4033a5e78f373b2e87627f50f39da99db86eef9b"
+ },
+ "openbookqa": {
+  "type": "choice",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 1,
+  "kept": 300,
+  "sha256": "81faa498feac14bf3896cfa893dfb8b1e22d7f7674da9ae21fbe92d39ed37420"
+ },
+ "commonsense_qa": {
+  "type": "choice",
+  "split": "train",
+  "seed": 1,
+  "drawn": 400,
+  "label_filtered": 0,
+  "excluded_reported": 0,
+  "repeats": 0,
+  "kept": 300,
+  "sha256": "a5b88c2e885ec850a66e04afd0ace6b49db6fd7556f8c3301b640ec2c2b540a7"
+ }
+}

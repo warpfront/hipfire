@@ -8,6 +8,7 @@ pub mod admission;
 pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
+pub mod decide;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
@@ -184,6 +185,50 @@ pub trait Carrier: Send + Sync {
     ) -> Option<bool> {
         None
     }
+
+    // ── decide (Jev-compatible logit readout) ──────────────────────────────
+    /// Whether this arch implements the three decide hooks below.
+    fn decide_supported(&self) -> bool {
+        false
+    }
+    /// Prefill `tokens` at `start_pos` and set `m.seq_pos = start_pos +
+    /// tokens.len()`. With `want_logits` the last position's full-vocab
+    /// logits are downloaded and returned; without it (the decide runner's
+    /// shared-prefix prefill, whose logits are never read) the device→host
+    /// copy is skipped and an empty `Vec` is returned.
+    fn decide_prefill_logits(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _tokens: &[u32],
+        _start_pos: usize,
+        _want_logits: bool,
+    ) -> Option<Result<Vec<f32>, String>> {
+        None
+    }
+    /// Snapshot `seq_pos` + recurrent state.
+    fn decide_save(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+    ) -> Option<Result<crate::decide::DecideSnapshot, String>> {
+        None
+    }
+    /// Restore a snapshot taken by `decide_save` on the same model.
+    fn decide_restore(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _snap: &crate::decide::DecideSnapshot,
+    ) -> Option<Result<(), String>> {
+        None
+    }
+    /// KV compaction offset (`KvCache::compact_offset`) of the model's
+    /// positional KV cache: 0 means uncompacted, so a positional rewind of
+    /// `seq_pos` is valid. `None` = hook not provided.
+    fn decide_kv_compact_offset(&self, _m: &LoadedModel) -> Option<usize> {
+        None
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
@@ -198,6 +243,11 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .iter()
         .copied()
         .find(|c| c.claims_arch_id(arch_id, false))
+}
+
+/// All registered carriers (read-only view for capability tests).
+pub fn registry_carriers() -> impl Iterator<Item = &'static dyn Carrier> {
+    REGISTRY.iter().copied()
 }
 
 // ─── Typed routing (replaces stringly `c.name() == "..."` predicates) ──────
@@ -4265,9 +4315,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         let _ = dev.bind_thread();
                         if let Err(e) = kv.free_gpu(dev) {
                             if ep_first_err.is_none() {
-                                ep_first_err = Some(format!(
-                                    "unload dense qwen TP KV rank {rank}: {e:?}"
-                                ));
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP KV rank {rank}: {e:?}"));
                             }
                         }
                         // Per-rank VMM teardown gate (mirrors the single-GPU
@@ -4276,9 +4325,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                         // success for contiguous (no arenas registered).
                         if let Err(e) = dev.ensure_vmm_cleaned() {
                             if ep_first_err.is_none() {
-                                ep_first_err = Some(format!(
-                                    "unload dense qwen TP VMM rank {rank}: {e:?}"
-                                ));
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP VMM rank {rank}: {e:?}"));
                             }
                         }
                     }

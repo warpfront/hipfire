@@ -698,6 +698,44 @@ async fn handle_request(
                 Err(message) => openai_error(&message, images_error_status(&message)),
             }
         }
+        (Method::POST, "/v1/systemone") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+
+            // Same exclusive admission as non-batch chat: the single-daemon
+            // backend serialises decide against chat traffic. The
+            // CancellationToken lets a client disconnect while queued abort
+            // the wait promptly; once acquired, `guard` moves into
+            // `handle_decide`'s spawn_blocking and is held until the daemon
+            // call(s) finish, not merely until this future is dropped.
+            let mut cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.token();
+            let cancelled = cancel_guard.cancelled();
+            let guard = match shared.admission.acquire_async(cancel.clone()).await {
+                Ok(g) => g,
+                Err(e) => return admission_error_response(&e),
+            };
+            let response =
+                crate::serve::decide::handle_decide(shared, body_val, guard, cancelled).await;
+            cancel_guard.disarm();
+            response
+        }
         _ => openai_error("not found", 404),
     }
 }

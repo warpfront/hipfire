@@ -3607,6 +3607,25 @@ fn main() {
                 }
             }
 
+            "decide" => {
+                let lanes_active = batch_scheduler
+                    .as_ref()
+                    .is_some_and(|s| s.active_count() > 0);
+                let (reply, reset) = hipfire_generate::decide::handle_decide_message(
+                    model.as_mut(),
+                    &mut gpu,
+                    &msg,
+                    lanes_active,
+                    slot_backend.is_some(),
+                );
+                // `reset`: the decide ran and rolled the model back; bump like `reset`.
+                if reset {
+                    state_epoch = state_epoch.saturating_add(1);
+                }
+                let _ = writeln!(stdout, "{reply}");
+                let _ = stdout.flush();
+            }
+
             "reset" => {
                 // attempt_id is mandatory and must be echoed exactly on the ack.
                 // Reject before mutating host/GPU state.

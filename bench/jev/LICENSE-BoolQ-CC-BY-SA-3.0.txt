@@ -1,0 +1,41 @@
+BoolQ-derived data: licence notice
+===================================
+
+The following files hold data derived from BoolQ, under BoolQ's own
+licence, and are the one exception to this repository's overall licensing
+(see "Scope" below):
+
+  bench/jev/*/probs/jevbench_doc-yesno.jsonl.gz
+  bench/jev/*/heldout/doc-yesno.jsonl.gz
+
+Each row is `{"source", "type", "probs", "gold"}`: served probabilities and
+a label index (spec `docs/specs/2026-09-28-jev-decide-design.md` §13.6),
+with no BoolQ passage or question text and no option keys. See
+bench/jev/DATA-LICENSES.md for the full per-dataset licence review.
+
+Source and attribution
+-----------------------
+
+BoolQ: Exploring the Surprising Difficulty of Natural Yes/No Questions.
+Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael
+Collins, Kristina Toutanova. NAACL 2019.
+https://github.com/google-research-datasets/boolq
+
+Licence
+-------
+
+BoolQ is distributed by Google under the Creative Commons
+Attribution-ShareAlike 3.0 Unported licence (CC BY-SA 3.0):
+https://creativecommons.org/licenses/by-sa/3.0/
+
+The files listed above are therefore themselves distributed under
+CC BY-SA 3.0, with attribution to BoolQ (Clark et al., 2019) as given above.
+
+Scope
+-----
+
+This notice covers only the files matching the patterns above. Not every
+model has both: qwen3.5-4b, for instance, has no
+`probs/jevbench_doc-yesno.jsonl.gz` (see `git ls-files bench/jev | grep -i
+yesno`). Everything else in this repository remains licensed under
+Apache-2.0 (see LICENSE and NOTICE in the project root).

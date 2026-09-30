@@ -12,4 +12,7 @@ hipfire-loader = { path = "../hipfire-loader" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
-serde_json.workspace = true
+# preserve_order: choice criteria keys (and question names) keep request order,
+# so option codes map to keys in the caller's order without relying on
+# feature unification from another crate.
+serde_json = { workspace = true, features = ["preserve_order"] }
