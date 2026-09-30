@@ -858,10 +858,11 @@ pub trait Speculator {
         Vec::new()
     }
 
-    /// Whether a prompt-cache hit may resume this drafter from the cached
-    /// prefix (suffix-only prefill). `false` makes every turn a cold
-    /// full-prompt prefill.
-    fn supports_prompt_cache(&self) -> bool {
+    /// Whether this speculator can continue its own state from a cached prompt
+    /// prefix of `start_pos` tokens (suffix-only prefill). `false` makes the
+    /// planner turn the hit into a cold miss.
+    fn prompt_cache_resumable(&self, start_pos: usize) -> bool {
+        let _ = start_pos;
         true
     }
 
@@ -1101,8 +1102,9 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
-    /// See [`Speculator::supports_prompt_cache`].
-    fn mtp_supports_prompt_cache(&self) -> bool {
+    /// See [`Speculator::prompt_cache_resumable`].
+    fn mtp_prompt_cache_resumable(&self, start_pos: usize) -> bool {
+        let _ = start_pos;
         true
     }
 
@@ -1327,8 +1329,8 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         self.arch.mtp_checkpoint_positions()
     }
 
-    fn supports_prompt_cache(&self) -> bool {
-        self.arch.mtp_supports_prompt_cache()
+    fn prompt_cache_resumable(&self, start_pos: usize) -> bool {
+        self.arch.mtp_prompt_cache_resumable(start_pos)
     }
 
     fn rewind_to(

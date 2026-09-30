@@ -2551,7 +2551,9 @@ fn main() {
                         // Jinja-rendered prompt. Enabling the cache would corrupt KV
                         // slot offsets after turn 1 (stale prefix reuse). Wire when
                         // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
+                        // arch_id 16 (qwen4): generate_qwen4_ar and native MTP resume a pure
+                        // prompt extension; divergent history cold-resets.
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14 | 16);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
                         let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)

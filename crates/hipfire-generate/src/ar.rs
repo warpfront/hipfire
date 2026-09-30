@@ -417,6 +417,64 @@ where
     Some(fp)
 }
 
+/// Insert one committed assistant turn into `asst_turn_cache`: verbatim body
+/// tokens plus the producer reasoning text. No-op unless `action.store`.
+pub fn qwen_ar_store_turn(
+    m: &mut LoadedModel,
+    action: &QwenArCacheAction,
+    cached_seq: Vec<u32>,
+    started_in_think: bool,
+) -> Option<u64> {
+    if !action.store {
+        return None;
+    }
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!(
+            "[qwen-cache store] cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+            cached_seq.len(),
+            action.fingerprint_text.len(),
+            action.tool_calls.len(),
+            action.fingerprint_text.chars().take(60).collect::<String>(),
+        );
+    }
+    // Whole-envelope store (Qwen branch only): FULL generated body verbatim
+    // plus the producer reasoning text. The shared lookup replays R...A as one
+    // span on think-envelope templates; no-reasoning turns keep the
+    // primer-prepended single-slot path.
+    let tok = m.tokenizer.as_ref().unwrap();
+    let cache = &mut m.asst_turn_cache;
+    qwen_ar_apply_cache_action(
+        |fp, seq| {
+            let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                tok,
+                &seq,
+                started_in_think,
+            )
+            .map(|text| hipfire_runtime::prompt_frame::CachedAssistantBody {
+                token_ids: Vec::new(),
+                text,
+            });
+            cache.insert(
+                fp,
+                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                    reasoning,
+                    tools: Vec::new(),
+                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: seq,
+                        text: String::new(),
+                    }),
+                },
+            )
+        },
+        action,
+        cached_seq,
+    )
+}
+
 /// Build the full Qwen AR `done` envelope (hostile-id safe). Used to stage
 /// `commit_ready` then emit identical payload as `done` after Commit.
 pub fn qwen_ar_done_value(
@@ -1798,6 +1856,10 @@ pub fn llama_prefill_sample_seed(mut seed: u32, token_count: usize, temperature:
 /// stay with the route selector; this body owns the invariant lifecycle:
 /// allocate logits, mutate device state before publishing tokens, roll back on
 /// every forward/semantic/terminal failure, and emit exactly one terminal.
+///
+/// `prompt_tokens` is the full canonical conversation; `prefill_tokens` is
+/// what gets forwarded: its suffix from `cached_tokens` on a prompt-cache
+/// hit, the whole prompt on a miss.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_ar_with_forward<Prefill, Decode>(
     m: &mut LoadedModel,
@@ -1806,6 +1868,8 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
     id: &str,
     route: GenerationRoute,
     prompt_tokens: &[u32],
+    prefill_tokens: &[u32],
+    cached_tokens: usize,
     vocab_size: usize,
     eos_token: u32,
     temp: f32,
@@ -1839,6 +1903,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         &rdna_compute::GpuTensor,
     ) -> Result<u32, String>,
 {
+    debug_assert_eq!(cached_tokens + prefill_tokens.len(), prompt_tokens.len());
     if vocab_size == 0 {
         emit_active_attempt_error(
             stdout,
@@ -1882,7 +1947,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
 
     emit_generation_start(route, stdout, id, started_in_think);
     let t0 = Instant::now();
-    if let Err(error) = forward_chunk(m, gpu, prompt_tokens, &prompt_logits) {
+    if let Err(error) = forward_chunk(m, gpu, prefill_tokens, &prompt_logits) {
         let _ = gpu.free_tensor(prompt_logits);
         let _ = gpu.free_tensor(decode_logits);
         let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -1916,6 +1981,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         }
     };
     m.seq_pos = prompt_tokens.len();
+    m.conversation_tokens.clear();
     m.conversation_tokens.extend_from_slice(prompt_tokens);
     let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let sampler_config = SamplerConfig {
@@ -2077,7 +2143,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
     }
 
     let hit_length_cap = generated >= max_tokens && !natural_stop;
-    let (finish, _) = match semantic.finish(stdout, hit_length_cap) {
+    let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
         Ok(result) => result,
         Err(error) => {
             let _ = gpu.free_tensor(decode_logits);
@@ -2108,7 +2174,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         0.0
     };
     let prefill_tok_s = if prefill_ms > 0.0 {
-        prompt_tokens.len() as f64 / (prefill_ms / 1000.0)
+        prefill_tokens.len() as f64 / (prefill_ms / 1000.0)
     } else {
         0.0
     };
@@ -2122,12 +2188,12 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         finish.finish_reason,
         generated,
         tok_s,
-        prompt_tokens.len(),
+        prefill_tokens.len(),
         prefill_ms,
         prefill_tok_s,
         decode_tok_s,
         prefill_ms,
-        0,
+        cached_tokens,
         "",
     );
     stage_terminal_tool_calls(
@@ -2142,6 +2208,13 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let im_end = tokenizer.encode("<|im_end|>");
+    let im_end_token = (im_end.len() == 1).then(|| im_end[0]);
+    let nl_set: std::collections::HashSet<u32> = tokenizer.encode("\n").into_iter().collect();
+    let cached_seq = crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+    let action = qwen_ar_cache_action(&finish, &visible_for_cache);
+    let _ = qwen_ar_store_turn(m, &action, cached_seq, started_in_think);
     let _ = gpu.free_tensor(decode_logits);
     emit_active_route_done_value(stdout, &pending_done);
 }
@@ -5600,56 +5673,7 @@ pub fn generate(
                     cached_seq.pop();
                 }
             }
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[qwen-cache store] cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    cached_seq.len(),
-                    cache_action.fingerprint_text.len(),
-                    cache_action.tool_calls.len(),
-                    cache_action
-                        .fingerprint_text
-                        .chars()
-                        .take(60)
-                        .collect::<String>(),
-                );
-            }
-            // Whole-envelope store (Qwen branch only): FULL generated body
-            // verbatim plus the producer reasoning text. The shared lookup
-            // replays R...A as one span on think-envelope templates;
-            // no-reasoning turns keep the primer-prepended single-slot path.
-            let tok = m.tokenizer.as_ref().unwrap();
-            let _ = qwen_ar_apply_cache_action(
-                |fp, seq| {
-                    let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
-                        tok,
-                        &seq,
-                        started_in_think,
-                    )
-                    .map(|text| {
-                        hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: Vec::new(),
-                            text,
-                        }
-                    });
-                    m.asst_turn_cache.insert(
-                        fp,
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning,
-                            tools: Vec::new(),
-                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                token_ids: seq,
-                                text: String::new(),
-                            }),
-                        },
-                    )
-                },
-                &cache_action,
-                cached_seq,
-            );
+            let _ = qwen_ar_store_turn(m, &cache_action, cached_seq, started_in_think);
         }
 
         emit_active_route_done(stdout, id, &pending_done);

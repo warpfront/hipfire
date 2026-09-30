@@ -1,6 +1,22 @@
 # Changelog
 
 ## Unreleased
+- **Qwen4 (Flash-Next) prompt-cache reuse, AR and native MTP.** A turn whose
+  canonical render purely extends the processed conversation keeps the device
+  state and prefills only the new suffix (`cached_tokens` > 0); edited or
+  divergent history still cold-resets. The daemon now advertises arch 16 as
+  cache-capable. An MTP turn right after an AR turn is a cold miss by design:
+  the AR decode does not feed the MTP head. MTP windows now stop at
+  `<|im_end|>` rather than the config EOS, so a turn's end-of-turn token no
+  longer commits a draft tail the drafter cannot roll back (which had
+  invalidated the cache after every MTP turn). `HIPFIRE_QWEN_PROMPT_CACHE=0`
+  disables reuse. Serve chain on `qwen3.8-flash-next.mq4` (gfx1151): turns
+  2-5 prefill 26-56 new tokens instead of 249-741; the first three turns are
+  byte-identical to the cold arm, and turn 4 diverges mid-story at a greedy
+  near-tie with coherent text. Warm-continuation oracle:
+  `crates/hipfire-arch-qwen4/examples/qwen4_prompt_cache.rs` (lab); daemon
+  test: `crates/hipfire-generate/tests/qwen4_prompt_cache_hw.rs` (ignored;
+  GPU).
 - **gfx1151: fix garbage output on Qwen3.5-family prompts that prefill through the GDN chunk scan with a partial last chunk.** The `gdn_chunk_scan_gfx1151` twin let clang sink its final output WMMAs into the `tok < rows` store branch. WMMA then ran with the tail lanes masked off, so the valid rows of a partial 16-row block read undefined operands (off by ~5e3, or NaN). Full 64-row chunks were unaffected. A 291-token prompt on qwen3.8-27b decoded `MENTS` under AR and MTP alike; `HIPFIRE_GFX1151_GDN_SCAN=0` was the workaround. An empty `asm volatile` pin now keeps the WMMAs at full EXEC, and the twin is again byte-identical to `gdn_chunk_scan` for every tail length. Regression test: `crates/rdna-compute/tests/gdn_chunk_scan_tail.rs` (ignored; GPU).
 - Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
   bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`

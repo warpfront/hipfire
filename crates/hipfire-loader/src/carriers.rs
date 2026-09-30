@@ -439,6 +439,7 @@ impl Carrier for Qwen4Carrier {
             Some(hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(
                 max_k,
                 ctx.max_seq,
+                meta.tokenizer.special_token_id("<|im_end|>"),
             ))
         } else {
             None
