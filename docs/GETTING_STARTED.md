@@ -214,9 +214,9 @@ hipfire run qwen3.5:4b "..."   # reuses serve when healthy
 hipfire stop                   # graceful stop of the tracked daemon
 ```
 
-Defaults (overridable in config): bind **`0.0.0.0:11435`**, pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
+Defaults (overridable in config): bind **`127.0.0.1:11435`** (loopback only), pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
 
-> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default `0.0.0.0` listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). For local-only use, bind loopback: `hipfire config set host 127.0.0.1` or `hipfire serve 127.0.0.1 11435`. Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
+> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
 
 Force a one-shot daemon and skip HTTP:
 
@@ -243,7 +243,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
-| `host` / `port` | `0.0.0.0` / `11435` | Serve bind (no auth, no TLS) |
+| `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
 
 Enable draft-model speculation only when you intend to:
 

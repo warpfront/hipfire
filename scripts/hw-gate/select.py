@@ -31,7 +31,8 @@ CONTRACT
 BUCKET RULES (first match wins per path; a path may hit `policy` in addition)
     kernel : kernels/**, crates/rdna-compute/**, crates/hipfire-dispatch/**, crates/hip-bridge/**,
              crates/saddle-core/**
-    serve  : crates/hipfire-engine/**, crates/hipfire-generate/**, crates/hipfire-daemon/src/slots.rs,
+    serve  : crates/hipfire-engine/**, crates/hipfire-generate/**, crates/hipfire-cli/src/serve/**,
+             crates/hipfire-client/**, crates/hipfire-daemon/src/slots.rs,
              crates/hipfire-daemon/src/serve*.rs, crates/hipfire-runtime/src/{emit_text,eos_filter,dflash,
              dflash_generic,dspark_core,spec,reset_core,triattn}.rs, crates/hipfire-arch-*/src/**/{serve,generate,spec}*.rs
     load   : crates/hipfire-loader/**, crates/hipfire-daemon/** (remaining), crates/hipfire-runtime/src/{model_load,
@@ -73,6 +74,9 @@ _KERNEL_PATTERNS: list[str] = [
 _SERVE_PATTERNS: list[str] = [
     "crates/hipfire-engine/**",
     "crates/hipfire-generate/**",
+    # the OpenAI HTTP gateway and its daemon client
+    "crates/hipfire-cli/src/serve/**",
+    "crates/hipfire-client/**",
     "crates/hipfire-daemon/src/slots.rs",
     "crates/hipfire-daemon/src/serve*.rs",
     # crates/hipfire-runtime/src/{emit_text,...}.rs expanded

@@ -2193,7 +2193,12 @@ pub fn load_lloyd_lut(
         )
     })?;
     let (e4m3, f16) = lloyd_luts_from_levels(&levels);
-    let c16 = lloyd_lut_c16_from_levels(&levels);
+    let c16 = lloyd_lut_c16_from_levels(&levels).map_err(|e| {
+        HipError::new(
+            0,
+            &format!("MQ4G256V2Lloyd weight {weight_name} sidecar {sidecar} invalid: {e}"),
+        )
+    })?;
     Ok((e4m3, f16, c16))
 }
 

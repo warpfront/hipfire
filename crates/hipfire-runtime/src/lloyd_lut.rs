@@ -122,22 +122,25 @@ pub fn lloyd_luts_from_levels(levels: &[f32; 16]) -> ([u32; 4], [u32; 8]) {
 /// [`lloyd_luts_from_levels`]). U1 emits the unbiased signed codes; the MMQ
 /// twin (U2) may fold a +120 bias into the zp term if the weight-side WMMA
 /// operand must stay unsigned (Outcome B).
-pub fn lloyd_lut_c16_from_levels(levels: &[f32; 16]) -> [u32; 4] {
+///
+/// A level outside [0,15] (or NaN) from a malformed sidecar is an `Err`, so the
+/// load fails instead of the daemon panicking.
+pub fn lloyd_lut_c16_from_levels(levels: &[f32; 16]) -> Result<[u32; 4], String> {
     let mut out = [0u32; 4];
     for (i, &l) in levels.iter().enumerate() {
         let c = l - LLOYD_CENTER;
         let code_f = (16.0 * c).round_ties_even();
         // L ∈ [0,15] ⇒ C ∈ [-7.5,7.5] ⇒ 16C ∈ [-120,120].
-        assert!(
-            (-120.0..=120.0).contains(&code_f),
-            "C16 code {code_f} out of [-120,120] for level {l}"
-        );
+        if !(-120.0..=120.0).contains(&code_f) {
+            return Err(format!(
+                "C16 code {code_f} out of [-120,120] for level {i} = {l}"
+            ));
+        }
         let code_i = code_f as i32;
-        debug_assert!((-120..=120).contains(&code_i));
         let byte = code_i as i8 as u8;
         out[i / 4] |= (byte as u32) << ((i % 4) * 8);
     }
-    out
+    Ok(out)
 }
 
 /// Validate + parse a `lloyd_levels` sidecar: F32 (qt=2), shape [16], 64 bytes.
@@ -347,7 +350,7 @@ mod tests {
             );
             let expected = scaled as i32;
             let levels = [LLOYD_CENTER + e; 16];
-            let c16 = lloyd_lut_c16_from_levels(&levels);
+            let c16 = lloyd_lut_c16_from_levels(&levels).unwrap();
             for i in 0..16 {
                 assert_eq!(c16_code(&c16, i), expected, "b=0x{b:02x} level {i}");
             }
@@ -366,7 +369,7 @@ mod tests {
         levels[1] = LLOYD_CENTER + 0.15625;
         levels[2] = LLOYD_CENTER - 0.09375;
         levels[3] = LLOYD_CENTER + 0.0625; // 16·0.0625 = 1.0 exact
-        let c16 = lloyd_lut_c16_from_levels(&levels);
+        let c16 = lloyd_lut_c16_from_levels(&levels).unwrap();
         assert_eq!(c16_code(&c16, 0), 2, "1.5 ties to even → 2");
         assert_eq!(c16_code(&c16, 1), 2, "2.5 ties to even → 2");
         assert_eq!(c16_code(&c16, 2), -2, "-1.5 ties to even → -2");
@@ -384,7 +387,7 @@ mod tests {
     #[test]
     fn c16_uniform_grid_matches_16_times_centered() {
         let levels: [f32; 16] = core::array::from_fn(|i| i as f32);
-        let c16 = lloyd_lut_c16_from_levels(&levels);
+        let c16 = lloyd_lut_c16_from_levels(&levels).unwrap();
         for i in 0..16 {
             let expected = (16.0 * (i as f32 - LLOYD_CENTER)).round_ties_even() as i32;
             assert_eq!(c16_code(&c16, i), expected, "uniform level {i}");
@@ -392,5 +395,17 @@ mod tests {
         // Ends: L=0 → -120; L=15 → +120.
         assert_eq!(c16_code(&c16, 0), -120);
         assert_eq!(c16_code(&c16, 15), 120);
+    }
+
+    #[test]
+    fn c16_rejects_malformed_levels_instead_of_panicking() {
+        // A corrupt sidecar passes the dtype/shape/size checks; its levels must
+        // fail the load, not abort the daemon.
+        for bad in [f32::NAN, f32::INFINITY, -1.0, 15.6] {
+            let mut levels: [f32; 16] = core::array::from_fn(|i| i as f32);
+            levels[5] = bad;
+            let err = lloyd_lut_c16_from_levels(&levels).unwrap_err();
+            assert!(err.contains("level 5"), "{bad}: {err}");
+        }
     }
 }

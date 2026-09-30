@@ -56,9 +56,27 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         Vec<u32>,
         Vec<usize>,
     ) {
+        drive_ar_semantic_path_with_stop(chunks, started_in_think, hit_length_cap, &[])
+    }
+
+    /// [`drive_ar_semantic_path`] with the request's `stop` sequences.
+    fn drive_ar_semantic_path_with_stop(
+        chunks: &[&str],
+        started_in_think: bool,
+        hit_length_cap: bool,
+        stop: &[&str],
+    ) -> (
+        String,
+        String,
+        Result<QwenArRouteFinish, hipfire_runtime::emit_text::ToolRouteError>,
+        bool,
+        Vec<u32>,
+        Vec<usize>,
+    ) {
         let _guard = begin_terminal_test("t1", 7);
         set_active_attempt_id(7);
-        let mut producer = QwenArSemanticProducer::new("t1", started_in_think);
+        let stop: Vec<String> = stop.iter().map(|s| (*s).to_owned()).collect();
+        let mut producer = QwenArSemanticProducer::new("t1", started_in_think).with_stop(&stop);
         let mut sink = Vec::new();
         let mut conversation_tokens = Vec::new();
         let mut streamed_tokens = Vec::new();
@@ -849,22 +867,123 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
 
     #[test]
     fn terminal_cause_resolve_priority() {
-        assert_eq!(
-            QwenArTerminalCause::resolve(true, true, true),
-            QwenArTerminalCause::OpenThink
+        use QwenArTerminalCause::*;
+        // (stopped_by_filter, stop_sequence, hit_length_cap, open_think)
+        // Out of budget inside <think> is a length stop, not a protocol error.
+        assert_eq!(QwenArTerminalCause::resolve(false, false, true, true), LengthCap);
+        // The model ending the turn inside <think> stays fail-closed, even on
+        // the final budget token; so does an open think without a length cap.
+        assert_eq!(QwenArTerminalCause::resolve(true, false, true, true), OpenThink);
+        assert_eq!(QwenArTerminalCause::resolve(true, false, false, true), OpenThink);
+        assert_eq!(QwenArTerminalCause::resolve(false, false, false, true), OpenThink);
+        // A user stop sequence ends the answer ahead of everything after it.
+        assert_eq!(QwenArTerminalCause::resolve(true, true, true, true), StopSequence);
+        assert_eq!(QwenArTerminalCause::resolve(false, true, true, false), StopSequence);
+        assert_eq!(QwenArTerminalCause::resolve(true, false, true, false), DecodedEot);
+        assert_eq!(QwenArTerminalCause::resolve(false, false, true, false), LengthCap);
+        assert_eq!(QwenArTerminalCause::resolve(false, false, false, false), NaturalStop);
+    }
+
+    #[test]
+    fn open_think_at_length_cap_is_length_with_reasoning_not_error() {
+        // max_tokens spent mid-reasoning: every reasoning byte streams, the turn
+        // ends with done/finish_reason=length, and nothing is cached.
+        let (out, visible, fin, stopped, _, _) =
+            drive_ar_semantic_path(&["step one, ", "step two"], true, true);
+        assert!(!stopped);
+        let fin = fin.expect("length finish");
+        assert_eq!(fin.cause, QwenArTerminalCause::LengthCap);
+        assert_eq!(fin.finish_reason, "length");
+        assert!(fin.wire_tool_calls.is_empty());
+        assert!(!fin.store_cache);
+        assert!(visible.is_empty(), "no answer text: {visible:?}");
+        let events = parse_jsonl(&out);
+        let reasoning: String = events
+            .iter()
+            .filter(|e| e["type"] == "reasoning")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasoning, "step one, step two");
+        assert!(events.iter().all(|e| e["type"] != "error"), "{out}");
+        let done: Vec<_> = events.iter().filter(|e| e["type"] == "done").collect();
+        assert_eq!(done.len(), 1, "{out}");
+        assert_eq!(done[0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn stop_sequence_split_across_tokens_is_trimmed_and_never_emitted() {
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path_with_stop(
+            &["Hello E", "N", "D tail", "never routed"],
+            false,
+            false,
+            &["END"],
         );
-        assert_eq!(
-            QwenArTerminalCause::resolve(true, true, false),
-            QwenArTerminalCause::DecodedEot
+        assert!(stopped, "stop sequence must end generation");
+        let fin = fin.expect("stop finish");
+        assert_eq!(fin.cause, QwenArTerminalCause::StopSequence);
+        assert_eq!(fin.finish_reason, "stop");
+        assert!(!fin.store_cache, "KV holds the trimmed stop text");
+        assert_eq!(visible, "Hello ");
+        let tokens: String = parse_jsonl(&out)
+            .iter()
+            .filter(|e| e["type"] == "token")
+            .map(|e| e["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(tokens, "Hello ");
+        assert!(!out.contains("END") && !out.contains("tail"), "{out}");
+    }
+
+    #[test]
+    fn stop_sequence_matches_answer_not_reasoning() {
+        // "\n" inside <think> must not end the turn (it would leave the think
+        // span open); it applies to the answer only.
+        let (out, visible, fin, _, _, _) = drive_ar_semantic_path_with_stop(
+            &["line one\nline two</think>", "answer\nmore"],
+            true,
+            false,
+            &["\n"],
         );
-        assert_eq!(
-            QwenArTerminalCause::resolve(false, true, false),
-            QwenArTerminalCause::LengthCap
+        let fin = fin.expect("stop finish");
+        assert_eq!(fin.cause, QwenArTerminalCause::StopSequence);
+        assert_eq!(fin.finish_reason, "stop");
+        assert_eq!(visible, "answer");
+        let reasoning: String = parse_jsonl(&out)
+            .iter()
+            .filter(|e| e["type"] == "reasoning")
+            .map(|e| e["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(reasoning, "line one\nline two");
+        assert!(!out.contains("more"), "{out}");
+    }
+
+    #[test]
+    fn stop_sequence_cutting_a_tool_call_is_a_clean_stop() {
+        // The stop lands inside the call's arguments: the partial call is
+        // dropped, not reported as a malformed-protocol error.
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path_with_stop(
+            &[r#"pre<tool_call>{"name":"read","arguments":{"path":"/x"}}</tool_call>"#],
+            false,
+            false,
+            &["/x"],
         );
-        assert_eq!(
-            QwenArTerminalCause::resolve(false, false, false),
-            QwenArTerminalCause::NaturalStop
-        );
+        assert!(stopped);
+        let fin = fin.expect("stop finish");
+        assert_eq!(fin.finish_reason, "stop");
+        assert!(fin.wire_tool_calls.is_empty());
+        assert_eq!(visible, "pre");
+        assert!(parse_jsonl(&out).iter().all(|e| e["type"] != "error"), "{out}");
+    }
+
+    #[test]
+    fn unmatched_stop_prefix_is_released_at_end_of_stream() {
+        let (out, visible, fin, stopped, _, _) =
+            drive_ar_semantic_path_with_stop(&["abc ", "EN"], false, false, &["END"]);
+        assert!(!stopped);
+        let fin = fin.expect("natural finish");
+        assert_eq!(fin.cause, QwenArTerminalCause::NaturalStop);
+        assert!(fin.store_cache);
+        assert_eq!(visible, "abc EN");
+        assert!(out.contains("EN"));
     }
 
     #[test]

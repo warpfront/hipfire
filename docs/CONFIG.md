@@ -451,7 +451,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `true` | bool | Adaptive draft block size. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
-| `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when weights present (DeepSeek path primary). Separate Qwen35 MTP env gate may apply — see env doc. |
+| `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |
 | `dspark_conf_threshold` | `null` | `null` or number 0.0–1.0 | `null` ⇒ per-arch carrier default (qwen3 0.1 / deepseek4 0.3 in comments). |
 | `ngram_mode` | `"off"` | `off` \| `on` \| `auto` | Model-free; byte-identical to AR when used. |
@@ -561,14 +561,16 @@ runtime PFlash module — not restated here.
 
 | Key | Default | Range |
 |---|---|---|
-| `host` | `"0.0.0.0"` | non-empty hostname/IP, no whitespace, ≤255 |
+| `host` | `"127.0.0.1"` | non-empty hostname/IP, no whitespace, ≤255 (`0.0.0.0` = all interfaces) |
 | `port` | `11435` | int 1–65535 |
 | `idle_timeout` | `300` | int 0–86400 seconds (`0` = never unload) |
 | `default_model` | `"qwen3.5:9b"` | non-empty tag/path string |
 | `serve.local` | `false` | Force the current command to use a locally spawned daemon. |
 | `max_request_bytes` | `67108864` (64 MiB) | int 4096–4GiB |
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
-| `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
+| `serve_queue_timeout_ms` | `600000` (10 min) | int 0–3600000 (`0` = no wait timeout). Serve runs one generation at a time by default, so this must cover a full generation. |
+| `serve.allow_request_pull` | `false` | bool. Let a chat request that names a registry model not on disk download it; off → 404 "run `hipfire pull`". Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PULL`. |
+| `serve.allow_request_paths` | `false` | bool. Let a chat request load any readable file it names; off → only installed models (models directory, catalog paths, the pre-warm model). Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS`. |
 | `experimental_budget_alert` | `false` | bool |
 | `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |

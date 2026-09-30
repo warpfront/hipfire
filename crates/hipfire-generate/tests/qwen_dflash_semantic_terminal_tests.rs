@@ -529,6 +529,35 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     }
 
     #[test]
+    fn open_think_at_length_cap_is_length_done_not_error() {
+        // Budget spent mid-reasoning on the spec path: the reasoning already
+        // streamed, and the terminal is done/length (no calls, no cache), not
+        // the fail-closed open-think error.
+        let (stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        assert!(stream.iter().any(|e| matches!(e, ClientEvent::Reasoning(_))));
+        assert!(fin.open_think);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "", false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "length");
+                assert!(!*release_tool_calls);
+                assert!(!*store_cache);
+                assert!(wire_tool_calls.is_empty());
+            }
+            other => panic!("expected length Done, got {other:?}"),
+        }
+        // A grammar violation still fails closed at the same boundary.
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, true, "", false);
+        assert!(matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }));
+    }
+
+    #[test]
     fn producer_decoded_eot_beats_length_without_token_rescan() {
         // Real emitter decoded_eot at budget boundary → stop, not length.
         let tok = test_tokenizer();

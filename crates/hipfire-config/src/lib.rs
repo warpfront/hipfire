@@ -1028,7 +1028,7 @@ pub static FIELDS: &[ConfigField] = &[
         "host",
         Serve,
         Process,
-        DefaultValue::String("0.0.0.0"),
+        DefaultValue::String("127.0.0.1"),
         ValueRule::Host,
         false,
         false,
@@ -1106,7 +1106,7 @@ pub static FIELDS: &[ConfigField] = &[
         "serve_queue_timeout_ms",
         Serve,
         Process,
-        DefaultValue::Integer(30000),
+        DefaultValue::Integer(600000),
         ValueRule::Integer {
             min: 0,
             max: 3600000
@@ -1114,7 +1114,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         Some("HIPFIRE_SERVE_QUEUE_TIMEOUT_MS"),
-        "Maximum admission-queue wait."
+        "Maximum admission-queue wait before a queued request gets 503. Serve runs one generation at a time by default, so this must cover one full generation; zero waits forever."
     ),
     process_bool_field!(
         "serve.retry_enabled",
@@ -1134,6 +1134,24 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
         "Backoff before the single serve retry; slept outside runtime and admission locks."
+    ),
+    process_bool_field!(
+        "serve.allow_request_pull",
+        "allow_request_pull",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_ALLOW_REQUEST_PULL",
+        "Let a chat request that names a registry model not on disk download it. Off: the request gets 404 and the operator runs `hipfire pull`."
+    ),
+    process_bool_field!(
+        "serve.allow_request_paths",
+        "allow_request_paths",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_ALLOW_REQUEST_PATHS",
+        "Let a chat request load any readable file it names. Off: requests may name only installed models (models directory, catalog, pre-warm model)."
     ),
     field!(
         "experimental.budget_alert",
@@ -3748,6 +3766,13 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
 pub fn mtp_ngram_enabled() -> bool {
     developer_bool("HIPFIRE_MTP_NGRAM", false)
 }
+/// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
+/// snapshot boolean, default off: the MTP prompt fill prefills the trunk
+/// through AR's ordinary route. `1` restores MTP's own route (512-row
+/// speculative-verify capture chunks, sequential GDN recurrence).
+pub fn mtp_own_prefill() -> bool {
+    developer_bool("HIPFIRE_MTP_OWN_PREFILL", false)
+}
 /// Raw `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` triple with production
 /// defaults (24/48/64). Validation (max <= 64, min <= max, …) stays with the
 /// arch consumer; this only resolves the snapshot values.
@@ -4882,7 +4907,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("speculation.mtp", ConfigValue::String("auto".to_owned())),
             ("speculation.mtp_k", ConfigValue::Integer(3)),
             ("speculation.ngram", ConfigValue::String("off".to_owned())),
-            ("serve.host", ConfigValue::String("0.0.0.0".to_owned())),
+            ("serve.host", ConfigValue::String("127.0.0.1".to_owned())),
             ("serve.port", ConfigValue::Integer(11435)),
             ("serve.idle_timeout_seconds", ConfigValue::Integer(300)),
             ("serve.local", ConfigValue::Bool(false)),

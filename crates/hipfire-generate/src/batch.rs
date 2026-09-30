@@ -251,6 +251,15 @@ where
     Ok(true)
 }
 
+/// Whether a generate message carries a `stop` the batch lanes cannot honour:
+/// any non-empty string or array form, or a value the sequential path rejects.
+fn request_has_stop(msg: &serde_json::Value) -> bool {
+    !matches!(
+        hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")),
+        Ok(stops) if stops.is_empty()
+    )
+}
+
 /// Tightened admission: require Qwen 5/6 (QwenAr) or dense LFM 11 (LfmAr), pp=1,
 /// no EP, model-owned batch state present, and no excluded features. Rendered
 /// prompts that open a think span stay on the sequential barrier route. MoE LFM
@@ -267,10 +276,9 @@ pub fn is_batch_request_eligible(
         .get("tools")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let has_stop = msg
-        .get("stop")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
+    // Any stop (string or array form), or an invalid one, takes the sequential
+    // path, which honours or rejects it.
+    let has_stop = request_has_stop(msg);
     // messages: absent OR exactly one user turn (HTTP chat shape).
     let has_spec = m.speculator.is_some();
     let has_adaptive = m.kv_adaptive.is_some();
@@ -2846,10 +2854,7 @@ pub fn is_qwen_ep_batch_request_eligible(
         .get("tools")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let has_stop = msg
-        .get("stop")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
+    let has_stop = request_has_stop(msg);
     if has_image || has_tools || has_stop {
         return false;
     }
@@ -3984,6 +3989,18 @@ mod tests {
     use super::*;
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::ar::generation_test_lock()
+    }
+
+    #[test]
+    fn any_stop_form_leaves_the_batch_path() {
+        use serde_json::json;
+        for absent in [json!({}), json!({"stop": null}), json!({"stop": []}), json!({"stop": ""})] {
+            assert!(!request_has_stop(&absent), "{absent}");
+        }
+        // The string form was batch-eligible before and silently ignored there.
+        for present in [json!({"stop": "\n"}), json!({"stop": ["END"]}), json!({"stop": 7})] {
+            assert!(request_has_stop(&present), "{present}");
+        }
     }
 
     #[derive(Clone, Copy)]

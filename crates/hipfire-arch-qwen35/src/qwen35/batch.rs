@@ -12,6 +12,7 @@ use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
+use super::prefill::HiddenCapture;
 use super::prefill::moe_grouped_m_total_max;
 use super::prefill::run_plain_gemm_key;
 use super::prefill::MOE_GROUPED_BLOCK_M;
@@ -1864,7 +1865,7 @@ pub fn forward_decode_batch_prepared(
         scratch,
         &state.pbs,
         None,
-        Some((&final_hidden, 0)),
+        Some((&final_hidden, 0, HiddenCapture::Verify)),
         None,
         0,
         None,

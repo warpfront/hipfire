@@ -58,7 +58,7 @@ and adds a per-tensor F32[16] `lloyd_levels` sidecar (see
 | `mq5v2` | **48** | `MQ5G256V2` | 168 | Dense product candidate (ladder) |
 | `mq3v2` | **49** | `MQ3G256V2` | 104 | Dense product candidate (ladder) |
 | `mq2v2` | **50** | `MQ2G256V2` | 72 | **Wire + runtime supported; product quality-rejected** |
-| `mq4v2lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
+| `mq4v2-lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
 
 **Wire implementation ≠ product admission.** MQ2V2 loads, decodes, and passes
 parity, but measured Qwen3.8 ladder KLD is catastrophic (~12–14 nats WT2/v6sel).

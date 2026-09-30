@@ -11,8 +11,8 @@
 use crate::{
     apply_kv_axis_overrides, config_bool, config_f64, config_i64, config_string, config_u64,
     find_daemon, find_model_path, http_get_json, list_local_models, load_params, probe_host,
-    pull_command, resolved_for_model, resolved_global, ListArgs, Paths, PullArgs, ServeArgs,
-    StopArgs,
+    pull_command, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs, Paths,
+    PullArgs, ServeArgs, StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
@@ -49,6 +49,74 @@ pub(crate) struct ServeMeta {
     pub(crate) recent_tok_s: Option<f64>,
     pub(crate) started: Instant,
     pub(crate) last_activity: Instant,
+    /// Daemon health published to `/health`. Lives here, not on
+    /// `ServeRuntime`, because a respawn and reload hold the runtime lock.
+    pub(crate) engine_state: EngineState,
+}
+
+/// Whether the daemon behind serve can take requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EngineState {
+    Up,
+    /// The daemon exited; serve is respawning it and reloading the model.
+    Restarting,
+    /// Respawning failed; serve exits once the supervisor notices.
+    Down,
+}
+
+impl EngineState {
+    /// `/health` `status` value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "ok",
+            Self::Restarting => "restarting",
+            Self::Down => "unhealthy",
+        }
+    }
+}
+
+fn set_engine_state(meta: &Mutex<ServeMeta>, state: EngineState) {
+    meta.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .engine_state = state;
+}
+
+/// How serve starts a daemon, kept so a dead one can be replaced.
+pub(crate) struct EngineSpawner {
+    pub(crate) daemon: PathBuf,
+    pub(crate) process_config: hipfire_config::ProcessConfig,
+    /// Spawn attempts per recovery before serve gives up.
+    pub(crate) attempts: u32,
+    /// Wait before the second attempt; doubles after each failure.
+    pub(crate) backoff: Duration,
+}
+
+impl EngineSpawner {
+    pub(crate) fn spawn(&self) -> Result<Engine> {
+        let engine = Engine::spawn_configured(&self.daemon, &BTreeMap::new(), &self.process_config)?;
+        engine.ping()?;
+        Ok(engine)
+    }
+}
+
+/// Who named the model being loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelOrigin {
+    /// The operator: `serve.default_model` / `--model` pre-warm, or the reload
+    /// of the resident model after a daemon restart.
+    Operator,
+    /// The `model` field of an HTTP request.
+    Request,
+}
+
+/// What an HTTP request's `model` field may make serve do.
+pub(crate) struct RequestModelPolicy {
+    /// `serve.allow_request_pull`: download a registry model that is not local.
+    pub(crate) allow_pull: bool,
+    /// `serve.allow_request_paths`: load any readable file the request names.
+    pub(crate) allow_paths: bool,
+    /// The operator's pre-warm model, which requests may always name.
+    pub(crate) operator_model: Option<String>,
 }
 
 pub(crate) fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
@@ -106,6 +174,11 @@ pub(crate) struct ServeRuntime {
     pub(crate) multi_slot_slots: u64,
     pub(crate) multi_slot_ctx: u64,
     pub(crate) multi_slot_prefill_chunk: u64,
+    pub(crate) spawner: EngineSpawner,
+    /// The `model` string the resident model was loaded under; reloaded after
+    /// a daemon restart.
+    pub(crate) resident_model: Option<String>,
+    pub(crate) request_policy: RequestModelPolicy,
 }
 
 pub(crate) struct ServeShared {
@@ -272,13 +345,7 @@ impl Admission {
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
-            return Err(AdmissionError {
-                message: format!(
-                    "serve queue full (depth {}/{})",
-                    state.queued, self.max_queue
-                ),
-                retry_after_seconds: self.retry_after_seconds(),
-            });
+            return Err(self.queue_full_error(state.queued));
         }
         state.queued = state.queued.saturating_add(1);
         let started = Instant::now();
@@ -292,13 +359,7 @@ impl Admission {
                 let remaining = self.timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
+                    return Err(self.wait_timeout_error());
                 }
                 let (next, wait) = self
                     .available
@@ -315,13 +376,7 @@ impl Admission {
                     };
                     if !can_acquire {
                         state.queued = state.queued.saturating_sub(1);
-                        return Err(AdmissionError {
-                            message: format!(
-                                "serve queue wait exceeded {}ms",
-                                self.timeout.as_millis()
-                            ),
-                            retry_after_seconds: self.retry_after_seconds(),
-                        });
+                        return Err(self.wait_timeout_error());
                     }
                 }
             }
@@ -361,13 +416,34 @@ impl Admission {
         state.eligible + usize::from(state.ineligible_busy) + state.queued
     }
 
+    /// `Retry-After` for a 503. The waiter has already spent the whole queue
+    /// timeout, and the running generation may end at any moment, so the hint
+    /// stays short instead of repeating that wait.
     pub(crate) fn retry_after_seconds(&self) -> u64 {
-        if self.timeout.is_zero() {
-            1
-        } else {
-            self.timeout.as_secs().max(1)
+        self.timeout.as_secs().clamp(1, 30)
+    }
+
+    fn queue_full_error(&self, queued: usize) -> AdmissionError {
+        AdmissionError {
+            message: format!(
+                "server busy: serve queue full (depth {queued}/{}); retry later",
+                self.max_queue
+            ),
+            retry_after_seconds: self.retry_after_seconds(),
         }
     }
+
+    fn wait_timeout_error(&self) -> AdmissionError {
+        AdmissionError {
+            message: format!(
+                "server busy: serve queue wait exceeded {}ms while another generation ran \
+                 (serve.queue_timeout_ms); retry later",
+                self.timeout.as_millis()
+            ),
+            retry_after_seconds: self.retry_after_seconds(),
+        }
+    }
+
     pub(crate) async fn acquire_async(
         self: &Arc<Self>,
         cancel: CancellationToken,
@@ -418,13 +494,7 @@ impl Admission {
                 });
             }
             if self.max_queue != 0 && state.queued >= self.max_queue {
-                return Err(AdmissionError {
-                    message: format!(
-                        "serve queue full (depth {}/{})",
-                        state.queued, self.max_queue
-                    ),
-                    retry_after_seconds: self.retry_after_seconds(),
-                });
+                return Err(self.queue_full_error(state.queued));
             }
             state.queued = state.queued.saturating_add(1);
         }
@@ -478,10 +548,7 @@ impl Admission {
 
             let remaining = self.timeout.saturating_sub(started.elapsed());
             if !self.timeout.is_zero() && remaining.is_zero() {
-                return Err(AdmissionError {
-                    message: format!("serve queue wait exceeded {}ms", self.timeout.as_millis()),
-                    retry_after_seconds: self.retry_after_seconds(),
-                });
+                return Err(self.wait_timeout_error());
             }
             if self.timeout.is_zero() {
                 tokio::select! {
@@ -860,9 +927,13 @@ pub(crate) fn serve_foreground(
 ) -> Result<()> {
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let registry = load_registry(&paths.registry).registry;
-    let process_config = hipfire_config::ProcessConfig::from_resolved(&global)?;
-    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
-    engine.ping()?;
+    let spawner = EngineSpawner {
+        daemon,
+        process_config: hipfire_config::ProcessConfig::from_resolved(&global)?,
+        attempts: ENGINE_RESPAWN_ATTEMPTS,
+        backoff: ENGINE_RESPAWN_BACKOFF,
+    };
+    let engine = spawner.spawn()?;
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
     let queue_timeout = Duration::from_millis(config_u64(&global, "serve.queue_timeout_ms")?);
@@ -892,6 +963,11 @@ pub(crate) fn serve_foreground(
         .model
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
+    let request_policy = RequestModelPolicy {
+        allow_pull: config_bool(&global, "serve.allow_request_pull")?,
+        allow_paths: config_bool(&global, "serve.allow_request_paths")?,
+        operator_model: Some(default_model.clone()),
+    };
     let instance_token = serve_instance_token();
     // Admission width: experimental multi-slot projects N concurrent daemon
     // sessions; continuous batch admits up to continuous_batch_size. Take the
@@ -932,6 +1008,9 @@ pub(crate) fn serve_foreground(
             multi_slot_slots,
             multi_slot_ctx,
             multi_slot_prefill_chunk,
+            spawner,
+            resident_model: None,
+            request_policy,
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -943,6 +1022,7 @@ pub(crate) fn serve_foreground(
             recent_tok_s: None,
             started: Instant::now(),
             last_activity: Instant::now(),
+            engine_state: EngineState::Up,
         }),
         max_request_bytes,
         admission: Arc::new(Admission::new_with_capacity(
@@ -977,9 +1057,19 @@ pub(crate) fn serve_foreground(
         format!("{}\n", serde_json::to_string(&pid_record)?),
     )?;
     let cleanup = pid_path.clone();
+    // SIGINT/SIGTERM stops accepting and lets requests in flight finish
+    // (bounded, see http::serve_listener_until); a second signal exits now.
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
     ctrlc::set_handler(move || {
-        let _ = fs::remove_file(&cleanup);
-        std::process::exit(0);
+        if signal_shutdown.is_cancelled() {
+            let _ = fs::remove_file(&cleanup);
+            std::process::exit(0);
+        }
+        eprintln!(
+            "[hipfire] shutting down: finishing requests in flight (signal again to exit now)"
+        );
+        signal_shutdown.cancel();
     })
     .context("failed to install serve signal handler")?;
     eprintln!("[hipfire] native serve listening on http://{bind}");
@@ -995,7 +1085,7 @@ pub(crate) fn serve_foreground(
                 .runtime
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .ensure_model(&default_model, &shared.meta, None);
+                .ensure_model(&default_model, &shared.meta, ModelOrigin::Operator);
             {
                 let mut meta = shared
                     .meta
@@ -1006,6 +1096,22 @@ pub(crate) fn serve_foreground(
             match result {
                 Ok(_) => eprintln!("[hipfire] pre-warmed {default_model}"),
                 Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
+            }
+        });
+    }
+    // Daemon supervision: a daemon that exited (crash, panic, or a sticky GPU
+    // fault, after which it exits 75) is respawned and the resident model
+    // reloaded. If it cannot be respawned, serve exits so a service manager
+    // restarts it instead of answering every request with an error.
+    {
+        let shared = Arc::clone(&shared);
+        let pid_path = pid_path.clone();
+        thread::spawn(move || loop {
+            thread::sleep(ENGINE_POLL);
+            if let Err(error) = supervise_engine(&shared) {
+                eprintln!("[hipfire] {error:#}; exiting");
+                let _ = fs::remove_file(&pid_path);
+                std::process::exit(1);
             }
         });
     }
@@ -1034,14 +1140,7 @@ pub(crate) fn serve_foreground(
                 if runtime.current_path.is_some() {
                     let result = runtime.engine.unload();
                     if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_arch = None;
-                        runtime.current_reasoning_contract =
-                            saddle_core::caps::ReasoningContract::Unsupported;
-                        runtime.current_reasoning_effort_native = false;
-                        runtime.current_reasoning_efforts = Vec::new();
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
+                        runtime.clear_resident(&shared.meta);
                     }
                     result
                 } else {
@@ -1060,11 +1159,15 @@ pub(crate) fn serve_foreground(
             }
         });
     }
-    runtime.block_on(crate::serve::http::serve_listener(
+    runtime.block_on(crate::serve::http::serve_listener_until(
         listener,
         Arc::clone(&shared),
+        shutdown,
     ))?;
     let _ = fs::remove_file(pid_path);
+    // A request still inside the daemon after the drain bound must not hold
+    // the exit: Runtime::drop would wait for its blocking worker.
+    runtime.shutdown_timeout(Duration::from_secs(1));
     Ok(())
 }
 
@@ -1122,17 +1225,36 @@ pub(crate) fn prewarm_qwen_mq4r_decode(engine: &mut Engine) -> Result<()> {
 }
 
 impl ServeRuntime {
+    /// Make `model` the resident model, loading it if needed.
+    ///
+    /// A dead daemon is respawned first. For `ModelOrigin::Request`, a
+    /// registry model that is not on disk is pulled only with
+    /// `serve.allow_request_pull`, and a file outside the operator's model set
+    /// is loaded only with `serve.allow_request_paths`; otherwise the request
+    /// gets "model not found". The load never depends on the request's
+    /// `max_tokens`: the daemon's `max_seq` cannot grow on reload, so the
+    /// request budget is fitted or refused against it instead.
     pub(crate) fn ensure_model(
         &mut self,
         model: &str,
         meta: &Mutex<ServeMeta>,
-        minimum_max_seq: Option<u64>,
+        origin: ModelOrigin,
     ) -> Result<hipfire_config::ResolvedConfig> {
+        if self.engine.exited() {
+            self.restart_engine(meta)?;
+            set_engine_state(meta, EngineState::Up);
+        }
         let (tag, entry) = crate::registry_entry_for_path(&self.paths, &self.registry, model)
             .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
             .unwrap_or((None, None));
         let mut path = find_model_path(&self.paths, &self.registry, model);
         if path.is_none() && entry.is_some() {
+            if origin == ModelOrigin::Request && !self.request_policy.allow_pull {
+                bail!(
+                    "model not found locally: {model}; run `hipfire pull {model}` on the server \
+                     first (downloads named by a request are off: serve.allow_request_pull)"
+                );
+            }
             pull_command(
                 &self.paths,
                 PullArgs {
@@ -1144,21 +1266,14 @@ impl ServeRuntime {
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
-        if let Some(minimum) = minimum_max_seq
-            .filter(|minimum| self.multi_slot_enabled && *minimum > self.multi_slot_ctx)
-        {
-            bail!(
-                "experimental multi-slot request requires context {minimum}, \
-                 exceeding serve.multi_slot_ctx={}",
-                self.multi_slot_ctx
-            );
-        }
-        let must_reload = self.current_path.as_ref() != Some(&path)
-            || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
-        if must_reload {
-            let max_tokens = minimum_max_seq
-                .map(|minimum| minimum.saturating_sub(1024))
-                .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+        if self.current_path.as_ref() != Some(&path) {
+            if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
+                bail!(
+                    "model not found: {model} (a request may name only installed models; \
+                     loading other files is off: serve.allow_request_paths)"
+                );
+            }
+            let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
             let mut params = load_params(
                 &resolved,
                 entry,
@@ -1177,6 +1292,14 @@ impl ServeRuntime {
                 self.kv_k_override.as_deref(),
                 self.kv_v_override.as_deref(),
             )?;
+            resolve_mtp_sidecar(
+                &mut params,
+                entry,
+                &self.paths.models,
+                &path,
+                model,
+                tag.as_deref(),
+            );
             if let Some(vision) = self.vision_override.as_ref() {
                 // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.
                 params["vision"] = serde_json::json!(vision.display().to_string());
@@ -1199,13 +1322,27 @@ impl ServeRuntime {
                 params["max_seq"] = serde_json::json!(self.multi_slot_ctx);
             }
             let requested_max_seq = params["max_seq"].as_u64().unwrap_or(0);
-            if let Some(minimum) = minimum_max_seq {
-                eprintln!("[hipfire] loading model for request context of at least {minimum}");
-            }
-            let loaded = self.engine.load(&path, params)?;
+            // For tp<=1 the daemon unloads the resident model before loading
+            // the new one, so after a failed load nothing is resident. At
+            // tp>1 it defers that unload until the new model is built, and a
+            // failure leaves the old model in place.
+            let loaded = match self.engine.load(&path, params) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    if self.tp.unwrap_or(1) <= 1 {
+                        self.clear_resident(meta);
+                    }
+                    return Err(error.into());
+                }
+            };
             if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
             {
-                prewarm_qwen_mq4r_decode(&mut self.engine)?;
+                // The new model is resident but not recorded yet; clear the
+                // old record so the next request reloads.
+                if let Err(error) = prewarm_qwen_mq4r_decode(&mut self.engine) {
+                    self.clear_resident(meta);
+                    return Err(error);
+                }
             }
             self.cache_capable = loaded
                 .get("cache_capable")
@@ -1253,12 +1390,143 @@ impl ServeRuntime {
             } else {
                 tag.unwrap_or_else(|| model.to_owned())
             };
+            self.resident_model = Some(model.to_owned());
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .current_model = Some(served_name);
         }
         Ok(resolved)
     }
+
+    /// Whether a request may load `path`, which its `model` field resolved
+    /// to. Without `serve.allow_request_paths`, only models the operator put
+    /// in place qualify: files under the models directory (symlinked entries
+    /// included), the resolved registry artifact, paths registered in the
+    /// model catalog, and the pre-warm model.
+    fn request_may_load(&self, path: &Path, entry: Option<&hipfire_registry::ModelEntry>) -> bool {
+        if self.request_policy.allow_paths {
+            return true;
+        }
+        let Ok(target) = fs::canonicalize(path) else {
+            return false;
+        };
+        let same = |candidate: &Path| fs::canonicalize(candidate).is_ok_and(|c| c == target);
+        fs::canonicalize(&self.paths.models).is_ok_and(|models| target.starts_with(models))
+            || entry.is_some_and(|entry| same(&self.paths.models.join(&entry.file)))
+            || crate::local_model_paths(&self.paths)
+                .unwrap_or_default()
+                .iter()
+                .any(|candidate| same(candidate))
+            || load_catalog(&self.paths.config).is_ok_and(|catalog| {
+                catalog
+                    .catalog
+                    .models
+                    .values()
+                    .filter_map(|record| record.path.as_deref())
+                    .any(same)
+            })
+            || self
+                .request_policy
+                .operator_model
+                .as_deref()
+                .and_then(|model| find_model_path(&self.paths, &self.registry, model))
+                .is_some_and(|operator| same(&operator))
+    }
+
+    /// Drop every field that names the resident model, serve-side and in
+    /// `/health`, so the next request reloads. Used when the daemon is known
+    /// to hold nothing (idle unload, failed switch, failed pre-warm, daemon
+    /// restart) or its state cannot be trusted (failed forced reset).
+    /// Ported from #787.
+    pub(crate) fn clear_resident(&mut self, meta: &Mutex<ServeMeta>) {
+        self.current_path = None;
+        self.current_arch = None;
+        self.current_reasoning_contract = saddle_core::caps::ReasoningContract::Unsupported;
+        self.current_reasoning_effort_native = false;
+        self.current_reasoning_efforts = Vec::new();
+        self.continuous_batch_capable = false;
+        self.current_max_seq = 0;
+        self.cache_capable = false;
+        self.resident_model = None;
+        meta.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current_model = None;
+    }
+
+    /// Replace a daemon that exited: reap it (freeing its GPU memory), then
+    /// spawn a new one with bounded, backed-off retries. Leaves
+    /// `engine_state` at `Restarting` on success (the caller sets `Up` once it
+    /// is done with the new daemon) and `Down` on failure. Returns the model
+    /// that was resident, for the caller to reload.
+    pub(crate) fn restart_engine(&mut self, meta: &Mutex<ServeMeta>) -> Result<Option<String>> {
+        set_engine_state(meta, EngineState::Restarting);
+        let status = self.engine.terminate();
+        let resident = self.resident_model.clone();
+        self.clear_resident(meta);
+        eprintln!("[hipfire] daemon exited ({status}); restarting it");
+        let attempts = self.spawner.attempts.max(1);
+        let mut backoff = self.spawner.backoff;
+        for attempt in 1..=attempts {
+            match self.spawner.spawn() {
+                Ok(engine) => {
+                    self.engine = engine;
+                    eprintln!("[hipfire] daemon restarted (attempt {attempt}/{attempts})");
+                    return Ok(resident);
+                }
+                Err(error) => {
+                    eprintln!("[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}");
+                }
+            }
+            if attempt < attempts {
+                thread::sleep(backoff);
+                backoff = backoff.saturating_mul(2);
+            }
+        }
+        // A later successful restart still reloads what was resident.
+        self.resident_model = resident;
+        set_engine_state(meta, EngineState::Down);
+        bail!("daemon exited and could not be restarted after {attempts} attempts")
+    }
+}
+
+/// How often the supervisor checks whether the daemon is still running.
+pub(crate) const ENGINE_POLL: Duration = Duration::from_secs(1);
+/// Respawn attempts per daemon failure, 1+2+4+8 s apart.
+const ENGINE_RESPAWN_ATTEMPTS: u32 = 5;
+const ENGINE_RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// One supervisor pass: if the daemon exited, respawn it and reload the model
+/// that was resident. `/health` reports `restarting` (503) until the reload
+/// finishes. Skips the pass while a request or load holds the runtime; that
+/// holder checks the daemon itself. Errors only when the daemon cannot be
+/// respawned.
+pub(crate) fn supervise_engine(shared: &ServeShared) -> Result<()> {
+    let mut runtime = match shared.runtime.try_lock() {
+        Ok(runtime) => runtime,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    if !runtime.engine.exited() {
+        return Ok(());
+    }
+    if let Some(model) = runtime.restart_engine(&shared.meta)? {
+        shared
+            .meta
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loading_model = Some(model.clone());
+        let reloaded = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Operator);
+        let mut meta = shared.meta.lock().unwrap_or_else(|error| error.into_inner());
+        finish_prewarm(&mut meta, reloaded.is_ok());
+        match reloaded {
+            Ok(_) => eprintln!("[hipfire] reloaded {model} after the daemon restart"),
+            Err(error) => {
+                eprintln!("[hipfire] reload of {model} after the daemon restart failed: {error:#}")
+            }
+        }
+    }
+    set_engine_state(&shared.meta, EngineState::Up);
+    Ok(())
 }
 
 /// Reject experimental multi-slot combined with continuous batching.
@@ -1523,6 +1791,7 @@ mod tests {
             recent_tok_s: None,
             started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            engine_state: EngineState::Up,
         }
     }
 
@@ -1616,6 +1885,17 @@ mod tests {
         let timeout = admission.acquire().unwrap_err();
         assert!(timeout.message.contains("wait exceeded"));
         assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn admission_retry_after_stays_short_for_long_queue_waits() {
+        let secs = |timeout| Admission::new(1, timeout).retry_after_seconds();
+        // The default 10-minute wait must not tell clients to back off 10 minutes.
+        assert_eq!(secs(Duration::from_secs(600)), 30);
+        assert_eq!(secs(Duration::from_secs(5)), 5);
+        // Unbounded wait (0) and sub-second waits still send a valid header.
+        assert_eq!(secs(Duration::ZERO), 1);
+        assert_eq!(secs(Duration::from_millis(5)), 1);
     }
 
     #[test]

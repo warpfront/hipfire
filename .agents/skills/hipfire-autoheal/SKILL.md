@@ -74,7 +74,7 @@ Never blind-kill or delete:
 | Config / env owners | [`docs/CONFIG.md`](../../../docs/CONFIG.md), [`docs/env-vars.md`](../../../docs/env-vars.md) |
 | Claim → validation route | [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) |
 
-Default bind: `0.0.0.0:11435`. Pid/log: `~/.hipfire/serve.pid`,
+Default bind: `127.0.0.1:11435`. Pid/log: `~/.hipfire/serve.pid`,
 `~/.hipfire/serve.log`. Install root: `~/.hipfire/` (`bin/daemon`, `models/`,
 `config.toml`).
 

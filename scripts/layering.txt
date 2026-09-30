@@ -25,12 +25,12 @@
  0 redline
  1 hip-bridge
  1 hipfire-client
+ 2 hipfire-isa
  1 hipfire-registry
  1 hsa-bridge
+ 1 peacemaker-lift
  1 redline-rocr
  1 va-bridge
- 1 peacemaker-lift
- 2 hipfire-isa
  2 hipfire-tui
  2 redline-dispatch
  3 rdna-compute

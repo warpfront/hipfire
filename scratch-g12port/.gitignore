@@ -1,7 +1,0 @@
-bin-*/
-mods/
-g12-host
-build*.log
-trace/*/daemon_*.csv
-trace/*/home/
-ab/*/*.daemon.log

@@ -71,6 +71,12 @@ jobs:
         # tests / examples that dispatch kernels need the self-hosted
         # GPU runner and are intentionally excluded here.
         run: cargo test --lib --workspace --locked
+      - name: Run serve gateway tests (bin crate)
+        # hipfire-cli is bin-only, so `--lib --workspace` skips it. Its tests
+        # drive the OpenAI HTTP gateway against the scripted fake daemon
+        # (crates/hipfire-cli/src/serve/fake_daemon.py, stdlib python3) and
+        # need no GPU. hipfire-client is a lib crate and runs above.
+        run: cargo test --locked -p hipfire-cli
 
   gates:
     name: gates (ratchets, layering, registers)

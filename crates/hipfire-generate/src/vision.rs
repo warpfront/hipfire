@@ -869,7 +869,10 @@ pub fn generate_vl(
         }
     }
 
-    if m.eviction.is_none() && prompt_est.saturating_add(max_tokens) > m.max_seq {
+    if m.eviction.is_none()
+        && prompt_est.saturating_add(crate::common::fit_max_tokens(max_tokens, prompt_est, m.max_seq))
+            > m.max_seq
+    {
         write_error(
             stdout,
             id,
@@ -927,6 +930,19 @@ pub fn generate_vl(
     let absolute_pos_vl = m.seq_pos.saturating_add(kv.compact_offset);
     let adaptive_engaged = m.kv_adaptive.is_some();
     let no_evict_cap = vl_no_eviction_kv_cap(m.physical_cap, m.max_seq, adaptive_engaged);
+    let max_tokens = if m.eviction.is_none() {
+        crate::common::fit_max_tokens(
+            max_tokens,
+            m.seq_pos + prompt_tokens.len() + trailer,
+            no_evict_cap,
+        )
+    } else {
+        crate::common::fit_max_tokens(
+            max_tokens,
+            absolute_pos_vl + prompt_tokens.len() + trailer,
+            m.max_seq,
+        )
+    };
     let over_budget = if m.eviction.is_none() {
         m.seq_pos
             .saturating_add(prompt_tokens.len())
@@ -3526,6 +3542,7 @@ pub fn generate_lfm2_vl(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     loop {
         if check_abort(id) {
             eprintln!("[daemon/vl-lfm2] aborted mid-decode");
@@ -3539,21 +3556,16 @@ pub fn generate_lfm2_vl(
         if stop_toks.contains(&next_tok) {
             break;
         }
-        let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Turn-end markers are checked on the token's own text.
         if matches!(
-            frag.trim(),
+            tokenizer.decode(&[next_tok]).trim(),
             "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>"
         ) {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Multi-byte characters span tokens: emit only completed text.
+        crate::dense::emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -3580,6 +3592,7 @@ pub fn generate_lfm2_vl(
             }
         }
     }
+    crate::dense::emit_dense_token_text(stdout, id, &text_stream.flush());
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
 
     // Post-loop abort latch — MANDATORY before the two-phase commit

@@ -1215,6 +1215,38 @@ mod tests {
             fast.dflash.as_ref().map(|draft| &draft.file)
         );
 
+        // The native Qwen3.8-27B MTP head (public checkpoint's `mtp.*` layer,
+        // `mtp_extract --quant mq4`) ships as one trunk-independent sidecar:
+        // it reuses the trunk's embed/lm_head, so every trunk tier pulls the
+        // same bytes, pinned by content.
+        let expected_mtp = Sidecar {
+            file: "qwen3.8-27b.mtp".into(),
+            sha256: Some("f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e".into()),
+            size_bytes: Some(225716224),
+        };
+        for (tag, entry) in [(tag, model), (fast_tag, fast), (xts_tag, xts)] {
+            assert_eq!(entry.mtp.as_ref(), Some(&expected_mtp), "{tag} MTP head");
+        }
+        let mut trunk_tiers = 0;
+        for (tag, entry) in &registry.models {
+            if !tag.starts_with("qwen3.8:27b") {
+                continue;
+            }
+            if tag.contains("draft") {
+                assert!(
+                    entry.mtp.is_none(),
+                    "{tag}: a DFlash draft carries no MTP head"
+                );
+            } else {
+                assert_eq!(entry.mtp.as_ref(), Some(&expected_mtp), "{tag} MTP head");
+                trunk_tiers += 1;
+            }
+        }
+        assert!(
+            trunk_tiers >= 13,
+            "every Qwen3.8-27B trunk tier declares the head"
+        );
+
         let settings = model
             .recommended_settings
             .as_ref()

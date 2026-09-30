@@ -31,6 +31,12 @@ BOOTSTRAP_ENV = {
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").
     "HIPFIRE_LOG_FORMAT",
+    # Read by GpuLocks::open() before install_process_config() — the lock
+    # directory must be resolved before the config snapshot exists, and a
+    # developer_var read would install the local fallback early. Two daemons
+    # contending for a card must read the same ambient dir before either has
+    # its own config.
+    "HIPFIRE_LOCK_DIR",
 }
 CENTRAL_CONFIG_READERS = {
     "crates/hipfire-config/src/lib.rs",

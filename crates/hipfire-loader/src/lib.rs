@@ -2153,10 +2153,12 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then sibling .mtp sidecar) ──
+    // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
-    // and typed mtp != off. Bundled first then sidecar `.mtp`; physical_cap is the KV
-    // window. On missing/failure errors when forced on (mtp=on), auto logs/falls back.
+    // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
+    // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
+    // whose hidden size or vocab differs from the trunk is refused before upload.
+    // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
     let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
@@ -2166,88 +2168,77 @@ fn finish_qwen35_load(
     {
         None
     } else {
+        use hipfire_arch_qwen35::mtp_head;
         let trunk_path = Path::new(ctx.path);
-        let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
-        let mut load_err: Option<String> = None;
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
-            trunk_path,
-            ctx.gpu,
-            physical_cap,
-        ) {
-            Ok(Some(h)) => {
-                eprintln!(
-                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
-                    h.config.n_embd, h.config.vocab_size
-                );
-                head_opt = Some(h);
-            }
-            Ok(None) => {
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
-                        &sidecar,
-                        ctx.gpu,
-                        physical_cap,
-                    ) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {}): n_embd={} vocab={}",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            head_opt = Some(h);
-                        }
-                        Err(e) => {
-                            load_err =
-                                Some(format!("sidecar {} load failed: {e}", sidecar.display()));
-                        }
-                    }
+        // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
+        // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
+        // daemon clients keep the canonical-sibling lookup.
+        let sidecar = ctx
+            .mtp_path
+            .clone()
+            .unwrap_or_else(|| trunk_path.with_extension("mtp"));
+        let (trunk_dim, trunk_vocab) = (config.dim, config.vocab_size);
+        let gpu = &mut *ctx.gpu;
+        let mut load = |path: &Path, offset: u64| {
+            mtp_head::check_mtp_head_for_trunk(path, offset, trunk_dim, trunk_vocab)?;
+            mtp_head::load_mtp_head_at_offset(path, gpu, physical_cap, offset)
+                .map_err(|e| format!("{}: load failed: {e}", path.display()))
+        };
+        let mut head_opt: Option<mtp_head::Qwen35MtpHead> = None;
+        let mut errors: Vec<String> = Vec::new();
+        match mtp_head::detect_bundled_mtp_offset(trunk_path) {
+            Ok(Some(offset)) => match load(trunk_path, offset) {
+                Ok(h) => {
+                    eprintln!(
+                        "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
+                        h.config.n_embd, h.config.vocab_size
+                    );
+                    head_opt = Some(h);
                 }
-            }
-            Err(e) => {
-                load_err = Some(format!("bundled trailer load failed: {e}"));
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
-                        &sidecar,
-                        ctx.gpu,
-                        physical_cap,
-                    ) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {} after bundled error): n_embd={} vocab={}",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            head_opt = Some(h);
-                            load_err = None;
-                        }
-                        Err(e2) => {
-                            load_err =
-                                Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
-                        }
-                    }
+                Err(e) => errors.push(format!("bundled trailer: {e}")),
+            },
+            Ok(None) => {}
+            Err(e) => errors.push(format!("bundled trailer unreadable: {e}")),
+        }
+        if head_opt.is_none() && sidecar.exists() {
+            match load(&sidecar, 0) {
+                Ok(h) => {
+                    let after = if errors.is_empty() {
+                        ""
+                    } else {
+                        " after bundled error"
+                    };
+                    eprintln!(
+                        "  MTP head loaded (sidecar {}{after}): n_embd={} vocab={}",
+                        sidecar.display(),
+                        h.config.n_embd,
+                        h.config.vocab_size
+                    );
+                    head_opt = Some(h);
+                    errors.clear();
                 }
+                Err(e) => errors.push(format!("sidecar {e}")),
             }
         }
         if head_opt.is_none() {
             if ctx.spec.mtp == Some(true) {
+                let reason = if errors.is_empty() {
+                    "no bundled trailer or .mtp sidecar found".to_string()
+                } else {
+                    errors.join("; ")
+                };
                 return Err(rollback_unfinished_qwen35(
-                    format!(
-                        "MTP head required (mtp=on) but not found: {}",
-                        load_err.unwrap_or_else(
-                            || "no bundled trailer or .mtp sidecar found".to_string()
-                        )
-                    ),
+                    format!("MTP head required (mtp=on) but not loaded: {reason}"),
                     bundle,
                     vision_weights,
                     ctx.gpu,
                 ));
             }
-            if let Some(err) = load_err {
-                eprintln!("  MTP head load failed: {err} — falling back to AR/n-gram");
+            if !errors.is_empty() {
+                eprintln!(
+                    "  MTP head not loaded: {} — falling back to AR/n-gram",
+                    errors.join("; ")
+                );
             }
         }
         head_opt
@@ -2460,6 +2451,7 @@ pub fn load_model_with_gemma4_drafter(
         draft_path,
         gemma4_drafter_path,
         gemma4_draft_len,
+        None,
         kv_mode_override,
         kv_k_override,
         kv_v_override,
@@ -2481,7 +2473,8 @@ pub fn load_model_with_gemma4_drafter(
 /// Consume an already-admitted source: the retained [`SourceAdmission`] handle
 /// plus its resolved carrier. Destructive work — VMM readiness, carrier load
 /// with its allocations and collectives — begins here, only after admission has
-/// succeeded.
+/// succeeded. `mtp_path` is the CLI-resolved Qwen MTP sidecar (`params.mtp`);
+/// `None` keeps the loader's `<trunk>.mtp` lookup.
 #[allow(clippy::too_many_arguments)]
 pub fn load_admitted_with_gemma4_drafter(
     admission: crate::admission::SourceAdmission,
@@ -2492,6 +2485,7 @@ pub fn load_admitted_with_gemma4_drafter(
     draft_path: Option<&str>,
     gemma4_drafter_path: Option<&str>,
     gemma4_draft_len: usize,
+    mtp_path: Option<&Path>,
     kv_mode_override: Option<&str>,
     kv_k_override: Option<&str>,
     kv_v_override: Option<&str>,
@@ -2531,6 +2525,7 @@ pub fn load_admitted_with_gemma4_drafter(
         deepseek4_experts_per_token,
         draft_path,
         vision_path,
+        mtp_path: mtp_path.map(Path::to_path_buf),
         kv_mode_override,
         kv_k_override,
         kv_v_override,
@@ -4479,14 +4474,13 @@ mod ep_admission_tests {
         publications: usize,
     }
 
-    fn qwen35_moe_fixture() -> PathBuf {
-        // One file per call: parallel tests sharing a path truncate each
-        // other's mmapped fixture (SIGBUS).
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// `tag` must be unique per caller: tests run in one process, so a
+    /// pid-only filename is shared by parallel tests that write, read, and
+    /// unlink the same path — a flake, not a fixture.
+    fn qwen35_moe_fixture(tag: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "hipfire-loader-qwen35-moe-admission-{}-{}.hfq",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            "hipfire-loader-qwen35-moe-admission-{tag}-{}.hfq",
+            std::process::id()
         ));
         let metadata = serde_json::json!({
             "config": {
@@ -4561,7 +4555,7 @@ mod ep_admission_tests {
     /// equally before-teardown).
     #[test]
     fn qwen35_moe_ep_unsupported_degree_preserves_active_model() {
-        let candidate = qwen35_moe_fixture();
+        let candidate = qwen35_moe_fixture("ep-degree");
         let mut active = ActiveModel {
             identity: "qwen3.6:27b-a3b-active",
             response: b"active-model-response".to_vec(),
@@ -4580,7 +4574,7 @@ mod ep_admission_tests {
     }
     #[test]
     fn explicit_unsupported_vmm_preserves_active_model() {
-        let candidate = qwen35_moe_fixture();
+        let candidate = qwen35_moe_fixture("vmm-explicit");
         let mut active = ActiveModel {
             identity: "resident",
             response: b"still-serving".to_vec(),
@@ -4591,7 +4585,7 @@ mod ep_admission_tests {
             &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
             "gfx1100", &mut active, &mut effects,
         ).unwrap_err();
-        assert!(refusal.contains("vmm") && refusal.contains("legacy"));
+        assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
         let _ = std::fs::remove_file(candidate);

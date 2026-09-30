@@ -398,6 +398,12 @@ pub struct MtpSpecState {
     /// into the MTP head's first step each cycle. Shape: `[dim]` F32.
     pub prev_hidden: GpuTensor,
 
+    /// Trunk position whose hidden `prev_hidden` holds, or `None` after a
+    /// reset. The MTP head pairs token `p` with the hidden of position
+    /// `p - 1`, so a fill starting at `start_pos` may reuse `prev_hidden`
+    /// only when this is `Some(start_pos - 1)`.
+    pub prev_hidden_pos: Option<usize>,
+
     /// Per-cycle scratch: post-output-norm hidden states from the trunk
     /// verify, one row per verify position. Shape: `[(max_n + 1) × dim]` F32.
     pub verify_hidden: GpuTensor,
@@ -478,6 +484,17 @@ pub struct MtpSpecState {
     /// `[max_n]` i32 stored in F32 slots. The captured graph reads each slot
     /// by pointer, while the host refreshes the values before every launch.
     pub mtp_positions: GpuTensor,
+
+    /// Takeover head-KV fill input rows, `[(verify_capacity + 1) × dim]` F32.
+    /// Row 0 holds the pre-window `prev_hidden` (h_{cur_pos-1}); row `i > 0`
+    /// holds verify hidden row `i - 1`, so row `i` pairs with verify token `i`
+    /// exactly as decode pairs `(tok_p, h_{p-1})`.
+    pub takeover_fill_hidden: GpuTensor,
+
+    /// Batched head scratch + rotation scratch for the takeover fill, sized to
+    /// `verify_capacity + 1` rows. Allocated by the first takeover window that
+    /// takes the batched route.
+    takeover_fill_batched: Option<(Qwen35MtpHeadBatchedScratch, GpuTensor)>,
 
     /// Captured q8 compressed proposal graph for the greedy device-token-chain
     /// path. It belongs to this state because the graph bakes scratch/weight
@@ -656,6 +673,7 @@ impl MtpSpecState {
         let mtp_token_chain = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
         let mtp_token_embed = gpu.alloc_tensor(&[dim], DType::F32)?;
         let mtp_positions = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let takeover_fill_hidden = gpu.alloc_tensor(&[(verify_capacity + 1) * dim], DType::F32)?;
 
         // Per-step top-2 scratches for p_min early-exit (16 B total, always
         // allocated — only used when state.p_min > 0).
@@ -673,6 +691,7 @@ impl MtpSpecState {
 
         Ok(Self {
             prev_hidden,
+            prev_hidden_pos: None,
             verify_hidden,
             verify_logits,
             verify_rot,
@@ -692,6 +711,8 @@ impl MtpSpecState {
             mtp_token_chain,
             mtp_token_embed,
             mtp_positions,
+            takeover_fill_hidden,
+            takeover_fill_batched: None,
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -777,10 +798,11 @@ impl MtpSpecState {
     /// call. Source is `target.scratch.tmp` (same buffer lm_head reads from).
     /// Call once after prefill's last `forward_scratch` to seed the cycle.
     pub fn capture_prev_hidden_from_scratch_tmp(
-        &self,
+        &mut self,
         gpu: &Gpu,
         target_scratch_tmp: &GpuTensor,
         dim: usize,
+        pos: usize,
     ) -> HipResult<()> {
         gpu.hip.memcpy_dtod_at(
             &self.prev_hidden.buf,
@@ -788,7 +810,9 @@ impl MtpSpecState {
             &target_scratch_tmp.buf,
             0,
             dim * 4,
-        )
+        )?;
+        self.prev_hidden_pos = Some(pos);
+        Ok(())
     }
 
     /// Capture the trunk's post-output-norm hidden from a row of
@@ -797,8 +821,9 @@ impl MtpSpecState {
     /// from the verify slot corresponding to the last committed token,
     /// avoiding the cost of a separate single-token forward.
     pub fn capture_prev_hidden_from_verify_row(
-        &self,
+        &mut self,
         gpu: &Gpu,
+        cur_pos: usize,
         row: usize,
         dim: usize,
     ) -> HipResult<()> {
@@ -808,7 +833,9 @@ impl MtpSpecState {
             &self.verify_hidden.buf,
             row * dim * 4,
             dim * 4,
-        )
+        )?;
+        self.prev_hidden_pos = Some(cur_pos + row);
+        Ok(())
     }
 
     /// Drafter-local reset for a fresh conversation. Zeros the MTP head KV
@@ -821,6 +848,7 @@ impl MtpSpecState {
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
         self.mtp_kv.reset(gpu)?;
+        self.prev_hidden_pos = None;
         Ok(())
     }
 
@@ -838,6 +866,11 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_token_chain);
         let _ = gpu.free_tensor(self.mtp_token_embed);
         let _ = gpu.free_tensor(self.mtp_positions);
+        let _ = gpu.free_tensor(self.takeover_fill_hidden);
+        if let Some((scratch, rot)) = self.takeover_fill_batched {
+            scratch.free_gpu(gpu);
+            let _ = gpu.free_tensor(rot);
+        }
         if let Some(exec) = self.mtp_proposal_graph_exec {
             let _ = gpu.hip.graph_exec_destroy(exec);
         }
@@ -1175,25 +1208,25 @@ fn mtp_assemble_verify_tokens(last_committed: u32, candidates: &[u32]) -> Vec<u3
     build_trunk_spine_verify_tokens(last_committed, candidates)
 }
 
-/// External-takeover MTP-KV repair policy (pure).
+/// Tokens whose MTP-head KV a takeover window fills (pure).
 ///
-/// After shared verify of an external ngram/PLD window:
-/// - If MTP is already retired, never run head repair.
-/// - If `accept_count > 0`, never run head repair: any positive external
-///   acceptance irreversibly retires MTP (caller latches `mtp_retired`).
-/// - If not retired and `accept_count == 0`, repair exactly the one committed
-///   input row (`last_committed` at `cur_pos`) using the pre-window hidden
-///   snapshot. Shared greedy verify always advances by 1 on zero accept
-///   (bonus only).
-///
-/// Returns how many MTP-head block-only forwards the takeover path must run
-/// (0 or 1). No O(accepted) multi-row repair.
-fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usize) -> usize {
-    if mtp_already_retired || accept_count > 0 {
-        0
-    } else {
-        1
-    }
+/// After shared verify/rollback the trunk holds `verify_tokens[..advance]`
+/// (`[last_committed, candidates..]`) at `cur_pos..cur_pos + advance`, with or
+/// without a bonus and including the accepted-EOS case. Decode writes head
+/// slot `p` from `(tok_p, h_{p-1})`, so the fill writes exactly those rows:
+/// row 0 pairs `last_committed` with the pre-window hidden, row `i > 0` pairs
+/// `candidates[i - 1]` with verify hidden row `i - 1`. The pending token at
+/// `cur_pos + advance` is written by the next window, as in decode.
+fn mtp_takeover_fill_tokens(last_committed: u32, candidates: &[u32], advance: usize) -> Vec<u32> {
+    assert!(
+        advance >= 1 && advance <= candidates.len() + 1,
+        "takeover fill: advance {advance} out of 1..={}",
+        candidates.len() + 1
+    );
+    let mut tokens = Vec::with_capacity(advance);
+    tokens.push(last_committed);
+    tokens.extend_from_slice(&candidates[..advance - 1]);
+    tokens
 }
 
 /// Enqueue the target lm_head over every MTP verify row.
@@ -1224,7 +1257,7 @@ fn mtp_trunk_verify_lm_head(
                     n_verify,
                 )?;
             } else {
-                gpu.gemm_q8_0_batched(
+                gpu.gemm_q8_0_batched_f32_chunked(
                     &w_out.buf,
                     verify_hidden,
                     logits_view,
@@ -1524,7 +1557,7 @@ fn mtp_shared_verify_accept_rollback(
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
 
     // ── 3. KV / DN rollback (or skip on full accept) ─────────────────
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
@@ -1583,6 +1616,32 @@ fn mtp_shared_verify_accept_rollback(
     })
 }
 
+/// Which trunk prefill route the MTP prompt fill drives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpPromptRoute {
+    /// The trunk prefills exactly like AR's serve prefill (same outer chunk
+    /// plan, widened chunks, GDN chunk scan, standard dispatch workload) and
+    /// hands its hidden rows to the head. KV, DeltaNet state and the
+    /// first-token logits match an AR prefill of the same tokens.
+    #[default]
+    ArRoute,
+    /// Legacy route (`HIPFIRE_MTP_OWN_PREFILL=1`): `prefill_max_batch`-row
+    /// trunk chunks captured as a speculative verify (sequential GDN
+    /// recurrence, `SpeculativeVerify` dispatch workload).
+    Own,
+}
+
+impl MtpPromptRoute {
+    /// Resolve from the config-owned opt-out (`HIPFIRE_MTP_OWN_PREFILL`).
+    pub fn from_own_prefill(own_prefill: bool) -> Self {
+        if own_prefill {
+            Self::Own
+        } else {
+            Self::ArRoute
+        }
+    }
+}
+
 /// DS4-style Qwen MTP prefill fill.
 ///
 /// Runs trunk prefill while capturing post-output-norm hidden for every
@@ -1590,17 +1649,17 @@ fn mtp_shared_verify_accept_rollback(
 /// positions. The MTP layer enters decode with a warm private KV cache instead
 /// of starting at the first generated token.
 ///
-/// Trunk prefill is split into `<= PREFILL_MAX_BATCH` committed chunks so
-/// adaptive-KV (and similar) controllers can run `maybe_downshift` between
-/// chunks at the exact committed trunk position. Without that boundary the
-/// internal `forward_prefill_batch` loop would write past the current-tier
-/// capacity (adaptive start `side_cap`) before any downshift could fire —
-/// post-prefill-only downshift is insufficient when prompt_len > start cap.
+/// The trunk chunk plan follows `route` (see [`MtpPromptRoute`]). The head
+/// fills in `<= prefill_max_batch` slices aligned to the start of the fill on
+/// either route, so a given set of hidden rows yields the same MTP KV.
+/// Callers observe a committed boundary after each trunk chunk. Adaptive KV
+/// never reaches this path (qwen generate refuses speculation under
+/// `kv_adaptive`).
 ///
-/// MTP private-cache offsets stay absolute: each chunk fills MTP KV at
+/// MTP private-cache offsets stay absolute: each slice fills MTP KV at
 /// `start_pos + off + i` (same schedule as the trunk), so multi-chunk prefill
-/// is position-identical to a single whole-prompt fill. Non-adaptive callers
-/// keep the same end state: full trunk KV + full MTP private KV + last-token logits.
+/// is position-identical to a single whole-prompt fill. End state: full trunk
+/// KV + full MTP private KV + last-token logits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrunkSpinePrefillTimings {
     pub trunk_prefill_secs: f64,
@@ -1651,6 +1710,7 @@ pub fn prefill_trunk_and_mtp_cache(
     state: &mut MtpSpecState,
     prompt_tokens: &[u32],
     start_pos: usize,
+    route: MtpPromptRoute,
 ) -> HipResult<TrunkSpinePrefillTimings> {
     // No-op boundary: same final state as the historical single-call path.
     prefill_trunk_and_mtp_cache_with_boundary(
@@ -1660,17 +1720,18 @@ pub fn prefill_trunk_and_mtp_cache(
         state,
         prompt_tokens,
         start_pos,
+        route,
         |_gpu, _target, _committed_pos| Ok(()),
     )
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
-/// after each trunk+MTP chunk commits, with the exclusive end position of the
-/// committed prefix (`start_pos + tokens_written_so_far`).
+/// after each trunk chunk and its MTP fill commit, with the exclusive end
+/// position of the committed prefix (`start_pos + tokens_written_so_far`).
 ///
-/// The callback runs while `target.kv_cache` holds the just-written prefix and
-/// before the next chunk may write past the current-tier capacity. Failures
-/// propagate and abort the remaining prefill (caller must free MTP state).
+/// The callback runs while `target.kv_cache` holds the just-written prefix.
+/// Failures propagate and abort the remaining prefill (caller must free MTP
+/// state).
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     gpu: &mut Gpu,
@@ -1679,22 +1740,46 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     state: &mut MtpSpecState,
     prompt_tokens: &[u32],
     start_pos: usize,
+    route: MtpPromptRoute,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
     F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
 {
-    let Some(chunk_max) =
+    let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
     else {
         return Ok(TrunkSpinePrefillTimings::default());
     };
+    // Trunk outer-chunk ceiling. ArRoute copies AR's serve prefill caller
+    // (`hipfire-generate` `ar.rs`, no-eviction branch) and queries it before
+    // the MTP buffers below take memory, as AR's query sees it.
+    let trunk_chunk_max = match route {
+        MtpPromptRoute::Own => head_rows,
+        MtpPromptRoute::ArRoute => match qwen35::ordinary_prefill_chunk_limit(
+            gpu,
+            &target.weights,
+            &target.config,
+            &target.dn_state,
+            &target.kv_cache,
+            None,
+        ) {
+            Ok(limit) => limit,
+            Err(e) => {
+                eprintln!("mtp prefill: chunk-limit query failed ({e}); keeping legacy ceiling");
+                qwen35::prefill_max_batch(gpu)
+            }
+        },
+    };
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
-    let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
-    // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
-    // also caps at this size; externalizing the loop exposes commit boundaries.
+    // The head pairs token `p` with the trunk hidden of position `p - 1`, as
+    // decode does. Row 0 holds the partner of the first fill token; row
+    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
+    // therefore pairs `prompt_tokens[j]` with row `j`.
+    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
+    // The head fills in `head_rows` slices whatever the trunk chunk size.
     let use_batched_mtp_fill = mtp_head::mtp_prompt_fill_uses_batched(
         state.mtp_kv.kv_mode,
         &[
@@ -1705,7 +1790,7 @@ where
         ],
     );
     let mut mtp_prefill_scratch = if use_batched_mtp_fill {
-        match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, chunk_max) {
+        match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, head_rows) {
             Ok(scratch) => Some(scratch),
             Err(error) => {
                 let _ = gpu.free_tensor(prompt_hidden);
@@ -1720,7 +1805,7 @@ where
             .max(head.config.n_ff)
             .max(dim)
             .max(head.config.n_head * head.config.head_dim);
-        match gpu.alloc_tensor(&[chunk_max * widest_k], DType::F32) {
+        match gpu.alloc_tensor(&[head_rows * widest_k], DType::F32) {
             Ok(tensor) => Some(tensor),
             Err(error) => {
                 if let Some(scratch) = mtp_prefill_scratch.take() {
@@ -1738,52 +1823,92 @@ where
         let mut trunk_prefill_secs = 0.0f64;
         let mut mtp_prompt_fill_secs = 0.0f64;
         let mut off = 0usize;
+        // Partner of the first token is h_{start_pos-1}. Reuse `prev_hidden`
+        // only when it holds that position; otherwise (cold start, or a warm
+        // fill whose predecessor hidden is gone) pair the token with a zero
+        // hidden, which the head's hnorm maps to zero.
+        if start_pos > 0 && state.prev_hidden_pos == Some(start_pos - 1) {
+            gpu.hip
+                .memcpy_dtod_at(&prompt_hidden.buf, 0, &state.prev_hidden.buf, 0, dim_bytes)?;
+        } else {
+            gpu.hip.memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])?;
+        }
         while off < prompt_tokens.len() {
-            let end = (off + chunk_max).min(prompt_tokens.len());
+            let remaining = prompt_tokens.len() - off;
+            let outer = match route {
+                MtpPromptRoute::Own => remaining.min(head_rows),
+                MtpPromptRoute::ArRoute => {
+                    qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, trunk_chunk_max)
+                        .unwrap_or(remaining.min(trunk_chunk_max).max(1))
+                }
+            };
+            let end = off + outer;
             let chunk = &prompt_tokens[off..end];
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
 
-            // Per-chunk hidden destination: row-major slice of the full prompt buffer.
-            let chunk_hidden = prompt_hidden.sub_offset(off * dim, chunk.len() * dim);
+            // Per-chunk hidden destination: rows `off + 1..` of the pairing buffer.
+            let chunk_hidden = prompt_hidden.sub_offset((off + 1) * dim, chunk.len() * dim);
 
             let t_trunk = Instant::now();
-            qwen35::forward_prefill_batch(
-                gpu,
-                &target.weights,
-                &target.config,
-                chunk,
-                chunk_start_pos,
-                &mut target.kv_cache,
-                &mut target.dn_state,
-                &target.scratch,
-                None,
-                Some(&chunk_hidden),
-                None,
-                None,
-            )?;
+            match route {
+                MtpPromptRoute::ArRoute => qwen35::forward_prefill_batch_capture_hidden(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    chunk,
+                    chunk_start_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    &chunk_hidden,
+                )?,
+                MtpPromptRoute::Own => qwen35::forward_prefill_batch(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    chunk,
+                    chunk_start_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    None,
+                    Some(&chunk_hidden),
+                    None,
+                    None,
+                )?,
+            }
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
 
             let t_mtp_fill = Instant::now();
             if let (Some(scratch), Some(rot)) =
                 (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
             {
-                let positions: Vec<i32> = (chunk_start_pos..committed_pos)
-                    .map(|position| position as i32)
-                    .collect();
-                mtp_head::mtp_head_forward_block_batched(
-                    gpu,
-                    head,
-                    scratch,
-                    &mut state.mtp_kv,
-                    chunk,
-                    &chunk_hidden,
-                    &positions,
-                    chunk.len(),
-                    &target.weights,
-                    Some(rot),
-                    true,
-                )?;
+                // Slices end on multiples of `head_rows` from the fill start,
+                // so both routes feed the head identical slices.
+                let mut slice_off = off;
+                while slice_off < end {
+                    let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
+                    let slice = &prompt_tokens[slice_off..slice_end];
+                    let slice_hidden = prompt_hidden.sub_offset(slice_off * dim, slice.len() * dim);
+                    let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
+                        .map(|position| position as i32)
+                        .collect();
+                    mtp_head::mtp_head_forward_block_batched(
+                        gpu,
+                        head,
+                        scratch,
+                        &mut state.mtp_kv,
+                        slice,
+                        &slice_hidden,
+                        &positions,
+                        slice.len(),
+                        &target.weights,
+                        Some(rot),
+                        true,
+                    )?;
+                    slice_off = slice_end;
+                }
             } else {
                 for (i, &token) in chunk.iter().enumerate() {
                     let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
@@ -1812,9 +1937,10 @@ where
             &state.prev_hidden.buf,
             0,
             &prompt_hidden.buf,
-            last * dim_bytes,
+            (last + 1) * dim_bytes,
             dim_bytes,
         )?;
+        state.prev_hidden_pos = Some(start_pos + last);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
             mtp_prompt_fill_secs,
@@ -2198,7 +2324,7 @@ pub fn spec_step_mtp(
     //
     // Both cases reduce to slot `advance - 1`.
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
 
     // ── 8. Roll back trunk DN state + replay accepted committed tokens ───
     //
@@ -2545,7 +2671,7 @@ pub fn spec_step_mtp_compressed(
 
     // ── 5. Capture prev_hidden from verify slot advance-1 ─────────────────
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
 
     // ── 6. Roll back trunk DN state + replay accepted ─────────────────────
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
@@ -3428,33 +3554,22 @@ pub fn spec_step_mtp_compressed_serial_with_k(
     );
 }
 
-/// External ngram-mod/PLD candidate verify with MTP retire-on-accept.
+/// External ngram-mod/PLD candidate verify with MTP-head KV fill.
 ///
 /// Greedy-lossless, MTP-head-bypass path. The daemon supplies a non-empty
 /// greedy candidate window `candidates` (already filtered for length
-/// `<= state.verify_capacity` and temp==0). Native MTP remains state/loop
-/// owner until the first positive external acceptance, after which MTP is
-/// irreversibly retired for the request.
+/// `<= state.verify_capacity` and temp==0).
 ///
 /// * Bypasses all head proposal / graph / device-chain work.
 /// * Uses greedy trunk acceptance (`chain_truncated=false`).
 /// * Sets `drafts_generated = candidates.len()` and `chain_truncated=false`.
-/// * Before shared verify, snapshots pre-window `state.prev_hidden` into
-///   `mtp_t_outs` row 0 **only when MTP is not already retired** (needed for
-///   the zero-accept single-row repair). When already retired the snapshot is
-///   skipped — no repair will run.
-/// * After shared verify/rollback:
-///   - `mtp_already_retired || accept_count > 0` → **zero** MTP-head forwards
-///     (no O(accepted) multi-row repair). Caller must latch retirement on any
-///     `accept_count > 0`.
-///   - not retired and `accept_count == 0` → repair exactly the one committed
-///     input row (`last_committed` at `cur_pos`) with the saved pre-window
-///     hidden; `advance` must be 1 (bonus-only). Leaves native MTP state
-///     aligned for a subsequent native MTP cycle.
-///
-/// Caller invariant: any positive external acceptance irreversibly retires
-/// MTP. Subsequent calls pass `mtp_already_retired = true` and must not rely
-/// on MTP private KV staying warm.
+/// * Before shared verify, stages the pre-window `state.prev_hidden`
+///   (h_{cur_pos-1}) as row 0 of `takeover_fill_hidden`.
+/// * After shared verify/rollback, fills the MTP-head KV for exactly the
+///   `advance` rows the trunk kept ([`mtp_takeover_fill_tokens`]) with
+///   decode's `(tok_p, h_{p-1})` pairing, from the staged hidden and the
+///   verify hidden rows. A rejected tail is never written, so native MTP can
+///   draft on the next window as if those rows had been decoded one by one.
 ///
 /// External candidates must be non-empty, greedy, and `len <= state.verify_capacity`.
 /// Panics if those bounds are violated so daemon bugs surface loudly.
@@ -3468,7 +3583,6 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     last_committed: u32,
     eos_token_id: u32,
     candidates: &[u32],
-    mtp_already_retired: bool,
 ) -> HipResult<MtpSpecResult> {
     assert!(
         mtp_external_candidates_within_capacity(candidates, state.verify_capacity),
@@ -3508,19 +3622,21 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     let dim_bytes = dim * 4;
 
     // Shared verify overwrites `state.prev_hidden` with verify row advance-1.
-    // Snapshot the pre-window partner into `mtp_t_outs` row 0 only when MTP
-    // is still live (zero-accept path needs it for single-row repair).
-    // Device D2D; no host round-trip. `mtp_t_outs` is proposal-only and
-    // unused by the external shared path — safe scratch of size `dim`.
-    if !mtp_already_retired {
-        gpu.hip.memcpy_dtod_at(
-            &state.mtp_t_outs.buf,
-            0,
-            &state.prev_hidden.buf,
-            0,
-            dim_bytes,
-        )?;
-    }
+    // Stage the pre-window partner of `last_committed` as fill row 0. That is
+    // h_{cur_pos-1}, the same (tok_p, h_{p-1}) pairing the prompt fill and
+    // decode use.
+    debug_assert_eq!(
+        state.prev_hidden_pos,
+        cur_pos.checked_sub(1),
+        "takeover fill: prev_hidden must hold h_{{cur_pos-1}}"
+    );
+    gpu.hip.memcpy_dtod_at(
+        &state.takeover_fill_hidden.buf,
+        0,
+        &state.prev_hidden.buf,
+        0,
+        dim_bytes,
+    )?;
 
     // Shared greedy verify/accept/rollback. Sampling is forced greedy for
     // external windows even if state.sampling.temp > 0 (daemon guarantees
@@ -3544,39 +3660,110 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         false,
     )?;
 
-    // Retire-on-accept: any accept_count>0 (or already-retired) skips all
-    // MTP-head repair. Zero-accept pre-takeover repairs only last_committed
-    // at cur_pos so native MTP stays aligned for the next cycle.
-    let repair_forwards = mtp_takeover_kv_repair_forwards(mtp_already_retired, result.accept_count);
-    if repair_forwards > 0 {
-        debug_assert_eq!(repair_forwards, 1, "takeover repair is single-row only");
-        assert_eq!(
-            result.advance, 1,
-            "spec_step_mtp_compressed_serial_with_takeover_candidates: zero-accept must advance by bonus only (advance={})",
-            result.advance
-        );
-        let trunk_weights: &Qwen35Weights = &target.weights;
-        // Single committed input row: last_committed @ cur_pos with the
-        // pre-window prev_hidden saved in mtp_t_outs row 0.
-        let hidden_ref = state.mtp_t_outs.sub_offset(0, dim);
-        mtp_head::mtp_head_forward_block_only(
-            gpu,
-            head,
-            &state.mtp_scratch,
-            &mut state.mtp_kv,
-            last_committed,
-            &hidden_ref,
-            None,
-            cur_pos,
-            trunk_weights,
-        )?;
-    }
+    mtp_takeover_fill_head_kv(
+        gpu,
+        head,
+        state,
+        &target.weights,
+        cur_pos,
+        &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
+    )?;
 
     // External path is always greedy and not truncated; ensure result fields
     // cohere even if shared helper drifted.
     result.drafts_generated = drafts_generated;
     result.chain_truncated = false;
     Ok(result)
+}
+
+/// Write MTP-head KV slots `cur_pos..cur_pos + tokens.len()` from
+/// `(tokens[i], takeover_fill_hidden[i])` after a takeover verify.
+///
+/// Row 0 of `takeover_fill_hidden` must already hold the pre-window hidden;
+/// this copies verify hidden rows `0..n-1` into rows `1..n`. Uses the batched
+/// KV-only head pass (same gate and kernels as the batched prompt fill) and
+/// falls back to per-row decode forwards otherwise. Rows are independent:
+/// each slot's K/V depends only on its own token and hidden.
+fn mtp_takeover_fill_head_kv(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    trunk_weights: &Qwen35Weights,
+    cur_pos: usize,
+    tokens: &[u32],
+) -> HipResult<()> {
+    let n = tokens.len();
+    let dim = head.config.n_embd;
+    let dim_bytes = dim * 4;
+    if n > 1 {
+        gpu.hip.memcpy_dtod_at(
+            &state.takeover_fill_hidden.buf,
+            dim_bytes,
+            &state.verify_hidden.buf,
+            0,
+            (n - 1) * dim_bytes,
+        )?;
+    }
+    let use_batched = mtp_head::mtp_prompt_fill_uses_batched(
+        state.mtp_kv.kv_mode,
+        &[
+            head.weights.eh_proj.gpu_dtype,
+            head.weights.wq.gpu_dtype,
+            head.weights.wk.gpu_dtype,
+            head.weights.wv.gpu_dtype,
+        ],
+    );
+    if use_batched {
+        if state.takeover_fill_batched.is_none() {
+            let rows = state.verify_capacity + 1;
+            let scratch = Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, rows)?;
+            let widest_k = (2 * dim)
+                .max(head.config.n_ff)
+                .max(head.config.n_head * head.config.head_dim);
+            match gpu.alloc_tensor(&[rows * widest_k], DType::F32) {
+                Ok(rot) => state.takeover_fill_batched = Some((scratch, rot)),
+                Err(error) => {
+                    scratch.free_gpu(gpu);
+                    return Err(error);
+                }
+            }
+        }
+        let (scratch, rot) = state
+            .takeover_fill_batched
+            .as_mut()
+            .expect("takeover fill scratch allocated above");
+        let positions: Vec<i32> = (cur_pos..cur_pos + n).map(|p| p as i32).collect();
+        let hidden = state.takeover_fill_hidden.sub_offset(0, n * dim);
+        mtp_head::mtp_head_forward_block_batched(
+            gpu,
+            head,
+            scratch,
+            &mut state.mtp_kv,
+            tokens,
+            &hidden,
+            &positions,
+            n,
+            trunk_weights,
+            Some(rot),
+            true,
+        )
+    } else {
+        for (i, &token) in tokens.iter().enumerate() {
+            let hidden_row = state.takeover_fill_hidden.sub_offset(i * dim, dim);
+            mtp_head::mtp_head_forward_block_only(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                token,
+                &hidden_row,
+                None,
+                cur_pos + i,
+                trunk_weights,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3809,19 +3996,16 @@ mod tests {
     }
 
     #[test]
-    fn takeover_kv_repair_policy_retired_and_accept() {
-        // Already retired → never repair, regardless of accept_count.
-        assert_eq!(mtp_takeover_kv_repair_forwards(true, 0), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(true, 1), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(true, 7), 0);
-
-        // Live MTP + positive external accept → retire, zero forwards
-        // (no O(accepted) multi-row repair).
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 1), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 3), 0);
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 64), 0);
-
-        // Live MTP + zero accept → single-row repair of last_committed only.
-        assert_eq!(mtp_takeover_kv_repair_forwards(false, 0), 1);
+    fn takeover_fill_rows_are_the_trunk_kept_prefix() {
+        let cands = [11, 12, 13, 14];
+        // Zero accept: bonus only, the seed row is the only trunk-kept row.
+        assert_eq!(mtp_takeover_fill_tokens(7, &cands, 1), vec![7]);
+        // Partial accept (2 drafts + bonus): rejected tail is never filled.
+        assert_eq!(mtp_takeover_fill_tokens(7, &cands, 3), vec![7, 11, 12]);
+        // Full accept: seed + every draft; the bonus is pending, not filled.
+        assert_eq!(
+            mtp_takeover_fill_tokens(7, &cands, 5),
+            vec![7, 11, 12, 13, 14]
+        );
     }
 }

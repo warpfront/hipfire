@@ -1,5 +1,0 @@
-# Benchmark traces and model caches stay on hipx; scripts and report are tracked.
-gfx1100/
-gfx1151/
-smoke-home/
-*.kldseq

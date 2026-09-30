@@ -750,6 +750,63 @@ pub fn spec_ctx_request_fits(
         <= ctx_capacity
 }
 
+/// Room [`fit_max_tokens`] leaves below the context cap. Covers the
+/// end-of-turn trailer and one speculative draft block, so a fitted request
+/// passes both the AR budget guard and [`spec_ctx_request_fits`].
+pub const FIT_MAX_TOKENS_MARGIN: usize = 64;
+
+thread_local! {
+    static FIT_MAX_TOKENS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the generate request being handled on this thread as one whose
+/// client omitted `max_tokens` (wire `max_tokens_fit: true`). Restores the
+/// previous value on drop.
+pub struct FitMaxTokensGuard {
+    previous: bool,
+}
+
+impl FitMaxTokensGuard {
+    pub fn set(fit: bool) -> Self {
+        Self {
+            previous: FIT_MAX_TOKENS.with(|cell| cell.replace(fit)),
+        }
+    }
+}
+
+impl Drop for FitMaxTokensGuard {
+    fn drop(&mut self) {
+        FIT_MAX_TOKENS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Generation budget for a context-length check.
+///
+/// An explicit client `max_tokens` is returned unchanged, so the caller's
+/// `used + max_tokens > cap` check refuses it as before. When the client
+/// omitted it ([`FitMaxTokensGuard`]), `max_tokens` is only a ceiling and is
+/// clamped to the room left after the tokens already `used` (prompt, cached
+/// prefix, trailer) minus [`FIT_MAX_TOKENS_MARGIN`]. With no room left the
+/// value is returned unchanged so the prompt itself is refused.
+pub fn fit_max_tokens(max_tokens: usize, used: usize, cap: usize) -> usize {
+    fit_max_tokens_if(FIT_MAX_TOKENS.with(std::cell::Cell::get), max_tokens, used, cap)
+}
+
+/// [`fit_max_tokens`] with the fit decision passed explicitly, for paths that
+/// read it from a queued request instead of the handling thread.
+pub fn fit_max_tokens_if(fit: bool, max_tokens: usize, used: usize, cap: usize) -> usize {
+    if !fit {
+        return max_tokens;
+    }
+    match cap
+        .saturating_sub(used)
+        .saturating_sub(FIT_MAX_TOKENS_MARGIN)
+    {
+        0 => max_tokens,
+        room => max_tokens.min(room),
+    }
+}
+
 /// Extract held ToolCalls from a FinishSummary (generate_spec holds them).
 pub fn finish_summary_held_tool_calls(
     finish: &FinishSummary,
@@ -1930,7 +1987,10 @@ pub fn token_logprob_fields(
 
 #[cfg(test)]
 mod tests {
-    use super::{latch_request_think_cap, spec_ctx_request_fits};
+    use super::{
+        fit_max_tokens, latch_request_think_cap, spec_ctx_request_fits, FitMaxTokensGuard,
+        FIT_MAX_TOKENS_MARGIN,
+    };
 
     #[test]
     fn numeric_think_cap_latches_once_and_keeps_first_position() {
@@ -1958,6 +2018,32 @@ mod tests {
         ));
         assert!(latched);
         assert_eq!(mark, Some(4096));
+    }
+
+    #[test]
+    fn omitted_max_tokens_fits_the_context_left_after_the_prompt() {
+        // Explicit client budget: unchanged, so the caller refuses it.
+        assert_eq!(fit_max_tokens(81_920, 1_000, 32_768), 81_920);
+        {
+            let _fit = FitMaxTokensGuard::set(true);
+            let fitted = fit_max_tokens(81_920, 1_000, 32_768);
+            assert_eq!(fitted, 32_768 - 1_000 - FIT_MAX_TOKENS_MARGIN);
+            // The fitted budget passes the AR guard and a spec draft block.
+            assert!(1_000 + fitted <= 32_768);
+            assert!(spec_ctx_request_fits(1_000, fitted, 16, 32_768));
+            // A default smaller than the room is kept.
+            assert_eq!(fit_max_tokens(4_096, 1_000, 32_768), 4_096);
+            // No room left: unchanged, so the prompt itself is refused.
+            assert_eq!(fit_max_tokens(4_096, 32_768, 32_768), 4_096);
+            assert_eq!(fit_max_tokens(4_096, 32_768 - 10, 32_768), 4_096);
+            {
+                let _explicit = FitMaxTokensGuard::set(false);
+                assert_eq!(fit_max_tokens(81_920, 1_000, 32_768), 81_920);
+            }
+            // The inner request's guard restores the outer decision.
+            assert_eq!(fit_max_tokens(81_920, 0, 1_064), 1_000);
+        }
+        assert_eq!(fit_max_tokens(81_920, 1_000, 32_768), 81_920);
     }
 
     #[test]

@@ -54,6 +54,12 @@ pub struct Session {
     pub convo: Vec<u64>,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
+    /// Whether this session currently holds a VRAM admission. Admission is
+    /// charged for GPU-resident state only: a Swapped or Cold session holds no
+    /// KV on the device, so leaving it charged would let idle conversations
+    /// exhaust the budget while slots sit free. Private so the charge can only
+    /// be taken and returned through the methods below, exactly once each.
+    admitted: bool,
 }
 
 #[derive(Default)]
@@ -102,19 +108,48 @@ impl SessionTable {
                     self.clock += 1;
                     self.clock
                 },
+                admitted: true,
             },
         );
         Ok(SessionId(id))
     }
 
-    /// Close a session, returning its slot and budget together.
+    /// Close a session, returning its slot and budget together. The budget is
+    /// returned only if the session still holds it; a Swapped or Cold session
+    /// already gave it back when it left the GPU.
     pub fn close(&mut self, pool: &mut SlotPool, adm: &mut AdmissionController, id: SessionId) {
         if let Some(session) = self.sessions.remove(&id.0) {
             if let Some(slot) = session.slot {
                 pool.release(slot);
             }
-            adm.release(session.granted_ctx);
+            if session.admitted {
+                adm.release(session.granted_ctx);
+            }
         }
+    }
+
+    /// Re-take the VRAM admission of a session that left the GPU, before its
+    /// state is restored into a slot. No-op for a session that already holds
+    /// it. On error the session stays unadmitted; the caller should mark it
+    /// Cold.
+    pub fn readmit(
+        &mut self,
+        adm: &mut AdmissionController,
+        id: SessionId,
+    ) -> Result<(), AdmitError> {
+        let Some(s) = self.sessions.get_mut(&id.0) else {
+            return Ok(());
+        };
+        if !s.admitted {
+            adm.admit(s.granted_ctx)?;
+            s.admitted = true;
+        }
+        Ok(())
+    }
+
+    /// Whether the session currently holds a VRAM admission.
+    pub fn is_admitted(&self, id: SessionId) -> bool {
+        self.sessions.get(&id.0).is_some_and(|s| s.admitted)
     }
 
     pub fn get(&self, id: SessionId) -> Option<&Session> {
@@ -244,11 +279,21 @@ impl SessionTable {
             .map(|(id, _)| SessionId(*id))
     }
 
-    /// Give up the slot, keeping the session restorable from its snapshot.
-    pub fn mark_swapped(&mut self, pool: &mut SlotPool, id: SessionId) {
+    /// Give up the slot and its VRAM admission, keeping the session
+    /// restorable from its snapshot.
+    pub fn mark_swapped(
+        &mut self,
+        pool: &mut SlotPool,
+        adm: &mut AdmissionController,
+        id: SessionId,
+    ) {
         if let Some(s) = self.sessions.get_mut(&id.0) {
             if let Some(slot) = s.slot.take() {
                 pool.release(slot);
+            }
+            if s.admitted {
+                adm.release(s.granted_ctx);
+                s.admitted = false;
             }
             s.residency = Residency::Swapped;
         }
@@ -256,10 +301,15 @@ impl SessionTable {
 
     /// Give up the slot with no usable snapshot. The tokens survive, so the
     /// next turn re-prefills — slow, never wrong. Every swap failure ends here.
-    pub fn mark_cold(&mut self, pool: &mut SlotPool, id: SessionId) {
+    /// The VRAM admission is returned too; a re-prefill opens a fresh session.
+    pub fn mark_cold(&mut self, pool: &mut SlotPool, adm: &mut AdmissionController, id: SessionId) {
         if let Some(s) = self.sessions.get_mut(&id.0) {
             if let Some(slot) = s.slot.take() {
                 pool.release(slot);
+            }
+            if s.admitted {
+                adm.release(s.granted_ctx);
+                s.admitted = false;
             }
             s.residency = Residency::Cold;
             s.next_pos = 0;
@@ -267,6 +317,7 @@ impl SessionTable {
     }
 
     /// Re-attach a session to a slot after its state has been restored.
+    /// Call [`Self::readmit`] first; this does not touch admission.
     pub fn mark_resident(&mut self, id: SessionId, slot: SlotId, seq_len: usize) {
         self.clock += 1;
         let now = self.clock;
@@ -443,7 +494,7 @@ mod tests {
             s.convo = vec![11];
             s.tokens = vec![1, 2, 3];
         }
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         assert_eq!(t.find_continuation(&[11, 22], &[]), Some(a));
     }
 
@@ -457,7 +508,7 @@ mod tests {
             s.convo = vec![11];
             s.tokens = vec![1, 2, 3];
         }
-        t.mark_cold(&mut pool, a);
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.find_continuation(&[11, 22], &[]), None);
     }
 
@@ -558,7 +609,7 @@ mod tests {
         t.get_mut(a).unwrap().tokens.clear();
         assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "nothing in its KV");
         t.get_mut(a).unwrap().tokens = vec![1];
-        t.mark_cold(&mut pool, a);
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "cold");
     }
 
@@ -593,7 +644,7 @@ mod tests {
     fn a_swapped_session_holds_no_slot_and_frees_it() {
         let (mut pool, mut adm, mut t) = rig(1);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         assert!(t.get(a).unwrap().slot.is_none());
         assert_eq!(t.get(a).unwrap().residency, Residency::Swapped);
         assert_eq!(t.resident(), 0);
@@ -606,7 +657,7 @@ mod tests {
         let (mut pool, mut adm, mut t) = rig(1);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2, 3]);
-        t.mark_cold(&mut pool, a);
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.get(a).unwrap().residency, Residency::Cold);
         assert_eq!(
             t.get(a).unwrap().tokens,
@@ -621,7 +672,7 @@ mod tests {
         let (mut pool, mut adm, mut t) = rig(2);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         let first = t.get(a).unwrap().slot.unwrap();
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         // The pool hands back whichever slot is free, which is usually the one
         // just released. What matters is that mark_resident accepts ANY slot --
         // residency is a property of the session, not the slot -- so restore
@@ -637,11 +688,106 @@ mod tests {
     fn begin_turn_on_a_swapped_session_is_an_error() {
         let (mut pool, mut adm, mut t) = rig(1);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.mark_swapped(&mut pool, a);
+        t.mark_swapped(&mut pool, &mut adm, a);
         assert!(
             t.begin_turn(&mut pool, a, &[1, 2]).is_err(),
             "a session with no slot cannot begin a turn"
         );
+    }
+
+    /// Budget that fits the weights plus exactly `n` sessions of `ctx`.
+    fn rig_budget(
+        n_slots: usize,
+        ctx: usize,
+        n: u64,
+    ) -> (SlotPool, AdmissionController, SessionTable) {
+        let pool = SlotPool::new(n_slots, 4096, PPB).unwrap();
+        let adm = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: GIB,
+                kv_bytes_per_token: 1024,
+            },
+            GIB + n * ctx as u64 * 1024 + 1,
+        );
+        (pool, adm, SessionTable::default())
+    }
+
+    #[test]
+    fn eviction_returns_admission_so_new_conversations_keep_opening() {
+        // 2 slots, budget for 2 sessions. Every new conversation evicts the
+        // LRU idle one, the way serve_engine's admit path does. Before
+        // admission was residency-scoped, swapped sessions stayed charged and
+        // the third conversation was refused with WouldExceedBudget while a
+        // slot sat free.
+        let (mut pool, mut adm, mut t) = rig_budget(2, 1024, 2);
+        for i in 0..10 {
+            let id = match t.open(&mut pool, &mut adm, 1024) {
+                Ok(id) => id,
+                Err(_) => {
+                    let v = t.lru_idle_victim(&[]).expect("idle victim");
+                    t.mark_swapped(&mut pool, &mut adm, v);
+                    t.open(&mut pool, &mut adm, 1024)
+                        .unwrap_or_else(|e| panic!("conversation {i} refused: {e}"))
+                }
+            };
+            t.touch(id);
+        }
+        assert_eq!(t.resident(), 2);
+        assert_eq!(adm.used_bytes(), GIB + 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn closing_a_swapped_session_does_not_release_twice() {
+        // release() matches by granted ctx, so a second release of a session
+        // that already gave its budget back would silently drop ANOTHER
+        // resident session's charge and let admission over-commit VRAM.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let _b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        let _c = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let charged = adm.used_bytes();
+        assert_eq!(charged, GIB + 2 * 1024 * 1024);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), charged, "b and c are still resident");
+    }
+
+    #[test]
+    fn a_cold_session_returns_its_admission() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_cold(&mut pool, &mut adm, a);
+        assert!(!t.is_admitted(a));
+        assert_eq!(adm.used_bytes(), 0);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+    }
+
+    #[test]
+    fn readmit_charges_a_restored_session_once() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+        t.readmit(&mut adm, a).unwrap();
+        t.readmit(&mut adm, a).unwrap(); // idempotent
+        assert_eq!(adm.used_bytes(), GIB + 1024 * 1024);
+        let slot = pool.acquire().unwrap();
+        t.mark_resident(a, slot, 0);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+    }
+
+    #[test]
+    fn readmit_refused_by_budget_leaves_the_session_unadmitted() {
+        let (mut pool, mut adm, mut t) = rig_budget(2, 1024, 1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        let _b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        assert!(t.readmit(&mut adm, a).is_err());
+        assert!(!t.is_admitted(a));
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), GIB + 1024 * 1024, "b keeps its charge");
     }
 
     #[test]

@@ -38,14 +38,9 @@ required_features_daemon    == 0
 # model still serving; the guard refuses it before any teardown or allocation.
 # The load arm was sitting exactly at the old ceiling, so no correctness fix
 # there fits under it. Paid down when the arm's branch duplication is factored.
-# RATCHET-RAISE 4863 -> 5358 (2026-09-30): inherited from upstream/beta, which
-# landed over the ceiling without a raise: VMM KV backend default + unified KV
-# resolution (4418013e1, 294c4ad9d, 86e67a9ca, f77b27ffd; +231), machine-wide
-# GPU UUID locks + hardware.devices resolution (4c7503b3b, 407ed387d; +206),
-# indexed kernel pack / compiler-free probe (29e48b615, 856d4f8f6, 206c516bc;
-# +28), gfx1201 PM4 pacing (0466dbd01; +14). Pay down by moving GPU
-# reservation and KV-backend resolution out of main.rs into loader/runtime.
-daemon_lines                <= 5358
+# RATCHET-RAISE 5355 -> 5362: the gfx1201 retained-decode PM4 pacing scope
+# (0466dbd01, HIPFIRE_GFX1201_PM4_PACING) added 14 lines after #778 measured 5348.
+daemon_lines                <= 5362
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

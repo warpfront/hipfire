@@ -33,6 +33,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use hipfire_runtime::stop_sequence::StopMatcher;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -51,32 +52,53 @@ pub fn arm_fault_after_prefill(armed: bool) {
 }
 
 /// Route already-classified think/content events in order. Reasoning bypasses
-/// tool parsing; answer content remains subject to ToolOutputRouter.
+/// tool parsing; answer content passes the user `stop` matcher, then
+/// ToolOutputRouter. Once a stop sequence matches, nothing after it (content,
+/// reasoning or tool markup) is routed.
 pub fn qwen_ar_route_think_events(
     stdout: &mut impl std::io::Write,
     id: &str,
     router: &mut ToolOutputRouter,
+    stop: &mut StopMatcher,
     channel_events: Vec<ThinkRouteEvent>,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     for channel_event in channel_events {
+        if stop.matched() {
+            break;
+        }
         match channel_event {
             ThinkRouteEvent::Reasoning(reasoning) => {
                 emit_reasoning_token(stdout, id, &reasoning);
             }
             ThinkRouteEvent::Content(content) => {
-                let events = router.push(&content)?;
-                for ev in events {
-                    match ev {
-                        ToolRouteEvent::VisibleText(vt) => {
-                            visible_acc.push_str(vt.as_str());
-                            emit_visible_token(stdout, id, vt.as_str());
-                        }
-                        ToolRouteEvent::ToolCall(_) => {
-                            // Retained in router.tool_calls(); safe terminal releases it.
-                        }
-                    }
-                }
+                let content = stop.push(&content);
+                qwen_ar_route_answer_content(stdout, id, router, &content, visible_acc)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pass stop-gated answer content to the tool router and emit its visible prose.
+fn qwen_ar_route_answer_content(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    router: &mut ToolOutputRouter,
+    content: &str,
+    visible_acc: &mut String,
+) -> Result<(), ToolRouteError> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    for ev in router.push(content)? {
+        match ev {
+            ToolRouteEvent::VisibleText(vt) => {
+                visible_acc.push_str(vt.as_str());
+                emit_visible_token(stdout, id, vt.as_str());
+            }
+            ToolRouteEvent::ToolCall(_) => {
+                // Retained in router.tool_calls(); safe terminal releases it.
             }
         }
     }
@@ -90,12 +112,13 @@ pub fn qwen_ar_route_filter_text(
     id: &str,
     think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
+    stop: &mut StopMatcher,
     text: &str,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     let mut channel_events = Vec::new();
     think_router.push_into(text, &mut channel_events);
-    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
+    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc)
 }
 
 /// Outcome of finishing the Qwen AR semantic router for one turn.
@@ -121,18 +144,34 @@ pub struct QwenArRouteFinish {
 pub enum QwenArTerminalCause {
     /// Decoded stop marker (`<|im_end|>` / `<|endoftext|>`) via filter.
     DecodedEot,
-    /// Hit the requested max_tokens budget without a decoded EOT.
+    /// Hit the requested max_tokens budget without a decoded EOT. Includes a
+    /// budget spent inside `<think>`: partial reasoning, no answer.
     LengthCap,
     /// Natural stop (no length, no EOT marker — model finished cleanly).
     NaturalStop,
-    /// Open think span at finish — fail-closed validation (no cache).
+    /// A user `stop` sequence matched in the answer; the text from the match
+    /// on is not emitted, so the turn is never cached.
+    StopSequence,
+    /// Think span still open when the model itself ended the turn (decoded
+    /// EOT inside `<think>`) — fail-closed validation (no cache).
     OpenThink,
 }
 
 impl QwenArTerminalCause {
-    /// Resolve cause: decoded EOT beats length on the same token.
-    pub fn resolve(stopped_by_filter: bool, hit_length_cap: bool, open_think: bool) -> Self {
-        if open_think {
+    /// Resolve cause. A matched stop sequence ends the answer, so it beats
+    /// everything after it. Otherwise decoded EOT beats length on the same
+    /// token, and an open think span is only an error when the model ended the
+    /// turn inside it; running out of budget there is an ordinary length stop.
+    pub fn resolve(
+        stopped_by_filter: bool,
+        stop_sequence: bool,
+        hit_length_cap: bool,
+        open_think: bool,
+    ) -> Self {
+        if stop_sequence {
+            return Self::StopSequence;
+        }
+        if open_think && (stopped_by_filter || !hit_length_cap) {
             return Self::OpenThink;
         }
         if stopped_by_filter {
@@ -148,6 +187,8 @@ impl QwenArTerminalCause {
 /// Finish the AR router. Length-cap (without EOT) never exposes tool_calls
 /// or primes asst_turn_cache. Decoded EOT on the final budget token still
 /// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
+/// A stop sequence keeps calls completed before it, drops a call it cut off,
+/// and never primes asst_turn_cache (the KV holds the trimmed stop text).
 /// Open think → non-retryable validation terminal, no cache, no hidden bytes.
 pub fn qwen_ar_finish_route(
     router: ToolOutputRouter,
@@ -164,13 +205,15 @@ pub fn qwen_ar_finish_route(
         });
     }
     let length_unsafe = matches!(cause, QwenArTerminalCause::LengthCap);
+    let stop_sequence = matches!(cause, QwenArTerminalCause::StopSequence);
     let buffered_before = router.tool_calls().to_vec();
     match router.finish() {
         Err(err) => {
-            if length_unsafe {
-                // Any pure-length terminal is unsafe: no calls, no cache.
+            if length_unsafe || stop_sequence {
+                // Any pure-length terminal is unsafe: no calls, no cache. A
+                // stop sequence that cut a call short leaves no call either.
                 Ok(QwenArRouteFinish {
-                    finish_reason: "length",
+                    finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
                     store_cache: false,
                     trailing_visible: Vec::new(),
@@ -208,7 +251,7 @@ pub fn qwen_ar_finish_route(
                 Ok(QwenArRouteFinish {
                     finish_reason: "tool_calls",
                     wire_tool_calls: finished_calls,
-                    store_cache: true,
+                    store_cache: !stop_sequence,
                     trailing_visible,
                     cause,
                 })
@@ -216,7 +259,7 @@ pub fn qwen_ar_finish_route(
                 Ok(QwenArRouteFinish {
                     finish_reason: "stop",
                     wire_tool_calls: Vec::new(),
-                    store_cache: true,
+                    store_cache: !stop_sequence,
                     trailing_visible,
                     cause,
                 })
@@ -239,57 +282,56 @@ pub fn qwen_ar_eos_filter_config() -> EosFilterConfig {
 /// Apply one filter observe step into the semantic router. Returns
 /// `Ok(true)` when the filter signals Stop / EmitAndStop (decoded EOT)
 /// so the caller can break the decode loop without emitting marker text.
+/// A user stop-sequence match is reported by `stop.matched()`, not here.
 pub fn qwen_ar_observe_and_route(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
     think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
+    stop: &mut StopMatcher,
     new_bytes: &[u8],
     visible_acc: &mut String,
 ) -> Result<bool, ToolRouteError> {
-    match filter.observe(new_bytes) {
-        FilterAction::Emit(text_bytes) => {
-            let text = std::str::from_utf8(&text_bytes).unwrap_or("");
-            if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
-            }
-            Ok(false)
-        }
-        FilterAction::EmitAndStop(text_bytes) => {
-            let text = std::str::from_utf8(&text_bytes).unwrap_or("");
-            if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
-            }
-            Ok(true)
-        }
-        FilterAction::Hold => Ok(false),
-        FilterAction::Stop => Ok(true),
+    let (text_bytes, filter_stop) = match filter.observe(new_bytes) {
+        FilterAction::Emit(text_bytes) => (text_bytes, false),
+        FilterAction::EmitAndStop(text_bytes) => (text_bytes, true),
+        FilterAction::Hold => return Ok(false),
+        FilterAction::Stop => return Ok(true),
+    };
+    let text = std::str::from_utf8(&text_bytes).unwrap_or("");
+    if !text.is_empty() {
+        qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc)?;
     }
+    Ok(filter_stop)
 }
 
 /// Shared end-of-stream drain used by production decode and deterministic
 /// tests. Flushes EOT-prefix prose through think routing, then classifies any
-/// trailing partial think marker as ordinary text in its current channel.
+/// trailing partial think marker as ordinary text in its current channel, then
+/// releases answer text the stop matcher held back as a possible stop prefix.
 pub fn qwen_ar_drain_pending_into_router(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
     think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
+    stop: &mut StopMatcher,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     let pending = filter.flush_pending();
     if !pending.is_empty() {
         let text = std::str::from_utf8(&pending).unwrap_or("");
         if !text.is_empty() {
-            qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
+            qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc)?;
         }
     }
 
     let mut channel_events = Vec::new();
     think_router.finish_into(&mut channel_events);
-    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
+    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc)?;
+    let held = stop.finish();
+    qwen_ar_route_answer_content(stdout, id, router, &held, visible_acc)
 }
 
 /// Raw-commit bookkeeping shared by production and tests. Advances
@@ -453,6 +495,8 @@ pub struct QwenArSemanticProducer {
     /// Stream positions recorded at each raw commit (testable ordering).
     pub raw_commit_positions: Vec<usize>,
     pub stopped_by_filter: bool,
+    /// User `stop` sequences, matched on answer text before it is emitted.
+    pub stop: StopMatcher,
 }
 
 impl QwenArSemanticProducer {
@@ -478,7 +522,14 @@ impl QwenArSemanticProducer {
             raw_committed: Vec::new(),
             raw_commit_positions: Vec::new(),
             stopped_by_filter: false,
+            stop: StopMatcher::default(),
         }
+    }
+
+    /// Gate this turn's answer text on the request's `stop` sequences.
+    pub fn with_stop(mut self, stop: &[String]) -> Self {
+        self.stop = StopMatcher::new(stop);
+        self
     }
 
     /// Sole production/test raw-commit entry parameterized by disposition.
@@ -511,27 +562,28 @@ impl QwenArSemanticProducer {
         match disposition {
             QwenArRawCommitDisposition::ClassifiedVisible => {
                 on_committed(pos, stdout);
-                if self.stopped_by_filter {
+                if self.stopped_by_filter || self.stop.matched() {
                     return Ok(true);
                 }
-                let stop = qwen_ar_observe_and_route(
+                let filter_stop = qwen_ar_observe_and_route(
                     stdout,
                     &self.id,
                     &mut self.filter,
                     &mut self.think_router,
                     &mut self.router,
+                    &mut self.stop,
                     new_bytes.as_ref(),
                     &mut self.visible_acc,
                 )?;
-                if stop {
+                if filter_stop {
                     self.stopped_by_filter = true;
                 }
-                Ok(stop)
+                Ok(filter_stop || self.stop.matched())
             }
             QwenArRawCommitDisposition::IntentionallyHidden => {
                 // Hidden: physical/state mutation only; never classify or emit.
                 let _ = (new_bytes, &mut on_committed);
-                Ok(self.stopped_by_filter)
+                Ok(self.stopped_by_filter || self.stop.matched())
             }
         }
     }
@@ -605,11 +657,16 @@ impl QwenArSemanticProducer {
             &mut self.filter,
             &mut self.think_router,
             &mut self.router,
+            &mut self.stop,
             &mut self.visible_acc,
         )?;
         let open_think = self.think_router.in_think();
-        let cause =
-            QwenArTerminalCause::resolve(self.stopped_by_filter, hit_length_cap, open_think);
+        let cause = QwenArTerminalCause::resolve(
+            self.stopped_by_filter,
+            self.stop.matched(),
+            hit_length_cap,
+            open_think,
+        );
         if matches!(cause, QwenArTerminalCause::OpenThink) {
             // Fail-closed: no calls/cache/done. Caller owns the
             // production rollback epilogue + single correlated error terminal
@@ -832,6 +889,15 @@ impl GenerationRoute {
         )
     }
 
+    /// Routes that honour OpenAI `stop`: the Qwen3.5-family semantic producers
+    /// (single-GPU AR, dense TP and MoE EP via `QwenArSemanticProducer`;
+    /// DFlash/MTP via `Qwen35Emit`). Each matches only the answer channel,
+    /// holds a possible stop prefix back, and never emits the stop text. Every
+    /// other route would ignore `stop` or leak it, so `generate` refuses it.
+    pub const fn supports_stop(self) -> bool {
+        matches!(self, Self::QwenAr | Self::QwenDflash)
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::QwenAr => "qwen_ar",
@@ -858,6 +924,31 @@ impl GenerationRoute {
             Self::PipelineParallel => "pipeline_parallel",
             Self::DotsOcr => "dots_ocr",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Parse a generate message's OpenAI `stop` field (string or array form).
+/// An invalid value emits one correlated `validation` error and returns `None`;
+/// the caller skips the request.
+pub fn stop_or_reject(
+    stdout: &mut impl Write,
+    id: &str,
+    msg: &serde_json::Value,
+) -> Option<Vec<String>> {
+    match hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")) {
+        Ok(stops) => Some(stops),
+        Err(message) => {
+            crate::dense::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &message,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            None
         }
     }
 }
@@ -2175,6 +2266,27 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    if !stop.is_empty() && !selected_route.supports_stop() {
+        crate::dense::emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "stop sequences are not supported on producer route {} (routes with stop: {})",
+                selected_route.name(),
+                GenerationRoute::ALL
+                    .iter()
+                    .filter(|r| r.supports_stop())
+                    .map(|r| r.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
     let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
@@ -2228,7 +2340,6 @@ pub fn generate(
                 presence_penalty,
                 frequency_penalty,
             );
-            let _ = stop;
             crate::dense::generate_gemma4(
                 m,
                 gpu,
@@ -2263,7 +2374,6 @@ pub fn generate(
                 presence_penalty,
                 frequency_penalty,
             );
-            let _ = stop;
             crate::dense::generate_muse_glimmer(
                 m,
                 gpu,
@@ -2499,7 +2609,6 @@ pub fn generate(
                 tools,
                 messages_history,
             );
-            let _ = stop;
             crate::dense::generate_qwen2(
                 m,
                 gpu,
@@ -2526,7 +2635,6 @@ pub fn generate(
                 tools,
                 messages_history,
             );
-            let _ = stop;
             crate::dense::generate_qwen2(
                 m,
                 gpu,
@@ -2555,7 +2663,6 @@ pub fn generate(
                 pflash_state,
                 pflash_cfg,
             );
-            let _ = stop;
             crate::dense::generate_maple(
                 m,
                 gpu,
@@ -2586,7 +2693,6 @@ pub fn generate(
                 pflash_cfg,
             );
             let _ = (repeat_penalty, repeat_window);
-            let _ = stop;
             crate::dense::generate_deepseek4_spec(
                 m,
                 gpu,
@@ -2616,7 +2722,6 @@ pub fn generate(
                 pflash_cfg,
             );
             let _ = (repeat_penalty, repeat_window);
-            let _ = stop;
             crate::dense::generate_deepseek4(
                 m,
                 gpu,
@@ -2879,7 +2984,6 @@ pub fn generate(
                 messages_history,
             );
             let _ = (repeat_penalty, repeat_window);
-            let _ = stop;
             let _ = (top_k, min_p, presence_penalty, frequency_penalty);
             crate::vision::generate_dots_ocr_text(
                 m,
@@ -2919,7 +3023,6 @@ pub fn generate(
                 assistant_prefix,
                 tools,
                 messages_history,
-                stop,
                 reasoning_effort,
                 enable_thinking,
                 request_seed as u64,
@@ -4041,6 +4144,19 @@ pub fn generate(
             })
             .unwrap_or(0),
     );
+    let max_tokens = if m.eviction.is_none() {
+        crate::common::fit_max_tokens(
+            max_tokens,
+            m.seq_pos + new_tokens.len() + trailer,
+            m.physical_cap,
+        )
+    } else {
+        crate::common::fit_max_tokens(
+            max_tokens,
+            absolute_pos + new_tokens.len() + trailer,
+            m.max_seq,
+        )
+    };
     if m.eviction.is_none() {
         if m.seq_pos
             .saturating_add(new_tokens.len())
@@ -4658,7 +4774,8 @@ pub fn generate(
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
         // seq_pos advance before classify).
         let mut semantic =
-            QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
+            QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty)
+                .with_stop(stop);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -4798,7 +4915,8 @@ pub fn generate(
                     crate::common::emit_committed_event(out, id, next_token, pos, elapsed_ms);
                 },
             ) {
-                Ok(true) => break, // decoded EOT suppressed; stop generation
+                // Decoded EOT or user stop sequence, neither emitted; stop generation.
+                Ok(true) => break,
                 Ok(false) => {}
                 Err(err) => {
                     emit_error_with_id(stdout, id, &err.to_string());
@@ -4873,18 +4991,6 @@ pub fn generate(
             }
             if tokenizer.is_terminator(next_token) {
                 break;
-            }
-
-            // hunt3 M-F: user stop-sequence match against the decoded output
-            // suffix. Matching on the full decoded text (not per-token) handles
-            // stop strings that span a token boundary. On a hit we break out of
-            // the decode loop; finish_reason naturally resolves to "stop" below
-            // (hit_length_cap is false and no tool_calls were emitted).
-            if !stop.is_empty() {
-                let decoded_suffix = tokenizer.decode(&streamed_tokens);
-                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                    break;
-                }
             }
 
             // max_think_tokens enforcement. Track whether we're inside an

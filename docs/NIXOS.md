@@ -258,8 +258,8 @@ and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 `HOME=/var/lib/hipfire` and `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels`.
 
 **Security:** `hipfire serve` has **no authentication and no TLS**
-([SERVE.md](SERVE.md)). Default listen remains **`0.0.0.0`** unless you set
-`extraSettings.host = "127.0.0.1"` (or equivalent). `openFirewall = false` does
+([SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
+`extraSettings.host = "0.0.0.0"` (or equivalent) to listen on all interfaces. `openFirewall = false` does
 **not** change the listen address — it only avoids opening `cfg.port` when the
 **host firewall is enabled**. Keep the firewall closed unless the host is on a
 trusted network or an authenticated TLS reverse proxy terminates in front of
@@ -295,7 +295,7 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `enable` | bool | `false` | Enable the service |
-| `openFirewall` | bool | `false` | Open `port` when the host firewall is enabled; does **not** change listen address (default still `0.0.0.0`) |
+| `openFirewall` | bool | `false` | Open `port` when the host firewall is enabled; does **not** change listen address (default `127.0.0.1`) |
 | `package` | package | `pkgs.hipfire` | Package to run |
 | `src` | path or null | `null` | Override source **path** (not a package/derivation) |
 | `github.owner` | str |  `"warpfront"`    | fetch owner |

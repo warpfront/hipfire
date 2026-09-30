@@ -1988,11 +1988,13 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     // bind their model hash, so sharing across entries is unlikely, but a
     // shared file must survive exactly like a shared DFlash draft.
     let mut kept_xdna: Option<(String, String)> = None;
+    // A shared MTP head under the same rule: every `qwen3.8:27b*` tier declares
+    // `qwen3.8-27b.mtp`, and the stem sweep below would otherwise catch it too.
+    let mut kept_mtp: Option<(String, String)> = None;
     if let Some((tag, entry)) = resolved {
         targets.extend(
             [
                 &entry.triattn,
-                &entry.mtp,
                 &entry.dspark,
                 &entry.t5,
                 &entry.clip,
@@ -2078,6 +2080,31 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
                 }
             }
         }
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .mtp
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_mtp = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
         targets.extend(
             entry
                 .heads
@@ -2113,6 +2140,14 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             );
         }
     }
+    if let Some((file, _)) = kept_mtp.as_ref() {
+        // The stem sweep matched the shared head beside the trunk; keep it.
+        let kept = paths.models.join(file);
+        if let Ok(canonical) = fs::canonicalize(&kept) {
+            targets.remove(&canonical);
+        }
+        targets.remove(&kept);
+    }
     if !args.yes {
         eprint!("Remove {} file(s)? [y/N] ", targets.len());
         std::io::stderr().flush()?;
@@ -2133,6 +2168,9 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     }
     if let Some((file, keepers)) = kept_vision {
         eprintln!("keeping Vision sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_mtp {
+        eprintln!("keeping MTP sidecar {file}: still declared by {keepers}");
     }
     if let Some((file, keepers)) = kept_xdna {
         eprintln!("keeping XDNA sidecar {file}: still declared by {keepers}");
@@ -2289,6 +2327,14 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         &model_path,
         canonical.as_deref(),
     )?;
+    resolve_mtp_sidecar(
+        &mut params,
+        entry,
+        &paths.models,
+        &model_path,
+        &args.model,
+        canonical.as_deref(),
+    );
     if let Some(vision) = &args.vision {
         // Forwarded in every mode; the daemon's `vision_mode=off` gate decides
         // and can then name the sidecar it declined on an image request.
@@ -3384,6 +3430,60 @@ fn resolve_dflash_sidecar(
         sidecar.file
     );
     Ok(())
+}
+
+/// Resolve the Qwen MTP head sidecar into `params["mtp"]`.
+///
+/// Call once the final `mtp_mode` is known (after the effective speculation
+/// selector); `off` never carries a head. Otherwise the first existing file
+/// wins: the registry `entry.mtp` file in `models_dir`, then `<entry
+/// file>.mtp` in `models_dir`, then `.mtp` beside `requested` as typed (when
+/// it names a file), then `.mtp` beside the canonical `model_path`.
+/// `find_model_path` canonicalizes, so a head beside a symlinked trunk — the
+/// models-dir layout — is invisible from `model_path` alone. With no hit
+/// `params["mtp"]` stays unset and the loader keeps its bundled-trailer and
+/// `<trunk>.mtp` lookup (and `on` fails there); a registry-declared head that
+/// is not pulled gets a one-line `hipfire pull` hint.
+pub(crate) fn resolve_mtp_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    requested: &str,
+    tag: Option<&str>,
+) {
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("mtp");
+    }
+    if params["mtp_mode"].as_str() == Some("off") {
+        return;
+    }
+    let mut candidates = Vec::new();
+    if let Some(entry) = entry {
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            candidates.push(models_dir.join(&sidecar.file));
+        }
+        candidates.push(models_dir.join(Path::new(&entry.file).with_extension("mtp")));
+    }
+    let requested = Path::new(requested);
+    if requested.is_file() {
+        // Absolute but not canonical: the daemon may run from another cwd,
+        // and the point is to keep the symlink's own directory.
+        let requested = std::path::absolute(requested).unwrap_or_else(|_| requested.to_path_buf());
+        candidates.push(requested.with_extension("mtp"));
+    }
+    candidates.push(model_path.with_extension("mtp"));
+    if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        params["mtp"] = serde_json::json!(hit.display().to_string());
+        return;
+    }
+    if let Some(sidecar) = entry.and_then(|entry| entry.mtp.as_ref()) {
+        eprintln!(
+            "[hipfire] MTP head {} not pulled; `hipfire pull {}` enables MTP speculation",
+            sidecar.file,
+            tag.unwrap_or("<model>")
+        );
+    }
 }
 
 /// Resolve a registry-declared XDNA spillover archive into `params["xdna"]`.
@@ -5086,6 +5186,14 @@ fn open_bench_engine(
         &path,
         tag.as_deref(),
     )?;
+    resolve_mtp_sidecar(
+        &mut params,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        &args.model,
+        tag.as_deref(),
+    );
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         // Automatic max_seq stays omitted so admission can derive the bound.
@@ -5114,21 +5222,16 @@ fn open_bench_engine(
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
 ///
-/// Answer mode is the default rather than an opt-in because a benchmark that
-/// lets the model think cannot complete. A reasoning model (any Qwen3.6 SKU,
-/// for one) opens `<think>` within its first tokens and has no chance of
-/// closing it inside the benchmark's budget — 16 tokens for the warmup, 128
-/// for a measured run. The daemon ranks an unclosed think span at finish above
-/// the length cap in both terminal classifiers (`QwenArTerminalCause::resolve`
-/// and `qwen_dflash_wire_terminal`), so it reports the truncation as a
-/// non-retryable validation error rather than `finish_reason=length`. The
-/// benchmark then aborts on the warmup generate, before recording a sample.
+/// Answer mode is the default rather than an opt-in so every model runs the
+/// same turn shape. A reasoning model (any Qwen3.6 SKU, for one) opens
+/// `<think>` within its first tokens and would spend the benchmark's whole
+/// budget — 16 tokens for the warmup, 128 for a measured run — inside it,
+/// ending every sample mid-thought at `finish_reason=length`.
 ///
 /// Benchmarks measure tokens per second and never read the text, so asking for
-/// answer mode costs nothing and removes the dependency on the model finishing
-/// a thought inside an arbitrary budget. `--reasoning-on` restores the
-/// thinking turn for anyone who wants to measure that path — with a budget
-/// large enough to close the span.
+/// answer mode costs nothing and keeps the measured path independent of how
+/// long a model thinks. `--reasoning-on` restores the thinking turn for anyone
+/// who wants to measure that path.
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
     bench_generate_request_reasoning(prompt, max_tokens, false)
 }
@@ -7259,6 +7362,7 @@ mod tests {
             recent_tok_s: None,
             started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            engine_state: crate::serve::EngineState::Up,
         }
     }
 
@@ -9276,6 +9380,191 @@ mod tests {
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
+    fn mtp_entry(file: &str, mtp: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            repo: "test/repo".into(),
+            file: file.into(),
+            size_gb: 1.0,
+            min_vram_gb: 1.0,
+            desc: "mtp test".into(),
+            mtp: mtp.map(|head| hipfire_registry::Sidecar {
+                file: head.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtp_sidecar_resolves_beside_a_symlinked_trunk() {
+        // B2: `find_model_path` canonicalizes, so the trunk path the daemon gets
+        // is the symlink TARGET. The head the user placed (or pulled) beside the
+        // symlink must still be found: via the models dir for a registry tag,
+        // via the path as typed for a bare path.
+        let paths = test_paths("mtp-symlinked-trunk");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("h2.group-alpha-refit.hfq");
+        fs::write(&target, b"trunk").unwrap();
+        let link = paths.models.join("qwen3.8-27b.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let head = paths.models.join("qwen3.8-27b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let canonical = fs::canonicalize(&link).unwrap();
+        assert_eq!(canonical, fs::canonicalize(&target).unwrap());
+
+        // Registry tag with the declared slot.
+        let entry = mtp_entry("qwen3.8-27b.mq4-xts", Some("qwen3.8-27b.mtp"));
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve_mtp_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &canonical,
+            "qwen3.8:27b-mq4-xts",
+            Some("qwen3.8:27b-mq4-xts"),
+        );
+        assert_eq!(params["mtp"], head.display().to_string());
+
+        // Bare path to a symlink outside the models dir, no registry entry.
+        let elsewhere = paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let bare_link = elsewhere.join("mine.mq4-xts");
+        std::os::unix::fs::symlink(&target, &bare_link).unwrap();
+        let bare_head = elsewhere.join("mine.mtp");
+        fs::write(&bare_head, b"head").unwrap();
+        let mut params = serde_json::json!({ "mtp_mode": "on" });
+        resolve_mtp_sidecar(
+            &mut params,
+            None,
+            &paths.models,
+            &canonical,
+            bare_link.to_str().unwrap(),
+            None,
+        );
+        assert_eq!(params["mtp"], bare_head.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn mtp_sidecar_prefers_models_dir_then_falls_back_beside_the_target() {
+        let paths = test_paths("mtp-precedence");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("qwen3.8-27b.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        let beside_target = store.join("qwen3.8-27b.mtp");
+        fs::write(&beside_target, b"head").unwrap();
+        let entry = mtp_entry("qwen3.8-27b.mq4", Some("qwen3.8-27b.mtp"));
+        let resolve = |params: &mut serde_json::Value| {
+            resolve_mtp_sidecar(
+                params,
+                Some(&entry),
+                &paths.models,
+                &target,
+                "qwen3.8:27b",
+                None,
+            )
+        };
+
+        // Only the canonical sibling exists: today's loader behaviour is kept.
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve(&mut params);
+        assert_eq!(params["mtp"], beside_target.display().to_string());
+
+        // A pulled head in the models dir wins over the canonical sibling.
+        let pulled = paths.models.join("qwen3.8-27b.mtp");
+        fs::write(&pulled, b"head").unwrap();
+        resolve(&mut params);
+        assert_eq!(params["mtp"], pulled.display().to_string());
+
+        // Nothing anywhere: no param, so the loader's own lookup decides.
+        fs::remove_file(&pulled).unwrap();
+        fs::remove_file(&beside_target).unwrap();
+        resolve(&mut params);
+        assert!(params.get("mtp").is_none(), "{params}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn mtp_sidecar_is_never_carried_when_mtp_is_off() {
+        let paths = test_paths("mtp-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let target = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b.mtp"), b"head").unwrap();
+        let entry = mtp_entry("qwen3.8-27b.mq4", Some("qwen3.8-27b.mtp"));
+        let resolve = |params: &mut serde_json::Value| {
+            resolve_mtp_sidecar(
+                params,
+                Some(&entry),
+                &paths.models,
+                &target,
+                "qwen3.8:27b",
+                None,
+            )
+        };
+        // A selector applied after an earlier resolution (e.g. `run --spec
+        // dflash` sets mtp_mode=off) must strip the stale path.
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve(&mut params);
+        assert!(params.get("mtp").is_some());
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        resolve(&mut params);
+        assert!(params.get("mtp").is_none(), "{params}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_keeps_shared_mtp_head_until_the_last_declaring_target() {
+        // Every `qwen3.8:27b*` tier declares `qwen3.8-27b.mtp`, whose name also
+        // matches the `<stem>.mtp` sweep beside the trunk being removed.
+        let paths = test_paths("rm-shared-mtp");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4", "qwen3.8-27b.mq4-xts", "qwen3.8-27b.mtp"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-xts", "qwen3.8-27b.mq4-xts", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.mtp = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        let rm = |model: &str| {
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: model.into(),
+                    yes: true,
+                },
+            )
+            .unwrap()
+        };
+        rm("qwen3.8:27b-mq4-xts");
+        assert!(!paths.models.join("qwen3.8-27b.mq4-xts").exists());
+        assert!(
+            paths.models.join("qwen3.8-27b.mtp").exists(),
+            "shared head is kept while a sibling declarer is on disk"
+        );
+        rm("qwen3.8:27b");
+        assert!(!paths.models.join("qwen3.8-27b.mq4").exists());
+        assert!(
+            !paths.models.join("qwen3.8-27b.mtp").exists(),
+            "head goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
     #[test]
     fn rm_without_dflash_declaration_leaves_draft_file_alone() {
         // A tag with no dflash declaration keeps master behaviour: its target
@@ -10921,6 +11210,18 @@ mod tests {
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,
                     multi_slot_prefill_chunk: 1024,
+                    spawner: crate::serve::EngineSpawner {
+                        daemon: daemon.clone(),
+                        process_config: process_config.clone(),
+                        attempts: 3,
+                        backoff: Duration::from_millis(10),
+                    },
+                    resident_model: None,
+                    request_policy: crate::serve::RequestModelPolicy {
+                        allow_pull: false,
+                        allow_paths: false,
+                        operator_model: None,
+                    },
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,
@@ -10932,6 +11233,7 @@ mod tests {
                     recent_tok_s: None,
                     started: Instant::now(),
                     last_activity: Instant::now(),
+                    engine_state: crate::serve::EngineState::Up,
                 }),
                 max_request_bytes: 8 * 1024 * 1024,
                 admission: Arc::new(Admission::new(4, Duration::from_secs(5))),
@@ -10990,7 +11292,9 @@ mod tests {
             Self {
                 paths,
                 port,
-                model_name: model_path.display().to_string(),
+                // Bare file name, resolved under `paths.models` like an
+                // installed model; request-named paths are refused by default.
+                model_name,
                 shared,
                 shutdown,
                 _join: Some(join),
@@ -11085,6 +11389,187 @@ mod tests {
             // ServeShared is held only by the server thread which has exited.
             let _ = fs::remove_dir_all(&self.paths.root);
         }
+    }
+
+    // ── 0.4.0 serve lifecycle: max_tokens fit, respawn, request policy ──
+
+    #[cfg(unix)]
+    fn serve_health(port: u16) -> (u16, serde_json::Value) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut response = agent
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect("GET /health");
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().expect("/health body");
+        let body = serde_json::from_str(&text).expect("/health JSON");
+        (status, body)
+    }
+
+    #[cfg(unix)]
+    fn post_status(port: u16, body: &serde_json::Value) -> (u16, serde_json::Value, String) {
+        let (status, bytes) = raw_nonstream_post(port, body);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let json = text
+            .find('{')
+            .and_then(|start| serde_json::from_str(&text[start..]).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, json, text)
+    }
+
+    /// An omitted max_tokens (config default 4096 against the fake's 4096
+    /// context) used to reload the model on every request, because the reload
+    /// cannot grow max_seq. Now it is fitted by the daemon, and an explicit
+    /// budget that cannot fit is a 400 with no reload.
+    #[cfg(unix)]
+    #[test]
+    fn serve_omitted_max_tokens_fits_without_reload() {
+        let h = Task11HttpHarness::spawn("fit-max-tokens");
+        let body = h.base_body("t11-stop-text", false);
+        for _ in 0..2 {
+            let (status, _, text) = post_status(h.port(), &body);
+            assert_eq!(status, 200, "{text}");
+        }
+        let mut explicit = body.clone();
+        explicit["max_tokens"] = serde_json::json!(8000);
+        let (status, _, text) = post_status(h.port(), &explicit);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("max_tokens=8000"), "{text}");
+        let mut fits = body.clone();
+        fits["max_tokens"] = serde_json::json!(100);
+        let (status, _, text) = post_status(h.port(), &fits);
+        assert_eq!(status, 200, "{text}");
+
+        let log = h.read_requests_log();
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "load").len(), 1);
+        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+        assert_eq!(generates.len(), 3);
+        assert!(generates[..2]
+            .iter()
+            .all(|g| g["max_tokens_fit"] == serde_json::json!(true)));
+        assert_eq!(generates[2]["max_tokens"], serde_json::json!(100));
+        assert!(generates[2].get("max_tokens_fit").is_none());
+    }
+
+    /// A request may not load a file outside the installed models, nor start
+    /// a registry download; an installed model still loads.
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_request_file_paths_and_downloads() {
+        let h = Task11HttpHarness::spawn("request-policy");
+        let mut body = h.base_body("t11-stop-text", false);
+        body["model"] = serde_json::json!("/etc/hostname");
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("serve.allow_request_paths"), "{text}");
+        body["model"] = serde_json::json!("qwen3.5:0.8b");
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("hipfire pull qwen3.5:0.8b"), "{text}");
+        assert!(Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").is_empty());
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+    }
+
+    /// After a failed switch the daemon holds nothing (tp<=1 unloads first):
+    /// `/health` must stop naming the old model and the next request for it
+    /// must reload instead of generating against an empty daemon.
+    #[cfg(unix)]
+    #[test]
+    fn serve_failed_model_switch_clears_residency() {
+        let h = Task11HttpHarness::spawn("switch-fail");
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(serve_health(h.port()).1["model"], serde_json::json!(h.model()));
+
+        fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        let mut bad = h.base_body("t11-stop-text", false);
+        bad["model"] = serde_json::json!("t20-load-fail.hfq");
+        let (status, _, text) = post_status(h.port(), &bad);
+        assert_ne!(status, 200, "{text}");
+        assert!(serve_health(h.port()).1["model"].is_null());
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
+        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+    }
+
+    /// A daemon that exits (crash, or a sticky GPU fault after which it exits
+    /// 75) is respawned and the next request is served.
+    #[cfg(unix)]
+    #[test]
+    fn serve_respawns_a_daemon_that_exited() {
+        let h = Task11HttpHarness::spawn("respawn");
+        let ok = h.base_body("t11-stop-text", false);
+        assert_eq!(post_status(h.port(), &ok).0, 200);
+        for fault in ["t11-premature-eof", "t20-gpu-poison"] {
+            let (status, _, text) = post_status(h.port(), &h.base_body(fault, false));
+            assert_ne!(status, 200, "{fault}: {text}");
+            let (status, _, text) = post_status(h.port(), &ok);
+            assert_eq!(status, 200, "after {fault}: {text}");
+        }
+        let log = h.read_requests_log();
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "configure").len(), 3);
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "load").len(), 3);
+        assert_eq!(serve_health(h.port()).0, 200);
+    }
+
+    /// `/health` is 503 while the daemon is dead and cannot be respawned, and
+    /// the supervisor brings it back with the resident model reloaded.
+    #[cfg(unix)]
+    #[test]
+    fn serve_health_is_unhealthy_until_the_daemon_is_back() {
+        let h = Task11HttpHarness::spawn("respawn-health");
+        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        let daemon = {
+            let mut runtime = h.shared.runtime.lock().unwrap();
+            std::mem::replace(
+                &mut runtime.spawner.daemon,
+                h.paths.root.join("missing-daemon"),
+            )
+        };
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-premature-eof", false));
+        assert_ne!(status, 200, "{text}");
+
+        assert!(crate::serve::supervise_engine(&h.shared).is_err());
+        let (status, health) = serve_health(h.port());
+        assert_eq!(status, 503);
+        assert_eq!(health["status"], "unhealthy");
+
+        h.shared.runtime.lock().unwrap().spawner.daemon = daemon;
+        crate::serve::supervise_engine(&h.shared).unwrap();
+        let (status, health) = serve_health(h.port());
+        assert_eq!(status, 200);
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["model"], serde_json::json!(h.model()));
+        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        // The supervisor reloaded the model; the request did not load again.
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
+        assert_eq!(loads, 2);
+    }
+
+    /// DeepSeek V4 (legacy contract) stages tool calls only on the terminal;
+    /// they must reach the client (#593).
+    #[cfg(unix)]
+    #[test]
+    fn serve_legacy_staged_tool_calls_reach_the_client() {
+        let h = Task11HttpHarness::spawn("legacy-tools");
+        let (status, json, text) =
+            post_status(h.port(), &h.tools_body("t20-legacy-staged-tool", false));
+        assert_eq!(status, 200, "{text}");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "read_file",
+            "{text}"
+        );
     }
 
     #[cfg(unix)]
@@ -11742,13 +12227,9 @@ mod tests {
 
     /// Every benchmark generate must ask for answer mode.
     ///
-    /// A reasoning model opens `<think>` in its first tokens and cannot close
-    /// it inside a benchmark's fixed budget (16 tokens for the warmup, 128 for
-    /// the measured runs). The daemon classifies an unclosed think span at
-    /// finish as a non-retryable validation terminal *ahead of* the length cap
-    /// — `QwenArTerminalCause::resolve` and `qwen_dflash_wire_terminal` in the
-    /// daemon both order it that way — so a thinking benchmark aborts on the
-    /// warmup, before it records a single sample.
+    /// A reasoning model opens `<think>` in its first tokens and would spend a
+    /// benchmark's fixed budget (16 tokens for the warmup, 128 for the measured
+    /// runs) inside it, so the measured turn would never reach the answer path.
     #[test]
     fn bench_generate_request_is_answer_mode_by_default() {
         let req = bench_generate_request("bench prompt", 128);
@@ -12990,5 +13471,504 @@ mod tests {
                 env::remove_var(&self.key);
             }
         }
+    }
+
+    /// Raw `POST /v1/chat/completions` with `Connection: close`: status, the
+    /// lowercased response head, and the de-chunked body. Panics if a chunked
+    /// body ends without its terminating zero-size chunk (a torn stream).
+    #[cfg(unix)]
+    fn raw_chat_post(port: u16, body: &serde_json::Value) -> (u16, String, Vec<u8>) {
+        let payload = body.to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+        .expect("write request");
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let mut rest = &raw[split + 4..];
+        if !head.contains("transfer-encoding: chunked") {
+            return (status, head, rest.to_vec());
+        }
+        let mut body = Vec::new();
+        loop {
+            let line_end = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "torn chunked body after {:?}",
+                        String::from_utf8_lossy(&body)
+                    )
+                });
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&rest[..line_end]).expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return (status, head, body);
+            }
+            assert!(
+                rest.len() >= size + 2,
+                "torn chunked body after {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// `data:` payloads of an SSE body, in order.
+    #[cfg(unix)]
+    fn sse_payloads(body: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(body)
+            .split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Error status comes from the daemon's typed class, and a stream that
+    /// fails before its first frame is an ordinary JSON error, not a 200.
+    #[cfg(unix)]
+    #[test]
+    fn typed_errors_keep_their_status_stream_and_nonstream() {
+        let harness = Task11HttpHarness::spawn("error-status");
+        let port = harness.port();
+        for stream in [false, true] {
+            for (tag, status) in [
+                ("t15-class-validation", 400),
+                ("t15-class-context", 400),
+                ("t15-class-unsupported", 400),
+                ("t15-class-internal", 500),
+                ("t15-transient-always", 503),
+            ] {
+                let (got, head, body) = raw_chat_post(port, &harness.base_body(tag, stream));
+                assert_eq!(got, status, "{tag} stream={stream}: {head}");
+                assert!(
+                    head.contains("content-type: application/json"),
+                    "{tag}: {head}"
+                );
+                let err: serde_json::Value = serde_json::from_slice(&body)
+                    .unwrap_or_else(|e| panic!("{tag}: one JSON error body ({e}): {body:?}"));
+                assert!(
+                    err.pointer("/error/message")
+                        .and_then(|v| v.as_str())
+                        .is_some(),
+                    "{tag}: {err}"
+                );
+                assert_eq!(
+                    head.contains("retry-after: 1"),
+                    status == 503,
+                    "{tag}: Retry-After only on 503: {head}"
+                );
+            }
+            // Gateway validation (no daemon class) also fails before commit.
+            let mut body = harness.base_body("t11-stop-text", stream);
+            body["max_tokens"] = serde_json::json!(0);
+            let (got, _, raw) = raw_chat_post(port, &body);
+            assert_eq!(got, 400, "max_tokens=0 stream={stream}");
+            assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
+        }
+    }
+
+    /// A stream that fails after it committed ends with an OpenAI error event
+    /// and `[DONE]` inside a cleanly terminated body, never a torn one.
+    #[cfg(unix)]
+    #[test]
+    fn stream_failure_after_first_token_ends_with_error_event_and_done() {
+        let harness = Task11HttpHarness::spawn("midstream-error");
+        let port = harness.port();
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t15-visible-token", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        let [role, token, error, done] = payloads.as_slice() else {
+            panic!("role, token, error, [DONE] expected: {payloads:?}");
+        };
+        assert!(role.contains(r#""role":"assistant""#), "{role}");
+        assert!(token.contains("visible-before-fail"), "{token}");
+        let error: serde_json::Value = serde_json::from_str(error).expect("error event JSON");
+        assert_eq!(error["error"]["type"], "server_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("transient after visible token")),
+            "{error}"
+        );
+        assert_eq!(done, "[DONE]");
+
+        // The OpenAI-compatible client reports the server's message.
+        match capture_stream(port, harness.base_body("t15-visible-token", true)) {
+            Err(hipfire_client::ClientError::Http(message)) => {
+                assert!(
+                    message.contains("transient after visible token"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected the stream's error event, got {other:?}"),
+        }
+
+        // Daemon death mid-stream is reported the same way.
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t11-premature-eof", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        assert!(payloads[1].contains("partial-before-eof"), "{payloads:?}");
+        assert!(payloads[2].contains(r#""error""#), "{payloads:?}");
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    }
+
+    /// Marks the child run of `accept_errors_do_not_stop_serving` (not a
+    /// product setting, so no `HIPFIRE_` prefix).
+    #[cfg(unix)]
+    const EMFILE_CHILD_ENV: &str = "T11_EMFILE_CHILD";
+
+    /// A failed `accept` must not end the server. A child process runs the
+    /// serve harness and then takes every free descriptor, so the kernel
+    /// completes this test's connect but serve's `accept` fails with EMFILE.
+    /// Once the child gives the descriptors back, the same connection must
+    /// be served.
+    #[cfg(unix)]
+    #[test]
+    fn accept_errors_do_not_stop_serving() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        if env::var_os(EMFILE_CHILD_ENV).is_some() {
+            return emfile_child();
+        }
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "tests::accept_errors_do_not_stop_serving",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test");
+        // Keep the read end open until the child exits: a closed pipe would
+        // make its test output fail.
+        let mut child_stdout = BufReader::new(child.stdout.take().unwrap());
+        let port: u16 = loop {
+            let mut line = String::new();
+            assert!(
+                child_stdout.read_line(&mut line).unwrap() > 0,
+                "child exited before it held every descriptor"
+            );
+            // libtest prints "test <name> ... " on the same line first.
+            if let Some((_, port)) = line.trim().split_once("EMFILE_READY ") {
+                break port.parse().unwrap();
+            }
+        };
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut child_stdin = child.stdin.take().unwrap();
+        writeln!(child_stdin, "connected").unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        drop(child_stdin);
+        let output = child.wait_with_output().expect("child test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("accept failed"),
+            "serve never hit an accept error: {stderr}"
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "connection not served after EMFILE: {response:?}\n{stderr}"
+        );
+        assert!(output.status.success(), "child test failed: {stderr}");
+        drop(child_stdout);
+    }
+
+    #[cfg(unix)]
+    fn emfile_child() {
+        let harness = Task11HttpHarness::spawn("emfile");
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(256);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut hogs = Vec::new();
+        while let Ok(file) = fs::File::open("/dev/null") {
+            hogs.push(file);
+        }
+        println!("EMFILE_READY {}", harness.port());
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // Serve fails its accept and backs off meanwhile.
+        thread::sleep(Duration::from_millis(300));
+        drop(hogs);
+        // The parent closes stdin once it has its response.
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    /// One `/metrics` sample value, by exact series name.
+    #[cfg(unix)]
+    fn metric(port: u16, name: &str) -> u64 {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from /metrics: {text}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// Failed generations and admission rejections reach `/metrics`, each in
+    /// its own counter; successes reach neither.
+    #[cfg(unix)]
+    #[test]
+    fn failures_and_admission_rejections_are_counted() {
+        let harness = Task11HttpHarness::spawn("metrics-counters");
+        let port = harness.port();
+        let failed = "hipfire_requests_failed_total";
+        let rejected = "hipfire_admission_rejected_total";
+
+        // JSON error, stream rejected before commit, stream failing after it.
+        for (tag, stream, status) in [
+            ("t15-class-validation", false, 400),
+            ("t15-class-internal", true, 500),
+            ("t15-visible-token", true, 200),
+            ("t11-stop-text", false, 200),
+            ("t11-stop-text", true, 200),
+        ] {
+            let (got, _, _) = raw_chat_post(port, &harness.base_body(tag, stream));
+            assert_eq!(got, status, "{tag} stream={stream}");
+        }
+        assert_eq!(metric(port, failed), 3);
+        assert_eq!(metric(port, rejected), 0);
+
+        // Hold the only slot and fill the four-deep queue: the next request
+        // is refused by admission.
+        let held = harness.shared.admission.acquire().unwrap();
+        let queued: Vec<_> = (0..4)
+            .map(|_| {
+                let body = harness.base_body("t11-stop-text", false);
+                thread::spawn(move || raw_chat_post(port, &body).0)
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 5 {
+            assert!(Instant::now() < deadline, "queue never filled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (status, head, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 503, "{head}");
+        drop(held);
+        for waiter in queued {
+            assert_eq!(waiter.join().unwrap(), 200);
+        }
+        assert_eq!(metric(port, rejected), 1);
+        assert_eq!(metric(port, failed), 3);
+    }
+
+    /// An image request queued for admission must not block the server: the
+    /// harness serves on one runtime thread, which a blocking wait would hold.
+    #[cfg(unix)]
+    #[test]
+    fn queued_image_request_does_not_block_the_server() {
+        let harness = Task11HttpHarness::spawn("images-admission");
+        let port = harness.port();
+        let held = harness.shared.admission.acquire().unwrap();
+        let image = thread::spawn(move || {
+            // `images` is refused only after admission, so this never
+            // reaches the daemon once it leaves the queue.
+            let payload = r#"{"prompt":"a red cube","images":["x"]}"#;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /v1/images/generations HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 2 {
+            assert!(Instant::now() < deadline, "image request never queued");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut health = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        health
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        health
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let _ = health.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "/health stalled behind a queued image request: {response:?}"
+        );
+
+        drop(held);
+        let response = image.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400") && response.contains("not a field"),
+            "{response}"
+        );
+    }
+
+    /// One HTTP/1.1 response from a kept-alive connection: status and body,
+    /// de-chunked or by Content-Length. Fails if the response does not end.
+    #[cfg(unix)]
+    fn read_keepalive_response(
+        reader: &mut std::io::BufReader<std::net::TcpStream>,
+    ) -> (u16, Vec<u8>) {
+        use std::io::BufRead;
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("status line");
+        let status = line
+            .split_whitespace()
+            .nth(1)
+            .expect("status")
+            .parse()
+            .unwrap();
+        let (mut length, mut chunked) = (None, false);
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("header");
+            let header = line.trim().to_ascii_lowercase();
+            if header.is_empty() {
+                break;
+            }
+            if let Some(value) = header.strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+            chunked |= header == "transfer-encoding: chunked";
+        }
+        let mut body = Vec::new();
+        if !chunked {
+            body.resize(length.expect("content-length"), 0);
+            reader.read_exact(&mut body).expect("body");
+            return (status, body);
+        }
+        loop {
+            line.clear();
+            reader
+                .read_line(&mut line)
+                .expect("chunk size (response never ended)");
+            let size = usize::from_str_radix(line.trim(), 16).expect("chunk size hex");
+            let mut chunk = vec![0; size + 2];
+            reader.read_exact(&mut chunk).expect("chunk");
+            if size == 0 {
+                return (status, body);
+            }
+            body.extend_from_slice(&chunk[..size]);
+        }
+    }
+
+    /// A client that keeps its connection gets complete, prompt responses to
+    /// a stream, then a non-stream, then a stream request on it; and a client
+    /// that closes as soon as it reads `[DONE]` does not hold the server up.
+    #[cfg(unix)]
+    #[test]
+    fn keepalive_connection_serves_stream_and_nonstream_in_turn() {
+        let harness = Task11HttpHarness::spawn("keepalive-reuse");
+        let port = harness.port();
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        for is_stream in [true, false, true] {
+            let payload = harness.base_body("t11-stop-text", is_stream).to_string();
+            write!(
+                writer,
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let started = Instant::now();
+            let (status, body) = read_keepalive_response(&mut reader);
+            assert_eq!(status, 200, "stream={is_stream}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "stream={is_stream} took {:?}",
+                started.elapsed()
+            );
+            if is_stream {
+                let payloads = sse_payloads(&body);
+                assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+                assert!(payloads
+                    .iter()
+                    .any(|p| p.contains("hello from fake daemon")));
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "stop");
+            }
+        }
+
+        // Close as soon as `[DONE]` arrives, like serve_harness and most SSE
+        // readers, before the chunked terminator.
+        let mut early = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        early
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let payload = harness.base_body("t11-stop-text", true).to_string();
+        write!(
+            early,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(&seen).contains("data: [DONE]") {
+            let n = early.read(&mut buf).expect("read until [DONE]");
+            assert!(n > 0, "closed before [DONE]");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        drop(early);
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 200);
     }
 }

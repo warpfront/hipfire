@@ -43,7 +43,7 @@ mtp_k = 3
 ngram = "off"
 
 [serve]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 11435
 # Replaces HIPFIRE_IDLE_TIMEOUT=300.
 idle_timeout_seconds = 300

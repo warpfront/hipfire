@@ -43,7 +43,8 @@ hipfire pull flux.schnell:1
 hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
 ```
 
-The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
+The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
+only by default; set `serve.host` to listen on other interfaces).
 
 Current stable release: **v0.3.1**, headlined by DFlash prompt-cache
 repair, registry draft sidecars, Ornith 1.5, sealed MoE execution

@@ -302,7 +302,7 @@ pub fn lookup(arch: &str, module: &str, extra_flags: &str) -> Result<KernelEntry
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
     #[test]
@@ -349,6 +349,23 @@ mod tests {
             // and per-invocation argv directly to all three raw trace files.
             return;
         }
+        // Deliberate changes that landed after the P0 capture (kernel cache
+        // ABI 4). The traces keep the captured bytes and argv; the portable
+        // digests above are re-pinned to the current source.
+        const REPINNED_SINCE_P0: [&str; 10] = [
+            "fused_rmsnorm_mq_rotate",
+            "fused_rmsnorm_mq_rotate_awq",
+            "fused_silu_mul_mq_rotate_awq",
+            "gated_delta_net_q8_fast",
+            "gemv_mq4g256",
+            "gemv_mq4g256v2_mq4v2",
+            "gemv_q8_0",
+            "gemv_q8_0_wide",
+            "mq_rotate_x",
+            "silu_mul",
+        ];
+        const FLAGS_ADDED_SINCE_P0: [&str; 1] = ["-fuse-cuid=none"];
+        let mut repins_seen = HashSet::new();
         for (trace, expected_count) in [("cold1", 35), ("smokecold1", 35), ("preinstall", 58)] {
             let records = std::fs::read_to_string(root.join(format!("{trace}.hipcc.jsonl"))).unwrap();
             let mut observed = 0;
@@ -358,19 +375,29 @@ mod tests {
                 let source_path = record["source"].as_str().unwrap();
                 let expected = std::fs::read(source_path).unwrap();
                 let entry = by_name.get(module).unwrap_or_else(|| panic!("missing {trace} module {module}"));
-                assert_eq!(entry.source().as_bytes(), expected, "{trace}: {module} source differs");
+                if let Some(&repinned) = REPINNED_SINCE_P0.iter().find(|name| **name == module) {
+                    assert_ne!(entry.source().as_bytes(), expected,
+                        "{trace}: {module} matches the trace again; drop it from REPINNED_SINCE_P0");
+                    repins_seen.insert(repinned);
+                } else {
+                    assert_eq!(entry.source().as_bytes(), expected, "{trace}: {module} source differs");
+                }
                 let argv = record["argv"].as_array().unwrap();
                 let expected_flags = argv.iter().map(|arg| arg.as_str().unwrap())
                     .take_while(|arg| *arg != "-o")
                     .filter(|arg| !arg.starts_with("--rocm-path=")
                         && !arg.starts_with("--hip-path=") && !arg.starts_with("-I"))
                     .collect::<Vec<_>>();
-                assert_eq!(entry.flags.iter().map(String::as_str).collect::<Vec<_>>(),
-                    expected_flags, "{trace}: {module} core hipcc flags differ");
+                let flags = entry.flags.iter().map(String::as_str)
+                    .filter(|flag| !FLAGS_ADDED_SINCE_P0.contains(flag))
+                    .collect::<Vec<_>>();
+                assert_eq!(flags, expected_flags, "{trace}: {module} core hipcc flags differ");
                 observed += 1;
             }
             assert_eq!(observed, expected_count, "{trace}: incomplete compiler trace");
         }
+        assert_eq!(repins_seen.len(), REPINNED_SINCE_P0.len(),
+            "REPINNED_SINCE_P0 names a module no trace compiled: {repins_seen:?}");
     }
 
     #[test]

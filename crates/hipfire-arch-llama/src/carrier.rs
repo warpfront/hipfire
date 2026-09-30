@@ -1231,6 +1231,7 @@ mod tests {
             state_quant_override: None,
             qwen_default_q8: true,
             vision_path: None,
+            mtp_path: None,
             cask,
             pp: 1,
             spec: SpecLoadCfg::default(),

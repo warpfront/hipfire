@@ -71,7 +71,7 @@ class GoldenRegistryTests(unittest.TestCase):
 
             def fake_run(argv, cwd=None, check=None):
                 calls.append(list(argv))
-                if argv[3:6] == ["--example", "daemon", "-p"]:
+                if argv[3:6] == ["-p", "hipfire-daemon"]:
                     daemon.write_text("daemon")
                 elif argv[3:6] == ["--bin", "hipfire", "-p"]:
                     cli.write_text("cli")
@@ -91,10 +91,8 @@ class GoldenRegistryTests(unittest.TestCase):
                         "cargo",
                         "build",
                         "--release",
-                        "--example",
-                        "daemon",
                         "-p",
-                        "hipfire-runtime",
+                        "hipfire-daemon",
                     ],
                     [
                         "cargo",

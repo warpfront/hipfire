@@ -85,6 +85,11 @@ pub struct LoadCtx<'a> {
     /// loads against the trunk's `vision_config_from_hfq`. `None` = trunk-only
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
+    /// Qwen MTP head sidecar (`.mtp`) resolved by the CLI (`params.mtp`):
+    /// models dir, then beside the path as typed, then beside the canonical
+    /// trunk. Read by `Qwen35Carrier` only, after the bundled trailer probe.
+    /// `None` = look beside the canonical trunk (`<trunk>.with_extension("mtp")`).
+    pub mtp_path: Option<PathBuf>,
     pub kv_mode_override: Option<&'a str>,
     /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
     pub kv_k_override: Option<&'a str>,

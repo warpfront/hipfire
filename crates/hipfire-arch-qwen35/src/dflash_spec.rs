@@ -321,14 +321,14 @@ pub fn load_dflash_state(
         draft_weights,
     );
     let _ = draft_hfq;
-    // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
-    // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
-    // (`seed_target_hidden_from_prompt_abortable`) prefills the prompt in
-    // chunks of up to `PREFILL_MAX_BATCH` and captures each into staging via
-    // `write_rows_to_staging` (whose `n <= max_batch` guard is a debug_assert,
-    // silent in release). Sizing staging to only `max_n` overflowed the d2d
-    // copy on any prompt longer than block_size+1 tokens. Size it to the
-    // larger of the two so both paths fit.
+    // The hidden-ring STAGING buffers must hold one staged chunk. Verify
+    // cycles stage only `max_n` (= block_size+1) rows. The prompt seed
+    // (`seed_target_hidden_from_prompt_abortable`) follows AR's chunk plan and
+    // writes chunks wider than staging straight to the ring, but its legacy
+    // route (`HIPFIRE_DFLASH_LEGACY_PREFILL=1`) stages chunks of up to
+    // `PREFILL_MAX_BATCH` via `write_rows_to_staging`. Sizing staging to only
+    // `max_n` overflowed the d2d copy there on any prompt longer than
+    // block_size+1 tokens. Size it to the larger of the two so both fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
     // Hidden extraction must use checkpoint target_layer_ids exactly — validate
     // against target layer range and allocate by the explicit list (not the

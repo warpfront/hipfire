@@ -290,7 +290,7 @@ pub fn spec_step_dflash_mtp(
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         match w_out.gpu_dtype {
             DType::Q8_0 => {
-                gpu.gemm_q8_0_batched(
+                gpu.gemm_q8_0_batched_f32_chunked(
                     &w_out.buf,
                     &hidden_rows,
                     &logits_batch,
@@ -875,7 +875,7 @@ pub fn spec_step_dflash_mtp_tree(
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         match w_out.gpu_dtype {
-            DType::Q8_0 => gpu.gemm_q8_0_batched(
+            DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(
                 &w_out.buf,
                 &hidden_rows,
                 &logits_batch,

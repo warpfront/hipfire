@@ -175,6 +175,7 @@ fn main() -> Result<(), String> {
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
         vision_path: None,
+        mtp_path: None,
         xdna: None,
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;

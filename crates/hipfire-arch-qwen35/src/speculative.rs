@@ -2791,6 +2791,13 @@ impl HiddenStateRingBuffer {
     /// rest of the engine relies on for ordering with null-stream consumers
     /// (e.g. the draft forward's D2H of hidden rows after this commit).
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
+        assert!(
+            n <= self.max_batch,
+            "commit_staging_to_ring: n {} > staging max_batch {} — a chunk wider than \
+             staging wrote straight to the ring; finish it with finish_prefill_chunk",
+            n,
+            self.max_batch
+        );
         let row_bytes = self.hidden_dim * 4;
         let head = self.head;
         let max_pos = self.max_positions;
@@ -2861,6 +2868,101 @@ impl HiddenStateRingBuffer {
         self.head = (head + n) % max_pos;
         self.written += n;
         Ok(())
+    }
+
+    /// Whether a ring-carrying prompt prefill may take the ordinary (AR)
+    /// prefill route: widened chunks, the GDN chunk scan, and chunks wider than
+    /// staging, whose rows [`write_chunk_rows`](Self::write_chunk_rows) writes
+    /// straight to the ring at `head`. Eager only: under graph capture or
+    /// Redline recording the rows must go through fixed-offset staging (a baked
+    /// `head` is wrong on replay), so chunks stay capped at `max_batch`.
+    /// `HIPFIRE_DFLASH_LEGACY_PREFILL=1` keeps the staged route everywhere.
+    pub fn rides_ordinary_prefill(&self, gpu: &Gpu) -> bool {
+        !gpu.graphs.capture_mode && !gpu.replay.is_recording() && !dflash_legacy_prefill()
+    }
+
+    /// Whether an `n`-row prefill chunk writes its rows straight to the ring
+    /// instead of staging. Only chunks wider than staging do, so every chunk
+    /// that fits (verify blocks, short prompts) keeps the staged commit.
+    pub fn writes_direct(&self, gpu: &Gpu, n: usize) -> bool {
+        n > self.max_batch && self.rides_ordinary_prefill(gpu)
+    }
+
+    /// Per-extract-layer write of an `n`-row prefill chunk: staging (see
+    /// [`write_rows_to_staging`](Self::write_rows_to_staging)), or for a
+    /// [`writes_direct`](Self::writes_direct) chunk the ring slots
+    /// `head..head + n`, wrapping. Pair with
+    /// [`finish_prefill_chunk`](Self::finish_prefill_chunk) after the chunk.
+    pub fn write_chunk_rows(
+        &self,
+        gpu: &mut Gpu,
+        extract_idx: usize,
+        src: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.writes_direct(gpu, n) {
+            return self.write_rows_to_staging(gpu, extract_idx, src, n);
+        }
+        assert!(
+            n <= self.max_positions,
+            "write_chunk_rows: n {} > ring max_positions {}",
+            n,
+            self.max_positions
+        );
+        let first = n.min(self.max_positions - self.head);
+        self.copy_rows_into_ring(gpu, extract_idx, self.head, src, 0, first)?;
+        if first < n {
+            self.copy_rows_into_ring(gpu, extract_idx, 0, src, first, n - first)?;
+        }
+        Ok(())
+    }
+
+    /// Place an `n`-row prefill chunk written by
+    /// [`write_chunk_rows`](Self::write_chunk_rows) and advance `head` by `n`:
+    /// commit staging, or for a direct chunk wait for its copies when a stream
+    /// is active (null-stream readers such as `download_hidden_block` follow).
+    pub fn finish_prefill_chunk(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
+        if !self.writes_direct(gpu, n) {
+            return self.commit_staging_to_ring(gpu, n);
+        }
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
+        self.advance_head_by(n);
+        Ok(())
+    }
+
+    /// Copy `rows` rows of `src` from row `src_row` to ring slot `dst_slot` of
+    /// one extract layer, on the active stream when one is set so the copy is
+    /// ordered after the forward kernels that produced `src`.
+    fn copy_rows_into_ring(
+        &self,
+        gpu: &Gpu,
+        extract_idx: usize,
+        dst_slot: usize,
+        src: &GpuTensor,
+        src_row: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let row_bytes = self.hidden_dim * 4;
+        let dst = &self.layer_bufs[extract_idx].buf;
+        match gpu.active_stream.as_ref() {
+            Some(stream) => gpu.hip.memcpy_dtod_async_at(
+                dst,
+                dst_slot * row_bytes,
+                &src.buf,
+                src_row * row_bytes,
+                rows * row_bytes,
+                stream,
+            ),
+            None => gpu.hip.memcpy_dtod_at(
+                dst,
+                dst_slot * row_bytes,
+                &src.buf,
+                src_row * row_bytes,
+                rows * row_bytes,
+            ),
+        }
     }
 
     /// Reset to empty (head=0, written=0). GPU buffers are not zeroed; stale
@@ -8990,14 +9092,152 @@ pub fn seed_target_hidden_from_prompt(
     Ok(())
 }
 
-/// Abortable variant of `seed_target_hidden_from_prompt`. Manually
-/// chunks the prefill at [`qwen35::PREFILL_MAX_BATCH`] boundaries and
-/// calls `abort_check` between chunks. Returns `Ok(true)` if aborted
-/// (state has been fully reset — caller should NOT continue with
-/// decode), `Ok(false)` on normal completion. The chunked path matches
-/// the kernel-internal sub-batch size, so per-chunk throughput is the
-/// same as the one-shot variant; the only overhead is one
-/// `download_hidden_block` per chunk (host-side memcpy of ~5 MB).
+/// `HIPFIRE_DFLASH_LEGACY_PREFILL=1`: the DFlash target prompt prefill keeps
+/// its previous route, 256-row seed chunks whose hidden rows go through ring
+/// staging, outside the widened chunk and the GDN chunk scan. Default off: the
+/// seed prefills on AR's ordinary route (see [`SeedPrefill`]).
+pub fn dflash_legacy_prefill() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_DFLASH_LEGACY_PREFILL", false)
+}
+
+/// Outer chunk plan and scratch shared by the DFlash prompt seeds.
+///
+/// Default: the plan of AR's ordinary prefill (`hipfire-generate` `ar.rs`,
+/// no-eviction branch): the ceiling is `ordinary_prefill_chunk_limit`, taken
+/// once per prompt, and each outer chunk is `ordinary_serve_prefill_chunk_len`.
+/// Each chunk runs the same forward AR runs, plus the hidden ring, which
+/// rides AR's route ([`HiddenStateRingBuffer::rides_ordinary_prefill`]). So
+/// after the prompt the target's KV, DeltaNet state and last-token logits are
+/// byte-identical to AR's prefill of the same prompt.
+///
+/// The ring holds only `max_positions` rows (a windowed draft's ring is W
+/// rows), so an outer chunk wider than the ring runs as ring-sized pieces
+/// ([`SeedPrefill::piece_len`]) whose hidden rows are read back one piece at
+/// a time.
+///
+/// Legacy (`HIPFIRE_DFLASH_LEGACY_PREFILL=1`): 256-row outer chunks.
+struct SeedPrefill {
+    ceiling: usize,
+    /// One scratch for every chunk that does not reuse the retained widened
+    /// scratch. Allocated on the first such chunk and freed by
+    /// [`SeedPrefill::free`]. Every PBS tensor is overwritten before it is
+    /// read, so reuse is bit-identical to a fresh scratch per chunk.
+    pbs: Option<qwen35::PrefillBatchScratch>,
+}
+
+impl SeedPrefill {
+    fn plan(gpu: &Gpu, target: &ModelSlot) -> Self {
+        let ceiling = if dflash_legacy_prefill() {
+            qwen35::PREFILL_MAX_BATCH
+        } else {
+            match qwen35::ordinary_prefill_chunk_limit(
+                gpu,
+                &target.weights,
+                &target.config,
+                &target.dn_state,
+                &target.kv_cache,
+                None,
+            ) {
+                Ok(limit) => limit,
+                Err(e) => {
+                    eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
+                    qwen35::prefill_max_batch(gpu)
+                }
+            }
+        };
+        Self { ceiling, pbs: None }
+    }
+
+    fn next_len(&self, remaining: usize) -> usize {
+        qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, self.ceiling)
+            .unwrap_or(remaining.min(self.ceiling).max(1))
+    }
+
+    /// Rows of the next forward call inside an outer chunk with `remaining`
+    /// rows left. A chunk the ring can hold runs whole. A wider one runs as
+    /// pieces planned by the widened chunk rule at the ring size rounded down
+    /// to the 512-row commit stride: the pieces keep every boundary AR's own
+    /// chunk planner makes, and each added boundary falls on one of the 512-row
+    /// commits the widened chunk already makes there.
+    fn piece_len(hidden_rb: &HiddenStateRingBuffer, remaining: usize) -> usize {
+        let ring = hidden_rb.max_positions;
+        if remaining <= ring {
+            return remaining;
+        }
+        let stride = qwen35::prefill::WIDENED_COMMIT_ROWS;
+        let cap = if ring >= stride { ring / stride * stride } else { ring };
+        qwen35::prefill::next_exact_prefill_chunk_len(remaining, cap)
+            .unwrap_or(remaining.min(cap))
+    }
+
+    /// Prefill one piece at `pos`, extracting hidden rows into the ring.
+    /// `total` is the seed's token count, which bounds the scratch.
+    fn forward(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut ModelSlot,
+        hidden_rb: &mut HiddenStateRingBuffer,
+        chunk: &[u32],
+        pos: usize,
+        total: usize,
+    ) -> HipResult<()> {
+        // A widened ceiling reuses the retained widened scratch, and a
+        // configured legacy cache (`HIPFIRE_PREFILL_REUSE_PBS=1`) is its own
+        // reuse: both run exactly the forward AR runs.
+        if self.ceiling > qwen35::prefill::WIDENED_COMMIT_ROWS
+            || target.scratch.prefill_batch.is_some()
+        {
+            return qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                chunk,
+                pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                Some(hidden_rb),
+                None,
+                None,
+                None,
+            );
+        }
+        if self.pbs.is_none() {
+            let rows = self.ceiling.min(total).max(2);
+            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(gpu, &target.config, rows, false)?);
+        }
+        qwen35::forward_prefill_batch_with_pbs(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None,
+            None,
+            None,
+            self.pbs.as_ref(),
+            None,
+            None,
+        )
+    }
+
+    fn free(self, gpu: &mut Gpu) {
+        if let Some(pbs) = self.pbs {
+            let _ = pbs.free_gpu(gpu);
+        }
+    }
+}
+
+/// Abortable variant of `seed_target_hidden_from_prompt`. Chunks the prefill
+/// with [`SeedPrefill`] (AR's plan by default) and calls `abort_check`
+/// between chunks. Returns `Ok(true)` if aborted (state has been fully reset,
+/// so the caller should NOT continue with decode), `Ok(false)` on normal
+/// completion. Each chunk costs one `download_hidden_block` on top of the
+/// forward (a host copy of its hidden rows).
 ///
 /// Used by the daemon's `generate_dflash` to honor client-side
 /// cancellation on long-context retries (cache-miss scenarios where
@@ -9025,43 +9265,37 @@ pub fn seed_target_hidden_from_prompt_abortable(
             snap.free_gpu(gpu);
         }
     }
-    let chunk_max = qwen35::PREFILL_MAX_BATCH;
-    let mut seq_pos: usize = 0;
-    while seq_pos < prompt_tokens.len() {
-        if abort_check() {
-            let _ = target.reset_state(gpu);
-            target_hidden_host.clear();
-            if let Some(cks) = checkpoints.as_deref_mut() {
-                for (_, snap) in cks.drain(..) {
-                    snap.free_gpu(gpu);
+    let mut seed = SeedPrefill::plan(gpu, target);
+    let result = (|| -> HipResult<bool> {
+        let mut seq_pos: usize = 0;
+        while seq_pos < prompt_tokens.len() {
+            if abort_check() {
+                let _ = target.reset_state(gpu);
+                target_hidden_host.clear();
+                if let Some(cks) = checkpoints.as_deref_mut() {
+                    for (_, snap) in cks.drain(..) {
+                        snap.free_gpu(gpu);
+                    }
                 }
+                return Ok(true);
             }
-            return Ok(true);
+            let end = seq_pos + seed.next_len(prompt_tokens.len() - seq_pos);
+            while seq_pos < end {
+                let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
+                let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
+                seed.forward(gpu, target, hidden_rb, chunk, seq_pos, prompt_tokens.len())?;
+                let block = download_hidden_block(gpu, hidden_rb, piece)?;
+                target_hidden_host.extend_from_slice(&block);
+                seq_pos += piece;
+            }
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+            }
         }
-        let end = (seq_pos + chunk_max).min(prompt_tokens.len());
-        let chunk = &prompt_tokens[seq_pos..end];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            chunk,
-            seq_pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            Some(hidden_rb),
-            None,
-            None,
-            None,
-        )?;
-        let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
-        target_hidden_host.extend_from_slice(&block);
-        seq_pos = end;
-        if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
-        }
-    }
-    Ok(false)
+        Ok(false)
+    })();
+    seed.free(gpu);
+    result
 }
 
 /// Incremental prompt seed for the DFlash prompt cache: prefill ONLY the
@@ -9097,36 +9331,29 @@ pub fn seed_target_hidden_suffix_abortable(
     ckpt_interval: usize,
     ckpt_cap: usize,
 ) -> HipResult<bool> {
-    let chunk_max = qwen35::PREFILL_MAX_BATCH;
-    let mut off: usize = 0;
-    let mut pos = start_pos;
-    while off < suffix.len() {
-        if abort_check() {
-            return Ok(true);
+    let mut seed = SeedPrefill::plan(gpu, target);
+    let result = (|| -> HipResult<bool> {
+        let mut off: usize = 0;
+        let mut pos = start_pos;
+        while off < suffix.len() {
+            if abort_check() {
+                return Ok(true);
+            }
+            let end = off + seed.next_len(suffix.len() - off);
+            while off < end {
+                let piece = SeedPrefill::piece_len(hidden_rb, end - off);
+                seed.forward(gpu, target, hidden_rb, &suffix[off..off + piece], pos, suffix.len())?;
+                pos += piece;
+                off += piece;
+            }
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+            }
         }
-        let end = (off + chunk_max).min(suffix.len());
-        let chunk = &suffix[off..end];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            chunk,
-            pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            Some(hidden_rb),
-            None,
-            None,
-            None,
-        )?;
-        pos += chunk.len();
-        off = end;
-        if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
-        }
-    }
-    Ok(false)
+        Ok(false)
+    })();
+    seed.free(gpu);
+    result
 }
 
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident

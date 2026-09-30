@@ -985,11 +985,13 @@ pub struct MtpRequestStats {
     pub ngram_mod_accepted: usize,
     /// `ngram_mod_accepted / ngram_mod_drafts` (0 when no drafts), 3-dp.
     pub ngram_mod_accept_rate: f64,
-    /// Native MTP windows (pre-retirement n-gram miss, or plain MTP).
+    /// Native MTP windows (every n-gram miss, or plain MTP).
     pub mtp_windows: usize,
-    /// Post-retirement trunk-only (`k=0`) windows on an n-gram miss.
+    /// Trunk-only (`k=0`) windows. qwen35 MTP no longer retires after an
+    /// n-gram accept (the takeover fills the head KV), so this stays 0; kept
+    /// on the wire for campaign parsers.
     pub ar_windows: usize,
-    /// Latched after the first positive n-gram acceptance this request.
+    /// Always false since takeovers fill the head KV; kept on the wire.
     pub mtp_retired: bool,
 }
 

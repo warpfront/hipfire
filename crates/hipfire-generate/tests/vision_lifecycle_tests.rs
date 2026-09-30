@@ -618,6 +618,7 @@ fn admit_and_load(
         None,
         None,
         None,
+        None,
         &hipfire_runtime::loader_api::CaskConfig::default(),
         1,
         spec,

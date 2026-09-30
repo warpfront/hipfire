@@ -7,12 +7,12 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 
 | Field | Default (source) |
 |---|---|
-| Bind host | `serve.host = "0.0.0.0"` |
+| Bind host | `serve.host = "127.0.0.1"` (loopback only) |
 | Port | `serve.port = 11435` |
 | Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
 | Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
-| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000` |
+| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 600000` (10 min) |
 | Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
 
 Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
@@ -23,7 +23,8 @@ implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATI
 
 The native handler implements **no authentication and no TLS**.
 Anyone who can reach the bind address can call every endpoint, including
-chat completions. Default bind is `0.0.0.0` (all interfaces).
+chat completions. Default bind is `127.0.0.1` (loopback only); set
+`serve.host = "0.0.0.0"` (or pass `0.0.0.0:11435`) to listen on all interfaces.
 
 - Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
 - Expose beyond localhost only behind a trusted network or an authenticated
@@ -32,7 +33,7 @@ chat completions. Default bind is `0.0.0.0` (all interfaces).
 ## Start and stop
 
 ```bash
-hipfire serve                         # foreground; Ctrl-C stops (default bind 0.0.0.0)
+hipfire serve                         # foreground; Ctrl-C stops (default bind 127.0.0.1)
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 300s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
@@ -82,13 +83,25 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
-4. **HTTP.** The native server accepts traffic. Only one generation holds the
-   daemon lock at a time (bounded queue).
+4. **HTTP.** The native server accepts traffic. Serve is single-stream by
+   default: one generation holds the daemon at a time and later requests wait
+   in a bounded queue (`serve.max_queue`). Continuous batching covers only
+   thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`). A
+   waiter that is still queued after `serve.queue_timeout_ms` (default 10
+   minutes, long enough for one full generation; `0` waits forever) gets
+   **503** "server busy" with `Retry-After`. A failed `accept` (for example,
+   out of file descriptors) is logged and retried, never fatal. At most 512
+   connections are served at once; further connects wait in the listen
+   backlog. A client must send a complete request head within 30 s of
+   connecting or of its previous response, which also closes idle keep-alive
+   connections.
 5. **Idle eviction.** When `idle_timeout > 0`, an interval unloads the model
    after idle seconds **and** only when no generation is in flight and the
    serve lock is free. Next request reloads.
 6. **Stop.** `hipfire stop` validates pid ownership before SIGTERM. Stale reused
-   pids are **not** killed; the pidfile is removed instead.
+   pids are **not** killed; the pidfile is removed instead. On SIGTERM or
+   Ctrl-C, serve stops accepting and frees the port at once, lets requests in
+   flight finish for up to 30 s, then exits; a second signal exits at once.
 
 Detached readiness: parent polls `GET /health` for up to **60 seconds**.
 `/health` means the native process is answering; inspect `model` and
@@ -113,8 +126,13 @@ Agent / Pi custom-provider configuration, see
 
 ### `GET /health`
 
-Always `200` while the HTTP server is up. `model` is the loaded tag/path or
-`null` when idle/unloaded; `loading_model` names an asynchronous pre-warm.
+`200` with `status: "ok"` while the daemon is up. `503` with
+`status: "restarting"` while serve respawns a daemon that exited (crash, panic,
+or a sticky GPU fault, after which the daemon exits 75) and reloads the
+resident model; `503` with `status: "unhealthy"` if respawning failed, after
+which serve exits 1 so a service manager can restart it. `model` is the loaded
+tag/path or `null` when idle/unloaded or after a failed model switch;
+`loading_model` names an asynchronous pre-warm or post-restart reload.
 
 ```bash
 # Loopback example (safe default for local smoke):
@@ -134,19 +152,29 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
 ```
 
 - **`stream: true`** (typical clients): SSE `data: {chat.completion.chunk}`
-  lines until `data: [DONE]`.
+  lines until `data: [DONE]`. The `200` and the role chunk go out when
+  generation sends its first frame, or after 15 s of silence (cold load, long
+  prefill), so a request that fails before then gets the same JSON error and
+  status as a non-stream request. A stream that fails after that ends with
+  `data: {"error": {"message", "type"}}` and then `data: [DONE]`. Until
+  `[DONE]`, 15 s without a frame sends a `: keepalive` SSE comment, which
+  SSE parsers ignore.
 - **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
 - Oversized body → **413** before the daemon lock (Content-Length or streamed
   cap at `max_request_bytes`).
 - Saturated admission queue → **503** with `Retry-After`.
 - Invalid JSON body → **400**.
+- Daemon errors map on their typed class: `validation`, `context_length`,
+  `unsupported` → **400**; `transient` → **503** with `Retry-After: 1`; any
+  other class → **500**. An unknown model → **404**.
 
 Request fields honored by the serve layer (non-exhaustive; sampling falls
 through to per-model / registry / daemon defaults when omitted):
 
 | Field | Notes |
 |---|---|
-| `model` | Tag or path; triggers reload if different from resident model |
+| `model` | Tag or path of an installed model; reloads if different from the resident model. A registry model that is not installed is 404 ("run `hipfire pull`") unless `serve.allow_request_pull = true`; a file outside the models directory, the catalog and the pre-warm model is 404 unless `serve.allow_request_paths = true`. |
+| `max_tokens` / `max_completion_tokens` | Omitted: the configured default (Qwen tags 81920, DeepSeek V4 Flash 393216, else `generation.max_tokens`) is fitted to the context left after the prompt, minus 64. Explicit and at or above the loaded context: 400. Never triggers a reload. |
 | `messages` | OpenAI chat messages (required for useful chat) |
 | `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
@@ -154,7 +182,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `seed` | OpenAI-compatible deterministic-sampling seed: non-negative integer (≤ u64::MAX). Same seed + same request → same output; `null`/omitted = fresh entropy per request; negative/fractional/non-integer → 400-style error, never silently unseeded. Best-effort like OpenAI: other sampling params and prompt must also match |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
 | `max_tokens` | Generation cap |
-| `stop` | Up to 4 strings, each ≤ 64 chars |
+| `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), and the stop text is not returned. Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP); every other route answers 400 instead of ignoring it |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on) |
 | `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
@@ -285,7 +313,9 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
 
 When `messages` contains no `system` or `developer` role, the serve layer inserts `prompt.system` from a per-model TOML override or the registry card's `recommended_settings.system_prompt`. A client-supplied system/developer message always wins.
 
-`finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`.
+`finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`. A
+turn that runs out of `max_tokens` while still reasoning ends with `length`:
+the partial `reasoning_content` is returned and `content` is empty.
 
 Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn

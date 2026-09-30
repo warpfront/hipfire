@@ -1731,6 +1731,204 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
     false
 }
 
+/// Incremental token → text decoder for per-token streaming emit sites.
+///
+/// `Tokenizer::decode` reassembles byte fragments only within one call, so
+/// calling it once per streamed token (`decode(&[tok])`) runs
+/// `from_utf8_lossy` over a partial sequence. Byte-level BPE and
+/// SentencePiece byte-fallback both spread one character over several tokens
+/// (`中` = `<0xE4> <0xB8> <0xAD>`, most emoji), so per-token decode sends one
+/// U+FFFD per fragment instead of the character.
+///
+/// `TokenTextStream` holds back only a trailing *incomplete* code point
+/// (at most 3 bytes) and returns everything before it. `decode_bytes` is
+/// concatenative over tokens, so this is exact and O(1) per token. Emit
+/// sites must skip the empty string a holdback step returns, and call
+/// [`flush`](Self::flush) once after the loop so a turn that stops
+/// mid-character does not silently drop its last bytes.
+#[derive(Debug, Clone, Default)]
+pub struct TokenTextStream {
+    /// Trailing bytes of an incomplete UTF-8 code point.
+    pending: Vec<u8>,
+}
+
+impl TokenTextStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one token; returns the text it completed (`""` while a
+    /// character is still split).
+    pub fn push(&mut self, tokenizer: &Tokenizer, token: u32) -> String {
+        self.push_bytes(&tokenizer.decode_bytes(&[token]))
+    }
+
+    /// Feed raw decoded bytes.
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // `valid_up_to` guarantees this prefix is well-formed.
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap_or_default());
+                    match e.error_len() {
+                        // Incomplete trailing sequence: wait for the next token.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                        // Bytes that can never become valid: holding them would
+                        // mute the rest of the turn, so replace and step past.
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// End of stream: the held-back bytes of a truncated character, decoded
+    /// lossily rather than dropped. Empty unless generation stopped
+    /// mid-character.
+    pub fn flush(&mut self) -> String {
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        tail
+    }
+}
+
+#[cfg(test)]
+mod token_text_stream_tests {
+    use super::*;
+
+    const LITERALS: &[&str] = &["hello", "中", "🎉", " world", "∑", "!"];
+
+    /// SentencePiece vocab with full byte fallback: ids 0..=255 are the
+    /// `<0xHH>` tokens, then whole-character literals — the vocab shape that
+    /// spreads one character over several tokens.
+    fn byte_fallback_tokenizer() -> Tokenizer {
+        let mut vocab: Vec<String> = (0u32..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        vocab.extend(LITERALS.iter().map(|s| (*s).to_string()));
+        let token_to_id = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            add_bos: false,
+            eot_id: None,
+            is_gpt2_bpe: false,
+            sp_dummy_prefix: false,
+        }
+    }
+
+    fn byte_tokens(s: &str) -> Vec<u32> {
+        s.bytes().map(u32::from).collect()
+    }
+
+    fn stream_all(tk: &Tokenizer, seq: &[u32]) -> String {
+        let mut stream = TokenTextStream::new();
+        let mut out = String::new();
+        for &t in seq {
+            out.push_str(&stream.push(tk, t));
+            assert!(stream.pending.len() <= 3, "holdback grew past one code point");
+        }
+        out.push_str(&stream.flush());
+        out
+    }
+
+    #[test]
+    fn per_token_decode_is_lossy_but_stream_is_exact() {
+        let tk = byte_fallback_tokenizer();
+        let text = "emoji 🎉🔥 中文 ∑";
+        let seq = byte_tokens(text);
+        let per_token: String = seq.iter().map(|&t| tk.decode(&[t])).collect();
+        assert!(per_token.contains('\u{FFFD}'), "baseline must reproduce the bug");
+        assert_eq!(stream_all(&tk, &seq), text);
+    }
+
+    #[test]
+    fn stream_equals_batch_decode_over_random_sequences() {
+        let tk = byte_fallback_tokenizer();
+        let vocab_len = (256 + LITERALS.len()) as u64;
+        let mut x: u64 = 0x5EED_1234_ABCD_0001;
+        for _ in 0..2000 {
+            let mut next = || {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
+            let len = 1 + (next() % 24) as usize;
+            let seq: Vec<u32> = (0..len).map(|_| (next() % vocab_len) as u32).collect();
+            assert_eq!(stream_all(&tk, &seq), tk.decode(&seq), "seq {seq:?}");
+        }
+    }
+
+    #[test]
+    fn every_byte_split_reassembles() {
+        let text = "a🎉b∑中";
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        for mask in 0u32..(1 << (n - 1)) {
+            let mut stream = TokenTextStream::new();
+            let mut out = String::new();
+            let mut start = 0;
+            for i in 0..n {
+                if i == n - 1 || (mask >> i) & 1 == 1 {
+                    out.push_str(&stream.push_bytes(&bytes[start..=i]));
+                    start = i + 1;
+                }
+            }
+            out.push_str(&stream.flush());
+            assert_eq!(out, text, "mask {mask:#b}");
+        }
+    }
+
+    #[test]
+    fn split_character_yields_empty_until_complete() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[0xF0]), "");
+        assert_eq!(stream.push_bytes(&[0x9F, 0x8E]), "");
+        assert_eq!(stream.push_bytes(&[0x89, b'!']), "🎉!");
+    }
+
+    #[test]
+    fn flush_keeps_a_truncated_tail() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[b'a', 0xF0, 0x9F]), "a");
+        assert_eq!(stream.flush(), "\u{FFFD}");
+        assert_eq!(stream.flush(), "");
+    }
+
+    #[test]
+    fn invalid_bytes_never_stall() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[0x80]), "\u{FFFD}");
+        assert_eq!(stream.push_bytes(&[0xFF, b'x']), "\u{FFFD}x");
+        // An impossible continuation after a lead byte is replaced, not held.
+        assert_eq!(stream.push_bytes(&[0xE4, b'y']), "\u{FFFD}y");
+        assert!(stream.pending.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod bpe_tests {
     use super::*;

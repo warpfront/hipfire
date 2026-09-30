@@ -751,6 +751,11 @@
       "dflash": {
         "file": "qwen38-27b-dflash-mq3.hfq"
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -786,6 +791,11 @@
       },
       "dflash": {
         "file": "qwen38-27b-dflash-mq3.hfq"
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
       },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
@@ -823,6 +833,11 @@
       "dflash": {
         "file": "qwen38-27b-dflash-mq3.hfq"
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -858,6 +873,11 @@
       },
       "dflash": {
         "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
       },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
@@ -897,6 +917,11 @@
       "dflash": {
         "file": "qwen38-27b-dflash-mq4.hfq"
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -933,6 +958,11 @@
       "dflash": {
         "file": "qwen38-27b-dflash-mq4.hfq"
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -968,6 +998,11 @@
       },
       "dflash": {
         "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
       },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
@@ -1110,6 +1145,11 @@
           "reasoning_effort": "xhigh"
         }
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -1142,6 +1182,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
       },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
@@ -1176,6 +1221,11 @@
           "reasoning_effort": "xhigh"
         }
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -1208,6 +1258,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
       },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
@@ -1242,6 +1297,11 @@
           "reasoning_effort": "xhigh"
         }
       },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -1274,6 +1334,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
       },
       "vision": {
         "file": "qwen3.8-27b-vision.hfq",

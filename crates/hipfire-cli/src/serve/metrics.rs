@@ -177,13 +177,13 @@ impl Metrics {
         counter(
             &mut out,
             "hipfire_requests_failed_total",
-            "Requests that ended in an error response.",
+            "Chat and image requests answered with an error, or whose stream ended in an error event. Oversized or unparseable bodies and admission rejections are not counted here.",
             self.requests_failed.load(Ordering::Relaxed),
         );
         counter(
             &mut out,
             "hipfire_admission_rejected_total",
-            "Requests refused by admission control (queue full or model mismatch).",
+            "Requests refused by admission control (queue full, or queue wait timed out).",
             self.admission_rejected.load(Ordering::Relaxed),
         );
         gauge(

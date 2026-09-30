@@ -1,5 +1,5 @@
 # SHA-256 of exact P0 gfx1201 effective source (cold1, smokecold1, preinstall hipcc traces)
-# Re-pinned 2026-09-30: ten entries whose kernel sources were edited after P0 (Sept 28-29 decode/RMSNorm/GEMV/GDN work).
+# Entries in REPINNED_SINCE_P0 (src/kernel_registry.rs) are re-pinned to the current source; the traces keep the captured bytes.
 add_inplace	c4adc723548a0b0f15615ee030e225dc60419423cb88fb0eb75c20346acad753
 alpha_gate	95ad80057a0ea52c318f6870d24527e6da269ab651764d71c1919edfe46693fa
 attention_flash_asym3_tile	ea142beec2099d32d4c6c87e64dab7daa6f1d4084379f5475a8f93724f4fb91c

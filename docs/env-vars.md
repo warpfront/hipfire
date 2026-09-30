@@ -117,6 +117,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
+| `HIPFIRE_DFLASH_LEGACY_PREFILL` | **unset / off**; `1` opts out | Qwen35 DFlash target prompt prefill (cold seed, prompt-cache suffix, forced tokens). Default: the seed plans its chunks exactly as AR's ordinary prefill does (`ordinary_prefill_chunk_limit`, then `ordinary_serve_prefill_chunk_len`) and each chunk takes AR's route (widened chunk with `commit_stride`, GDN chunk scan, whole-chunk FA2), so after the prompt the target's KV, DeltaNet state and last-token logits are byte-identical to AR's prefill. Chunks wider than the 256-row ring staging write their hidden rows straight to the ring; this is eager only, and verify and captured forwards keep staging. `1` restores the previous route: 256-row chunks through staging, outside the widened chunk and the chunk scan. Both routes reuse one prefill scratch across chunks. |
 | `HIPFIRE_DN_SNAPSHOT_BULK_OFF` | **unset**; `1` opts out | DeltaNet snapshot save/restore as one descriptor-driven byte-copy launch each (`dflash_state_bulk_copy_gfx1100`, pure byte copy) instead of one `hipMemcpy` per tensor. Default on exact gfx1100 and exact gfx1201 (railgun E0 port); DFlash and MTP share the snapshot. `1` restores the memcpy loops. |
 | `HIPFIRE_GDN_REPLAY_ML_OFF` | **unset**; `1` opts out | Exact gfx1201: the DFlash/MTP GDN tape replay runs every LinearAttention layer in two launches (`dflash_gdn_replay_pre_ml` + `gated_delta_net_q8_fast_ml`, byte-identical) instead of 4 launches per layer. Q8 state with the fast (single-end requant) kernel only; declines while a Redline recording is open. `1` restores the per-layer launches. |
 | `HIPFIRE_SELECT_REGRID_OFF` | **unset**; `1` opts out | Exact gfx1201: `topk_values_batched_f32` (DFlash2 selector) and `argmax_f32_batched` run 1024-thread rows with wave32 reductions (`select_regrid.hip`, byte-identical including ties; tie rows rerun the shipping top-K body). `1` restores the shipping one-block-per-row kernels. |
@@ -130,6 +131,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` | auto / 3 | Config + RuntimeConfig |
 | `HIPFIRE_MTP_INCREMENTAL` | **unset**: Qwen4 MTP drafts incrementally; `0` forces batched at the full `mtp_k`, `1` forces incremental | Qwen4 MTP draft route |
 | `HIPFIRE_MTP_DRAFT_HEAD` | **`mq2r`**; `mq2`..`mq6` with optional `r` (exact top-8 Q8_0 re-scoring) | Qwen4 MTP draft-ranking copy of the LM head |
+| `HIPFIRE_MTP_OWN_PREFILL` | **unset / off**; `1` opts out | Qwen35 MTP prompt fill. Default: the trunk prefills the prompt through AR's own route (same outer chunks, widened chunk, GDN chunk scan, standard dispatch) and hands its hidden rows to the MTP head, so the prompt's KV, DeltaNet state and first-token logits match AR's. `1` restores MTP's previous route: 512-row trunk chunks captured as a speculative verify (sequential GDN recurrence; on Q8 KV, no query16 flash prefill). Resolved once per MTP load (`hipfire_config::mtp_own_prefill`); serve.log prints `qwen35 MTP prompt fill route: …`. |
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Qwen35 MTP opt-in gate | Loader — separate from DeepSeek MTP |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` / `HIPFIRE_DEEPSEEK4_SPEC_K` | DeepSeek MTP legacy | |
 | `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DSpark | |
@@ -549,6 +551,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-runtime/src/config.rs, scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_DFLASH_LEGACY_PREFILL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
@@ -929,6 +932,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs |
 | `HIPFIRE_MTP_K` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-config/src/lib.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |

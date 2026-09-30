@@ -77,7 +77,7 @@ Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path
 | Bucket | Path rules (summary) |
 |---|---|
 | **kernel** | `kernels/**`, `crates/rdna-compute/**`, `crates/hipfire-dispatch/**`, `crates/hip-bridge/**`, `crates/saddle-core/**` |
-| **serve** | `crates/hipfire-engine/**`, `crates/hipfire-generate/**`, daemon `slots.rs` / `serve*.rs`, runtime emit/eos/dflash/spec/reset/triattn surfaces, arch `serve`/`generate`/`spec` sources |
+| **serve** | `crates/hipfire-engine/**`, `crates/hipfire-generate/**`, the HTTP gateway `crates/hipfire-cli/src/serve/**` and `crates/hipfire-client/**`, daemon `slots.rs` / `serve*.rs`, runtime emit/eos/dflash/spec/reset/triattn surfaces, arch `serve`/`generate`/`spec` sources |
 | **load** | loader/daemon/runtime load+config surfaces, arch `load*`/`weights*`/`carrier.rs`, `crates/hipfire-config/**`, `crates/hipfire-registry/**`, `registry/**`, workspace/`crates/*/Cargo.toml` and lockfile |
 | **none** | everything else (docs, benchmarks, most scripts, tests, markdown, …) |
 

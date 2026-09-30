@@ -63,6 +63,8 @@ def scenario_from(req):
         "t15-reset-fail-epoch",
         "t15-reset-fail-attempt",
         "t11-premature-eof",
+        "t20-legacy-staged-tool",
+        "t20-gpu-poison",
         "t11-capability-denial",
         "t11-dirty-markers",
         "t11-length-withhold",
@@ -156,6 +158,18 @@ def handle_generate(req):
         })
         return
 
+    if scenario == "t20-legacy-staged-tool":
+        # Legacy contract (no contract_version, like DeepSeek V4): calls are
+        # staged only on the terminal, never sent as a tool_calls event.
+        calls = [{"name": "read_file", "arguments": {"path": "a.rs"}}]
+        emit_correlated({"type": "gen_start"}, rid, aid)
+        terminal = {"finish_reason": "tool_calls", "prompt_tokens": 2, "tokens": 1,
+                    "tok_s": 9.0, "calls": calls}
+        emit_correlated(dict(terminal, type="commit_ready"), rid, aid)
+        if wait_commit(rid, aid) != "commit":
+            return
+        emit_correlated(dict(terminal, type="done"), rid, aid)
+        return
     # All success / premature / t15 paths start with correlated v2 gen_start
     # except pure typed pre-start errors above.
     emit_correlated({
@@ -253,6 +267,12 @@ def handle_generate(req):
     if scenario == "t11-premature-eof":
         emit_correlated({"type": "token", "text": "partial-before-eof"}, rid, aid)
         sys.exit(0)
+
+    if scenario == "t20-gpu-poison":
+        # Sticky GPU fault: the daemon answers the request, then exits 75.
+        emit_typed_error(rid, aid, "GPU context dead after sticky HipError(719) at fixture; "
+                         "process restart required", cls="gpu", retryable=False)
+        sys.exit(75)
 
     if scenario == "t11-stop-text":
         success_stop(rid, aid)
@@ -494,6 +514,12 @@ for line in sys.stdin:
         out({"type": "pong"})
     elif ty == "load":
         MODEL_PATH = str(req.get("model") or "")
+        if "load-fail" in MODEL_PATH:
+            # The real daemon unloads the resident model before a tp<=1 load.
+            MODEL_PATH = ""
+            out({"type": "error", "message": "load failed: fixture", "class": "validation",
+                 "retryable": False, "rolled_back": False})
+            continue
         out({
             "type": "loaded",
             "arch": "fake",

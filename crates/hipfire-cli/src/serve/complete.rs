@@ -10,7 +10,7 @@
 //! transformations that convert daemon events into OpenAI responses.
 
 use crate::serve::http::request_id;
-use crate::serve::{Admission, AdmissionGuard, ServeMeta, ServeShared};
+use crate::serve::{Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared};
 use crate::{
     apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
     insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp, Paths,
@@ -253,6 +253,41 @@ pub(crate) fn tool_call_from_legacy_value(value: &serde_json::Value) -> Result<T
     // Legacy wire already used `{name, arguments}` objects (same shape as v2).
     // Keep an explicit boundary so legacy retention never reintroduces text scans.
     tool_call_from_canonical_value(value)
+}
+
+/// Absorb canonical `calls` staged on a legacy terminal payload
+/// (`commit_ready` / `done`) into the legacy tool-call buffer.
+///
+/// Legacy-contract daemons deliver tool calls two ways: a separate `tool_calls`
+/// event, or `calls` staged on the terminal payload. Routes that never
+/// advertise `contract_version: 2` (DeepSeek V4) only stage, so a buffer fed
+/// only by the separate event stays empty and the terminal drops the calls. A
+/// staged array is authoritative and *replaces* the buffer (same rule as
+/// [`SemanticEventFold::absorb_terminal_calls`]), so a daemon that both emits
+/// and stages never double-counts. A terminal without `calls` leaves the
+/// buffer untouched. Ported from #593.
+pub(crate) fn absorb_legacy_terminal_calls(
+    terminal: &serde_json::Value,
+    buffered: &mut Vec<ToolCall>,
+) -> Result<(), String> {
+    if terminal
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        != Some("tool_calls")
+    {
+        return Ok(());
+    }
+    let Some(calls) = terminal.get("calls") else {
+        return Ok(());
+    };
+    let calls = calls
+        .as_array()
+        .ok_or_else(|| "tool_calls terminal `calls` must be a JSON array".to_owned())?;
+    *buffered = calls
+        .iter()
+        .map(tool_call_from_legacy_value)
+        .collect::<Result<_, _>>()?;
+    Ok(())
 }
 
 /// JSON kind label for diagnostic logging (no values).
@@ -1515,6 +1550,10 @@ pub(crate) fn fold_complete_request_stream(
             })
         }
         StreamContract::Legacy => {
+            if let Some(terminal) = legacy_done.as_ref() {
+                absorb_legacy_terminal_calls(terminal, &mut legacy_tool_calls)
+                    .map_err(|detail| StreamContractError::MalformedToolCall { detail })?;
+            }
             let finish = legacy_done
                 .as_ref()
                 .and_then(|d| d.get("finish_reason"))
@@ -1542,6 +1581,10 @@ pub(crate) fn fold_complete_request_stream(
 #[derive(Debug)]
 pub(crate) struct RequestContract {
     pub max_tokens: u64,
+    /// The client omitted `max_tokens`: `max_tokens` is the configured
+    /// default and only a ceiling; the daemon fits it to the context left
+    /// after the prompt (wire `max_tokens_fit`).
+    pub max_tokens_fit: bool,
     pub messages: serde_json::Value,
     /// Normalized/default-system-projected messages before tool-choice prompt
     /// instructions are added.  Slot ownership uses this stable view so a
@@ -1580,11 +1623,14 @@ pub(crate) fn project_request_contract(
     resolved: &hipfire_config::ResolvedConfig,
     include_reasoning: bool,
 ) -> Result<RequestContract> {
-    let max_tokens = body
+    let explicit_max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(resolved, "generation.max_tokens")?);
+        .and_then(serde_json::Value::as_u64);
+    let max_tokens = match explicit_max_tokens {
+        Some(max_tokens) => max_tokens,
+        None => config_u64(resolved, "generation.max_tokens")?,
+    };
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
     }
@@ -1596,6 +1642,7 @@ pub(crate) fn project_request_contract(
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
     Ok(RequestContract {
         max_tokens,
+        max_tokens_fit: explicit_max_tokens.is_none(),
         messages,
         conversation_messages,
         tool_choice_policy,
@@ -1657,21 +1704,13 @@ pub(crate) fn complete_request_attempt(
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
-        let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+        let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
                     // Rollback could not be attested: model state is unknown, so
                     // the next request must full-reload rather than trust it.
-                    runtime.current_path = None;
-                    runtime.current_arch = None;
-                    runtime.current_reasoning_contract =
-                        saddle_core::caps::ReasoningContract::Unsupported;
-                    runtime.current_reasoning_effort_native = false;
-                    runtime.current_reasoning_efforts = Vec::new();
-                    runtime.continuous_batch_capable = false;
-                    runtime.current_max_seq = 0;
-                    runtime.cache_capable = false;
+                    runtime.clear_resident(&shared.meta);
                 }
                 return Err(error.into());
             }
@@ -1682,10 +1721,23 @@ pub(crate) fn complete_request_attempt(
             include_reasoning_content(runtime.current_arch.as_deref()),
         )?;
         let max_tokens = contract.max_tokens;
-        let required_max_seq = max_tokens.saturating_add(1024);
-        if runtime.current_max_seq < required_max_seq {
-            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+        // The loaded context is fixed (a reload restores the same max_seq),
+        // and the prompt shares it. An explicit budget that cannot fit next
+        // to even a one-token prompt is refused here; a smaller one that does
+        // not fit the actual prompt is refused by the daemon (context_length).
+        let context = if runtime.multi_slot_enabled {
+            runtime.multi_slot_ctx
+        } else {
+            runtime.current_max_seq
+        };
+        if !contract.max_tokens_fit && context > 0 && max_tokens >= context {
+            bail!(
+                "max_tokens={max_tokens} does not fit the loaded context window of {context} \
+                 tokens, which the prompt shares; lower max_tokens, or omit it to use the room \
+                 left after the prompt"
+            );
         }
+        let penalty_defaults = runtime.tp.unwrap_or(1) <= 1;
         let normalized_messages = contract.messages;
         let conversation_messages = contract.conversation_messages;
         let tool_choice_policy = contract.tool_choice_policy;
@@ -1698,6 +1750,9 @@ pub(crate) fn complete_request_attempt(
             "max_tokens": max_tokens,
             "attempt_id": attempt_id,
         });
+        if contract.max_tokens_fit {
+            generate["max_tokens_fit"] = serde_json::Value::Bool(true);
+        }
         if let Some(image) = image_base64 {
             generate["image_base64"] = serde_json::Value::String(image);
         }
@@ -1707,11 +1762,12 @@ pub(crate) fn complete_request_attempt(
             ("repeat_penalty", "generation.repeat_penalty"),
         ] {
             let explicit = body.get(key).and_then(serde_json::Value::as_f64);
-            insert_optional_f64(
-                &mut generate,
-                key,
-                request_f64(&resolved, config_key, explicit)?,
-            );
+            let value = if key == "repeat_penalty" && !penalty_defaults {
+                explicit
+            } else {
+                request_f64(&resolved, config_key, explicit)?
+            };
+            insert_optional_f64(&mut generate, key, value);
         }
         // Validate OpenAI logprobs contract before forwarding; reject rather
         // than silently clamping so callers notice a mismatch.
@@ -1752,7 +1808,7 @@ pub(crate) fn complete_request_attempt(
         ] {
             if let Some(value) = body.get(key) {
                 generate[key] = value.clone();
-            } else {
+            } else if key == "min_p" || penalty_defaults {
                 insert_optional_f64(
                     &mut generate,
                     key,
@@ -1897,6 +1953,16 @@ pub(crate) fn complete_request_attempt(
                         &mut event_callback,
                     )?;
                     legacy_done = Some(staged.clone());
+                    // The HTTP terminal is delivered here, not on the
+                    // post-commit `done`, so calls staged on the payload must
+                    // be absorbed before the completion is built.
+                    absorb_legacy_terminal_calls(&staged, &mut legacy_tool_calls).map_err(
+                        |detail| {
+                            hipfire_client::ClientError::Protocol(format!(
+                                "malformed canonical tool call: {detail}"
+                            ))
+                        },
+                    )?;
                     let finish = staged
                         .get("finish_reason")
                         .and_then(serde_json::Value::as_str);
@@ -2051,6 +2117,19 @@ pub(crate) fn complete_request_attempt(
         Some(flag) => engine_clone.generate_cancellable(&generate, flag, &mut on_event),
         None => engine_clone.generate(&generate, &mut on_event),
     };
+    if let Err(error) = &gen_result {
+        if error.to_string().contains("process restart required") {
+            // The daemon exits after reporting a sticky GPU fault. Reap it now
+            // so the next request respawns it instead of racing that exit.
+            drop(engine_clone);
+            shared
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .engine
+                .terminate();
+        }
+    }
     let done = gen_result?;
     let mut meta = shared
         .meta
@@ -2092,6 +2171,10 @@ pub(crate) fn complete_request_attempt(
     }
 
     let mut done = legacy_done.unwrap_or(done);
+    // Idempotent after a staged commit_ready; the live absorb for a legacy
+    // stream that skipped staging and ended on a plain `done`.
+    absorb_legacy_terminal_calls(&done, &mut legacy_tool_calls)
+        .map_err(|detail| anyhow!("malformed canonical tool call: {detail}"))?;
     let finish = done
         .get("finish_reason")
         .and_then(serde_json::Value::as_str);
@@ -3023,6 +3106,7 @@ mod tests {
             recent_tok_s: None,
             started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            engine_state: crate::serve::EngineState::Up,
         }
     }
 
@@ -5314,6 +5398,71 @@ mod tests {
         .expect("contract_version 1 is legacy");
         assert_eq!(legacy_v1.contract, StreamContract::Legacy);
         assert_eq!(legacy_v1.content, "plain");
+    }
+
+    #[test]
+    fn legacy_terminal_staged_tool_calls_are_absorbed() {
+        let gen_start = serde_json::json!({"type": "gen_start", "id": "req-9", "attempt_id": 9});
+        let call = serde_json::json!({"name": "get_current_date_time", "arguments": {}});
+        let staged_done = serde_json::json!({
+            "type": "done", "finish_reason": "tool_calls", "calls": [call],
+            "id": "req-9", "attempt_id": 9
+        });
+        let separate_event = serde_json::json!({
+            "type": "tool_calls", "calls": [call], "id": "req-9", "attempt_id": 9
+        });
+        let fold = |events: &[serde_json::Value]| fold_complete_request_stream("req-9", 9, events);
+
+        // Staging only (DS4 shape): the terminal payload is the sole source.
+        let staged_only = fold(&[gen_start.clone(), staged_done.clone()]).unwrap();
+        assert_eq!(staged_only.contract, StreamContract::Legacy);
+        assert_eq!(staged_only.tool_calls.len(), 1);
+        assert_eq!(staged_only.tool_calls[0].name, "get_current_date_time");
+
+        // Emitted and staged: the staged array replaces the buffer, no double count.
+        let both = fold(&[gen_start.clone(), separate_event.clone(), staged_done]).unwrap();
+        assert_eq!(both.tool_calls.len(), 1);
+
+        // A separate event with no `calls` on the terminal keeps the legacy path.
+        let emitted_only = fold(&[
+            gen_start.clone(),
+            separate_event,
+            serde_json::json!({"type": "done", "finish_reason": "tool_calls",
+                               "id": "req-9", "attempt_id": 9}),
+        ])
+        .unwrap();
+        assert_eq!(emitted_only.tool_calls.len(), 1);
+
+        // A non-tool terminal never absorbs calls.
+        let stopped = fold(&[
+            gen_start.clone(),
+            serde_json::json!({"type": "token", "text": "answer", "id": "req-9", "attempt_id": 9}),
+            serde_json::json!({"type": "done", "finish_reason": "stop", "calls": [call],
+                               "id": "req-9", "attempt_id": 9}),
+        ])
+        .unwrap();
+        assert_eq!(stopped.content, "answer");
+        assert!(stopped.tool_calls.is_empty());
+
+        // Malformed staged payloads fail closed instead of dropping the call.
+        let malformed = fold(&[
+            gen_start,
+            serde_json::json!({"type": "done", "finish_reason": "tool_calls",
+                               "calls": [{"arguments": {}}], "id": "req-9", "attempt_id": 9}),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(malformed, StreamContractError::MalformedToolCall { .. }),
+            "{malformed:?}"
+        );
+        let mut buffered = Vec::new();
+        let non_array = absorb_legacy_terminal_calls(
+            &serde_json::json!({"finish_reason": "tool_calls", "calls": {}}),
+            &mut buffered,
+        )
+        .unwrap_err();
+        assert!(non_array.contains("must be a JSON array"), "{non_array}");
+        assert!(buffered.is_empty());
     }
 
     #[test]

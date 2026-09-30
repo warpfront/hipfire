@@ -24,6 +24,7 @@ use hipfire_runtime::prompt_frame::AssistantPrefix;
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, StopReason,
 };
+use hipfire_runtime::stop_sequence::StopMatcher;
 use hipfire_runtime::tokenizer::Tokenizer;
 
 pub struct Qwen35Emit<'a> {
@@ -52,7 +53,8 @@ pub struct Qwen35Emit<'a> {
     grammar_violated: bool,
     eos_token: u32,
     im_end_token: Option<u32>,
-    stop: Vec<String>,
+    /// User `stop` sequences, matched on answer text before it is emitted.
+    stop: StopMatcher,
     max_think_tokens: usize,
     open_think_prefix: bool,
     think_count: usize,
@@ -146,7 +148,7 @@ impl<'a> Qwen35Emit<'a> {
             grammar_violated: false,
             eos_token: ctx.eos,
             im_end_token: ctx.im_end,
-            stop: ctx.stop,
+            stop: StopMatcher::new(&ctx.stop),
             max_think_tokens: ctx.max_think,
             open_think_prefix,
             think_count: 0,
@@ -184,23 +186,27 @@ impl<'a> Qwen35Emit<'a> {
         }
     }
 
-    /// Route classified reasoning/content events. Content continues through
-    /// the tool protocol router; reasoning bypasses it and is never cached as
-    /// visible prose.
+    /// Route classified reasoning/content events. Content passes the user
+    /// `stop` matcher, then the tool protocol router; reasoning bypasses both
+    /// and is never cached as visible prose. Once a stop sequence matches,
+    /// nothing after it is routed.
     fn route_think_events(
         &mut self,
         channel_events: Vec<ThinkRouteEvent>,
         events: &mut Vec<ClientEvent>,
     ) {
         for channel_event in channel_events {
-            if self.router_malformed {
-                continue;
+            if self.router_malformed || self.stop.matched() {
+                break;
             }
             match channel_event {
                 ThinkRouteEvent::Reasoning(text) => {
                     events.push(ClientEvent::Reasoning(text));
                 }
-                ThinkRouteEvent::Content(text) => self.route_content_text(&text, events),
+                ThinkRouteEvent::Content(text) => {
+                    let text = self.stop.push(&text);
+                    self.route_content_text(&text, events);
+                }
             }
         }
     }
@@ -252,7 +258,8 @@ impl<'a> Qwen35Emit<'a> {
         events
     }
 
-    /// Drain pending EOT-prefix prose, then finalize partial think markers.
+    /// Drain pending EOT-prefix prose, finalize partial think markers, then
+    /// release answer text held back as a possible stop prefix.
     fn drain_pending_into_router(&mut self, events: &mut Vec<ClientEvent>) {
         let pending = self.filter.flush_pending();
         if !pending.is_empty() {
@@ -263,6 +270,8 @@ impl<'a> Qwen35Emit<'a> {
         let mut channel_events = Vec::new();
         self.think_router.finish_into(&mut channel_events);
         self.route_think_events(channel_events, events);
+        let held = self.stop.finish();
+        self.route_content_text(&held, events);
     }
 
     /// Whether a streamed token id is a decoded EOT / terminator.
@@ -270,18 +279,6 @@ impl<'a> Qwen35Emit<'a> {
         token == self.eos_token
             || self.im_end_token == Some(token)
             || self.tokenizer.is_terminator(token)
-    }
-
-    /// User stop-sequence match against the decoded streamed suffix.
-    /// Shared by `begin` (first token) and `observe` (later tokens).
-    fn matches_stop_sequence(&self) -> bool {
-        if self.stop.is_empty() {
-            return false;
-        }
-        let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
-        self.stop
-            .iter()
-            .any(|s| decoded_suffix.ends_with(s.as_str()))
     }
 
     /// True when this turn ended on a decoded EOT (token id or filter stop_at).
@@ -321,7 +318,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
                 stop: Some(StopReason::Eos),
             };
         }
-        if self.matches_stop_sequence() {
+        if self.stop.matched() {
             return EmitOutcome {
                 events,
                 stop: Some(StopReason::StopSequence),
@@ -374,8 +371,8 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             };
         }
 
-        // User stop-sequence match against the decoded suffix. Mirrors 4622-4628.
-        if self.matches_stop_sequence() {
+        // User stop sequence matched in the answer text this token completed.
+        if self.stop.matched() {
             return EmitOutcome {
                 events,
                 stop: Some(StopReason::StopSequence),
@@ -422,7 +419,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         let open_think = self.think_router.in_think();
         let decoded_eot = self.decoded_eot();
 
-        if open_think {
+        if open_think && !self.stop.matched() {
             // Unsafe terminal: drop pending (already flushed/dropped), no calls,
             // no safe stop. Daemon emits error-only (no done/cache).
             let _ = self.router.finish();
@@ -450,6 +447,16 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         let buffered_before = self.router.tool_calls().to_vec();
         match self.router.finish() {
+            // A stop sequence that cut a tool call short leaves no call and
+            // no malformed verdict: the call text was never part of the answer.
+            Err(_) if self.stop.matched() => FinishSummary {
+                events,
+                finish_reason: "stop",
+                tool_calls: 0,
+                visible_text: std::mem::take(&mut self.visible_acc),
+                decoded_eot,
+                open_think: false,
+            },
             Err(_) => FinishSummary {
                 events,
                 finish_reason: "malformed_protocol",
@@ -950,6 +957,49 @@ mod tests {
         }
         assert!(saw_stop, "multi-token stop must still fire via observe");
         assert!(n > 1, "multi-token stop must not only hit begin");
+    }
+
+    #[test]
+    fn stop_sequence_text_is_never_a_token_event() {
+        let tok = test_tokenizer();
+        let ids = tok.encode("ab STOP cd");
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop: vec!["STOP".to_string()],
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+        let mut tokens = String::new();
+        let mut saw_stop = false;
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 { emit.begin(*id) } else { emit.observe(*id) };
+            for e in &outcome.events {
+                if let ClientEvent::Token(t) = e {
+                    tokens.push_str(t);
+                }
+            }
+            if outcome.stop == Some(StopReason::StopSequence) {
+                saw_stop = true;
+                break;
+            }
+        }
+        assert!(saw_stop);
+        let fin = emit.finish();
+        for e in &fin.events {
+            if let ClientEvent::Token(t) = e {
+                tokens.push_str(t);
+            }
+        }
+        assert_eq!(tokens, "ab ");
+        assert_eq!(fin.finish_reason, "stop");
+        assert_eq!(fin.visible_text, "ab ");
     }
 
     #[test]

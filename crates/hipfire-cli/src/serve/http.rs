@@ -12,10 +12,11 @@ use crate::serve::complete::{
     complete_request_cancellable, completion_json, gate_chat_completions_tools,
     openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
 };
+use crate::serve::metrics::Metrics;
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard};
 use crate::{list_local_models, unix_timestamp};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::server::conn::http1;
@@ -23,9 +24,12 @@ use hyper::{
     body::{Frame, Incoming},
     header, Method, Request, Response,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
+    cell::Cell,
+    collections::VecDeque,
     convert::Infallible,
+    future::Future,
     io,
     pin::Pin,
     sync::{
@@ -33,10 +37,13 @@ use std::{
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
+    time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 // ---------------------------------------------------------------------------
 // Boxed body and helpers
@@ -95,22 +102,27 @@ fn static_server_error() -> Response<BoxBody> {
         .expect("static 500 response builds")
 }
 
-pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
+fn openai_error_body(message: &str, status: u16) -> serde_json::Value {
     let error_type = if (400..500).contains(&status) {
         "invalid_request_error"
     } else {
         "server_error"
     };
-    json_response_result(
-        &serde_json::json!({
-            "error": { "message": message, "type": error_type }
-        }),
-        status,
-    )
-    .unwrap_or_else(|_| static_server_error())
+    serde_json::json!({
+        "error": { "message": message, "type": error_type }
+    })
 }
 
-pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
+pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
+    json_response_result(&openai_error_body(message, status), status)
+        .unwrap_or_else(|_| static_server_error())
+}
+
+pub(crate) fn admission_error_response(
+    metrics: &Metrics,
+    error: &AdmissionError,
+) -> Response<BoxBody> {
+    metrics.record_admission_rejected();
     let mut resp = openai_error(&error.message, 503);
     if let Ok(retry_after) = header::HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
         resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
@@ -276,6 +288,8 @@ pub(crate) struct ResponseChunk {
     bytes: Vec<u8>,
     ack: Option<AckSender>,
     fail: bool,
+    /// Ends with `data: [DONE]`: nothing, not even a keepalive, may follow.
+    last: bool,
 }
 
 impl ResponseChunk {
@@ -284,6 +298,16 @@ impl ResponseChunk {
             bytes,
             ack: None,
             fail: false,
+            last: false,
+        }
+    }
+    /// The final frame of a response (its bytes end with `data: [DONE]`).
+    fn last(bytes: Vec<u8>, ack: Option<AckSender>) -> Self {
+        Self {
+            bytes,
+            ack,
+            fail: false,
+            last: true,
         }
     }
     pub(crate) fn fail() -> Self {
@@ -291,34 +315,59 @@ impl ResponseChunk {
             bytes: Vec::new(),
             ack: None,
             fail: true,
+            last: false,
         }
     }
 }
 
-/// Streaming SSE body: multiple frames via channel. Dropped receiver closes
-/// sender and callback returns Cancelled. Terminal chunk ack is registered with
-/// the connection tracker when that frame is yielded (not on a later body poll).
+/// SSE comment sent after [`SSE_SILENCE_LIMIT`] without a frame. Conforming
+/// SSE parsers (the OpenAI SDKs, `hipfire_client::read_openai_sse`) drop it.
+const SSE_KEEPALIVE: &[u8] = b": keepalive\n\n";
+
+/// Streaming SSE body: frames the handler already holds (`first`), then the
+/// channel. Dropped receiver closes sender and callback returns Cancelled.
+/// Terminal chunk ack is registered with the connection tracker when that
+/// frame is yielded (not on a later body poll).
+/// Until the last frame, a silence of `keepalive_every` (a long prefill, or a
+/// tool call buffered to the end) yields an [`SSE_KEEPALIVE`] comment, so
+/// clients and proxies with an idle-read timeout keep the connection.
 /// Owns a clone of the worker cancellation flag; drop (client disconnect after
 /// the response is returned) sets it so long silent towers abort promptly.
 pub(crate) struct ChannelBody {
+    first: VecDeque<ResponseChunk>,
     rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
     tracker: FlushAcks,
     cancelled: Arc<AtomicBool>,
     failed: bool,
+    /// The last frame (`[DONE]`) has been yielded.
+    done: bool,
+    keepalive: Pin<Box<tokio::time::Sleep>>,
+    keepalive_every: Duration,
 }
 
 impl ChannelBody {
     pub(crate) fn new(
+        first: VecDeque<ResponseChunk>,
         rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
         tracker: FlushAcks,
         cancelled: Arc<AtomicBool>,
+        keepalive_every: Duration,
     ) -> Self {
         Self {
+            first,
             rx,
             tracker,
             cancelled,
             failed: false,
+            done: false,
+            keepalive: Box::pin(tokio::time::sleep(keepalive_every)),
+            keepalive_every,
         }
+    }
+
+    fn restart_keepalive(&mut self) {
+        let next = tokio::time::Instant::now() + self.keepalive_every;
+        self.keepalive.as_mut().reset(next);
     }
 }
 
@@ -343,7 +392,11 @@ impl hyper::body::Body for ChannelBody {
             ))));
         }
 
-        match Pin::new(&mut self.rx).poll_recv(cx) {
+        let chunk = match self.first.pop_front() {
+            Some(chunk) => Poll::Ready(Some(chunk)),
+            None => Pin::new(&mut self.rx).poll_recv(cx),
+        };
+        match chunk {
             Poll::Ready(Some(chunk)) => {
                 if chunk.fail {
                     self.failed = true;
@@ -368,10 +421,19 @@ impl hyper::body::Body for ChannelBody {
                 if let Some(ack) = chunk.ack {
                     self.tracker.register(ack);
                 }
+                self.done |= chunk.last;
+                self.restart_keepalive();
                 Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk.bytes)))))
             }
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                if !self.done && self.keepalive.as_mut().poll(cx).is_ready() {
+                    // The next poll_frame polls the re-armed timer again.
+                    self.restart_keepalive();
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(SSE_KEEPALIVE)))));
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -421,46 +483,128 @@ impl Drop for CancelOnDrop {
 // Public Hyper entry point
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn serve_listener(listener: TcpListener, shared: Arc<ServeShared>) -> Result<()> {
-    serve_listener_until(listener, shared, CancellationToken::new()).await
-}
+/// Most client connections served at once. Further connects wait in the
+/// kernel's listen backlog until one closes, so idle sockets cannot use up
+/// the process's descriptors (the default soft limit is 1024).
+const MAX_CONNECTIONS: usize = 512;
 
-/// Accept loop that exits cleanly when `shutdown` is cancelled.
+/// A client must deliver a complete request head this soon after it connects
+/// or after its previous response; hyper then closes the connection. This is
+/// also what reaps idle keep-alive connections.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause after a failed `accept`, doubled per consecutive failure.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// After shutdown, how long in-flight requests get to finish.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+
+/// Accept loop. A failed `accept` (out of descriptors, a connection reset
+/// before it was accepted) is logged and retried, never fatal. When
+/// `shutdown` is cancelled the loop stops accepting and releases the port,
+/// lets requests in flight finish for up to [`SHUTDOWN_DRAIN`], and returns.
 pub(crate) async fn serve_listener_until(
     listener: TcpListener,
     shared: Arc<ServeShared>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connections = TaskTracker::new();
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let shared = Arc::clone(&shared);
-                tokio::spawn(async move {
-                    // One tracker per connection so pipelined responses share FIFO
-                    // flush ordering without global state.
-                    let acks = FlushAcks::new();
-                    let io = TrackedIo::new(stream, acks.clone());
-                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let shared = Arc::clone(&shared);
-                        let acks = acks.clone();
-                        async move {
-                            Ok::<_, Infallible>(handle_request(req, shared, acks).await)
-                        }
-                    });
-                    if let Err(err) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(io), service)
-                        .await
-                    {
-                        // Hyper already logs connection resets; keep quiet for normal close.
-                        let msg = err.to_string();
-                        if !msg.contains("incomplete") && !msg.contains("reset") {
-                            eprintln!("[hipfire] connection error: {err:#}");
-                        }
-                    }
-                });
+        let slot = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            slot = Arc::clone(&slots).acquire_owned() => {
+                slot.expect("the connection semaphore is never closed")
             }
+        };
+        let accepted = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                backoff = ACCEPT_BACKOFF_MIN;
+                connections.spawn(serve_connection(
+                    stream,
+                    Arc::clone(&shared),
+                    shutdown.clone(),
+                    slot,
+                ));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[hipfire] accept failed: {error}; retrying in {} ms",
+                    backoff.as_millis()
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+            }
+        }
+    }
+    drop(listener);
+    connections.close();
+    if tokio::time::timeout(SHUTDOWN_DRAIN, connections.wait())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "[hipfire] shutdown: requests still in flight after {} s; exiting",
+            SHUTDOWN_DRAIN.as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// One client connection, holding one of the [`MAX_CONNECTIONS`] slots. On
+/// shutdown it stops keep-alive: an idle connection closes at once, a busy
+/// one after its response.
+async fn serve_connection(
+    stream: TcpStream,
+    shared: Arc<ServeShared>,
+    shutdown: CancellationToken,
+    _slot: OwnedSemaphorePermit,
+) {
+    // One tracker per connection so pipelined responses share FIFO
+    // flush ordering without global state.
+    let acks = FlushAcks::new();
+    let io = TrackedIo::new(stream, acks.clone());
+    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+        let shared = Arc::clone(&shared);
+        let acks = acks.clone();
+        async move { Ok::<_, Infallible>(handle_request(req, shared, acks).await) }
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    let conn = builder.serve_connection(TokioIo::new(io), service);
+    tokio::pin!(conn);
+    let mut draining = false;
+    let result = loop {
+        tokio::select! {
+            result = conn.as_mut() => break result,
+            _ = shutdown.cancelled(), if !draining => {
+                draining = true;
+                conn.as_mut().graceful_shutdown();
+            }
+        }
+    };
+    if let Err(err) = result {
+        // Normal closes stay quiet: resets, idle connections reaped by the
+        // header timeout, and a client closing while its response is still
+        // open (IncompleteMessage). The last one is every streaming client
+        // that stops reading at `data: [DONE]`: the chunked terminator is
+        // written only after the daemon commit succeeds, so the body can
+        // still fail if the commit does. A close before `[DONE]` is a client
+        // cancel, which the body's drop already aborts.
+        let msg = err.to_string();
+        if !err.is_timeout() && !err.is_incomplete_message() && !msg.contains("reset") {
+            eprintln!("[hipfire] connection error: {err:#}");
         }
     }
 }
@@ -482,15 +626,23 @@ async fn handle_request(
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+            // 503 while the daemon is dead or being respawned, so probes and
+            // service managers see that requests cannot be served.
+            let state = meta.engine_state;
             let body = serde_json::json!({
-                "status": "ok",
+                "status": state.as_str(),
                 "model": meta.current_model,
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
                 "token": meta.instance_token,
                 "native": true,
             });
-            json_response(body, 200)
+            let status = if state == crate::serve::EngineState::Up {
+                200
+            } else {
+                503
+            };
+            json_response(body, status)
         }
         (Method::GET, "/stats") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
@@ -606,17 +758,17 @@ async fn handle_request(
                     .await
                 {
                     Ok(g) => g,
-                    Err(e) => return admission_error_response(&e),
+                    Err(e) => return admission_error_response(&shared.metrics, &e),
                 }
             } else {
                 match shared.admission.acquire_async(cancel.clone()).await {
                     Ok(g) => g,
-                    Err(e) => return admission_error_response(&e),
+                    Err(e) => return admission_error_response(&shared.metrics, &e),
                 }
             };
 
             if let Err(error) = gate_chat_completions_tools(&body_val) {
-                return openai_error(&error.to_string(), 400);
+                return RequestFailure::new(error.to_string(), 400).respond(&shared.metrics);
             }
 
             let is_stream = body_val.get("stream").and_then(|v| v.as_bool()) == Some(true);
@@ -647,9 +799,12 @@ async fn handle_request(
                     return openai_error(&msg, status);
                 }
             };
-            match handle_images_generations(shared, body_val).await {
+            match handle_images_generations(Arc::clone(&shared), body_val).await {
                 Ok(resp) => resp,
-                Err(message) => openai_error(&message, images_error_status(&message)),
+                Err(message) => {
+                    let status = images_error_status(&message);
+                    RequestFailure::new(message, status).respond(&shared.metrics)
+                }
             }
         }
         // OpenAI-shaped reference edit: `multipart/form-data` with one to four
@@ -693,9 +848,12 @@ async fn handle_request(
                 Ok(v) => v,
                 Err(message) => return openai_error(&message, 400),
             };
-            match handle_images_generations(shared, body_val).await {
+            match handle_images_generations(Arc::clone(&shared), body_val).await {
                 Ok(resp) => resp,
-                Err(message) => openai_error(&message, images_error_status(&message)),
+                Err(message) => {
+                    let status = images_error_status(&message);
+                    RequestFailure::new(message, status).respond(&shared.metrics)
+                }
             }
         }
         _ => openai_error("not found", 404),
@@ -776,9 +934,17 @@ async fn handle_images_generations(
         .map(str::to_owned);
 
     // Serialize against chat traffic and cap queue depth the same way the
-    // chat path does; the daemon processes messages sequentially.
-    let guard = shared.admission.acquire().map_err(|e| e.to_string())?;
-    let _guard = guard;
+    // chat path does; the daemon processes messages sequentially. The wait
+    // is async so a queued image request does not park a runtime worker.
+    // Dropping this future (client gone) withdraws it from the queue.
+    let _guard = match shared
+        .admission
+        .acquire_async(CancellationToken::new())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => return Ok(admission_error_response(&shared.metrics, &error)),
+    };
 
     let (engine, loaded_model) = {
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -1068,6 +1234,14 @@ fn images_error_status(message: &str) -> u16 {
 // Streaming / Non-streaming handlers
 // ---------------------------------------------------------------------------
 
+/// Longest an SSE client goes without a byte. A stream commits (200 + role
+/// chunk) when the worker sends its first frame; if generation is still
+/// silent this long after admission (cold load, long prefill), it commits
+/// anyway, and a committed stream sends [`SSE_KEEPALIVE`] after this much
+/// silence. 15 s sits under common idle-read limits (nginx
+/// `proxy_read_timeout` 60 s, undici `bodyTimeout` 300 s).
+const SSE_SILENCE_LIMIT: Duration = Duration::from_secs(15);
+
 async fn handle_streaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -1075,57 +1249,87 @@ async fn handle_streaming(
     cancelled: Arc<AtomicBool>,
     acks: FlushAcks,
 ) -> Response<BoxBody> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
-
-    let id = request_id();
-    let created = unix_timestamp();
-    let include_usage = body
-        .pointer("/stream_options/include_usage")
-        .and_then(|v| v.as_bool())
-        == Some(true);
-    let model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_owned();
-
-    let first = serde_json::json!({
-        "id": id,
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+    let commit = Arc::new(Mutex::new(StreamCommit::Pending));
+    let sink = SseSink {
+        tx,
+        commit: Arc::clone(&commit),
+        committed: Cell::new(false),
+        terminal_sent: Cell::new(false),
+        id: request_id(),
+        created: unix_timestamp(),
+        model: body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned(),
+        include_usage: body
+            .pointer("/stream_options/include_usage")
+            .and_then(|v| v.as_bool())
+            == Some(true),
+    };
+    let role = serde_json::json!({
+        "id": sink.id,
         "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
+        "created": sink.created,
+        "model": sink.model,
         "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
     });
-    let _ = tx.try_send(ResponseChunk::plain(sse_data(&first)));
+    let mut first = VecDeque::from([ResponseChunk::plain(sse_data(&role))]);
 
-    let tx_clone = tx.clone();
-    let shared_clone = Arc::clone(&shared);
-    let id_clone = id.clone();
-    let model_clone = model.clone();
     let body_cancelled = Arc::clone(&cancelled);
+    let worker_shared = Arc::clone(&shared);
     tokio::task::spawn_blocking(move || {
-        let result = complete_request_cancellable(
-            &shared_clone,
-            &body,
-            guard,
-            Some((id_clone.clone(), created)),
-            &cancelled,
-            |event| forward_sse_stream_event(&tx_clone, &id_clone, created, &model_clone, event),
-            |completion| deliver_sse_terminal_ack(&tx_clone, completion, include_usage),
-        );
-        finish_sse_stream(tx_clone, result);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            complete_request_cancellable(
+                &worker_shared,
+                &body,
+                guard,
+                Some((sink.id.clone(), sink.created)),
+                &cancelled,
+                |event| sink.forward_event(event),
+                |completion| sink.deliver_terminal(completion),
+            )
+        }));
+        let result = outcome.unwrap_or_else(|payload| {
+            Err(anyhow!(
+                "generation worker panicked: {}",
+                panic_message(payload.as_ref())
+            ))
+        });
+        sink.finish(result, &worker_shared.metrics);
     });
 
-    let body = ChannelBody::new(rx, acks, body_cancelled);
-    let mut resp = Response::builder()
+    // Validation, model load and the daemon's own request checks all run in
+    // the worker before its first frame, so a failure there still gets its
+    // real status as an ordinary JSON error instead of a 200 stream.
+    tokio::select! {
+        chunk = rx.recv() => match chunk {
+            // The worker commits before it sends anything.
+            Some(chunk) => first.push_back(chunk),
+            None => {
+                return match commit_stream(&commit) {
+                    Err(failure) => failure.respond(&shared.metrics),
+                    Ok(()) => RequestFailure::new("generation ended without a response", 500)
+                        .respond(&shared.metrics),
+                };
+            }
+        },
+        _ = tokio::time::sleep(SSE_SILENCE_LIMIT) => {
+            if let Err(failure) = commit_stream(&commit) {
+                return failure.respond(&shared.metrics);
+            }
+        }
+    }
+
+    let body = ChannelBody::new(first, rx, acks, body_cancelled, SSE_SILENCE_LIMIT);
+    Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(boxed(body))
-        .unwrap();
-    // Ensure chunked; hyper sets it automatically for streaming bodies.
-    resp
+        .unwrap()
 }
 
 async fn handle_nonstreaming(
@@ -1135,9 +1339,9 @@ async fn handle_nonstreaming(
     cancelled: Arc<AtomicBool>,
     acks: FlushAcks,
 ) -> Response<BoxBody> {
-    // Staged terminal channel: Ok((bytes, ack_tx)) for success, Err(msg) for preterminal.
+    // Staged terminal channel: Ok((bytes, ack_tx)) for success, Err(failure) for preterminal.
     let (staged_tx, staged_rx) = tokio::sync::oneshot::channel::<
-        Result<(Vec<u8>, std::sync::mpsc::Sender<Result<(), ()>>), String>,
+        Result<(Vec<u8>, std::sync::mpsc::Sender<Result<(), ()>>), RequestFailure>,
     >();
     let staged_tx = Arc::new(Mutex::new(Some(staged_tx)));
 
@@ -1191,27 +1395,21 @@ async fn handle_nonstreaming(
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(tx) = lock.take() {
-            match outcome {
+            let failure = match outcome {
+                // Ok but terminal never called — report as error.
                 Ok(Ok(_completion)) => {
-                    // Ok but terminal never called — report as error.
-                    let _ = tx.send(Err(
-                        "generation completed without a response body".to_string()
-                    ));
+                    RequestFailure::new("generation completed without a response body", 500)
                 }
-                Ok(Err(error)) => {
-                    let msg = error.to_string();
-                    let _ = tx.send(Err(msg));
-                }
-                Err(payload) => {
-                    let detail = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "non-string panic payload".to_string());
-                    let _ = tx.send(Err(format!("generation worker panicked: {detail}")));
-                }
-                Ok(Ok(_)) => {}
-            }
+                Ok(Err(error)) => RequestFailure::from_error(&error),
+                Err(payload) => RequestFailure::new(
+                    format!(
+                        "generation worker panicked: {}",
+                        panic_message(payload.as_ref())
+                    ),
+                    500,
+                ),
+            };
+            let _ = tx.send(Err(failure));
         }
     });
 
@@ -1229,8 +1427,10 @@ async fn handle_nonstreaming(
                 .unwrap();
             resp
         }
-        Ok(Err(message)) => openai_error(&message, request_error_status(&message)),
-        Err(_) => openai_error("generation worker disconnected", 500),
+        Ok(Err(failure)) => failure.respond(&shared.metrics),
+        Err(_) => {
+            RequestFailure::new("generation worker disconnected", 500).respond(&shared.metrics)
+        }
     }
 }
 
@@ -1238,8 +1438,69 @@ async fn handle_nonstreaming(
 // Preserved business helpers (same shapes, adapted to tokio mpsc where needed)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn request_error_status(message: &str) -> u16 {
-    let lower = message.to_ascii_lowercase();
+/// Retry-After for a typed `transient` daemon failure (HTTP 503).
+const TRANSIENT_RETRY_AFTER_SECS: u64 = 1;
+
+/// A failed chat completion. Before a stream commits it is an OpenAI JSON
+/// error with `status`; after, the same body goes out as an SSE error event.
+#[derive(Debug)]
+pub(crate) struct RequestFailure {
+    message: String,
+    status: u16,
+}
+
+impl RequestFailure {
+    fn new(message: impl Into<String>, status: u16) -> Self {
+        Self {
+            message: message.into(),
+            status,
+        }
+    }
+
+    fn from_error(error: &anyhow::Error) -> Self {
+        Self::new(error.to_string(), request_error_status(error))
+    }
+
+    /// The JSON error response ending this request; counts it as failed.
+    fn respond(&self, metrics: &Metrics) -> Response<BoxBody> {
+        metrics.record_failure();
+        let mut resp = openai_error(&self.message, self.status);
+        if self.status == 503 {
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from(TRANSIENT_RETRY_AFTER_SECS),
+            );
+        }
+        resp
+    }
+
+    /// The error event and `[DONE]` that end a stream failing after commit.
+    fn sse_event(&self) -> Vec<u8> {
+        let mut bytes = sse_data(&openai_error_body(&self.message, self.status));
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        bytes
+    }
+}
+
+/// HTTP status for a failed completion. A typed daemon error maps on its wire
+/// `class`, never on its message: `validation`, `context_length` and
+/// `unsupported` are the client's to fix (400), `transient` is worth a retry
+/// (503), and every other class is a server fault (500). Only gateway-side
+/// errors, which carry no class, fall back to matching their message.
+pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
+    use hipfire_client::error_class;
+    let typed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<hipfire_client::ClientError>())
+        .and_then(hipfire_client::ClientError::typed_daemon);
+    if let Some(typed) = typed {
+        return match typed.class.as_str() {
+            error_class::VALIDATION | error_class::CONTEXT_LENGTH | error_class::UNSUPPORTED => 400,
+            error_class::TRANSIENT => 503,
+            _ => 500,
+        };
+    }
+    let lower = error.to_string().to_ascii_lowercase();
     if lower.contains("model not found") {
         404
     } else if lower.contains("kv budget")
@@ -1256,6 +1517,14 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     }
 }
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 pub(crate) fn request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1270,89 +1539,128 @@ pub(crate) fn sse_data(value: &serde_json::Value) -> Vec<u8> {
     format!("data: {}\n\n", value).into_bytes()
 }
 
-/// Forward one logical generate event onto the OpenAI SSE channel.
-/// Delta-bearing events serialize to plain (no-ack) SSE bytes. No-delta mid-stream
-/// events are silent — terminal ack handles pure-tool delivery. A dropped receiver
-/// maps to `Cancelled`.
-pub(crate) fn forward_sse_stream_event(
-    sender: &tokio::sync::mpsc::Sender<ResponseChunk>,
-    id: &str,
+/// Commit point of one SSE response, shared by the handler and its worker.
+enum StreamCommit {
+    /// Nothing sent yet: a failure can still be an ordinary JSON error.
+    Pending,
+    /// The 200 and the role chunk are (or are about to be) on the wire.
+    Committed,
+    /// The worker failed before its first frame; the handler answers with this.
+    Rejected(RequestFailure),
+}
+
+/// Commit the response to 200 unless the worker already rejected it, in
+/// which case its failure is handed back instead.
+fn commit_stream(commit: &Mutex<StreamCommit>) -> Result<(), RequestFailure> {
+    let mut state = commit.lock().unwrap_or_else(|error| error.into_inner());
+    match std::mem::replace(&mut *state, StreamCommit::Committed) {
+        StreamCommit::Rejected(failure) => Err(failure),
+        StreamCommit::Pending | StreamCommit::Committed => Ok(()),
+    }
+}
+
+/// Worker end of one OpenAI SSE response.
+struct SseSink {
+    tx: tokio::sync::mpsc::Sender<ResponseChunk>,
+    commit: Arc<Mutex<StreamCommit>>,
+    /// Worker-side copy of "committed", so each token skips the lock.
+    committed: Cell<bool>,
+    /// The acknowledged terminal (`[DONE]`) frame was handed to the body.
+    terminal_sent: Cell<bool>,
+    id: String,
     created: u64,
-    model: &str,
-    event: &serde_json::Value,
-) -> Result<(), hipfire_client::ClientError> {
-    if let Some(delta) = openai_stream_delta_for_event(event) {
+    model: String,
+    include_usage: bool,
+}
+
+impl SseSink {
+    /// Send one frame, committing the response first if this is the first.
+    /// A dropped receiver maps to `Cancelled`.
+    fn send(&self, chunk: ResponseChunk) -> Result<(), hipfire_client::ClientError> {
+        if !self.committed.get() {
+            // Only this worker ever rejects, and only after its last send, so
+            // committing cannot fail here.
+            let _ = commit_stream(&self.commit);
+            self.committed.set(true);
+        }
+        self.tx
+            .blocking_send(chunk)
+            .map_err(|_| hipfire_client::ClientError::Cancelled)
+    }
+
+    /// Forward one logical generate event. Delta-bearing events serialize to
+    /// plain (no-ack) SSE bytes. No-delta mid-stream events are silent —
+    /// terminal ack handles pure-tool delivery.
+    fn forward_event(&self, event: &serde_json::Value) -> Result<(), hipfire_client::ClientError> {
+        let Some(delta) = openai_stream_delta_for_event(event) else {
+            return Ok(());
+        };
         let chunk = serde_json::json!({
-            "id": id,
+            "id": self.id,
             "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
+            "created": self.created,
+            "model": self.model,
             "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
         });
-        sender
-            .blocking_send(ResponseChunk::plain(sse_data(&chunk)))
-            .map_err(|_| hipfire_client::ClientError::Cancelled)
-    } else {
-        let _ = sender;
-        Ok(())
+        self.send(ResponseChunk::plain(sse_data(&chunk)))
     }
-}
 
-/// Serialize terminal tool_calls (if safe), finish, optional usage, and `[DONE]`
-/// into one non-empty acknowledged chunk. Waits for ChannelBody progress ack.
-pub(crate) fn deliver_sse_terminal_ack(
-    sender: &tokio::sync::mpsc::Sender<ResponseChunk>,
-    completion: &Completion,
-    include_usage: bool,
-) -> Result<(), hipfire_client::ClientError> {
-    let mut bytes = Vec::new();
-    for chunk in openai_stream_terminal_chunks(completion, include_usage) {
-        bytes.extend_from_slice(&sse_data(&chunk));
-    }
-    bytes.extend_from_slice(b"data: [DONE]\n\n");
-    if bytes.is_empty() {
-        return Err(hipfire_client::ClientError::Protocol(
-            "stream terminal payload must be non-empty".into(),
-        ));
-    }
-    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-    sender
-        .blocking_send(ResponseChunk {
-            bytes,
-            ack: Some(ack_tx),
-            fail: false,
-        })
-        .map_err(|_| hipfire_client::ClientError::Cancelled)?;
-    match ack_rx.recv() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-    }
-}
-
-/// Close an OpenAI SSE body after `complete_request_cancellable`.
-/// Success: terminal already delivered+acked at commit_ready — emit no post-commit bytes.
-/// Cancelled: no server_error/`[DONE]`. Post-terminal engine errors force an unclean
-/// reader failure rather than appending a success/error frame.
-pub(crate) fn finish_sse_stream(
-    sender: tokio::sync::mpsc::Sender<ResponseChunk>,
-    result: Result<Completion>,
-) {
-    match result {
-        Ok(_completion) => {
-            drop(sender);
+    /// Serialize terminal tool_calls (if safe), finish, optional usage, and
+    /// `[DONE]` into one acknowledged chunk; wait until the socket flushed it.
+    fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
+        let mut bytes = Vec::new();
+        for chunk in openai_stream_terminal_chunks(completion, self.include_usage) {
+            bytes.extend_from_slice(&sse_data(&chunk));
         }
-        Err(error) => {
-            let cancelled = error
-                .downcast_ref::<hipfire_client::ClientError>()
-                .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-            if cancelled {
-                drop(sender);
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        self.terminal_sent.set(true);
+        self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
+        match ack_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+        }
+    }
+
+    /// Close the body after `complete_request_cancellable`.
+    /// - Success or cancel: nothing more to send.
+    /// - Failure before the first frame: hand it to the handler, which answers
+    ///   with its status instead of a 200.
+    /// - Failure after commit: an SSE error event, then `[DONE]`.
+    /// - Failure after the acknowledged `[DONE]` (e.g. the daemon commit):
+    ///   nothing may follow it, so the body fails and the reader sees it torn.
+    fn finish(self, result: Result<Completion>, metrics: &Metrics) {
+        let Err(error) = result else {
+            return;
+        };
+        let cancelled = error
+            .downcast_ref::<hipfire_client::ClientError>()
+            .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
+        if cancelled {
+            return;
+        }
+        eprintln!(
+            "[hipfire] {}: streaming completion failed: {error:#}",
+            self.id
+        );
+        if self.terminal_sent.get() {
+            metrics.record_failure();
+            let _ = self.tx.try_send(ResponseChunk::fail());
+            return;
+        }
+        let failure = RequestFailure::from_error(&error);
+        if !self.committed.get() {
+            let mut state = self.commit.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*state, StreamCommit::Pending) {
+                *state = StreamCommit::Rejected(failure);
                 return;
             }
-            eprintln!("[hipfire] streaming completion failed: {error:#}");
-            let _ = sender.try_send(ResponseChunk::fail());
-            drop(sender);
+            // The handler committed on its deadline while the worker was silent.
         }
+        metrics.record_failure();
+        let _ = self
+            .tx
+            .blocking_send(ResponseChunk::last(failure.sse_event(), None));
     }
 }
 
@@ -1428,16 +1736,18 @@ mod tests {
         let acks = FlushAcks::new();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        tx.try_send(ResponseChunk {
-            bytes: b"data: hi\n\n".to_vec(),
-            ack: Some(ack_tx),
-            fail: false,
-        })
-        .expect("send chunk");
+        tx.try_send(ResponseChunk::last(b"data: hi\n\n".to_vec(), Some(ack_tx)))
+            .expect("send chunk");
         drop(tx);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut body = ChannelBody::new(rx, acks.clone(), Arc::clone(&cancelled));
+        let mut body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            acks.clone(),
+            Arc::clone(&cancelled),
+            Duration::from_secs(60),
+        );
         let mut cx = noop_cx();
         match Pin::new(&mut body).poll_frame(&mut cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -1466,12 +1776,60 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         assert!(!cancelled.load(Ordering::SeqCst), "flag must start false");
-        let body = ChannelBody::new(rx, acks, Arc::clone(&cancelled));
+        let body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            acks,
+            Arc::clone(&cancelled),
+            Duration::from_secs(60),
+        );
         drop(body);
         assert!(
             cancelled.load(Ordering::SeqCst),
             "dropping ChannelBody must set cancelled"
         );
+    }
+
+    /// A silent stream gets `: keepalive` comments; after the `[DONE]` frame
+    /// nothing more is written, however long the body stays open.
+    #[tokio::test]
+    async fn channel_body_keepalive_stops_at_the_last_frame() {
+        async fn next(body: &mut ChannelBody) -> Option<Result<Frame<Bytes>, io::Error>> {
+            poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
+        }
+        fn data(frame: Option<Result<Frame<Bytes>, io::Error>>) -> Bytes {
+            frame
+                .expect("frame")
+                .expect("data frame")
+                .into_data()
+                .expect("data")
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            FlushAcks::new(),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(30),
+        );
+
+        assert_eq!(data(next(&mut body).await), SSE_KEEPALIVE);
+        tx.send(ResponseChunk::plain(b"data: x\n\n".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(data(next(&mut body).await), &b"data: x\n\n"[..]);
+        tx.send(ResponseChunk::last(b"data: [DONE]\n\n".to_vec(), None))
+            .await
+            .unwrap();
+        assert_eq!(data(next(&mut body).await), &b"data: [DONE]\n\n"[..]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), next(&mut body))
+                .await
+                .is_err(),
+            "no frame may follow [DONE]"
+        );
+        drop(tx);
+        assert!(next(&mut body).await.is_none());
     }
 
     #[tokio::test]
@@ -1574,5 +1932,69 @@ mod tests {
         assert!(edits_form_to_body(vec![], vec![])
             .unwrap_err()
             .contains("required"));
+    }
+
+    fn typed_daemon_error(class: &str, message: &str) -> anyhow::Error {
+        anyhow::Error::new(hipfire_client::ClientError::Daemon(
+            hipfire_client::TypedDaemonError {
+                message: message.to_owned(),
+                class: class.to_owned(),
+                retryable: false,
+                rolled_back: false,
+                attempt_id: 1,
+                id: None,
+            },
+        ))
+    }
+
+    /// A typed daemon error gets its status from `class`, whatever its text
+    /// says; only classless gateway errors are matched by message.
+    #[test]
+    fn request_error_status_maps_daemon_class_before_message() {
+        for (class, status) in [
+            ("validation", 400),
+            ("context_length", 400),
+            ("unsupported", 400),
+            ("transient", 503),
+            ("internal", 500),
+            ("gpu", 500),
+            ("malformed", 500),
+        ] {
+            assert_eq!(
+                request_error_status(&typed_daemon_error(class, "boom")),
+                status,
+                "class {class}"
+            );
+        }
+        // Text that the gateway fallback reads as a client error does not
+        // override a server-fault class, and vice versa.
+        assert_eq!(
+            request_error_status(&typed_daemon_error("internal", "invalid state: required")),
+            500
+        );
+        assert_eq!(
+            request_error_status(&typed_daemon_error("validation", "seed must be an integer")),
+            400
+        );
+        // Context layers added on the way up keep the daemon's class.
+        assert_eq!(
+            request_error_status(
+                &typed_daemon_error("transient", "prefill glitch")
+                    .context("retry aborted: admission re-acquire failed")
+            ),
+            503
+        );
+        // Classless gateway errors keep the message fallback.
+        assert_eq!(
+            request_error_status(&anyhow!("max_tokens must be between 1 and 393216")),
+            400
+        );
+        assert_eq!(request_error_status(&anyhow!("model not found: x")), 404);
+        assert_eq!(
+            request_error_status(&anyhow::Error::new(hipfire_client::ClientError::Protocol(
+                "failed to serialize request".into()
+            ))),
+            500
+        );
     }
 }

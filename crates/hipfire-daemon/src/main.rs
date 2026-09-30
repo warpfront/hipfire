@@ -82,6 +82,7 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod request_guards;
 mod slots;
 
 #[cfg(test)]
@@ -1224,7 +1225,11 @@ fn main() {
         }
     });
     let mut inbox = DaemonInbox::new(msg_rx);
-    while let Ok(daemon_msg) = inbox.recv() {
+    loop {
+        request_guards::exit_if_gpu_poisoned(&mut stdout);
+        let Ok(daemon_msg) = inbox.recv() else {
+            break;
+        };
         let (msg, admission_from_message, mut singleton_transfer_from_message) = match daemon_msg {
             DaemonMsg::Regular(m) => (m, None, None),
             DaemonMsg::RegularWithAdmission(m, admission) => (m, Some(admission), None),
@@ -1773,6 +1778,7 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -2287,6 +2293,7 @@ fn main() {
                         draft_path.as_deref(),
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
+                        mtp_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_k_override.as_deref(),
                         kv_v_override.as_deref(),
@@ -3054,24 +3061,11 @@ fn main() {
                         },
                         None => None,
                     };
-                // hunt3 M-F: parse user stop sequences (top-level `stop` field on
-                // the generate message; the CLI forwards OpenAI `stop` here, already
-                // normalized to string[], <=4 entries, <=64 chars each). The decode
-                // loops match these against the decoded output suffix and finish
-                // with finish_reason="stop" on a hit. Re-apply the cap defensively
-                // in case a non-hipfire client drives the daemon directly.
-                let stop_seqs: Vec<String> = msg
-                    .get("stop")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str())
-                            .filter(|s| !s.is_empty())
-                            .take(4)
-                            .map(|s| s.chars().take(64).collect::<String>())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // OpenAI `stop` (string or array form); an invalid value is rejected.
+                let Some(stop_seqs) = hipfire_generate::ar::stop_or_reject(&mut stdout, id, &msg)
+                else {
+                    continue;
+                };
 
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
@@ -3110,6 +3104,7 @@ fn main() {
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
+                let _fit = request_guards::fit_max_tokens(&msg);
                 let top_p = msg
                     .get("top_p")
                     .and_then(|v| v.as_f64())
@@ -3305,6 +3300,10 @@ fn main() {
                 // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
                 let has_vl = m.has_vision_encoder();
+                let tp = m.ep.is_some();
+                if request_guards::refuse_ep_request(&mut stdout, id, &msg, tp, has_image) {
+                    continue;
+                }
 
                 if has_image {
                     let _ =

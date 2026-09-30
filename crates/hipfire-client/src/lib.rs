@@ -417,6 +417,9 @@ struct EngineInner {
     last_state_epoch: Mutex<Option<u64>>,
     active_attempt_id: Mutex<Option<u64>>,
     last_retry_reset_eligible: Mutex<Option<bool>>,
+    /// Set by the reader thread when the daemon's stdout reaches EOF: the
+    /// daemon exited (or can no longer answer) even if it is not reaped yet.
+    stdout_closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -447,6 +450,8 @@ impl Engine {
         let control: Arc<Mutex<Option<mpsc::Sender<Value>>>> = Arc::new(Mutex::new(None));
         let pending_clone = Arc::clone(&pending);
         let control_clone = Arc::clone(&control);
+        let stdout_closed = Arc::new(AtomicBool::new(false));
+        let stdout_closed_reader = Arc::clone(&stdout_closed);
         let handle = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -514,6 +519,7 @@ impl Engine {
                 let mut map = pending_clone.lock().unwrap();
                 map.clear();
             }
+            stdout_closed_reader.store(true, Ordering::Release);
             *control_clone.lock().unwrap() = None;
         });
         let inner = EngineInner {
@@ -527,6 +533,7 @@ impl Engine {
             last_state_epoch: Mutex::new(None),
             active_attempt_id: Mutex::new(None),
             last_retry_reset_eligible: Mutex::new(None),
+            stdout_closed,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -1176,6 +1183,24 @@ impl Engine {
     pub fn child_id(&self) -> u32 {
         self.inner.child.lock().unwrap().id()
     }
+
+    /// True once the daemon can no longer answer: its stdout reached EOF or
+    /// the process has exited.
+    pub fn exited(&self) -> bool {
+        self.inner.stdout_closed.load(Ordering::Acquire)
+            || matches!(self.inner.child.lock().unwrap().try_wait(), Ok(Some(_)))
+    }
+
+    /// Kill the daemon if it still runs and reap it, so its GPU memory is
+    /// released before a replacement starts. Returns the exit status.
+    pub fn terminate(&self) -> String {
+        let mut child = self.inner.child.lock().unwrap();
+        let _ = child.kill();
+        child
+            .wait()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|error| format!("unknown ({error})"))
+    }
 }
 
 impl Drop for EngineInner {
@@ -1768,6 +1793,7 @@ mod tests {
             last_state_epoch: std::sync::Mutex::new(None),
             active_attempt_id: std::sync::Mutex::new(None),
             last_retry_reset_eligible: std::sync::Mutex::new(None),
+            stdout_closed: std::sync::Arc::new(AtomicBool::new(false)),
         };
         Engine {
             inner: std::sync::Arc::new(inner),
