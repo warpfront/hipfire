@@ -1029,7 +1029,7 @@ mod ora {
         assert!(!dn.s_ef_residual.is_empty(), "fresh DN has no EF — not Q8+EF");
         let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq)
             .unwrap_or_else(|e| panic!("scratch kv_seq={kv_seq}: {e:?}"));
-        let admitted = qwen35::ordinary_prefill_chunk_limit(&*gpu, &m.weights, &m.config, &dn, None);
+        let admitted = qwen35::ordinary_prefill_chunk_limit(&*gpu, &m.weights, &m.config, &dn, &kv, None);
         match &admitted {
             Ok(a) => eprintln!("  run L={l} resume_p={resume_p}: requested={ceiling} admitted={a}"),
             Err(e) => eprintln!("  run L={l} resume_p={resume_p}: requested={ceiling} admission-query failed: {e:?}"),

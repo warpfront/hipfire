@@ -252,7 +252,15 @@ required-features = []
 
 [[example]]
 name = "tmp_gemm_v2_oracle"
-required-features = []
+required-features = ["lab"]
+
+[[example]]
+name = "kx3_foldfree_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_fa2_fp8_screen"
+required-features = ["lab"]
 
 [[example]]
 name = "imatrix_collect"
