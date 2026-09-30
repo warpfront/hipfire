@@ -1304,6 +1304,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
     }
 
+    /// No exact target+MTP suffix rehydration yet: `mtp_prefill` always
+    /// rebuilds from position zero, so a prompt-cache hit must not be planned.
+    fn mtp_supports_prompt_cache(&self) -> bool {
+        false
+    }
+
     fn k(&self) -> usize {
         self.max_k
     }

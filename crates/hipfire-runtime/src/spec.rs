@@ -858,6 +858,13 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// Whether a prompt-cache hit may resume this drafter from the cached
+    /// prefix (suffix-only prefill). `false` makes every turn a cold
+    /// full-prompt prefill.
+    fn supports_prompt_cache(&self) -> bool {
+        true
+    }
+
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
     /// so a drafter that forgets to free is a missing-trait-method compile
     /// error rather than a silent VRAM leak.
@@ -1094,6 +1101,11 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
+    /// See [`Speculator::supports_prompt_cache`].
+    fn mtp_supports_prompt_cache(&self) -> bool {
+        true
+    }
+
     /// Restore the MTP target's recurrent state to an advertised checkpoint
     /// and discard checkpoints from the now-stale future.
     fn mtp_rewind_to(
@@ -1313,6 +1325,10 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.arch.mtp_checkpoint_positions()
+    }
+
+    fn supports_prompt_cache(&self) -> bool {
+        self.arch.mtp_supports_prompt_cache()
     }
 
     fn rewind_to(

@@ -2389,13 +2389,6 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
 /// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
 /// avoid a 1-token DeltaNet over-advance. Caller must be in the
 /// `messages_history.is_some()` case.
-/// Native Qwen4 MTP has no validated exact-prefix rehydrate path yet. Keep
-/// those requests on a cold full-prefix replay, including transitions from an
-/// AR turn whose host conversation cache still looks like a strict extension.
-pub fn spec_cache_disabled_for(spec_name: &str, env_disabled: bool) -> bool {
-    env_disabled || spec_name == "mtp"
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prompt_cache(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
@@ -2921,13 +2914,16 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = spec_cache_disabled_for(
-        spec_name,
-        hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-            .ok()
-            .as_deref()
-            == Some("0"),
-    );
+    // Drafters without suffix rehydration (native Qwen4 MTP) replay the full
+    // prompt every turn.
+    let cache_disabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0")
+        || m.speculator
+            .as_ref()
+            .is_some_and(|s| !s.supports_prompt_cache());
+    // DFlash divergent-render resume (default ON; opt out with
     // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
     // resident KV prefix). When on, the recurrent state is checkpointed during
     // the prompt seed and a divergent render resumes from the latest checkpoint

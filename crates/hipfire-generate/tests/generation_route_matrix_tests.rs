@@ -441,29 +441,6 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
     }
 }
 #[test]
-fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(
-        "mtp", false
-    ));
-    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
-        "dflash", false
-    ));
-
-    let plan = hipfire_generate::qwen::plan_from_rendered(
-        &[10, 11],
-        vec![10, 11, 12],
-        false,
-        &[],
-        false,
-        "mtp",
-    );
-    assert!(!plan.cache_hit);
-    assert_eq!(plan.start_pos, 0);
-    assert_eq!(plan.cached_tokens, 0);
-    assert_eq!(plan.new_tokens, vec![10, 11, 12]);
-}
-
-#[test]
 fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
