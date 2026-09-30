@@ -18,7 +18,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
@@ -346,6 +346,35 @@ impl HfqFile {
             .ok()
             .map(std::path::PathBuf::from);
         Self::open_with_reap_plan(path, reap_plan.as_deref())
+    }
+
+    /// Header-only sibling of [`Self::open`]: read the 32-byte container
+    /// header and return its `arch_id` — no mmap, no metadata JSON parse, no
+    /// tensor index.
+    ///
+    /// [`Self::open`] is the load path: it walks the metadata and
+    /// materialises every tensor entry, which is far too much work for a
+    /// discovery scan. Serve's `/v1/models` uses this to classify an on-disk
+    /// file the registry does not vouch for — a trunk versus a sidecar
+    /// artifact (the DFlash drafts and friends carry arch ids 20/21/22/23;
+    /// see `docs/architecture-ids.md` § Sidecar / reserved ids). `Err` for
+    /// anything that is not a container, or is shorter than one, so a caller
+    /// can read "cannot tell" as "not a trunk".
+    ///
+    /// The layout is the one [`Self::open_at_offset`] parses: `HFQM` magic,
+    /// `u32` version, `u32` arch id, `u32` tensor count, then the metadata and
+    /// data offsets — little-endian, relative to the container start.
+    pub fn probe_arch_id(path: &Path) -> std::io::Result<u32> {
+        let mut file = File::open(path)?;
+        let mut header = [0u8; 32];
+        file.read_exact(&mut header)?;
+        if &header[..4] != b"HFQM" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HfqFile: not an HFQ container: {}", path.display()),
+            ));
+        }
+        Ok(u32::from_le_bytes(header[8..12].try_into().unwrap()))
     }
 
     /// `open` with the REAP plan injected instead of taken from process config.
@@ -2654,6 +2683,42 @@ pub(crate) mod hfq_test_fixture {
             f.write_all(data).unwrap();
         }
         f.flush().unwrap();
+    }
+}
+
+// ─── Header-only arch-id probe ─────────────────────────────────────────────
+
+/// `HfqFile::probe_arch_id` backs serve's `/v1/models` discovery filter, which
+/// classifies files the registry does not vouch for by their container arch id.
+#[cfg(test)]
+mod probe_tests {
+    use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
+
+    #[test]
+    fn probe_reads_the_arch_id_of_a_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let trunk = dir.path().join("trunk.hfq");
+        write_min_hfq(&trunk, 5, &[("A", 3, &[2, 4], &[1u8; 8])]);
+        assert_eq!(HfqFile::probe_arch_id(&trunk).unwrap(), 5);
+
+        // The sidecar class the discovery filter exists for: a DFlash draft.
+        let draft = dir.path().join("draft.hfq");
+        write_min_hfq(&draft, 20, &[("A", 3, &[2, 4], &[1u8; 8])]);
+        assert_eq!(HfqFile::probe_arch_id(&draft).unwrap(), 20);
+    }
+
+    #[test]
+    fn probe_fails_closed_on_a_non_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_hfq = dir.path().join("README.md");
+        std::fs::write(&not_hfq, b"# not a model\n").unwrap();
+        assert!(HfqFile::probe_arch_id(&not_hfq).is_err());
+        // Shorter than the 32-byte header: `Err`, not a panic.
+        let truncated = dir.path().join("truncated.hfq");
+        std::fs::write(&truncated, b"HFQM\x01\x00\x00\x00").unwrap();
+        assert!(HfqFile::probe_arch_id(&truncated).is_err());
+        assert!(HfqFile::probe_arch_id(&dir.path().join("absent.hfq")).is_err());
     }
 }
 

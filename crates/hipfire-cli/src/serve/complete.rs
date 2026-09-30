@@ -1663,15 +1663,9 @@ pub(crate) fn complete_request_attempt(
                 if force_reset {
                     // Rollback could not be attested: model state is unknown, so
                     // the next request must full-reload rather than trust it.
-                    runtime.current_path = None;
-                    runtime.current_arch = None;
-                    runtime.current_reasoning_contract =
-                        saddle_core::caps::ReasoningContract::Unsupported;
-                    runtime.current_reasoning_effort_native = false;
-                    runtime.current_reasoning_efforts = Vec::new();
-                    runtime.continuous_batch_capable = false;
-                    runtime.current_max_seq = 0;
-                    runtime.cache_capable = false;
+                    // Same reset as the failed-switch path — one place owns
+                    // "nothing is resident".
+                    runtime.clear_resident(&shared.meta);
                 }
                 return Err(error.into());
             }
@@ -3016,13 +3010,8 @@ mod tests {
         ServeMeta {
             current_model: Some("model.hfq".to_owned()),
             loading_model: Some("model.hfq".to_owned()),
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
+            ..ServeMeta::new("test".to_owned())
         }
     }
 
