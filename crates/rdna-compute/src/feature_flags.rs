@@ -125,6 +125,8 @@ pub struct FeatureFlags {
     /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
     pub rdna3_hfq4_moe_gate_up_k2048: bool,
     pub mmq_override: Option<bool>,
+    /// Experimental PR #616 packed prefill for uniform MQ4 and MQ4V2.
+    pub packed_mq4_prefill: bool,
     pub mmq_min_batch: Option<usize>,
     pub fp16_disabled: bool,
     pub fp16_layer_min: Option<usize>,
@@ -667,6 +669,7 @@ impl FeatureFlags {
                 Some("1") | Some("on") => Some(true),
                 _ => None,
             },
+            packed_mq4_prefill: value("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL").as_deref() == Ok("1"),
             mmq_min_batch: parse_usize("HIPFIRE_MMQ_MIN_BATCH"),
             fp16_disabled: value("HIPFIRE_FP16").map_or(false, |v| v == "0"),
             fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
@@ -1086,6 +1089,7 @@ impl FeatureFlags {
             rdna3_hfq4_lm_head_k2048: false,
             rdna3_hfq4_moe_gate_up_k2048: false,
             mmq_override: None,
+            packed_mq4_prefill: false,
             mmq_min_batch: None,
             fp16_disabled: false,
             fp16_layer_min: None,

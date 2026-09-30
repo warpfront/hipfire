@@ -384,6 +384,11 @@ pub enum KernelKey {
     GemmHfq3G256Residual,
     GemmHfp4G32Residual,
     GemmMq3G256LloydResidual,
+    // Explicit experimental packed entries only; never selected by resolve().
+    GemmMq4Packed,
+    GemmMq4PackedResidual,
+    GemmMq4V2Packed,
+    GemmMq4V2PackedResidual,
     // GEMM — spec-decode (DFlash) batched lm_head catalog (#397 Ship 5.3).
     // These take the canonical signature `(a, x, y, m, k, batch_size)` and
     // dispatch the batched verify/draft lm_head GEMM. Each `gpu.gemm_*` method

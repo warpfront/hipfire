@@ -43,6 +43,10 @@ redline-rocr = { path = "../redline-rocr" }
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
 [[example]]
+name = "bench_packed_mq4_shapes"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_argmax_vs_download_gfx1201"
 required-features = ["lab"]
 

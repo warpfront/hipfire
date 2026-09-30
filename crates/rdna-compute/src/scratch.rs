@@ -1742,6 +1742,14 @@ impl ScratchState {
         Ok(yp)
     }
 
+    /// Reserve the existing 144-byte DS4 slot without issuing a quantizer.
+    /// Caller must invalidate graphs before growth and overwrite every block.
+    pub(crate) fn reserve_packed_mq4(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<*mut c_void> {
+        let needed = q8_1_mmq_x_needed(k, n);
+        grow_scratch_buffer(hip, &mut self.q8_1_mmq_x_scratch, &mut self.q8_1_mmq_x_scratch_bytes, needed)?;
+        Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
     pub fn reserve_int8_mmq(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<Int8MmqReservation> {
         if k == 0 || n == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(0, "reserve_int8_mmq: need k%256==0 and n>0"));

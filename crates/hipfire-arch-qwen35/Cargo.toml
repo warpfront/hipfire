@@ -12,6 +12,7 @@ default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
 moe-oracle = ["dep:sha2"]
+lab = []
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
@@ -25,6 +26,10 @@ saddle-core = { path = "../saddle-core" }
 sha2 = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+[[example]]
+name = "mq4_prefill_state_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"

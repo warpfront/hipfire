@@ -26,6 +26,24 @@ somewhere in this file).
 
 ## Manual — precedence
 
+Experimental local MQ4 prefill campaign: `HIPFIRE_GFX1100_MQ4_WIDE_PREFILL=1`
+admits the existing 27B dense shape with uniform MQ4 projections to staged
+ordinary prefill widths on gfx1100, using native MMQ and full PBS. Default off.
+It preserves 512-row Q8/EF recurrent commits and rejects unaudited dispatch
+overrides. It can compose with `HIPFIRE_GFX1100_PACKED_MQ4_PREFILL=1`:
+full FFN tiles then use packed kernels sharing the budgeted MMQ scratch slot;
+complete 512-row chunks are coalesced while irregular tails retain their
+legacy grouping and native fallback. This keeps each row's quantization
+route unchanged when widening packed prefill. Packed MQ4V2 also requires
+full rather than lean PBS and its extra activation scratch is budgeted.
+The combination is experimental too.
+Packed activations retain native MMQ's per-32-element Q8 scale and matching
+per-32 dot/zero correction; the legacy `group128` kernel symbol is not the
+current precision contract. The earlier G128 experiment is historical only.
+`HIPFIRE_PREFILL_CHUNK_ROWS` chooses the requested 512/1024/2048/4096/8192 rung;
+memory admission may reduce it. This does not widen verify/TP/MoE paths or
+enable V2-only producer/lean-scratch optimizations for MQ4.
+
 1. **Built-in typed defaults** in `hipfire-config` / `RuntimeConfig`.
 2. **Registry card** `recommended_settings` from `registry/v1.json`.
 3. **Global** `~/.hipfire/config.toml`.

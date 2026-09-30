@@ -16,6 +16,30 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// Exact wire format and epilogue for the opt-in packed dispatcher entries.
+fn packed_gemm_contract(key: KernelKey) -> Option<(DType, bool)> {
+    use KernelKey::*;
+    match key {
+        GemmMq4Packed => Some((DType::MQ4G256, false)),
+        GemmMq4PackedResidual => Some((DType::MQ4G256, true)),
+        GemmMq4V2Packed => Some((DType::MQ4G256V2, false)),
+        GemmMq4V2PackedResidual => Some((DType::MQ4G256V2, true)),
+        _ => None,
+    }
+}
+
+fn validate_packed_gemm_dtype(key: KernelKey, dtype: DType) -> Result<(), DispatchError> {
+    if let Some((expected, _)) = packed_gemm_contract(key) {
+        if dtype != expected {
+            return Err(DispatchError::Hip(format!(
+                "packed GEMM key {:?} requires {:?}, got {:?}",
+                key, expected, dtype
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn is_gemm_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,
@@ -194,6 +218,10 @@ impl GemmFamily {
     /// site that called the dispatcher entry point directly. Use this method for
     /// those; use [`run`] only where the dtype-keyed heuristic matches the
     /// site's prior behavior.
+    ///
+    /// Explicit packed MQ4 entries retain their GPU entry's narrow experimental
+    /// admission checks (opt-in, exact arch/shape, outside capture). Registry
+    /// membership alone does not imply that a packed call is admitted.
     pub fn run_key(
         &self,
         key: KernelKey,
@@ -212,6 +240,19 @@ impl GemmFamily {
         let batch_size = params.batch_size;
         let m = w.m;
         let k = w.k;
+
+        // Preserve the former direct-call sequence: packed consumes already
+        // rotated F32, and must not acquire the generic calibration tap below.
+        // Registry resolution above is mandatory; the original GPU entry owns
+        // opt-in / arch / shape / capture admission and the pack+GEMM sequence.
+        if let Some((dtype, add)) = packed_gemm_contract(key) {
+            validate_packed_gemm_dtype(key, w.dtype)?;
+            return if dtype == DType::MQ4G256V2 {
+                hip!(gpu.gemm_mq4v2_packed(w.buf, x, y, m, k, batch_size, add))
+            } else {
+                hip!(gpu.gemm_mq4_packed(w.buf, x, y, m, k, batch_size, add))
+            };
+        }
 
         // Calibration tap. This is the batched chokepoint for every arch that
         // migrated off `llama::weight_gemm` onto dispatcher-entry keys —
@@ -577,6 +618,52 @@ mod tests {
     use crate::context::DispatchCtx;
     use crate::types::{DispatchError, KernelKey};
     use rdna_compute::DType;
+
+    #[test]
+    fn packed_gemm_registry_preserves_wire_format_and_epilogue() {
+        use super::{packed_gemm_contract, validate_packed_gemm_dtype};
+        let family = GemmFamily::new();
+        let ctx = DispatchCtx::for_test("gfx1100");
+        for (key, dtype, add) in [
+            (KernelKey::GemmMq4Packed, DType::MQ4G256, false),
+            (KernelKey::GemmMq4PackedResidual, DType::MQ4G256, true),
+            (KernelKey::GemmMq4V2Packed, DType::MQ4G256V2, false),
+            (KernelKey::GemmMq4V2PackedResidual, DType::MQ4G256V2, true),
+        ] {
+            let resolved = family.registry().resolve(key, &ctx, None).unwrap();
+            assert_eq!(resolved.key, key);
+            assert_eq!(packed_gemm_contract(resolved.key), Some((dtype, add)));
+            assert!(validate_packed_gemm_dtype(key, dtype).is_ok());
+            for other in [
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2Lloyd,
+                DType::HFQ4G256,
+                DType::MQ4CG256,
+            ] {
+                assert_eq!(
+                    validate_packed_gemm_dtype(key, other).is_ok(),
+                    other == dtype
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_gemm_never_changes_default_resolution() {
+        use super::packed_gemm_contract;
+        let family = GemmFamily::new();
+        for arch in [
+            "gfx906", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let ctx = DispatchCtx::for_test(arch);
+            for dtype in [DType::MQ4G256, DType::MQ4G256V2, DType::HFQ4G256] {
+                if let Ok(resolved) = family.resolve(dtype, &ctx, None) {
+                    assert_eq!(packed_gemm_contract(resolved.key), None);
+                }
+            }
+        }
+    }
 
     #[test]
     fn v2_plain_resolves_exact_not_hfq4() {
