@@ -305,6 +305,10 @@ pub fn is_batch_request_eligible(
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
+        dense_tp: matches!(
+            m.ep.as_ref().map(|e| &e.inner),
+            Some(hipfire_loader::EpArch::Qwen35DenseTp { .. })
+        ),
         pp: m.pp,
         has_speculator: has_spec,
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
@@ -2881,6 +2885,7 @@ pub fn is_qwen_ep_batch_request_eligible(
         // Topology already proven/staged above; ep:true would hit the global EP
         // short-circuit to Unknown for Qwen and make this QwenAr gate unreachable.
         ep: false,
+        dense_tp: false,
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),

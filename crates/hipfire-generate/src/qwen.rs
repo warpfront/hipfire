@@ -3714,7 +3714,7 @@ pub fn generate_spec(
     // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
     // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
     // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
-    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.model_path) {
+    let mut guard = match carrier.spec_target_guard(&mut m.state, &mut m.ep, &m.model_path) {
         Ok(g) => g,
         Err(e) => {
             crate::ar::emit_active_route_error(
