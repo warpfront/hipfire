@@ -199,6 +199,7 @@ fn wt_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             });
         }
         if data.len() % 2 != 0 {
@@ -222,6 +223,7 @@ fn wt_from_raw(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         });
     }
     let dtype = match qt {
@@ -250,6 +252,7 @@ fn wt_from_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -1031,6 +1034,7 @@ fn wt_from_source_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             });
         }
         if data.len() % 2 != 0 {
@@ -1054,6 +1058,7 @@ fn wt_from_source_raw(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         });
     }
     let dtype = match qt {
@@ -1082,6 +1087,7 @@ fn wt_from_source_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 

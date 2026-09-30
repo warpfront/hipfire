@@ -19,6 +19,14 @@ pub struct ModelFootprint {
     pub weights_bytes: u64,
     /// Charged per session, per token of granted context.
     pub kv_bytes_per_token: u64,
+    /// Pinned host weight bytes held for the model's lifetime (spilled layers).
+    ///
+    /// Charged against the HOST tier, not the VRAM budget: these are
+    /// `hipHostMalloc` allocations the model cannot release while it is loaded, so
+    /// they are exactly what `admit_host` must account for before granting a
+    /// swapped-out snapshot. `LoadStats::host_pinned_bytes` from the loader is the
+    /// measured source.
+    pub host_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +69,11 @@ impl AdmissionController {
             budget_bytes,
             admitted: Vec::new(),
             host_budget: crate::swap::DEFAULT_HOST_BUDGET_BYTES,
-            host_used: 0,
+            // The model's spilled weights are already committed `hipHostMalloc`
+            // bytes before any session exists, so the host tier starts with them
+            // charged: `admit_host` must refuse a snapshot that would not fit
+            // alongside them, which is exactly what the tier guards.
+            host_used: footprint.host_bytes,
         }
     }
 
@@ -152,6 +164,7 @@ mod tests {
         ModelFootprint {
             weights_bytes: 15 * GIB,
             kv_bytes_per_token: 34 * 1024,
+            host_bytes: 0,
         }
     }
 
@@ -160,6 +173,7 @@ mod tests {
         ModelFootprint {
             weights_bytes: 20 * GIB,
             kv_bytes_per_token: 10_854,
+            host_bytes: 0,
         }
     }
 
@@ -253,12 +267,41 @@ mod tests {
         );
     }
 
+    /// Pinned spill bytes are charged to the host tier from the start: a
+    /// `memory.gpu_layer_budget` load holds `hipHostMalloc` weights the model
+    /// cannot release, so `admit_host` must refuse a snapshot that will not fit
+    /// alongside them. Without this the tier hands out the same bytes twice.
+    #[test]
+    fn pinned_weights_are_charged_before_any_session() {
+        let mut a = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 0,
+                host_bytes: 700,
+            },
+            1 << 30,
+        );
+        a.set_host_budget(1000);
+        assert_eq!(
+            a.host_used_bytes(),
+            700,
+            "the model's pinned weights are charged up front"
+        );
+        assert!(
+            !a.admit_host(400),
+            "400 does not fit beside the 700 bytes already pinned"
+        );
+        assert!(a.admit_host(300));
+        assert_eq!(a.host_used_bytes(), 1000);
+    }
+
     #[test]
     fn the_host_tier_has_its_own_budget() {
         let mut a = AdmissionController::new(
             ModelFootprint {
                 weights_bytes: 0,
                 kv_bytes_per_token: 0,
+                host_bytes: 0,
             },
             1 << 30,
         );

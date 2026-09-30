@@ -1157,6 +1157,7 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         3 => {
@@ -1171,6 +1172,7 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         1 => {
@@ -1192,6 +1194,7 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         2 => {
@@ -1205,6 +1208,7 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
         other => panic!(

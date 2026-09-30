@@ -770,8 +770,8 @@ fn run() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|e| format!("GPU init: {e}"))?;
     let weights = {
         let mut source = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .map_err(|e| format!("load weights: {e}"))?;
     let scratch =

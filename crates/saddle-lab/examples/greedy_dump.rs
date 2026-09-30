@@ -47,11 +47,11 @@ fn main() {
         let weights = {
             let mut paro_source =
                 qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-            let paro_layout = qwen35::Layout::single(config.n_layers);
+            let mut paro_layout = qwen35::Layout::single(config.n_layers);
             qwen35::load_weights(
                 &mut paro_source,
                 std::slice::from_mut(&mut gpu),
-                &paro_layout,
+                &mut paro_layout,
             )
             .expect("load paro")
         };
@@ -61,8 +61,8 @@ fn main() {
         let config = qwen35::config_from_hfq(&hfq).expect("read config");
         let weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+            let mut layout = qwen35::Layout::single(config.n_layers);
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
                 .expect("load weights")
         };
         (config, weights, Some(hfq))

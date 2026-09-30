@@ -65,12 +65,9 @@ fn load_single(
     gpu: &mut Gpu,
 ) -> qwen35::Qwen35Weights {
     let mut source = HfqSource::new(hfq, config);
-    qwen35::load_weights(
-        &mut source,
-        std::slice::from_mut(gpu),
-        &Layout::single(config.n_layers),
-    )
-    .expect("load single weights")
+    let mut layout = Layout::single(config.n_layers);
+    qwen35::load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)
+        .expect("load single weights")
 }
 
 fn make_kv(gpu: &mut Gpu, config: &qwen35::Qwen35Config) -> KvCache {

@@ -292,12 +292,9 @@ fn load_single(path: &str) -> Option<Single> {
         return None;
     };
     let mut src = HfqSource::new(&mut hfq, &config);
-    let weights = qwen35::load_weights(
-        &mut src,
-        std::slice::from_mut(&mut gpu),
-        &Layout::single(config.n_layers),
-    )
-    .expect("single load_weights");
+    let mut layout = Layout::single(config.n_layers);
+    let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
+        .expect("single load_weights");
     let mask = kv_mask(&config);
     let kv = KvCache::new_gpu_fwht3_capped_filtered(
         &mut gpu,
@@ -452,9 +449,9 @@ fn qwen35_pp2_vs_single_oracle() {
             return;
         }
     };
-    let layout = Layout::from_gpus(&gpus, config.n_layers);
+    let mut layout = Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_src = HfqSource::new(&mut hfq, &config);
-    let weights_pp = qwen35::load_weights(&mut hfq_src, &mut gpus.devices, &layout)
+    let weights_pp = qwen35::load_weights(&mut hfq_src, &mut gpus.devices, &mut layout)
         .expect("pp load_weights_multi");
     let scratch_pp =
         Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, SCRATCH_WINDOW, KV_MAX)

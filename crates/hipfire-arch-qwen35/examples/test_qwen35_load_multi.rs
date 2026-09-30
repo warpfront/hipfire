@@ -13,8 +13,8 @@
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4
 
 use hipfire_arch_qwen35::qwen35;
-use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::multi_gpu::Gpus;
 use std::path::Path;
 
@@ -36,10 +36,10 @@ fn main() {
     );
 
     println!("\n── load_weights (multi-GPU) ────────────────────────────");
-    let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
+    let mut layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
-    let weights =
-        qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout).expect("load_weights");
+    let weights = qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &mut layout)
+        .expect("load_weights");
 
     println!("\n── verify per-tensor device placement ───────────────────");
     let attr0 = gpus.devices[0]

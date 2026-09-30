@@ -291,6 +291,7 @@ fn main() {
                     row_stride: 0,
                     paro: None,
                     awq_scale: if awq { Some(d_awq) } else { None },
+                    exec: rdna_compute::ExecTarget::Gpu,
                 };
                 // NOTE: anchor takes ownership of d_awq in the AWQ arm; the
                 // direct-producer oracle above already ran, so reuse the

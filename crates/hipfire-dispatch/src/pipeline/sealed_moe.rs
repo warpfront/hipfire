@@ -3615,6 +3615,7 @@ mod tests {
                         row_stride: expert.gate_up.row_stride,
                         rotation: None,
                         awq_scale: None,
+                        exec: rdna_compute::ExecTarget::Gpu,
                     },
                     crate::families::gemv::WeightRef {
                         buf: &expert.down.buf,
@@ -3624,6 +3625,7 @@ mod tests {
                         row_stride: expert.down.row_stride,
                         rotation: None,
                         awq_scale: None,
+                        exec: rdna_compute::ExecTarget::Gpu,
                     },
                 )
             })
@@ -4072,6 +4074,7 @@ mod tests {
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     }
 
@@ -4634,6 +4637,7 @@ mod tests {
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     }
 

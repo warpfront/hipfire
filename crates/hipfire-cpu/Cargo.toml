@@ -1,0 +1,13 @@
+[package]
+name = "hipfire-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU execution core for host-mapped (spilled) quantized weights"
+
+[dependencies]
+rayon.workspace = true
+
+[dev-dependencies]
+# Oracle for the f16 widening in `quant` (the canonical decoder uses this crate).
+half.workspace = true

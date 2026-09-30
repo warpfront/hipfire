@@ -422,6 +422,7 @@ fn gemv_auto(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| format!("gemv dispatch: {e}"))

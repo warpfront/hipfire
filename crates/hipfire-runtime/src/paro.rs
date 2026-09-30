@@ -221,6 +221,7 @@ pub fn load_paro_weight(
                 is_alias: false,
             }),
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         })
     })();
 
@@ -347,6 +348,7 @@ pub fn load_fp16_weight_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 

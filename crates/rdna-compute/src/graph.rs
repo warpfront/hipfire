@@ -134,10 +134,35 @@ pub struct GraphState {
 
     // Replay (DeltaNet tape, per-n_steps)
     pub replay: PerBGraphCache,
+
+    /// Set once, from the weights the loader produced: this model's step mix
+    /// includes at least one CPU-executed weight (`memory.offload_exec=cpu` over a
+    /// spilled layer).
+    ///
+    /// A CPU-executed step is a host sync point — a D2H, the multiplication, an
+    /// H2D — so it can neither be *recorded* into a hipGraph nor replayed out of
+    /// one. Rather than trust every capture path to remember that, the four capture
+    /// entries below refuse while this is set: the model takes the non-captured
+    /// path for its whole lifetime, which is what the callers assume. `false` on
+    /// every model that spills nothing, so a resident load is unchanged.
+    pub cpu_exec_weights: bool,
 }
 
 impl GraphState {
     // ── hipGraph capture/replay (AR forward) ──────────────────────────────
+
+    /// Refuse a capture that this model's step mix cannot support. See
+    /// [`Self::cpu_exec_weights`].
+    pub(crate) fn reject_cpu_exec_capture(&self) -> HipResult<()> {
+        if self.cpu_exec_weights {
+            return Err(HipError::new(
+                0,
+                "memory.offload_exec=cpu: a CPU-executed step is a host sync point, so no \
+                 hipGraph capture is possible for this model's lifetime",
+            ));
+        }
+        Ok(())
+    }
 
     /// Begin capturing all kernel launches on the active stream into a graph.
     /// While capturing, dispatch methods that support it will use the blob
@@ -148,6 +173,7 @@ impl GraphState {
         device_id: i32,
         stream: &Stream,
     ) -> HipResult<()> {
+        self.reject_cpu_exec_capture()?;
         bind_thread(hip, device_id)?;
         self.capture_blobs.clear();
         self.capture_mode = true;
@@ -164,6 +190,7 @@ impl GraphState {
         device_id: i32,
         stream: &Stream,
     ) -> HipResult<()> {
+        self.reject_cpu_exec_capture()?;
         bind_thread(hip, device_id)?;
         self.capture_blobs.clear();
         self.capture_mode = true;
@@ -369,6 +396,7 @@ impl GraphState {
         stream: &Stream,
         b: usize,
     ) -> HipResult<()> {
+        self.reject_cpu_exec_capture()?;
         bind_thread(hip, device_id)?;
         debug_assert!(
             self.verify.capturing.is_none(),
@@ -483,6 +511,7 @@ impl GraphState {
         stream: &Stream,
         n_steps: usize,
     ) -> HipResult<()> {
+        self.reject_cpu_exec_capture()?;
         bind_thread(hip, device_id)?;
         debug_assert!(
             self.replay.capturing.is_none(),

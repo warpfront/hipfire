@@ -106,11 +106,11 @@ fn main() {
         );
         eprintln!("  loading via safetensors (ParoQuant path)");
         let mut paro_source = qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-        let paro_layout = qwen35::Layout::single(config.n_layers);
+        let mut paro_layout = qwen35::Layout::single(config.n_layers);
         let weights = qwen35::load_weights(
             &mut paro_source,
             std::slice::from_mut(&mut gpu),
-            &paro_layout,
+            &mut paro_layout,
         )
         .expect("load_weights");
         (config, weights, bytes)
@@ -128,8 +128,8 @@ fn main() {
             bytes
         );
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
             .expect("load weights");
         (config, weights, bytes)
     };

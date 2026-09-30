@@ -24,7 +24,9 @@ pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_LOCATION_TYPE_DEVICE,
+    HIP_MEM_LOCATION_TYPE_HOST,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
@@ -83,6 +85,11 @@ pub struct DeviceBuffer {
 enum DeviceBufferOwnership {
     HipMalloc,
     Vmm,
+    /// Owner of a `hipHostMalloc(hipHostMallocMapped)` allocation: system RAM the
+    /// GPU dereferences over PCIe. Released with `hipHostFree`, and — unlike a
+    /// host-located VMM arena — it is NOT charged against the device heap, which
+    /// is the whole point of the offload path using it.
+    HostMapped,
     Borrowed,
 }
 
@@ -105,6 +112,10 @@ impl DeviceBuffer {
 
     pub fn is_borrowed(&self) -> bool {
         self.ownership == DeviceBufferOwnership::Borrowed
+    }
+
+    pub fn is_host_mapped(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::HostMapped
     }
 
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
@@ -134,6 +145,27 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Vmm,
+        }
+    }
+
+    /// Create the unique owner descriptor for a mapped host allocation.
+    ///
+    /// `ptr` is the **device-visible** address (what kernels are handed), which
+    /// `hipHostGetDevicePointer` may alias differently from the host pointer that
+    /// `hipHostMalloc` returned. The host pointer is what `hipHostFree` needs, so
+    /// the owner of a host-mapped allocation must register `(ptr -> host_ptr)`
+    /// with the `Gpu` that will free it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the device-visible alias of a live `hipHostMalloc` buffer of
+    /// at least `size` bytes, freed exactly once through its registered host
+    /// pointer.
+    pub unsafe fn from_host_mapped(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
+        DeviceBuffer {
+            ptr,
+            size,
+            ownership: DeviceBufferOwnership::HostMapped,
         }
     }
 

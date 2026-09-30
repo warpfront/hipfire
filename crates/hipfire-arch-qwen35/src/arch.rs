@@ -76,9 +76,21 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
+        // One line when `memory.offload_exec=cpu`, naming which spilled formats
+        // the CPU can actually execute (silent otherwise; see the fn's docs).
+        // Before the source takes its mutable borrow of `hfq`.
+        //
+        // The split is the loader's own arithmetic (`Layout::spill_count`), so this
+        // reports exactly what the load below will do; qwen35 no longer has a
+        // placement policy of its own.
+        let spilled = Layout::spill_count(cfg.n_layers, hipfire_config::memory::gpu_layer_budget());
+        crate::qwen35::load::report_cpu_exec_coverage(hfq, spilled);
+        // The retained-replay refusal and the CPU-exec capture flag live in the
+        // shared loader (`model_load::load_weights`), which owns the placement and
+        // the `Gpu` for every arch — so there is one check, not one per arch.
         let mut source = HfqSource::new(hfq, cfg);
-        let layout = Layout::single(cfg.n_layers);
-        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
+        let mut layout = Layout::single(cfg.n_layers);
+        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)
             .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
     }
 

@@ -261,24 +261,35 @@ impl Rig {
             * (cfg.n_slots as u64)
             * (cap_rounded as u64)
             * (per_pos_bytes as u64);
-        let planned = weight_bytes + kv_bytes + 768 * 1024 * 1024;
 
-        // GPU context only before preflight — no device allocations yet. Free/
-        // total come from the live device so gfx1100 is not over-admitted
-        // against a hardcoded R9700 budget.
+        // GPU context, then weights, then the preflight.
+        //
+        // The preflight's input is what the loader *actually* allocated
+        // (`weights.stats`), so it has to follow the load. Its job is unchanged —
+        // refuse before the K/V arenas and scratch are committed, which is where an
+        // overshoot would happen — and the weights are committed either way, so the
+        // check still stops the KV overshoot it was written for.
         let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
+        let weights: Qwen35Weights = {
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+            let mut layout = qwen35::Layout::single(config.n_layers);
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
+        }
+        .map_err(|e| format!("load weights: {e}"))?;
+        // Captured before `Guard` takes ownership of the weights; admission is
+        // built from what the loader measured, not from the file size.
+        let weight_stats = weights.stats;
+        // `weight_stats.device_bytes` has already left `vram_free`, so the
+        // commitment still to be admitted is KV plus scratch headroom. Free/total
+        // come from the live device, so gfx1100 is not over-admitted against a
+        // hardcoded R9700 budget.
+        let planned = kv_bytes + 768 * 1024 * 1024;
         let (vram_free, vram_total) = gpu
             .hip
             .get_vram_info()
             .map_err(|e| format!("vram info: {e}"))?;
         preflight_alloc(planned, vram_free as u64, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;
-        let weights: Qwen35Weights = {
-            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-        }
-        .map_err(|e| format!("load weights: {e}"))?;
 
         // ── Transactional post-weight guard ────────────────────────────────
         // Every allocation after weights is owned here. On any error, Drop
@@ -341,6 +352,8 @@ impl Rig {
         }
         let mut g = Guard {
             gpu: Some(gpu),
+            // Captured before the move: admission is built from what the loader
+            // measured, and the `Guard` takes ownership of the weights themselves.
             weights: Some(weights),
             k_arenas: Vec::with_capacity(n_fa_layers),
             v_arenas: Vec::with_capacity(n_fa_layers),
@@ -427,8 +440,12 @@ impl Rig {
 
         let mut adm = AdmissionController::new(
             ModelFootprint {
-                weights_bytes: weight_bytes,
+                // Measured by the loader, not estimated from the file: the device
+                // half is what actually landed in VRAM, and the host half is the
+                // unreclaimable pinned spill the host tier must carry.
+                weights_bytes: weight_stats.device_bytes,
                 kv_bytes_per_token: (n_fa_layers * 2 * per_pos_bytes) as u64,
+                host_bytes: weight_stats.host_pinned_bytes,
             },
             vram_total as u64,
         );

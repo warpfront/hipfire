@@ -113,6 +113,7 @@ fn batched_proj(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
+                exec: w.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -143,6 +144,7 @@ fn batched_proj(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
+                exec: w.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -228,6 +230,7 @@ fn lm_head_batched_lfm(
                 row_stride: out_weight.k,
                 rotation: None,
                 awq_scale: None,
+                exec: out_weight.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -260,6 +263,7 @@ fn lm_head_batched_lfm(
                 row_stride: out_weight.k,
                 rotation: None,
                 awq_scale: None,
+                exec: out_weight.exec,
             };
             let params = GemmParams {
                 w: &w_ref,
@@ -630,6 +634,7 @@ pub fn forward_decode_batch_prepared_lfm(
                         row_stride: w.k,
                         rotation: None,
                         awq_scale: None,
+                        exec: w.exec,
                     };
                     let params = GemmParams {
                         w: &w_ref,
@@ -828,6 +833,7 @@ pub fn forward_decode_batch_prepared_lfm(
                         row_stride: w.k,
                         rotation: None,
                         awq_scale: None,
+                        exec: w.exec,
                     };
                     let params = GemmParams {
                         w: &w_ref,

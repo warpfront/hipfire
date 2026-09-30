@@ -3932,6 +3932,10 @@ pub struct ReplayController {
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
+    /// Set once by the loader when this model's step mix includes CPU-executed
+    /// weights: a CPU step is a host sync point, so the tape cannot record it and
+    /// capture is refused. See [`Self::set_cpu_exec_weights`].
+    cpu_exec_weights: bool,
 }
 
 impl ReplayController {
@@ -3976,6 +3980,8 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            // Stays false until a load resolves placement (`Gpu::set_cpu_exec_weights`).
+            cpu_exec_weights: false,
             replay_observation: ReplayObservation::default(),
             radiowave_effect_certifications: BTreeMap::new(),
             unknown_effect_launches: 0,
@@ -4087,6 +4093,14 @@ impl ReplayController {
         self.prepared_pm4 = None;
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
+        // `cpu_exec_weights` is deliberately NOT reset here. It is a model property
+        // owned by the shared loader (`model_load::load_weights_inner` re-derives it
+        // from the resolved placement on every load), and this reset runs from
+        // `configure_model_default` — *after* a successful load. Clearing it here
+        // would drop the gate for the very CPU-exec model the load just set it for,
+        // re-enabling capture and the stale-activation replay the gate exists to
+        // prevent. A model swap is covered because the loader writes the new model's
+        // value before this runs.
         self.replay_observation = ReplayObservation::default();
         self.radiowave_effect_certifications.clear();
         self.radiowave_effect_launches = 0;
@@ -5424,10 +5438,22 @@ impl ReplayController {
         Ok(())
     }
 
+    /// Record that this model's step mix includes CPU-executed weights, which the
+    /// tape cannot express. Set once by the loader.
+    pub fn set_cpu_exec_weights(&mut self, on: bool) {
+        self.cpu_exec_weights = on;
+    }
+
     /// Start one explicitly delimited prefill or decode capture. This clears
     /// only the prior launch sequence; validation observations and the backend
     /// request remain intact.
     pub fn begin_capture(&mut self) -> Result<(), &'static str> {
+        if self.cpu_exec_weights {
+            return Err(
+                "memory.offload_exec=cpu: a CPU-executed step is a host sync point, so the \
+                 replay tape cannot record it",
+            );
+        }
         match self.state {
             ReplayState::Hip => return Err("replay backend is disabled"),
             ReplayState::Fallback => return Err("replay controller is in sticky fallback"),

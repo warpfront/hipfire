@@ -40,6 +40,11 @@ pub struct WeightRef<'a> {
     pub row_stride: usize,
     pub rotation: Option<GivensRef<'a>>,
     pub awq_scale: Option<&'a GpuTensor>,
+    /// Which engine reads this weight — see [`rdna_compute::ExecTarget`]. The CPU
+    /// seam dispatches on this rather than on the buffer's memory location, so a
+    /// spilled layer executed on the CPU and a host-mapped layer left on the GPU
+    /// are distinguishable without re-deriving the decision per step.
+    pub exec: rdna_compute::ExecTarget,
 }
 
 // ── Dispatch parameters ────────────────────────────────

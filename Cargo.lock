@@ -1303,6 +1303,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -1393,6 +1394,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-cpu"
+version = "0.3.1"
+dependencies = [
+ "half",
+ "rayon",
+]
+
+[[package]]
 name = "hipfire-daemon"
 version = "0.3.1"
 dependencies = [
@@ -1428,6 +1437,7 @@ version = "0.3.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hipfire-cpu",
  "rdna-compute",
 ]
 
@@ -1601,6 +1611,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-engine",

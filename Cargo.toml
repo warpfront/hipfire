@@ -35,6 +35,7 @@ members = [
     "crates/redline-dispatch",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
+    "crates/hipfire-cpu",
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",

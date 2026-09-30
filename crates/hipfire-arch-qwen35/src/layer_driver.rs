@@ -384,6 +384,7 @@ mod tests {
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         }
 
@@ -409,6 +410,7 @@ mod tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 }
             }
             let (expert_execution_plan, expert_table, expert_binding) =

@@ -250,6 +250,7 @@ fn wt_from_raw(
         row_stride,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 

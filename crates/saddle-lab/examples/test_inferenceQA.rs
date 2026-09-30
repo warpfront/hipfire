@@ -338,8 +338,8 @@ fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
         .map_err(|e| CaseOutcome::Skip(format!("GPU init unavailable: {e}")))?;
     let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }))
     .map_err(|panic| CaseOutcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?
     .map_err(|e| CaseOutcome::Fail(format!("failed to load weights: {e}")))?;

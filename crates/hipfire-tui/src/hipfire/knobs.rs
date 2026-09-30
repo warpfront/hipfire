@@ -61,6 +61,35 @@ pub const KNOBS: &[KnobInfo] = &[
         options: &[],
     },
     KnobInfo {
+        key: "gpu_layer_budget",
+        title: "Layers kept on the GPU",
+        summary: "How many of the model's layers stay on the GPU. The rest spill to system RAM.",
+        effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
+        default: "",
+        when: "Leave it unset for normal use — every layer then stays on the GPU. Set a count when the model or context will not otherwise fit.",
+        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. '-1' and an empty value mean the same as unset: every layer stays on the GPU."),
+        options: &[],
+    },
+    KnobInfo {
+        key: "offload_exec",
+        title: "Who multiplies a spilled layer",
+        summary: "Which engine executes the ops that read a spilled layer's weights: the GPU over PCIe, or the CPU.",
+        effect: "The CPU arm replaces a per-step read of every spilled weight over the link with a host-side GEMV, which is what makes a spill pay instead of costing. It is a per-step host sync (no hipGraph), and the GPU kernels are the faster engine once the bytes are resident.",
+        default: "pcie",
+        when: "Leave on PCIe unless a spilled layer's per-step link read is the bottleneck; 'cpu' is the arm the CPU-exec offload path exists for.",
+        note: Some("Decides who multiplies, never what is spilled: placement stays the 'GPU layers' row, and the KV cache stays in VRAM either way. Refused together with a retained-replay (Redline) backend, and unset/empty/unknown all fall back to pcie. Read once at load — changing it takes effect on the next serve/restart."),
+        options: &[
+            (
+                "pcie",
+                "'over PCIe' — `memory.offload_exec = pcie`: the GPU kernels read the host-mapped weights over the link and multiply.",
+            ),
+            (
+                "cpu",
+                "'on CPU' — `memory.offload_exec = cpu`: the CPU executes those GEMVs from system RAM; the GPU gets the result back.",
+            ),
+        ],
+    },
+    KnobInfo {
         key: "kv_cache",
         title: "KV cache precision",
         summary: "Precision/memory tradeoff for the attention key/value cache.",

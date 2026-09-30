@@ -206,6 +206,7 @@ fn main() {
                 row_stride: 0,
                 rotation: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             };
             gemv.run_auto(&ctx, &mut gpu, &wr, &x_t, &y_t)
                 .expect("run_auto");

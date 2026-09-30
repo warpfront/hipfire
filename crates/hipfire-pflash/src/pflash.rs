@@ -19,8 +19,8 @@
 use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
@@ -524,8 +524,8 @@ pub fn load_drafter(
                 )
             })?;
             let mut src = qwen35::HfqSource::new(&mut hfq, &q35_cfg);
-            let layout = qwen35::Layout::single(q35_cfg.n_layers);
-            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
+            let mut layout = qwen35::Layout::single(q35_cfg.n_layers);
+            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &mut layout)?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
             let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
             // Hybrid drafter only stores K (and V for chat-path) at

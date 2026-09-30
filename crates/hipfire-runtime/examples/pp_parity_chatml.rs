@@ -80,8 +80,8 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpu = Gpu::init().expect("Gpu::init");
     let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-    let layout = qwen35::Layout::single(config.n_layers);
-    let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+    let mut layout = qwen35::Layout::single(config.n_layers);
+    let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
         .expect("load_weights");
     let mut kv = KvCache::new_gpu_asym3_capped(
         &mut gpu,
@@ -136,10 +136,10 @@ fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
     let mut hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
-    let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
+    let mut layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
-    let weights =
-        qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout).expect("load_weights");
+    let weights = qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &mut layout)
+        .expect("load_weights");
     let scratch_set =
         Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096).expect("scratch_set");
     let mut kv = KvCache::new_gpu_asym3_capped_multi(

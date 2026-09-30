@@ -114,6 +114,7 @@ fn load_wt(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         });
     }
     let dtype = match info.quant_type {
@@ -129,6 +130,7 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             });
         }
         3 => DType::Q8_0,
@@ -161,6 +163,7 @@ fn load_wt(
         row_stride: 0,
         paro: None,
         awq_scale,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -354,6 +357,7 @@ impl Gemma4Weights {
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             }
         };
 

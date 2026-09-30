@@ -1064,6 +1064,7 @@ pub(crate) fn alloc_ep_dummies(
             row_stride: spec.gate_stride,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         let down = WeightTensor {
             buf: down_owner.shallow_clone(),
@@ -1073,6 +1074,7 @@ pub(crate) fn alloc_ep_dummies(
             row_stride: spec.down_stride,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         owners.push(gate_owner);
         owners.push(down_owner);
@@ -2058,11 +2060,16 @@ pub struct Qwen35Weights {
     /// (single-GPU path). When true, `output.buf` is a non-owning view of
     /// `token_embd.buf` and must NOT be freed in `free_gpu`.
     pub lm_head_aliases_embd: bool,
-
     /// Immutable EP shard provenance. `Some` only when loaded via
     /// `load_weights_ep_rank` on the exact 4×gfx1201 MQ4R route; all
     /// ordinary (single-GPU, TP, paged) loads leave `None`.
     pub(crate) ep_shard: Option<Qwen35EpShardInfo>,
+
+    /// What this load actually allocated, by destination. See
+    /// [`hipfire_runtime::model_load::LoadStats`]. The paged-experts route is the
+    /// one exception: its expert buffers belong to the `WeightPager`, which
+    /// accounts for them itself, so they are not included here.
+    pub stats: hipfire_runtime::model_load::LoadStats,
 }
 
 impl Qwen35Weights {
@@ -2401,6 +2408,143 @@ pub(crate) fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
         let _ = gpu.free_tensor(tensor);
     };
     free_moe_ffn_with(ffn, &mut free);
+}
+
+/// Sum the bytes [`free_moe_ffn_with`] releases, without consuming the layer.
+///
+/// Deliberately adjacent to the free walker and branching identically: the two must
+/// agree, and a divergence here under-charges admission (a silent over-admit) rather
+/// than leaking something an error would surface. `moe_ffn_owned_bytes_matches_the_free_walker`
+/// pins the pairing by construction, not by hope.
+pub(crate) fn moe_ffn_owned_bytes(ffn: &MoeFfnWeights) -> (u64, u64) {
+    use hipfire_runtime::model_load::split_tensor_bytes;
+    let mut stats = (0u64, 0u64);
+    let mut add = |other: (u64, u64)| {
+        stats.0 += other.0;
+        stats.1 += other.1;
+    };
+
+    add(ffn.router.owned_bytes());
+    add(ffn.shared_expert_gate.owned_bytes());
+    add(ffn.shared_expert.gate.owned_bytes());
+    add(ffn.shared_expert.up.owned_bytes());
+    add(ffn.shared_expert.down.owned_bytes());
+    add(split_tensor_bytes([&ffn.expert_gate_up_ptrs]));
+    add(split_tensor_bytes([&ffn.expert_down_ptrs]));
+    // Non-owning pointer table: its buffer, not what it points into — those are the
+    // per-expert `down.awq_scale` twins counted below.
+    if let Some(t) = &ffn.expert_down_awq_ptrs {
+        add(split_tensor_bytes([t]));
+    }
+    if let Some(t) = &ffn.expert_dtype_tags {
+        add(split_tensor_bytes([t]));
+    }
+    if let Some(owners) = &ffn.packed_expert_owners {
+        // Packed expert weights are non-owning views over two layer blobs: their
+        // individually-owned metadata counts, their blobs do not.
+        for e in ffn.experts.iter().chain(ffn.retired_expert_weights.iter()) {
+            add(e.gate_up.owned_metadata_bytes());
+            add(e.down.owned_metadata_bytes());
+        }
+        add(split_tensor_bytes([&owners.gate_up]));
+        add(split_tensor_bytes([&owners.down]));
+    } else {
+        for e in &ffn.experts {
+            add(e.gate_up.owned_bytes());
+            add(e.down.owned_bytes());
+        }
+        for e in &ffn.retired_expert_weights {
+            add(e.gate_up.owned_bytes());
+            add(e.down.owned_bytes());
+        }
+    }
+    // EP dummy views borrow `ep_dummy_buffers`: metadata only here, the owning
+    // buffers below.
+    for e in &ffn.ep_dummy_experts {
+        add(e.gate_up.owned_metadata_bytes());
+        add(e.down.owned_metadata_bytes());
+    }
+    if let Some(s) = &ffn.paro_shared {
+        for t in [
+            &s.gate_up_pairs,
+            &s.gate_up_theta,
+            &s.gate_up_channel_scales,
+            &s.down_pairs,
+            &s.down_theta,
+            &s.down_channel_scales,
+        ] {
+            add(split_tensor_bytes([t]));
+        }
+    }
+    for d in &ffn.ep_dummy_buffers {
+        add(split_tensor_bytes([d]));
+    }
+    stats
+}
+
+impl LayerWeights {
+    /// Sum the bytes [`Self::free_gpu`] releases, without consuming the layer.
+    ///
+    /// Same pairing rule as [`moe_ffn_owned_bytes`]: branch for branch with the
+    /// teardown, so an accounting error shows up as a visible diff against the free
+    /// list beside it. One documented exception — a paged-experts layer's routed
+    /// buffers belong to the `WeightPager`, which charges them itself, so
+    /// `experts` is empty here and nothing dangles.
+    pub fn owned_bytes(&self) -> (u64, u64) {
+        use hipfire_runtime::model_load::{add_bytes, split_tensor_bytes};
+        // Iterators, not fixed-size arrays: a fixed arity silently drops a tensor
+        // when one is added to the struct, which is exactly the under-count this
+        // function exists to avoid.
+        let sum = |norms: &[&GpuTensor], weights: &[&WeightTensor]| {
+            let mut stats = split_tensor_bytes(norms.iter().copied());
+            for w in weights {
+                stats = add_bytes(stats, w.owned_bytes());
+            }
+            stats
+        };
+        match self {
+            // The DeltaNet arms own `conv_weight` and `norm_weight` as well as the
+            // two small scalars — `free_gpu` releases all four, so all four count.
+            LayerWeights::DeltaNet(l) => sum(
+                &[
+                    &l.attn_norm,
+                    &l.ffn_norm,
+                    &l.a_log,
+                    &l.dt_bias,
+                    &l.conv_weight,
+                    &l.norm_weight,
+                ],
+                &[
+                    &l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo, &l.w_gate, &l.w_up, &l.w_down,
+                ],
+            ),
+            LayerWeights::FullAttn(l) => sum(
+                &[&l.attn_norm, &l.ffn_norm, &l.q_norm, &l.k_norm],
+                &[&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down],
+            ),
+            LayerWeights::DeltaNetMoe(l) => {
+                let stats = sum(
+                    &[
+                        &l.attn_norm,
+                        &l.ffn_norm,
+                        &l.conv_weight,
+                        &l.norm_weight,
+                        &l.a_log,
+                        &l.dt_bias,
+                    ],
+                    &[&l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo],
+                );
+                add_bytes(stats, moe_ffn_owned_bytes(&l.ffn))
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                let stats = sum(
+                    &[&l.attn_norm, &l.ffn_norm, &l.q_norm, &l.k_norm],
+                    &[&l.wq, &l.wk, &l.wv, &l.wo],
+                );
+                add_bytes(stats, moe_ffn_owned_bytes(&l.ffn))
+            }
+        }
+    }
 }
 
 // ─── State ──────────────────────────────────────────────────────────────

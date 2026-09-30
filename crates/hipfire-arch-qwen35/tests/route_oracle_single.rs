@@ -288,9 +288,9 @@ fn decode_run(path: &str, kv_tier: &str, prompt_tokens: &[u32], label: &str) -> 
         .map(|t| *t == LayerType::FullAttention)
         .collect();
     let mut gpu = Gpu::init().expect("Gpu::init");
-    let layout = qwen35::Layout::single(config.n_layers);
+    let mut layout = qwen35::Layout::single(config.n_layers);
     let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-    let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+    let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
         .expect("load_weights");
     drop(src);
     drop(hfq);

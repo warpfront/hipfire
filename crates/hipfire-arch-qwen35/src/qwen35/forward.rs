@@ -1682,11 +1682,24 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    let use_graph = ar_graph_test
+    let graph_would_be_used = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
         && (config.num_experts == 0 || allow_moe);
+    // A CPU-executed step (memory.offload_exec=cpu over a spilled layer) is a host
+    // sync point — a D2H and an H2D around the multiplication — so it can neither
+    // be recorded into a hipGraph nor replayed out of one. Take the non-captured
+    // path for the model's whole lifetime instead.
+    //
+    // The flag is the loader's recorded decision (set once from the resolved
+    // placement), so this cannot drift from the weights, and `GraphState` itself
+    // refuses a capture while it is set.
+    let cpu_blocks_capture = gpu.graphs.cpu_exec_weights;
+    if graph_would_be_used && cpu_blocks_capture {
+        hipfire_dispatch::log_capture_disabled_once();
+    }
+    let use_graph = graph_would_be_used && !cpu_blocks_capture;
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -2819,6 +2832,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wqkv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: wqkv.exec,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2828,6 +2842,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wz.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: wz.exec,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2837,6 +2852,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_beta.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: w_beta.exec,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2846,6 +2862,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_alpha.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: w_alpha.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2892,6 +2909,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: wqkv.exec,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2901,6 +2919,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: wz.exec,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2910,6 +2929,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: w_beta.exec,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2919,6 +2939,7 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: w_alpha.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2986,6 +3007,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wq.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: wq.exec,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -2995,6 +3017,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wk.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: wk.exec,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3004,6 +3027,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: wv.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3042,6 +3066,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: wq.exec,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -3051,6 +3076,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: wk.exec,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3060,6 +3086,7 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: wv.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3118,6 +3145,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_gate.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: w_gate.exec,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3127,6 +3155,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_up.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            exec: w_up.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3160,6 +3189,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: w_gate.exec,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3169,6 +3199,7 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: w_up.exec,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -5242,8 +5273,18 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
         ));
     }
     let last_n = forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, pbs,
-        partials, Some(captures),
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        pbs,
+        partials,
+        Some(captures),
     )?;
     debug_assert_eq!(last_n, n);
     gpus.devices[0].bind_thread()?;
@@ -5443,8 +5484,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5456,9 +5496,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5503,8 +5541,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5516,9 +5553,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5581,8 +5616,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5594,9 +5628,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5641,8 +5673,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5654,9 +5685,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5701,8 +5730,8 @@ fn forward_prefill_dense_tp_batched(
             }
             offset += n;
         }
-    Ok(last_chunk_n)
-}
+        Ok(last_chunk_n)
+    }
 }
 
 /// Layer-granular batched dense-TP prefill. Chunks with the existing
@@ -5783,8 +5812,18 @@ pub fn forward_prefill_dense_tp(
     let pbs_refs: Vec<&PrefillBatchScratch> = pbs_vec.iter().collect();
     let partial_refs: Vec<&GpuTensor> = partials.iter().collect();
     let last_chunk_n = match forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_refs,
-        &partial_refs, None,
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        &pbs_refs,
+        &partial_refs,
+        None,
     ) {
         Ok(n) => n,
         Err(e) => {

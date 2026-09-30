@@ -17,6 +17,7 @@
 //! family-local reductions.
 
 use crate::device_mesh::{CollectiveHint, DeviceMesh, DimKind};
+use crate::model_load::Residency;
 use crate::tp_shard::ExpertAssign;
 use rdna_compute::DType;
 use std::collections::HashSet;
@@ -290,6 +291,64 @@ pub struct WeightPlacement {
     pub name: String,
     pub layer: Option<usize>,
     pub devices: Vec<usize>,
+    /// Where this placement's bytes live. `HostMapped` means the load asked for
+    /// this layer to be spilled, so an executor that cannot upload to host memory
+    /// must refuse the entry rather than allocate it in the VRAM the spill exists
+    /// to free — see [`placement_residency`] and
+    /// `weight_store::fulfill_manifest_single`.
+    pub residency: Residency,
+}
+
+/// The resolved residency of one manifest entry, from the same split arithmetic
+/// the loader applies (`model_load::Layout::spill_count`): layers before the
+/// spilled prefix go to host memory, everything else — including every
+/// non-layer tensor, since `token_embd` / `output_norm` / `lm_head` are always
+/// resident — stays on the device.
+///
+/// One function, so the plan's declared tier and the executor's refusal cannot
+/// disagree about which entries a budget asks to spill.
+pub fn placement_residency(layer: Option<usize>, n_layers: usize) -> Residency {
+    residency_for_spilled_prefix(
+        layer,
+        crate::model_load::Layout::spill_count(
+            n_layers,
+            hipfire_config::memory::gpu_layer_budget(),
+        ),
+    )
+}
+
+/// Pure core of [`placement_residency`]: `spilled` layers spill, the rest are
+/// resident, and a non-layer tensor is always resident. Split out so the rule is
+/// testable without the process-global budget snapshot.
+pub fn residency_for_spilled_prefix(layer: Option<usize>, spilled: usize) -> Residency {
+    match layer {
+        Some(layer) if layer < spilled => Residency::HostMapped,
+        _ => Residency::Device,
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    /// The prefix rule, at its boundaries: layer `spilled-1` spills, layer
+    /// `spilled` does not, and a non-layer tensor never spills (the embedding,
+    /// output norm and lm_head are resident in every mode).
+    #[test]
+    fn only_the_spilled_prefix_goes_to_host() {
+        assert_eq!(residency_for_spilled_prefix(Some(0), 0), Residency::Device);
+        assert_eq!(
+            residency_for_spilled_prefix(Some(0), 1),
+            Residency::HostMapped
+        );
+        assert_eq!(
+            residency_for_spilled_prefix(Some(7), 8),
+            Residency::HostMapped
+        );
+        assert_eq!(residency_for_spilled_prefix(Some(8), 8), Residency::Device);
+        assert_eq!(residency_for_spilled_prefix(None, 8), Residency::Device);
+        assert_eq!(residency_for_spilled_prefix(None, 0), Residency::Device);
+    }
 }
 
 /// One ordered collective implied by one manifest operation.
@@ -594,6 +653,7 @@ pub fn plan_manifest(
             name: entry.name.clone(),
             layer: entry.layer,
             devices: placement_devices(entry, mesh, n_layers),
+            residency: placement_residency(entry.layer, n_layers),
         })
         .collect();
     let state_placements = state

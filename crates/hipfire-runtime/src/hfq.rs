@@ -5,12 +5,17 @@
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
 use crate::llama::{
-    f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
+    f16_to_f32, layer_owned_bytes, llama_load_stats, EmbeddingFormat, LayerWeights, LlamaConfig,
+    LlamaWeights, ModelArch, WeightTensor,
 };
-use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
+use crate::model_load::{
+    add_bytes, load_weights as rt_load_weights, split_tensor_bytes, LoadedWeights, Residency,
+    WeightSource,
+};
 use crate::weight_backend::{
-    decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
-    reupload_f16_as_f32, HfqBackend, WeightBackend,
+    decode_raw_codec, dequant_weight_raw, exec_for, flat_name_candidates, load_awq_scale_for,
+    load_embedding, raw_codec, resolve_lm_head, reupload_f16_as_f32, upload_bytes, HfqBackend,
+    WeightBackend,
 };
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
@@ -1646,27 +1651,31 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
-/// Load a weight tensor (quantized or F16) onto GPU.
-pub(crate) fn load_weight_tensor(
-    hfq: &HfqFile,
-    gpu: &Gpu,
-    name: &str,
+/// Decode one tensor's bytes into a `WeightTensor` at `residency`: the passthrough
+/// codec registry and the host-decode fallback, in one place for every arch.
+///
+/// Split out of [`load_weight_tensor`] so the borrowed-mmap and `pread` routes
+/// cannot drift from each other — they previously each carried their own copy of
+/// this match, which is exactly how qwen35's decoder grew six formats the
+/// registry did not know about. Public for the paths that decode bytes they
+/// gathered themselves (qwen35's REAP router gather and its lm_head read).
+pub fn decode_weight_bytes(
+    gpu: &mut Gpu,
+    quant_type: u8,
+    data: &[u8],
     m: usize,
     k: usize,
-    candidates: fn(&str) -> Vec<String>,
+    name: &str,
+    residency: Residency,
 ) -> HipResult<WeightTensor> {
-    let st_name = candidates(name)
-        .into_iter()
-        .find(|c| hfq.find_tensor_info(c).is_some())
-        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
-    let (info, data) = hfq
-        .tensor_data(&st_name)
-        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {st_name}")))?;
-
-    let mut wt = match info.quant_type {
+    match quant_type {
+        // qt 1 (native F16) expands to F32 here. This is the reader every
+        // *projection* goes through, and a projection's storage dtype is not a
+        // policy: a model whose every projection is qt 1 (llama's own fixture is
+        // exactly that) loads and forwards through this arm, and the F32 GEMV is
+        // the path it was validated on. The one place the F16/F32 choice *is* a
+        // policy is the LM head — see [`decode_lm_head_bytes`].
         1 => {
-            // F16 — the HFQ path host-decodes to F32 for the F32 GEMV (NOT a
-            // verbatim upload, so not a RAW_CODECS row; dequant_weight_raw keeps F16).
             let f32_data: Vec<f32> = data
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -1674,8 +1683,8 @@ pub(crate) fn load_weight_tensor(
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok::<WeightTensor, HipError>(WeightTensor {
+            let buf = upload_bytes(gpu, bytes, &[m, k], residency)?;
+            Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
                 m,
@@ -1683,16 +1692,93 @@ pub(crate) fn load_weight_tensor(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: exec_for(residency),
             })
         }
+        // Everything else: the passthrough registry, or the host-decode fallback
+        // (qt 2/16 and any format the registry does not carry) — which also takes
+        // `residency`, so an offloaded layer can never quietly land on the device.
         other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name),
-            None => Err(HipError::new(
-                0,
-                &format!("unsupported quant_type {other} for weight {st_name}"),
-            )),
+            Some(codec) => decode_raw_codec(gpu, codec, data, m, k, name, residency),
+            None => dequant_weight_raw(gpu, other, data, m, k, residency),
         },
-    }?;
+    }
+}
+
+/// Decode an LM-head tensor: [`decode_weight_bytes`], except that a native F16
+/// (qt 1) head honours `kernel.lm_head_f16` and stays F16 (`native`/`auto`) rather
+/// than expanding to F32 (`f32`/`legacy`).
+///
+/// The expansion is exact in both directions (F16 → F32 is a widen), so this
+/// chooses which GEMV runs and what the head costs in VRAM — never a value. It is
+/// a policy only for the head: a qt-1 *projection* is storage, and widening it is
+/// what the projection reader does (see [`decode_weight_bytes`]).
+pub fn decode_lm_head_bytes(
+    gpu: &mut Gpu,
+    quant_type: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+    residency: Residency,
+) -> HipResult<WeightTensor> {
+    if quant_type == 1 && hipfire_config::kernel::lm_head_f16_native() {
+        return dequant_weight_raw(gpu, 1, data, m, k, residency);
+    }
+    decode_weight_bytes(gpu, quant_type, data, m, k, name, residency)
+}
+
+/// Load a weight tensor (quantized or host-decoded) at `residency`.
+///
+/// The single projection reader for every arch that reaches `HfqBackend`
+/// (`LlamaHfqSource`, qwen2, qwen35, DSpark). Borrowed mmap first — on a discrete
+/// GPU the mapping stays alive, so the upload DMAs straight out of page-cache
+/// pages with no heap staging copy — then the owned `pread` fallback, which is
+/// what UMA loads and post-`drop_mmap` sidecars need.
+///
+/// `residency` decides only *where* the bytes land, never what they are: a
+/// host-mapped layer decodes byte-for-byte like a resident one.
+pub fn load_weight_tensor(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    candidates: fn(&str) -> Vec<String>,
+    residency: Residency,
+) -> HipResult<WeightTensor> {
+    let mut matched: Option<String> = None;
+    let mut wt: Option<WeightTensor> = None;
+    for candidate in candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data(&candidate) {
+            let qt = info.quant_type;
+            wt = Some(decode_weight_bytes(
+                gpu, qt, data, m, k, &candidate, residency,
+            )?);
+            matched = Some(candidate);
+            break;
+        }
+        if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
+            let qt = info.quant_type;
+            wt = Some(decode_weight_bytes(
+                gpu, qt, &buf, m, k, &candidate, residency,
+            )?);
+            matched = Some(candidate);
+            break;
+        }
+    }
+    let mut wt = wt.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
+    if residency == Residency::HostMapped
+        && hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok()
+    {
+        let base = wt.buf.buf.as_ptr() as usize;
+        eprintln!(
+            "[offload-debug] host tensor '{name}' {:?} bytes={} va=0x{base:x}..0x{:x}",
+            wt.gpu_dtype,
+            wt.buf.byte_size(),
+            base + wt.buf.byte_size(),
+        );
+    }
     // Centralized AWQ sidecar attachment. Replaces the prior per-arm
     // inline `load_awq_scale()` calls at the qt=13 / qt=17 arms — those
     // were the only loaders touching `awq_scale` and missing arms (qt=15
@@ -1700,8 +1786,17 @@ pub(crate) fn load_weight_tensor(
     // sidecars if added later. Routed through `DType::supports_awq_sidecar`
     // so future widening is a single helper edit, not a scattered
     // per-loader hunt. See dispatch.rs for the allow-list rationale.
+    //
+    // `load_awq_scale_for` resolves the sidecar under the *matched* on-disk name
+    // first, so a tensor found through an aliased candidate still finds its own
+    // sidecar; the scale itself stays device-resident (a 1-D f16 vector of length
+    // K is kilobytes, and host-locating it would cost PCIe traffic on the hot path
+    // to save nothing).
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
+        wt.awq_scale = matched
+            .as_deref()
+            .and_then(|matched_name| load_awq_scale_for(hfq, gpu, matched_name, k))
+            .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
     }
     Ok(wt)
 }
@@ -1712,11 +1807,12 @@ pub(crate) fn load_weight_tensor(
 /// before loading (e.g. the DSpark qwen3 sidecar loader on UMA).
 pub fn load_weight_tensor_pread(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     candidates: fn(&str) -> Vec<String>,
+    residency: Residency,
 ) -> HipResult<WeightTensor> {
     let st_name = candidates(name)
         .into_iter()
@@ -1726,37 +1822,9 @@ pub fn load_weight_tensor_pread(
         .tensor_data_vec(&st_name)
         .ok_or_else(|| HipError::new(0, &format!("tensor not found: {st_name}")))?;
 
-    let mut wt = match info.quant_type {
-        1 => {
-            // F16 — host-decode to F32 for the F32 GEMV path.
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok::<WeightTensor, HipError>(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name),
-            None => Err(HipError::new(
-                0,
-                &format!("unsupported quant_type {other} for weight {st_name}"),
-            )),
-        },
-    }?;
+    let mut wt = decode_weight_bytes(gpu, info.quant_type, &data, m, k, &st_name, residency)?;
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
+        wt.awq_scale = load_awq_scale_for(hfq, gpu, &st_name, k);
     }
     Ok(wt)
 }
@@ -1814,6 +1882,7 @@ impl WeightSource for LlamaHfqSource<'_> {
                     cfg.vocab_size,
                     cfg.dim,
                     flat_name_candidates,
+                    Residency::Device,
                 )
             },
             |gpu| {
@@ -1826,7 +1895,12 @@ impl WeightSource for LlamaHfqSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, i: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        i: usize,
+        residency: Residency,
+    ) -> HipResult<LayerWeights> {
         let cfg = self.cfg;
         let q_out_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -1838,8 +1912,17 @@ impl WeightSource for LlamaHfqSource<'_> {
             candidates: flat_name_candidates,
             read_proj: load_weight_tensor,
             layer: i,
+            residency,
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
+    }
+    /// The generic llama-family reader is dense-only on this path: every tensor of
+    /// a layer goes through `HfqBackend`, so a spill lands completely.
+    fn spill_refusal(&self) -> Option<String> {
+        None
+    }
+    fn layer_bytes(&self, layer: &LayerWeights) -> (u64, u64) {
+        layer_owned_bytes(layer)
     }
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
         layer.free_gpu(gpu);
@@ -1915,7 +1998,7 @@ pub fn load_weights_hfq(
     validate_llama_hfq_admission(hfq)?;
 
     let mut source = LlamaHfqSource { hfq, cfg: config };
-    let layout = crate::model_load::Layout::single(config.n_layers);
+    let mut layout = crate::model_load::Layout::single(config.n_layers);
     let LoadedWeights {
         token_embd,
         embd_format,
@@ -1923,7 +2006,8 @@ pub fn load_weights_hfq(
         output,
         layers,
         lm_head_aliases_embd,
-    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
+        stats,
+    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)?;
     Ok(LlamaWeights {
         token_embd,
         embd_format,
@@ -1931,6 +2015,7 @@ pub fn load_weights_hfq(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     })
 }
 
@@ -2146,6 +2231,7 @@ fn load_fp16_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -2256,6 +2342,7 @@ pub fn load_weights_paroquant_llama(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: rdna_compute::ExecTarget::Gpu,
             })
         },
     )?;
@@ -2281,6 +2368,14 @@ pub fn load_weights_paroquant_llama(
         }
     }
 
+    // Measured from the tensors this route produced, before `layers` is moved.
+    let stats = llama_load_stats(
+        &token_embd,
+        &output_norm,
+        &output,
+        &layers,
+        lm_head_aliases_embd,
+    );
     Ok(LlamaWeights {
         token_embd,
         embd_format: embd_fmt,
@@ -2288,6 +2383,7 @@ pub fn load_weights_paroquant_llama(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     })
 }
 // ─── HFQM streaming writer (calibration collector) ──────────────────────────

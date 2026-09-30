@@ -55,8 +55,8 @@ fn main() -> HipResult<()> {
     let trunk_config = qwen35::config_from_hfq(&trunk_hfq).expect("trunk config_from_hfq");
     let trunk_weights = {
         let mut src = qwen35::HfqSource::new(&mut trunk_hfq, &trunk_config);
-        let layout = qwen35::Layout::single(trunk_config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(trunk_config.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .expect("trunk load_weights");
 

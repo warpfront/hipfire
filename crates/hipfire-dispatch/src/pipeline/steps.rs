@@ -8,6 +8,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
+use crate::cpu_exec;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -671,7 +672,18 @@ pub fn execute_steps(
 
     let mut i = 0;
     while i < steps.len() {
-        if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
+        // Fusion is bypassed for a window that contains a CPU-executed step: a
+        // fused entry is one kernel launch over several weights, so it cannot
+        // half-land on the CPU seam, and splitting it costs launches it was
+        // there to save — nothing else. (Fusion has no numerical contract to
+        // preserve here; see the module docs on the tolerance contract.)
+        let fused = match_prefix(FUSED_TABLE, &steps[i..], ctx).filter(|(_, len)| {
+            !ctx.cpu_exec()
+                || !steps[i..i + *len]
+                    .iter()
+                    .any(|s| cpu_exec::plan_step(gpu, s).is_some())
+        });
+        if let Some((key, len)) = fused {
             // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
             // When the flag is on, the matched window is a per-row 3-way QKV
             // decode key whose kernel supports the fold, and the 3 steps right
@@ -687,7 +699,17 @@ pub fn execute_steps(
             }
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
+        } else if let Some(plan) = cpu_exec::plan_step(gpu, &steps[i]) {
+            cpu_exec::run_step(gpu, &plan)?;
+            i += 1;
         } else {
+            if ctx.cpu_exec() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
+                // Host-mapped weight that the CPU could not take: an unsupported
+                // quant format, or a step shape that never reached the seam. Counted
+                // so the failure is visible instead of silent (see the coverage
+                // line at load and `cpu_exec_counters`).
+                cpu_exec::count_host_mapped_gpu_step();
+            }
             launch_op(gpu, ctx, &steps[i])?;
             i += 1;
         }
@@ -1275,6 +1297,7 @@ fn launch_fused(
 mod tests {
     use super::*;
     use crate::context::DispatchCtx;
+    use crate::cpu_exec;
     use crate::families::fused_qkv::FusedQkvFamily;
     use crate::types::KernelKey;
 
@@ -1360,15 +1383,9 @@ mod tests {
         use std::sync::Arc;
         let mut flags = FeatureFlags::for_test("gfx1100");
         flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        ctx.arch = rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(flags.clone()));
+        ctx.flags = Arc::new(flags);
         // short-circuit: every guard opens with `force_unfused → false`, so even
         // an empty slice returns false. This proves the branch exists.
         let empty: &[Step] = &[];
@@ -1518,15 +1535,9 @@ mod tests {
         use std::sync::Arc;
         let mut flags = FeatureFlags::for_test("gfx1100");
         flags.force_unfused = true;
-        let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
-                "gfx1100",
-                Arc::new(FeatureFlags::for_test("gfx1100")),
-            ),
-            flags: Arc::new(flags),
-            resources: crate::resource::ResourceManager::for_test(),
-            workload: crate::context::DispatchWorkload::Standard,
-        };
+        let mut ctx = DispatchCtx::for_test("gfx1100");
+        ctx.arch = rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(flags.clone()));
+        ctx.flags = Arc::new(flags);
         let empty: &[Step] = &[];
         assert!(
             !guard_qkv_q4k(empty, &ctx),

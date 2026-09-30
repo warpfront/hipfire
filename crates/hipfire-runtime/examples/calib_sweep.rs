@@ -1520,11 +1520,11 @@ fn main() {
         );
         // Load weights via HfqSource + Layout::single — verbatim copy of collect_e8_hessian_native.rs:135-137 / build_kld_ref_native.rs:145-147
         let mut source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq, &cfg);
-        let layout = hipfire_runtime::model_load::Layout::single(cfg.n_layers);
+        let mut layout = hipfire_runtime::model_load::Layout::single(cfg.n_layers);
         let weights = hipfire_arch_qwen35::qwen35::load_weights(
             &mut source,
             std::slice::from_mut(&mut gpu),
-            &layout,
+            &mut layout,
         )
         .unwrap_or_else(|e| panic!("qwen35 load_weights: {e:?}"));
         // Need raw hfq reference for verification — reconstruct a view of tensor names before dropping.

@@ -141,8 +141,8 @@ fn main() {
         let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
         let weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &q35_config);
-            let layout = qwen35::Layout::single(q35_config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+            let mut layout = qwen35::Layout::single(q35_config.n_layers);
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
         }
         .expect("failed to load weights");
         eprintln!("Loaded {} layers", weights.layers.len());

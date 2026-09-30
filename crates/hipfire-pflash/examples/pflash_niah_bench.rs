@@ -31,10 +31,10 @@
 //! of kept token IDs, so no peer-copy plumbing is required. ROCR_VISIBLE_DEVICES
 //! controls which physical GPUs the device indices resolve to.
 
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState};
 use hipfire_pflash::pflash::{
     self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
 };
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use std::fs;
@@ -465,8 +465,8 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init_with_device(target_device).expect("target GPU init");
     let weights = {
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .expect("load weights");
     eprintln!(

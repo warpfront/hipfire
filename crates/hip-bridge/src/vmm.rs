@@ -147,6 +147,12 @@ impl VmmArena {
         self.reserved_bytes
     }
 
+    /// The primary physical allocation handle backing this arena, if any mapped
+    /// segment exists. Exposed so callers can query the handle's placement with
+    /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
+    pub fn primary_handle(&self) -> Option<HipMemGenericAllocationHandle> {
+        self.segments.first().and_then(|seg| seg.handle)
+    }
     pub const fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
     }

@@ -755,6 +755,27 @@ where
     }
     let mut store = WeightStore::with_origin(origin);
     for entry in weights {
+        // Fail closed on a requested spill: this executor's only upload is
+        // `upload_pooled_bytes` (pooled DEVICE memory), so a host-mapped placement
+        // would land in the VRAM the spill exists to free — the silent-device-
+        // allocation failure mode, arrived at from the other side. The legacy
+        // `hfq::load_weights_hfq` route (which honours `Residency` through
+        // `HfqBackend`) is what spills llama today; this pilot refuses until it
+        // grows a host upload.
+        if crate::weight_manifest::placement_residency(entry.layer, n_layers)
+            == crate::model_load::Residency::HostMapped
+        {
+            let error = FulfillError {
+                name: entry.name.clone(),
+                layer: entry.layer,
+                device: 0,
+                reason: "memory.gpu_layer_budget asks for this layer to spill to host memory, \
+                         but the manifest executor has no host-mapped upload path; unset the \
+                         key or use the legacy HFQ route"
+                    .to_string(),
+            };
+            return Err(rollback_fulfill_error(store, gpu, error));
+        }
         let devices = placement_devices(entry, mesh, n_layers);
         if devices.as_slice() != [0] {
             let error = FulfillError {

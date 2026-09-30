@@ -1614,6 +1614,116 @@ mod render_tests {
         buf.content().iter().map(|c| c.symbol()).collect()
     }
 
+    /// The easy settings list is only useful if its rows actually DRAW, and the
+    /// explainer pane only if the row's help key resolves to a curated entry.
+    /// `easy_mode_lists_stay_positionally_parallel` and
+    /// `easy_help_keys_have_explainers` both pass on data structures alone, so a
+    /// row that aligns and resolves but never renders would slip past both.
+    ///
+    /// Both renderings are pinned explicitly by setting the value in-test.
+    /// `render_with` builds on `App::load()`, which reads the developer's real
+    /// `~/.hipfire/config.toml` — asserting the unset rendering against whatever
+    /// happens to be loaded makes this test fail for anyone who has set a value,
+    /// which is precisely the bug it should be reporting an absence of.
+    #[test]
+    fn settings_easy_draws_the_offload_row_and_its_explainer() {
+        let idx = App::load()
+            .expect("App::load")
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("gpu_layer_budget")))
+            .expect("offload row present in the easy list");
+
+        let render = |value: &str| {
+            let text = render_with(|app| {
+                app.tab = Tab::Settings;
+                app.settings_easy = true;
+                app.config
+                    .values
+                    .insert("gpu_layer_budget".into(), value.to_string());
+                // Also clear the override set: a real user config that has this
+                // key set draws a "●" override marker between the label and the
+                // value, which would make the adjacency assertion below depend on
+                // the developer's own config.
+                app.config.overrides.clear();
+                app.settings_selected = idx;
+            });
+            // Match the LABEL+VALUE pair, not the bare label: a bare
+            // `contains("GPU layers")` also matches a mangled label like
+            // "GPU layersXX", which passes on exactly the regression this exists
+            // to catch. Verified by renaming the row and watching it fail.
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+
+        let unset = render("");
+        assert!(
+            unset.contains("GPU layers all on GPU"),
+            "an unset budget must render as a readable state, not a blank cell"
+        );
+
+        let set = render("32");
+        assert!(
+            set.contains("GPU layers 32 on GPU"),
+            "a set budget must render its value with the same units as the label"
+        );
+
+        assert!(
+            set.contains("Layers kept on the GPU"),
+            "selecting the row must render its curated explainer"
+        );
+    }
+
+    /// The row's *other* half: the exec side must draw too, with the value in the
+    /// same cell grammar as its sibling and its own explainer. Values are pinned
+    /// in-test because `render_with` builds on `App::load()`, which reads the
+    /// developer's real config.
+    #[test]
+    fn settings_easy_draws_the_offload_exec_row_and_its_explainer() {
+        let idx = App::load()
+            .expect("App::load")
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("offload_exec")))
+            .expect("offload_exec row present in the easy list");
+
+        let render = |value: &str| {
+            let text = render_with(|app| {
+                app.tab = Tab::Settings;
+                app.settings_easy = true;
+                app.config
+                    .values
+                    .insert("offload_exec".into(), value.to_string());
+                // A real config that has the key set draws a "●" override marker
+                // between the label and the value; clear it so the adjacency
+                // assertion does not depend on the developer's own config.
+                app.config.overrides.clear();
+                app.settings_selected = idx;
+            });
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+
+        assert!(
+            render("pcie").contains("Offload exec over PCIe"),
+            "the default arm must draw as a readable state"
+        );
+        assert!(
+            render("cpu").contains("Offload exec on CPU"),
+            "the CPU arm must draw as a readable state"
+        );
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.config.overrides.clear();
+            app.settings_selected = idx;
+        });
+        assert!(
+            text.contains("Who multiplies a spilled layer"),
+            "selecting the row must render its curated explainer"
+        );
+    }
+
     fn dash_with_system(system: SystemInfo) -> Dashboard {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),

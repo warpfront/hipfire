@@ -220,12 +220,9 @@ fn load_weights(
     let mut hfq =
         HfqFile::open(model).map_err(|e| format!("open model {}: {e}", model.display()))?;
     let mut source = HfqSource::new(&mut hfq, config);
-    qwen35::load_weights(
-        &mut source,
-        std::slice::from_mut(gpu),
-        &Layout::single(config.n_layers),
-    )
-    .map_err(|e| format!("load Qwen35 weights: {e:?}"))
+    let mut layout = Layout::single(config.n_layers);
+    qwen35::load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)
+        .map_err(|e| format!("load Qwen35 weights: {e:?}"))
 }
 
 fn make_kv(gpu: &mut Gpu, config: &Qwen35Config, max_seq: usize) -> Result<KvCache, String> {

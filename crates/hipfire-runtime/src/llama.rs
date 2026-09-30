@@ -13,7 +13,7 @@ use crate::kv_backend::{
 use crate::kv_mode::KvMode;
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, ExecTarget, Gpu, GpuTensor};
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,9 +518,55 @@ pub struct WeightTensor {
     /// `None` for tensors that weren't AWQ-pre-scaled — backward-compatible
     /// with all existing .hfq files.
     pub awq_scale: Option<GpuTensor>,
+    /// Which engine executes the ops that read this weight. Set by the loader from
+    /// the resolved residency plus `memory.offload_exec`; `Gpu` is the default and
+    /// the only value on a fully resident model. See [`ExecTarget`].
+    pub exec: ExecTarget,
 }
 
 impl WeightTensor {
+    /// Weight bytes this tensor owns, as `(device, pinned-host)`, split on each
+    /// buffer's own allocation tag.
+    ///
+    /// Deliberately the exact set [`Self::free_all`] releases — the code blob, the
+    /// ParoQuant rotation sidecars it does not alias, and the AWQ scale — so the
+    /// accounting a load reports and the teardown it will perform cannot disagree.
+    pub fn owned_bytes(&self) -> (u64, u64) {
+        let (device, host) = self.owned_metadata_bytes();
+        let bytes = self.buf.byte_size() as u64;
+        if self.buf.buf.is_host_mapped() {
+            (device, host + bytes)
+        } else {
+            (device + bytes, host)
+        }
+    }
+
+    /// The metadata part of [`Self::owned_bytes`]: exactly what
+    /// [`Self::free_metadata_only`] releases. A tied output head reports this and
+    /// not its buffer, because that buffer is the embedding's.
+    pub fn owned_metadata_bytes(&self) -> (u64, u64) {
+        let mut stats = (0u64, 0u64);
+        let mut add = |t: &GpuTensor| {
+            let bytes = t.byte_size() as u64;
+            if t.buf.is_host_mapped() {
+                stats.1 += bytes;
+            } else {
+                stats.0 += bytes;
+            }
+        };
+        if let Some(paro) = &self.paro {
+            if !paro.is_alias {
+                add(&paro.pairs);
+                add(&paro.theta);
+                add(&paro.channel_scales);
+            }
+        }
+        if let Some(awq) = &self.awq_scale {
+            add(awq);
+        }
+        stats
+    }
+
     /// Free the weight buffer and any associated metadata (ParoQuant rotation,
     /// AWQ sidecar) from GPU.
     pub fn free_all(self, gpu: &mut Gpu) {
@@ -577,6 +623,7 @@ impl WeightTensor {
                 krot: p.krot as usize,
             }),
             awq_scale: self.awq_scale.as_ref(),
+            exec: self.exec,
         }
     }
 }
@@ -681,6 +728,63 @@ pub struct LlamaWeights {
     /// (tied lm_head, single-GPU alias). When true, `free_gpu` must NOT free
     /// `output.buf`. Mirrors `Qwen35Weights` / `Qwen2Weights`.
     pub lm_head_aliases_embd: bool,
+    /// What this load actually allocated, by destination. See [`LoadStats`].
+    pub stats: crate::model_load::LoadStats,
+}
+
+/// One layer's owned bytes, as `(device, pinned-host)`.
+///
+/// Lives next to `LayerWeights`' own field list so the accounting stays in step
+/// with the struct; `LlamaHfqSource::layer_bytes`, the ParoQuant route and the GGUF
+/// route all report through here.
+pub fn layer_owned_bytes(layer: &LayerWeights) -> (u64, u64) {
+    use crate::model_load::{add_bytes, split_tensor_bytes};
+    let mut stats = split_tensor_bytes(
+        [
+            Some(&layer.attn_norm),
+            Some(&layer.ffn_norm),
+            layer.q_norm.as_ref(),
+            layer.k_norm.as_ref(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    for weight in [
+        &layer.wq,
+        &layer.wk,
+        &layer.wv,
+        &layer.wo,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.w_down,
+    ] {
+        stats = add_bytes(stats, weight.owned_bytes());
+    }
+    stats
+}
+
+/// [`crate::model_load::LoadStats`] for a llama-family load: embedding + final
+/// norm, the output head (metadata only when it aliases the embedding), and every
+/// layer. The one place the three llama routes report from.
+pub fn llama_load_stats(
+    token_embd: &GpuTensor,
+    output_norm: &GpuTensor,
+    output: &WeightTensor,
+    layers: &[LayerWeights],
+    lm_head_aliases_embd: bool,
+) -> crate::model_load::LoadStats {
+    use crate::model_load::{split_tensor_bytes, LoadStats};
+    let mut stats = LoadStats::default();
+    stats.add(split_tensor_bytes([token_embd, output_norm]));
+    stats.add(if lm_head_aliases_embd {
+        output.owned_metadata_bytes()
+    } else {
+        output.owned_bytes()
+    });
+    for layer in layers {
+        stats.add(layer_owned_bytes(layer));
+    }
+    stats
 }
 
 pub struct LayerWeights {
@@ -780,6 +884,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        exec: w.exec,
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
@@ -1306,6 +1411,7 @@ pub fn weight_gemv_prerotated(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            exec: w.exec,
         };
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
@@ -1345,6 +1451,7 @@ pub fn weight_gemv_prerotated(
                 row_stride: 0,
                 rotation: None,
                 awq_scale: None,
+                exec: w.exec,
             };
             return gemv
                 .run(
@@ -1373,6 +1480,7 @@ pub fn weight_gemv_prerotated(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        exec: w.exec,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
@@ -1410,6 +1518,7 @@ pub fn weight_gemv_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        exec: w.exec,
     };
 
     match w.gpu_dtype {
@@ -1505,8 +1614,48 @@ pub fn weight_gemv_swiglu_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        exec: w_down.exec,
     };
     match w_down.gpu_dtype {
+        // ── CPU-executed offload (`memory.offload_exec=cpu`) ─────────────────
+        // The SiLU is not a weight-reading op, so it stays on the GPU; the
+        // down-projection and its residual accumulate then run on the CPU over
+        // the host-mapped weight bytes. This is the one op family that fuses the
+        // GEMV into a kernel the seam cannot see, so it splits here rather than
+        // widening the seam.
+        _ if hipfire_dispatch::host_mapped_cpu_capable(&wr) => {
+            // The SiLU is not a weight-reading op, so it stays on the GPU; the
+            // down-projection and its residual accumulate run on the CPU over the
+            // host-mapped weight bytes.
+            //
+            // This op family fuses silu + rotate + gemv into one kernel, so the
+            // split has to be expressed by the one caller that knows about it —
+            // but it is expressed as *steps*, so the CPU decision, the rotation
+            // disposition and the launch all come from the seam and the recorded
+            // `WeightRef.exec`, not from a second private convention here.
+            gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
+            // `wr` above carries `awq_scale: None` because the fused GPU arm gets
+            // the sidecar through `w_down` (`fused_silu_mul_rotate_mq_for`).
+            // The CPU path has to apply that division itself, so hand it the real
+            // sidecar: the activation here is the raw (unrotated) SiLU output,
+            // exactly what `fused_silu_mul_rotate_mq_awq` divides before rotating.
+            let wr_cpu = WeightRef {
+                awq_scale: w_down.awq_scale.as_ref(),
+                ..wr
+            };
+            let steps = [hipfire_dispatch::pipeline::Step::GemvResidual {
+                w: &wr_cpu,
+                input: hipfire_dispatch::pipeline::GemvInput::Raw(ffn_hidden_scratch),
+                residual: x,
+                // A residual step accumulates into `residual` and never writes its
+                // `out` scratch (see `cpu_exec::run_step`), so this is a placeholder
+                // that the plan cannot touch: the step is CPU-executed by
+                // construction (the arm's guard proved the seam will take it).
+                out: x,
+            }];
+            hipfire_dispatch::pipeline::execute_steps(gpu, &ctx, &steps)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+        }
         DType::MQ4G256
         | DType::MQ4G256V2
         | DType::MQ4CG256
@@ -3540,6 +3689,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             GgmlType::Q6K => {
@@ -3552,6 +3702,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             GgmlType::Q8_0 => {
@@ -3564,6 +3715,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             GgmlType::F32 => {
@@ -3576,6 +3728,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
             _ => {
@@ -3593,6 +3746,7 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 })
             }
         }
@@ -3635,6 +3789,7 @@ pub fn load_weights(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         }
     };
 
@@ -3711,6 +3866,7 @@ pub fn load_weights(
         layers.push(layer);
     }
 
+    let stats = llama_load_stats(&token_embd, &output_norm, &output, &layers, false);
     Ok(LlamaWeights {
         token_embd,
         embd_format: embd_fmt,
@@ -3718,6 +3874,7 @@ pub fn load_weights(
         output,
         layers,
         lm_head_aliases_embd: false,
+        stats,
     })
 }
 

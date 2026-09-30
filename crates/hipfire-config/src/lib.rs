@@ -500,7 +500,12 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
 // Keep generic OpenAI-style values (`auto|none|high|max`) alongside it so
 // non-Qwen3.8 parents still validate. Values pass through as request strings;
 // model-specific mapping lives downstream of config validation.
-const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+// Which engine executes a spilled layer's weight-reading GEMVs. Exported for the
+// same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
+// a value the schema accepts becomes unselectable (and an unselectable value
+// cycles from the wrong place).
+pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -640,6 +645,30 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_KV_ADAPTIVE"),
         "Runtime VRAM-fit KV precision policy."
+    ),
+    field!(
+        "memory.gpu_layer_budget",
+        "gpu_layer_budget",
+        Memory,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: -1, max: 65536 },
+        true,
+        false,
+        Some("HIPFIRE_GPU_LAYER_BUDGET"),
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) and empty mean fully resident too: nothing is spilled unless a layer count is set."
+    ),
+    field!(
+        "memory.offload_exec",
+        "offload_exec",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("pcie"),
+        ValueRule::Enum(OFFLOAD_EXECS),
+        true,
+        false,
+        Some("HIPFIRE_OFFLOAD_EXEC"),
+        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link, 'cpu' executes those GEMVs on the CPU instead. Decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
@@ -5653,6 +5682,207 @@ mod tests {
                 raw.parse::<Deepseek4ComputePlacement>().is_err(),
                 "expected rejection for {raw}"
             );
+        }
+    }
+}
+
+/// Kernel-scope typed keys the weight loader must read (`kernel.*`).
+pub mod kernel {
+    use super::process_value;
+
+    /// Pure truth table behind [`lm_head_f16_native`], split out so unit tests can
+    /// pin the contract without touching the process-global snapshot.
+    pub fn parse_lm_head_f16_native(raw: Option<&str>) -> bool {
+        match raw
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("0") | Some("f32") | Some("fp32") | Some("legacy") => false,
+            _ => true,
+        }
+    }
+
+    /// Whether a native F16 (qt 1) LM head stays F16 instead of being expanded to
+    /// F32 (`kernel.lm_head_f16`, compat env `HIPFIRE_LM_HEAD_F16`).
+    ///
+    /// Mirrors that key's allow-list exactly: `0`/`f32`/`fp32`/`legacy` expand to
+    /// F32; `auto`/`native`/`f16`/`1` — and absent or unrecognised, which fall back
+    /// to `auto` — keep the native F16 storage. The values are identical either
+    /// way (F16 → F32 widening is exact); only which GEMV runs differs, so this is
+    /// a storage/bandwidth policy and never a numerics change.
+    ///
+    /// Lives here rather than in an arch crate because the single shared weight
+    /// reader needs it: the expansion is a per-tensor decision taken while the
+    /// bytes are read, not an arch-level one.
+    pub fn lm_head_f16_native() -> bool {
+        parse_lm_head_f16_native(process_value("HIPFIRE_LM_HEAD_F16").as_deref())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_is_the_default_and_the_failure_mode() {
+            // Absent, empty and unrecognised all keep the native F16 storage: a
+            // typo must not silently double the LM head's footprint.
+            for raw in [
+                None,
+                Some(""),
+                Some("auto"),
+                Some("native"),
+                Some("f16"),
+                Some("1"),
+                Some("surprise"),
+            ] {
+                assert!(
+                    parse_lm_head_f16_native(raw),
+                    "{raw:?} must keep the native F16 storage"
+                );
+            }
+        }
+
+        #[test]
+        fn the_four_legacy_spellings_expand_to_f32() {
+            for raw in ["0", "f32", "fp32", "legacy"] {
+                assert!(
+                    !parse_lm_head_f16_native(Some(raw)),
+                    "{raw} must select the legacy F32 expansion"
+                );
+            }
+            // Trimmed and case-insensitive, like every other key in this module.
+            assert!(!parse_lm_head_f16_native(Some(" F32 ")));
+            assert!(!parse_lm_head_f16_native(Some("LEGACY")));
+        }
+    }
+}
+
+/// Placement policy for partial GPU offload — decides which layers stay in
+/// device VRAM versus spill to host RAM, resolved once at load so placement is
+/// fixed for the model's lifetime and never thrashes per request. This module is
+/// intentionally pure and GPU-independent: it owns the configuration vocabulary
+/// ([`GpuLayerBudget`], [`OffloadExec`]) and nothing else.
+pub mod memory {
+    use super::process_value;
+
+    /// The requested resident-layer count for partial GPU offload
+    /// (`memory.gpu_layer_budget`, compat env `HIPFIRE_GPU_LAYER_BUDGET`), or
+    /// `None` when nothing is configured.
+    ///
+    /// The count is layers LEFT ON the GPU; the layers before them spill to host
+    /// RAM. `None` — unset, empty, `auto`, `-1`, or anything unparseable — keeps
+    /// every layer resident: that is the zero-diff default and the regression guard
+    /// for the whole feature, and it is why a bad value can never force an offload.
+    ///
+    /// Pure, so the contract is unit-testable without the process-global snapshot.
+    /// Placement itself is the shared loader's (`model_load::Layout::spill_count`);
+    /// this is only the number the user asked for.
+    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> Option<usize> {
+        match raw.map(|value| value.trim().to_ascii_lowercase()) {
+            Some(value) => match value.parse::<i64>() {
+                Ok(n) if n >= 0 => Some(n as usize),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// The configured resident-layer budget from the process snapshot.
+    pub fn gpu_layer_budget() -> Option<usize> {
+        parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
+    }
+
+    /// Which engine executes the ops that read a spilled layer's weights
+    /// (`memory.offload_exec`, compat env `HIPFIRE_OFFLOAD_EXEC`).
+    ///
+    /// [`OffloadExec::Pcie`] is the default and byte-for-byte today's behaviour:
+    /// the GPU kernels dereference a device alias of the host-mapped weights, so
+    /// every spilled byte crosses PCIe once per token. [`OffloadExec::Cpu`]
+    /// executes those GEMVs on the CPU instead, which bounds the per-token cost
+    /// of a spilled layer by the link rather than by device DRAM.
+    ///
+    /// This decides *who multiplies*, never *what is spilled* — placement stays
+    /// [`gpu_layer_budget`], and the KV cache stays in VRAM either way.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum OffloadExec {
+        /// GPU kernels read the host-mapped weights over PCIe (default).
+        Pcie,
+        /// CPU executes the steps whose weight tensor is host-mapped.
+        Cpu,
+    }
+
+    impl std::fmt::Display for OffloadExec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OffloadExec::Pcie => write!(f, "pcie"),
+                OffloadExec::Cpu => write!(f, "cpu"),
+            }
+        }
+    }
+
+    /// Pure truth table behind [`offload_exec`], split out so the contract is
+    /// unit-testable without the process-global snapshot. Unset, empty and
+    /// unknown all fail closed to [`OffloadExec::Pcie`] — a bad value must never
+    /// silently move work to the CPU.
+    pub fn parse_offload_exec(raw: Option<&str>) -> OffloadExec {
+        match raw.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "cpu" => OffloadExec::Cpu,
+            _ => OffloadExec::Pcie,
+        }
+    }
+
+    /// The configured [`OffloadExec`] from the process snapshot.
+    pub fn offload_exec() -> OffloadExec {
+        parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn offload_exec_roundtrip() {
+            // Only "cpu" (trimmed, case-insensitive) selects CPU execution;
+            // everything else — including the absent value — is the pcie default,
+            // so a typo can never move work to the CPU silently.
+            assert_eq!(parse_offload_exec(Some("cpu")), OffloadExec::Cpu);
+            assert_eq!(parse_offload_exec(Some(" cpu ")), OffloadExec::Cpu);
+            assert_eq!(parse_offload_exec(Some("CPU")), OffloadExec::Cpu);
+            assert_eq!(parse_offload_exec(None), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("pcie")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("PCIE")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("banana")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("cpu0")), OffloadExec::Pcie);
+            // Display is the wire spelling the registry/TOML round-trips.
+            assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
+            assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
+        }
+
+        #[test]
+        fn gpu_layer_budget_roundtrip() {
+            // Unset resolves to "no budget" — every layer resident, the zero-diff
+            // baseline.
+            assert_eq!(parse_gpu_layer_budget(None), None);
+            // Empty string is unset, not an error.
+            assert_eq!(parse_gpu_layer_budget(Some("")), None);
+            // "auto" and "-1" mean the same as unset (case-insensitive): the engine
+            // keeps every layer on the GPU until it measures the device, so neither
+            // spelling can force an offload.
+            assert_eq!(parse_gpu_layer_budget(Some("auto")), None);
+            assert_eq!(parse_gpu_layer_budget(Some("-1")), None);
+            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), None);
+            // A non-negative integer is the resident-layer count (trimmed).
+            assert_eq!(parse_gpu_layer_budget(Some("3")), Some(3));
+            assert_eq!(parse_gpu_layer_budget(Some(" 12 ")), Some(12));
+            // The counts at both ends of the range, which the loader's split
+            // arithmetic depends on: 0 spills everything, n keeps everything.
+            assert_eq!(parse_gpu_layer_budget(Some("0")), Some(0));
+            assert_eq!(parse_gpu_layer_budget(Some("65536")), Some(65536));
+            // Garbage and negative values resolve to "no budget" rather than
+            // forcing an offload.
+            assert_eq!(parse_gpu_layer_budget(Some("banana")), None);
+            assert_eq!(parse_gpu_layer_budget(Some("-2")), None);
         }
     }
 }

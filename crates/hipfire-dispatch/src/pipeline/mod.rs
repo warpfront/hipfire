@@ -114,6 +114,7 @@ pub fn execute_pipeline(
                     row_stride: params.k,
                     rotation: None,
                     awq_scale: None,
+                    exec: rdna_compute::ExecTarget::Gpu,
                 };
                 gemv.run_auto(ctx, gpu, &w, params.x, params.y)?;
             }

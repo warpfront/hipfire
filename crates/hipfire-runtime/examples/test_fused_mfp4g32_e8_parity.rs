@@ -39,8 +39,8 @@ fn main() {
         );
     }
     let mut source = HfqSource::new(&mut hfq, &config);
-    let layout = Layout::single(config.n_layers);
-    let weights = qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout)
+    let mut layout = Layout::single(config.n_layers);
+    let weights = qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &mut layout)
         .expect("load weights");
 
     // First DeltaNet layer carries both the FFN (gate/up) and the LA preamble

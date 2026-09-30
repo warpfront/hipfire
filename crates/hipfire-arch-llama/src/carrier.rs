@@ -10,8 +10,8 @@ use hipfire_runtime::dspark_core::DsparkWeights;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
-    EmbeddingFormat, ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LayerWeights,
-    LlamaConfig, LlamaWeights, WeightTensor,
+    llama_load_stats, EmbeddingFormat, ForwardScratch, KvCache, KvDims, KvLayers, KvTarget,
+    LayerWeights, LlamaConfig, LlamaWeights, WeightTensor,
 };
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as ModelSourceTrait;
@@ -395,6 +395,7 @@ fn resident_weight(
         row_stride: dtype.row_stride(k),
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
@@ -571,6 +572,14 @@ fn assemble_llama_weights(
         });
     }
     debug_assert!(cells.is_empty(), "validated LLaMA assembly left cells");
+    // Measured from the tensors this route produced, before `layers` is moved.
+    let stats = llama_load_stats(
+        &token_embd,
+        &output_norm,
+        &output,
+        &layers,
+        lm_head_aliases_embd,
+    );
     Ok(LlamaWeights {
         token_embd,
         embd_format,
@@ -578,6 +587,7 @@ fn assemble_llama_weights(
         output,
         layers,
         lm_head_aliases_embd,
+        stats,
     })
 }
 

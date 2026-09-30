@@ -1061,13 +1061,17 @@ fn run_mtp_proposal_graph_body_q8(
 }
 
 fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
-    gpu.graphs.capture_blobs.clear();
-    gpu.graphs.capture_mode = true;
+    // Through `GraphState` rather than straight at the stream, so the CPU-exec
+    // capture gate cannot be bypassed. Only the *begin* side: the matching `end`
+    // below keeps its own graph/exec/blob ownership, because
+    // `end_graph_capture` would publish this proposal graph into the plain-AR
+    // forward cache.
     let stream = gpu
         .active_stream
         .as_ref()
         .expect("proposal graph capture requires an explicit stream");
-    gpu.hip.stream_begin_capture(stream, 0)
+    gpu.graphs
+        .begin_graph_capture(&gpu.hip, gpu.device_id, stream)
 }
 
 fn end_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {

@@ -205,8 +205,8 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let weights: Qwen35Weights = {
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(config.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .expect("load weights");
 
@@ -221,6 +221,9 @@ fn main() {
     let footprint = ModelFootprint {
         weights_bytes: weight_bytes,
         kv_bytes_per_token,
+        // This demo loads fully resident (no `memory.gpu_layer_budget`), so there
+        // are no pinned host weight bytes to charge.
+        host_bytes: 0,
     };
     println!(
         "\nAdmissionController footprint (measured, this model): weights={:.2} GiB, \

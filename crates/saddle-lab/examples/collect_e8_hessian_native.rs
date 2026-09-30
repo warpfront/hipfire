@@ -132,8 +132,8 @@ fn main() {
         config.moe_intermediate_size,
     );
     let mut source = HfqSource::new(&mut hfq, &config);
-    let layout = Layout::single(config.n_layers);
-    let weights = qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout)
+    let mut layout = Layout::single(config.n_layers);
+    let weights = qwen35::load_weights(&mut source, std::slice::from_mut(&mut gpu), &mut layout)
         .expect("load weights");
     eprintln!(
         "loaded {} layers, vocab={}, n_ctx={}",

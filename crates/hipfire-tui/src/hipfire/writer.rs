@@ -81,6 +81,13 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "thinking_budget",
         kind: FieldKind::Enum(THINKING_BUDGET),
     },
+    // Also an easy row with no spec, so it was equally uneditable. The values come
+    // from the schema's own list rather than a local copy, so this cannot drift
+    // from what `set_cli` accepts.
+    FieldSpec {
+        key: "reasoning_effort",
+        kind: FieldKind::Enum(hipfire_config::REASONING_EFFORTS),
+    },
     FieldSpec {
         key: "chat_template",
         kind: FieldKind::FreeStr {
@@ -108,6 +115,27 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
             min: 512,
             max: 524288,
         },
+    },
+    // Present in `config::easy_keys()`, so the Settings editor offers it as an
+    // inline-editable row; without a spec here Enter falls through to "not
+    // editable from the TUI" and no value can be typed. `min: -1` matches the
+    // schema, where a negative value is the reserved "fully resident" spelling
+    // rather than a count. Clearing a value this row has set is the row's
+    // Delete/Backspace — the mainline clear path (`App::reset_selected_setting`)
+    // — because an emptied buffer is not the unset spelling for a numeric field,
+    // exactly as it is not for any other numeric row.
+    FieldSpec {
+        key: "gpu_layer_budget",
+        kind: FieldKind::Int {
+            min: -1,
+            max: 65536,
+        },
+    },
+    // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
+    // which is also what its own field validates against, so the two cannot drift.
+    FieldSpec {
+        key: "offload_exec",
+        kind: FieldKind::Enum(hipfire_config::OFFLOAD_EXECS),
     },
     FieldSpec {
         key: "flash_mode",
@@ -319,6 +347,87 @@ mod tests {
         assert!(write_value(&path, "port", "70000").is_err());
         assert!(write_value(&path, "kv_cache", "magic4").is_err());
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An empty buffer is *not* a clear spelling — not for the offload row and
+    /// not for any row that predates it. Clearing a setting is the row's
+    /// Delete/Backspace (`App::reset_selected_setting` -> `delete_key`), so
+    /// `write_value` keeps the rule master has: empty input on a numeric field is
+    /// the invalid input it always was. The config/CLI spelling for "unset" is
+    /// the literal `null`, which the schema's nullable fields accept.
+    #[test]
+    fn empty_input_is_invalid_and_the_null_spelling_clears_a_nullable_field() {
+        let (root, path) = temp_config();
+        assert!(
+            write_value(&path, "gpu_layer_budget", "").is_err(),
+            "empty is not a clear spelling for the offload row"
+        );
+        assert!(
+            write_value(&path, "gpu_layer_budget", "   ").is_err(),
+            "nor is whitespace-only input"
+        );
+        assert!(
+            write_value(&path, "max_tokens", "").is_err(),
+            "unchanged from master for a pre-existing Int row"
+        );
+        assert!(
+            write_value(&path, "temperature", "").is_err(),
+            "unchanged from master for a pre-existing Float row"
+        );
+        assert!(
+            write_value(&path, "mmq_screen", "").is_err(),
+            "unchanged from master for a pre-existing Enum row"
+        );
+        assert!(
+            write_value(&path, "deepseek4_experts_per_token", "").is_err(),
+            "unchanged from master even for a pre-existing *nullable* integer"
+        );
+        assert!(!path.exists(), "a rejected write must not touch the file");
+
+        // `null` is the schema's unset spelling for a nullable field: it drops
+        // the key. A real value still writes, and a bad one is still rejected.
+        assert_eq!(
+            write_value(&path, "gpu_layer_budget", "null").unwrap(),
+            Value::Null
+        );
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert!(
+            loaded.layer.get("gpu_layer_budget").is_none(),
+            "the null spelling takes the key off disk"
+        );
+        write_value(&path, "gpu_layer_budget", "24").unwrap();
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("gpu_layer_budget"),
+            Some(&ConfigValue::Integer(24))
+        );
+        assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
+
+        // A free string keeps the empty string as a value.
+        assert_eq!(
+            write_value(&path, "prefill_drafter", "").unwrap(),
+            Value::String(String::new())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The option list a user can cycle through must be what the schema accepts:
+    /// a value the schema accepts but the TUI omits is unselectable, and one the
+    /// TUI offers but the schema rejects is a dead end.
+    #[test]
+    fn offload_exec_options_are_the_schema_values() {
+        let (root, path) = temp_config();
+        let spec = field_spec("offload_exec").expect("offload_exec has a spec");
+        let FieldKind::Enum(options) = spec.kind else {
+            panic!("offload_exec must be an enum row, got {:?}", spec.kind);
+        };
+        assert_eq!(options, hipfire_config::OFFLOAD_EXECS);
+        for value in options {
+            write_value(&path, "offload_exec", value)
+                .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
+        }
+        assert!(write_value(&path, "offload_exec", "gpu").is_err());
         let _ = fs::remove_dir_all(root);
     }
 

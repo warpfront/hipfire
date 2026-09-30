@@ -314,6 +314,7 @@ pub(crate) fn gemv_auto(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     };
     // DeepSeek prepares and reuses the FWHT input in architecture-owned
     // scratch. `run_auto` treats its input as plain and rotates every typed MQ
@@ -1481,7 +1482,9 @@ pub fn ensure_request_capacity(
     Ok(scratch_grew || cache_grew)
 }
 
-pub(crate) fn refresh_compressor_cache_shard_tables(states: &mut [DeepseekV4State]) -> Result<(), String> {
+pub(crate) fn refresh_compressor_cache_shard_tables(
+    states: &mut [DeepseekV4State],
+) -> Result<(), String> {
     let world = states.len();
     if !matches!(world, 3 | 4) {
         return Err(format!(

@@ -281,10 +281,10 @@ fn load_qwen35_pp(
             .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
     );
     let _hfq_cache_warmer = hfq_file.start_cache_warmup();
-    let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
+    let mut layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
     let weights =
-        hipfire_arch_qwen35::qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout)
+        hipfire_arch_qwen35::qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &mut layout)
             .map_err(|e| format!("{e}"))?;
     let is_kv_layer: Vec<bool> = config
         .layer_types
@@ -665,11 +665,11 @@ impl Carrier for Qwen35Carrier {
                 let mut paro_source =
                     hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
                         .map_err(|e| format!("ParoSource::new: {e:?}"))?;
-                let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
+                let mut paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
                 let weights = hipfire_arch_qwen35::qwen35::load_weights(
                     &mut paro_source,
                     std::slice::from_mut(ctx.gpu),
-                    &paro_layout,
+                    &mut paro_layout,
                 )
                 .map_err(|e| format!("load_weights: {e:?}"))?;
                 hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);

@@ -307,6 +307,7 @@ mod tests {
             ModelFootprint {
                 weights_bytes: GIB,
                 kv_bytes_per_token: 1024,
+                host_bytes: 0,
             },
             32 * GIB,
         );

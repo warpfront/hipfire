@@ -2094,15 +2094,18 @@ impl Gpu {
             .ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
     }
 
-    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
-    /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
+    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256.
+    ///
+    /// `x` must be **pre-rotated** — one `mq_rotate_x` pass over x, not per row —
+    /// because the kernel's inner loop is the plain HFQ4-G256 dot product and does
+    /// no rotation of its own. (The sign tables belong to `mq_rotate_x`, not here:
+    /// passing them as kernargs shifted `m`/`k` out of their slots, which is why
+    /// this wrapper's callers saw an all-zero result.)
     pub fn gemv_mq4g256(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
-        signs1: &GpuTensor,
-        signs2: &GpuTensor,
         m: usize,
         k: usize,
     ) -> HipResult<()> {
@@ -2112,16 +2115,12 @@ impl Gpu {
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
-        let mut s1_ptr = signs1.buf.as_ptr();
-        let mut s2_ptr = signs2.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
             &mut y_ptr as *mut _ as *mut c_void,
-            &mut s1_ptr as *mut _ as *mut c_void,
-            &mut s2_ptr as *mut _ as *mut c_void,
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];

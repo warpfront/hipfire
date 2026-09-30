@@ -1463,7 +1463,15 @@ fn q8_attend_slots(
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
             let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
             return gpu.attention_q8_0_flash_prefill_wmma(
-                q, &k_view, &v_view, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
+                q,
+                &k_view,
+                &v_view,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
                 batch_size,
             );
         }
@@ -2489,6 +2497,27 @@ pub fn forward_batch_slots_graphed(
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
     if !gpu.slots_decode_graph() || !pure_decode {
+        return forward_batch_slots(
+            gpu,
+            weights,
+            config,
+            batch,
+            pool,
+            dn_states,
+            k_arenas,
+            v_arenas,
+            desc_staging,
+            pbs,
+            s,
+            logits_out,
+        );
+    }
+    // The captured step includes the per-slot lm_head `Step::Gemv`, so a spilled
+    // model routes it to the CPU (a host sync point) and the graph must not be
+    // used — same rule as the dense AR graph in `qwen35/forward.rs`, and the same
+    // loader-recorded flag; `GraphState` refuses the capture independently.
+    if gpu.graphs.cpu_exec_weights {
+        hipfire_dispatch::log_capture_disabled_once();
         return forward_batch_slots(
             gpu,
             weights,

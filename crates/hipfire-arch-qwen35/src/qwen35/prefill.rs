@@ -392,7 +392,6 @@ fn prefill_max_batch_for_arch(arch: &str, fp8_chunk512: bool) -> usize {
     }
 }
 
-
 fn explicit_prefill_max_batch() -> Option<usize> {
     hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
         .ok()
@@ -2723,6 +2722,7 @@ pub(crate) fn run_plain_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     };
     let params = GemmParams {
         w: &w,
@@ -2773,6 +2773,7 @@ pub(crate) fn run_residual_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     };
     // The residual stream `y` is BOTH the residual and the output (`y += W·x`).
     let params = GemmParams {
@@ -3279,6 +3280,7 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
             row_stride: ffn.router.k,
             rotation: None,
             awq_scale: None,
+            exec: ffn.router.exec,
         };
         let params = GemmParams {
             w: &w,
@@ -9185,10 +9187,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }

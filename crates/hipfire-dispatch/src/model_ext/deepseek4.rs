@@ -10,10 +10,10 @@
 
 #![cfg(any())]
 
-use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GemvFamily, GemvParams, GemvVariant, WeightRef};
 use crate::types::DispatchError;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ── Weight dispatch helpers ─────────────────────────────
 
@@ -45,6 +45,9 @@ fn weight_ref<'a>(w: &'a GpuTensor, m: usize, k: usize) -> WeightRef<'a> {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        // A bare `GpuTensor` carries no execution target, and this helper only
+        // serves the device-resident DeepSeek4 path.
+        exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
@@ -190,14 +193,26 @@ impl Deepseek4ModelExt for () {
         params: &CompressorParams,
     ) -> Result<(), DispatchError> {
         gemv_auto_dispatch(
-            gemv, ctx, gpu,
-            params.wkv, params.x_rotated, params.x_plain,
-            params.kv_buf, params.proj_dim, params.hidden_size,
+            gemv,
+            ctx,
+            gpu,
+            params.wkv,
+            params.x_rotated,
+            params.x_plain,
+            params.kv_buf,
+            params.proj_dim,
+            params.hidden_size,
         )?;
         gemv_auto_dispatch(
-            gemv, ctx, gpu,
-            params.wgate, params.x_rotated, params.x_plain,
-            params.score_buf, params.proj_dim, params.hidden_size,
+            gemv,
+            ctx,
+            gpu,
+            params.wgate,
+            params.x_rotated,
+            params.x_plain,
+            params.score_buf,
+            params.proj_dim,
+            params.hidden_size,
         )?;
         Ok(())
     }
@@ -210,9 +225,15 @@ impl Deepseek4ModelExt for () {
         params: &JointKvParams,
     ) -> Result<(), DispatchError> {
         gemv_auto_dispatch(
-            gemv, ctx, gpu,
-            params.wkv, params.tmp, params.tmp_plain,
-            params.kv, params.kv_dim, params.hidden_size,
+            gemv,
+            ctx,
+            gpu,
+            params.wkv,
+            params.tmp,
+            params.tmp_plain,
+            params.kv,
+            params.kv_dim,
+            params.hidden_size,
         )?;
         gpu.rmsnorm_f32(params.kv, params.kv_norm, params.kv, params.rms_norm_eps)
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -232,26 +253,45 @@ impl Deepseek4ModelExt for () {
         // Step 1: RMSNorm (+ optional FWHT rotation).
         if wq_a_needs_fwht {
             gpu.fused_rmsnorm_rotate_mq_plain(
-                params.hc_x_in, params.attn_norm,
-                params.tmp, params.tmp_plain,
-                params.hidden_size, params.rms_norm_eps,
+                params.hc_x_in,
+                params.attn_norm,
+                params.tmp,
+                params.tmp_plain,
+                params.hidden_size,
+                params.rms_norm_eps,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
         } else {
-            gpu.rmsnorm_f32(params.hc_x_in, params.attn_norm, params.tmp_plain, params.rms_norm_eps)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.rmsnorm_f32(
+                params.hc_x_in,
+                params.attn_norm,
+                params.tmp_plain,
+                params.rms_norm_eps,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
         }
 
         // Step 2: wq_a GEMV → q_lat bottleneck.
         gemv_auto_dispatch(
-            gemv, ctx, gpu,
-            params.wq_a, params.tmp, params.tmp_plain,
-            params.q_lat, params.q_lora_rank, params.hidden_size,
+            gemv,
+            ctx,
+            gpu,
+            params.wq_a,
+            params.tmp,
+            params.tmp_plain,
+            params.q_lat,
+            params.q_lora_rank,
+            params.hidden_size,
         )?;
 
         // Step 3: q_norm on the bottleneck.
-        gpu.rmsnorm_f32(params.q_lat, params.q_norm, params.q_lat, params.rms_norm_eps)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gpu.rmsnorm_f32(
+            params.q_lat,
+            params.q_norm,
+            params.q_lat,
+            params.rms_norm_eps,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
 
         // Step 4: FWHT rotate q_lat for wq_b (if needed).
         if wq_b_needs_fwht {
@@ -262,9 +302,15 @@ impl Deepseek4ModelExt for () {
         // Step 5: wq_b GEMV → full Q head space.
         let q_total = params.n_heads * params.head_dim;
         gemv_auto_dispatch(
-            gemv, ctx, gpu,
-            params.wq_b, params.q_lat_rot, params.q_lat,
-            params.q, q_total, params.q_lora_rank,
+            gemv,
+            ctx,
+            gpu,
+            params.wq_b,
+            params.q_lat_rot,
+            params.q_lat,
+            params.q,
+            q_total,
+            params.q_lora_rank,
         )?;
 
         // Step 6: per-head RMSNorm.

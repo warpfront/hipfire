@@ -52,6 +52,10 @@ serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+# The canonical CPU decoder for quantized weights (`quant::dequant_group`): the
+# CPU-exec offload path runs it, and `weight_backend::dequantize_to_f32` delegates
+# to it so there is one copy of every byte layout rather than two transcriptions.
+hipfire-cpu = { path = "../hipfire-cpu" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
@@ -112,6 +116,9 @@ tracing = "0.1"
 [dev-dependencies]
 # SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
 sha2.workspace = true
+# `tests/cpu_quant_cross_check.rs`: holds `hipfire-cpu`'s transcription of the
+# canonical decoder to the decoder itself, over the real fixture tensors.
+hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }

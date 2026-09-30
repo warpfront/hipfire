@@ -9,10 +9,11 @@
 
 use crate::hfq::HfqFile;
 use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
+use crate::model_load::Residency;
 use hip_bridge::HipResult;
 use rdna_compute::{
-    DType, Gpu, GpuTensor, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES,
-    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
+    DType, ExecTarget, Gpu, GpuTensor, HipError, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES,
+    MQ4C_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
 };
 
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
@@ -221,6 +222,7 @@ pub fn reupload_f16_as_f32(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -244,6 +246,7 @@ pub fn tied_lm_head_alias(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
@@ -405,6 +408,38 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 30,
         dtype: DType::MQ4G256Lloyd,
     },
+    // qt 31-37: formats qwen35's loader decoded privately before the registry
+    // covered them. All passthrough (upload bytes verbatim, tag the dtype) and
+    // all with a K%256 kernel constraint; the MFP* arms carry the offline FWHT
+    // rotation kind in the per-row header, so they are NOT interchangeable with
+    // their MQ* / HFP4G32 neighbours at the same byte size.
+    RawCodec {
+        quant_type: 31,
+        dtype: DType::MQ5G256,
+    },
+    RawCodec {
+        quant_type: 32,
+        dtype: DType::MFP4G32Lloyd,
+    },
+    RawCodec {
+        quant_type: 33,
+        dtype: DType::MFP4G32P,
+    },
+    RawCodec {
+        quant_type: 34,
+        dtype: DType::MFP4G32E8,
+    },
+    // qt 35 (MFP4G32E8SOA) is deliberately absent: it is an lm_head-only format
+    // whose loader expands SoA rows to a row-major FP16 shadow instead of
+    // uploading the blob, so it is not a passthrough codec.
+    RawCodec {
+        quant_type: 36,
+        dtype: DType::MFP3G32E8,
+    },
+    RawCodec {
+        quant_type: 37,
+        dtype: DType::MFP2G32E8,
+    },
     // MQ2/MQ3-G256-GL ("global Lloyd"): 2- resp. 3-bit codes against ONE
     // tensor-global codebook plus a per-block fp16 scale, stored SoA as
     // `[M*gpr*IDX B indices][M*gpr*2 B scales]` (IDX = 64 / 96). Passthrough
@@ -479,17 +514,60 @@ pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
     raw_codec(quant_type).map(|codec| codec.dtype)
 }
 
+/// Expected packed payload length for the group-of-256 formats whose group count
+/// is `K/256` and whose group width is a format constant, or `None` for a format
+/// with no such layout to validate.
+///
+/// One row per format. These six checks used to be six copies of the same
+/// multiply with six hand-written error strings, split between this file and the
+/// qwen35 loader — so a format could be validated in one and not the other.
+/// Callers must run the K%256 guard first: `k / 256` truncates silently.
+pub(crate) fn expected_payload_bytes(dtype: DType, m: usize, k: usize) -> Option<usize> {
+    let group_bytes = match dtype {
+        DType::MQ4G256V2 => 136,
+        DType::MQ4CG256 => MQ4C_GROUP_BYTES,
+        DType::MQ6G256V2 => MQ6G256V2_GROUP_BYTES,
+        DType::MQ5G256V2 => MQ5G256V2_GROUP_BYTES,
+        DType::MQ3G256V2 => MQ3G256V2_GROUP_BYTES,
+        DType::MQ2G256V2 => MQ2G256V2_GROUP_BYTES,
+        _ => return None,
+    };
+    Some(m * (k / 256) * group_bytes)
+}
+
+/// Which engine reads a weight at `residency`.
+///
+/// The one place that decision is made. A device weight is always read by the
+/// GPU; a host-mapped weight is read by the CPU only when `memory.offload_exec=cpu`
+/// asks for it, so the `pcie` default keeps the GPU kernels dereferencing it over
+/// the link — byte-identical, slower.
+pub(crate) fn exec_for(residency: Residency) -> ExecTarget {
+    if residency == Residency::HostMapped
+        && hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu
+    {
+        ExecTarget::Cpu
+    } else {
+        ExecTarget::Gpu
+    }
+}
+
 /// Decode a passthrough quant format: enforce the K%256 guard (via DType),
-/// upload bytes verbatim, build the `WeightTensor` with the dtype + its
-/// DType-derived row_stride. `name` is the caller context for the guard panic.
-/// AWQ sidecars are attached by the caller (hfq), never here.
+/// upload bytes verbatim to `residency`, build the `WeightTensor` with the dtype
+/// + its DType-derived row_stride. `name` is the caller context for the guard
+/// error. AWQ sidecars are attached by the caller (hfq), never here.
+///
+/// Takes `&mut Gpu` because a host-mapped upload registers its owner on the `Gpu`
+/// (so `hipHostFree` can find it later); `Residency::Device` never needs that, but
+/// one signature for both is what keeps this a single decoder instead of a device
+/// copy and a host copy that drift.
 pub(crate) fn decode_raw_codec(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     codec: &RawCodec,
     data: &[u8],
     m: usize,
     k: usize,
     name: &str,
+    residency: Residency,
 ) -> HipResult<WeightTensor> {
     // Low-bit layout validation — centralized before any upload/host-dequant.
     // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
@@ -506,87 +584,22 @@ pub(crate) fn decode_raw_codec(
             ),
         ));
     }
-    if codec.dtype == DType::MQ4G256V2 {
-        let gpr = k / 256;
-        let expected = m * gpr * 136;
+    if let Some(expected) = expected_payload_bytes(codec.dtype, m, k) {
         if data.len() != expected {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "{name}: {:?} blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+                    codec.dtype,
                     data.len()
                 ),
             ));
         }
     }
-    if codec.dtype == DType::MQ4CG256 {
-        let gpr = k / 256;
-        // Pad layout: 136 B/group (fp16 scale+zero @+0, 4 B zero pad @+4,
-        // 128 B nibbles @+8). Compact 132 B groups are not a production path.
-        let expected = m * gpr * MQ4C_GROUP_BYTES;
-        if data.len() != expected {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
-                    data.len()
-                ),
-            ));
-        }
-    }
-    if codec.dtype == DType::MQ6G256V2 {
-        let gpr = k / 256;
-        let expected = m * gpr * MQ6G256V2_GROUP_BYTES;
-        if data.len() != expected {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
-                    data.len()
-                ),
-            ));
-        }
-    }
-    if codec.dtype == DType::MQ5G256V2 {
-        let gpr = k / 256;
-        let expected = m * gpr * MQ5G256V2_GROUP_BYTES;
-        if data.len() != expected {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
-                    data.len()
-                ),
-            ));
-        }
-    }
-    if codec.dtype == DType::MQ3G256V2 {
-        let gpr = k / 256;
-        let expected = m * gpr * MQ3G256V2_GROUP_BYTES;
-        if data.len() != expected {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
-                    data.len()
-                ),
-            ));
-        }
-    }
-    if codec.dtype == DType::MQ2G256V2 {
-        let gpr = k / 256;
-        let expected = m * gpr * MQ2G256V2_GROUP_BYTES;
-        if data.len() != expected {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
-                    data.len()
-                ),
-            ));
-        }
-    }
-    let buf = gpu.upload_raw(data, &[data.len()])?;
+    let buf = match residency {
+        Residency::Device => gpu.upload_raw(data, &[data.len()])?,
+        Residency::HostMapped => gpu.upload_raw_host(data, &[data.len()])?,
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: codec.dtype,
@@ -595,6 +608,7 @@ pub(crate) fn decode_raw_codec(
         row_stride: codec.dtype.row_stride(k),
         paro: None,
         awq_scale: None,
+        exec: exec_for(residency),
     })
 }
 
@@ -670,21 +684,44 @@ fn validate_lowbit_layout(
     Ok(())
 }
 
-/// Quant `data` → device `WeightTensor [m, k]`. Moved from
+/// Upload raw bytes to `residency`. The one place the device/host choice is made,
+/// so every reader in the crate resolves the spill the same way and a new format
+/// cannot accidentally arrive with a device-only upload path.
+pub(crate) fn upload_bytes(
+    gpu: &mut Gpu,
+    data: &[u8],
+    shape: &[usize],
+    residency: Residency,
+) -> HipResult<GpuTensor> {
+    match residency {
+        Residency::Device => gpu.upload_raw(data, shape),
+        Residency::HostMapped => gpu.upload_raw_host(data, shape),
+    }
+}
+
+/// Quant `data` → `WeightTensor [m, k]` at `residency`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
+///
+/// The host-decode formats (qt 1/2/16) keep their explicit widening here rather
+/// than becoming `RAW_CODECS` rows: they are decoded, not uploaded verbatim. They
+/// do take `residency`, because an offloaded layer must never quietly land in the
+/// VRAM the spill exists to free.
 pub fn dequant_weight_raw(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    residency: Residency,
 ) -> HipResult<WeightTensor> {
     // Host-decode formats stay explicit (NOT passthrough table rows):
     match quant_type {
         1 => {
-            // F16 — keep as F16 bytes (the HFQ path host-decodes qt 1 to F32 instead;
-            // this divergence is why qt 1 is not a RAW_CODECS row).
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            // F16 — keep as F16 bytes. This is the `kernel.lm_head_f16` *native*
+            // arm; the legacy `f32` spelling expands qt 1 to F32 before reaching
+            // here (see `hfq::load_weight_tensor`). Either way it is decoded, not
+            // uploaded verbatim, which is why qt 1 is not a RAW_CODECS row.
+            let buf = upload_bytes(gpu, data, &[data.len()], residency)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F16,
@@ -693,11 +730,12 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: exec_for(residency),
             })
         }
         2 => {
             // F32 — upload as [m, k].
-            let buf = gpu.upload_raw(data, &[m, k])?;
+            let buf = upload_bytes(gpu, data, &[m, k], residency)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -706,6 +744,7 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: exec_for(residency),
             })
         }
         16 => {
@@ -714,7 +753,7 @@ pub fn dequant_weight_raw(
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            let buf = upload_bytes(gpu, bytes, &[m, k], residency)?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -723,10 +762,11 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                exec: exec_for(residency),
             })
         }
         other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw"),
+            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw", residency),
             None => Err(hip_bridge::HipError::new(
                 0,
                 &format!("unsupported quant_type {other} for dequant_weight_raw"),
@@ -735,16 +775,11 @@ pub fn dequant_weight_raw(
     }
 }
 
-/// RMSNorm scale `data` → device `GpuTensor [shape]`, adding `bias` to every
-/// element (`1.0` for qwen3.5/gemma, `0.0` for qwen2/llama/minimax). Moved from
-/// `load_norm_weight` (Task 2), with the `+= 1.0` generalised to `+= bias`.
-pub fn dequant_norm(
-    gpu: &mut Gpu,
-    quant_type: u8,
-    data: &[u8],
-    shape: &[usize],
-    bias: f32,
-) -> HipResult<GpuTensor> {
+/// CPU-side dequant of an HTQ norm weight to F32 (qt 1/2/16), adding `bias`. Factored
+/// out of [`dequant_norm`] so this device path and its host-located counterpart decode
+/// byte-for-byte identically — a sign/normalization drift here is the "token soup"
+/// attractor failure mode, so there is exactly one copy.
+fn dequantize_norm(quant_type: u8, data: &[u8], shape: &[usize], bias: f32) -> Vec<f32> {
     let mut f32_data: Vec<f32> = match quant_type {
         1 => data
             .chunks_exact(2)
@@ -767,6 +802,21 @@ pub fn dequant_norm(
     for v in &mut f32_data {
         *v += bias;
     }
+    f32_data
+}
+
+/// RMSNorm scale `data` → device `GpuTensor [shape]`, adding `bias` to every element
+/// (`1.0` for qwen3.5/gemma, `0.0` for qwen2/llama/minimax). Moved from `load_norm_weight`
+/// (Task 2), with the `+= 1.0` generalised to `+= bias`. The CPU dequant is factored into
+/// [`dequantize_norm`] so the host-located offload path stays byte-identical.
+pub fn dequant_norm(
+    gpu: &mut Gpu,
+    quant_type: u8,
+    data: &[u8],
+    shape: &[usize],
+    bias: f32,
+) -> HipResult<GpuTensor> {
+    let f32_data = dequantize_norm(quant_type, data, shape, bias);
     gpu.upload_f32(&f32_data, shape)
 }
 
@@ -850,8 +900,31 @@ fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
-    let f32_data: Vec<f32> = match quant_type {
+/// CPU-side dequant of HTQ weight bytes to F32 for every supported quant_type
+/// (F16/F32/BF16, Q8_0, MQ4/6/MQ3, MFP4, codebook 19/20/30, ...). Factored out of
+/// [`dequant_f32`] so this device path and its host-located counterpart decode
+/// byte-for-byte identically — a sign/normalization drift here is the "token soup"
+/// attractor failure mode, so there is exactly one copy.
+fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
+    // `hipfire_cpu` is the canonical CPU decoder: it is the one the CPU-exec offload
+    // path actually runs, and it covers formats this match did not (qt 49's
+    // MQ3G256V2, for instance, used to reach the panic at the end of this function).
+    // Delegating leaves one implementation to keep correct instead of two
+    // transcriptions that must agree — which is why the cross-check that used to
+    // hold them together is gone.
+    if let Some(q) = hipfire_cpu::quant::CpuQuant::from_quant_type(quant_type) {
+        let group_elems = q.group_elems();
+        if group_elems != 0 && n % group_elems == 0 && q.group_bytes() != 0 {
+            let mut out = vec![0.0f32; n];
+            for (g, group) in out.chunks_mut(group_elems).enumerate() {
+                let start = g * q.group_bytes();
+                let packed = data.get(start..).unwrap_or_default();
+                hipfire_cpu::quant::dequant_group(q, packed, group);
+            }
+            return out;
+        }
+    }
+    match quant_type {
         1 => data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -1253,7 +1326,15 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
         40 => dequant_tq2_to_f32(data, n),
         41 => dequant_bq1_to_f32(data, n),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
-    };
+    }
+}
+
+/// Dequantize an HTQ weight tensor to a device `F32 [n]` tensor. The CPU dequant is
+/// factored into [`dequantize_to_f32`] so the host-located offload path stays byte for
+/// byte identical — the only difference from the device path is the upload target
+/// (device memory vs host-mapped system RAM readable over PCIe).
+pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipResult<GpuTensor> {
+    let f32_data = dequantize_to_f32(quant_type, data, n);
     gpu.upload_f32(&f32_data[..n], &[n])
 }
 
@@ -1289,9 +1370,22 @@ pub struct HfqBackend<'a> {
     pub gpu: &'a mut Gpu,
     pub norm_bias: f32,
     pub candidates: fn(&str) -> Vec<String>,
-    pub read_proj:
-        fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+    pub read_proj: fn(
+        &HfqFile,
+        &mut Gpu,
+        &str,
+        usize,
+        usize,
+        fn(&str) -> Vec<String>,
+        Residency,
+    ) -> HipResult<WeightTensor>,
     pub layer: usize,
+    /// Where this layer's weight tensors land: device VRAM, or host-mapped system
+    /// RAM read over PCIe. Set per-layer by the loader from the resolved placement
+    /// ([`crate::model_load::Layout::residency_for_layer`]); `Device` is the
+    /// fully-resident, zero-diff default. See [`Gpu::upload_f32_host`] for the
+    /// host upload path these weights use.
+    pub residency: Residency,
 }
 
 impl<'a> WeightBackend for HfqBackend<'a> {
@@ -1300,32 +1394,52 @@ impl<'a> WeightBackend for HfqBackend<'a> {
     }
 
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+        let name = hfq_proj_name(self.layer, rel);
+        // One reader for both residencies: the `Residency` argument is what makes
+        // the difference, so there is no separate host entry point to keep in step
+        // (and no "this arch has no host reader" failure mode to explain).
         (self.read_proj)(
             self.hfq,
             self.gpu,
-            &hfq_proj_name(self.layer, rel),
+            &name,
             m,
             k,
             self.candidates,
+            self.residency,
         )
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
-        dequant_norm(self.gpu, info.quant_type, &data, shape, self.norm_bias)
+        let f32_data = dequantize_norm(info.quant_type, &data, shape, self.norm_bias);
+        if self.residency == Residency::HostMapped {
+            self.gpu.upload_f32_host(&f32_data, shape)
+        } else {
+            self.gpu.upload_f32(&f32_data, shape)
+        }
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
-        dequant_f32(self.gpu, info.quant_type, &data, n)
+        let f32_data = dequantize_to_f32(info.quant_type, &data, n);
+        if self.residency == Residency::HostMapped {
+            self.gpu.upload_f32_host(&f32_data[..n], &[n])
+        } else {
+            self.gpu.upload_f32(&f32_data[..n], &[n])
+        }
     }
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
-        let t = dequant_f32(self.gpu, info.quant_type, &data, n)?;
+        let f32_data = dequantize_to_f32(info.quant_type, &data, n);
+        let t = if self.residency == Residency::HostMapped {
+            self.gpu.upload_f32_host(&f32_data[..n], &[n])?
+        } else {
+            self.gpu.upload_f32(&f32_data[..n], &[n])?
+        };
         assert_eq!(
             t.numel(),
             n,
@@ -1708,6 +1822,17 @@ mod tests {
             (21, DType::HFP4G32),       // wb:459 / hfq:944
             (24, DType::MFP4G32),       // wb:475 / hfq:963
             (30, DType::MQ4G256Lloyd),  // wb:443 / hfq:978 (renumbered from 21; do not swap)
+            // qt 31-37 — decoded by qwen35's private match before the registry
+            // covered them (q35 = hipfire-arch-qwen35/src/qwen35/load.rs arms).
+            // These were `assert!(k % 256 == 0)` in that match; the guard is now
+            // `DType::requires_k_mod_256`, so a wrong dtype here also silently
+            // drops the K constraint rather than mis-tagging alone.
+            (31, DType::MQ5G256),      // q35:331 MQ5-G256, 168 B/group 5.25 bpw
+            (32, DType::MFP4G32Lloyd), // q35:366 mfp4 + 32 B fp16 codebook prefix
+            (33, DType::MFP4G32P),     // q35:388 mfp4 + E4M3 per-block scale, no prefix
+            (34, DType::MFP4G32E8),    // q35:406 E8-lattice codewords, same row_bytes
+            (36, DType::MFP3G32E8),    // q35:433 3-bit lattice, 13 B/blk 3.25 bpw
+            (37, DType::MFP2G32E8),    // q35:453 2-bit lattice,  9 B/blk 2.25 bpw
             // GL ("global Lloyd") codebook formats — MoE-routed-expert only.
             // RHS pinned against hipfire-quantize `QuantType::MQ2G256GL = 38` /
             // `MQ3G256GL = 39`; a swap here mis-decodes 64 B/group indices as
@@ -1741,6 +1866,33 @@ mod tests {
             assert!(
                 raw_codec(qt).is_none(),
                 "qt={qt} is host-decode, must not be a raw codec"
+            );
+        }
+    }
+
+    /// The CPU decoder table and the dispatch dtype map must agree.
+    ///
+    /// `hipfire_cpu::quant::CpuQuant` is the canonical per-format decoder (indexed
+    /// by quant_type) and `hipfire_dispatch::cpu_exec::cpu_quant_for` is the
+    /// per-DType view of it that the dispatch seam actually calls. Two tables for
+    /// one fact is exactly the kind of pair that drifts: a new format added to one
+    /// and not the other means a weight either never moves to the CPU or moves
+    /// there with no decoder. Whichever side gains a row, this fails until the
+    /// other does too.
+    #[test]
+    fn cpu_decoder_tables_agree_per_format() {
+        use hipfire_cpu::quant::CpuQuant;
+        for codec in RAW_CODECS {
+            let Some(from_qt) = CpuQuant::from_quant_type(codec.quant_type) else {
+                continue;
+            };
+            assert_eq!(
+                hipfire_dispatch::cpu_exec::cpu_quant_for(codec.dtype),
+                Some(from_qt),
+                "qt {} ({:?}): the CPU decoder table says {from_qt:?} but the \
+                 dispatch dtype map disagrees",
+                codec.quant_type,
+                codec.dtype
             );
         }
     }

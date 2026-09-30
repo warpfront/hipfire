@@ -11,9 +11,14 @@
 mod macros;
 
 pub mod context;
+pub mod cpu_exec;
 pub mod families;
 pub mod ops;
 pub mod pipeline;
+pub use cpu_exec::{
+    cpu_exec_counters, cpu_quant_for, host_mapped_cpu_capable, log_capture_disabled_once,
+    run_host_mapped_gemv, run_host_mapped_gemv_residual,
+};
 pub mod resource;
 pub mod tables;
 pub mod traits;

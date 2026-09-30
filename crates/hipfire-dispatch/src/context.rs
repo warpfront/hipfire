@@ -26,6 +26,10 @@ pub struct DispatchCtx {
     pub flags: Arc<FeatureFlags>,
     pub resources: ResourceManager,
     pub workload: DispatchWorkload,
+    /// Whether this model's step mix includes CPU-executed weights. Read from the
+    /// `Gpu` in [`Self::new`], which the loader set once from the resolved
+    /// placement, so a dispatch site cannot forget to pass it.
+    cpu_exec: bool,
 }
 
 impl DispatchCtx {
@@ -41,7 +45,22 @@ impl DispatchCtx {
             flags,
             resources: ResourceManager::new(gpu),
             workload: DispatchWorkload::Standard,
+            cpu_exec: gpu.graphs.cpu_exec_weights,
         }
+    }
+
+    /// Whether CPU-executed steps are possible for this model. `false` on any
+    /// model that spills nothing, which is every model without
+    /// `memory.gpu_layer_budget`.
+    pub fn cpu_exec(&self) -> bool {
+        self.cpu_exec
+    }
+
+    /// Override the CPU-exec flag, for seams that build a context without a loaded
+    /// model (tests, dry runs).
+    pub fn with_cpu_exec(mut self, cpu_exec: bool) -> Self {
+        self.cpu_exec = cpu_exec;
+        self
     }
 
     /// Attach call-site semantics to this otherwise hardware-derived context.
@@ -62,6 +81,9 @@ impl DispatchCtx {
             flags,
             resources: crate::resource::ResourceManager::for_test(),
             workload: DispatchWorkload::Standard,
+            // No loaded model to ask, so the conservative default is "no CPU
+            // steps"; tests that need them call `with_cpu_exec(true)`.
+            cpu_exec: false,
         }
     }
 }

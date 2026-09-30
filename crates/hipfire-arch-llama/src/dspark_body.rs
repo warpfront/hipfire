@@ -59,9 +59,10 @@ use hipfire_runtime::dspark_core::{
 };
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
-    weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
-    PrefillBatchScratch, WeightTensor,
+    llama_load_stats, weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig,
+    LlamaWeights, ModelArch, PrefillBatchScratch, WeightTensor,
 };
+use hipfire_runtime::model_load::Residency;
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
     HfqBackend,
@@ -169,6 +170,8 @@ pub fn load_qwen3_dspark(
     };
     let lm_head = load_global_proj(source, gpu, "lm_head.weight", draft_vocab, cfg.dim)?;
 
+    // Measured from the tensors this sidecar route produced.
+    let stats = llama_load_stats(&token_embd, &output_norm, &lm_head, &layers, false);
     let weights = LlamaWeights {
         token_embd,
         embd_format,
@@ -176,6 +179,7 @@ pub fn load_qwen3_dspark(
         output: lm_head,
         layers,
         lm_head_aliases_embd: false,
+        stats,
     };
 
     // 7. DSpark globals
@@ -311,6 +315,9 @@ fn load_drafter_layer(
         candidates: bare_name_candidates,
         read_proj: load_weight_tensor_pread,
         layer: i,
+        // The DSpark drafter sidecar is always fully resident: residency is the
+        // caller's placement decision and this loader has none of its own.
+        residency: Residency::Device,
     };
     load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
         .map_err(|e| format!("qwen3_dspark layer {i}: {e:?}"))
@@ -347,7 +354,7 @@ fn load_global_proj(
 ) -> Result<WeightTensor, String> {
     let (info, data) = read_first(source, name, bare_name_candidates)
         .ok_or_else(|| format!("qwen3_dspark: {name} missing"))?;
-    let mut wt = dequant_weight_raw(gpu, info.quant_type, &data, m, k)
+    let mut wt = dequant_weight_raw(gpu, info.quant_type, &data, m, k, Residency::Device)
         .map_err(|e| format!("qwen3_dspark: {name}: {e:?}"))?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = load_awq_scale_for(source, gpu, name, k);

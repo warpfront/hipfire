@@ -29,6 +29,7 @@
  1 va-bridge
  2 hipfire-tui
  2 redline-dispatch
+ 3 hipfire-cpu
  3 rdna-compute
  4 hipfire-dispatch
  4 saddle-core

@@ -9,8 +9,8 @@ use crate::compiler::KernelCompiler;
 use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{
-    DeviceBuffer, HipError, HipMemAllocationProp, HipResult, HipRuntime, Rocblas, VmmArena,
-    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    DeviceBuffer, HipError, HipMemAllocationProp, HipMemGenericAllocationHandle, HipResult,
+    HipRuntime, Rocblas, VmmArena, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -176,6 +176,20 @@ fn pm4_dynamic_grid_enabled() -> bool {
 /// must never hit FP8 WMMA. Threshold tuned conservatively; A/B against
 /// FP16 WMMA on the production prefill bench can lower it later.
 pub(crate) const FP8_WMMA_MIN_BATCH: usize = 1024;
+
+/// Slack mapped past the end of every host-located weight tensor.
+///
+/// Forward-path GEMV/attention kernels read a few bytes beyond each tensor blob —
+/// a phantom group header or a vector tail load. The device path absorbs that into
+/// `hipMalloc` slack, but an exact-fit host reservation makes the first overread
+/// the first unmapped byte and faults with "Page not present" (every real MQ3 blob
+/// is an exact 4096-byte multiple, so the slack is exactly zero precisely when it
+/// matters). The overread provably does not affect output: device-path
+/// byte-identity runs produce identical results with or without it.
+///
+/// 1 MiB is generous relative to the observed overread (bytes to one group header)
+/// and now costs host RAM only, so there is no reason to shave it.
+const HOST_TAIL_PAD_BYTES: usize = 1024 * 1024;
 
 // AR-forward hipGraph policy (2026-05-15, after `<think>\n!!!!!` attractor
 // debug on Qwen3.5-27B mq4 gfx1100):
@@ -548,12 +562,19 @@ impl DType {
         }
     }
 
-    /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
+    /// Whether this format's GEMV kernel requires K%256==0 (HFP4/MFP4 family: the
+    /// per-row header plus 17-byte g32 blocks; V2 Magnum and the GL codebook
+    /// formats: `gpr = K/256` indexes the scale/column region).
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
             DType::HFP4G32
                 | DType::MFP4G32
+                | DType::MFP4G32Lloyd
+                | DType::MFP4G32P
+                | DType::MFP4G32E8
+                | DType::MFP3G32E8
+                | DType::MFP2G32E8
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2
@@ -564,6 +585,23 @@ impl DType {
                 | DType::MQ2G256V2
         )
     }
+}
+
+/// Which engine executes the ops that read one weight tensor.
+///
+/// This is a *recorded decision*, not a derived property: a weight's memory
+/// location says where the bytes are, and `memory.offload_exec` says who reads
+/// them. `HostMapped` + `Cpu` is the pair a CPU-executed step needs, and every
+/// searn that must agree about it (the dispatch CPU seam, the hipGraph capture
+/// gate) reads this field instead of re-deriving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExecTarget {
+    /// The GPU kernels read this weight (device memory, or host memory over PCIe).
+    #[default]
+    Gpu,
+    /// The CPU reads this weight's bytes: only produced for a host-mapped weight
+    /// when `memory.offload_exec=cpu`.
+    Cpu,
 }
 
 /// Activation-capture hook for the Tier 1 hipfire-native calibration path.
@@ -646,6 +684,13 @@ pub struct Gpu {
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
+    /// `hipHostMalloc(hipHostMallocMapped)` owners, keyed by the **device-visible**
+    /// base address kernels are handed. The value is the *host* pointer that
+    /// `hipHostFree` needs, which `hipHostGetDevicePointer` may alias differently
+    /// on non-large-BAR systems — so the pair must be remembered rather than
+    /// reconstructed. Stored as `usize` (not a raw pointer) to leave `Gpu`'s
+    /// auto-traits exactly as they were for the VMM arena map.
+    host_mapped: HashMap<usize, usize>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
@@ -985,6 +1030,18 @@ impl Gpu {
         Ok(())
     }
 
+    /// Record that this model's step mix includes CPU-executed weights.
+    ///
+    /// Set once per load, from the placement the loader resolved, and it is the
+    /// single source of truth for the three decisions that must agree: whether a
+    /// hipGraph may be captured at all, whether the retained-replay tape may
+    /// record, and whether the dispatch seam plans CPU steps (`DispatchCtx::new`
+    /// reads it back off this `Gpu`).
+    pub fn set_cpu_exec_weights(&mut self, on: bool) {
+        self.graphs.cpu_exec_weights = on;
+        self.replay.set_cpu_exec_weights(on);
+    }
+
     /// Begin capturing this `Gpu`'s stream into a graph.
     ///
     /// Mode 1 is `hipStreamCaptureModeThreadLocal`: only this thread is
@@ -992,6 +1049,10 @@ impl Gpu {
     /// this crate launches during capture must already be warm -- a kernel
     /// compile mid-capture is exactly the kind of call the mode forbids.
     pub fn begin_stream_capture(&mut self) -> HipResult<()> {
+        // Same gate as the `GraphState` capture entries (see
+        // `GraphState::cpu_exec_weights`): this is the third capture path, so the
+        // refusal has to live on it too rather than only at its call site.
+        self.graphs.reject_cpu_exec_capture()?;
         self.bind_thread()?;
         let stream = self.active_stream.as_ref().ok_or_else(|| {
             hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
@@ -1326,6 +1387,7 @@ impl Gpu {
             pool: crate::pool::GpuPool::new(),
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
+            host_mapped: HashMap::new(),
             active_stream: None,
             last_kernel: None,
             scratch: crate::scratch::ScratchState {
@@ -1397,6 +1459,8 @@ impl Gpu {
                     capturing: None,
                     lmhead_argmax: std::collections::HashSet::new(),
                 },
+                // False until a load resolves placement; see `Gpu::set_cpu_exec_weights`.
+                cpu_exec_weights: false,
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
@@ -2288,6 +2352,57 @@ impl Gpu {
         } else {
             self.hip.memcpy_htod(dst, src)
         }
+    }
+
+    /// Blocking D→H copy of `src`'s first `dst.len()` bytes.
+    ///
+    /// Deliberately **not** capture-aware, unlike [`Self::memcpy_htod_auto`]: a
+    /// device→host copy is a host sync point, so it can never be part of a
+    /// captured graph. Reaching this during capture is a bug in whoever decided
+    /// to capture a graph containing a CPU-executed step, and it is reported as
+    /// an error rather than enqueued onto the capturing stream (where it would
+    /// either fail the capture or silently produce a replay that returns stale
+    /// activations).
+    pub fn memcpy_dtoh_auto(
+        &self,
+        dst: &mut [u8],
+        src: &hip_bridge::DeviceBuffer,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "memcpy_dtoh_auto during hipGraph capture: a CPU-executed step cannot be \
+                 captured; the capture decision must be disabled when host-mapped weights \
+                 are executed on the CPU",
+            ));
+        }
+        self.hip.memcpy_dtoh(dst, src)
+    }
+
+    /// Raw host bytes of a host-mapped tensor ([`Self::host_located`]), for the
+    /// CPU-executed offload path.
+    ///
+    /// `None` unless this `Gpu` owns the allocation: the buffer's own pointer is
+    /// the *device-visible* alias, which `hipHostGetDevicePointer` may place
+    /// anywhere relative to the `hipHostMalloc` pointer `hipHostFree` needs, so
+    /// the registry is the only sound source of the host address.
+    ///
+    /// The returned slice borrows the tensor, not the `Gpu`: the allocation lives
+    /// until the model unloads (`release_registered_host_mapped`), and callers
+    /// need `&mut Gpu` for the copies around a CPU step while still holding it.
+    /// `HOST_TAIL_PAD_BYTES` of slack past the logical size is included in the
+    /// allocation but *not* in the returned slice.
+    pub fn host_bytes<'a>(&self, tensor: &'a GpuTensor) -> Option<&'a [u8]> {
+        // bind_thread: skip — pure map lookup on host memory, no device state.
+        if !tensor.buf.is_host_mapped() {
+            return None;
+        }
+        let host_ptr = *self.host_mapped.get(&(tensor.buf.as_ptr() as usize))?;
+        // Safety: registered by `alloc_host_mapped_tensor` as a live
+        // `hipHostMalloc` of `tensor.buf.size() + HOST_TAIL_PAD_BYTES` bytes,
+        // freed exactly once on unload.
+        Some(unsafe { std::slice::from_raw_parts(host_ptr as *const u8, tensor.buf.size()) })
     }
 
     /// Helper: launch a kernel using the blob path during graph capture,
@@ -3195,6 +3310,15 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
+            eprintln!(
+                "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
+                arena.base_address(),
+                byte_size,
+                arena.reserved_bytes(),
+                arena.granularity(),
+            );
+        }
         // WINDOWS FIX (2026-09-09): hipMemCreate/hipMemMap on Windows/ROCm 7.2
         // (gfx1100) maps a second, later segment onto the SAME physical pages as
         // the first (vmm_arena_smoke boundary-growth assert fails; every
@@ -3206,6 +3330,14 @@ impl Gpu {
         // over on-demand commit on the platform whose driver breaks growth.
         #[cfg(windows)]
         let initial_mapped_bytes = arena.reserved_bytes();
+        // `hipMemMap` requires a granularity-aligned size. Current callers all pass
+        // aligned lengths (the KV arenas), so this never tripped — but an arbitrary
+        // tensor length fails here, which is exactly how the host path broke on a
+        // real quantized code blob. Round up (the reservation is already rounded by
+        // `reserve`) so the latent device-side failure cannot surprise a later caller.
+        let initial_mapped_bytes = initial_mapped_bytes
+            .next_multiple_of(arena.granularity())
+            .min(arena.reserved_bytes());
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -3229,6 +3361,89 @@ impl Gpu {
             shape: shape.to_vec(),
             dtype,
         })
+    }
+
+    /// Allocate a **host-mapped** tensor: system RAM the GPU reads directly over PCIe.
+    ///
+    /// This is the primitive partial GPU offload uses for spilled weights, and the
+    /// mechanism is load-bearing rather than an implementation detail. The obvious
+    /// alternative — a host-located VMM arena (`hipMemCreate` PINNED/Host +
+    /// `hipMemMap` into device VA) — is charged against the device heap 1:1 on
+    /// gfx1201: measured, a held 4 GiB host arena drops the allocatable device
+    /// headroom from 15360 MB to 11264 MB, which made offload net-zero for the VRAM
+    /// it exists to free. `hipHostMalloc(hipHostMallocMapped)` moves the same bytes
+    /// for a measured device cost of 0 MB, and `hipHostGetDevicePointer` hands back
+    /// an address the kernels dereference unchanged.
+    /// `examples/host_offload_headroom.rs` asserts this property.
+    ///
+    /// `byte_size` is the *logical* tensor size; the allocation is padded past it
+    /// because forward-path kernels overread the tensor tail (see
+    /// [`HOST_TAIL_PAD_BYTES`]). The pad costs host RAM only.
+    fn alloc_host_mapped_tensor(
+        &mut self,
+        byte_size: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let alloc_bytes = byte_size.saturating_add(HOST_TAIL_PAD_BYTES);
+        let host_ptr = self
+            .hip
+            .host_malloc(alloc_bytes, hip_bridge::HIP_HOST_MALLOC_MAPPED)?;
+        // The device alias is what kernels are handed; the host pointer is what
+        // hipHostFree needs. They coincide on large-BAR boxes but need not.
+        let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
+            Ok(p) if !p.is_null() => p,
+            _ => host_ptr,
+        };
+        let key = dev_ptr as usize;
+        if self.host_mapped.insert(key, host_ptr as usize).is_some() {
+            self.host_mapped.remove(&key);
+            let _ = self.hip.host_free(host_ptr);
+            return Err(HipError::new(
+                0,
+                &format!("duplicate host-mapped tensor base address 0x{key:x}"),
+            ));
+        }
+        Ok(GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(dev_ptr, byte_size) },
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// Live `hipHostMalloc` owners. Zero after a clean unload; nonzero means a leak.
+    pub fn host_mapped_count(&self) -> usize {
+        // bind_thread: skip — pure length read, touches no device state.
+        self.host_mapped.len()
+    }
+
+    /// Release every registered host-mapped allocation, mirroring
+    /// [`Self::release_registered_vmm`]. Returns the number still registered.
+    fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
+        let mut first_error = None;
+        // Remove only on success, mirroring `release_registered_vmm`: draining
+        // unconditionally would drop the sole record of a pointer whose
+        // `hipHostFree` failed, turning a retryable failure into an invisible
+        // leak that `host_mapped_count()` could no longer report.
+        let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
+        for key in keys {
+            let host_ptr = self.host_mapped[&key];
+            match self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
+                Ok(()) => {
+                    self.host_mapped.remove(&key);
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(self.host_mapped.len()),
+        }
     }
 
     fn retain_failed_vmm_arena(
@@ -3288,6 +3503,26 @@ impl Gpu {
             .map(VmmArena::granularity)
     }
 
+    /// Whether a tensor was allocated by [`Self::alloc_host_mapped_tensor`] — its pages
+    /// are system RAM the kernels read over PCIe rather than the card's VRAM. Pure
+    /// ownership check; touches no device state. Offload tests and logs read this to
+    /// prove a spilled layer actually left VRAM rather than being merely
+    /// device-pinned. Device-VMM tensors are not host-located by construction.
+    pub fn host_located(&self, tensor: &GpuTensor) -> bool {
+        // bind_thread: skip — pure read of the tensor's own ownership tag; no device call.
+        tensor.buf.is_host_mapped()
+    }
+
+    /// The primary physical allocation handle backing a tensor's VMM arena, if any.
+    /// Exposed so callers can query the handle's placement with
+    /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
+    pub fn vmm_handle(&self, tensor: &GpuTensor) -> Option<HipMemGenericAllocationHandle> {
+        // bind_thread: skip — pure read of the arena registry; no device call.
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .and_then(|arena| arena.primary_handle())
+    }
+
     /// Return the driver's recommended physical mapping granularity without
     /// reserving an address range. Model-owned VMM planners use this for a
     /// dry-run admission check before mapping any cache pages.
@@ -3316,6 +3551,19 @@ impl Gpu {
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
         self.bind_thread()?;
+        // Offloaded weights are a second owner class; without this check a leaked
+        // host-mapped tensor would let unload claim a clean handoff while holding
+        // pinned system RAM, which is exactly what this guard exists to prevent
+        // for VMM owners.
+        let live_host = self.host_mapped.len();
+        if live_host != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "refusing cleanup while {live_host} live host-mapped tensor owner(s) remain; unload the active model first"
+                ),
+            ));
+        }
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -3432,6 +3680,36 @@ impl Gpu {
             hip.memcpy_htod(&tensor.buf, bytes)
         })
     }
+    /// Upload host-side **f32 data** into a **host-located** `F32` tensor — the
+    /// offload counterpart to [`Self::upload_f32`]. The physical pages are system
+    /// RAM that kernels read over PCIe, so this is how an offloaded layer's weights
+    /// land without pinning device memory.
+    ///
+    /// Mirrors [`Self::upload_f32`] except the allocation target is host: the whole
+    /// tensor is mapped for `self.device_id` at reserve time (the same proven pattern
+    /// `examples/vmm_tensor_smoke.rs` exercises — a PCIe H2D/D2H round-trip through the
+    /// mapped VA) and the f32 words are copied in via `memcpy_htod`, which ROCm routes
+    /// to the mapped VA regardless of direction. The result is a `GpuTensor` whose
+    /// `.buf` is host RAM readable by kernels — exactly what an offloaded layer's weight
+    /// read must dereference. Byte-for-byte identical contents to the device path; only
+    /// the physical location differs.
+    pub fn upload_f32_host(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "upload_f32_host: element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| HipError::new(0, "upload_f32_host: byte size overflowed"))?;
+        // Host-mapped: system RAM the kernels read over PCIe, at no device-heap
+        // cost (see `alloc_host_mapped_tensor`).
+        let mut tensor = self.alloc_host_mapped_tensor(byte_size, shape, DType::F32)?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        unsafe { self.hip.memcpy_htod(&tensor.buf, bytes)? }
+        Ok(tensor)
+    }
 
     /// Upload host-side **f16 bit patterns** straight into an `F16` tensor.
     ///
@@ -3519,6 +3797,20 @@ impl Gpu {
         Ok(data)
     }
 
+    /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
+    /// reinterpretation, so a caller can compare code blobs bit-for-bit.
+    ///
+    /// Works for host-located tensors too: `memcpy_dtoh` reads through the
+    /// mapped handle across PCIe, which is what makes the offload parity check
+    /// (device upload vs host upload) a plain `Vec<u8>` equality.
+    pub fn download_raw_bytes(&self, tensor: &GpuTensor) -> HipResult<Vec<u8>> {
+        self.bind_thread()?;
+        let n = tensor.byte_size();
+        let mut data = vec![0u8; n];
+        self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
+        Ok(data)
+    }
+
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         self.alloc_then_init(shape, dtype, |hip, stream, tensor| match stream {
@@ -3538,6 +3830,20 @@ impl Gpu {
     /// (the pool-backed twin lives in hipfire-runtime weight fulfillment).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         self.upload_raw_with_copy(data, shape, HipRuntime::memcpy_htod)
+    }
+
+    /// Upload raw bytes to a **host-located** tensor (for offloaded quantized weights).
+    ///
+    /// The offload counterpart to [`Self::upload_raw`]: the physical pages are system
+    /// RAM accessed by kernels over PCIe, so an offloaded layer's quantized codes live
+    /// in host memory instead of VRAM. Same injectable copy step as [`Self::upload_raw`];
+    /// only the allocation target differs — [`Self::alloc_host_mapped_tensor`] rather
+    /// than `hip.malloc` — so the bytes leave the card *and* stop being charged to it.
+    /// Contents are byte-for-byte identical to the device path, so numerics are
+    /// unchanged while VRAM is freed.
+    pub fn upload_raw_host(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        self.upload_raw_with_copy_host(data, shape, HipRuntime::memcpy_htod)
     }
 
     /// [`Self::upload_raw`] with an injectable copy step so regressions can
@@ -3562,6 +3868,26 @@ impl Gpu {
         })
     }
 
+    /// [`Self::upload_raw_host`] with an injectable copy step so a regression can force
+    /// copy-failure without a production knob, verifying the host owner is released on error.
+    fn upload_raw_with_copy_host(
+        &mut self,
+        data: &[u8],
+        shape: &[usize],
+        copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        // Host-mapped: system RAM the kernels read over PCIe, at no device-heap
+        // cost (see `alloc_host_mapped_tensor`).
+        let mut tensor = self.alloc_host_mapped_tensor(data.len(), shape, DType::Raw)?;
+        if let Err(err) = copy(&self.hip, &tensor.buf, data) {
+            // Host-mapped owner — free_tensor runs hipHostFree, so a failed copy
+            // leaves no orphaned host page or dangling registration.
+            let _ = self.free_tensor(tensor);
+            return Err(err);
+        }
+        Ok(tensor)
+    }
+
     /// Free a tensor. Contiguous buffers return to the pool. VMM owners run
     /// arena release once: success removes the registration; failure **retains**
     /// the arena for [`Self::retry_vmm_cleanup`] / [`Self::ensure_vmm_cleaned`]
@@ -3569,6 +3895,18 @@ impl Gpu {
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
+        if tensor.buf.is_host_mapped() {
+            // Host-mapped owners are never pooled: hipHostFree takes the host
+            // pointer, and an offloaded weight is static (freed at unload), so
+            // there is nothing to gain from reusing the mapping.
+            let host_ptr = self.host_mapped.remove(&key).ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("host-mapped tensor at 0x{key:x} has no registered host pointer"),
+                )
+            })?;
+            return self.hip.host_free(host_ptr as *mut std::ffi::c_void);
+        }
         if self.vmm_arenas.contains_key(&key) {
             if !tensor.buf.is_vmm_owner() {
                 return Err(HipError::new(
@@ -5266,12 +5604,18 @@ impl Drop for Gpu {
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
-        if std::thread::panicking() && self.vmm_allocation_count() == 0 {
+        if std::thread::panicking()
+            && self.vmm_allocation_count() == 0
+            && self.host_mapped.is_empty()
+        {
             return;
         }
         self.bind_thread_or_warn();
         if let Err(err) = self.release_registered_vmm() {
             eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
+        }
+        if let Err(err) = self.release_registered_host_mapped() {
+            eprintln!("[rdna-compute] failed to release host-mapped tensor during Gpu drop: {err}");
         }
     }
 }
@@ -5476,13 +5820,134 @@ mod tests {
         );
     }
 
-    fn try_gpu() -> Option<super::Gpu> {
-        super::Gpu::init().ok()
+    /// One device is shared by every GPU test in this module, and several assert on
+    /// allocator/VRAM bookkeeping. `upload_raw_copy_failure_hip_frees_owner` demands
+    /// byte-exact `hipMemGetInfo` free across its window, which a sibling test
+    /// allocating or freeing VRAM in that window breaks — observed as a failure on
+    /// roughly one `cargo test -p rdna-compute --lib` run in three with no source
+    /// change. Holding this lock for each GPU test's duration makes the suite
+    /// deterministic without weakening any assertion. Poisoning is ignored: a panic
+    /// in one test must not fail the rest.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialized GPU handle for a test. The guard must be *bound* for the test's
+    /// duration — `let Some((mut gpu, _guard)) = try_gpu() else { … }` — because
+    /// dropping it immediately would release the lock.
+    fn try_gpu() -> Option<(super::Gpu, std::sync::MutexGuard<'static, ()>)> {
+        let guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match super::Gpu::init() {
+            Ok(gpu) => Some((gpu, guard)),
+            Err(_) => None,
+        }
+    }
+
+    /// The CPU-executed offload path reads spilled weight bytes through
+    /// `host_bytes`, which resolves the *host* pointer from the registry — the
+    /// device-visible alias `hipHostGetDevicePointer` returns need not be the
+    /// address `hipHostFree` needs, so guessing costs a read of unrelated
+    /// memory. Pin the identity instead: the bytes' device view and host view
+    /// are the same allocation, and a device tensor has no host view at all.
+    #[test]
+    fn host_bytes_aliases_the_uploaded_allocation() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let payload: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(3).wrapping_add(1))
+            .collect();
+        let t = gpu
+            .upload_raw_host(&payload, &[payload.len()])
+            .expect("host-mapped raw upload");
+        assert!(gpu.host_located(&t), "upload_raw_host must host-locate");
+        assert_eq!(
+            gpu.host_bytes(&t).expect("registered host pointer"),
+            &payload[..],
+            "the host view must be the allocation the upload filled"
+        );
+
+        let dev = gpu.alloc_tensor(&[8], DType::F32).expect("device tensor");
+        assert!(
+            gpu.host_bytes(&dev).is_none(),
+            "a device-resident tensor has no host view"
+        );
+
+        // The D2H helper reads through the device alias, so both views must agree.
+        let mut back = vec![0u8; payload.len()];
+        gpu.memcpy_dtoh_auto(&mut back, &t.buf).expect("dtoh");
+        assert_eq!(back, payload);
+
+        gpu.free_tensor(t).ok();
+        gpu.free_tensor(dev).ok();
+    }
+
+    /// A D→H copy is a host sync point and can never be part of a captured
+    /// graph. Entering capture with one pending is a bug in whoever decided to
+    /// capture a CPU-executed step, so it must fail loudly rather than enqueue
+    /// onto the capturing stream (where replay would silently return stale
+    /// activations).
+    #[test]
+    fn memcpy_dtoh_auto_refuses_under_capture() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let t = gpu.upload_f32(&[1.0f32; 4], &[4]).expect("upload");
+        let mut back = vec![0u8; 16];
+        gpu.graphs.capture_mode = true;
+        let err = gpu
+            .memcpy_dtoh_auto(&mut back, &t.buf)
+            .expect_err("must refuse during capture");
+        gpu.graphs.capture_mode = false;
+        assert!(
+            err.to_string().contains("capture"),
+            "refusal must name capture: {err}"
+        );
+        gpu.memcpy_dtoh_auto(&mut back, &t.buf)
+            .expect("works outside capture");
+        gpu.free_tensor(t).ok();
+    }
+
+    /// A leaked host-mapped owner must make teardown refuse, the way a leaked VMM
+    /// arena does. Offloaded weights are a second owner class, and without this
+    /// check an orphaned one would let unload report a clean handoff while still
+    /// holding pinned system RAM.
+    #[test]
+    fn ensure_vmm_cleaned_refuses_while_a_host_mapped_owner_is_live() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        assert_eq!(
+            gpu.host_mapped_count(),
+            0,
+            "fresh GPU owns no host-mapped tensors"
+        );
+        gpu.ensure_vmm_cleaned().expect("idle GPU is clean");
+
+        let t = gpu
+            .upload_f32_host(&[1.0f32; 16], &[16])
+            .expect("host-mapped upload");
+        assert_eq!(gpu.host_mapped_count(), 1);
+        let err = gpu
+            .ensure_vmm_cleaned()
+            .expect_err("must refuse while a host-mapped owner is live");
+        assert!(
+            err.to_string().contains("host-mapped"),
+            "refusal must name the owner class: {err}"
+        );
+
+        gpu.free_tensor(t).expect("free the host-mapped owner");
+        assert_eq!(gpu.host_mapped_count(), 0);
+        gpu.ensure_vmm_cleaned()
+            .expect("clean again after the owner is freed");
     }
 
     #[test]
     fn ensure_vmm_cleaned_never_releases_a_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5526,7 +5991,7 @@ mod tests {
 
     #[test]
     fn vmm_fullmap_covers_unaligned_reservation() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5601,7 +6066,7 @@ mod tests {
     /// measured window; a leaked owner still forces a fresh malloc on retry.
     #[test]
     fn alloc_then_init_failure_returns_pool_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5646,7 +6111,7 @@ mod tests {
     /// `free_tensor`/pool). Soft-skip without GPU like the other leaf tests.
     #[test]
     fn upload_raw_copy_failure_hip_frees_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5659,10 +6124,25 @@ mod tests {
         assert!(warm.buf.is_hip_allocation());
         gpu.free_tensor(warm).expect("free warm into pool");
 
+        // Global free VRAM cannot verify a release byte-exactly on this driver.
+        // Measured (`free_retention` probe, gfx1201): the owner's own bytes always
+        // return exactly, but the driver intermittently charges extra overhead at
+        // allocation that `hipFree` never returns — 0 or 28 MiB for a 64 MiB
+        // request, up to 56 MiB at 2 GiB. Byte-exact equality therefore failed a
+        // correct implementation in roughly 2 of 5 runs. Use a payload far above
+        // that measured overhead (a leak of this owner drops free by 512 MiB) and
+        // tolerate an absolute 64 MiB, which no observed overhead reaches.
+        const PROBE_BYTES: usize = 512 * 1024 * 1024;
+        const TOLERANCE_BYTES: usize = 64 * 1024 * 1024;
+        /// How long to let a late reclaim land. Never-returned driver overhead is
+        /// covered by `TOLERANCE_BYTES` instead; this only absorbs lag.
+        const POLL_MILLIS: u64 = 500;
+        let payload = vec![7u8; PROBE_BYTES];
+
         let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
         let pool_before = gpu.pool_stats();
 
-        let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
+        let err = match gpu.upload_raw_with_copy(&payload, &[PROBE_BYTES], |_hip, _buf, _data| {
             Err(hip_bridge::HipError::new(2, "injected raw H2D failure"))
         }) {
             Err(error) => error,
@@ -5676,10 +6156,23 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
-        assert_eq!(
-            free_after, free_before,
-            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
+        // Reclaim on this driver is occasionally LATE rather than lost (measured:
+        // the owner's bytes return exactly in 11 of 12 samples, with the "missing"
+        // 28 MiB appearing on a later pass), so a single instantaneous sample can't
+        // tell "reclaimed late" from "leaked" — which is precisely the distinction
+        // this test exists to make. Poll briefly, and fail only if free never
+        // recovers.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(POLL_MILLIS);
+        let mut free_after = gpu.hip.get_vram_info().expect("vram after").0;
+        while free_after + TOLERANCE_BYTES < free_before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS / 10));
+            free_after = gpu.hip.get_vram_info().expect("vram after").0;
+        }
+        assert!(
+            free_after + TOLERANCE_BYTES >= free_before,
+            "copy-fail must hip.free the malloc owner: {PROBE_BYTES} bytes never came back \
+             (free VRAM {free_before} → {free_after} after {POLL_MILLIS}ms of polling, \
+             total={total}, tolerance={TOLERANCE_BYTES})"
         );
         // hip.free path must not touch pool counters (would if free_tensor'd).
         assert_eq!(
@@ -5696,7 +6189,7 @@ mod tests {
 
     #[test]
     fn free_tensor_unmap_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5745,7 +6238,7 @@ mod tests {
 
     #[test]
     fn free_tensor_release_failure_retains_owner_for_retry() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5777,7 +6270,7 @@ mod tests {
 
     #[test]
     fn access_reset_failure_does_not_publish_live_owner() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -5815,7 +6308,7 @@ mod tests {
 
     #[test]
     fn ensure_vmm_cleaned_refuses_while_pending() {
-        let Some(mut gpu) = try_gpu() else {
+        let Some((mut gpu, _guard)) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };

@@ -32,13 +32,13 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{load_weight_tensor, HfqFile};
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::model_load::{self, Layout, LoadedWeights, Residency, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
-    dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
-    HfqBackend, WeightBackend,
+    dequant_norm, flat_name_candidates, load_embedding, resolve_lm_head, HfqBackend, WeightBackend,
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -252,6 +252,28 @@ pub struct Qwen2LayerWeights {
     pub w_down: WeightTensor, // mlp.down_proj.weight
 }
 
+impl Qwen2LayerWeights {
+    /// Return every buffer of this layer to the pool.
+    ///
+    /// The shared load transaction calls this for each layer already published
+    /// when a later one fails, so a rollback reclaims exactly what the load
+    /// committed. Mirrors the per-layer arm of [`Qwen2Weights::free_gpu`].
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_norm);
+        self.wq.free_all(gpu);
+        let _ = gpu.free_tensor(self.wq_bias);
+        self.wk.free_all(gpu);
+        let _ = gpu.free_tensor(self.wk_bias);
+        self.wv.free_all(gpu);
+        let _ = gpu.free_tensor(self.wv_bias);
+        self.wo.free_all(gpu);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.w_gate.free_all(gpu);
+        self.w_up.free_all(gpu);
+        self.w_down.free_all(gpu);
+    }
+}
+
 /// GPU-resident Qwen2 model weights.
 pub struct Qwen2Weights {
     pub token_embd: GpuTensor,
@@ -262,6 +284,9 @@ pub struct Qwen2Weights {
     /// True when the model uses tied embeddings and `output` aliases the
     /// embedding table (no separate `lm_head.weight` on disk).
     pub tied_lm_head: bool,
+    /// What this load actually allocated, by destination. See
+    /// [`hipfire_runtime::model_load::LoadStats`].
+    pub stats: hipfire_runtime::model_load::LoadStats,
 }
 
 impl Qwen2Weights {
@@ -331,36 +356,155 @@ pub fn load_weights(
     cfg: &Qwen2Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen2Weights> {
-    #[cfg(unix)]
-    hfq.drop_mmap();
-
-    eprintln!("qwen2: loading token_embd...");
-    let (embd_token, embd_format) = load_embed_tokens(hfq, gpu, cfg)?;
-
-    eprintln!("qwen2: loading model.norm...");
-    let output_norm = load_norm_weight_raw(hfq, gpu, "model.norm.weight", cfg.hidden_size)?;
-
-    eprintln!("qwen2: loading lm_head...");
-    let (output, tied_lm_head) = load_lm_head(hfq, gpu, cfg, &embd_token, embd_format)?;
-
-    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-    for i in 0..cfg.num_hidden_layers {
-        eprintln!(
-            "qwen2: loading layer {}/{}...",
-            i + 1,
-            cfg.num_hidden_layers
-        );
-        layers.push(load_layer(hfq, gpu, cfg, i)?);
-    }
-
-    Ok(Qwen2Weights {
-        token_embd: embd_token,
+    let mut source = Qwen2WeightSource { hfq, cfg };
+    let mut layout = Layout::single(cfg.num_hidden_layers);
+    let LoadedWeights {
+        token_embd,
         embd_format,
         output_norm,
         output,
         layers,
-        tied_lm_head,
+        lm_head_aliases_embd,
+        stats,
+    } = model_load::load_weights(&mut source, std::slice::from_mut(gpu), &mut layout)?;
+
+    Ok(Qwen2Weights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers,
+        tied_lm_head: lm_head_aliases_embd,
+        stats,
     })
+}
+
+/// qwen2's `WeightSource`: the same embed → norm → lm_head → layer sequence it
+/// used to drive inline, wired into `hipfire_runtime::model_load` so qwen2
+/// inherits the shared placement resolution (`memory.gpu_layer_budget`), the
+/// shared whole-model rollback, and the shared fail-closed admission checks
+/// instead of having none of them.
+struct Qwen2WeightSource<'a> {
+    hfq: &'a mut HfqFile,
+    cfg: &'a Qwen2Config,
+}
+
+impl WeightSource for Qwen2WeightSource<'_> {
+    type Layer = Qwen2LayerWeights;
+
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+
+    /// Drop the mmap before loading: on unified memory a live mapping and the GPU
+    /// copy would otherwise share the same physical pages and double the
+    /// footprint. Every read below therefore resolves through the pread path.
+    fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
+        #[cfg(unix)]
+        self.hfq.drop_mmap();
+        Ok(())
+    }
+
+    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+        eprintln!("qwen2: loading token_embd...");
+        load_embed_tokens(self.hfq, gpu, self.cfg)
+    }
+
+    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
+        eprintln!("qwen2: loading model.norm...");
+        load_norm_weight_raw(self.hfq, gpu, "model.norm.weight", self.cfg.hidden_size)
+    }
+
+    fn read_output(
+        &mut self,
+        gpu: &mut Gpu,
+        embd: &GpuTensor,
+        embd_fmt: EmbeddingFormat,
+        _can_alias: bool,
+    ) -> HipResult<(WeightTensor, bool)> {
+        // `load_lm_head` already handles both arms; `_can_alias` is ignored
+        // because qwen2 is single-GPU by construction and the reupload arm is
+        // unreachable (see its closure).
+        eprintln!("qwen2: loading lm_head...");
+        load_lm_head(self.hfq, gpu, self.cfg, embd, embd_fmt)
+    }
+
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        i: usize,
+        residency: Residency,
+    ) -> HipResult<Self::Layer> {
+        eprintln!(
+            "qwen2: loading layer {}/{}...",
+            i + 1,
+            self.cfg.num_hidden_layers
+        );
+        load_layer(self.hfq, gpu, self.cfg, i, residency)
+    }
+
+    /// Dense GQA: every tensor of a layer goes through `HfqBackend`, so a spill
+    /// lands completely rather than half-applying.
+    fn spill_refusal(&self) -> Option<String> {
+        None
+    }
+
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
+        layer.free_gpu(gpu);
+    }
+    fn layer_bytes(&self, layer: &Qwen2LayerWeights) -> (u64, u64) {
+        qwen2_layer_bytes(layer)
+    }
+}
+
+/// One qwen2 layer's owned bytes, mirroring `Qwen2LayerWeights::free_gpu`: the
+/// norms/biases are plain tensors, the seven projections own their blobs and
+/// sidecars.
+fn qwen2_layer_bytes(layer: &Qwen2LayerWeights) -> (u64, u64) {
+    use hipfire_runtime::model_load::{add_bytes, split_tensor_bytes};
+    let mut stats = split_tensor_bytes([
+        &layer.attn_norm,
+        &layer.wq_bias,
+        &layer.wk_bias,
+        &layer.wv_bias,
+        &layer.ffn_norm,
+    ]);
+    for weight in [
+        &layer.wq,
+        &layer.wk,
+        &layer.wv,
+        &layer.wo,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.w_down,
+    ] {
+        stats = add_bytes(stats, weight.owned_bytes());
+    }
+    stats
+}
+
+/// [`LoadStats`](hipfire_runtime::model_load::LoadStats) for a qwen2 load built
+/// outside the shared loader (the safetensors-source route). The HFQ route reports
+/// through `model_load` itself; `qwen2_layer_bytes` is what both use per layer.
+fn qwen2_load_stats(
+    token_embd: &GpuTensor,
+    output_norm: &GpuTensor,
+    output: &WeightTensor,
+    layers: &[Qwen2LayerWeights],
+    tied_lm_head: bool,
+) -> hipfire_runtime::model_load::LoadStats {
+    use hipfire_runtime::model_load::{split_tensor_bytes, LoadStats};
+    let mut stats = LoadStats::default();
+    stats.add(split_tensor_bytes([token_embd, output_norm]));
+    stats.add(if tied_lm_head {
+        output.owned_metadata_bytes()
+    } else {
+        output.owned_bytes()
+    });
+    for layer in layers {
+        stats.add(qwen2_layer_bytes(layer));
+    }
+    stats
 }
 
 // ─── Per-tensor loaders ─────────────────────────────────────────────────
@@ -413,6 +557,7 @@ fn load_lm_head(
                 cfg.vocab_size,
                 cfg.hidden_size,
                 flat_name_candidates,
+                Residency::Device,
             )
         },
         // qwen2 is single-GPU; the reupload arm is never taken.
@@ -425,6 +570,7 @@ fn load_layer(
     gpu: &mut Gpu,
     cfg: &Qwen2Config,
     i: usize,
+    residency: Residency,
 ) -> HipResult<Qwen2LayerWeights> {
     let q_dim = cfg.num_attention_heads * cfg.head_dim;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
@@ -436,6 +582,9 @@ fn load_layer(
         candidates: flat_name_candidates,
         read_proj: load_weight_tensor,
         layer: i,
+        // Residency is the caller's resolved placement (the shared loader's
+        // `Layout`), so qwen2 spills exactly the layers llama and qwen35 do.
+        residency,
     };
 
     Ok(Qwen2LayerWeights {
@@ -480,27 +629,12 @@ fn load_norm_weight_raw(
     Ok(t)
 }
 
-/// TODO(transformer-extraction): duplicates `load_weight_tensor` +
-/// `load_weight_tensor_raw` in `hipfire-arch-qwen35::qwen35`. The qwen35
-/// version handles ~14 quant_types; this rev-1 starter only covers the
-/// two we've actually shipped HFQ files for (HFQ4G256, F16). Extend as
-/// needed, or wait for the consolidation PR to pick up the qwen35
-/// implementation.
-fn load_weight_tensor(
-    hfq: &HfqFile,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-    candidates: fn(&str) -> Vec<String>,
-) -> HipResult<WeightTensor> {
-    for cand in candidates(name) {
-        if let Some((info, data)) = hfq.tensor_data_vec(&cand) {
-            return dequant_weight_raw(gpu, info.quant_type, &data, m, k);
-        }
-    }
-    panic!("qwen2: tensor not found: {name}");
-}
+// qwen2's own copy of the projection reader used to live here. It was a strict
+// subset of `hipfire_runtime::hfq::load_weight_tensor` (pread-only,
+// `dequant_weight_raw`-only, panicking on a missing tensor), so it was deleted in
+// favour of the shared reader — which also gives qwen2 the mmap-first path and
+// real errors on a missing tensor. qwen2 keeps its bespoke weight *loop*
+// (`Qwen2Weights::load`); only the per-tensor read was consolidated.
 
 // ─── Source-based loaders (from &dyn ModelSource) ──────────────────────
 
@@ -638,6 +772,7 @@ fn load_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        exec: rdna_compute::ExecTarget::Gpu,
     })
 }
 
@@ -685,6 +820,7 @@ fn load_lm_head_from_source(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            exec: rdna_compute::ExecTarget::Gpu,
         };
         Ok((wt, true))
     } else {
@@ -824,6 +960,7 @@ pub fn load_weights_from_source(
         layers.push(load_layer_from_source(source, gpu, cfg, i)?);
     }
 
+    let stats = qwen2_load_stats(&embd_token, &output_norm, &output, &layers, tied_lm_head);
     Ok(Qwen2Weights {
         token_embd: embd_token,
         embd_format,
@@ -831,6 +968,7 @@ pub fn load_weights_from_source(
         output,
         layers,
         tied_lm_head,
+        stats,
     })
 }
 

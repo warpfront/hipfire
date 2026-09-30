@@ -65,13 +65,13 @@
 28  PARO4G128     arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
 29  PARO4G128T    arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
 30  MQ4G256Lloyd  passthrough
-31  MQ5G256       arch-loaded  qwen35 load.rs owns the MQ5 upload path
-32  MFP4G32Lloyd  arch-loaded  qwen35 load.rs owns the MFP4-Lloyd upload path
-33  MFP4G32P      arch-loaded  qwen35 load.rs owns the MFP4-P upload path
-34  MFP4G32E8     arch-loaded  qwen35 load.rs + deepseek4 dense_hfq_dtype own the E8 upload path
+31  MQ5G256       passthrough
+32  MFP4G32Lloyd  passthrough
+33  MFP4G32P      passthrough
+34  MFP4G32E8     passthrough
 35  MFP4G32E8SOA  arch-loaded  qwen35 load.rs + deepseek4 dense_hfq_dtype own the E8-SoA upload path
-36  MFP3G32E8     arch-loaded  qwen35 load.rs owns the MFP3-E8 upload path
-37  MFP2G32E8     arch-loaded  qwen35 load.rs owns the MFP2-E8 upload path
+36  MFP3G32E8     passthrough
+37  MFP2G32E8     passthrough
 38  MQ2G256GL     passthrough
 39  MQ3G256GL     passthrough
 40  TQ2G128       passthrough  PR #597 Bonsai ternary

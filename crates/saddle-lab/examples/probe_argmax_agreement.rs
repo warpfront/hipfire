@@ -69,8 +69,8 @@ fn main() {
     );
     let small_weights = {
         let mut src = qwen35::HfqSource::new(&mut small_hfq, &small_cfg);
-        let layout = qwen35::Layout::single(small_cfg.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(small_cfg.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .expect("small load");
     eprintln!("small loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -88,8 +88,8 @@ fn main() {
     );
     let large_weights = {
         let mut src = qwen35::HfqSource::new(&mut large_hfq, &large_cfg);
-        let layout = qwen35::Layout::single(large_cfg.n_layers);
-        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+        let mut layout = qwen35::Layout::single(large_cfg.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &mut layout)
     }
     .expect("large load");
     eprintln!("large loaded in {:.1}s", t1.elapsed().as_secs_f32());

@@ -45,6 +45,9 @@ fn weight_ref<'a>(w: &'a GpuTensor, m: usize, k: usize) -> WeightRef<'a> {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        // A bare `GpuTensor` carries no execution target, and this helper only
+        // serves the device-resident MLA path.
+        exec: rdna_compute::ExecTarget::Gpu,
     }
 }
 
