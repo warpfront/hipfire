@@ -335,6 +335,12 @@ pub enum ValueRule {
         max: f64,
     },
     KvAdaptive,
+    /// `auto` | a GPU share in `[0.0, 0.5]`. The schedule divides a spilled step's
+    /// output rows between the two engines (GPU = the `pcie` path, CPU = the `cpu`
+    /// path); `0.0` collapses it to the CPU engine alone, i.e. the step runs exactly
+    /// as `memory.offload_exec=cpu`. The upper bound is 0.5 because a share above
+    /// half the rows is better expressed by switching `memory.offload_exec` to `pcie`.
+    PassbackShare,
     /// `legacy` | `vmm`. Rejects the pre-rename `contiguous` spelling with a
     /// migration message rather than a generic enum failure.
     KvBackend,
@@ -412,6 +418,9 @@ impl ConfigField {
             ValueRule::KvBackend => {
                 matches!(value, ConfigValue::String(v) if matches!(v.as_str(), "legacy" | "vmm"))
             }
+            ValueRule::PassbackShare => matches!(value, ConfigValue::String(v) if {
+                v == "auto" || v.parse::<f64>().is_ok_and(|f| (0.0..=0.5).contains(&f))
+            }),
             ValueRule::Deepseek4Placement => matches!(value, ConfigValue::String(v)
                 if v.parse::<Deepseek4ComputePlacement>().is_ok()),
         };
@@ -543,7 +552,7 @@ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high"
 // same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
 // a value the schema accepts becomes unselectable (and an unselectable value
 // cycles from the wrong place).
-pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu"];
+pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -706,7 +715,19 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_OFFLOAD_EXEC"),
-        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link, 'cpu' executes those GEMVs on the CPU instead. Decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+    ),
+    field!(
+        "memory.offload_passback_share",
+        "offload_passback_share",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::PassbackShare,
+        true,
+        false,
+        Some("HIPFIRE_OFFLOAD_PASSBACK_SHARE"),
+        "How a spilled step's output rows are divided between the two engines under scheduled co-inference (memory.offload_exec=passback only): the GPU takes the first rows (the 'pcie' arm) while the CPU runs the rest (the 'cpu' arm). 'auto' (default) schedules the split from this host's measured engine rates and refines it online; a number in (0, 0.5] pins it; 0 collapses the split onto the CPU engine alone, so the mode is then byte-identical to memory.offload_exec=cpu."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
@@ -6233,6 +6254,9 @@ pub mod memory {
         Pcie,
         /// CPU executes the steps whose weight tensor is host-mapped.
         Cpu,
+        /// Every spilled step runs on both: the GPU takes the first
+        /// `memory.offload_passback_share` of its output rows, the CPU the rest.
+        Passback,
     }
 
     impl std::fmt::Display for OffloadExec {
@@ -6240,6 +6264,7 @@ pub mod memory {
             match self {
                 OffloadExec::Pcie => write!(f, "pcie"),
                 OffloadExec::Cpu => write!(f, "cpu"),
+                OffloadExec::Passback => write!(f, "passback"),
             }
         }
     }
@@ -6251,6 +6276,7 @@ pub mod memory {
     pub fn parse_offload_exec(raw: Option<&str>) -> OffloadExec {
         match raw.map(|v| v.trim().to_ascii_lowercase()) {
             Some(v) if v == "cpu" => OffloadExec::Cpu,
+            Some(v) if v == "passback" => OffloadExec::Passback,
             _ => OffloadExec::Pcie,
         }
     }
@@ -6258,6 +6284,61 @@ pub mod memory {
     /// The configured [`OffloadExec`] from the process snapshot.
     pub fn offload_exec() -> OffloadExec {
         parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
+    }
+
+    /// How much of a split step the GPU takes (`memory.offload_passback_share`).
+    ///
+    /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
+    /// mode the key is inert (see [`stray_passback_share_notice`]).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum PassbackShare {
+        /// Scheduled from this host's own measured engine rates.
+        Auto,
+        /// Pinned by the user. `0.0` disables the pass-back.
+        Share(f64),
+    }
+
+    impl std::fmt::Display for PassbackShare {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                PassbackShare::Auto => write!(f, "auto"),
+                PassbackShare::Share(v) => write!(f, "{v}"),
+            }
+        }
+    }
+
+    /// Pure truth table behind [`offload_passback_share`]. Unset, empty and
+    /// unknown all resolve to `Auto`; the schema ([`super::ValueRule::PassbackShare`])
+    /// rejects an out-of-range number before this runs, so the fallback here is
+    /// belt-and-braces rather than the primary guard.
+    pub fn parse_passback_share(raw: Option<&str>) -> PassbackShare {
+        match raw.map(|v| v.trim()) {
+            Some("auto") => PassbackShare::Auto,
+            Some(v) => match v.parse::<f64>() {
+                Ok(f) if (0.0..=0.5).contains(&f) => PassbackShare::Share(f),
+                _ => PassbackShare::Auto,
+            },
+            None => PassbackShare::Auto,
+        }
+    }
+
+    /// The configured [`PassbackShare`] from the process snapshot.
+    pub fn offload_passback_share() -> PassbackShare {
+        parse_passback_share(process_value("HIPFIRE_OFFLOAD_PASSBACK_SHARE").as_deref())
+    }
+
+    /// `true` when a share is set but the mode cannot read it, so the load can
+    /// print one informational line instead of silently ignoring the key.
+    ///
+    /// The mode is the selector and the share is its modifier, so a share in a
+    /// `pcie`/`cpu` run is not a misconfiguration to refuse — just an inert key
+    /// worth naming once.
+    pub fn stray_passback_share_configured() -> bool {
+        let Some(raw) = process_value("HIPFIRE_OFFLOAD_PASSBACK_SHARE") else {
+            return false;
+        };
+        let mode = offload_exec();
+        mode != OffloadExec::Passback && raw.trim() != "" && raw.trim() != "auto"
     }
 
     /// Largest contiguous resident tail `[i_gpu_start .. n_layers)` such that the
@@ -6354,9 +6435,47 @@ pub mod memory {
             assert_eq!(parse_offload_exec(Some("PCIE")), OffloadExec::Pcie);
             assert_eq!(parse_offload_exec(Some("banana")), OffloadExec::Pcie);
             assert_eq!(parse_offload_exec(Some("cpu0")), OffloadExec::Pcie);
+            // Pass-back is its own mode; whitespace/case trimmed like "cpu".
+            assert_eq!(parse_offload_exec(Some("passback")), OffloadExec::Passback);
+            assert_eq!(
+                parse_offload_exec(Some(" Passback ")),
+                OffloadExec::Passback
+            );
+            assert_eq!(parse_offload_exec(Some("PASSBACK")), OffloadExec::Passback);
+            assert_eq!(parse_offload_exec(Some("passback0")), OffloadExec::Pcie);
             // Display is the wire spelling the registry/TOML round-trips.
             assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
             assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
+            assert_eq!(OffloadExec::Passback.to_string(), "passback");
+        }
+
+        #[test]
+        fn passback_share_roundtrip() {
+            // Absent/empty/unknown all schedule.
+            assert_eq!(parse_passback_share(None), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("auto")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some(" auto ")), PassbackShare::Auto);
+            // Both ends of the legal range are pinned shares; 0 disables.
+            assert_eq!(
+                parse_passback_share(Some("0")),
+                PassbackShare::Share(0.0)
+            );
+            assert_eq!(
+                parse_passback_share(Some("0.375")),
+                PassbackShare::Share(0.375)
+            );
+            assert_eq!(
+                parse_passback_share(Some("0.5")),
+                PassbackShare::Share(0.5)
+            );
+            // Out of range and garbage fail closed to scheduling (the schema
+            // rejects them earlier; this is the second guard).
+            assert_eq!(parse_passback_share(Some("0.6")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("-0.1")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("banana")), PassbackShare::Auto);
+            assert_eq!(PassbackShare::Auto.to_string(), "auto");
+            assert_eq!(PassbackShare::Share(0.25).to_string(), "0.25");
         }
 
         #[test]

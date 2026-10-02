@@ -1,0 +1,6 @@
+## 9b_cpu_r1 (repeat pass, interleaved)
+cpu exec: idle 77.8% — window ending at step 4096 covers 2048 steps: 1192ms wall, 928ms on CPU (453us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 78.1% — window ending at step 8192 covers 4096 steps: 2443ms wall, 1908ms on CPU (466us CPU/step) — GPU-idle lower bound, see report_idle
+## 27b_cpu_r1 (repeat pass, interleaved)
+cpu exec: idle 65.7% — window ending at step 2048 covers 1024 steps: 1121ms wall, 736ms on CPU (719us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 66.3% — window ending at step 4096 covers 2048 steps: 2276ms wall, 1509ms on CPU (737us CPU/step) — GPU-idle lower bound, see report_idle

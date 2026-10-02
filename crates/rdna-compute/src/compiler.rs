@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 
 #[cfg(target_os = "windows")]
@@ -50,6 +51,34 @@ fn unique_token() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}_{n}_{nanos}", std::process::id())
+}
+
+/// Process-global lock per kernel cache key, held across a JIT compile.
+///
+/// Parallel callers inside one process (the `rdna-compute` lib test binary runs
+/// its GPU tests on a thread pool, and every test builds its own `Gpu`) each
+/// launched their own hipcc for the *same* module on a cold cache — one compile
+/// publishes the blob all of them would produce.
+///
+/// Every failing run observed had several of those identical compiles racing
+/// (five in one; `tensor_ops` was the only module compiling at all in that run).
+/// The crash they produced is a ROCm 7.2 `clang-22` frontend stack fault
+/// (`clang::Parser::ParsePragmaLoopHint` → SIGSEGV in
+/// `Lexer::LexTokenInternal` on `tensor_ops.hip`), intermittent, and not
+/// reproduced by hand. This lock does **not** claim to fix that compiler bug. It
+/// removes the redundant concurrent compiles that were present in every failing
+/// run — worth doing on its own: the losers now reuse the winner's published
+/// blob instead of recompiling the same source.
+///
+/// Distinct keys still compile in parallel — the point of `compile_batch_for_symbols`
+/// — so this is per-key, never a global compile lock.
+static COMPILE_LOCKS: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Arc<parking_lot::Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// The lock guarding one cache key.
+fn compile_lock(key: &Path) -> Arc<parking_lot::Mutex<()>> {
+    let mut locks = COMPILE_LOCKS.lock();
+    locks.entry(key.to_path_buf()).or_default().clone()
 }
 
 /// Shared on-disk kernel cache root: `$HIPFIRE_KERNEL_CACHE` when set,
@@ -1219,6 +1248,20 @@ impl KernelCompiler {
             });
         }
 
+        // One hipcc per cache key in this process — see `compile_lock`.
+        let key_lock = compile_lock(&obj_path);
+        let _key_guard = key_lock.lock();
+
+        // A sibling caller may have published this key while we waited for the
+        // lock: reuse its blob instead of compiling the same source again.
+        if nonempty_blob(&obj_path) {
+            let published = obj_path.clone();
+            self.writeback_package(name, source, symbol, &published, false);
+            self.ensure_radiowave_certification(name, &published);
+            self.compiled.insert(name.to_string(), published);
+            return Ok(&self.compiled[name]);
+        }
+
         if stale_precompiled {
             eprintln!("  {name}: pre-compiled blob hash is stale and no cached build matches; recompiling");
         }
@@ -1233,6 +1276,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &module_flags,
         )?;
+        drop(_key_guard);
         self.ensure_radiowave_certification(name, &obj_path);
 
         // Hot keys keep the toolchain ID; cold pairs use the packaging key
@@ -1789,6 +1833,22 @@ mod tests {
             "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=1", "llvm-mc 23",
         );
         assert_ne!(custom, other_variant);
+    }
+
+    #[test]
+    fn compile_lock_is_per_cache_key_and_mutually_exclusive() {
+        let a = compile_lock(Path::new("/cache/gfx1201/module.aa.hsaco"));
+        let a_again = compile_lock(Path::new("/cache/gfx1201/module.aa.hsaco"));
+        let b = compile_lock(Path::new("/cache/gfx1201/module.bb.hsaco"));
+        assert!(Arc::ptr_eq(&a, &a_again), "one lock per key");
+        assert!(!Arc::ptr_eq(&a, &b), "distinct keys get distinct locks");
+        let held = a.lock();
+        assert!(
+            a.try_lock().is_none(),
+            "a held key excludes a second compile"
+        );
+        assert!(b.try_lock().is_some(), "a different key stays free");
+        drop(held);
     }
 
     #[test]

@@ -198,6 +198,17 @@ Each line gives the D2H / GEMV / H2D split for a step shape, and the second
 counter *must* be `0 host-mapped steps still on GPU`. A non-zero value means a
 step shape never reached the CPU — report it, do not average it away.
 
+The same flag prints `cpu exec: idle N% — window ending at step S covers K
+steps: …ms wall, …ms on CPU (…us CPU/step)`, one line per window on the global
+step count's doubling schedule. That percentage is the share of the window's
+decode wall spent inside CPU-executed steps, and since a CPU step is a host sync
+point (a blocking D2H, the multiplication, an H2D) and prefill never enters the
+seam, it is a **lower bound on the GPU's idle fraction**. Quote the last lines of
+a run (the windows that cover most of it); the first windows are cold. This is
+the headroom reading for pass-back — scheduled co-inference of the spilled layers —
+not a rate and not a correctness signal. Also: `--runs N` decodes N times in one
+process, so use the per-window lines rather than any cumulative ratio.
+
 **Read the call count on the line before you quote a number.** A shape is printed
 at its first call and then at every doubling of that shape's call count, and each
 line's three means are over *that shape's* calls so far: the `calls=1` line is the

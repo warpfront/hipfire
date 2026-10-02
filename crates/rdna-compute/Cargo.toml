@@ -17,6 +17,7 @@ hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
 libloading = { workspace = true, optional = true }
+parking_lot = "0.12"
 rayon = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

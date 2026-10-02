@@ -677,3 +677,408 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::Q8F16 => "Q8F16",
     }
 }
+
+// ── Pass-back row split (`memory.offload_exec=passback`) ──────────────────────
+
+/// Read `n` f32 values back from a device tensor.
+fn read_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<f32> {
+    gpu.hip.device_synchronize().expect("sync");
+    let mut out = vec![0.0f32; n];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip.memcpy_dtoh(bytes, &t.buf).expect("dtoh");
+    out
+}
+
+/// Every row of a split step's output, compared bit for bit against the whole-step
+/// path it was cut from.
+///
+/// Rows are independent in both engines, so bitwise equality is the correct
+/// expectation, and any offset error shows up as a whole-row shift. Rows `[0, g)`
+/// come from the production kernel over the same bytes as a full launch; rows
+/// `[g, m)` come from the CPU over `&bytes[g*row_bytes..]`, and their equality
+/// *also* proves the GPU arm did not write past `g` — i.e. that the two arms'
+/// regions are disjoint, which is why the join needs no synchronization.
+#[allow(clippy::too_many_arguments)]
+fn split_case(
+    gpu: &mut Gpu,
+    gemv: &GemvFamily,
+    ctx: &DispatchCtx,
+    opts: &hipfire_dispatch::offload_split::PassbackOptions,
+    label: &str,
+    q: CpuQuant,
+    dtype: DType,
+    bytes: &[u8],
+    m: usize,
+    k: usize,
+) -> bool {
+    use hipfire_dispatch::pipeline::{GemvInput, Step};
+
+    // The gate's correctness-critical invariant: the byte length is exactly
+    // `m * row_bytes`, which is what makes a byte view the CPU arm's row `g`.
+    assert_eq!(
+        bytes.len() % m,
+        0,
+        "{label}: {}-byte weight is not a whole number of {m} rows",
+        bytes.len()
+    );
+    let row_bytes = bytes.len() / m;
+    assert_eq!(
+        row_bytes,
+        hipfire_cpu::gemv::row_bytes(q, k),
+        "{label}: row stride disagrees with the CPU decoder ({row_bytes} vs {})",
+        hipfire_cpu::gemv::row_bytes(q, k)
+    );
+
+    let w = gpu
+        .upload_raw_host(bytes, &[bytes.len()])
+        .expect("upload host-mapped w");
+    assert!(gpu.host_located(&w), "{label}: weight is not host-mapped");
+    let mut x_rot = activation(k, m);
+    if q.is_fwht_g256() {
+        rotate_x(&mut x_rot);
+    }
+    let x_dev = gpu.upload_f32(&x_rot, &[k]).expect("upload x");
+    let wr = WeightRef {
+        buf: &w,
+        dtype,
+        m,
+        k,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    };
+
+    // ── the plain GEMV arm: rows [0, g) GPU, [g, m) CPU ──────────────────────
+    let out_split = gpu.alloc_tensor(&[m], DType::F32).expect("alloc out");
+    let before = hipfire_dispatch::split_counters();
+    let ran = hipfire_dispatch::offload_split::run_with(
+        gpu,
+        ctx,
+        &Step::Gemv {
+            w: &wr,
+            input: GemvInput::Prerotated(&x_dev),
+            out: &out_split,
+        },
+        opts,
+    )
+    .unwrap_or_else(|e| panic!("{label}: split failed: {e:?}"));
+    assert!(ran, "{label}: the pass-back refused a covered shape");
+    let after = hipfire_dispatch::split_counters();
+    assert_eq!(after.0 - before.0, 1, "{label}: exactly one split step");
+    let g = (after.1 - before.1) as usize;
+    assert!(g > 0 && g < m, "{label}: split offset {g} of {m}");
+    assert_eq!(g % 8, 0, "{label}: split offset {g} is not 8-row aligned");
+
+    let out_full = gpu.alloc_tensor(&[m], DType::F32).expect("alloc ref");
+    gemv.run(
+        ctx,
+        gpu,
+        &GemvParams {
+            w: &wr,
+            x: &x_dev,
+            y: &out_full,
+            variant: GemvVariant::Prerotated,
+            residual: None,
+            gate: None,
+            up: None,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{label}: reference launch failed: {e:?}"));
+    let mut cpu_full = vec![0.0f32; m];
+    cpu_gemv(q, bytes, m, k, &x_rot, &mut cpu_full);
+
+    let split = read_f32(gpu, &out_split, m);
+    let full = read_f32(gpu, &out_full, m);
+    // How far apart the two *engines* are on identical bytes — the numerical
+    // divergence the end-to-end text may or may not expose. Printed per case, and
+    // the test requires at least one covered case to differ: a split whose arms
+    // agreed bitwise would be a mixture in name only (and this is the reference
+    // against which the requirement "coherent output, plus a measured divergence"
+    // is met at the element level rather than at the token level).
+    let arm_scale = cpu_full.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-30);
+    let arm_delta = full
+        .iter()
+        .zip(&cpu_full)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let arms_differ = arm_delta > 0.0;
+    for row in 0..g {
+        assert_eq!(
+            split[row].to_bits(),
+            full[row].to_bits(),
+            "{label}: GPU row {row} differs from a full Prerotated launch \
+             (g={g}, m={m})"
+        );
+    }
+    for row in g..m {
+        assert_eq!(
+            split[row].to_bits(),
+            cpu_full[row].to_bits(),
+            "{label}: CPU row {row} differs from a whole-weight CPU gemv \
+             (g={g}, m={m})"
+        );
+    }
+
+    // ── the residual arm: `acc += W·x`, rows [0, g) GPU, [g, m) CPU ──────────
+    // Only dtypes whose GPU residual arm exists can be split at all
+    // (`dispatch_residual`'s set is `for_gemv_residual`'s): the gate must refuse
+    // the rest rather than fail to launch, because the whole-CPU step handles
+    // every format the CPU decodes.
+    let residual_covered =
+        hipfire_dispatch::types::KernelKey::for_gemv_residual(dtype).is_ok();
+    // +8 rows of sentinel past `m`, so an over-long offset launch is caught.
+    let mut seed = activation(m, 7919);
+    seed.extend_from_slice(&[999.0f32; 8]);
+    if !residual_covered {
+        let acc = gpu.upload_f32(&seed, &[m + 8]).expect("upload acc");
+        let refused = hipfire_dispatch::offload_split::run_with(
+            gpu,
+            ctx,
+            &Step::GemvResidual {
+                w: &wr,
+                input: GemvInput::Prerotated(&x_dev),
+                residual: &acc,
+                out: &acc,
+            },
+            opts,
+        )
+        .unwrap_or_else(|e| panic!("{label}: uncovered residual shape errored: {e:?}"));
+        assert!(
+            !refused,
+            "{label}: a residual shape with no GPU arm must run on the CPU engine alone (not co-inferenced)"
+        );
+        eprintln!(
+            "{label:44} m={m:<6} k={k:<6} row_bytes={row_bytes:<6} g={g:<6} \
+             (m-g={}) exact; residual arm refused (no GPU residual kernel); \
+             arm delta {:.3e} (rel {:.2e})",
+            m - g,
+            arm_delta,
+            arm_delta / arm_scale,
+        );
+        gpu.free_tensor(out_split).ok();
+        gpu.free_tensor(out_full).ok();
+        gpu.free_tensor(acc).ok();
+        gpu.free_tensor(x_dev).ok();
+        gpu.free_tensor(w).ok();
+        return arms_differ;
+    }
+    let resid_split = gpu.upload_f32(&seed, &[m + 8]).expect("upload acc");
+    let resid_full = gpu.upload_f32(&seed, &[m + 8]).expect("upload acc ref");
+    let before = hipfire_dispatch::split_counters();
+    let ran = hipfire_dispatch::offload_split::run_with(
+        gpu,
+        ctx,
+        &Step::GemvResidual {
+            w: &wr,
+            input: GemvInput::Prerotated(&x_dev),
+            // Production aliases `out` with `residual` on this arm (the residual
+            // form never writes `out`); mirror that.
+            residual: &resid_split,
+            out: &resid_split,
+        },
+        opts,
+    )
+    .unwrap_or_else(|e| panic!("{label}: residual split failed: {e:?}"));
+    assert!(ran, "{label}: the pass-back refused a covered residual shape");
+    let after = hipfire_dispatch::split_counters();
+    assert_eq!(
+        (after.1 - before.1) as usize,
+        g,
+        "{label}: the residual arm's offset differs from the plain arm's"
+    );
+    gemv.run(
+        ctx,
+        gpu,
+        &GemvParams {
+            w: &wr,
+            x: &x_dev,
+            y: &resid_full,
+            variant: GemvVariant::WithResidual,
+            residual: None,
+            gate: None,
+            up: None,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{label}: residual reference launch failed: {e:?}"));
+
+    let acc_split = read_f32(gpu, &resid_split, m + 8);
+    let acc_full = read_f32(gpu, &resid_full, m + 8);
+    for row in 0..g {
+        assert_eq!(
+            acc_split[row].to_bits(),
+            acc_full[row].to_bits(),
+            "{label}: residual GPU row {row} differs from a full WithResidual \
+             launch (g={g}, m={m})"
+        );
+    }
+    for row in g..m {
+        let expected = seed[row] + cpu_full[row];
+        assert_eq!(
+            acc_split[row].to_bits(),
+            expected.to_bits(),
+            "{label}: residual CPU row {row} differs from `acc + W·x` \
+             (g={g}, m={m})"
+        );
+    }
+    for row in m..m + 8 {
+        assert_eq!(
+            acc_split[row], 999.0,
+            "{label}: row {row} past m={m} was written by the offset launch"
+        );
+    }
+
+    eprintln!(
+        "{label:44} m={m:<6} k={k:<6} row_bytes={row_bytes:<6} g={g:<6} \
+         (m-g={}) exact; arm delta {:.3e} (rel {:.2e})",
+        m - g,
+        arm_delta,
+        arm_delta / arm_scale,
+    );
+    gpu.free_tensor(out_split).ok();
+    gpu.free_tensor(out_full).ok();
+    gpu.free_tensor(resid_split).ok();
+    gpu.free_tensor(resid_full).ok();
+    gpu.free_tensor(x_dev).ok();
+    gpu.free_tensor(w).ok();
+    arms_differ
+}
+
+/// The pass-back split's load-bearing test: a split step's two arms are
+/// bit-identical, row for row, to the two whole-step paths they are cut from —
+/// the production `pcie` launch for rows `[0, g)`, the CPU GEMV for rows
+/// `[g, m)` — over real fixture tensors and over the odd-`m` tail.
+///
+/// Needs the process in `passback` (or `cpu`) mode: `run_with` goes through the
+/// same `plan_step` gate the seam does, which reads the process-start config
+/// snapshot (never the ambient environment at call time). Run:
+///
+///   HIPFIRE_OFFLOAD_EXEC=passback cargo test -p hipfire-arch-qwen35 --release \
+///     --test gpu_gemv_parity -- --ignored --nocapture passback_row_offset
+#[test]
+#[ignore]
+fn passback_row_offset_equivalence() {
+    use hipfire_config::memory::{offload_exec, OffloadExec, PassbackShare};
+    use hipfire_dispatch::offload_split::{PassbackOptions, MIN_SPLIT_BYTES};
+
+    if !matches!(offload_exec(), OffloadExec::Cpu | OffloadExec::Passback) {
+        eprintln!(
+            "SKIP — needs a CPU-executing mode in the process environment:\n  \
+             HIPFIRE_OFFLOAD_EXEC=passback cargo test -p hipfire-arch-qwen35 --release \
+             --test gpu_gemv_parity -- --ignored --nocapture passback_row_offset"
+        );
+        return;
+    }
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP — no GPU ({e:?}).");
+            return;
+        }
+    };
+    gpu.ensure_mq_signs().expect("mq signs");
+    let ctx = DispatchCtx::new(&gpu);
+    let gemv = GemvFamily::new();
+    let opts = PassbackOptions {
+        enabled: true,
+        share: PassbackShare::Share(0.5),
+    };
+    let dir = models_dir();
+    let mut cases: Vec<(String, CpuQuant, DType, Vec<u8>, usize, usize)> = Vec::new();
+
+    // Real fixture tensors: the strongest evidence (real strides, real group
+    // counts), and the natural shape plus the smallest odd row count that still
+    // clears `MIN_SPLIT_BYTES` — the odd-`m` tail through a row offset.
+    for (file, qt, dtype, q) in REAL {
+        let path = dir.join(file);
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            continue;
+        }
+        let hfq = HfqFile::open(&path).expect("open fixture");
+        let Some((name, m, k)) = hfq
+            .tensors()
+            .iter()
+            .filter(|i| {
+                i.quant_type == *qt && i.shape.len() == 2 && !i.name.contains("embed_tokens") && {
+                    let k = i.shape[1] as usize;
+                    k % 256 == 0 && (i.shape[0] as usize) * k <= MAX_ELEMS
+                }
+            })
+            .max_by_key(|i| (i.shape[0] as usize) * (i.shape[1] as usize))
+            .map(|i| (i.name.clone(), i.shape[0] as usize, i.shape[1] as usize))
+        else {
+            continue;
+        };
+        let (_, bytes) = hfq.tensor_data_vec(&name).expect("tensor bytes");
+        let row_bytes = bytes.len() / m;
+        let short = name.rsplit('.').nth(1).unwrap_or(&name).to_string();
+        cases.push((format!("{file} {short}"), *q, *dtype, bytes.clone(), m, k));
+        let min_rows = MIN_SPLIT_BYTES.div_ceil(row_bytes) | 1;
+        if min_rows < m {
+            let rows = min_rows;
+            cases.push((
+                format!("{file} {short} odd-m={rows}"),
+                *q,
+                *dtype,
+                bytes[..rows * row_bytes].to_vec(),
+                rows,
+                k,
+            ));
+        }
+    }
+
+    // Synthetic twins of the dense formats the local fixtures do not carry (the
+    // 27B XTS ships MQ4G256V2 / MQ3G256V2; the HFQ4G256 family is the other
+    // shipped dense tier). Sized above `MIN_SPLIT_BYTES` so the split actually
+    // runs.
+    for (qt, dtype, q) in SYNTH {
+        if !matches!(
+            *dtype,
+            DType::MQ4G256V2 | DType::MQ3G256V2 | DType::MQ4CG256 | DType::HFQ4G256 | DType::Q8_0
+        ) {
+            continue;
+        }
+        let k = 4096usize;
+        let row_bytes = hipfire_cpu::gemv::row_bytes(*q, k);
+        let m = MIN_SPLIT_BYTES.div_ceil(row_bytes) | 1;
+        cases.push((
+            format!("synthetic qt={qt} {q:?}"),
+            *q,
+            *dtype,
+            synth_weights(*q, m, k),
+            m,
+            k,
+        ));
+    }
+
+    assert!(
+        !cases.is_empty(),
+        "no fixture or synthetic case was available — pull qwen3.5:2b"
+    );
+    let differing_arms = cases
+        .iter()
+        .filter(|(label, q, dtype, bytes, m, k)| {
+            split_case(
+                &mut gpu, &gemv, &ctx, &opts, label, *q, *dtype, bytes, *m, *k,
+            )
+        })
+        .count();
+    // The two engines are independent implementations with different
+    // accumulation orders, so their *numbers* must differ somewhere in the matrix
+    // even when the greedy token stream matches: a split whose arms agreed bitwise
+    // would be a mixture in name only.
+    assert!(
+        differing_arms > 0,
+        "no covered case showed the two engines' numbers differing — the split \
+         would be a no-op mixture"
+    );
+    eprintln!(
+        "\npass-back row-offset equivalence: {} case(s) bit-exact on {}; \
+         {differing_arms} of them mix numerically different engines",
+        cases.len(),
+        gpu.arch
+    );
+}

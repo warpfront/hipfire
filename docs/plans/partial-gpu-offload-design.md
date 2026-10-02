@@ -286,7 +286,12 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   accumulate (the residual is the destination; a residual step never writes its
   `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
   GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
-  then the CPU GEMV plus residual.
+  then the CPU GEMV plus residual. Under `passback` it now hands that residual
+  GEMV to the co-inference seam as a `Step::GemvResidual` (falling back to the
+  whole-CPU path when the seam declines), so the dense FFN down-projection is
+  co-inferenced instead of run wholly on the CPU — measured **+3.8 % / +2.6 %** on
+  the 9B at 8 / 16 of 32 spilled (interleaved fresh-process pairs, passback mode;
+  § 6.2.2).
 - **Two launcher properties the CPU path must reproduce exactly**, both of which
   fail *silently* rather than erroring, and both now pinned by parity arms in
   `crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs`: the per-channel **AWQ**
@@ -340,6 +345,12 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   fused launch the guard missed or a call site that bypasses `execute_steps`
   shows up there instead of as a mystery. The `calls=` field on the line is what
   makes the number quotable: a shape's first line is its cold first step.
+  The same flag prints `cpu exec: idle N% — window ending at step S …` on the
+  *global* step count's doubling schedule: the share of a decode window's wall
+  spent inside CPU-executed steps. Because a CPU step is a host sync point and
+  prefill never enters the seam, that share is a **lower bound on the GPU's idle
+  fraction** — the only reason a scheme that hands part of a spilled step back
+  to the GPU could pay. It is a headroom reading, not a correctness signal.
 - **Not covered, deliberately.** The slots/serve body (`forward_batch_slots` →
   `dense_ffn_body_slots`) and prefill run batched GEMM kernels that never enter
   `execute_steps`, so their spilled weights are still read over PCIe; the seam
@@ -371,6 +382,177 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   completions. Numbers, method, fixture identity, ceilings and the superseded
   first readings:
   [`docs/perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md`](../perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md).
+
+#### 6.2.2 Pass-back: scheduled co-inference of the spilled layers (`memory.offload_exec=passback`)
+
+**What this mode is.** Pass-back is a **mixture of the two single paths of §6.2.1** — the
+GPU reading the host-mapped weights over the link (`pcie`) and the CPU SIMD kernels
+reading host RAM (`cpu`) — run **concurrently on the same spilled step**. It is not a
+third engine, not a fallback, and not a per-layer choice: consecutive layers are serially
+dependent through the residual stream, so moving a whole layer between the engines only
+swaps who idles, and the mixture has to be *within* a step. The `share` is the
+**schedule** that divides a step's output rows — `[0, g)` to the GPU (the `pcie` path),
+`[g, m)` to the CPU (the `cpu` path). A step that ends up wholly on one engine is a
+**degenerate point of that schedule** (`share → 0`), not a validation failure and not a
+retreat to a worse path; the refusal gates below only bound which steps can be
+co-inferenced at all.
+
+Shipped 2026-10-01. §6.2.1's CPU arm is a host sync point, so the GPU is idle for
+most of its wall — 77.7 % of the decode wall at 8/32 layers spilled on the 9B,
+89.8 % at 16/32, 94.6 % at 24/32, and 66.0 % on a 27B at 8/64
+([`2026-10-01-offload-passback-headroom-idle.md`](../perf-checkpoints/2026-10-01-offload-passback-headroom-idle.md)).
+The same record measured the headroom: a CPU GEMV stream and a GPU PCIe read of the
+*same* host-mapped bytes are near-additive to **75–78 GB/s** combined (the CPU keeps
+86–94 % of its solo ~52 GB/s while the GPU pulls its 27.3–28.4 GB/s unchanged),
+against ~46 GB/s for the CPU while the GPU reads — a ~1.4× ceiling, and one bounded
+by host DRAM rather than by either engine. This mode turns that idle window into
+work. *(The record is `historical`; the numbers below are its, not a current
+product claim.)*
+
+- **The split.** A spilled step's output rows are independent, so the step is split
+  **by output rows**: rows `[0, g)` go back to the GPU — the production kernel,
+  reading the same host-mapped weight over the link — and rows `[g, m)` stay on the
+  CPU. Per-layer placement cannot capture any of this: consecutive layers are
+  serially dependent through the residual stream, so moving a whole layer across
+  swaps who idles instead of overlapping anything. The split must be *within* a step.
+- **Config.** `memory.offload_exec` gains `passback` (env
+  `HIPFIRE_OFFLOAD_EXEC`). The GPU's share `g/m` is `memory.offload_passback_share`
+  (env `HIPFIRE_OFFLOAD_PASSBACK_SHARE`): `auto` (default) schedules it, a number in
+  `(0, 0.5]` pins it, and `0` disables the pass-back — the mode is then
+  byte-identical to `cpu` (the A/B twin and the byte-identity test). The key is read
+  only in `passback` mode; set in another mode it is inert and prints one
+  informational line at load. The upper bound is 0.5 because a step that should hand
+  more than half its rows to the GPU is better expressed by switching the mode to
+  `pcie`.
+- **Both arms are the existing paths, over a row range.** The GPU arm is `pcie`'s
+  launch restricted to rows `[0, g)` (`launch_op_rows`); the CPU arm is `cpu`'s step
+  restricted to `[g, m)` (`cpu_arm_prepare` / `cpu_arm_finish`). No third engine and
+  no new numerics, which is what makes the GPU arm bit-identical, row for row, to a
+  full `pcie` launch and `share = 0` byte-identical to `cpu`.
+- **Ordering, not streams.** Today's step is `D2H(x) → CPU GEMV → H2D(y)`. The
+  overlap is an ordering result: issue the blocking D2H *before* enqueueing the GPU
+  arm (so it drains only the step's producer, never the arm), enqueue the GPU arm
+  async, run the CPU multiply while it executes, then do the blocking H2D of the
+  CPU's rows — stream-ordered after the GPU arm because both are on the same
+  (default) stream. The copies are `k*4` bytes down and `(m-g)*4` up (~30 KB at 9B
+  shapes) against tens of MB of weight bytes, so a second stream plus an event pair
+  would buy the overlap of a ~2 µs copy. If a measurement ever shows a split step's
+  copies stalling, the fix is pre-decided: one non-blocking stream, an event recorded
+  on the current stream right after the producer, `stream_wait_event(aux, ev)`, the
+  D2H on `aux`, and an event pair back before the H2D — `hip-bridge` already exposes
+  all of it. Not built speculatively.
+- **Covered shapes (4).** `Gemv{Raw}`, `Gemv{Prerotated}`,
+  `GemvResidual{Prerotated}`, and `GemvResidual{Raw}` when the dtype has a fused
+  residual kernel. The mechanism is that every covered kernel indexes its weight as
+  `A + row*row_stride` from the passed base and writes `y[row]`, so a byte view of the
+  weight plus a pointer-offset output *is* a row-shifted launch. Split offsets are
+  8-row aligned: 2 for the residual kernels' `row0 = blockIdx.x << 1` + `float2`
+  store, 8 to keep every covered format's weight byte offset 4-byte aligned.
+- **Eligibility (the schedule's degenerate point).** A step that fails any gate below is
+  not "rejected" — it simply runs **wholly on the CPU engine** (`share → 0`), the
+  degenerate point of the co-inference schedule, never on `pcie`. The gates: not
+  host-mapped; a padded `row_stride`; a weight whose byte length is not exactly
+  `m * row_bytes(q, k)` (the correctness-critical invariant: it is what makes
+  `&host_bytes[g*row_bytes..]` the CPU arm's row `g`); no vector row dot for the format
+  (with the scalar decoder the best share is all-GPU, which `pcie` does better); a
+  non-F32 or short output; a weight below 2 MiB (the launch and the join outweigh the
+  overlap); and `GemvResidual{Raw}` without a fused residual kernel (its fallback
+  scratch and accumulate are whole-tensor). A failed seeding probe leaves the shape on
+  `DEFAULT_GPU_SHARE` and the controller converges from there.
+- **Scheduler.** The optimum is a property of the *host* (link width, DRAM peak, core
+  count, AVX2), so no constant is load-bearing. The first split-eligible step of each
+  `(dtype, k)` seeds itself by timing both engines on that step's *own* weight buffer
+  (median of 3 reps; the GPU arm through a scratch-output probe, so a residual probe
+  cannot be double-counted by the following real arm) and every split step then
+  refines the share from its own arm timings. The join is `copy + max(0, gpu_ns −
+  cpu_ns)`, and the controller reads it **relative to the shape's own no-wait floor**
+  — the smallest join it has seen, i.e. what the copy costs when the GPU arm finished
+  first — with a hysteresis margin (10 µs, or a quarter of the floor). Only the excess
+  over `floor + margin` can be a wait: when there is one, `r_gpu` is sampled as
+  `rows_gpu·row_bytes / (cpu_ns + excess)` and the share moves toward the balance
+  point; when there is not, the CPU is the straggler and the share rises. Both an
+  absolute microsecond threshold (the measured copy alone is 30–50 µs for the ~30 KB
+  this mode copies back, so any threshold below that samples on *every* step) and the
+  raw join (`cpu_ns + join` is the *CPU's* duration whenever the CPU is the straggler,
+  which reports a GPU rate an order of magnitude too low and pins the split to its
+  floor with both engines idle in turn) are wrong here; the floor is measured, not
+  assumed. Shares are clamped to `[0.05, 0.50]`, adjusted every 4 steps (step 0.3 of
+  the way toward `r_gpu/(r_gpu+r_cpu)`), and latched once a shape has applied 64
+  adjustments with the last four all under 0.005. The latch is **not permanent**: a
+  latched shape keeps measuring (the rate EWMAs never stop), and re-opens — re-tracking
+  and re-latching — when the fresh proposal leaves `REOPEN_EPS` (0.01) in the same
+  direction for `REOPEN_CONFIRM` (3) consecutive adjustments. `REOPEN_EPS` is a
+  *proposal-axis* band, so the balance-point dead zone is `REOPEN_EPS / ALPHA ≈ 0.033`;
+  it holds a 2× margin over the freeze band (`FREEZE_EPS` = 0.005, the largest proposal a
+  just-latched shape can be holding), which is the hysteresis that keeps it from
+  thrashing. The same-direction run is the other half: one out-of-band proposal can come
+  from a host-load transient or a single badly sampled join, and unlatching on it hands
+  the controller the noise the latch exists to reject. The original `0.02` was a
+  `0.02 / ALPHA ≈ 0.067` dead zone — it tripped on a *step* change but let a slow
+  host-load *drift* slide the optimum by 6.7 points before the latch noticed; `0.01`
+  halves that, at no static- or step-scenario cost in `offload_split`'s deterministic
+  host-load model. The band is deliberately **not** field-identifiable: the re-open path
+  is live on serving runs (the trace's `reopens` counter shows unlatches), yet a four-arm
+  A/B (0.005 without the streak, 0.005/0.01/0.02 with it, 3 interleaved fresh-process
+  rounds at 8 and 16 of 32 spilled) left every arm inside its own run-to-run spread and
+  flipped the ordering between budgets, so the static fixture does not resolve the band —
+  and the 0.005 penalty the earlier spread measured (−1.8 %/−5.2 %) did not reproduce on
+  this host, which is why the value rests on the freeze-band margin and the drift model,
+  not on a field win. A runtime calibration of the band was considered and rejected: the
+  only per-shape scatter the loop holds is the converged proposal magnitude, which the
+  freeze guarantees is under `FREEZE_EPS`, so a scatter-derived band would land at the
+  freeze band with no margin — where the model shows a clean static plant re-opening nine
+  times in 1024 steps.
+- **Known estimator limitations (not latch defects, not fixed here).** They feed the
+  reopen signal, so they are the next work in this path:
+  - `min_join_ns` is a monotone running *minimum* that never rises. Once host/PCIe
+    contention lifts the true no-wait floor above the fastest join ever seen, every later
+    join reads as a wait and its reconstructed `r_gpu` reads low — biasing the balance
+    point, and hence the reopen comparison, downward. A decayed or windowed percentile
+    floor would track the regime.
+  - `r_gpu` is refreshed only on a *waited* join. A shape whose joins sit at the floor
+    carries a dead anchor (the live trace showed `m=4096 k=12288` with ~655 `gpu samples`
+    over 6400 steps and `last waited=false`), so any reopen for it is CPU-rate drift
+    measured against a stale GPU rate — the likely mechanism behind the model's
+    static-optimum-under-±300 µs-host-jitter scenario, where the share parked at ~0.24
+    against a ~0.34 optimum. The same
+    estimate feeds the `!gpu_waited` upward ratchet, which has no downward counterpart.
+    (The ratchet is latent, not a live bug: a shape pinned at `SHARE_MAX` only stays
+    there while the GPU is genuinely faster — the cap is right there — and if the balance
+    moves against it, joins start waiting, `r_gpu` reappears and the both-rates branch
+    reopens it.) None of this is where this fixture's gap is: the share already sits
+    where the probe says it should (perf-gap § 5), and the skipped-step wall term measures
+    3.7–6.3 %
+    ([`2026-10-02-offload-passback-coverage-phase0.md`](../perf-checkpoints/2026-10-02-offload-passback-coverage-phase0.md)).
+- **Output determinism (expected cross-mode divergence, and pass-back's own).** The
+  modes are not interchangeable byte-wise: `cpu` and `pcie` run a layer's GEMV on
+  different engines, so they need not agree (measured on the 2B: `cpu` 2046 B vs
+  `pcie` 3554 B). Within a mode at the same layer split the output is deterministic
+  (`cpu`×2 and `pcie`×2 byte-identical). `passback` is the one mode that is **not**
+  reproducible run-to-run, because its scheduling — the row split — is derived per
+  process (the seeding probe plus online arm timings), so identical invocations mix
+  the two engines differently. `memory.offload_passback_share = 0` is byte-identical
+  to `cpu` (measured), so the seam is sound. Pin the share in any gate that diffs
+  pass-back output against a reference; the 2026-10-01 record's 9B byte-identity held
+  on its own prompts, where the argmax was insensitive — not as a general property
+  ([`2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](../perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5).
+- **Accounting and diagnostics.** A split step is *not* charged to the CPU-idle
+  numerator (its wall contains GPU work, so it would inflate the lower bound §6.2.1
+  documents) and gets its own `split: …` trace line under
+  `HIPFIRE_CPU_EXEC_TRACE=1`, whose `join` is the blocking H2D
+  (`copy + max(0, gpu_ns − cpu_ns)`): the line also prints the controller's own state
+  (`gpu samples`, `floor`, the last `waited`, the last `target`, `applied`, `reopens`,
+  `frozen`), so a share
+  nobody can explain is diagnosable from one run.
+  `gpu≥GB/s` is a lower bound by construction (it divides the GPU's bytes by the *whole*
+  step wall) and is printed as a bound for that reason. `hipfire offload-bench` measures
+  the host independently (its own `--format`/`--buffer-mb`/`--reps`, `--json`, and
+  `--write` to persist the recommended share), and refuses while a daemon pid file
+  names a live process.
+- **Scope.** The dense qwen3.5 seam only — the step lists that carry
+  `qkv_via_execute_steps`, `qkvza_via_execute_steps`, `gate_up_via_execute_steps` and
+  the dense `Step::GemvResidual` sites. MoE / routed-expert paths never reach it and
+  get no arms.
 
 ### 6.3 Dispatch substrate (`hipfire-dispatch/.../superop.rs`)
 - The executor binds by index today; add a residency-aware bind step: for each `WeightSlot`, pick

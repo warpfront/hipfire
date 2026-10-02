@@ -1571,12 +1571,13 @@ pub fn weight_gemv_swiglu_residual(
         lloyd_lut_c16: w_down.lloyd_lut_c16,
     };
     match w_down.gpu_dtype {
-        // ── CPU-executed offload (`memory.offload_exec=cpu`) ─────────────────
+        // ── Host-executed offload (`memory.offload_exec=cpu|passback`) ──────
         // The SiLU is not a weight-reading op, so it stays on the GPU; the
-        // down-projection and its residual accumulate then run on the CPU over
-        // the host-mapped weight bytes. This is the one op family that fuses the
-        // GEMV into a kernel the seam cannot see, so it splits here rather than
-        // widening the seam.
+        // down-projection and its residual accumulate are one `Step::GemvResidual`
+        // over the host-mapped weight bytes. Hand that step to the generic seam,
+        // which owns the CPU/pass-back decision: `cpu` runs it whole on the CPU
+        // and `passback` splits it by output rows. `pcie` never reaches this arm,
+        // because `host_mapped_cpu_capable` gates on the CPU-exec predicate.
         _ if hipfire_dispatch::host_mapped_cpu_capable(gpu, &wr) => {
             gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
             // `wr` above carries `awq_scale: None` because the fused GPU arm gets
@@ -1588,7 +1589,14 @@ pub fn weight_gemv_swiglu_residual(
                 awq_scale: w_down.awq_scale.as_ref(),
                 ..wr
             };
-            hipfire_dispatch::run_host_mapped_gemv_residual(gpu, &wr_cpu, ffn_hidden_scratch, x)
+            use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+            let step = Step::GemvResidual {
+                w: &wr_cpu,
+                input: GemvInput::Raw(ffn_hidden_scratch),
+                residual: x,
+                out: x,
+            };
+            execute_steps(gpu, &ctx, &[step])
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         DType::MQ4G256

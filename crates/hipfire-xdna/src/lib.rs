@@ -595,6 +595,12 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        ///
+        /// `&self` is deliberate: the mapping is interior-mutable by contract
+        /// (the `Arc` keeps the mapping alive, and writers synchronize through
+        /// [`Self::publish`]), so the aliasing rule the borrow checker would
+        /// need is the caller's, documented on [`Self::as_slice`].
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.

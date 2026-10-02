@@ -2919,6 +2919,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "libloading",
+ "parking_lot",
  "radiowave",
  "rayon",
  "redline-dispatch",
