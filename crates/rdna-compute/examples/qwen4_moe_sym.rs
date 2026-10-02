@@ -1052,7 +1052,9 @@ fn x_onehot_sweep(
             for v in [m, k, 1, n, n] {
                 a.push_i32(v as i32);
             }
-            launch(gpu, func, [(m / 64) as u32, (n / 16) as u32, 1], block, &mut a)?;
+            // The super-run gate/up (block 256) covers 16 output columns per CTA.
+            let cols = if block == 256 { 32 } else { 64 };
+            launch(gpu, func, [(m / cols) as u32, (n / 16) as u32, 1], block, &mut a)?;
         }
         gpu.hip.device_synchronize()?;
         Ok((download(gpu, &ygu.buf, n * MI * 2)?, download(gpu, &ydn.buf, n * DN_M * 2)?))
