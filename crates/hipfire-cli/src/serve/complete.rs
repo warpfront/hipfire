@@ -2176,6 +2176,52 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     Ok(())
 }
 
+/// True when a generation error leaves the daemon's slot session mid-turn
+/// and the next request must cold-reset instead of building on it.
+///
+/// Poison on any typed daemon error that did not attest a rollback, EXCEPT
+/// the classes that are pre-generation by wire contract: they are refused
+/// before any engine state exists, so `rolled_back == false` is trivially
+/// true for them and poisoning would discard the cross-turn prefix cache on
+/// every 400. This is the allow-list side, not a deny-list of "safe"
+/// classes: classes NOT listed here poison, because mid-generation failures
+/// hide outside the obvious class names — beta emits `internal` for a
+/// multi-slot engine death after produced tokens
+/// (hipfire-daemon `slots.rs`, "engine terminated without completing
+/// request ... N tokens were produced"), `generation` for unsafe slot
+/// terminals, and `gpu` for mid-generation vision/reset faults, and none of
+/// those is even a `hipfire_client::error_class` constant. A class that
+/// starts firing mid-generation must either attest `rolled_back` honestly
+/// or be added here with a pointer to its pre-generation sites.
+fn poisons_session_state(error: &hipfire_client::ClientError) -> bool {
+    use hipfire_client::error_class as ec;
+    let Some(typed) = error.typed_daemon() else {
+        return false;
+    };
+    // Pre-generation-only classes (beta sites): `malformed`/`validation`/
+    // `context_length`/`unsupported` refuse at request shaping before a slot
+    // session exists; `overload` is the worker-cap/queue refusal before
+    // submit; `cancel` is a rejection before session acceptance (an accepted
+    // mid-stream cancel emits a route-cancel, not an error envelope);
+    // `transport` is gateway-side client I/O. `transient` is deliberately
+    // NOT exempt: a transient failure without attested rollback leaves dirty
+    // state, and the retry path's forced reset or the poison reset both
+    // clean it.
+    if typed.rolled_back {
+        return false;
+    }
+    !matches!(
+        typed.class.as_str(),
+        ec::MALFORMED
+            | ec::VALIDATION
+            | ec::CONTEXT_LENGTH
+            | ec::CANCEL
+            | ec::TRANSPORT
+            | ec::UNSUPPORTED
+            | ec::OVERLOAD
+    )
+}
+
 /// One correlated generation attempt under the shared serve runtime lock.
 ///
 /// `identity` is the public completion identity (stable across retries);
@@ -2231,15 +2277,28 @@ pub(crate) fn complete_request_attempt(
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
-        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+        if force_reset
+            || runtime.needs_session_reset
+            || (!runtime.cache_capable && !runtime.continuous_batch_capable)
+        {
             if let Err(error) = runtime.engine.reset(attempt_id) {
-                if force_reset {
-                    // Rollback could not be attested: model state is unknown, so
-                    // the next request must full-reload rather than trust it.
-                    runtime.clear_resident(&shared.meta);
-                }
+                // Rollback could not be attested: model state is unknown, so
+                // the next request must full-reload rather than trust it —
+                // whether the reset was forced by retry policy or by a
+                // poisoned prior attempt. Under concurrent multi-slot load
+                // the daemon refuses the reset while any slot is active or
+                // queued (it never resets under a live slot), so the
+                // poisoned request's own attempt fails closed and
+                // `clear_resident` plans one full reload for the next
+                // request — expensive, but it cannot disturb in-flight
+                // slots. (This failure path clearing the resident model even
+                // for poison-triggered resets — previously forced retries
+                // only — is deliberate: an unattested reset leaves the same
+                // unknown-state situation as a forced one.)
+                runtime.clear_resident(&shared.meta);
                 return Err(error.into());
             }
+            runtime.needs_session_reset = false;
         }
         let contract = project_request_contract(
             body,
@@ -2677,6 +2736,34 @@ pub(crate) fn complete_request_attempt(
                 .unwrap_or_else(|error| error.into_inner())
                 .engine
                 .terminate();
+        } else if poisons_session_state(error) {
+            // The daemon failed mid-generation and could not roll the slot
+            // back, so the session state is mid-turn. Without this, the
+            // next request continues from the poisoned state (observed: the
+            // follow-up turn echoed the failed turn's prompt verbatim).
+            //
+            // Scope note: the flag is process-global on purpose — the
+            // gateway has no per-conversation session key (the daemon owns
+            // slot session lifecycle), so per-session poisoning would mean
+            // replicating daemon keying. Two consequences, both accepted:
+            // (a) a request racing between this failure and the flag-set
+            // can start before the reset lands — on current beta the daemon
+            // closes the failed session on every post-admission error path
+            // before emitting, so the racer starts a fresh session anyway
+            // and only a future daemon regression could leak one turn of
+            // stale prefix; (b) the follow-up cold reset is refused by the
+            // daemon while other slots are active, which fails this attempt
+            // closed and plans a full reload rather than disturbing
+            // in-flight slots.
+            shared
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .needs_session_reset = true;
+            eprintln!(
+                "[hipfire] generation failed without rollback ({error}); \
+                 session state poisoned — next request cold-resets"
+            );
         }
     }
     let done = gen_result?;
@@ -3770,6 +3857,54 @@ mod tests {
                 id: Some("req-t15".into()),
             },
         ))
+    }
+
+    #[test]
+    fn poisons_session_state_only_for_mid_generation_failures() {
+        use hipfire_client::{error_class as ec, ClientError, TypedDaemonError};
+        let daemon_err = |class: &str, rolled_back: bool| {
+            ClientError::Daemon(TypedDaemonError {
+                message: "unsafe multi_slot terminal: open_think".into(),
+                class: class.into(),
+                retryable: false,
+                rolled_back,
+                attempt_id: 7,
+                id: Some("chatcmpl-1".into()),
+            })
+        };
+        // Mid-generation classes poison: the observed corruption
+        // ("generation"), beta's multi-slot engine-death "internal" ("N
+        // tokens were produced"), mid-generation "gpu" faults, a transient
+        // failure without attested rollback, and the reserved spec-decode
+        // classes all leave state unattested.
+        for class in [
+            "generation",
+            ec::INTERNAL,
+            "gpu",
+            ec::TRANSIENT,
+            ec::ADAPTIVE_POISON,
+            ec::DETERMINISTIC_MISMATCH,
+        ] {
+            assert!(poisons_session_state(&daemon_err(class, false)), "{class}");
+        }
+        // Unknown future classes with a missing rollback fail safe.
+        assert!(poisons_session_state(&daemon_err("something_new", false)));
+        // A rolled-back generation failure keeps the session.
+        assert!(!poisons_session_state(&daemon_err("generation", true)));
+        // Pre-generation refusals never touched the engine.
+        for class in [
+            ec::VALIDATION,
+            ec::MALFORMED,
+            ec::CONTEXT_LENGTH,
+            ec::CANCEL,
+            ec::TRANSPORT,
+            ec::UNSUPPORTED,
+            ec::OVERLOAD,
+        ] {
+            assert!(!poisons_session_state(&daemon_err(class, false)), "{class}");
+        }
+        // Non-daemon errors (build/IO) are not session poisoning.
+        assert!(!poisons_session_state(&ClientError::Io(std::io::Error::other("boom"))));
     }
 
     #[test]

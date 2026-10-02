@@ -255,6 +255,21 @@ pub(crate) struct ServeRuntime {
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
+    /// Set when an attempt failed mid-generation without a rollback: the
+    /// slot session is mid-turn, so the next attempt cold-resets before
+    /// generating (see `poisons_session_state` in `complete.rs`). Cleared
+    /// by that reset and by `clear_resident`.
+    ///
+    /// Process-global by design: the gateway has no per-conversation session
+    /// key (the daemon owns slot session lifecycle). The follow-up reset is
+    /// refused by the daemon while any multi-slot session is active or
+    /// queued, so under concurrency a poison costs the poisoned request's
+    /// own attempt plus one full reload (`clear_resident`) — never a reset
+    /// under a live slot. A request racing the flag-set can start one turn
+    /// early; current beta closes the failed session on every post-admission
+    /// error path, so this flag is defense-in-depth against a future daemon
+    /// regression, not the primary cleanup.
+    pub(crate) needs_session_reset: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_k_override: Option<String>,
     pub(crate) kv_v_override: Option<String>,
@@ -1481,6 +1496,7 @@ pub(crate) fn serve_foreground(
             continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
+            needs_session_reset: false,
             kv_override: args.kv_mode.clone(),
             kv_k_override: args.kv_k.clone(),
             kv_v_override: args.kv_v.clone(),
@@ -1965,6 +1981,7 @@ impl ServeRuntime {
         self.continuous_batch_capable = false;
         self.current_max_seq = 0;
         self.cache_capable = false;
+        self.needs_session_reset = false;
         self.resident_model = None;
         let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
         meta.current_model = None;
@@ -3044,6 +3061,7 @@ mod tests {
             continuous_batch_capable: true,
             current_max_seq: 32768,
             cache_capable: true,
+            needs_session_reset: false,
             kv_override: Some("q8".to_owned()),
             kv_k_override: None,
             kv_v_override: None,

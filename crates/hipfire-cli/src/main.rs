@@ -12307,6 +12307,7 @@ mod tests {
                     continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
+                    needs_session_reset: false,
                     kv_override: None,
                     kv_k_override: None,
                     kv_v_override: None,
@@ -14965,6 +14966,54 @@ mod tests {
             assert_eq!(got, 400, "max_tokens=0 stream={stream}");
             assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
         }
+    }
+
+    /// A mid-generation-class daemon failure without attested rollback
+    /// (`internal`, `rolled_back=false`) poisons the session: the NEXT
+    /// request cold-resets on the wire before generating. A pre-generation
+    /// refusal (`validation`) must not. The fake daemon reports
+    /// `cache_capable=true`, so absent poison or a forced retry reset, no
+    /// reset is issued at all — the wire log is the assertion.
+    #[cfg(unix)]
+    #[test]
+    fn internal_failure_poisons_next_request_cold_resets_validation_does_not() {
+        let harness = Task11HttpHarness::spawn("poison-reset");
+        let port = harness.port();
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t15-class-internal", false));
+        assert_eq!(status, 500, "internal rolled_back=false failure");
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "post-poison follow-up succeeds");
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t15-class-validation", false));
+        assert_eq!(status, 400, "validation refusal");
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "post-validation follow-up succeeds");
+
+        let log = harness.read_requests_log();
+        let types: Vec<&str> = log
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        let gen_idx: Vec<usize> = types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| (*t == "generate").then_some(i))
+            .collect();
+        assert_eq!(gen_idx.len(), 4, "wire types: {types:?}");
+        let reset_idx: Vec<usize> = types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| (*t == "reset").then_some(i))
+            .collect();
+        assert_eq!(reset_idx.len(), 1, "exactly one reset: {types:?}");
+        let reset = reset_idx[0];
+        assert!(
+            reset > gen_idx[0] && reset < gen_idx[1],
+            "reset must sit between the poisoned generate and its follow-up: {types:?}"
+        );
+        assert!(
+            reset < gen_idx[2],
+            "no reset may precede the post-validation generate: {types:?}"
+        );
     }
 
     /// A stream that fails after it committed ends with an OpenAI error event
