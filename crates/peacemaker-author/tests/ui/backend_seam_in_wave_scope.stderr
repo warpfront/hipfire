@@ -1,0 +1,15 @@
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+ --> tests/ui/backend_seam_in_wave_scope.rs:9:17
+  |
+9 |         w.isa().barrier(&[])?;
+  |                 ^^^^^^^ --- argument #1 of type `&Auth` is missing
+  |
+note: method defined here
+ --> src/backend.rs
+  |
+  |     fn barrier(&mut self, auth: &Auth, transitions: &[SlotTransition]) -> Result<(), String>;
+  |        ^^^^^^^
+help: provide the argument
+  |
+9 |         w.isa().barrier(/* &Auth */, &[])?;
+  |                         ++++++++++++

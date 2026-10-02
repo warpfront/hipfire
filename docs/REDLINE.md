@@ -363,6 +363,15 @@ A retained route is valid only when all of the following hold.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.
+- Retained PM4 kernarg segments live in a host-writable GPU-agent (VRAM) pool
+  by default: kernels whose prologue chains dependent kernarg `s_load`s
+  otherwise pay host-memory latency on every round. The per-replay binding
+  patches stay plain host stores through the BAR, and one fence plus a one-byte
+  readback publishes them before the doorbell. Small-BAR systems (CPU access
+  never allowed) and a gfx1151 non-system entry acquire keep the CPU-agent
+  fine-grained pool; `HIPFIRE_PM4_KERNARG_POOL=host` forces it. The daemon log
+  records the choice as `[redline] retained PM4 kernargs: pool=…`. The indirect
+  buffer, timestamps and completion words stay in the host pool.
 
 ### Geometry and dynamic bindings
 

@@ -2,7 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! S2 launch fusion: exact gfx1100 hidden-ring scatter kernels.
+//! S2 launch fusion: hidden-ring scatter kernels on exact gfx1100 and exact
+//! gfx1201 (`ArchCaps::supports_dflash_hidden_scatter_fusion`). The historical
+//! `_gfx1100` symbol names are kept.
 //!
 //! Replaces the per-row `memcpy_dtod_at` storms in
 //! `HiddenStateRingBuffer::commit_staging_to_ring` and
@@ -15,7 +17,7 @@
 //! Routing contract (checked in-crate so the `&Gpu` scatter path can route
 //! without a signature change):
 //! - [`Gpu::dflash_hidden_commit5_applicable`] is the full fused-commit
-//!   predicate: gfx1100, kill switch clear, 5+5 F32 buffers with enough
+//!   predicate: exact gfx1100 or gfx1201, kill switch clear, 5+5 F32 buffers with enough
 //!   elements, `n <= max_pos`, and neither hipGraph capture nor retained
 //!   replay recording active (the kernels bake the current head, so they
 //!   must never be captured).
@@ -63,7 +65,7 @@ impl Gpu {
         hidden: usize,
         max_pos: usize,
     ) -> bool {
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_hidden_scatter_fusion() {
             return false;
         }
         if self.flags.hidden_scatter_fuse_off {
@@ -197,7 +199,7 @@ impl Gpu {
         if rows == 0 {
             return Ok(true);
         }
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_hidden_scatter_fusion() {
             return Ok(false);
         }
         if self.flags.hidden_scatter_fuse_off {

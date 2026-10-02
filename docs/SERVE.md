@@ -13,6 +13,7 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
 | Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
 | Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 600000` (10 min) |
+| Prefix cache | `serve.prefix_cache = false` (opt-in; paged slots, text only) |
 | Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
 
 Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
@@ -63,7 +64,7 @@ Flags (also accepted by `restart`):
 | Flag | Effect |
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
-| `--kv-mode <m>` | Sets `HIPFIRE_KV_MODE` for this run |
+| `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
 | `--idle-timeout <s>` | Sets `HIPFIRE_IDLE_TIMEOUT` (0..86400) |
 | `--no-prewarm` | Sets `HIPFIRE_NO_PREWARM=1` |
 | `--tp N` | Sets `HIPFIRE_TP` (1..64) for expert-parallel load |
@@ -83,12 +84,22 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
+   Multi-slot serve (`serve.multi_slot = true`) fails closed instead: the slot
+   engine is its only backend, so a failed pre-warm (for example, slot-engine
+   allocations that do not fit beside another process on the card) logs the
+   load error, answers `/health` with 503 `unhealthy`, and exits 1.
 4. **HTTP.** The native server accepts traffic. Serve is single-stream by
    default: one generation holds the daemon at a time and later requests wait
    in a bounded queue (`serve.max_queue`). Continuous batching covers only
-   thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`). A
-   waiter that is still queued after `serve.queue_timeout_ms` (default 10
-   minutes, long enough for one full generation; `0` waits forever) gets
+   thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`).
+   With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
+   decode at once on the experimental multi-slot engine. Concurrent requests
+   can produce different greedy text than serial requests at ≥4 slots; output
+   is deterministic for a fixed batch composition. 2 slots matched serial in
+   earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
+   1–4 of 4 prompts. A waiter that is still queued after `serve.queue_timeout_ms`
+   (default 10 minutes, long enough for one full generation; `0` waits
+   forever) gets
    **503** "server busy" with `Retry-After`. A failed `accept` (for example,
    out of file descriptors) is logged and retried, never fatal. At most 512
    connections are served at once; further connects wait in the listen
@@ -113,7 +124,7 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native` |
+| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native`, `capabilities` |
 | `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
 | `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
@@ -129,10 +140,12 @@ Agent / Pi custom-provider configuration, see
 `200` with `status: "ok"` while the daemon is up. `503` with
 `status: "restarting"` while serve respawns a daemon that exited (crash, panic,
 or a sticky GPU fault, after which the daemon exits 75) and reloads the
-resident model; `503` with `status: "unhealthy"` if respawning failed, after
-which serve exits 1 so a service manager can restart it. `model` is the loaded
-tag/path or `null` when idle/unloaded or after a failed model switch;
-`loading_model` names an asynchronous pre-warm or post-restart reload.
+resident model; `503` with `status: "unhealthy"` if respawning failed, or if
+multi-slot serve could not load its model (pre-warm, or the reload after a
+respawn), after which serve exits 1 so a service manager can restart it.
+`model` is the loaded tag/path or `null` when idle/unloaded or after a failed
+model switch; `loading_model` names an asynchronous pre-warm or post-restart
+reload.
 
 ```bash
 # Loopback example (safe default for local smoke):
@@ -179,7 +192,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied |
-| `seed` | OpenAI-compatible deterministic-sampling seed: non-negative integer (≤ u64::MAX). Same seed + same request → same output; `null`/omitted = fresh entropy per request; negative/fractional/non-integer → 400-style error, never silently unseeded. Best-effort like OpenAI: other sampling params and prompt must also match |
+| `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
 | `max_tokens` | Generation cap |
 | `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), and the stop text is not returned. Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP); every other route answers 400 instead of ignoring it |
@@ -317,6 +330,14 @@ When `messages` contains no `system` or `developer` role, the serve layer insert
 turn that runs out of `max_tokens` while still reasoning ends with `length`:
 the partial `reasoning_content` is returned and `content` is empty.
 
+Streaming error contract: a failure that happens BEFORE the first byte is a
+plain HTTP error status (no SSE body). A failure after the stream has started
+emits an OpenAI-shaped SSE `data: {"error": {...}}` frame followed by
+`data: [DONE]`, so a streaming client always sees a terminal event instead of
+a silently truncated `200`. Non-streaming failures keep the typed
+status mapping (`400` request/config, `503` + `Retry-After` overload or
+transient, `500` internal).
+
 Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
 LCP can hit. Other arches reset every request (stateless OpenAI shape).
@@ -366,6 +387,50 @@ but the request fails, `run` exits rather than colliding on the GPU lock.
 
 Model mismatch: serve reloads to the requested model on the chat path (cold
 start cost on that first switched request).
+
+## Experimental prefix cache (multi-slot)
+
+`serve.prefix_cache` is **off by default**. On the multi-slot engine
+(`serve.multi_slot=true`) it enables cross-session radix reuse of sealed
+128-token KV pages plus Qwen hybrid checkpoints. `.mtp` sidecars are
+probed as both `foo.mq4v2.mtp` and `foo.mtp` on the slot engine and the
+single-slot loader (`hipfire run --spec mtp`). Verified on gfx1101 /
+ROCm 10 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR,
+and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
+Vision+prefix reuse stays off. Non-empty stop sequences, logprobs, and the images+tools combination stay refused on slots; tools alone are supported.
+This is not a registry admission.
+
+### Capability advertisement
+
+`/health` carries a `capabilities` object built once at startup from the
+SAME resolved config the daemon's slot engine reads, so what is advertised
+is what the engine was built with. OpenAI-compatible clients ignore the
+extra field; hipfire clients (and deployment tooling) use it for discovery:
+
+```json
+{
+  "status": "ok",
+  "capabilities": {
+    "openai_compatible": true,
+    "mode": "multi-slot",
+    "multi_slot": true,
+    "multi_slot_slots": 2,
+    "prefix_cache": true,
+    "structured_output": true,
+    "structured_output_subset": "json-schema-strict-v1",
+    "refused_request_fields": ["stop", "logprobs", "response_format:json_object"]
+  }
+}
+```
+
+The standard route advertises the honest absence (`"multi_slot": false`,
+`"structured_output": false`) rather than aspirational capabilities.
+
+```bash
+HIPFIRE_SERVE_MULTI_SLOT=true HIPFIRE_SERVE_PREFIX_CACHE=true \
+  HIPFIRE_SERVE_PREFIX_CACHE_MAX_BYTES=268435456 \
+  hipfire serve 127.0.0.1:11435 <model.hfq>
+```
 
 ## Production smoke (GPU)
 

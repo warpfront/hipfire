@@ -26,7 +26,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -68,8 +68,22 @@ fn main() {
         prefill_chunk: 1024,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-sp7-swap"),
-        kv_mode: "q8".to_string(),
+        is_vl: false,
+        vl_path: None,
+        mtp_k: 0,
+        kv_mode_raw: String::new(),
         kv_backend: "legacy".to_string(),
+        prefix_cache: false,
+        prefix_cache_max_bytes: 0,
+        max_batch_tokens: 4096,
+        prefill_min_tokens: 1,
+        wait_max_count: 64,
+        wait_max_bytes: 256 * 1024 * 1024,
+        queue_timeout_ms: 30_000,
+        structured_jump_forward: false,
+        // No DFlash draft on this route (the oracle pins slot concurrency).
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");
@@ -92,6 +106,17 @@ fn main() {
                 top_p: 1.0,
                 top_k: 0,
                 seed: 0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                min_p: 0.0,
+                visual_data: None,
+                json_schema: None,
+                started_in_think: false,
+                think_budget: 0,
+                request_tag: 0,
+                queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");
@@ -103,7 +128,7 @@ fn main() {
                 match ev {
                     Event::Accepted { .. } => accepted = true,
                     Event::Token { id } => tokens.push(id),
-                    Event::Rejected { reason } => {
+                    Event::Rejected { reason, .. } => {
                         rejected = Some(reason);
                         break;
                     }

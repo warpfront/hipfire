@@ -27,6 +27,12 @@ pub fn native_cli_path() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    // Tests never fall back to a real build: a test reaching
+    // `start_background_serve` would exec a detached `hipfire serve` that
+    // outlives the test and holds the GPU and its per-card locks.
+    if cfg!(test) {
+        return None;
+    }
     let home = env::var_os("HIPFIRE_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
@@ -92,9 +98,24 @@ impl HipfirePaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialises the tests that mutate HIPFIRE_CLI_BIN.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn native_cli_path_never_falls_back_to_a_real_build_under_test() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::remove_var("HIPFIRE_CLI_BIN");
+        assert_eq!(native_cli_path(), None);
+        // The deliberate spawn: with a built `target/*/hipfire` on disk this
+        // used to exec a detached `hipfire serve -d`.
+        assert!(status::start_background_serve().is_err());
+    }
 
     #[test]
     fn native_cli_path_resolves_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = env::temp_dir().join(format!("hipfire-native-cli-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("hipfire");

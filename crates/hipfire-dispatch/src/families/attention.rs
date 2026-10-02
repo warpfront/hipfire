@@ -13,6 +13,7 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
+use rdna_compute::attention::GFX12_QUERY16_MAX_CTX;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {
@@ -876,7 +877,8 @@ fn dispatch_kv_write(
 /// Above ~60K the combined K+V working set crosses the R9700 last-level-cache
 /// boundary and the lower-workgroup query16 path can lose, so 32K is the
 /// certified upper bound. Explicit `HIPFIRE_FLASH_PREFILL=1` remains available
-/// for research outside this envelope.
+/// for research outside this envelope. Above it, the default stays on only
+/// where the gfx1201 Q8 FA2 body takes the call (see `AttnQ8_0KvBatchedMasked`).
 fn gfx12_query16_default_eligible(
     n_heads: usize,
     head_dim: usize,
@@ -886,10 +888,9 @@ fn gfx12_query16_default_eligible(
     const QUERY_TILE: usize = 16;
     const MIN_WORKGROUPS: usize = 128;
     const MIN_CTX: usize = 256;
-    const MAX_CTX: usize = 32_768;
 
     matches!(head_dim, 64 | 128 | 256)
-        && (MIN_CTX..=MAX_CTX).contains(&max_ctx_len)
+        && (MIN_CTX..=GFX12_QUERY16_MAX_CTX).contains(&max_ctx_len)
         && batch_size.div_ceil(QUERY_TILE) * n_heads >= MIN_WORKGROUPS
 }
 
@@ -1880,7 +1881,7 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8
                 {
@@ -2053,7 +2054,23 @@ fn dispatch_attend(
                         io.batch_size,
                         io.max_ctx_len,
                     );
-                let flash_default_on = gpu.arch.starts_with("gfx11") || gfx12_query16_route_ok;
+                // Above the query16 envelope the default stays on only where
+                // the gfx1201 Q8 FA2 body takes the call (same admission the
+                // launcher applies). Otherwise every >32K prefill segment fell
+                // to the tiled partials+reduce kernel below (R9700 H2 prefill
+                // at 49K: 134.9 s vs 34.6 s). At or below 32K nothing changes.
+                let gfx12_fa2_long_ctx_ok = io.max_ctx_len > GFX12_QUERY16_MAX_CTX
+                    && gfx12_query16_workload_eligible(ctx)
+                    && gpu.gfx12_q8_fa2_prefill_admitted(
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                    );
+                let flash_default_on = gpu.arch.starts_with("gfx11")
+                    || gfx12_query16_route_ok
+                    || gfx12_fa2_long_ctx_ok;
                 let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
                     .ok()
                     .as_deref()
@@ -2120,7 +2137,7 @@ fn dispatch_attend(
                     && io.head_dim == 256
                     && (64..=8192).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.max_ctx_len
                         .checked_mul(4 * (256 / 32) * 34)
                         .is_some_and(|bytes| {
@@ -2222,6 +2239,27 @@ fn dispatch_attend(
                         && io.head_dim % 32 == 0
                         && io.head_dim <= 256;
                     if wmma_ok {
+                        // gfx1151 VerifyAttn: byte-identical context-parallel
+                        // twin of the single-slot WMMA kernel below for
+                        // 1..=32 rows (f16 S tiles in the flash partials).
+                        // Declines (Ok(false)) on every other arch/shape.
+                        if let Some(fp) = io.flash_partials {
+                            if hip!(gpu.try_attention_verify_wmma(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.positions(),
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.max_ctx_len,
+                                io.batch_size,
+                                fp,
+                            ))? {
+                                return Ok(());
+                            }
+                        }
                         return hip!(gpu.attention_q8_0_flash_prefill_wmma(
                             io.q,
                             io.k_cache,

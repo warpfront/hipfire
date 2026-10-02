@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — ad-hoc coherence battery; use scripts/serve_harness.py (docs/VALIDATION.md)
+echo "warning: awq_coherence_check.sh is deprecated and will be removed in 0.5.0; use scripts/serve_harness.py" >&2
 # awq_coherence_check.sh — eyeball coherence of AWQ quants post-sweep.
 #
 # Uses target/release/examples/run (interactive REPL) with stdin-piped

@@ -17,7 +17,10 @@ use crate::swap::SwapError;
 
 /// Magic for the serialised form: "HIPF_SW1" as big-endian ASCII.
 const MAGIC: u64 = 0x484950465F535731;
-const VERSION: u32 = 1;
+/// v2: added `per_pos_v_bytes` — the rotated-K tiers (asym{2,3,4}/fwht{2,3,4})
+/// store K and V at different per-position strides, so one stride field can no
+/// longer size both spans of the payload.
+const VERSION: u32 = 2;
 
 /// FNV-1a over the payload. Same construction `replay.rs::capture_summary`
 /// uses, kept identical so there is one hash idiom in the codebase.
@@ -39,7 +42,12 @@ pub fn checksum_of(bytes: &[u8]) -> u64 {
 pub struct SnapshotStamp {
     pub model_hash: u64,
     pub kv_dtype_tag: u32,
+    /// K-arena per-position stride in bytes.
     pub per_pos_bytes: u32,
+    /// V-arena per-position stride in bytes. Equals `per_pos_bytes` on the
+    /// q8/bf16 tiers; DIFFERS on the rotated-K tiers, and a payload laid out
+    /// with one stride can never be restored into the other.
+    pub per_pos_v_bytes: u32,
     pub n_fa_layers: u32,
     pub dn_layout_version: u32,
     pub cap: u32,
@@ -62,10 +70,13 @@ pub struct SlotSnapshot {
 }
 
 impl SlotSnapshot {
-    /// Bytes the payload must contain for this stamp and `seq_len`.
+    /// Bytes the payload must contain for this stamp and `seq_len`: per FA
+    /// layer, `seq_len` positions of K at the K stride plus the same at the
+    /// V stride, then the DeltaNet state.
     pub fn expected_len(&self) -> usize {
-        let kv =
-            self.stamp.n_fa_layers as usize * 2 * self.seq_len * self.stamp.per_pos_bytes as usize;
+        let kv = self.stamp.n_fa_layers as usize
+            * self.seq_len
+            * (self.stamp.per_pos_bytes as usize + self.stamp.per_pos_v_bytes as usize);
         kv + self.stamp.dn_bytes as usize
     }
 
@@ -102,6 +113,7 @@ impl SlotSnapshot {
         out.extend_from_slice(&self.stamp.model_hash.to_le_bytes());
         out.extend_from_slice(&self.stamp.kv_dtype_tag.to_le_bytes());
         out.extend_from_slice(&self.stamp.per_pos_bytes.to_le_bytes());
+        out.extend_from_slice(&self.stamp.per_pos_v_bytes.to_le_bytes());
         out.extend_from_slice(&self.stamp.n_fa_layers.to_le_bytes());
         out.extend_from_slice(&self.stamp.dn_layout_version.to_le_bytes());
         out.extend_from_slice(&self.stamp.cap.to_le_bytes());
@@ -121,7 +133,7 @@ impl SlotSnapshot {
     /// buffer too short for what its own header claims, *before* indexing —
     /// a truncated spill file must be an error, never a panic.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SwapError> {
-        const HEADER: usize = 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8;
+        const HEADER: usize = 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8;
         if bytes.len() < HEADER {
             return Err(SwapError::Corrupt(format!(
                 "buffer is {} bytes, shorter than the {HEADER}-byte header",
@@ -152,6 +164,7 @@ impl SlotSnapshot {
         o += 8;
         let kv_dtype_tag = u32_at(&mut o);
         let per_pos_bytes = u32_at(&mut o);
+        let per_pos_v_bytes = u32_at(&mut o);
         let n_fa_layers = u32_at(&mut o);
         let dn_layout_version = u32_at(&mut o);
         let cap = u32_at(&mut o);
@@ -189,6 +202,7 @@ impl SlotSnapshot {
                 model_hash,
                 kv_dtype_tag,
                 per_pos_bytes,
+                per_pos_v_bytes,
                 n_fa_layers,
                 dn_layout_version,
                 cap,
@@ -221,22 +235,89 @@ pub fn capture_slot(
     stamp: SnapshotStamp,
 ) -> Result<SlotSnapshot, SwapError> {
     let desc = pool.descriptors()[slot.0];
-    let seq_len = desc.seq_len as usize;
-    let span = seq_len * stamp.per_pos_bytes as usize;
+    let mut seq_len = desc.seq_len as usize;
+    if pool.is_paged() {
+        // The block table is the paged source of truth for the live length;
+        // desc.seq_len is kept in sync with it, but read it from here so a
+        // stale descriptor can never widen or shrink the capture. This must
+        // happen before `span`/`payload` are sized so the copy loop and the
+        // buffer agree by construction.
+        let bt = pool
+            .block_table(slot)
+            .ok_or_else(|| SwapError::Gpu("capture: slot has no block table".into()))?;
+        seq_len = bt.live_tokens();
+    }
+    let per_pos_k = stamp.per_pos_bytes as usize;
+    let per_pos_v = stamp.per_pos_v_bytes as usize;
+    let span_k = seq_len * per_pos_k;
+    let span_v = seq_len * per_pos_v;
     let dn_total: usize = extra.iter().map(|t| t.buf.size()).sum();
-    let mut payload = vec![0u8; k_arenas.len() * 2 * span + dn_total];
+    let mut payload = vec![0u8; k_arenas.len() * (span_k + span_v) + dn_total];
     let mut off = 0usize;
 
-    // Only the LIVE prefix: seq_len, not cap.
-    for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-        for (arena, base) in [(k, desc.k_base), (v, desc.v_base)] {
-            if span > 0 {
-                let view = arena.sub_offset(base as usize, span);
-                gpu.hip
-                    .memcpy_dtoh(&mut payload[off..off + span], &view.buf)
-                    .map_err(|e| SwapError::Gpu(e.to_string()))?;
+    if pool.is_paged() {
+        // Paged mode: KV is scattered across physical pages. Copy each
+        // page's worth of data from the arena into the contiguous payload.
+        // The K and V pages share the block table but are sized by their
+        // own arena's stride.
+        let bt = pool
+            .block_table(slot)
+            .ok_or_else(|| SwapError::Gpu("capture: slot has no block table".into()))?;
+        let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+        let n_full_pages = seq_len / page_tokens;
+        let last_page_tokens = seq_len % page_tokens;
+        let needed_pages = n_full_pages + usize::from(last_page_tokens > 0);
+        if bt.num_pages() < needed_pages {
+            return Err(SwapError::Corrupt(format!(
+                "capture: block table holds {} pages but seq_len {seq_len} \
+                 needs {needed_pages} — refusing to read past the table",
+                bt.num_pages()
+            )));
+        }
+
+        for (arenas, per_pos) in [(k_arenas, per_pos_k), (v_arenas, per_pos_v)] {
+            let page_bytes = page_tokens * per_pos;
+            for arena in arenas {
+                // Copy full pages.
+                for lp in 0..n_full_pages {
+                    let phys = bt.physical(lp).expect("page count pre-validated") as usize;
+                    let arena_off = phys * page_bytes;
+                    let view = arena.sub_offset(arena_off, page_bytes);
+                    gpu.hip
+                        .memcpy_dtoh(&mut payload[off..off + page_bytes], &view.buf)
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += page_bytes;
+                }
+                // Copy partial last page.
+                if last_page_tokens > 0 {
+                    let phys =
+                        bt.physical(n_full_pages).expect("page count pre-validated") as usize;
+                    let arena_off = phys * page_bytes;
+                    let last_bytes = last_page_tokens * per_pos;
+                    let view = arena.sub_offset(arena_off, last_bytes);
+                    gpu.hip
+                        .memcpy_dtoh(&mut payload[off..off + last_bytes], &view.buf)
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += last_bytes;
+                }
             }
-            off += span;
+        }
+    } else {
+        // Legacy mode: contiguous slab at the slot's per-arena base, each
+        // arena sized by its own stride.
+        for (arenas, base, span) in [
+            (k_arenas, desc.legacy_k_base, span_k),
+            (v_arenas, desc.legacy_v_base, span_v),
+        ] {
+            for arena in arenas {
+                if span > 0 {
+                    let view = arena.sub_offset(base as usize, span);
+                    gpu.hip
+                        .memcpy_dtoh(&mut payload[off..off + span], &view.buf)
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                }
+                off += span;
+            }
         }
     }
     for t in extra {
@@ -277,23 +358,88 @@ pub fn restore_slot(
     snap.validate(expect)?;
 
     let desc = pool.descriptors()[slot.0];
-    let span = snap.seq_len * snap.stamp.per_pos_bytes as usize;
+    let per_pos_k = snap.stamp.per_pos_bytes as usize;
+    let per_pos_v = snap.stamp.per_pos_v_bytes as usize;
+    let span_k = snap.seq_len * per_pos_k;
+    let span_v = snap.seq_len * per_pos_v;
     let dn_total: usize = extra.iter().map(|t| t.buf.size()).sum();
-    if k_arenas.len() * 2 * span + dn_total != snap.payload.len() {
+    if k_arenas.len() * (span_k + span_v) + dn_total != snap.payload.len() {
         return Err(SwapError::Corrupt(
             "payload does not match this rig's arena and state sizes".to_string(),
         ));
     }
     let mut off = 0usize;
-    for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-        for (arena, base) in [(k, desc.k_base), (v, desc.v_base)] {
-            if span > 0 {
-                let view = arena.sub_offset(base as usize, span);
-                gpu.hip
-                    .memcpy_htod(&view.buf, &snap.payload[off..off + span])
-                    .map_err(|e| SwapError::Gpu(e.to_string()))?;
+    if pool.is_paged() {
+        // Paged mode: ensure the slot has enough pages, then scatter the
+        // contiguous payload back into the physical pages (K and V pages
+        // sized by their own arena's stride).
+        //
+        // Ordering matters: provisioning grows the block table, but the
+        // descriptor's `seq_len` (what readers and kernels see) is published
+        // ONLY after every byte has landed. Publishing it here — before the
+        // copies — left a window where a concurrent reader observed a length
+        // over rows that had not been restored.
+        pool.provision_pages_for(slot, snap.seq_len)
+            .map_err(|e| SwapError::Gpu(e))?;
+        let bt = pool
+            .block_table(slot)
+            .ok_or_else(|| SwapError::Gpu("restore: slot has no block table".into()))?;
+        let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+        let n_full_pages = snap.seq_len / page_tokens;
+        let last_page_tokens = snap.seq_len % page_tokens;
+        let needed_pages = n_full_pages + usize::from(last_page_tokens > 0);
+        if bt.num_pages() < needed_pages {
+            return Err(SwapError::Corrupt(format!(
+                "restore: block table holds {} pages but seq_len {} needs \
+                 {needed_pages} — refusing to write past the table",
+                bt.num_pages(),
+                snap.seq_len
+            )));
+        }
+
+        for (arenas, per_pos) in [(k_arenas, per_pos_k), (v_arenas, per_pos_v)] {
+            let page_bytes = page_tokens * per_pos;
+            for arena in arenas {
+                // Copy full pages.
+                for lp in 0..n_full_pages {
+                    let phys = bt.physical(lp).expect("page count pre-validated") as usize;
+                    let arena_off = phys * page_bytes;
+                    let view = arena.sub_offset(arena_off, page_bytes);
+                    gpu.hip
+                        .memcpy_htod(&view.buf, &snap.payload[off..off + page_bytes])
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += page_bytes;
+                }
+                // Copy partial last page.
+                if last_page_tokens > 0 {
+                    let phys =
+                        bt.physical(n_full_pages).expect("page count pre-validated") as usize;
+                    let arena_off = phys * page_bytes;
+                    let last_bytes = last_page_tokens * per_pos;
+                    let view = arena.sub_offset(arena_off, last_bytes);
+                    gpu.hip
+                        .memcpy_htod(&view.buf, &snap.payload[off..off + last_bytes])
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += last_bytes;
+                }
             }
-            off += span;
+        }
+    } else {
+        // Legacy mode: contiguous slab at the slot's per-arena base, each
+        // arena sized by its own stride.
+        for (arenas, base, span) in [
+            (k_arenas, desc.legacy_k_base, span_k),
+            (v_arenas, desc.legacy_v_base, span_v),
+        ] {
+            for arena in arenas {
+                if span > 0 {
+                    let view = arena.sub_offset(base as usize, span);
+                    gpu.hip
+                        .memcpy_htod(&view.buf, &snap.payload[off..off + span])
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                }
+                off += span;
+            }
         }
     }
     for t in extra {
@@ -303,6 +449,8 @@ pub fn restore_slot(
             .map_err(|e| SwapError::Gpu(e.to_string()))?;
         off += n;
     }
+    // Both modes publish the new length LAST, after the KV payload and the
+    // recurrent-state buffers (`extra`) are in place.
     pool.set_seq_len(slot, snap.seq_len)
         .map_err(|e| SwapError::Gpu(e))?;
     Ok(())
@@ -317,6 +465,7 @@ mod tests {
             model_hash: 0xABCD,
             kv_dtype_tag: 1,
             per_pos_bytes: 4,
+            per_pos_v_bytes: 4,
             n_fa_layers: 2,
             dn_layout_version: 1,
             cap: 4096,

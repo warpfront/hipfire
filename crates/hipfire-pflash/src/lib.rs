@@ -2,7 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! hipfire-pflash: PFlash speculative prefill compression — retained legacy research.
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
+
+//! hipfire-pflash: PFlash speculative prefill compression — deprecated since
+//! 0.4.0, removal in 0.5.0.
 //!
 //! This crate is the historical reproduction home for PFlash. It is not
 //! mainline or production functionality; prefix caching supersedes it for

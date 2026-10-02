@@ -8,6 +8,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
+use crate::cpu_exec;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -793,8 +794,113 @@ pub fn execute_validated_steps<'a>(
     // A fused hyper write that produced the gate quarters of the hyper write
     // at this index, and the quarter slot it used.
     let mut gates_ready: Option<(usize, usize)> = None;
+    // The hyper write at this index takes its gates from its paired read
+    // (`HIPFIRE_QWEN4_HC_FUSE` >= 1, see `paired_hyper_write`).
+    let mut pregated: Option<usize> = None;
+    let hc_level = if cpu_exec::cpu_exec_enabled() {
+        0
+    } else {
+        gpu.flags.qwen4_hc_fuse_level()
+    };
+    let hc_fuse = hc_level >= 1;
+    let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
+    // A multi-row hyper read outside the `HIPFIRE_QWEN4_HC_FUSE` pairing that
+    // wrote the gates of the hyper write at this index (`next_hyper_write`).
+    let mut read_gates_at: Option<usize> = None;
     while i < steps.len() {
-        if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
+        if hc_fuse {
+            use crate::pipeline::layer_ops::{
+                execute_gated_delta_net_hc, execute_hyper_read_paired,
+                execute_hyper_write_pregated, execute_indexed_attention_hc,
+                hyper_read_pairs_write,
+            };
+            match &steps[i] {
+                Step::HyperWrite(write) if pregated == Some(i) => {
+                    pregated = None;
+                    execute_hyper_write_pregated(gpu, write)?;
+                    i += 1;
+                    continue;
+                }
+                Step::HyperRead(read) => {
+                    if let Some((j, write)) = paired_hyper_write(steps, i + 1, read) {
+                        if hyper_read_pairs_write(gpu, read, write) {
+                            if execute_hyper_read_paired(gpu, read, write)? {
+                                pregated = Some(j);
+                            }
+                            gpu.scratch.prerotated = None;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the mixer whose paired
+                // write already has its gates carries that write in its output
+                // projection's epilogue; unfused when its projection is not
+                // covered (the write then runs pregated as at level 1).
+                Step::GatedDeltaNet(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                    if let Step::HyperWrite(write) = &steps[i + 1] {
+                        let mut fused = false;
+                        execute_gated_delta_net_hc(gpu, op, Some(write), &mut fused)?;
+                        gpu.scratch.prerotated = None;
+                        if fused {
+                            pregated = None;
+                        }
+                        i += 1 + usize::from(fused);
+                        continue;
+                    }
+                }
+                Step::IndexedAttention(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                    if let Step::HyperWrite(write) = &steps[i + 1] {
+                        let mut fused = false;
+                        execute_indexed_attention_hc(gpu, op, Some(write), &mut fused)?;
+                        gpu.scratch.prerotated = None;
+                        if fused {
+                            pregated = None;
+                        }
+                        i += 1 + usize::from(fused);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A sealed MoE call after its target's zero fill.  H8a
+        // (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the call's qt44 combine takes
+        // over the fill when it can start from +0.0, else the fill runs first
+        // inside the call.  H4 level 3 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): when the
+        // hyper write that closes the block already has its gates, the shared
+        // down may carry it; a write so carried is skipped.
+        if moe_zinit || hc_level >= 3 {
+            if let (Step::Clear(clear), Some(Step::Moe(call))) = (&steps[i], steps.get(i + 1)) {
+                let write = match steps.get(i + 2) {
+                    Some(Step::HyperWrite(write)) if hc_level >= 3 && pregated == Some(i + 2) => {
+                        Some(write)
+                    }
+                    _ => None,
+                };
+                gpu.scratch.prerotated = None;
+                let folded = crate::pipeline::sealed_moe::execute_sealed_after_clear(
+                    gpu, call, clear, write,
+                )?;
+                if folded {
+                    pregated = None;
+                }
+                i += 2 + usize::from(folded);
+                continue;
+            }
+        }
+        // Fusion is bypassed for a window that contains a CPU-executed step: a
+        // fused entry is one kernel launch over several weights, so it cannot
+        // half-land on the CPU seam, and splitting it costs launches it was
+        // there to save — nothing else. (Fusion has no numerical contract to
+        // preserve here; see the module docs on the tolerance contract.)
+        let fused = match_prefix(FUSED_TABLE, &steps[i..], ctx).filter(|(_, len)| {
+            !cpu_exec::cpu_exec_enabled()
+                || !steps[i..i + *len]
+                    .iter()
+                    .any(|s| cpu_exec::plan_step(gpu, s).is_some())
+        });
+        if let Some((key, len)) = fused {
             // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
             // When the flag is on, the matched window is a per-row 3-way QKV
             // decode key whose kernel supports the fold, and the 3 steps right
@@ -810,7 +916,17 @@ pub fn execute_validated_steps<'a>(
             }
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
+        } else if let Some(plan) = cpu_exec::plan_step(gpu, &steps[i]) {
+            cpu_exec::run_step(gpu, &plan)?;
+            i += 1;
         } else {
+            if cpu_exec::cpu_exec_enabled() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
+                // Host-mapped weight that the CPU could not take: an unsupported
+                // quant format, or a step shape that never reached the seam. Counted
+                // so the failure is visible instead of silent (see the coverage
+                // line at load and `cpu_exec_counters`).
+                cpu_exec::count_host_mapped_gpu_step();
+            }
             if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
                 (&steps[i], steps.get(i + 1))
             {
@@ -877,6 +993,30 @@ pub fn execute_validated_steps<'a>(
                     continue;
                 }
             }
+            // Multi-row: a hyper read also writes the gates of the next hyper
+            // write of its (meanwhile unchanged) streams in its norm pass.
+            if let Step::HyperRead(read) = &steps[i] {
+                if let Some(j) = next_hyper_write(steps, i + 1, read) {
+                    let Step::HyperWrite(write) = &steps[j] else {
+                        unreachable!("next_hyper_write returns a hyper write")
+                    };
+                    if crate::pipeline::layer_ops::execute_hyper_read_paired(gpu, read, write)? {
+                        read_gates_at = Some(j);
+                    }
+                    gpu.scratch.prerotated = None;
+                    i += 1;
+                    continue;
+                }
+            }
+            if let Step::HyperWrite(write) = &steps[i] {
+                if read_gates_at == Some(i) {
+                    read_gates_at = None;
+                    crate::pipeline::layer_ops::execute_hyper_write_pregated(gpu, write)?;
+                    gpu.scratch.prerotated = None;
+                    i += 1;
+                    continue;
+                }
+            }
             launch_op(gpu, ctx, &steps[i])?;
             // A pending prerotated input lives until its consumer step ran;
             // a sealed MoE consumes it in one of its granular stages.
@@ -889,6 +1029,32 @@ pub fn execute_validated_steps<'a>(
     Ok(())
 }
 
+/// The hyper write that closes `read`'s block: the first `HyperWrite` of the
+/// same streams from `from`, with only mixer steps (which never write the
+/// streams) between.  Anything else, or a write of other streams, ends the
+/// search: the read and write are then not paired.
+fn paired_hyper_write<'s, 'a>(
+    steps: &'s [Step<'a>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<(usize, &'s crate::pipeline::layer_ops::HyperWriteOp<'a>)> {
+    let streams = read.input.buf.as_ptr();
+    for (j, step) in steps.iter().enumerate().skip(from) {
+        match step {
+            Step::GatedDeltaNet(_)
+            | Step::IndexedAttention(_)
+            | Step::Clear(_)
+            | Step::Moe(_)
+            | Step::MoeStage(..) => {}
+            Step::HyperWrite(write) if write.input.buf.as_ptr() == streams => {
+                return Some((j, write));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// The index of the next hyper write of `read`'s streams when it is itself
 /// followed by a hyper read of them and only stream-neutral mixer steps
 /// separate it from `read` (so the streams it normalizes are the ones `read`
@@ -899,14 +1065,26 @@ fn next_fused_hyper_write(
     read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
 ) -> Option<usize> {
     let streams = read.input.buf.as_ptr();
+    next_hyper_write(steps, from, read).filter(|&j| {
+        matches!(steps.get(j + 1),
+            Some(Step::HyperRead(next)) if next.input.buf.as_ptr() == streams)
+    })
+}
+
+/// The index of the next in-place hyper write of `read`'s streams when only
+/// stream-neutral mixer steps separate it from `read`, so the streams it
+/// normalizes are the ones `read` normalized.
+fn next_hyper_write(
+    steps: &[Step<'_>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<usize> {
+    let streams = read.input.buf.as_ptr();
     for (j, step) in steps.iter().enumerate().skip(from) {
         match step {
             Step::GatedDeltaNet(_) | Step::IndexedAttention(_) | Step::Clear(_) | Step::Moe(_) => {}
             Step::HyperWrite(write)
-                if write.input.buf.as_ptr() == streams
-                    && write.output.buf.as_ptr() == streams
-                    && matches!(steps.get(j + 1),
-                        Some(Step::HyperRead(next)) if next.input.buf.as_ptr() == streams) =>
+                if write.input.buf.as_ptr() == streams && write.output.buf.as_ptr() == streams =>
             {
                 return Some(j);
             }
@@ -1565,6 +1743,7 @@ fn launch_fused<'a>(
 mod tests {
     use super::*;
     use crate::context::DispatchCtx;
+    use crate::cpu_exec;
     use crate::families::fused_qkv::FusedQkvFamily;
     use crate::types::KernelKey;
 

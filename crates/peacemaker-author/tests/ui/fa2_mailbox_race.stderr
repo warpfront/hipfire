@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `LdsRegion<Mailbox, Published>: JoinPart<VPlane, Free>` is not satisfied
+  --> tests/ui/fa2_mailbox_race.rs:19:37
+   |
+19 |     let v_plane = join::<VPlane, _, _>(v_body, mbox)?;
+   |                                     ^ not a `Free` part
+   |
+   = note: other waves may still be reading it; only a barrier can retire their reads
+   = note: retire it at a barrier you already have, or add one: `wg.barrier((retire(region),))`
+help: the trait `JoinPart<VPlane, Free>` is not implemented for `LdsRegion<Mailbox, Published>`
+      but it is implemented for `LdsRegion<Mailbox, Free>`
+  --> src/lds.rs
+   |
+   | impl<J, R> JoinPart<J, Free> for LdsRegion<R, Free> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `Free`, found `Published`
+note: required by a bound in `peacemaker_author::join`
+  --> src/lds.rs
+   |
+   | pub fn join<J: 'static, A: JoinPart<J, Free>, B: JoinPart<J, Free>>(a: A, b: B) -> Result<LdsRegion<J, Free>, String> {
+   |                                                  ^^^^^^^^^^^^^^^^^ required by this bound in `join`

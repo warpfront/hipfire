@@ -70,7 +70,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::tokenizer::Tokenizer;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
@@ -306,7 +306,7 @@ fn main() {
         .map(|_| DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new"))
         .collect();
     let mut desc_staging =
-        SlotDescStaging::new(&mut gpu, n_slots, max_batch).expect("SlotDescStaging::new");
+        SlotDescStaging::new(&mut gpu, n_slots, max_batch, 0).expect("SlotDescStaging::new");
     let pbs =
         PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch::new");
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens)
@@ -322,12 +322,23 @@ fn main() {
     // Greedy for every slot: deterministic output, and it takes
     // `sample_per_slot`'s `argmax_f32_batched` fast path for the whole
     // batch every step rather than one kernel launch per slot.
+    // q8 slot KV tier: this demo exercises batching/decoding, not a KV tier.
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+    let repeat_windows: Vec<rdna_compute::GpuTensor> = (0..n_slots)
+        .map(|_| gpu.zeros(&[2048usize], DType::F32))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("repeat windows");
     let mut sample_params: Vec<SlotSampleParams> = (0..n_slots)
         .map(|_| SlotSampleParams {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
             seed: 0,
+            repeat_window: 0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
         })
         .collect();
 
@@ -337,10 +348,20 @@ fn main() {
             remaining_prompt: prompt_tokens[s].clone(),
             next_pos: 0,
             decoding: false,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         })
         .collect();
 
-    let mut scheduler = Scheduler { chunk_size };
+    let mut scheduler = Scheduler {
+        chunk_size,
+        vl_sequential: false,
+        prefill_cursor: 0,
+    };
     let mut n_generated = vec![0usize; n_slots];
     let mut finished = vec![false; n_slots];
     let mut generated_tokens: Vec<Vec<u32>> = vec![Vec::new(); n_slots];
@@ -370,7 +391,7 @@ fn main() {
     // Safety net against an infinite loop from a logic error above; a
     // correct run always terminates within n_steps.
     for step in 0..n_steps {
-        let batch = scheduler.next_batch(&mut work);
+        let batch = scheduler.next_batch(&mut work, chunk_size.max(1), 1);
         if batch.is_empty() {
             break;
         }
@@ -390,6 +411,7 @@ fn main() {
             &k_arenas,
             &v_arenas,
             &mut desc_staging,
+            &kv_tier,
             &pbs,
             &scratch,
             &logits_out,
@@ -401,6 +423,7 @@ fn main() {
         gpu.sample_per_slot(
             &logits_out,
             &mut sample_params,
+            &repeat_windows,
             n_slots,
             config.vocab_size,
             &out_tokens,

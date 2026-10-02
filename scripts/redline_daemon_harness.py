@@ -169,30 +169,17 @@ def qwen4_shadow_failures(shadow):
     windows = parity.get("windows") or []
     if not windows:
         failures.append("parity table has no windows")
+    # The recorded-HIP oracle applies the same synthesized and program-declared
+    # position bindings as the retained plan, so both arms carry the
+    # multi-position claim.
     for window in windows:
         position = window.get("position")
-        row = window.get("pm4") or {}
-        if not row:
-            failures.append(f"position {position}: retained arm missing from parity")
-            continue
-        failures.extend(qwen4_row_failures(row, f"position {position}: pm4"))
-
-    # The recorded-HIP oracle is the captured blob replayed at its own capture
-    # position: its substitution comes from the controller's synthesized-binding
-    # calibration, which Qwen4 replaces with program-declared bindings. It is
-    # therefore compared once, at the capture geometry, while the retained arm
-    # carries the multi-position claim.
-    blob = parity.get("blob") or {}
-    row = blob.get("recorded_hip") or {}
-    if not row:
-        failures.append("parity.blob.recorded_hip missing (capture-position oracle)")
-    elif blob.get("position") != windows[0].get("position"):
-        failures.append(
-            f"parity.blob.position {blob.get('position')} != first window "
-            f"{windows[0].get('position')} ({row})"
-        )
-    else:
-        failures.extend(qwen4_row_failures(row, "blob.recorded_hip"))
+        for arm in ("pm4", "recorded_hip"):
+            row = window.get(arm) or {}
+            if not row:
+                failures.append(f"position {position}: {arm} arm missing from parity")
+                continue
+            failures.extend(qwen4_row_failures(row, f"position {position}: {arm}"))
 
     failure = shadow.get("failure_behavior") or {}
     if not failure:
@@ -445,9 +432,11 @@ def main():
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument(
         "--kv-mode",
-        choices=("q8", "fwht2", "fwht3", "fwht4"),
-        default="q8",
-        help="KV layout used by capture, shadow replay, and the HIP oracle",
+        choices=("q8", "fwht2", "fwht3", "fwht4", "bf16"),
+        help=(
+            "KV layout used by capture, shadow replay, and the HIP oracle "
+            "(default: q8; bf16 with --qwen4, whose KV is BF16 only)"
+        ),
     )
     parser.add_argument("--capture-repeats", type=int, default=2)
     parser.add_argument("--measure-repeats", type=int, default=5)
@@ -553,6 +542,10 @@ def main():
         help="fixed target verify batch for the DSpark shadow (default: 3)",
     )
     args = parser.parse_args()
+    if args.kv_mode is None:
+        args.kv_mode = "bf16" if args.qwen4 else "q8"
+    if args.qwen4 and args.kv_mode != "bf16":
+        sys.exit(f"--qwen4 requires --kv-mode bf16 (got {args.kv_mode})")
 
     model = Path(args.model).expanduser().resolve()
     daemon_path = Path(args.daemon).expanduser().resolve()

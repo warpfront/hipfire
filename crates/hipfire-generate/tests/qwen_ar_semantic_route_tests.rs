@@ -522,7 +522,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
 
     #[test]
     fn eos_filter_config_delegates_think_and_keeps_both_terminators() {
-        let cfg = qwen_ar_eos_filter_config();
+        let cfg = hipfire_runtime::eos_filter::qwen35_eos_filter_config();
         assert!(!cfg.strip_think);
         assert!(!cfg.started_in_think);
         assert!(cfg.stop_at.contains(&b"<|im_end|>".to_vec()));

@@ -185,3 +185,165 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_dense_wmma_f
     }
 #undef AT_BARRIER
 }
+
+// QSA attention over each row's own selection (the index budget no longer
+// covers the window) in F16 WMMA: the sparse counterpart of
+// indexed_attention_dense_wmma_f16, with the same F16 rounding of Q, K, V and
+// the probabilities, F32 accumulation and an online softmax in key order
+// (not bit-exact; callers are KLD-gated like the dense route).
+//
+// indexed_attention_kv_f16_sparse first writes the cache rows as F16 K
+// ([token][kv_heads * 256]) and V in compress-4 block-transposed form
+// ([block][kv_head][dim][4 tokens]), so the V^T operand of a 16-key tile of
+// four selected blocks is four 8-byte loads per lane, and K rows load
+// straight into the A operand.  Grid [ceil(tokens / 4), kv_heads], block 256.
+extern "C" __global__ void indexed_attention_kv_f16_sparse(
+    const float* __restrict__ k, const float* __restrict__ v, _Float16* __restrict__ k16,
+    _Float16* __restrict__ v4t, int tokens, int kv_heads) {
+    const int block = blockIdx.x, kv = blockIdx.y, c = threadIdx.x;
+    const int width = kv_heads * 256;
+    _Float16 vv[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const int tok = block * 4 + s;
+        const size_t at = (size_t)tok * width + kv * 256 + c;
+        if (tok < tokens) {
+            k16[at] = (_Float16)k[at];
+            vv[s] = (_Float16)v[at];
+        } else {
+            vv[s] = (_Float16)0.0f;
+        }
+    }
+    *(uint2*)(v4t + (((size_t)block * kv_heads + kv) * 256 + c) * 4) =
+        *(const uint2*)vv;
+}
+
+// Two waves per (row, KV head): the twelve query heads of the KV group are
+// the sixteen WMMA query columns (four padded), each 16-key tile is four
+// selected four-token blocks (rank order; the incomplete tail block last),
+// scores are S^T = K Q^T so a lane owns one head's online softmax, and each
+// wave keeps O^T += V^T P^T for 128 of the 256 dims in registers (both waves
+// compute the same scores).  Keys at or past the row's visible end and unused
+// slots are masked.  Grid [ceil(rows / 2), kv_heads], block 128.
+// head_dim 256, 12 heads per KV head, compress 4.
+extern "C" __global__ __launch_bounds__(128) void indexed_attention_sparse_wmma_f16(
+    const float* __restrict__ q_with_gate, const _Float16* __restrict__ k16,
+    const _Float16* __restrict__ v4t, const int* __restrict__ selected,
+    float* __restrict__ output, int rows, int position_start, int n_heads, int n_kv_heads,
+    int budget_blocks, int capacity) {
+    constexpr int HD = 256, G = 12;
+    __shared__ __align__(16) _Float16 q_lds[4 * 16 * HD];  // [wave][dc][head][16]
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, l16 = lane & 15, half = lane >> 4;
+    const int row = blockIdx.x * 2 + (wave >> 1), dh = wave & 1;
+    const int kv = blockIdx.y;
+    if (row >= rows) return;  // no block-wide barrier below
+    const int q_stride = n_heads * 2 * HD, width = n_kv_heads * HD;
+    _Float16* qw = q_lds + wave * 16 * HD;
+    const float* qrow = q_with_gate + (size_t)row * q_stride + kv * G * 2 * HD;
+    for (int e = lane; e < 16 * HD; e += 32) {
+        const int h = e / HD, d = e - h * HD;
+        qw[((d >> 4) * 16 + h) * 16 + (d & 15)] = h < G ? (_Float16)qrow[h * 2 * HD + d] : (_Float16)0.0f;
+    }
+    // Each wave's LDS block is private: its own writes only need to land.
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+
+    const int visible = position_start + row + 1;
+    const int block_count = visible / 4;
+    const int chosen = min(budget_blocks, block_count);
+    const int groups = chosen + (visible > block_count * 4 ? 1 : 0);
+    const int* row_sel = selected + (size_t)row * capacity;
+    float m_run = -INFINITY, l_run = 0.f;
+    qsa_f8_t o[8];
+#pragma unroll
+    for (int dt = 0; dt < 8; ++dt) o[dt] = qsa_f8_t{0,0,0,0,0,0,0,0};
+    for (int g0 = 0; g0 < groups; g0 += 4) {
+        // Lane l16 owns key l16: group g0 + l16 / 4, slot l16 % 4.  A chosen
+        // group is the aligned block of its first slot's token (the selector
+        // emits whole blocks); the incomplete tail block comes last.  A slot
+        // outside that structure, or at/past the visible end, is masked.
+        const int g = g0 + (l16 >> 2), slot = l16 & 3;
+        int my_block = -1, my_token = -1;
+        if (g < chosen) {
+            const int first = row_sel[g * 4];
+            my_block = first >= 0 ? first >> 2 : -1;
+            my_token = row_sel[g * 4 + slot];
+        } else if (g < groups) {
+            my_block = block_count;
+            my_token = block_count * 4 + slot;
+        }
+        const bool my_valid =
+            my_block >= 0 && my_token == my_block * 4 + slot && my_token < visible;
+        const unsigned valid_mask = (unsigned)__ballot(my_valid) & 0xffffu;
+        const _Float16* krow = k16 + (size_t)(my_valid ? my_token : 0) * width + kv * HD;
+        qsa_f8_t s = qsa_f8_t{0,0,0,0,0,0,0,0};
+#pragma unroll 4
+        for (int dc = 0; dc < HD / 16; ++dc) {
+            const qsa_h16_t b = *(const qsa_h16_t*)(qw + (dc * 16 + l16) * 16);
+            qsa_h16_t a = *(const qsa_h16_t*)(krow + dc * 16);
+            if (!my_valid) a = qsa_h16_t{};
+            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+        }
+        // s[i] = score of key 2i + half for head l16.
+        float p[8];
+        float tmax = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            p[i] = (valid_mask >> (2 * i + half)) & 1u ? s[i] * 0.0625f : -INFINITY;
+            tmax = fmaxf(tmax, p[i]);
+        }
+        tmax = fmaxf(tmax, qsa_other_half(tmax));
+        const float m_new = fmaxf(m_run, tmax);
+        float alpha = 1.f, tsum = 0.f;
+        if (m_new != -INFINITY) {
+            alpha = expf(m_run - m_new);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { p[i] = expf(p[i] - m_new); tsum += p[i]; }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) p[i] = 0.f;
+        }
+        tsum += qsa_other_half(tsum);
+        l_run = l_run * alpha + tsum;
+        m_run = m_new;
+        qsa_h16_t pb;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float x = qsa_other_half(p[i]);
+            pb[2 * i] = (_Float16)(half ? x : p[i]);
+            pb[2 * i + 1] = (_Float16)(half ? p[i] : x);
+        }
+        // The four groups' blocks, from the lanes owning their first key.
+        int blocks[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) blocks[j] = __shfl(my_block, 4 * j, 32);
+#pragma unroll
+        for (int dt = 0; dt < 8; ++dt) {
+            const int dim = (dh * 8 + dt) * 16 + l16;
+            qsa_h16_t a;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint2 raw = make_uint2(0u, 0u);
+                if (blocks[j] >= 0)
+                    raw = *(const uint2*)(v4t + (((size_t)blocks[j] * n_kv_heads + kv) * HD + dim) * 4);
+                const _Float16* hv = (const _Float16*)&raw;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) a[4 * j + t] = hv[t];
+            }
+            o[dt] *= alpha;
+            o[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, o[dt]);
+        }
+    }
+    // o[dt][i] = O^T[dim (dh * 8 + dt) * 16 + 2i + half][head l16].
+    if (l16 >= G) return;
+    const int head = kv * G + l16;
+    const float* gate = q_with_gate + (size_t)row * q_stride + head * 2 * HD + HD;
+    float* out = output + (size_t)row * n_heads * HD + head * HD;
+#pragma unroll
+    for (int dt = 0; dt < 8; ++dt) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int d = (dh * 8 + dt) * 16 + 2 * i + half;
+            out[d] = l_run > 0.f ? o[dt][i] / l_run / (1.0f + expf(-gate[d])) : 0.f;
+        }
+    }
+}

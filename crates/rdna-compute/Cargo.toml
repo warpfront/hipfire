@@ -43,6 +43,14 @@ redline-rocr = { path = "../redline-rocr" }
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
 [[example]]
+name = "qwen4_moe_sym"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_packed_mq4_shapes"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_argmax_vs_download_gfx1201"
 required-features = ["lab"]
 
@@ -196,6 +204,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_moe_expert_gemv"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qwen4_hc_wmma"
 required-features = ["lab"]
 
 [[example]]
@@ -751,6 +763,14 @@ name = "vmm_tensor_smoke"
 required-features = ["lab"]
 
 [[example]]
+name = "host_kernel_access"
+required-features = ["lab"]
+
+[[example]]
+name = "host_offload_headroom"
+required-features = ["lab"]
+
+[[example]]
 name = "mq4v2_moe_parity"
 required-features = ["lab"]
 
@@ -820,4 +840,20 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_mq4v2_residual_row_serial_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_kv_slot_desc_ports"
+required-features = ["lab"]
+
+[[example]]
+name = "vit_qtiled_parity_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_attention_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qsa_indexed"
 required-features = ["lab"]

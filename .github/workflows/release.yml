@@ -1,0 +1,105 @@
+name: release-kernel-packs
+
+# Prebuilt kernel packs for a release tag.
+#
+# hipcc needs no GPU, so a hosted runner compiles every admitted registry arch
+# inside a ROCm dev image and uploads, per arch, to the tag's GitHub release
+# (created as a draft when the tag has none yet; an existing release keeps its
+# draft/prerelease/latest state):
+#   hipfire-kernels-<tag>-<arch>.tar.gz          manifest.json + <arch>/*.{hsaco,hash,index.json}
+#   hipfire-kernels-<tag>-<arch>.tar.gz.sha256
+#   hipfire-kernels-<tag>-<arch>.manifest.json
+# `install.sh --tag` / `install.ps1 -Tag` download the pack for the detected
+# arch, check the SHA-256, manifest and every index against the checked-out
+# sources, and fall back to local hipcc compilation when anything differs.
+#
+# The image's ROCm fixes the manifest's toolchain and, by default, the admitted
+# ROCm range (its major.minor up to the next major). The default image,
+# rocm/dev-ubuntu-26.04:10.0.0-full, carries the ROCm 10.0.0 packages
+# (amdrocm*10.0 10.0.0-4, HIP 7.15.26333) the project's GPU hosts run, so its
+# packs admit ROCm [10.0, 11.0) and match those hosts' hipcc. A pack is only
+# installed where the local hipcc (if any) is the build that compiled it.
+# Repository variables: HIPFIRE_ROCM_IMAGE builds with another ROCm;
+# HIPFIRE_PACK_ROCM_MIN and HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE (set both) declare a
+# different range. To publish from a local toolchain instead, run
+# scripts/build-kernel-pack.sh and upload with gh (docs/GETTING_STARTED.md,
+# "Prebuilt kernel packs").
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach kernel packs for
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-kernel-packs-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  kernel-packs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      ROCM_IMAGE: ${{ vars.HIPFIRE_ROCM_IMAGE || 'docker.io/rocm/dev-ubuntu-26.04:10.0.0-full' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      # The 10.0 image unpacks to ~30 GB, more than a hosted runner's root
+      # volume has free, so Docker stores it on the /mnt scratch disk.
+      - name: Pull the ROCm image
+        run: |
+          df -h / /mnt
+          conf=/etc/docker/daemon.json
+          sudo systemctl stop docker.socket docker.service
+          sudo mkdir -p /mnt/docker
+          { sudo cat "$conf" 2>/dev/null || echo '{}'; } \
+            | jq '. + {"data-root": "/mnt/docker"}' | sudo tee "$conf.new" >/dev/null
+          sudo mv "$conf.new" "$conf"
+          sudo systemctl start docker.service
+          docker pull "$ROCM_IMAGE"
+          df -h / /mnt
+
+      - name: Build kernel packs (every admitted arch)
+        env:
+          ROCM_MIN: ${{ vars.HIPFIRE_PACK_ROCM_MIN }}
+          ROCM_MAX: ${{ vars.HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE }}
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e TAG -e ROCM_MIN -e ROCM_MAX -e OWNER="$(id -u):$(id -g)" \
+            "$ROCM_IMAGE" bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential ca-certificates curl git
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain stable --profile minimal
+              export PATH="$HOME/.cargo/bin:$PATH"
+              git config --global --add safe.directory /src
+              range=()
+              if [ -n "$ROCM_MIN" ] || [ -n "$ROCM_MAX" ]; then
+                range=(--rocm-min "$ROCM_MIN" --rocm-max-exclusive "$ROCM_MAX")
+              fi
+              status=0
+              scripts/build-kernel-pack.sh --tag "$TAG" --commit HEAD --out dist "${range[@]}" || status=$?
+              chown -R "$OWNER" dist 2>/dev/null || true
+              exit "$status"'
+
+      # The repository's Actions allowlist admits only GitHub-owned and a few
+      # named third-party actions, so the upload uses the runner's gh CLI.
+      - name: Attach packs to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --draft --title "$TAG" \
+                 --notes "Kernel packs; release notes to follow."
+          gh release upload "$TAG" dist/* --clobber

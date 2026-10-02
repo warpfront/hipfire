@@ -127,7 +127,16 @@ extern "C" __global__ __launch_bounds__(64) void moe_combine_order_top10(
 // ranks' 16-byte slices are loaded before the in-order accumulation, and each
 // column runs the exact moe_down_combine_grouped arithmetic.
 // Grid [ceil(hidden / 512), tokens], block 64, hidden % 8 == 0.
-extern "C" __global__ __launch_bounds__(64) void moe_down_combine_grouped_top10_bf16in(
+//
+// `initial_zero`: the destination was just cleared to +0.0 by a ClearOp and
+// carries no residual, so the accumulator starts as a register +0.0 and the
+// destination is write-only (no residual load; the clear is then redundant).
+// +0.0 is exactly what the cleared buffer would have read back, and
+// bf16_round(+0.0) = +0.0, so every round that follows sees identical bits
+// and the stores are bytewise those of clear + the `false` instantiation.
+// Only the `_zinit` symbol instantiates it; the original symbol is `false`.
+template <bool initial_zero>
+static __device__ __forceinline__ void moe_down_combine_grouped_bf16in(
     const unsigned short* __restrict__ grouped_down, const int2* __restrict__ order,
     float* __restrict__ residual, int hidden, int tokens) {
     const int token = blockIdx.y;
@@ -144,8 +153,15 @@ extern "C" __global__ __launch_bounds__(64) void moe_down_combine_grouped_top10_
                            : make_uint4(0, 0, 0, 0);
     }
     float* res = residual + (size_t)token * hidden + col0;
-    const float4 r0 = *(const float4*)res, r1 = *(const float4*)(res + 4);
-    float acc[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
+    float acc[8];
+    if (initial_zero) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+    } else {
+        const float4 r0 = *(const float4*)res, r1 = *(const float4*)(res + 4);
+        acc[0] = r0.x; acc[1] = r0.y; acc[2] = r0.z; acc[3] = r0.w;
+        acc[4] = r1.x; acc[5] = r1.y; acc[6] = r1.z; acc[7] = r1.w;
+    }
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
         __hip_bfloat16 accumulated = moe_top10_bf16_round(acc[e]);
@@ -163,4 +179,17 @@ extern "C" __global__ __launch_bounds__(64) void moe_down_combine_grouped_top10_
     }
     *(float4*)res = make_float4(acc[0], acc[1], acc[2], acc[3]);
     *(float4*)(res + 4) = make_float4(acc[4], acc[5], acc[6], acc[7]);
+}
+
+extern "C" __global__ __launch_bounds__(64) void moe_down_combine_grouped_top10_bf16in(
+    const unsigned short* __restrict__ grouped_down, const int2* __restrict__ order,
+    float* __restrict__ residual, int hidden, int tokens) {
+    moe_down_combine_grouped_bf16in<false>(grouped_down, order, residual, hidden, tokens);
+}
+
+// Same arguments and launch as the symbol above; `residual` is write-only.
+extern "C" __global__ __launch_bounds__(64) void moe_down_combine_grouped_top10_bf16in_zinit(
+    const unsigned short* __restrict__ grouped_down, const int2* __restrict__ order,
+    float* __restrict__ residual, int hidden, int tokens) {
+    moe_down_combine_grouped_bf16in<true>(grouped_down, order, residual, hidden, tokens);
 }

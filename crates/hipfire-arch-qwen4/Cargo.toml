@@ -22,11 +22,15 @@ memmap2.workspace = true
 saddle-quant = { path = "../saddle-quant" }
 
 [features]
-reference-parity = []
+reference-parity = ["rdna-compute/lab"]
 lab = []
 
 [[example]]
 name = "qwen4_parity"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_qsa_ctx"
 required-features = ["reference-parity"]
 
 [[example]]

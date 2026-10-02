@@ -165,12 +165,28 @@ works, what to measure, what counts as pass/fail.
 - **`dflash_mode=off` is the default.** Any test exercising DFlash
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.
-- **PFlash is retained legacy research, not mainline or production functionality.**
-  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*` and exists
-  only for historical reference and reproduction; prefix caching supersedes it
-  for supported serving workloads. Agents must not treat PFlash as a production
-  element, recommendation, acceptance route, or basis for a current
-  performance claim.
+- **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
+  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
+  loads, warns when used (`prefill_compression` != `off`), and is not
+  supported; prefix caching supersedes it for supported serving workloads.
+  Agents must not treat PFlash as a production element, recommendation,
+  acceptance route, or basis for a current performance claim.
+- **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
+  `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
+  status of every env var / config key is in `docs/env-vars.md` /
+  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): Givens asym KV
+  (`legacy-asymN`) and the `asymN`/`turboN` KV aliases (use `fwhtN`);
+  legacy contiguous DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`,
+  `HIPFIRE_DFLASH_CTX_CAP`); the `scripts/coherence-gate-*.sh` batteries,
+  `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`;
+  GGUF **weight** input to the quantizer (lossy double quantization; use
+  llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
+  by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).
+- **CASK is deprecated since 0.4.0 and will be removed in 0.5.0.**
+  CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
+  sidecar-gen`) still loads, warns when used, and is not supported. Do not
+  treat it as a production element, recommendation, acceptance route, or basis
+  for a current performance claim, and do not build on it.
 
 ---
 
@@ -323,7 +339,7 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 - Env: `HIPFIRE_NORMALIZE_PROMPT=0`
 - TUI: `hipfire config set prompt_normalize false`
-- Per-model: `hipfire config qwen3.8:27b-mq4-xt set prompt_normalize false`
+- Per-model: `hipfire config qwen3.8:27b-mq4-xts set prompt_normalize false`
 
 
 **Verify:** see §3 prompt-shape A/B test.
@@ -669,7 +685,10 @@ Caveats that are part of the fixture, not trivia:
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
 - **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
-  which keep the retained Redline AR route; greedy requests only.** Each MTP
+  which keep the retained Redline AR route.** Greedy requests verify against
+  the target argmax. Sampled requests (temperature > 0, neutral penalties)
+  verify against one AR-sampler draw per row, which is exact naive sampling.
+  Non-neutral penalties keep AR. Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
@@ -713,11 +732,11 @@ Caveats that are part of the fixture, not trivia:
   was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
   with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
   [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
-- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
-  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
-  `memory.max_seq` forced to 2048), so it fails closed at load and never
-  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
-  bench-side `max_seq` knob — not an MTP change.
+- Qwen4 loads admit `max_seq` from 2048 (the automatic value) up to the
+  model's `max_position_embeddings`; before 2026-09-30 it had to be exactly
+  2048, so `hipfire bench` (which asks for the configured `memory.max_seq`)
+  failed closed at load. Contexts past 2048 select attention blocks through
+  the QSA indexer; every measurement above was taken at `max_seq=2048`.
 - Decode numbers are not comparable across instruments: the raw decode probe
   measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
   Same model, different measurement; never average or compare them across.
@@ -730,13 +749,12 @@ Caveats that are part of the fixture, not trivia:
 |---|---|---|
 | "DFlash got slower overnight" | Prompt structure changed (one newline added/removed) | Use byte-identical prompts via `benchmarks/prompts/*.txt` |
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
-| "0 evictions even though sidecar loaded" | `cask_beta` too high (default 128) means trigger is at budget+128 | Lower beta to 16 to actually exercise the eviction policy |
 | "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
 | 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
-| `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
+| `hipMalloc out of memory` at hidden_rb | Legacy contiguous DFlash (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`) sizes the draft context structures to the context; long ctx + 27B can exhaust 24 GB | Use the default windowed draft (draft VRAM pinned at W); otherwise lower `HIPFIRE_DFLASH_CTX_CAP` or ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
-| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xt set dflash_mode on` |
+| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xts set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
@@ -752,16 +770,18 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
-| `HIPFIRE_KV_MODE` | Override kv_cache config | (config) |
+| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive/CASK), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
 | `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
-|`HIPFIRE_DFLASH_CTX_CAP`|Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring). Bounds draft-side VRAM on large-`max_seq` serve loads; over-cap requests fall back to AR (identical output, slower). `0` = uncapped legacy.|8192|
-|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context (NInfer pattern): SWA over the last W rows on draft layers 0..n-2 + full-attention last layer reaching min(physical_cap, 4W). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Refused with CASK eviction. `0`/unset = Legacy (cap + AR fallback).|0 (off)|
+|`HIPFIRE_DFLASH_CTX_CAP`|**Legacy contiguous DFlash only** (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`). Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring); over-cap requests fall back to AR (identical output, slower). `0` = uncapped. Ignored in windowed mode.|8192|
+|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` = legacy contiguous.|draft-declared window (legacy contiguous if none)|
 | `HIPFIRE_LM_HEAD_F16` | `auto`/`native` keeps qt=1 lm_head as F16; `f32`/`legacy` expands to F32 | auto/native |
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
+| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. Unset/`auto`/`-1`/unparseable = fully resident (never forces offload). Sibling of `HIPFIRE_OFFLOAD_EXEC`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md). | unset (fully resident) |
+| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default) or `cpu`. Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1. | `pcie` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 
 | `hipfire bench` flag | Purpose |
@@ -772,9 +792,13 @@ Caveats that are part of the fixture, not trivia:
 | `--ddtree-batched` | Use batched tree verify (research) |
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
-| `--cask-sidecar PATH` | Load TriAttention sidecar |
-| `--cask-budget N` | KV eviction target |
-| `--cask-beta N` | Hysteresis (lower = more aggressive eviction) |
+
+**Deprecation note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
+config keys, `hipfire sidecar-gen`, and the `dflash_spec_demo --cask-*`
+flags; FlashCASK) is deprecated since 0.4.0 and will be removed in 0.5.0.
+It prints a deprecation warning when used, forces legacy contiguous DFlash
+(windowed draft disabled), and is not a flag, fix or pitfall workaround to
+reach for.
 
 ---
 
@@ -795,7 +819,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-09-23 (v0.3.1 cut; fixture pin: Qwen3.8-27B MQ4XT). When this
+*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XTS). When this
 doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
 

@@ -20,7 +20,7 @@ use crate::state::ResourceSummary;
 /// `lds_fixed` is `KernelDescriptor.group_segment_fixed_size`; it is a
 /// parameter (not re-read here) so the measurement stays a pure function
 /// of the instruction stream.
-pub fn summarize(body: &Body, lds_fixed: u32) -> ResourceSummary {
+pub fn summarize(body: &Body, arch: crate::inst::Arch, wave: crate::inst::Wave, lds_fixed: u32) -> ResourceSummary {
     let mut max_vgpr = 0u16;
     let mut max_sgpr = 0u16;
     let mut uses_vcc = false;
@@ -29,11 +29,14 @@ pub fn summarize(body: &Body, lds_fixed: u32) -> ResourceSummary {
         let Some(inst) = body.insts.get(*id) else {
             continue;
         };
-        for operand in &inst.operands {
+        for (index, operand) in inst.operands.iter().enumerate() {
             match operand {
                 Operand::Reg(reg) | Operand::Half(reg, _) => match reg.kind {
                     Kind::V => max_vgpr = max_vgpr.max(reg.base + u16::from(reg.len)),
-                    Kind::S => max_sgpr = max_sgpr.max(reg.base + u16::from(reg.len)),
+                    Kind::S => {
+                        let reg = crate::codec::gfx12::operand_register(arch, wave, inst, index).expect("register operand");
+                        max_sgpr = max_sgpr.max(reg.base + u16::from(reg.len));
+                    }
                     Kind::Ttmp => {}
                 },
                 Operand::Special(
@@ -84,6 +87,22 @@ mod tests {
         .unwrap_or_else(|error| panic!("{name}: {error:?}"))
     }
 
+    #[test]
+    fn metadata_wave_width_controls_scalar_masks_not_data_pairs() {
+        let s = |base, len| Operand::Reg(crate::reg::RegRef { kind: Kind::S, base, len });
+        let mut body = Body::default();
+        for i in [
+            inst("v_cmp_nlt_f32_e64", vec![s(87, 2), v(0, 1), v(1, 1)]),
+            inst("v_cndmask_b32_e64", vec![v(2, 1), v(0, 1), v(1, 1), s(87, 2)]),
+        ] { let id = body.insts.insert(i); body.layout.push(id); }
+        for (wave, expected) in [(crate::inst::Wave::Wave32, 88), (crate::inst::Wave::Wave64, 89)] {
+            assert_eq!(summarize(&body, Arch::Gfx1201, wave, 0).max_sgpr, expected);
+        }
+        let pair = inst("s_mov_b64", vec![s(87, 2), s(0, 2)]);
+        let id = body.insts.insert(pair); body.layout.push(id);
+        assert_eq!(summarize(&body, Arch::Gfx1201, crate::inst::Wave::Wave32, 0).max_sgpr, 89);
+    }
+
     fn v(base: u16, len: u8) -> Operand {
         Operand::Reg(crate::reg::RegRef { kind: Kind::V, base, len })
     }
@@ -97,7 +116,7 @@ mod tests {
         let mut body = Body::default();
         let id = body.insts.insert(mov);
         body.layout.push(id);
-        let summary = summarize(&body, 0);
+        let summary = summarize(&body, Arch::Gfx1201, crate::inst::Wave::Wave32, 0);
         assert_eq!(summary.max_vgpr, 201);
         assert_eq!(summary.max_sgpr, 0);
         assert!(!summary.uses_vcc);
@@ -137,7 +156,7 @@ mod kt48_tests {
     #[test]
     fn kt48_resource_summary() {
         let body = kt48_body();
-        let summary = super::summarize(&body, 0);
+        let summary = super::summarize(&body, Arch::Gfx1201, crate::inst::Wave::Wave32, 0);
         assert!(summary.max_vgpr <= 238, "vgpr {}", summary.max_vgpr);
         assert!(summary.max_sgpr <= 30, "sgpr {}", summary.max_sgpr);
         assert!(summary.uses_vcc);

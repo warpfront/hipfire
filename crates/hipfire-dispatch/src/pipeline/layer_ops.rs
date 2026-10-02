@@ -17,21 +17,26 @@ use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
-    gated_delta_conv_params_batched, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
-    gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gated,
+    gated_delta_conv_params_batched, gated_delta_conv_params_qknorm_batched,
+    gated_delta_conv_qknorm_route, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
+    gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gate_wmma_qknormed,
+    gated_delta_step_gated,
     hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm,
-    hyper_norm_f16, hyper_norm_gate, hyper_read_projected, hyper_read_up_fused, hyper_read_up_wmma,
+    hyper_norm_f16, hyper_norm_gate, hyper_read_projected,
+    hyper_read_up_fused, hyper_read_up_wmma,
     hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
-    indexed_attention_norm_rope_batch, indexed_attention_pool_rope,
+    indexed_attention_index_key_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
     GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
-    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, HcActivationFused,
-    HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected, HyperReadUpFused, HyperWrite,
+    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat, HcActivationFused,
+    HyperNextGates, HyperNorm, HyperNormGate, HyperReadProjected,
+    HyperReadUpFused, HyperWrite,
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
-    IndexedAttentionDecodePrologue, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
-    IndexedAttentionReuseSelection, IndexedAttentionSelectBatch, ScaleF32,
+    IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
+    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
+    IndexedAttentionSelectBatch, QsaKvFormat, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
@@ -152,11 +157,37 @@ pub fn project_weights(
         if done[i] || !shared(weight, gpu) {
             continue;
         }
-        let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
+        let ld = gpu.f16_row_pitch(weight.k);
+        let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows, ld))?;
+        // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
+        // may share one row-region launch without sharing their accumulators.
+        if gpu.qwen4_mq6_x4_regions()
+            && projections.len() == 4
+            && projections[0].1.dtype == DType::BF16
+        {
+            let mut indices = [0usize; 3];
+            let mut count = 0;
+            for j in i..projections.len() {
+                let (w, out) = projections[j];
+                if !done[j] && w.k == weight.k && shared(w, gpu) && out.dtype == DType::F32 {
+                    if count < 3 { indices[count] = j; }
+                    count += 1;
+                }
+            }
+            if count == 3 {
+                let regions = indices.map(|j| {
+                    let (w, out) = projections[j];
+                    (w.buf, out, w.m)
+                });
+                if hip(gpu.gemm_mq6g256v2_xf16_regions(&regions, &x_f16, weight.k, rows, ld))? {
+                    for j in indices { done[j] = true; }
+                }
+            }
+        }
         for j in i..projections.len() {
             let (w, out) = projections[j];
             if !done[j] && w.k == weight.k && shared(w, gpu) {
-                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows))?;
+                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows, ld))?;
                 done[j] = true;
             }
         }
@@ -353,7 +384,8 @@ fn project_rotated(
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
-            // gfx1151 long prefill: the KLD-gated F16 WMMA route, else exact.
+            // Long prefill on gfx11 or gfx1201: the KLD-gated F16 WMMA route,
+            // else exact.
             match gpu.gemm_bf16_xf32_f16_wmma_qwen4(
                 &[(weight.buf, output, weight.m)],
                 x,
@@ -495,17 +527,80 @@ impl HyperReadOp<'_> {
 }
 
 pub fn execute_hyper_read(gpu: &mut Gpu, op: &HyperReadOp<'_>) -> Result<(), DispatchError> {
-    execute_hyper_read_inner(gpu, op, false, None)
+    execute_hyper_read_inner(gpu, op, false, None, None).map(|_| ())
+}
+
+/// Whether `write`'s gates can come from `read`'s norm pass
+/// ([`hyper_norm_gate`] with the read's F16 output): same streams, rows and
+/// geometry, and the gate projection the fused kernel implements.
+fn write_gates_fusable(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
+    let wide = read.branches * read.hidden;
+    gpu.arch_caps.has_gfx11_plus_simt()
+        && read.rows > 1
+        && write.rows == read.rows
+        && write.branches == read.branches
+        && write.hidden == read.hidden
+        && write.state_bf16 == read.state_bf16
+        && write.input.buf.as_ptr() == read.input.buf.as_ptr()
+        && write.block_inject.dtype == DType::BF16
+        && write.block_inject.m == write.branches
+        && write.block_inject.k == wide
+        && HyperNormGate::supports(write.branches, write.hidden)
+}
+
+/// Whether the HC read `read` can hand its paired HC write `write` the gates
+/// (`HIPFIRE_QWEN4_HC_FUSE` >= 1): the same stream tensor and norm weight, four
+/// branches of `hidden % 256 == 0 <= 2560`, the same rows and storage, and a
+/// plain BF16 gate projection.  The caller guarantees that only
+/// stream-neutral mixer steps run between the two.
+pub fn hyper_read_pairs_write(
+    gpu: &Gpu,
+    read: &HyperReadOp<'_>,
+    write: &HyperWriteOp<'_>,
+) -> bool {
+    gpu.flags.qwen4_hc_fuse_level() >= 1
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && read.input.buf.as_ptr() == write.input.buf.as_ptr()
+        && read.input.buf.as_ptr() == write.output.buf.as_ptr()
+        && read.input.numel() == write.input.numel()
+        && read.norm_weight.buf.as_ptr() == write.norm_weight.buf.as_ptr()
+        && read.rows == write.rows
+        && read.branches == 4
+        && write.branches == 4
+        && read.hidden == write.hidden
+        && HyperNormGate::supports(read.branches, read.hidden)
+        && read.state_bf16 == write.state_bf16
+        && write.block_inject.dtype == DType::BF16
+        && write.block_inject.m == 4
+        && write.block_inject.k == 4 * write.hidden
+        && write.block_inject.awq_scale.is_none()
+        && write.gates.dtype == DType::F32
+        && write.gates.numel() >= write.rows * write.branches
+}
+
+/// [`execute_hyper_read`] that, on the multi-row F16 WMMA route, also writes
+/// the gates of `write` — the next hyper write of the same, unchanged
+/// streams — in the norm's pass (one read of the streams for both norms).
+/// Returns whether it did; the write then runs [`execute_hyper_write_pregated`].
+pub fn execute_hyper_read_paired(
+    gpu: &mut Gpu,
+    read: &HyperReadOp<'_>,
+    write: &HyperWriteOp<'_>,
+) -> Result<bool, DispatchError> {
+    execute_hyper_read_inner(gpu, read, false, None, Some(write))
 }
 
 /// `normalized_ready`: a preceding fused launch already wrote this read's
 /// single-row `normalized` (see [`execute_hyper_write_then_read`]).
+/// Returns whether `write_gates`' gates were written.
 fn execute_hyper_read_inner(
     gpu: &mut Gpu,
     op: &HyperReadOp<'_>,
     normalized_ready: bool,
     rotate_into: Option<&GpuTensor>,
-) -> Result<(), DispatchError> {
+    write_gates: Option<&HyperWriteOp<'_>>,
+) -> Result<bool, DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper read wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
@@ -539,10 +634,31 @@ fn execute_hyper_read_inner(
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
+    let ld16 = gpu.f16_row_pitch(wide);
     let mut activated = false;
+    let mut gates_written = false;
     if f16 {
-        let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
-        hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?;
+        let x16 = hip(gpu.qwen4_f16_x_scratch(op.rows * ld16))?;
+        match write_gates.filter(|w| wmma_read && write_gates_fusable(gpu, op, w)) {
+            Some(write) => {
+                hip(hyper_norm_gate(
+                    gpu,
+                    &HyperNormGate {
+                        input: &input,
+                        norm_weight: write.norm_weight,
+                        gate_weight: write.block_inject.buf,
+                        gates: &view(write.gates, 0, op.rows * op.branches),
+                        rows: op.rows,
+                        branches: op.branches,
+                        hidden: op.hidden,
+                        state_bf16: op.state_bf16,
+                        read_f16: Some((op.norm_weight, &x16, ld16)),
+                    },
+                ))?;
+                gates_written = true;
+            }
+            None => hip(hyper_norm_f16(gpu, &norm, &x16, ld16, !wmma_read))?,
+        }
         hip(gpu.gemm_bf16_xf16_f16_wmma(
             op.input_mix_down.buf,
             &x16,
@@ -550,30 +666,41 @@ fn execute_hyper_read_inner(
             op.input_mix_down.m,
             op.input_mix_down.k,
             op.rows,
+            ld16,
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
-        && ((op.rows == 1
-            && op.input_mix_down.dtype == DType::BF16
-            && op.input_mix_down.k.is_multiple_of(32))
-            || (op.rows <= 8
-                && op.input_mix_down.dtype == DType::Q8_0
-                && op.input_mix_down.k.is_multiple_of(256)))
+        && op.rows <= 8
+        && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
+            || (op.input_mix_down.dtype == DType::Q8_0 && op.input_mix_down.k.is_multiple_of(256)))
     {
-        // Decode: the long-K down GEMV splits each row across four waves and
-        // applies the activation below in its epilogue.
+        // Decode and the few rows of a speculative verify: the long-K down
+        // GEMV splits each row across waves and applies the activation below
+        // in its epilogue. A verify row must be bitwise the decode row, so a
+        // BF16 weight (the final read has no Q8 decode copy) runs the one-row
+        // kernel per row: the multi-row GEMM's sum order differs, and the
+        // BF16-rounded activation then flips an element now and then.
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
         let down = &op.input_mix_down;
         let act = Some(1.0 / op.branches as f32);
-        hip(if down.dtype == DType::Q8_0 && op.rows > 1 {
-            gpu.gemv_q8_0_k8_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
+        if down.dtype == DType::Q8_0 && op.rows > 1 {
+            hip(gpu.gemv_q8_0_k8_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows))?;
         } else if down.dtype == DType::Q8_0 {
-            gpu.gemv_q8_0_k8(down.buf, &normalized, &low, down.m, down.k, act)
+            hip(gpu.gemv_q8_0_k8(down.buf, &normalized, &low, down.m, down.k, act))?;
         } else {
-            gpu.gemv_bf16_xf32_k4(down.buf, &normalized, &low, down.m, down.k, act)
-        })?;
+            for row in 0..op.rows {
+                hip(gpu.gemv_bf16_xf32_k4(
+                    down.buf,
+                    &view(&normalized, row * down.k, down.k),
+                    &view(&low, row * down.m, down.m),
+                    down.m,
+                    down.k,
+                    act,
+                ))?;
+            }
+        }
         activated = true;
     } else {
         if !normalized_ready {
@@ -671,9 +798,11 @@ fn execute_hyper_read_inner(
             normalized_bf16,
         };
         if wmma_read {
-            return hip(hyper_read_up_wmma(gpu, &read));
+            hip(hyper_read_up_wmma(gpu, &read, ld16))?;
+        } else {
+            hip(hyper_read_up_fused(gpu, &read))?;
         }
-        return hip(hyper_read_up_fused(gpu, &read));
+        return Ok(gates_written);
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
     if let Some(rotated) = rotate_into.filter(|r| {
@@ -681,14 +810,15 @@ fn execute_hyper_read_inner(
     }) {
         // The next step rotates `mixed` into `rotated` first: write that
         // rotation here too (the step's rotate then skips).
-        return hip(gpu.hyper_read_projected_rotate(
+        hip(gpu.hyper_read_projected_rotate(
             &normalized,
             &up,
             &mixed,
             &view(rotated, 0, op.rows * op.hidden),
             op.hidden,
             op.rows,
-        ));
+        ))?;
+        return Ok(gates_written);
     }
     hip(hyper_read_projected(
         gpu,
@@ -701,7 +831,8 @@ fn execute_hyper_read_inner(
             branches: op.branches,
             hidden: op.hidden,
         },
-    ))
+    ))?;
+    Ok(gates_written)
 }
 /// Hyper-connection write: grouped normalization, branch gate projection, and
 /// in-place residual injection in the source-defined BF16 order.
@@ -772,13 +903,96 @@ impl HyperWriteOp<'_> {
 }
 
 pub fn execute_hyper_write(gpu: &mut Gpu, op: &HyperWriteOp<'_>) -> Result<(), DispatchError> {
+    execute_hyper_write_inner(gpu, op, false)
+}
+
+/// [`execute_hyper_write`] whose gates the paired read already produced
+/// ([`execute_hyper_read_paired`]) from the same, unchanged, streams.
+pub fn execute_hyper_write_pregated(
+    gpu: &mut Gpu,
+    op: &HyperWriteOp<'_>,
+) -> Result<(), DispatchError> {
+    execute_hyper_write_inner(gpu, op, true)
+}
+
+/// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 output
+/// projection that applies the paired HC write `write` in its GEMM epilogue.
+/// `write`'s gates must already be in `write.gates` (the paired read produced
+/// them from the streams the write overwrites; see
+/// [`execute_hyper_read_paired`]).  The rotated activation is the unfused
+/// route's, the GEMM accumulates in its order and the HC streams receive the
+/// `hyper_write` expression, so the result is bitwise the projection followed
+/// by [`execute_hyper_write_pregated`].  The attention output is not
+/// materialized.  Returns `false`, having launched nothing, when the shape or
+/// route is not covered; the caller then projects and writes unfused.
+fn project_output_into_hyper_write(
+    gpu: &mut Gpu,
+    weight: &WeightRef<'_>,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    write: &HyperWriteOp<'_>,
+) -> Result<bool, DispatchError> {
+    let Some(wide) = write.branches.checked_mul(write.hidden) else {
+        return Ok(false);
+    };
+    if gpu.flags.qwen4_hc_fuse_level() < 2
+        || weight.dtype != DType::MQ6G256V2
+        || weight.m != write.hidden
+        || write.branches != 4
+        || write.rows != rows
+        || write.input.dtype != DType::F32
+        || write.input.buf.as_ptr() != write.output.buf.as_ptr()
+        || write.input.numel() < rows * wide
+        || write.gates.dtype != DType::F32
+        || write.gates.numel() < rows * write.branches
+        || !gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows)
+    {
+        return Ok(false);
+    }
+    let (x, x_is_f16) = if gpu.arch_caps.is_gfx1151() || input.dtype == DType::BF16 {
+        // The hcw kernels read packed X rows.
+        (hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows, weight.k))?, true)
+    } else {
+        let rotated = rotate_input(gpu, weight, input, rows, rotation)?.ok_or(
+            DispatchError::UnsupportedVariant {
+                family: "layer-operations",
+                variant: "rotation-scratch-absent",
+                arch: "",
+                quant: "quantized",
+            },
+        )?;
+        (rotated, false)
+    };
+    hip(gpu.gemm_mq6g256v2_hcw(
+        weight.buf,
+        &x,
+        x_is_f16,
+        None,
+        weight.m,
+        weight.k,
+        rows,
+        write.input,
+        write.gates,
+        write.state_bf16,
+    ))?;
+    Ok(true)
+}
+
+fn execute_hyper_write_inner(
+    gpu: &mut Gpu,
+    op: &HyperWriteOp<'_>,
+    gates_ready: bool,
+) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
     let input = view(op.input, 0, op.rows * wide);
     let normalized = view(op.normalized, 0, op.rows * wide);
     let mixed = view(op.mixed, 0, op.rows * op.hidden);
     let gates = view(op.gates, 0, op.rows * op.branches);
     let output = view(op.output, 0, op.rows * wide);
-    hyper_write_gates(gpu, op, &input, &normalized, &gates)?;
+    if !gates_ready {
+        hyper_write_gates(gpu, op, &input, &normalized, &gates)?;
+    }
     hip(hyper_write(
         gpu,
         &HyperWrite {
@@ -887,7 +1101,7 @@ pub fn execute_hyper_write_then_read(
         next_gates.as_ref(),
         clear.as_ref(),
     ))?;
-    execute_hyper_read_inner(gpu, read, true, rotate_into)?;
+    execute_hyper_read_inner(gpu, read, true, rotate_into, None)?;
     Ok(Some(next_gates.is_some()))
 }
 
@@ -900,10 +1114,19 @@ fn hyper_write_gates(
     gates: &GpuTensor,
 ) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
+    // Decode and the few rows of a speculative verify: the norm, then four
+    // gate rows of K = branches * hidden with four waves per row, row by row
+    // (a verify row must be bitwise the decode row; the fused multi-row norm
+    // + gate below sums in a different order).
+    let k4 = gpu.arch_caps.has_gfx11_plus_simt()
+        && op.rows <= 8
+        && op.block_inject.dtype == DType::BF16
+        && op.block_inject.k.is_multiple_of(32);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
-    let fused = gpu.arch_caps.has_gfx11_plus_simt()
+    let fused = !k4
+        && gpu.arch_caps.has_gfx11_plus_simt()
         && op.rows > 1
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.m == op.branches
@@ -921,6 +1144,7 @@ fn hyper_write_gates(
                 branches: op.branches,
                 hidden: op.hidden,
                 state_bf16: op.state_bf16,
+                read_f16: None,
             },
         ))?;
     } else {
@@ -935,21 +1159,19 @@ fn hyper_write_gates(
                 state_bf16: op.state_bf16,
             },
         ))?;
-        if op.rows == 1
-            && gpu.arch_caps.has_gfx11_plus_simt()
-            && op.block_inject.dtype == DType::BF16
-            && op.block_inject.k.is_multiple_of(32)
-        {
-            // Decode: four gate rows of K = branches * hidden; four waves per
-            // row instead of one.
-            hip(gpu.gemv_bf16_xf32_k4(
-                op.block_inject.buf,
-                normalized,
-                gates,
-                op.block_inject.m,
-                op.block_inject.k,
-                None,
-            ))?;
+        if k4 {
+            let m = op.block_inject.m;
+            let k = op.block_inject.k;
+            for row in 0..op.rows {
+                hip(gpu.gemv_bf16_xf32_k4(
+                    op.block_inject.buf,
+                    &view(normalized, row * k, k),
+                    &view(gates, row * m, m),
+                    m,
+                    k,
+                    None,
+                ))?;
+            }
         } else {
             project_weight(
                 gpu,
@@ -1007,7 +1229,7 @@ pub struct GatedDeltaNetOp<'a> {
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
 /// row prefix needs: the recurrent state after the last row (slot `rows - 1`
-/// of `states`, `[rows, value_heads * value_dim * key_dim]` F32, written
+/// of `states`, a `[rows]` ring of states in `recurrent`'s format, written
 /// instead of updating `recurrent`, which stays the pre-forward state), the
 /// convolution input rows (`inputs`, `[rows, qkv]` F32; every reader of the
 /// convolution history rounds it to BF16), and the recurrence inputs a
@@ -1055,10 +1277,19 @@ impl GatedDeltaNetOp<'_> {
             DType::F32,
             "gated delta projection scratch",
         )?;
+        let state_format = GdnStateFormat::of(self.recurrent).map_err(|error| {
+            DispatchError::Hip(format!("gated delta state: {error}"))
+        })?;
+        if !state_format.supports(self.key_dim, self.value_dim) {
+            return Err(DispatchError::Hip(format!(
+                "gated delta {} state needs 128x128 heads",
+                state_format.name()
+            )));
+        }
         require_tensor(
             self.recurrent,
-            checked_mul(value, self.key_dim, "gated delta state")?,
-            DType::F32,
+            state_format.state_units(self.value_heads, self.key_dim, self.value_dim),
+            state_format.dtype(),
             "gated delta state",
         )?;
         require_tensor(
@@ -1143,6 +1374,18 @@ pub fn execute_gated_delta_net(
     gpu: &mut Gpu,
     op: &GatedDeltaNetOp<'_>,
 ) -> Result<(), DispatchError> {
+    execute_gated_delta_net_hc(gpu, op, None, &mut false)
+}
+
+/// [`execute_gated_delta_net`] whose output projection may carry the paired HC
+/// write `hc` (whose gates the paired read already produced).  `fused` reports
+/// that it did: `hc`'s streams are then written and the write step is done.
+pub fn execute_gated_delta_net_hc(
+    gpu: &mut Gpu,
+    op: &GatedDeltaNetOp<'_>,
+    hc: Option<&HyperWriteOp<'_>>,
+    fused: &mut bool,
+) -> Result<(), DispatchError> {
     let qk = op.key_heads * op.key_dim;
     let value = op.value_heads * op.value_dim;
     let qkv = 2 * qk + value;
@@ -1189,6 +1432,7 @@ pub fn execute_gated_delta_net(
         value_heads: op.value_heads,
         key_dim: op.key_dim,
         value_dim: op.value_dim,
+        position: op.start_position,
     };
     let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
     if chunked && capture.is_some() {
@@ -1224,41 +1468,57 @@ pub fn execute_gated_delta_net(
         if chunked {
             conv_output.dtype = DType::BF16;
         }
+        let conv = GatedDeltaConvBatched {
+            input: &projection,
+            kernel: op.conv,
+            history: op.conv_state,
+            output: &conv_output,
+            next_history: op.conv_state,
+            rows: op.rows,
+            channels: qkv,
+            history_rows,
+            kernel_size: op.conv_kernel,
+            start_cursor,
+        };
+        let gate_params = GatedDeltaParamsBatched {
+            a: &a,
+            b: &b,
+            a_log: op.a_log,
+            dt_bias: op.dt_bias,
+            gate: &gate,
+            beta: &beta,
+            rows: op.rows,
+            heads: op.value_heads,
+        };
+        let step = GatedDeltaStepBatched {
+            projection: &conv_output,
+            ..dims
+        };
+        // Opt-in `HIPFIRE_QWEN4_GDN_CONV_QKNORM`: on the exact gfx1151 chunked
+        // route (never a row capture, recorder or graph capture, and never the
+        // persistent gfx1201 route) the convolution also stores the normalized
+        // Q/K the recurrence reads, so its Q/K columns of `conv_output` are not
+        // written and the separate Q/K-norm launch is skipped.
+        let fused_qk = chunked
+            && capture.is_none()
+            && gated_delta_conv_qknorm_route(gpu, &step, &conv);
         // Convolution and gate parameters in one launch.
-        hip(gated_delta_conv_params_batched(
-            gpu,
-            &GatedDeltaConvBatched {
-                input: &projection,
-                kernel: op.conv,
-                history: op.conv_state,
-                output: &conv_output,
-                next_history: op.conv_state,
-                rows: op.rows,
-                channels: qkv,
-                history_rows,
-                kernel_size: op.conv_kernel,
-                start_cursor,
-            },
-            &GatedDeltaParamsBatched {
-                a: &a,
-                b: &b,
-                a_log: op.a_log,
-                dt_bias: op.dt_bias,
-                gate: &gate,
-                beta: &beta,
-                rows: op.rows,
-                heads: op.value_heads,
-            },
-        ))?;
+        if fused_qk {
+            hip(gated_delta_conv_params_qknorm_batched(
+                gpu,
+                &conv,
+                &gate_params,
+                &step,
+                false,
+            ))?;
+        } else {
+            hip(gated_delta_conv_params_batched(gpu, &conv, &gate_params))?;
+        }
         // The chunked route's output is BF16-rounded: stored as BF16 when the
         // output projection rotates it straight to F16 (half the bytes).
         if bf16_store(&op.output, gpu) {
             gdn_output.dtype = DType::BF16;
         }
-        let step = GatedDeltaStepBatched {
-            projection: &conv_output,
-            ..dims
-        };
         let gated = GatedDeltaGateBatched {
             recurrent_output: &recurrent_output,
             z: &z,
@@ -1271,7 +1531,11 @@ pub fn execute_gated_delta_net(
         // The F16 prefill route fuses the gate into the chunked WMMA
         // recurrence (KLD-gated); otherwise the exact kernels run.
         if chunked {
-            hip(gated_delta_step_gate_wmma(gpu, &step, &gated))?;
+            if fused_qk {
+                hip(gated_delta_step_gate_wmma_qknormed(gpu, &step, &gated))?;
+            } else {
+                hip(gated_delta_step_gate_wmma(gpu, &step, &gated))?;
+            }
         } else {
             hip(gated_delta_step_batched(gpu, &step))?;
             // An FWHT-basis output projection rotates the gate output first:
@@ -1353,6 +1617,7 @@ pub fn execute_gated_delta_net(
                     value_heads: op.value_heads,
                     key_dim: op.key_dim,
                     value_dim: op.value_dim,
+                    position,
                 },
                 &GatedDeltaGate {
                     recurrent_output: &recurrent_output,
@@ -1364,6 +1629,21 @@ pub fn execute_gated_delta_net(
                 },
                 rotate_into.as_ref(),
             ))?;
+        }
+    }
+    // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the paired HC write rides the output
+    // projection's epilogue; the projection then never lands in `output_tensor`.
+    if let Some(write) = hc {
+        if project_output_into_hyper_write(
+            gpu,
+            &op.output,
+            &gdn_output,
+            op.rows,
+            Some(op.rotation),
+            write,
+        )? {
+            *fused = true;
+            return Ok(());
         }
     }
     let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
@@ -1382,8 +1662,10 @@ pub fn execute_gated_delta_net(
 
 /// Borrowed cache tensors plus scalar metadata for one operation.  The
 /// architecture commits these scalar values to persistent state after the
-/// shared step list succeeds.
+/// shared step list succeeds. The K/V caches are `format`'s rows and the raw
+/// and pooled index keys its `index_dtype`.
 pub struct IndexedAttentionState<'a> {
+    pub format: QsaKvFormat,
     pub full_keys: &'a GpuTensor,
     pub full_values: &'a GpuTensor,
     pub raw_index_keys: &'a GpuTensor,
@@ -1582,24 +1864,33 @@ impl IndexedAttentionOp<'_> {
             DType::F32,
             "indexed attention projected output",
         )?;
+        let kv_row_units = self.state.format.kv_row_units(self.kv_heads, self.head_dim);
+        if !self.state.format.supports(self.kv_heads, self.head_dim) {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention {} K/V does not support {} KV heads x {}",
+                self.state.format.name(),
+                self.kv_heads,
+                self.head_dim
+            )));
+        }
         require_tensor(
             self.state.full_keys,
             checked_mul(
                 self.state.full_capacity,
-                kv_width,
+                kv_row_units,
                 "indexed attention full keys",
             )?,
-            DType::F32,
+            self.state.format.kv_dtype(),
             "indexed attention full keys",
         )?;
         require_tensor(
             self.state.full_values,
             checked_mul(
                 self.state.full_capacity,
-                kv_width,
+                kv_row_units,
                 "indexed attention full values",
             )?,
-            DType::F32,
+            self.state.format.kv_dtype(),
             "indexed attention full values",
         )?;
         require_tensor(
@@ -1609,7 +1900,7 @@ impl IndexedAttentionOp<'_> {
                 index_kv_width,
                 "indexed attention raw keys",
             )?,
-            DType::F32,
+            self.state.format.index_dtype(),
             "indexed attention raw keys",
         )?;
         require_tensor(
@@ -1619,7 +1910,7 @@ impl IndexedAttentionOp<'_> {
                 index_kv_width,
                 "indexed attention pooled keys",
             )?,
-            DType::F32,
+            self.state.format.index_dtype(),
             "indexed attention pooled keys",
         )?;
         require_tensor(
@@ -1748,9 +2039,65 @@ impl IndexedAttentionOp<'_> {
     }
 }
 
+/// Developer observer of the QSA reference harness: called with `(gpu, qsa
+/// slot, op)` right after a QSA step's projections, so the op's index / query
+/// + gate / K / V scratch holds the raw projected rows and the cache, pool
+/// and selection are still the step's pre-prologue state.
+pub type QsaProjectionHook =
+    Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String>>;
+
+thread_local! {
+    // Const-initialized `None`: no allocation, one thread-local read per QSA
+    // step while no harness installed a hook.
+    static QSA_PROJECTION_HOOK: std::cell::RefCell<Option<(usize, QsaProjectionHook)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) this thread's [`QsaProjectionHook`]; the slot counter
+/// restarts at 0.
+pub fn set_qsa_projection_hook(hook: Option<QsaProjectionHook>) {
+    QSA_PROJECTION_HOOK.with(|cell| *cell.borrow_mut() = hook.map(|hook| (0, hook)));
+}
+
+/// Whether this thread has a [`QsaProjectionHook`] installed.
+pub fn qsa_projection_hook_installed() -> bool {
+    QSA_PROJECTION_HOOK.with(|cell| cell.borrow().is_some())
+}
+
+/// Restart the hook's QSA slot counter (a forward's first QSA step is slot 0).
+pub fn reset_qsa_projection_slot() {
+    QSA_PROJECTION_HOOK.with(|cell| {
+        if let Some((slot, _)) = cell.borrow_mut().as_mut() {
+            *slot = 0;
+        }
+    });
+}
+
+fn qsa_projection_hook_run(gpu: &mut Gpu, op: &IndexedAttentionOp<'_>) -> Result<(), DispatchError> {
+    QSA_PROJECTION_HOOK.with(|cell| match cell.borrow_mut().as_mut() {
+        None => Ok(()),
+        Some((slot, hook)) => {
+            let index = *slot;
+            *slot += 1;
+            hook(gpu, index, op).map_err(DispatchError::Hip)
+        }
+    })
+}
+
 pub fn execute_indexed_attention(
     gpu: &mut Gpu,
     op: &IndexedAttentionOp<'_>,
+) -> Result<(), DispatchError> {
+    execute_indexed_attention_hc(gpu, op, None, &mut false)
+}
+
+/// [`execute_indexed_attention`] whose output projection may carry the paired
+/// HC write `hc` (see [`execute_gated_delta_net_hc`]).
+pub fn execute_indexed_attention_hc(
+    gpu: &mut Gpu,
+    op: &IndexedAttentionOp<'_>,
+    hc: Option<&HyperWriteOp<'_>>,
+    fused: &mut bool,
 ) -> Result<(), DispatchError> {
     let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
     let index_q_width = op.index_heads * op.index_dim;
@@ -1781,6 +2128,7 @@ pub fn execute_indexed_attention(
         _ => &all,
     };
     project_weights(gpu, op.input, op.rows, Some(op.rotation), projections)?;
+    qsa_projection_hook_run(gpu, op)?;
 
     if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
         // Decode / few-row verify: the norms, RoPE, cache append and
@@ -1806,6 +2154,7 @@ pub fn execute_indexed_attention(
                 head_dim: op.head_dim,
                 position: initial_position,
                 rows: op.rows,
+                format: op.state.format,
             },
         ))?;
     } else {
@@ -1823,46 +2172,66 @@ pub fn execute_indexed_attention(
                 rotary_dim: op.index_dim.min(64),
             },
         ))?;
-        hip(gpu.bf16_round_trip_f32_strided(
-            &index_batch,
-            op.rows,
-            index_q_width,
-            index_width,
-            index_kv_width,
-        ))?;
-        let index_k_batch = view(
-            &index_batch,
-            index_q_width,
-            op.rows * index_width - index_q_width,
-        );
-        // The destination row offset travels as a scalar (`= position *
-        // index_kv_width`) against the base tensor, and the recorder declares it, so
-        // the tape keeps a position-independent pointer and replay re-derives the
-        // offset for its own position instead of replaying the capture-position row.
-        hip(gpu.copy_rows_strided_f32(
-            &index_k_batch,
-            op.state.raw_index_keys,
-            op.rows,
-            index_kv_width,
-            index_width,
-            index_kv_width,
-            initial_position * index_kv_width,
-            Some(index_kv_width),
-        ))?;
-        hip(indexed_attention_norm_rope_batch(
-            gpu,
-            &IndexedAttentionNormRopeBatch {
-                values: &qgate_batch,
-                norm: op.q_norm,
-                rows: op.rows,
-                row_stride: 2 * q_width,
-                heads: op.heads,
-                head_dim: op.head_dim,
-                head_stride: 2 * op.head_dim,
-                position_start: initial_position,
-                rotary_dim: op.head_dim.min(64),
-            },
-        ))?;
+        if op.state.format.index_dtype() == DType::BF16 {
+            // Round in place and append into the BF16 arena, as the decode
+            // prologue does.
+            hip(indexed_attention_index_key_append_batch(
+                gpu,
+                &IndexedAttentionIndexKeyAppendBatch {
+                    index_rows: &index_batch,
+                    raw_index_keys: op.state.raw_index_keys,
+                    rows: op.rows,
+                    index_q_width,
+                    index_kv_width,
+                    position_start: initial_position,
+                },
+            ))?;
+        } else {
+            hip(gpu.bf16_round_trip_f32_strided(
+                &index_batch,
+                op.rows,
+                index_q_width,
+                index_width,
+                index_kv_width,
+            ))?;
+            let index_k_batch = view(
+                &index_batch,
+                index_q_width,
+                op.rows * index_width - index_q_width,
+            );
+            // The destination row offset travels as a scalar (`= position *
+            // index_kv_width`) against the base tensor, and the recorder declares it,
+            // so the tape keeps a position-independent pointer and replay
+            // re-derives the offset for its own position instead of replaying the
+            // capture-position row.
+            hip(gpu.copy_rows_strided_f32(
+                &index_k_batch,
+                op.state.raw_index_keys,
+                op.rows,
+                index_kv_width,
+                index_width,
+                index_kv_width,
+                initial_position * index_kv_width,
+                Some(index_kv_width),
+            ))?;
+        }
+        // AppendOnly never projected Q; its scratch holds no rows to rotate.
+        if !matches!(op.mode, IndexedAttentionMode::AppendOnly) {
+            hip(indexed_attention_norm_rope_batch(
+                gpu,
+                &IndexedAttentionNormRopeBatch {
+                    values: &qgate_batch,
+                    norm: op.q_norm,
+                    rows: op.rows,
+                    row_stride: 2 * q_width,
+                    heads: op.heads,
+                    head_dim: op.head_dim,
+                    head_stride: 2 * op.head_dim,
+                    position_start: initial_position,
+                    rotary_dim: op.head_dim.min(64),
+                },
+            ))?;
+        }
         hip(indexed_attention_norm_rope_batch(
             gpu,
             &IndexedAttentionNormRopeBatch {
@@ -1886,7 +2255,9 @@ pub fn execute_indexed_attention(
                 full_values: op.state.full_values,
                 rows: op.rows,
                 position_start: initial_position,
-                kv_width,
+                kv_heads: op.kv_heads,
+                head_dim: op.head_dim,
+                format: op.state.format,
             },
         ))?;
     }
@@ -1896,14 +2267,12 @@ pub fn execute_indexed_attention(
     // active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
-        // Decode pools only the block its row completes (earlier blocks hold
-        // the same kernel's output for unchanged raw keys).
-        let pool = if op.rows == 1 {
-            indexed_attention_pool_rope_incremental
-        } else {
-            indexed_attention_pool_rope
-        };
-        hip(pool(
+        // Pool only the blocks this launch's rows complete: blocks below
+        // `position / compress` hold the same kernel's output for raw keys no
+        // later row rewrites (a rollback rewinds to a position, and the block
+        // containing it is re-pooled). Re-pooling the whole prefix every
+        // prefill chunk was quadratic in the context.
+        hip(indexed_attention_pool_rope_incremental(
             gpu,
             &IndexedAttentionPoolRope {
                 raw_keys: op.state.raw_index_keys,
@@ -1950,6 +2319,7 @@ pub fn execute_indexed_attention(
                 head_dim: op.head_dim,
                 selected_len,
                 full_capacity: op.state.full_capacity,
+                format: op.state.format,
             },
         ))?;
         return project_weight(
@@ -2001,17 +2371,33 @@ pub fn execute_indexed_attention(
             compress: op.compress,
             capacity: op.state.selected_capacity,
             full_capacity: op.state.full_capacity,
+            format: op.state.format,
             shape_selected: op.state.selected_capacity,
         },
     ))?;
-    project_weight(
-        gpu,
-        &op.output,
-        &qsa_output_batch,
-        &view(op.attention_output, 0, op.rows * op.output.m),
-        op.rows,
-        Some(op.rotation),
-    )?;
+    let fused_hc = match hc {
+        Some(write) => project_output_into_hyper_write(
+            gpu,
+            &op.output,
+            &qsa_output_batch,
+            op.rows,
+            Some(op.rotation),
+            write,
+        )?,
+        None => false,
+    };
+    if fused_hc {
+        *fused = true;
+    } else {
+        project_weight(
+            gpu,
+            &op.output,
+            &qsa_output_batch,
+            &view(op.attention_output, 0, op.rows * op.output.m),
+            op.rows,
+            Some(op.rotation),
+        )?;
+    }
     let final_selected = view(
         &selected_batch,
         (op.rows - 1) * op.state.selected_capacity * std::mem::size_of::<i32>(),
@@ -2389,40 +2775,50 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
     project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
 }
 
-/// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
+/// `output[r] = rows_input[r] + row[r / group]` for every one of `rows` rows
+/// of `width`: each `row` entry is shared by `group` consecutive rows.
 pub struct BroadcastAddOp<'a> {
     pub rows_input: &'a GpuTensor,
     pub row: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub rows: usize,
     pub width: usize,
+    pub group: usize,
 }
 
 impl BroadcastAddOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        if self.rows == 0 || self.width == 0 {
+        if self.rows == 0 || self.width == 0 || self.group == 0 {
             return Err(DispatchError::Hip(
                 "broadcast add has empty geometry".into(),
+            ));
+        }
+        if !self.rows.is_multiple_of(self.group) {
+            return Err(DispatchError::Hip(
+                "broadcast add rows are not a multiple of the group".into(),
             ));
         }
         let elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
         require_tensor(self.rows_input, elements, DType::F32, "broadcast add input")?;
         require_tensor(self.output, elements, DType::F32, "broadcast add output")?;
-        require_tensor(self.row, self.width, DType::F32, "broadcast add row")
+        require_tensor(
+            self.row,
+            self.rows / self.group * self.width,
+            DType::F32,
+            "broadcast add row",
+        )
     }
 }
 
 pub fn execute_broadcast_add(gpu: &mut Gpu, op: &BroadcastAddOp<'_>) -> Result<(), DispatchError> {
-    let row = view(op.row, 0, op.width);
-    for r in 0..op.rows {
-        let offset = r * op.width;
-        hip(gpu.add_f32(
-            &view(op.rows_input, offset, op.width),
-            &row,
-            &view(op.output, offset, op.width),
-        ))?;
-    }
-    Ok(())
+    hip(gpu.add_broadcast_rows_f32(
+        op.rows_input,
+        op.row,
+        op.output,
+        op.rows,
+        op.width,
+        op.group,
+    ))
 }
 
 /// Final hyper read uses the same operation contract as a regular read; this
@@ -2702,6 +3098,7 @@ mod tests {
             k_norm: t,
             output: weight,
             state: IndexedAttentionState {
+                format: QsaKvFormat::F32,
                 full_keys: t,
                 full_values: t,
                 raw_index_keys: t,
@@ -2785,5 +3182,162 @@ mod tests {
             .validate_layout()
             .expect_err("a K/V-only append leaves no selection to reuse");
         assert!(error.to_string().contains("after a K/V-only append"));
+    }
+
+    /// H4 attention epilogue: the MQ6G256V2 output projection that carries its
+    /// paired HC write must leave the streams bytewise as the projection
+    /// followed by the pregated write does, F32 and BF16-bit streams, F32 and
+    /// BF16 activations, ragged row counts.
+    #[test]
+    fn output_projection_carrying_the_hyper_write_is_bytewise_the_unfused_pair() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        std::sync::Arc::make_mut(&mut gpu.flags).qwen4_hc_fuse = 2;
+        if gpu.flags.qwen4_hc_fuse_level() < 2 {
+            eprintln!("skip: needs gfx1151 or gfx1201");
+            return;
+        }
+        let (hidden, k) = (2560usize, 1024usize);
+        let wide = 4 * hidden;
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let bf16_bytes = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect()
+        };
+        let group = 200usize; // MQ6G256V2_GROUP_BYTES
+        let mut weights = vec![0u8; hidden * k / 256 * group];
+        let mut state = 11u32;
+        for chunk in weights.chunks_mut(group) {
+            for byte in chunk.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+            for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let weight_buf = gpu.upload_raw(&weights, &[weights.len()]).expect("weights");
+        let weight = plain_weight(&weight_buf, DType::MQ6G256V2, hidden, k);
+        let norm = gpu.zeros(&[wide], DType::BF16).expect("norm");
+        let inject_buf = gpu.zeros(&[4 * wide], DType::BF16).expect("inject");
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for rows in [131usize, 530] {
+            let rotation = gpu.zeros(&[rows * k], DType::F32).expect("rotation");
+            let gates = gpu
+                .upload_f32(&wave(5, rows * 4, 1.5), &[rows * 4])
+                .expect("gates");
+            let mixed = gpu.zeros(&[rows * hidden], DType::F32).expect("mixed");
+            let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+            // Only gfx1151's unfused route reads a BF16 activation.
+            let activations: &[bool] = if gpu.arch_caps.is_gfx1151() {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &bf16_activation in activations {
+                let values = wave(7, rows * k, 2.0);
+                let input = if bf16_activation {
+                    let mut t = gpu
+                        .upload_raw(&bf16_bytes(&values), &[rows * k * 2])
+                        .expect("input");
+                    t.dtype = DType::BF16;
+                    t.shape = vec![rows * k];
+                    t
+                } else {
+                    gpu.upload_f32(&values, &[rows * k]).expect("input")
+                };
+                for state_bf16 in [false, true] {
+                    let initial = wave(1, rows * wide, 3.0);
+                    let raw = if state_bf16 {
+                        let mut raw = bf16_bytes(&initial);
+                        raw.resize(rows * wide * 4, 0);
+                        raw
+                    } else {
+                        initial.iter().flat_map(|v| v.to_le_bytes()).collect()
+                    };
+                    let mut streams = || {
+                        let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                        t.dtype = DType::F32;
+                        t.shape = vec![rows * wide];
+                        t
+                    };
+                    let (reference, fused) = (streams(), streams());
+                    let before = bits(&gpu, &reference);
+                    macro_rules! write_op {
+                        ($streams:expr) => {
+                            HyperWriteOp {
+                                state_bf16,
+                                input: $streams,
+                                norm_weight: &norm,
+                                block_inject: plain_weight(&inject_buf, DType::BF16, 4, wide),
+                                normalized: &normalized,
+                                mixed: &mixed,
+                                gates: &gates,
+                                output: $streams,
+                                rows,
+                                branches: 4,
+                                hidden,
+                                rotation: &rotation,
+                            }
+                        };
+                    }
+                    project_weight(&mut gpu, &weight, &input, &mixed, rows, Some(&rotation))
+                        .expect("project");
+                    execute_hyper_write_pregated(&mut gpu, &write_op!(&reference)).expect("write");
+                    assert!(
+                        project_output_into_hyper_write(
+                            &mut gpu,
+                            &weight,
+                            &input,
+                            rows,
+                            Some(&rotation),
+                            &write_op!(&fused),
+                        )
+                        .expect("fused"),
+                        "fused epilogue declined rows={rows}"
+                    );
+                    let (want, got) = (bits(&gpu, &reference), bits(&gpu, &fused));
+                    assert_ne!(want, before, "the write changed nothing");
+                    let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        differing, 0,
+                        "{differing} streams words differ: rows={rows} state_bf16={state_bf16} \
+                         bf16_activation={bf16_activation}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn plain_weight(buf: &GpuTensor, dtype: DType, m: usize, k: usize) -> WeightRef<'_> {
+        WeightRef {
+            buf,
+            dtype,
+            m,
+            k,
+            row_stride: k,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
     }
 }

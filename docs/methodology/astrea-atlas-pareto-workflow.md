@@ -92,10 +92,10 @@ Proposed runtime matrix axes for decode candidates (when the join exists):
 - `HIPFIRE_GRAPH=0`
 - `HIPFIRE_GRAPH=1`
 - `HIPFIRE_KV_MODE=q8`
-- `HIPFIRE_KV_MODE=asym3`
+- `HIPFIRE_KV_MODE=fwht3`
 
-`asym2` and `asym4` would remain optional unless a candidate specifically
-targets those policies. Historical gfx1100 KMD2 notes are not current floors.
+`fwht2` and `fwht4` would remain optional unless a candidate specifically
+targets those policies; legacy `asym*` modes are out of the matrix. Historical gfx1100 KMD2 notes are not current floors.
 
 Proposed runtime row fields for a joined candidate (beyond ordinary Atlas
 observation fields) include `candidate_id`, `baseline_candidate_id`, and the
@@ -123,7 +123,7 @@ Requested environment is not enough. Atlas must record the actual route:
 
 - Q8 short-context default should normally be `attention_q8_0_kv`
   (`q8_nonflash`).
-- `asym3` should route through `attention_flash_asym3`.
+- `fwht3` should route through `attention_flash_fwht3`.
 - Graph capture must not silently switch the attention implementation.
 
 Historical gfx1100 graph notes (capture forcing Q8 flash at short context) are
@@ -137,7 +137,7 @@ A future combined Astrea/Atlas report might print one table per baseline:
 candidate        KLD     PPL    bpw   size   runtime       tok/s   delta
 flat-mq4         ...     ...    ...   ...    q8+graph      ...     baseline
 kmd2-full        ...     ...    ...   ...    q8+graph      ...     -8.0%
-kmd2-full        ...     ...    ...   ...    asym3+graph   ...     -5.2%
+kmd2-full        ...     ...    ...   ...    fwht3+graph   ...     -5.2%
 ```
 
 Rows with no correctness result are allowed in exploratory mode but must be

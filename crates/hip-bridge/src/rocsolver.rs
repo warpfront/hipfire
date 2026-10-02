@@ -158,6 +158,7 @@ impl Rocsolver {
         ]);
         let lib = candidates
             .iter()
+            // SAFETY: libloading::Library::new maps librocsolver by path; Library owns the mapping.
             .find_map(|name| unsafe { Library::new(name).ok() })
             .ok_or_else(|| RocsolverError::LibraryUnavailable {
                 context: format!(
@@ -166,36 +167,41 @@ impl Rocsolver {
                 ),
             })?;
 
-        unsafe {
-            let fn_dpotrf: Symbol<RocsolverDpotrfFn> =
+        // SAFETY: `lib` is live; symbol matches rocSOLVER C ABI.
+        let fn_dpotrf: RocsolverDpotrfFn = unsafe {
+            let sym: Symbol<RocsolverDpotrfFn> =
                 lib.get(b"rocsolver_dpotrf")
                     .map_err(|e| RocsolverError::SymbolMissing {
                         context: format!("resolve rocsolver_dpotrf: {e}"),
                     })?;
-            let fn_dtrtri: Symbol<RocsolverDtrtriFn> =
+            *sym
+        };
+        // SAFETY: `lib` is live; symbol matches rocSOLVER C ABI.
+        let fn_dtrtri: RocsolverDtrtriFn = unsafe {
+            let sym: Symbol<RocsolverDtrtriFn> =
                 lib.get(b"rocsolver_dtrtri")
                     .map_err(|e| RocsolverError::SymbolMissing {
                         context: format!("resolve rocsolver_dtrtri: {e}"),
                     })?;
-            // dpotri is a clean fit alongside dpotrf/dtrtri but not strictly
-            // required; keep it optional so older librocsolver still provides
-            // Cholesky + triangular inverse.
-            let fn_dpotri = lib
-                .get::<RocsolverDpotriFn>(b"rocsolver_dpotri")
+            *sym
+        };
+        // dpotri is a clean fit alongside dpotrf/dtrtri but not strictly
+        // required; keep it optional so older librocsolver still provides
+        // Cholesky + triangular inverse.
+        // SAFETY: optional symbol from live `lib`; missing yields None.
+        let fn_dpotri = unsafe {
+            lib.get::<RocsolverDpotriFn>(b"rocsolver_dpotri")
                 .ok()
-                .map(|s| *s);
+                .map(|s| *s)
+        };
 
-            let fn_dpotrf = *fn_dpotrf;
-            let fn_dtrtri = *fn_dtrtri;
-
-            Ok(Self {
-                _lib: lib,
-                handle,
-                fn_dpotrf,
-                fn_dtrtri,
-                fn_dpotri,
-            })
-        }
+        Ok(Self {
+            _lib: lib,
+            handle,
+            fn_dpotrf,
+            fn_dtrtri,
+            fn_dpotri,
+        })
     }
 
     /// Whether `rocsolver_dpotri` was resolved (optional symbol).
@@ -320,6 +326,9 @@ fn check_info(info: *mut c_int, _context: &str) -> RocsolverResult<()> {
     // perform a hipMemcpy without a HIP dependency, so it reads as host memory
     // and documents the requirement. For CPU/unit-test paths this suffices and
     // soft-failure is preserved.
+    // SAFETY: caller of dpotrf/dtrtri/dpotri guarantees `info` is non-null and
+    // host-visible (or unified) after the solver completes; see method docs.
+    // Null was rejected above.
     let val = unsafe { std::ptr::read(info) };
     if val == 0 {
         Ok(())
@@ -333,8 +342,14 @@ fn check_info(info: *mut c_int, _context: &str) -> RocsolverResult<()> {
     }
 }
 
-// rocSOLVER handle is bound to a GPU context; not shared across threads without sync.
+// SAFETY: Rocsolver stores an opaque borrowed rocBLAS handle plus function
+// pointers. Send moves the wrapper; concurrent use still needs external sync.
+// Sync is claimed because the underlying rocBLAS handle APIs are thread-safe
+// for distinct calls when the caller serializes work on shared buffers — this
+// does not prove buffer aliasing safety across threads.
 unsafe impl Send for Rocsolver {}
+// SAFETY: see Send note; Sync allows shared refs to the resolved symbols/handle
+// identity. Buffer/stream races remain the caller's contract.
 unsafe impl Sync for Rocsolver {}
 
 #[cfg(test)]

@@ -105,7 +105,8 @@ fn main() {
 #[cfg(feature = "deltanet")]
 mod dn {
     use rdna_compute::kv_slots::{self, KvSlotDesc, R9700_VRAM_BYTES};
-    use rdna_compute::slot_pool::SlotPool;
+    use rdna_compute::page_pool::PAGE_TOKENS;
+    use rdna_compute::slot_pool::{SlotId, SlotPool};
     use rdna_compute::{DType, Gpu, GpuTensor};
 
     // ─────────────────────────── shared helpers ────────────────────────────
@@ -119,15 +120,16 @@ mod dn {
     }
 
     /// Pack KvSlotDesc records byte-identically to kernels/src/kv_slot_desc.h
-    /// (k_base u64, v_base u64, seq_len i32, cap i32 = 24 bytes). Copied from
-    /// `test_batched_attn_slots.rs` (SP1 Task 7) — same struct, same ABI.
+    /// (block_table u64, legacy_k_base u64, legacy_v_base u64, seq_len i32,
+    /// page_tokens i32 = 32 bytes).
     fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(descs.len() * 24);
+        let mut out = Vec::with_capacity(descs.len() * 32);
         for d in descs {
-            out.extend_from_slice(&d.k_base.to_ne_bytes());
-            out.extend_from_slice(&d.v_base.to_ne_bytes());
+            out.extend_from_slice(&d.block_table.to_ne_bytes());
+            out.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
+            out.extend_from_slice(&d.legacy_v_base.to_ne_bytes());
             out.extend_from_slice(&d.seq_len.to_ne_bytes());
-            out.extend_from_slice(&d.cap.to_ne_bytes());
+            out.extend_from_slice(&d.page_tokens.to_ne_bytes());
         }
         out
     }
@@ -465,6 +467,7 @@ mod dn {
             positions_flat.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+            /*use_v_base=*/ false,
         )
         .expect("multi-slot kv write");
         gpu.hip.device_synchronize().expect("sync");
@@ -478,9 +481,9 @@ mod dn {
 
         for (s, positions) in positions_per_slot.iter().enumerate() {
             let desc = descs[s];
-            let cap = desc.cap as usize;
-            let region =
-                &arena[desc.k_base as usize..desc.k_base as usize + cap * KV_PER_POS_BYTES];
+            let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
+            let region = &arena
+                [desc.legacy_k_base as usize..desc.legacy_k_base as usize + cap * KV_PER_POS_BYTES];
             let decoded = decode_q8_0(region);
             let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
             for &p in positions {
@@ -557,6 +560,7 @@ mod dn {
                 positions.len(),
                 Some(&descs_dev),
                 Some(&row_slot_dev),
+                false,
             )
             .expect("isolation write");
             gpu.hip.device_synchronize().expect("sync");
@@ -569,9 +573,9 @@ mod dn {
             gpu.free_tensor(descs_dev).expect("free descs_dev");
 
             for (s, &desc) in descs.iter().enumerate() {
-                let cap = desc.cap as usize;
-                let region =
-                    &arena[desc.k_base as usize..desc.k_base as usize + cap * KV_PER_POS_BYTES];
+                let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
+                let region = &arena[desc.legacy_k_base as usize
+                    ..desc.legacy_k_base as usize + cap * KV_PER_POS_BYTES];
                 let decoded = decode_q8_0(region);
                 if s == target {
                     let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
@@ -628,6 +632,7 @@ mod dn {
                 positions.len(),
                 Some(&descs_dev),
                 Some(&row_slot_dev),
+                false,
             )
             .expect("positive control write");
             gpu.hip.device_synchronize().expect("sync");
@@ -640,9 +645,9 @@ mod dn {
             gpu.free_tensor(descs_dev).expect("free descs_dev");
 
             let desc_b = descs[bystander];
-            let cap_b = desc_b.cap as usize;
-            let region_b =
-                &arena[desc_b.k_base as usize..desc_b.k_base as usize + cap_b * KV_PER_POS_BYTES];
+            let cap_b = rdna_compute::kv_slots::legacy_cap(desc_b.seq_len as usize);
+            let region_b = &arena[desc_b.legacy_k_base as usize
+                ..desc_b.legacy_k_base as usize + cap_b * KV_PER_POS_BYTES];
             let decoded_b = decode_q8_0(region_b);
             let n_finite = decoded_b.iter().filter(|v| v.is_finite()).count();
             assert!(
@@ -654,9 +659,9 @@ mod dn {
             );
 
             let desc_t = descs[target];
-            let cap_t = desc_t.cap as usize;
-            let region_t =
-                &arena[desc_t.k_base as usize..desc_t.k_base as usize + cap_t * KV_PER_POS_BYTES];
+            let cap_t = rdna_compute::kv_slots::legacy_cap(desc_t.seq_len as usize);
+            let region_t = &arena[desc_t.legacy_k_base as usize
+                ..desc_t.legacy_k_base as usize + cap_t * KV_PER_POS_BYTES];
             let decoded_t = decode_q8_0(region_t);
             assert!(
                 decoded_t.iter().all(|v| !v.is_finite()),
@@ -721,6 +726,7 @@ mod dn {
             positions.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+            false,
         )
         .expect("negative-control write");
         gpu.hip.device_synchronize().expect("sync");
@@ -736,9 +742,9 @@ mod dn {
         // launch actually wrote to slot 0's offset instead, so this region
         // never got touched and still reads the zero fill.
         let desc_t = descs[target];
-        let cap_t = desc_t.cap as usize;
-        let region_t =
-            &arena[desc_t.k_base as usize..desc_t.k_base as usize + cap_t * KV_PER_POS_BYTES];
+        let cap_t = rdna_compute::kv_slots::legacy_cap(desc_t.seq_len as usize);
+        let region_t = &arena[desc_t.legacy_k_base as usize
+            ..desc_t.legacy_k_base as usize + cap_t * KV_PER_POS_BYTES];
         let decoded_t = decode_q8_0(region_t);
         let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
         for &p in &positions {
@@ -753,6 +759,537 @@ mod dn {
                 &reference,
             );
         });
+    }
+
+    // ═══════════════════════ Paged KV component (SP4) ══════════════════════
+
+    /// Build a paged `SlotPool` whose block tables are deliberately
+    /// NON-monotonic. Allocate A, then B, release A, then take C: the free
+    /// list is LIFO, so C's logical page 0 lands in A's OLD physical page 2
+    /// and its table reads [2, 1, 0] — a kernel that ignored the block table
+    /// and read C's KV contiguously would get pages in the wrong order (and
+    /// B's live pages sitting right after them). That is exactly the failure
+    /// mode this section exists to catch.
+    fn build_paged_pool_scattered() -> (SlotPool, SlotId, SlotId) {
+        let mut pool = SlotPool::new_paged(3, 384, KV_PER_POS_BYTES, 6).expect("paged pool");
+        let a = pool.acquire().expect("acquire A");
+        let b = pool.acquire().expect("acquire B");
+        pool.set_seq_len(a, 300).expect("A seq_len"); // pages [0, 1, 2]
+        pool.set_seq_len(b, 130).expect("B seq_len"); // pages [3, 4]
+        pool.release(a); // frees 0, 1, 2 (B keeps 3, 4)
+        let c = pool.acquire().expect("acquire C"); // LIFO: pages [2, 1, 0]
+        pool.set_seq_len(c, 257).expect("C seq_len");
+        assert_eq!(
+            pool.block_table(c).unwrap().page_indices(),
+            &[2u32, 1, 0],
+            "scatter setup broke: C's table must be non-monotonic for this test to mean anything"
+        );
+        (pool, b, c)
+    }
+
+    /// Upload paged descriptors for the WHOLE pool — one descriptor entry
+    /// per pool slot, indexed by pool slot id, exactly like production's
+    /// `descs_dev` (the kernels do `slot_descs[row_slot[row]]` with raw pool
+    /// ids, so a table sized only to the live slots would be indexed out of
+    /// range). Released or never-filled slots get the legacy zero-base
+    /// zero-length descriptor `SlotPool::reset` leaves behind; no row may
+    /// target them.
+    fn upload_paged_pool_descs(
+        gpu: &mut Gpu,
+        pool: &SlotPool,
+    ) -> (Vec<KvSlotDesc>, Vec<GpuTensor>) {
+        let n = pool.descriptors().len();
+        let mut descs = Vec::with_capacity(n);
+        let mut tables: Vec<GpuTensor> = Vec::with_capacity(n);
+        for i in 0..n {
+            match pool.block_table(SlotId(i)) {
+                Some(bt) if bt.num_pages() > 0 => {
+                    let indices = bt.page_indices();
+                    let bytes: Vec<u8> = indices.iter().flat_map(|x| x.to_ne_bytes()).collect();
+                    let dev = gpu
+                        .upload_raw(&bytes, &[indices.len()])
+                        .expect("block table upload");
+                    descs.push(KvSlotDesc {
+                        block_table: dev.buf.as_ptr() as u64,
+                        legacy_k_base: 0,
+                        legacy_v_base: 0,
+                        seq_len: bt.live_tokens() as i32,
+                        page_tokens: PAGE_TOKENS as i32,
+                    });
+                    tables.push(dev);
+                }
+                _ => {
+                    descs.push(KvSlotDesc {
+                        block_table: 0,
+                        legacy_k_base: 0,
+                        legacy_v_base: 0,
+                        seq_len: 0,
+                        page_tokens: 0,
+                    });
+                }
+            }
+        }
+        (descs, tables)
+    }
+
+    /// Decode one position out of a paged arena, translating through the
+    /// HOST copy of the block table — the ground truth the kernel must agree
+    /// with.
+    fn decode_paged_position(
+        arena: &[u8],
+        pages: &[u32],
+        per_pos_bytes: usize,
+        pos: usize,
+    ) -> Vec<f32> {
+        let page_bytes = PAGE_TOKENS * per_pos_bytes;
+        let lp = pos / PAGE_TOKENS;
+        let off = pos % PAGE_TOKENS;
+        let phys = pages[lp] as usize;
+        let start = phys * page_bytes + off * per_pos_bytes;
+        decode_q8_0(&arena[start..start + per_pos_bytes])
+    }
+
+    /// Step 1 for paged KV: positions deliberately chosen to CROSS page
+    /// boundaries (127|128, 255|256), written through paged descriptors into
+    /// an arena whose free-list layout puts C's pages in REVERSE order.
+    /// Every written position must decode — via the host block table — to
+    /// exactly what the legacy single-sequence kernel wrote for the same
+    /// values, and every UNwritten position in both live slots' pages must
+    /// still be NaN poison (the write went precisely where the table said,
+    /// and nowhere else).
+    fn test_kv_write_paged_golden(gpu: &mut Gpu) {
+        let (pool, b, c) = build_paged_pool_scattered();
+        let slots = vec![b, c];
+        let arena_bytes = pool.arena_bytes();
+
+        // Positions crossing page boundaries in both slots.
+        let positions_per_slot: Vec<Vec<usize>> = vec![
+            vec![0, 100, 127, 128, 129],      // B: 130 live, 2 pages
+            vec![0, 127, 128, 200, 255, 256], // C: 257 live, 3 pages
+        ];
+
+        let mut src = Vec::new();
+        let mut positions_flat = Vec::new();
+        let mut row_slot = Vec::new();
+        for (i, &s) in slots.iter().enumerate() {
+            let live = pool.block_table(s).unwrap().live_tokens();
+            for &p in &positions_per_slot[i] {
+                assert!(
+                    p < live,
+                    "test position {p} exceeds slot {}'s live length",
+                    s.0
+                );
+                for e in 0..KV_DIM {
+                    src.push(kv_src_value(s.0, p, e));
+                }
+                positions_flat.push(p as i32);
+                row_slot.push(s.0 as i32);
+            }
+        }
+
+        let poisoned = poison_bytes(arena_bytes);
+        let dst = gpu
+            .upload_raw(&poisoned, &[arena_bytes])
+            .expect("poisoned paged arena");
+        let src_dev = gpu
+            .upload_f32(&src, &[positions_flat.len() * KV_DIM])
+            .expect("src upload");
+        let positions_dev = gpu
+            .upload_raw(&i32_bytes(&positions_flat), &[positions_flat.len()])
+            .expect("positions upload");
+        let row_slot_dev = gpu
+            .upload_raw(&i32_bytes(&row_slot), &[row_slot.len()])
+            .expect("row_slot upload");
+        let (descs, table_devs) = upload_paged_pool_descs(gpu, &pool);
+        let descs_dev = gpu
+            .upload_raw(&pack_descs(&descs), &[descs.len()])
+            .expect("paged descs upload");
+
+        gpu.kv_cache_write_q8_0_batched_slots(
+            &dst,
+            &src_dev,
+            &positions_dev,
+            KV_N_KV_HEADS,
+            KV_HEAD_DIM,
+            positions_flat.len(),
+            Some(&descs_dev),
+            Some(&row_slot_dev),
+            false,
+        )
+        .expect("paged multi-slot kv write");
+        gpu.hip.device_synchronize().expect("sync");
+        let arena = download_raw(gpu, &dst);
+
+        for (i, &s) in slots.iter().enumerate() {
+            let bt = pool.block_table(s).unwrap();
+            let pages = bt.page_indices();
+            let live = bt.live_tokens();
+            let written: Vec<usize> = positions_per_slot[i].clone();
+            // Reference slab must hold every position the slot's pages cover.
+            let ref_cap = live.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
+
+            // Every written position decodes to the legacy reference's bytes.
+            for &p in &written {
+                let candidate = decode_paged_position(&arena, pages, KV_PER_POS_BYTES, p);
+                let src_slice: Vec<f32> = (0..KV_DIM).map(|e| kv_src_value(s.0, p, e)).collect();
+                let reference = kv_legacy_reference(gpu, ref_cap, &src_slice, &[p]);
+                assert_close(
+                    &format!(
+                        "KV paged golden slot={} pos={p} (page {})",
+                        s.0,
+                        pages[p / PAGE_TOKENS]
+                    ),
+                    &candidate,
+                    &reference,
+                );
+            }
+
+            // Every UNwritten position in the slot's own pages is still NaN.
+            let mut checked = 0usize;
+            for p in 0..live {
+                if written.contains(&p) {
+                    continue;
+                }
+                let decoded = decode_paged_position(&arena, pages, KV_PER_POS_BYTES, p);
+                assert!(
+                    decoded.iter().all(|v| !v.is_finite()),
+                    "KV paged golden slot {}: position {p} was not written this call but its \
+                     page bytes changed — the write leaked outside the block-table translation",
+                    s.0
+                );
+                checked += 1;
+            }
+            println!(
+                "  KV paged golden slot={} (pages {:?}, {live} live): OK ({} written positions \
+                 match reference, {checked} unwritten positions still poison)",
+                s.0,
+                pages,
+                written.len()
+            );
+        }
+
+        gpu.free_tensor(dst).expect("free dst");
+        gpu.free_tensor(src_dev).expect("free src_dev");
+        gpu.free_tensor(positions_dev).expect("free positions_dev");
+        gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
+        gpu.free_tensor(descs_dev).expect("free descs_dev");
+        for t in table_devs {
+            gpu.free_tensor(t).expect("free block table");
+        }
+    }
+
+    /// Cross-slot isolation for paged KV: write ONLY slot C's rows into a
+    /// fully poisoned arena; B's live pages (physical 3 and 4 — note C's
+    /// REVERSED table puts its own logical page 0 at physical 2, adjacent to
+    /// B's first page) must still be 100% NaN. A kernel that fell back to
+    /// contiguous-slab addressing for C would write into physical pages
+    /// 0..2* — physical 3 is B's — and flip B out of poison.
+    fn test_kv_write_paged_isolation(gpu: &mut Gpu) {
+        let (pool, b, c) = build_paged_pool_scattered();
+        let arena_bytes = pool.arena_bytes();
+
+        let live_c = pool.block_table(c).unwrap().live_tokens();
+        let positions: Vec<usize> = (0..live_c).collect();
+        let src: Vec<f32> = positions
+            .iter()
+            .flat_map(|&p| (0..KV_DIM).map(move |e| kv_src_value(c.0, p, e)))
+            .collect();
+        let positions_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let row_slot = vec![c.0 as i32; positions.len()];
+
+        let poisoned = poison_bytes(arena_bytes);
+        let dst = gpu
+            .upload_raw(&poisoned, &[arena_bytes])
+            .expect("poisoned paged arena (isolation)");
+        let src_dev = gpu
+            .upload_f32(&src, &[positions.len() * KV_DIM])
+            .expect("src upload");
+        let positions_dev = gpu
+            .upload_raw(&i32_bytes(&positions_i32), &[positions.len()])
+            .expect("positions upload");
+        let row_slot_dev = gpu
+            .upload_raw(&i32_bytes(&row_slot), &[row_slot.len()])
+            .expect("row_slot upload");
+        let (descs, table_devs) = upload_paged_pool_descs(gpu, &pool);
+        let descs_dev = gpu
+            .upload_raw(&pack_descs(&descs), &[descs.len()])
+            .expect("paged descs upload");
+
+        gpu.kv_cache_write_q8_0_batched_slots(
+            &dst,
+            &src_dev,
+            &positions_dev,
+            KV_N_KV_HEADS,
+            KV_HEAD_DIM,
+            positions.len(),
+            Some(&descs_dev),
+            Some(&row_slot_dev),
+            false,
+        )
+        .expect("paged isolation write");
+        gpu.hip.device_synchronize().expect("sync");
+        let arena = download_raw(gpu, &dst);
+
+        // Bystander B: every position of every live page still poison.
+        let bt_b = pool.block_table(b).unwrap();
+        for p in 0..bt_b.live_tokens() {
+            let decoded = decode_paged_position(&arena, bt_b.page_indices(), KV_PER_POS_BYTES, p);
+            assert!(
+                decoded.iter().all(|v| !v.is_finite()),
+                "KV paged isolation: writing ALL of slot {}'s positions flipped bystander \
+                 slot {}'s page bytes at position {p} — paged addressing leaked across slots",
+                c.0,
+                b.0
+            );
+        }
+
+        // Target C: its full live length decodes finite and correct.
+        for &p in &positions {
+            let candidate = decode_paged_position(
+                &arena,
+                pool.block_table(c).unwrap().page_indices(),
+                KV_PER_POS_BYTES,
+                p,
+            );
+            assert!(
+                candidate.iter().all(|v| v.is_finite()),
+                "KV paged isolation: target slot {} position {p} came back non-finite",
+                c.0
+            );
+        }
+        println!(
+            "  KV paged isolation: OK (slot {} wrote {} positions via a reversed block table; \
+             bystander slot {}'s pages untouched)",
+            c.0,
+            positions.len(),
+            b.0
+        );
+
+        gpu.free_tensor(dst).expect("free dst");
+        gpu.free_tensor(src_dev).expect("free src_dev");
+        gpu.free_tensor(positions_dev).expect("free positions_dev");
+        gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
+        gpu.free_tensor(descs_dev).expect("free descs_dev");
+        for t in table_devs {
+            gpu.free_tensor(t).expect("free block table");
+        }
+    }
+
+    /// Paged attention read path: the SAME logical KV content, attended once
+    /// through paged descriptors over the scattered arena and once through
+    /// legacy descriptors over a gathered contiguous arena. Both arms run
+    /// `attention_q8_0_kv_batched_masked_slots`; they read byte-identical
+    /// KV, so the outputs must match. A kernel that ignored the block table
+    /// reads the wrong physical pages and diverges here.
+    fn test_attn_paged_matches_legacy(gpu: &mut Gpu) {
+        let (pool, b, c) = build_paged_pool_scattered();
+        let slots = vec![b, c];
+        let arena_bytes = pool.arena_bytes();
+
+        // Write EVERY live position of both slots (attention reads [0, pos]).
+        let mut src = Vec::new();
+        let mut positions_flat = Vec::new();
+        let mut row_slot = Vec::new();
+        for &s in &slots {
+            let live = pool.block_table(s).unwrap().live_tokens();
+            for p in 0..live {
+                for e in 0..KV_DIM {
+                    src.push(kv_src_value(s.0, p, e));
+                }
+                positions_flat.push(p as i32);
+                row_slot.push(s.0 as i32);
+            }
+        }
+
+        let zeroed = vec![0u8; arena_bytes];
+        let dst = gpu
+            .upload_raw(&zeroed, &[arena_bytes])
+            .expect("paged arena");
+        let src_dev = gpu
+            .upload_f32(&src, &[positions_flat.len() * KV_DIM])
+            .expect("src upload");
+        let positions_dev = gpu
+            .upload_raw(&i32_bytes(&positions_flat), &[positions_flat.len()])
+            .expect("positions upload");
+        let row_slot_dev = gpu
+            .upload_raw(&i32_bytes(&row_slot), &[row_slot.len()])
+            .expect("row_slot upload");
+        let (descs, table_devs) = upload_paged_pool_descs(gpu, &pool);
+        let descs_dev = gpu
+            .upload_raw(&pack_descs(&descs), &[descs.len()])
+            .expect("paged descs upload");
+
+        gpu.kv_cache_write_q8_0_batched_slots(
+            &dst,
+            &src_dev,
+            &positions_dev,
+            KV_N_KV_HEADS,
+            KV_HEAD_DIM,
+            positions_flat.len(),
+            Some(&descs_dev),
+            Some(&row_slot_dev),
+            false,
+        )
+        .expect("paged kv write (attn setup)");
+        gpu.hip.device_synchronize().expect("sync");
+        let arena = download_raw(gpu, &dst);
+        gpu.free_tensor(dst).expect("free dst");
+        gpu.free_tensor(src_dev).expect("free src_dev");
+        gpu.free_tensor(positions_dev).expect("free positions_dev");
+        gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
+
+        // Decode row per slot, at each slot's LAST live position. row_slot
+        // carries raw POOL slot ids (b, c) indexing the FULL n_slots-entry
+        // descriptor tables both arms upload — the same contract production
+        // kernels run under.
+        let rows = slots.len();
+        let pos_data: Vec<i32> = slots
+            .iter()
+            .map(|&s| (pool.block_table(s).unwrap().live_tokens() - 1) as i32)
+            .collect();
+        let row_slot_attn: Vec<i32> = slots.iter().map(|s| s.0 as i32).collect();
+        let positions_attn = gpu
+            .upload_raw(&i32_bytes(&pos_data), &[rows])
+            .expect("attn positions");
+        let row_slot_attn_dev = gpu
+            .upload_raw(&i32_bytes(&row_slot_attn), &[rows])
+            .expect("attn row_slot");
+        let q_data: Vec<f32> = (0..rows * KV_DIM)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let q = gpu.upload_f32(&q_data, &[rows * KV_DIM]).expect("q");
+        let out_paged = gpu.zeros(&[rows * KV_DIM], DType::F32).expect("out paged");
+
+        // Paged arm: the scattered arena as uploaded.
+        let k_paged = gpu
+            .upload_raw(&arena, &[arena.len()])
+            .expect("paged k arena");
+        let v_paged = gpu
+            .upload_raw(&arena, &[arena.len()])
+            .expect("paged v arena");
+        gpu.attention_q8_0_kv_batched_masked_slots(
+            &q,
+            &k_paged,
+            &v_paged,
+            &out_paged,
+            &positions_attn,
+            KV_N_KV_HEADS,
+            KV_N_KV_HEADS,
+            KV_HEAD_DIM,
+            pool.cap_tokens(),
+            *pos_data.iter().max().unwrap() as usize + 1,
+            rows,
+            None,
+            0,
+            0,
+            Some(&descs_dev),
+            Some(&row_slot_attn_dev),
+        )
+        .expect("paged attention");
+        gpu.hip.device_synchronize().expect("sync paged attn");
+
+        // Legacy arm: gather every slot's pages into contiguous per-slot
+        // slabs (the host block table is the ground-truth translator) and
+        // build a FULL n_slots-entry legacy descriptor table over the
+        // gathered arena — entry 0 (released slot A) stays a zero-length
+        // dummy, so row_slot [b, c] lands on B's and C's slabs in both arms.
+        let page_bytes = PAGE_TOKENS * KV_PER_POS_BYTES;
+        let mut legacy_arena: Vec<u8> = Vec::with_capacity(arena.len());
+        let mut legacy_descs: Vec<KvSlotDesc> = Vec::with_capacity(pool.descriptors().len());
+        for i in 0..pool.descriptors().len() {
+            match pool.block_table(SlotId(i)) {
+                Some(bt) if bt.num_pages() > 0 => {
+                    let base = legacy_arena.len() as u64;
+                    for &phys in bt.page_indices() {
+                        let start = phys as usize * page_bytes;
+                        legacy_arena.extend_from_slice(&arena[start..start + page_bytes]);
+                    }
+                    legacy_descs.push(KvSlotDesc {
+                        block_table: 0,
+                        legacy_k_base: base,
+                        legacy_v_base: base,
+                        seq_len: bt.live_tokens() as i32,
+                        page_tokens: 0,
+                    });
+                }
+                _ => {
+                    legacy_descs.push(KvSlotDesc {
+                        block_table: 0,
+                        legacy_k_base: 0,
+                        legacy_v_base: 0,
+                        seq_len: 0,
+                        page_tokens: 0,
+                    });
+                }
+            }
+        }
+        let k_legacy = gpu
+            .upload_raw(&legacy_arena, &[legacy_arena.len()])
+            .expect("legacy k arena");
+        let v_legacy = gpu
+            .upload_raw(&legacy_arena, &[legacy_arena.len()])
+            .expect("legacy v arena");
+        let legacy_descs_dev = gpu
+            .upload_raw(&pack_descs(&legacy_descs), &[legacy_descs.len()])
+            .expect("legacy descs upload");
+        let out_legacy = gpu.zeros(&[rows * KV_DIM], DType::F32).expect("out legacy");
+
+        gpu.attention_q8_0_kv_batched_masked_slots(
+            &q,
+            &k_legacy,
+            &v_legacy,
+            &out_legacy,
+            &positions_attn,
+            KV_N_KV_HEADS,
+            KV_N_KV_HEADS,
+            KV_HEAD_DIM,
+            pool.cap_tokens(),
+            *pos_data.iter().max().unwrap() as usize + 1,
+            rows,
+            None,
+            0,
+            0,
+            Some(&legacy_descs_dev),
+            Some(&row_slot_attn_dev),
+        )
+        .expect("legacy attention");
+        gpu.hip.device_synchronize().expect("sync legacy attn");
+
+        let got = download_f32(gpu, &out_paged);
+        let want = download_f32(gpu, &out_legacy);
+        assert_close("attention paged vs gathered-legacy", &got, &want);
+
+        gpu.free_tensor(k_paged).expect("free k_paged");
+        gpu.free_tensor(v_paged).expect("free v_paged");
+        gpu.free_tensor(k_legacy).expect("free k_legacy");
+        gpu.free_tensor(v_legacy).expect("free v_legacy");
+        gpu.free_tensor(legacy_descs_dev)
+            .expect("free legacy descs");
+        gpu.free_tensor(positions_attn)
+            .expect("free positions_attn");
+        gpu.free_tensor(row_slot_attn_dev)
+            .expect("free row_slot_attn");
+        gpu.free_tensor(q).expect("free q");
+        gpu.free_tensor(out_paged).expect("free out_paged");
+        gpu.free_tensor(out_legacy).expect("free out_legacy");
+        gpu.free_tensor(descs_dev).expect("free descs_dev");
+        for t in table_devs {
+            gpu.free_tensor(t).expect("free block table");
+        }
+        println!(
+            "  attention paged vs legacy: OK (slots {:?} attended via reversed block tables \
+             match the gathered-contiguous arm)",
+            slots.iter().map(|s| s.0).collect::<Vec<_>>()
+        );
+    }
+
+    /// Download a full f32 tensor.
+    fn download_f32(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
+        let bytes = download_raw(gpu, t);
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     // ═══════════════════════════ DeltaNet component ════════════════════════
@@ -1454,6 +1991,15 @@ mod dn {
         }
         println!("\n### KV write: negative control (candidate arm only) ###");
         test_kv_write_negative_control(&mut gpu);
+
+        println!(
+            "\n### KV write PAGED (SP4 paged block tables): golden across page boundaries ###"
+        );
+        test_kv_write_paged_golden(&mut gpu);
+        println!("\n### KV write PAGED: cross-slot isolation over scattered pages ###");
+        test_kv_write_paged_isolation(&mut gpu);
+        println!("\n### KV write PAGED: attention read path vs gathered-legacy arm ###");
+        test_attn_paged_matches_legacy(&mut gpu);
 
         println!("\n### DeltaNet (SP2 Task 4): golden equivalence, slots 1..=8 ###");
         for n in 1..=DN_MAX_SLOTS {

@@ -101,7 +101,7 @@ ss -ltn 2>/dev/null | grep -q ":$PORT " || {
   tail -20 "$WORK/serve.log" >&2
   fail "server never listened on $PORT"
 }
-grep -q "multi-slot backend up" "$WORK/serve.log" || {
+grep -q "experimental multi-slot mode" "$WORK/serve.log" || {
   tail -20 "$WORK/serve.log" >&2
   fail "multi-slot backend did not start — serve.multi_slot was not honoured"
 }

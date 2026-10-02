@@ -8,7 +8,7 @@
 - Compact runtime snapshots: `hipfire_runtime::config::RuntimeConfig` and
   `rdna_compute::feature_flags::FeatureFlags`
 
-**Last checked:** 2026-07-21.
+**Last checked:** 2026-09-05.
 
 Persistent stores under `~/.hipfire/`:
 
@@ -61,9 +61,10 @@ Process and diagnostic keys are global-only. `hipfire config <model> set ...`
 rejects them because the daemon snapshots these values once; claiming a
 per-model override inside a long-lived serve process would be misleading.
 
-This page is the normative **key/default/enum** table. CASK/TriAttention and
-PFlash are experimental opt-ins; multi-GPU topology lives in its linked owner
-rather than a duplicated matrix here.
+This page is the normative **key/default/enum** table. CASK/TriAttention is
+deprecated (removal in 0.5.0) and PFlash is retained legacy research (see their
+sections); multi-GPU topology
+lives in its linked owner rather than a duplicated matrix here.
 
 ---
 
@@ -278,7 +279,7 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `fp8`, `bf16` (family-dependent) |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); legacy spellings `asym4`, `asym3`, `asym2`, `turbo`, `turbo4`, `turbo3`, `turbo2` (family-dependent; see below) |
 | `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
@@ -299,9 +300,28 @@ pair; see the native override refusal below.
 - `fwht2` \| `fwht3` \| `fwht4` → signed FWHT K at that bit width
 - `asym2` \| `asym3` \| `asym4` and `turbo` \| `turbo2` \| `turbo3` \| `turbo4`
   → **FWHT** K (`turbo` ≡ `fwht3`, `turboN`/`asymN` ≡ `fwhtN`). These are
-  not the old Givens-Asym constructors.
+  legacy spellings kept as aliases; they do not build the old Givens-Asym
+  constructors. **Deprecated since 0.4.0, removal in 0.5.0**: spell `fwhtN`.
 - `legacy-asym2` \| `legacy-asym3` \| `legacy-asym4` → old Givens-Asym K
-  (explicit rollback spelling)
+  (**legacy**; explicit rollback spelling, `--kv-k` / `memory.kv_k` only —
+  `memory.kv_cache` does not accept it). **Deprecated since 0.4.0, removal in
+  0.5.0**: fwht3 supersedes Givens asym KV.
+
+Naming any deprecated KV value at load prints one line:
+`[hipfire-daemon] warning: KV name '<name>' is deprecated and will be removed in 0.5.0 (…; use fwhtN or q8)`.
+
+`fwht3` (and `fwht2`/`fwht4`) is an optional **headroom** mode on the
+Qwen3.5-family sites of every arch: it shrinks K to trade quality for
+context/VRAM. No default selects it (only the developer kill switch below).
+
+Qwen3 dense (flat constructor) accepts only `q8` K plus `legacy-asym3` /
+`legacy-asym4` at head_dim 256; bare `asymN`/`turboN`/`fwhtN` are refused.
+Outside Qwen, the llama-family **HFQ** loader keeps the pre-migration alias
+table: bare `asym3`/`asym4`/`turbo4` still build the legacy Givens
+constructors, while `asym2`/`turbo2`/`turbo`/`turbo3`/`fwhtN` are unsupported
+and fall back to `q8` with a warning. The llama **Dir** loader reads names
+through the Qwen table, so bare `asymN`/`turboN` mean FWHT there and fall back
+to `q8` with a warning. Those llama spellings are deprecated the same way.
 
 **Qwen V names:** `q8`, `lloyd2`, `lloyd3`, `lloyd4`. Lloyd V **requires**
 FWHT K (including `asymN`/`turboN` aliases that resolve to FWHT). Lloyd V
@@ -321,23 +341,49 @@ FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
 **before** destructive teardown with requested/effective values and
 supported alternatives. No silent fallback on unsupported Qwen sites.
 
-**Resolution of `auto` / unset (Qwen family):** Q8/Q8 on every route
-(HFQ, PaRo, PP, Dir) except exact **gfx1201** eligible single-GPU sites
-whose accepted set includes native FP8, which select FP8/FP8. Qwen PP/Dir
-without an FP8 constructor stay Q8/Q8. gfx1200 / gfx11 / gfx94x never
-inherit FP8. Registry Qwen cards leave mode as `auto` (no q8 pin).
+**Resolution of `auto` / unset (Qwen family):** native **fp8** (one K+V
+layout) on exact **gfx1201** when the load is native-eligible: attention
+geometry H24 / Hkv4 / D256, single GPU (`pp = tp = 1`), no `kv_adaptive`,
+no CASK sidecar. Every other Qwen load resolves **q8/q8**: gfx1100, gfx1151
+and every other arch; gfx1201 with a different geometry, with adaptive or
+CASK, or on PP / dense TP / MoE EP (those policies have no native
+constructor); and Qwen3 dense (flat constructor). gfx1200 / gfx11 / gfx94x
+never inherit fp8. Registry Qwen cards leave mode as `auto` (a registry
+`default_kv_mode = "q8"` is not lowered into config).
 
 **Non-Qwen families are unchanged:** Maple keeps BF16/BF16 (registry and
 direct-path auto; explicit `--kv-mode q8` still works). Gemma4 eager stays
-Q8/Q8; lowered stays sliding Q8 / full Asym3+Q8. DeepSeek4 keeps its F32
+Q8/Q8; lowered hard-codes sliding Q8 plus a full-attention tier in legacy
+Givens Asym3 + Q8 V and ignores `kv_cache`. DeepSeek4 keeps its F32
 compressor default (or explicit F16); V is not independently selectable
-there. Other carriers keep their existing site policy.
+there. Other carriers keep their existing site policy (llama, MiniMax and
+LFM2-MoE resolve `auto` to q8).
 
-**Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` restores the prior
-*implicit Qwen* per-site default (HFQ/PaRo auto distinctions). Default is
-ON (Q8/Q8). It must not override any authored CLI/config mode or K/V, must
-not touch the exact eligible gfx1201 FP8 path, and must not affect
-non-Qwen families.
+**Qwen3.8-Flash-Next / Qwen4 (arch 16)** has its own table: `kv_cache`
+sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
+recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
+arch, `fp32` through the `state_quant` load parameter.
+
+| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other arches |
+|---|---|---|
+| `auto` / unset | `fp8` | `bf16` |
+| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same |
+| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused |
+| anything else (`q8`, `fwhtN`, `f16`, …) | refused | refused |
+
+`auto` picks fp8 only on exact gfx1201 and only for a head geometry the
+kernels implement (head_dim 256, even KV-head count; Flash-Next qualifies);
+otherwise it stays `bf16`. The native MTP layer keeps the exact state. On
+Flash-Next, fp8 cuts each trunk QSA layer's context state from 4,736 to
+1,352 bytes per token, and the Q8 GDN state is 3.88× smaller than F32;
+`memory.max_seq` goes up to the native 262,144.
+
+**Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
+the prior *implicit Qwen* per-site default wherever `auto` does not pick
+native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V, PaRo `auto` → FWHT3/Q8,
+PaRo unset → Q8/Q8, other sites Q8/Q8. Default is ON (Q8/Q8). It must not
+override any authored CLI/config mode or K/V, must not touch the eligible
+gfx1201 fp8 path, and must not affect non-Qwen families.
 
 **Precedence** (each key independently — mode, K, V, backend):
 
@@ -382,7 +428,7 @@ capacity; the preflight weight projection never caps the effective context.
 Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
 divides that remaining memory by the selected K+V token stride. VMM reserves
 virtual space to `max_seq` and maps physical pages on demand; without eviction,
-`physical_cap == max_seq`, while CASK can make `physical_cap < max_seq`.
+`physical_cap == max_seq`, while deprecated CASK eviction can make `physical_cap < max_seq`.
 Larger prefill PBS allocations are lazy: each request chooses the widest rung
 that fits currently free VRAM after mapped (not virtually reserved) KV. When
 future KV growth needs the memory, widened PBS reuse is released between
@@ -402,7 +448,7 @@ and never silently falls back (refusal may suggest `--kv-backend legacy`).
 
 Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
 matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
-legacy service with a logged reason. Adaptive→CASK handoff **requires**
+legacy service with a logged reason. The deprecated adaptive→CASK handoff **requires**
 VMM: if VMM is unavailable that combination is refused rather than handed off as
 invalid legacy. Private speculative draft caches (DFlash/MTP) are owned
 separately from the trunk KV backend and do not relabel it; their actual backend
@@ -449,7 +495,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 |---|---|---|---|
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
-| `dflash_adaptive_b` | `true` | bool | Adaptive draft block size. |
+| `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads; `HIPFIRE_DFLASH_ADAPTIVE_B=0` forces fixed. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |
@@ -500,7 +546,16 @@ compatibility overrides.
 
 ---
 
-## CASK / TriAttention eviction
+## CASK / TriAttention eviction (deprecated, removal in 0.5.0)
+
+CASK / TriAttention KV eviction (including FlashCASK under DFlash) is
+deprecated since 0.4.0 and will be removed in 0.5.0. The keys below still
+load, but the path is **not supported**, not a recommended setting, and not an
+acceptance route. Every load that sets `cask_sidecar` or `cask=true` prints one
+warning line:
+`[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported`.
+All defaults leave it off, and a downloaded `.triattn*.bin` sidecar never
+attaches unless `cask_sidecar` or `cask_auto_attach=true` is set.
 
 | Key | Default | Range |
 |---|---|---|
@@ -508,17 +563,12 @@ compatibility overrides.
 | `cask` | `false` | bool (m-fold vs plain drop) |
 | `cask_budget` | `512` | int 64–65536 |
 | `cask_beta` | `128` | int 0–65536 |
+| `cask_handoff_tokens` | `0` | int 0–1048576 |
 | `cask_core_frac` | `0.5` | number 0.0–1.0 |
 | `cask_fold_m` | `2` | int 1–16 |
 | `cask_auto_attach` | `false` | bool |
 
-Developer escapes use `[developer] cask_off = true` and
-`force_a3b_eviction = true`; the old names remain one-shot aliases.
-
-TriAttention and CASK are experimental, opt-in features. A downloaded sidecar
-does not attach by default. To experiment, set `cask_sidecar` explicitly or set
-`cask_auto_attach=true`; set `cask=true` only when core-aware m-folding is also
-intended. Sidecar generation: `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
+Sidecar generation (deprecated with CASK): `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
 
 ---
 
@@ -533,7 +583,7 @@ Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 
 ---
 
-## PFlash speculative prefill (experimental)
+## PFlash speculative prefill (deprecated, removal in 0.5.0)
 
 | Key | Default | Range / values |
 |---|---|---|
@@ -549,6 +599,11 @@ Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 | `prefill_drafter_device` | `-1` | int −1–15 (`-1` = same device as target) |
 | `prefill_profile` | `false` | bool |
 | `prefill_sparse_threshold` | `32768` | int 0–1048576 |
+
+**Status:** deprecated since 0.4.0, removal in 0.5.0; not supported. Prefix
+caching supersedes it. Setting `prefill_compression` to anything but `off`
+prints one line at load:
+`[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression=<mode> set at load)`.
 
 Off by default. Typed fields cover product PFlash policy; remaining experiments
 live under `[developer]` and retain matching `HIPFIRE_PREFILL_*` one-shot
@@ -571,8 +626,15 @@ runtime PFlash module — not restated here.
 | `serve_queue_timeout_ms` | `600000` (10 min) | int 0–3600000 (`0` = no wait timeout). Serve runs one generation at a time by default, so this must cover a full generation. |
 | `serve.allow_request_pull` | `false` | bool. Let a chat request that names a registry model not on disk download it; off → 404 "run `hipfire pull`". Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PULL`. |
 | `serve.allow_request_paths` | `false` | bool. Let a chat request load any readable file it names; off → only installed models (models directory, catalog paths, the pre-warm model). Env: `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS`. |
+| `serve.max_queue_bytes` | `268435456` | int 1–1TiB. Multi-slot route: total request bytes allowed to wait in the admission queue |
+| `serve.max_batch_tokens` | `4096` | int 1–1048576 (global trunk-row budget) |
+| `serve.prefill_min_tokens` | `1` | int 1–1048576 (prefill quantum) |
+| `serve.prefix_cache` | `false` | bool — experimental; off until route admission |
+| `serve.prefix_cache_max_bytes` | `0` | int 0–1TiB (0 = no retained cache) |
+| `serve.structured_jump_forward` | `false` | bool — experimental |
+| `serve.stream_stall_timeout_ms` | `30000` | int 0–3600000. Multi-slot route: a streaming client that leaves its response channel full (or a final frame unflushed) this long is aborted and its queue permit released |
 | `experimental_budget_alert` | `false` | bool |
-| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
+| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. Needs `memory.kv_cache = "q8"` set explicitly: the slot engine refuses every other value, including the default `auto`. Concurrent requests can produce different greedy text than serial requests at ≥4 slots; output is deterministic for a fixed batch composition. 2 slots matched serial in earlier testing; on 35B-A3B MoE checkpoints, 2 slots also diverged from serial on 1–4 of 4 prompts. A pre-warm that fails (for example, slot-engine allocations that do not fit beside another process on the card) exits serve with the load error rather than serving lazily ([`SERVE.md`](SERVE.md) § Lifecycle). |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |
 | `serve.multi_slot_ctx` | `8192` | int 512–1048576 per-slot context capacity (tokens). |
 | `serve.multi_slot_prefill_chunk` | `1024` | int 1–1048576. Prefill tokens taken from one slot per multi-slot step; batch scratch is sized `n_slots ×` this. Env: `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK`. |
@@ -727,6 +789,303 @@ Note: CLI `ddtree_budget` default is `0` while bare `RuntimeConfig` default is `
 Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus Qwen3.5 dense (`qwen3_5`) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
+
+## Lifecycle status
+
+Every schema key carries one lifecycle status. The table is generated from
+`crates/hipfire-config/src/lib.rs` by `scripts/check-lifecycle.py --write`, and
+`scripts/no-gpu-ci.sh` fails when it drifts. The status is `deprecated` when the
+field carries `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`,
+otherwise `experimental` or `stable` from the schema's `experimental` flag.
+Deprecated keys still load in 0.4.0 and warn once when they switch a deprecated
+feature on; their defaults are inert, so default configs never reach
+deprecated code. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-status).
+
+Deprecated since 0.4.0, removal in 0.5.0:
+
+- `memory.cask.*` (CASK / TriAttention eviction).
+- `speculation.prefill.*` and `diagnostic.pflash.score_layer` (PFlash; prefix caching supersedes it).
+- KV **values** `asym2|asym3|asym4`, `turbo|turbo2|turbo3|turbo4` (`kv_cache`, `kv_k`) and `legacy-asym2|3|4` (`kv_k`): Givens asym KV and its aliases; use `fwhtN` or `q8`.
+
+<!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
+
+**Count:** 270 schema keys, plus the `developer.<name>` namespace.
+
+| Key | Legacy key | Env | Lifecycle |
+|---|---|---|---|
+| `attention.ck_runtime_lib` | `ck_runtime_lib` | `HIPFIRE_FLASH_ATTN_CK_LIB` | experimental |
+| `attention.ck_workspace_bytes` | `ck_workspace_bytes` | `HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES` | experimental |
+| `attention.flash` | `flash_mode` | `HIPFIRE_ATTN_FLASH` | stable |
+| `diagnostic.blob_force` | `blob_force` | `HIPFIRE_BLOB_FORCE` | experimental |
+| `diagnostic.compiler.hipcc_extra_flags` | `hipcc_extra_flags` | `HIPFIRE_HIPCC_EXTRA_FLAGS` | experimental |
+| `diagnostic.compiler.no_device_compiler` | `no_device_compiler` | `HIPFIRE_NO_DEVICE_COMPILER` | experimental |
+| `diagnostic.draft_gemm_dump` | `draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | experimental |
+| `diagnostic.draft_subphase` | `draft_subphase` | `HIPFIRE_DRAFT_SUBPHASE` | experimental |
+| `diagnostic.gemm_dump` | `gemm_dump` | `HIPFIRE_GEMM_DUMP` | experimental |
+| `diagnostic.kernel.ddtree_logw_cutoff` | `ddtree_logw_cutoff` | `HIPFIRE_DDTREE_LOGW_CUTOFF` | experimental |
+| `diagnostic.kernel.fp16_layer_max` | `fp16_layer_max` | `HIPFIRE_FP16_LAYER_MAX` | experimental |
+| `diagnostic.kernel.fp16_layer_min` | `fp16_layer_min` | `HIPFIRE_FP16_LAYER_MIN` | experimental |
+| `diagnostic.kernel.gate_up_variant` | `gate_up_variant` | `HIPFIRE_GATE_UP_VARIANT` | experimental |
+| `diagnostic.kernel.gemv_rows` | `gemv_rows` | `HIPFIRE_GEMV_ROWS` | experimental |
+| `diagnostic.kernel.gfx11_weight_load_policy` | `gfx11_weight_load_policy` | `HIPFIRE_GFX11_WEIGHT_LOAD_POLICY` | experimental |
+| `diagnostic.kernel.gfx12_weight_load_policy` | `gfx12_weight_load_policy` | `HIPFIRE_GFX12_WEIGHT_LOAD_POLICY` | experimental |
+| `diagnostic.kernel.gfx942_mfma_prefill` | `gfx942_mfma_prefill` | `HIPFIRE_GFX942_MFMA_PREFILL` | experimental |
+| `diagnostic.kernel.hfq3_mmq_layer_max` | `hfq3_mmq_layer_max` | `HIPFIRE_HFQ3_MMQ_LAYER_MAX` | experimental |
+| `diagnostic.kernel.hfq3_mmq_layer_min` | `hfq3_mmq_layer_min` | `HIPFIRE_HFQ3_MMQ_LAYER_MIN` | experimental |
+| `diagnostic.kernel.lloyd_mb4` | `lloyd_mb4` | `HIPFIRE_LLOYD_MB4` | experimental |
+| `diagnostic.kernel.mmq_min_batch` | `mmq_min_batch` | `HIPFIRE_MMQ_MIN_BATCH` | experimental |
+| `diagnostic.kernel.mq3_mb4` | `mq3_mb4` | `HIPFIRE_MQ3_MB4` | experimental |
+| `diagnostic.kernel.rdna2_variant` | `rdna2_variant` | `HIPFIRE_RDNA2_VARIANT` | experimental |
+| `diagnostic.kernel.rocblas_min_batch` | `rocblas_min_batch` | `HIPFIRE_ROCBLAS_MIN_BATCH` | experimental |
+| `diagnostic.kernel.wo_wmma_variant` | `wo_wmma_variant` | `HIPFIRE_WO_WMMA_VARIANT` | experimental |
+| `diagnostic.mmq_quantize_only` | `mmq_diag_quantize_only` | `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` | experimental |
+| `diagnostic.pflash.score_layer` | `pflash_score_layer` | `HIPFIRE_PFLASH_SCORE_LAYER` | deprecated |
+| `diagnostic.prompt_heat_json` | `prompt_heat_json` | `HIPFIRE_PROMPT_HEAT_JSON` | experimental |
+| `diagnostic.prompt_heat_limit` | `prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | experimental |
+| `diagnostic.prompt_token_heat` | `prompt_token_heat` | `HIPFIRE_PROMPT_TOKEN_HEAT` | experimental |
+| `diagnostic.qkv_bias` | `fuse_qkv_bias_debug` | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | experimental |
+| `diagnostic.replay.dispatch_profile` | `replay_dispatch_profile` | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | experimental |
+| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | `HIPFIRE_GFX1151_REDLINE_CU_COUNT` | experimental |
+| `diagnostic.replay.gfx1151_entry_acquire` | `gfx1151_pm4_entry_acquire` | `HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE` | experimental |
+| `diagnostic.replay.gfx1151_initiator` | `gfx1151_pm4_initiator` | `HIPFIRE_GFX1151_PM4_INITIATOR` | experimental |
+| `diagnostic.replay.gfx1151_interleave` | `gfx1151_pm4_interleave` | `HIPFIRE_GFX1151_PM4_INTERLEAVE` | experimental |
+| `diagnostic.replay.gfx1151_resource_limits` | `gfx1151_pm4_resource_limits` | `HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS` | experimental |
+| `diagnostic.replay.manual_capture` | `replay_manual_capture` | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | experimental |
+| `diagnostic.replay.pm4_acquire_policy` | `replay_pm4_acquire_policy` | `HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY` | experimental |
+| `diagnostic.replay.pm4_dynamic_grid` | `replay_pm4_dynamic_grid` | `HIPFIRE_REPLAY_PM4_DYNAMIC_GRID` | experimental |
+| `diagnostic.replay.pm4_gcr_trim` | `replay_pm4_gcr_trim` | `HIPFIRE_REPLAY_PM4_GCR_TRIM` | experimental |
+| `diagnostic.replay.pm4_kernarg_pool` | `replay_pm4_kernarg_pool` | `HIPFIRE_PM4_KERNARG_POOL` | experimental |
+| `diagnostic.replay.pm4_max_parallel_phases` | `replay_pm4_max_parallel_phases` | `HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES` | experimental |
+| `diagnostic.replay.pm4_min_parallel_width` | `replay_pm4_min_parallel_width` | `HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH` | experimental |
+| `diagnostic.replay.pm4_min_parallel_workgroups` | `replay_pm4_min_parallel_workgroups` | `HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WORKGROUPS` | experimental |
+| `diagnostic.replay.pm4_native_phases` | `replay_pm4_native_phases` | `HIPFIRE_REPLAY_PM4_NATIVE_PHASES` | experimental |
+| `diagnostic.replay.pm4_queues` | `replay_pm4_queues` | `HIPFIRE_REPLAY_PM4_QUEUES` | experimental |
+| `diagnostic.replay.pm4_register_policy` | `replay_pm4_stateful` | `HIPFIRE_REPLAY_PM4_STATEFUL` | experimental |
+| `diagnostic.replay.pm4_wait_policy` | `replay_pm4_wait_policy` | `HIPFIRE_REPLAY_PM4_WAIT_POLICY` | experimental |
+| `diagnostic.replay.pool_debug` | `replay_pool_debug` | `HIPFIRE_REDLINE_POOL_DEBUG` | experimental |
+| `diagnostic.replay.route_proof_log` | `replay_route_proof_log` | `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | experimental |
+| `experimental.budget_alert` | `experimental_budget_alert` | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | experimental |
+| `experimental.graph.ar` | `graph_ar` | `HIPFIRE_AR_GRAPH` | experimental |
+| `experimental.graph.forward` | `graph_forward` | `HIPFIRE_GRAPH` | experimental |
+| `experimental.graph.moe` | `graph_moe` | `HIPFIRE_GRAPH_MOE` | experimental |
+| `fusions.force_unfused` | `force_unfused` | `HIPFIRE_FORCE_UNFUSED` | experimental |
+| `fusions.policy` | `fusion_policy` |  | stable |
+| `fusions.qkv_bias` | `fuse_qkv_bias` | `HIPFIRE_FUSE_QKV_BIAS` | stable |
+| `generation.loop_guard_threshold` | `ngram_loop_threshold` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | stable |
+| `generation.loop_guard_window` | `ngram_window` | `HIPFIRE_NGRAM_WINDOW` | stable |
+| `generation.max_tokens` | `max_tokens` |  | stable |
+| `generation.min_p` | `min_p` |  | stable |
+| `generation.presence_penalty` | `presence_penalty` |  | stable |
+| `generation.repeat_penalty` | `repeat_penalty` |  | stable |
+| `generation.temperature` | `temperature` |  | stable |
+| `generation.top_k` | `top_k` |  | stable |
+| `generation.top_p` | `top_p` |  | stable |
+| `hardware.allow_mixed_arch` | `allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | stable |
+| `hardware.deepseek4_compute_placement` | `deepseek4_compute_placement` |  | stable |
+| `hardware.devices` | `devices` | `HIPFIRE_DEVICES` | stable |
+| `hardware.tp_use_rccl` | `tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` | stable |
+| `hardware.uniform_vram_tolerance_gb` | `uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | stable |
+| `image.decode` | `image_decode` | `HIPFIRE_IMAGE_DECODE` | stable |
+| `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
+| `kernel.attn_qresident_v2` | `attn_qresident_v2` | `HIPFIRE_ATTN_QRESIDENT_V2` | stable |
+| `kernel.calib_force_bf16` | `calib_force_bf16` | `HIPFIRE_CALIB_BF16` | experimental |
+| `kernel.deepseek4_q8_4w` | `deepseek4_q8_4w` | `HIPFIRE_DEEPSEEK4_Q8_4W` | stable |
+| `kernel.deepseek4_q8_wmma` | `deepseek4_q8_wmma` | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | stable |
+| `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
+| `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
+| `kernel.flash_partials_batch` | `flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` | experimental |
+| `kernel.fp16` | `fp16` | `HIPFIRE_FP16` | stable |
+| `kernel.fp8_wmma` | `fp8_wmma` | `HIPFIRE_FP8_WMMA` | experimental |
+| `kernel.g12_a4c2` | `g12_a4c2` | `HIPFIRE_G12_A4C2` | stable |
+| `kernel.g12_dec_norm` | `g12_dec_norm` | `HIPFIRE_G12_DEC_NORM` | stable |
+| `kernel.g12_norm` | `g12_norm` | `HIPFIRE_G12_NORM` | stable |
+| `kernel.gate_up_nosync` | `gate_up_nosync` | `HIPFIRE_GATE_UP_NOSYNC` | experimental |
+| `kernel.gcn5_wave64_hybrid` | `gcn5_wave64_hybrid` | `HIPFIRE_GCN5_WAVE64_HYBRID` | experimental |
+| `kernel.gemma4_batched_embedding_prefill` | `gemma4_batched_embedding_prefill` | `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL` | experimental |
+| `kernel.gemma4_ple_activation_fused_prefill` | `gemma4_ple_activation_fused_prefill` | `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL` | experimental |
+| `kernel.gemma4_ple_batched_prefill` | `gemma4_ple_batched_prefill` | `HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL` | experimental |
+| `kernel.gemma4_ple_branch_batched_prefill` | `gemma4_ple_branch_batched_prefill` | `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL` | experimental |
+| `kernel.gemma4_q8_fused_prefill` | `gemma4_q8_fused_prefill` | `HIPFIRE_GEMMA4_Q8_FUSED_PREFILL` | experimental |
+| `kernel.gemv_dp4a` | `gemv_dp4a` | `HIPFIRE_GEMV_DP4A` | stable |
+| `kernel.gemv_prefetch` | `gemv_prefetch` | `HIPFIRE_GEMV_PREFETCH` | stable |
+| `kernel.gfx1100_dec_norm` | `gfx1100_dec_norm` | `HIPFIRE_GFX1100_DEC_NORM` | stable |
+| `kernel.gfx11_a4_candidates` | `gfx11_a4_candidates` | `HIPFIRE_GFX11_A4_CANDIDATES` | experimental |
+| `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
+| `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
+| `kernel.gfx11_iu4_shape` | `gfx11_iu4_shape` | `HIPFIRE_GFX11_IU4_SHAPE` | experimental |
+| `kernel.gfx11_iu4_symfold` | `gfx11_iu4_symfold` | `HIPFIRE_IU4_SYMFOLD` | experimental |
+| `kernel.gfx11_lean_pbs` | `gfx11_lean_pbs` | `HIPFIRE_GFX11_LEAN_PBS` | experimental |
+| `kernel.gfx11_producer_quant_fused` | `gfx11_producer_quant_fused` | `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` | stable |
+| `kernel.gfx11_q8_fa2_wide` | `gfx11_q8_fa2_wide` | `HIPFIRE_GFX11_Q8_FA2_WIDE` | experimental |
+| `kernel.gfx12_fa2_prefill` | `gfx12_fa2_prefill` | `HIPFIRE_GFX12_FA2_PREFILL` | stable |
+| `kernel.gfx12_fa_packet` | `gfx12_fa_packet` | `HIPFIRE_GFX12_FA_PACKET` | stable |
+| `kernel.gfx12_fa_prep_fp8q` | `gfx12_fa_prep_fp8q` | `HIPFIRE_GFX12_FA_PREP_FP8Q` | stable |
+| `kernel.gfx12_fa_prep_fused` | `gfx12_fa_prep_fused` | `HIPFIRE_GFX12_FA_PREP_FUSED` | stable |
+| `kernel.gfx12_fp8_stream` | `gfx12_fp8_stream` | `HIPFIRE_GFX12_FP8_STREAM` | stable |
+| `kernel.gfx12_gdn_chunk_scan` | `gfx12_gdn_chunk_scan` | `HIPFIRE_GFX12_GDN_CHUNK_SCAN` | stable |
+| `kernel.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | `HIPFIRE_GFX12_GDN_PRE_FUSED` | stable |
+| `kernel.gfx12_mq4v2_fp8_gateup` | `gfx12_mq4v2_fp8_gateup` | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | stable |
+| `kernel.gfx12_mq4v2_fp8_qkv` | `gfx12_mq4v2_fp8_qkv` | `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | stable |
+| `kernel.gfx12_mq4v2_fp8_qkvza` | `gfx12_mq4v2_fp8_qkvza` | `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA` | stable |
+| `kernel.gfx12_mq4v2_fp8_resid` | `gfx12_mq4v2_fp8_resid` | `HIPFIRE_GFX12_MQ4V2_FP8_RESID` | stable |
+| `kernel.gfx12_mq4v2_fp8_v2` | `gfx12_mq4v2_fp8_v2` | `HIPFIRE_GFX12_MQ4V2_FP8_V2` | stable |
+| `kernel.gfx12_producer_quant_fused` | `gfx12_producer_quant_fused` | `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` | stable |
+| `kernel.gfx12_silu_quant_fused` | `gfx12_silu_quant_fused` | `HIPFIRE_GFX12_SILU_QUANT_FUSED` | stable |
+| `kernel.gfx942_gemv_v2` | `gfx942_gemv_v2` | `HIPFIRE_GFX942_GEMV_V2` | experimental |
+| `kernel.gfx942_gemv_v3` | `gfx942_gemv_v3` | `HIPFIRE_GFX942_GEMV_V3` | experimental |
+| `kernel.gfx942_lds_gemv` | `gfx942_lds_gemv` | `HIPFIRE_GFX942_LDS_GEMV` | experimental |
+| `kernel.gfx942_rmsnorm_split` | `gfx942_rmsnorm_split` | `HIPFIRE_GFX942_RMSNORM_SPLIT` | experimental |
+| `kernel.hfq3_dp4a` | `hfq3_dp4a` | `HIPFIRE_HFQ3_DP4A` | experimental |
+| `kernel.hfq3_mmq` | `hfq3_mmq` | `HIPFIRE_HFQ3_MMQ` | experimental |
+| `kernel.hfq4_mmq_gfx906_y64` | `hfq4_mmq_gfx906_y64` | `HIPFIRE_HFQ4_MMQ_GFX906_Y64` | experimental |
+| `kernel.hfq4_mmq_rdna2` | `hfq4_mmq_rdna2` | `HIPFIRE_HFQ4_MMQ_RDNA2` | experimental |
+| `kernel.hfq4g128_mmq` | `hfq4g128_mmq` | `HIPFIRE_HFQ4G128_MMQ` | stable |
+| `kernel.iu4_prefill` | `iu4_prefill` | `HIPFIRE_IU4_PREFILL` | stable |
+| `kernel.lloyd_force_baseline` | `lloyd_force_baseline` | `HIPFIRE_LLOYD_FORCE_BASELINE` | experimental |
+| `kernel.lm_head_f16` | `lm_head_f16` | `HIPFIRE_LM_HEAD_F16` | stable |
+| `kernel.lm_head_overwrite` | `lm_head_overwrite` | `HIPFIRE_LM_HEAD_OVERWRITE` | experimental |
+| `kernel.lm_head_wmma` | `lm_head_wmma` | `HIPFIRE_LM_HEAD_WMMA` | stable |
+| `kernel.mmq` | `mmq` | `HIPFIRE_MMQ` | stable |
+| `kernel.moe_down_combine_vec4` | `moe_down_combine_vec4` | `HIPFIRE_MOE_DOWN_COMBINE_VEC4` | experimental |
+| `kernel.moe_grouped_4w` | `moe_grouped_4w` | `HIPFIRE_MOE_GROUPED_4W` | experimental |
+| `kernel.moe_grouped_gemm` | `moe_grouped_gemm` | `HIPFIRE_MOE_GROUPED_GEMM` | stable |
+| `kernel.moe_grouped_i8` | `moe_grouped_i8` | `HIPFIRE_MOE_GROUPED_I8` | experimental |
+| `kernel.moe_grouped_i8_k4` | `moe_grouped_i8_k4` | `HIPFIRE_MOE_GROUPED_I8_K4` | experimental |
+| `kernel.moe_grouped_i8_k4_gfx12` | `moe_grouped_i8_k4_gfx12` | `HIPFIRE_MOE_GROUPED_I8_K4_GFX12` | experimental |
+| `kernel.moe_grouped_i8_k8` | `moe_grouped_i8_k8` | `HIPFIRE_MOE_GROUPED_I8_K8` | experimental |
+| `kernel.moe_grouped_m2` | `moe_grouped_m2` | `HIPFIRE_MOE_GROUPED_M2` | experimental |
+| `kernel.moe_hfq6_i8` | `moe_hfq6_i8` | `HIPFIRE_MOE_HFQ6_I8` | experimental |
+| `kernel.moe_hfq6_v2` | `moe_hfq6_v2` | `HIPFIRE_MOE_HFQ6_V2` | experimental |
+| `kernel.moe_paro_i8` | `moe_paro_i8` | `HIPFIRE_MOE_PARO_I8` | experimental |
+| `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | `HIPFIRE_MOE_PARO_I8_K8` | experimental |
+| `kernel.mw16` | `mw16` | `HIPFIRE_MW16` | experimental |
+| `kernel.npu_spillover` | `npu_spillover` | `HIPFIRE_NPU_SPILLOVER` | experimental |
+| `kernel.prefill_batched` | `prefill_batched` | `HIPFIRE_PREFILL_BATCHED` | stable |
+| `kernel.q8_batched_legacy` | `q8_batched_legacy` | `HIPFIRE_Q8_BATCHED_LEGACY` | experimental |
+| `kernel.qkvza_split_tail` | `qkvza_split_tail` | `HIPFIRE_QKVZA_SPLIT_TAIL` | experimental |
+| `kernel.rdna3_hfq4_lm_head_k2048` | `rdna3_hfq4_lm_head_k2048` | `HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048` | experimental |
+| `kernel.rdna3_hfq4_moe_gate_up_k2048` | `rdna3_hfq4_moe_gate_up_k2048` | `HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048` | experimental |
+| `kernel.rdna3_hfq4_qkv_wave64` | `rdna3_hfq4_qkv_wave64` | `HIPFIRE_RDNA3_HFQ4_QKV_WAVE64` | experimental |
+| `kernel.rdna3_hfq4_qkvza_2wave` | `rdna3_hfq4_qkvza_2wave` | `HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE` | experimental |
+| `kernel.rdna3_hfq4_qkvza_hoist_x32` | `rdna3_hfq4_qkvza_hoist_x32` | `HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32` | experimental |
+| `kernel.rdna3_hfq4_qkvza_k2048` | `rdna3_hfq4_qkvza_k2048` | `HIPFIRE_RDNA3_HFQ4_QKVZA_K2048` | experimental |
+| `kernel.rdna3_hfq4_qkvza_ldsx8` | `rdna3_hfq4_qkvza_ldsx8` | `HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8` | experimental |
+| `kernel.rdna3_hfq4_qkvza_reduce_chain` | `rdna3_hfq4_qkvza_reduce_chain` | `HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN` | experimental |
+| `kernel.rdna3_hfq4_qkvza_wavepack4` | `rdna3_hfq4_qkvza_wavepack4` | `HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4` | experimental |
+| `kernel.rdna3_hfq4_residual_k2048` | `rdna3_hfq4_residual_k2048` | `HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048` | experimental |
+| `kernel.rdna3_hfq4_residual_stage_x32` | `rdna3_hfq4_residual_stage_x32` | `HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32` | experimental |
+| `kernel.rdna3_hfq4_sigmoid_buffer` | `rdna3_hfq4_sigmoid_buffer` | `HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER` | experimental |
+| `kernel.rdna3_hfq4_sigmoid_rows4` | `rdna3_hfq4_sigmoid_rows4` | `HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4` | experimental |
+| `kernel.rdna3_hfq4_sigmoid_tight_grid` | `rdna3_hfq4_sigmoid_tight_grid` | `HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID` | experimental |
+| `kernel.rdna3_rmsnorm_sign_const` | `rdna3_rmsnorm_sign_const` | `HIPFIRE_RDNA3_RMSNORM_SIGN_CONST` | experimental |
+| `kernel.rdna3_rmsnorm_sign_lds` | `rdna3_rmsnorm_sign_lds` | `HIPFIRE_RDNA3_RMSNORM_SIGN_LDS` | experimental |
+| `kernel.rdna3_rmsnorm_split` | `rdna3_rmsnorm_split` | `HIPFIRE_RDNA3_RMSNORM_SPLIT` | experimental |
+| `kernel.rdna3_rmsnorm_vecsum` | `rdna3_rmsnorm_vecsum` | `HIPFIRE_RDNA3_RMSNORM_VECSUM` | experimental |
+| `kernel.rdna3_rmsnorm_wavegrid` | `rdna3_rmsnorm_wavegrid` | `HIPFIRE_RDNA3_RMSNORM_WAVEGRID` | experimental |
+| `kernel.rmsnorm_mq_tight_lds` | `rmsnorm_mq_tight_lds` | `HIPFIRE_RMSNORM_MQ_TIGHT_LDS` | experimental |
+| `kernel.rocblas_all_archs` | `rocblas_all_archs` | `HIPFIRE_ROCBLAS_ALL_ARCHS` | experimental |
+| `kernel.rocblas_off` | `rocblas_off` | `HIPFIRE_ROCBLAS_OFF` | stable |
+| `kernel.rope_interleaved_legacy` | `rope_interleaved_legacy` | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | experimental |
+| `kernel.verify_attn` | `verify_attn` | `HIPFIRE_VERIFY_ATTN` | stable |
+| `kernel.wo_mmq` | `wo_mmq` | `HIPFIRE_WO_MMQ` | experimental |
+| `memory.cask.auto_attach` | `cask_auto_attach` |  | deprecated |
+| `memory.cask.beta` | `cask_beta` |  | deprecated |
+| `memory.cask.budget` | `cask_budget` |  | deprecated |
+| `memory.cask.core_fraction` | `cask_core_frac` |  | deprecated |
+| `memory.cask.enabled` | `cask` |  | deprecated |
+| `memory.cask.fold` | `cask_fold_m` |  | deprecated |
+| `memory.cask.handoff_tokens` | `cask_handoff_tokens` |  | deprecated |
+| `memory.cask.sidecar` | `cask_sidecar` | `HIPFIRE_CASK_SIDECAR` | deprecated |
+| `memory.gpu_layer_budget` | `gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` | stable |
+| `memory.kv_adaptive` | `kv_adaptive` | `HIPFIRE_KV_ADAPTIVE` | stable |
+| `memory.kv_backend` | `kv_backend` |  | stable |
+| `memory.kv_cache` | `kv_cache` | `HIPFIRE_KV_MODE` | stable |
+| `memory.kv_k` | `kv_k` |  | stable |
+| `memory.kv_v` | `kv_v` |  | stable |
+| `memory.max_seq` | `max_seq` |  | stable |
+| `memory.mmq.screen` | `mmq_screen` | `HIPFIRE_MMQ_SCREEN` | stable |
+| `memory.mmq.screen_threshold` | `mmq_screen_threshold` | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | stable |
+| `memory.offload_exec` | `offload_exec` | `HIPFIRE_OFFLOAD_EXEC` | stable |
+| `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
+| `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
+| `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
+| `memory.unsafe_wsl_vmm_kv` | `unsafe_wsl_vmm_kv` | `HIPFIRE_UNSAFE_WSL_VMM_KV` | experimental |
+| `model.deepseek4_experts_per_token` | `deepseek4_experts_per_token` |  | stable |
+| `prefill.chunk_rows` | `prefill_chunk_rows` | `HIPFIRE_PREFILL_CHUNK_ROWS` | stable |
+| `prompt.chat_template` | `chat_template` | `HIPFIRE_CHAT_TEMPLATE_FILE` | stable |
+| `prompt.default_chatml` | `default_chatml` | `HIPFIRE_DEFAULT_CHATML` | stable |
+| `prompt.jinja_chat` | `jinja_chat` | `HIPFIRE_JINJA_CHAT` | stable |
+| `prompt.normalize` | `prompt_normalize` | `HIPFIRE_NORMALIZE_PROMPT` | stable |
+| `prompt.system` | `system_prompt` |  | stable |
+| `reasoning.budget` | `thinking_budget` |  | stable |
+| `reasoning.effort` | `reasoning_effort` |  | stable |
+| `reasoning.max_tokens` | `max_think_tokens` |  | stable |
+| `reasoning.max_total_tokens` | `max_total_think_tokens` | `HIPFIRE_MAX_TOTAL_THINK_TOKENS` | stable |
+| `reasoning.mode` | `thinking` |  | stable |
+| `replay.backend` | `replay_backend` | `HIPFIRE_REPLAY_BACKEND` | stable |
+| `replay.gfx1201_pm4_pacing` | `gfx1201_pm4_pacing` | `HIPFIRE_GFX1201_PM4_PACING` | stable |
+| `replay.pm4_gfx11_vmem_acquire` | `replay_pm4_gfx11_vmem_acquire` | `HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE` | experimental |
+| `replay.transport` | `replay_transport` | `HIPFIRE_REPLAY_TRANSPORT` | experimental |
+| `replay.unsafe_wsl_redline` | `unsafe_wsl_redline` | `HIPFIRE_UNSAFE_WSL_REDLINE` | experimental |
+| `serve.allow_request_paths` | `allow_request_paths` | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | stable |
+| `serve.allow_request_pull` | `allow_request_pull` | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | stable |
+| `serve.continuous_batch_size` | `continuous_batch_size` | `HIPFIRE_CONTINUOUS_BATCH_SIZE` | stable |
+| `serve.default_model` | `default_model` | `HIPFIRE_MODEL` | stable |
+| `serve.host` | `host` | `HIPFIRE_HOST` | stable |
+| `serve.idle_timeout_seconds` | `idle_timeout` | `HIPFIRE_IDLE_TIMEOUT` | stable |
+| `serve.local` | `local` | `HIPFIRE_LOCAL` | stable |
+| `serve.max_batch_tokens` | `max_batch_tokens` | `HIPFIRE_SERVE_MAX_BATCH_TOKENS` | experimental |
+| `serve.max_queue` | `serve_max_queue` | `HIPFIRE_SERVE_MAX_QUEUE` | stable |
+| `serve.max_queue_bytes` | `max_queue_bytes` | `HIPFIRE_SERVE_MAX_QUEUE_BYTES` | experimental |
+| `serve.max_request_bytes` | `max_request_bytes` | `HIPFIRE_MAX_REQUEST_BYTES` | stable |
+| `serve.multi_slot` | `multi_slot` | `HIPFIRE_SERVE_MULTI_SLOT` | stable |
+| `serve.multi_slot_ctx` | `multi_slot_ctx` | `HIPFIRE_SERVE_MULTI_SLOT_CTX` | stable |
+| `serve.multi_slot_prefill_chunk` | `multi_slot_prefill_chunk` | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | stable |
+| `serve.multi_slot_slots` | `multi_slot_slots` | `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` | stable |
+| `serve.port` | `port` | `HIPFIRE_PORT` | stable |
+| `serve.prefill_min_tokens` | `prefill_min_tokens` | `HIPFIRE_SERVE_PREFILL_MIN_TOKENS` | experimental |
+| `serve.prefix_cache` | `prefix_cache` | `HIPFIRE_SERVE_PREFIX_CACHE` | experimental |
+| `serve.prefix_cache_max_bytes` | `prefix_cache_max_bytes` | `HIPFIRE_SERVE_PREFIX_CACHE_MAX_BYTES` | experimental |
+| `serve.queue_timeout_ms` | `serve_queue_timeout_ms` | `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | stable |
+| `serve.retry_backoff_ms` | `retry_backoff_ms` | `HIPFIRE_SERVE_RETRY_BACKOFF_MS` | experimental |
+| `serve.retry_enabled` | `retry_enabled` | `HIPFIRE_SERVE_RETRY_ENABLED` | experimental |
+| `serve.stream_stall_timeout_ms` | `stream_stall_timeout_ms` | `HIPFIRE_SERVE_STREAM_STALL_TIMEOUT_MS` | experimental |
+| `serve.structured_jump_forward` | `structured_jump_forward` | `HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD` | experimental |
+| `speculation.ddtree_budget` | `ddtree_budget` | `HIPFIRE_DDTREE_BUDGET` | experimental |
+| `speculation.ddtree_topk` | `ddtree_topk` | `HIPFIRE_DDTREE_TOPK` | experimental |
+| `speculation.ddtree_tree_la` | `ddtree_tree_la` | `HIPFIRE_DDTREE_TREE_LA` | experimental |
+| `speculation.dflash` | `dflash_mode` | `HIPFIRE_DFLASH_MODE` | stable |
+| `speculation.dflash_adaptive_b` | `dflash_adaptive_b` |  | stable |
+| `speculation.dflash_fast_sample` | `dflash_fast_sample` | `HIPFIRE_DFLASH_FAST_SAMPLE` | experimental |
+| `speculation.dflash_ngram_block` | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` | stable |
+| `speculation.dflash_q8_lmhead_wmma` | `dflash_q8_lmhead_wmma` | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | experimental |
+| `speculation.dflash_tree` | `dflash_tree` | `HIPFIRE_DFLASH_TREE` | experimental |
+| `speculation.draft_f16` | `draft_f16` | `HIPFIRE_DRAFT_F16` | stable |
+| `speculation.dspark_confidence` | `dspark_conf_threshold` |  | experimental |
+| `speculation.mode` | `speculation` | `HIPFIRE_SPECULATION` | stable |
+| `speculation.mtp` | `mtp_mode` | `HIPFIRE_MTP_MODE` | stable |
+| `speculation.mtp_k` | `mtp_k` | `HIPFIRE_MTP_K` | stable |
+| `speculation.mtp_ngram` | `mtp_ngram` | `HIPFIRE_MTP_NGRAM` | stable |
+| `speculation.ngram` | `ngram_mode` | `HIPFIRE_NGRAM_DRAFT` | stable |
+| `speculation.ngram_k` | `ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | stable |
+| `speculation.ngram_min_count` | `ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | stable |
+| `speculation.prefill.alpha` | `prefill_alpha` |  | deprecated |
+| `speculation.prefill.block` | `prefill_block` |  | deprecated |
+| `speculation.prefill.drafter` | `prefill_drafter` |  | deprecated |
+| `speculation.prefill.drafter_device` | `prefill_drafter_device` |  | deprecated |
+| `speculation.prefill.drafter_kv` | `prefill_drafter_kv` | `HIPFIRE_PFLASH_DRAFTER_KV` | deprecated |
+| `speculation.prefill.keep_ratio` | `prefill_keep_ratio` |  | deprecated |
+| `speculation.prefill.min_keep` | `prefill_min_keep` |  | deprecated |
+| `speculation.prefill.mode` | `prefill_compression` |  | deprecated |
+| `speculation.prefill.profile` | `prefill_profile` |  | deprecated |
+| `speculation.prefill.recent` | `prefill_recent` |  | deprecated |
+| `speculation.prefill.sink` | `prefill_sink` |  | deprecated |
+| `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` |  | deprecated |
+| `speculation.prefill.threshold` | `prefill_threshold` |  | deprecated |
+| `vision.mode` | `vision_mode` | `HIPFIRE_VISION_MODE` | stable |
+| `developer.<name>` | | `HIPFIRE_<NAME>` | developer |
+
+<!-- lifecycle-table:end -->
 
 ## Related
 

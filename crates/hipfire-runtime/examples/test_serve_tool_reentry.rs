@@ -28,7 +28,7 @@ fn main() {
     use hipfire_runtime::prompt_frame::{
         continuation_suffix_tool_results, AssistantPrefix, ChatFrame,
     };
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
@@ -52,8 +52,21 @@ fn main() {
         prefill_chunk: 512,
         host_budget_bytes: 8 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-tool-reentry-swap"),
-        kv_mode: "q8".to_string(),
+        is_vl: false,
+        vl_path: None,
+        mtp_k: 0,
+        kv_mode_raw: String::new(),
         kv_backend: "legacy".to_string(),
+        prefix_cache: false,
+        prefix_cache_max_bytes: 0,
+        max_batch_tokens: 4096,
+        prefill_min_tokens: 1,
+        wait_max_count: 64,
+        wait_max_bytes: 256 * 1024 * 1024,
+        queue_timeout_ms: 30_000,
+        structured_jump_forward: false,
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("engine");
 
@@ -94,6 +107,20 @@ fn main() {
                 top_p: 1.0,
                 top_k: 0,
                 seed: 0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                min_p: 0.0,
+                visual_data: None,
+                json_schema: None,
+                started_in_think: false,
+                // Unconstrained request: OpenAI-style think semantics (an
+                // over-long think span ends at max_tokens), no canceller tag
+                // (this example never cancels a queued request).
+                think_budget: 0,
+                request_tag: 0,
+                queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");
@@ -111,7 +138,7 @@ fn main() {
                 }
                 Event::Token { .. } => {}
                 Event::Done { .. } => break,
-                Event::Rejected { reason } => panic!("rejected: {reason}"),
+                Event::Rejected { reason, .. } => panic!("rejected: {reason}"),
             }
         }
         assert_ne!(session, u64::MAX, "engine never accepted the request");

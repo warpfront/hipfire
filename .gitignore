@@ -187,3 +187,4 @@ dist_test/
 # Root-level agent scratch trees; durable evidence goes in docs/ or commit
 # messages
 /scratch-*/
+scs_suite_report.json

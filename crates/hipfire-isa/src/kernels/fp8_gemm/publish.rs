@@ -1,11 +1,12 @@
-use super::{ActScale, Builder, Spec, ds_store, op, s, so, v, vo, vload};
+use super::{ActScale, Builder, Spec, ds_store, vo, vload};
+use crate::kernels::common::{op, s, sop, v};
 
 /// Address and prefetch every fragment byte of one A slot. All four b64
 /// transactions are retained until the prior slot's WMMA readers are done.
 pub(super) fn fetch_a(b:&mut Builder,kb_offset:u32,slab:u32)->Result<(),String>{
-    so(b,format!("s_lshl_b32 s91, s85, 7"),&[91],&[85])?;
-    if kb_offset!=0 {so(b,format!("s_add_co_i32 s91, s91, {:#x}",kb_offset*128),&[91],&[91])?;}
-    if slab!=0 {so(b,format!("s_add_co_i32 s91, s91, {}",slab*64),&[91],&[91])?;}
+    sop(b,format!("s_lshl_b32 s91, s85, 7"),&[91],&[85])?;
+    if kb_offset!=0 {sop(b,format!("s_add_co_i32 s91, s91, {:#x}",kb_offset*128),&[91],&[91])?;}
+    if slab!=0 {sop(b,format!("s_add_co_i32 s91, s91, {}",slab*64),&[91],&[91])?;}
     b.clause(|b| {
         for j in 0..4 {vload(b,168+2*j,2,177,36,Some(91),j as u32*8)?;}
         Ok(())
@@ -28,16 +29,16 @@ pub(super) fn stage_a(b:&mut Builder,slot:usize,slab:u32)->Result<(),String>{
 /// The row ratio has no dependence on either A slot. Hold it in an address
 /// register unused by the K loop, then publish from there after A1 is stored.
 pub(super) fn fetch_next_ratio(b:&mut Builder,next_kb:u32)->Result<(),String>{
-    so(b,"s_add_co_i32 s92, s94, s85",&[92],&[94,85])?;
-    so(b,format!("s_add_co_i32 s92, s92, {next_kb}"),&[92],&[92])?;
-    so(b,"s_lshl_b32 s92, s92, 10",&[92],&[92])?;
+    sop(b,"s_add_co_i32 s92, s94, s85",&[92],&[94,85])?;
+    sop(b,format!("s_add_co_i32 s92, s92, {next_kb}"),&[92],&[92])?;
+    sop(b,"s_lshl_b32 s92, s92, 10",&[92],&[92])?;
     vload(b,184,1,182,40,Some(92),0)
 }
 pub(super) fn publish_next_ratios(b:&mut Builder,spec:Spec,next_kb:u32,plane:usize)->Result<(),String>{
     ds_store(b,2+plane,184,1,182,16384+plane as u32*1024)?;
     if spec.act_scale==ActScale::K128 {
-        so(b,"s_add_co_i32 s93, s85, 0",&[93],&[85])?;
-        so(b,"s_lshl_b32 s93, s93, 2",&[93],&[93])?;
+        sop(b,"s_add_co_i32 s93, s85, 0",&[93],&[85])?;
+        sop(b,"s_lshl_b32 s93, s93, 2",&[93],&[93])?;
         vload(b,168,1,183,48,Some(93),0)?;
         vload(b,169,1,183,48,Some(93),4*next_kb)?;
         // Positive powers of two: floating exponents are affine. The bit
@@ -57,9 +58,9 @@ pub(super) fn publish_next_ratios(b:&mut Builder,spec:Spec,next_kb:u32,plane:usi
 /// with the probe's `lane*16` per-lane address. The two K16 fragments within
 /// each b128 are selected by st*8. No W is ever staged into LDS or decoded.
 pub(super) fn weight_base(b:&mut Builder)->Result<(),String>{
-    so(b,"s_add_co_i32 s90, s94, s85",&[90],&[94,85])?;
-    so(b,"s_lshl_b32 s90, s90, 15",&[90],&[90])?;
-    so(b,"s_add_co_i32 s90, s90, s95",&[90],&[90,95])
+    sop(b,"s_add_co_i32 s90, s94, s85",&[90],&[94,85])?;
+    sop(b,"s_lshl_b32 s90, s90, 15",&[90],&[90])?;
+    sop(b,"s_add_co_i32 s90, s90, s95",&[90],&[90,95])
 }
 pub(super) fn fetch_w(b:&mut Builder,unit:usize)->Result<(),String>{
     b.clause(|b|{

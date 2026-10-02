@@ -2688,19 +2688,6 @@ pub fn render_client_events(
     }
 }
 
-/// Release held terminal `ClientEvent::ToolCalls` after a tool-safe verdict.
-pub fn release_held_finish_tool_calls(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    finish: &FinishSummary,
-) {
-    for ev in &finish.events {
-        if let ClientEvent::ToolCalls(calls) = ev {
-            emit_tool_calls_event(stdout, id, calls);
-        }
-    }
-}
-
 pub fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -3146,7 +3133,7 @@ pub fn generate_dflash(
     //
     // Thread the request's sampling into the speculator BEFORE the step loop.
     // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
-    // ngram-mod is greedy MTP only: env opt-in, thinking off. `enable_thinking`
+    // ngram-mod is greedy MTP only: `speculation.mtp_ngram` (env HIPFIRE_MTP_NGRAM), thinking off. `enable_thinking`
     // is the resolved Jinja toggle; serve lowers thinking-off to
     // `thinking_enabled=false` and never sends the legacy `max_think_tokens==1`.
     if let Some(spec) = m.speculator.as_mut() {
@@ -3158,10 +3145,7 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
-                && hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                && hipfire_config::mtp_ngram_enabled()
                 && temp <= 1e-6
                 && !enable_thinking,
         });
@@ -3509,7 +3493,10 @@ pub fn generate_dflash(
                 "grammar violation during speculative decode"
             } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
                 "open think span at end of generation (validation)"
-            } else if run.finish.finish_reason == "malformed_protocol" {
+            } else if matches!(
+                run.finish.finish_reason,
+                "malformed_protocol" | "truncated_tool_call"
+            ) {
                 "malformed tool protocol"
             } else {
                 "fail-closed speculative decode"
@@ -3725,6 +3712,11 @@ pub fn generate_spec(
     // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
     // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
     // so the guard, the speculator borrow, and the bookkeeping below coexist.
+    // `block_size` is the speculator's EFFECTIVE proposal width: the DFlash
+    // trailing-τ controller reseeds it to full at request start
+    // (`configure_request`) and only shrinks it after 8 observed cycles, so
+    // the request-start capacity checks below see the full block while the
+    // in-loop overflow guard re-reads the live value each cycle.
     let (block_size, ctx_capacity) = match m.speculator.as_ref() {
         Some(s) => (s.block_size(), s.ctx_capacity()),
         None => {
@@ -3887,7 +3879,7 @@ pub fn generate_spec(
             stdout,
             Some(id),
             &format!(
-                "prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)",
+                "prompt+max_tokens exceeds ctx_capacity {} (raise max_seq or shorten the request)",
                 ctx_capacity,
             ),
             "context_length",
@@ -4294,7 +4286,10 @@ pub fn generate_spec(
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
         }
-        if position.saturating_add(block_size) >= ctx_capacity {
+        // Overflow guard reads the CURRENT effective width each cycle — the
+        // controller may have shrunk the proposal below the full block since
+        // the request-start capacity checks above.
+        if position.saturating_add(spec.block_size()) >= ctx_capacity {
             ctx_exhausted = true;
             break;
         }
@@ -4340,7 +4335,7 @@ pub fn generate_spec(
         spec_cycles += 1;
         spec_accepted += step.accepted;
         // `emit` is already the committed tail with the seed re-echo stripped.
-        let committed_tail: Vec<u32> = step.emit.to_vec();
+        let committed_tail = step.emit;
         // Absolute host cursor before this window's commit. Spec.step left
         // target/drafter advanced over the FULL emit; semantic observe may
         // stop on a strict prefix (EOT/stop/forced/budget) and must not keep
@@ -4959,8 +4954,9 @@ pub fn generate_spec(
     let finish = emit.finish();
     // Open-think / malformed finish reasons also need a truthful rollback when
     // grammar did not already reset (state may still be baked). An open think
-    // span at a pure length exit is an ordinary `length` terminal instead:
-    // partial reasoning, state intact, same rule as the wrapper's classifier.
+    // span or an unfinished tool call at a pure length exit is an ordinary
+    // `length` terminal instead: state intact, same rule as the wrapper's
+    // classifier and AR.
     let length_exit = ctx_exhausted
         || qwen_dflash_hit_length_cap(
             generated,
@@ -4969,8 +4965,10 @@ pub fn generate_spec(
             semantic_stop.is_some(),
         );
     let open_think = finish.open_think || finish.finish_reason == "open_think";
+    let truncated_call = finish.finish_reason == "truncated_tool_call";
     if fail_closed_rollback.is_none()
-        && ((open_think && !length_exit) || finish.finish_reason == "malformed_protocol")
+        && (((open_think || truncated_call) && !length_exit)
+            || finish.finish_reason == "malformed_protocol")
     {
         // Guard already dropped — reset via host-held bundle/speculator.
         fail_closed_rollback = Some(production_fail_closed_rollback(m, gpu, None, None));
@@ -5690,7 +5688,8 @@ pub fn generate_multi(
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
-
+    // A terminator ended the turn (vs. the budget running out).
+    let mut decoded_eot = false;
     while generated < max_tokens {
         if check_abort(id) {
             // G4.9: the mesh dispatcher resets recurrent state and attests
@@ -5774,13 +5773,11 @@ pub fn generate_multi(
             let _ = stdout.flush();
         }
 
-        if next_token == config.eos_token {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-        if tokenizer.is_terminator(next_token) {
+        if next_token == config.eos_token
+            || im_end_token == Some(next_token)
+            || tokenizer.is_terminator(next_token)
+        {
+            decoded_eot = true;
             break;
         }
         // max_think_tokens / force-answer enforcement: same decoded-text scan
@@ -6226,6 +6223,7 @@ pub fn generate_multi(
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated, max_tokens, decoded_eot),
     });
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
@@ -6395,12 +6393,21 @@ pub fn qwen_dflash_wire_terminal(
             rolled_back,
         };
     }
-    // Open think is a nonretryable unsafe terminal (error XOR done) when the
-    // model ended the turn inside it. Running out of budget there is an
-    // ordinary length stop: the reasoning streamed so far, no answer.
+    // Open think and an unfinished tool call are nonretryable unsafe terminals
+    // (error XOR done) when the model ended the turn inside them. Running out
+    // of budget there is an ordinary length stop — no calls, no cache — exactly
+    // as AR classifies it (`qwen_ar_finish_route`).
     if (finish.open_think || finish.finish_reason == "open_think") && !hit_length_cap {
         return QwenDflashWireTerminal::Malformed {
             message: "open think span at end of generation (validation)".to_string(),
+            class: "validation",
+            retryable: false,
+            rolled_back,
+        };
+    }
+    if finish.finish_reason == "truncated_tool_call" && !hit_length_cap {
+        return QwenDflashWireTerminal::Malformed {
+            message: "malformed tool protocol".to_string(),
             class: "validation",
             retryable: false,
             rolled_back,
@@ -7855,6 +7862,7 @@ pub fn generate_qwen4_ar(
             );
         }
     }
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, plan.rendered.len() + 1, m.max_seq);
     let required = plan
         .rendered
         .len()

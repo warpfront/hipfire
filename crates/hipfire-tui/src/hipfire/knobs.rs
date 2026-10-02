@@ -61,6 +61,35 @@ pub const KNOBS: &[KnobInfo] = &[
         options: &[],
     },
     KnobInfo {
+        key: "gpu_layer_budget",
+        title: "Layers kept on the GPU",
+        summary: "How many of the model's layers stay on the GPU. The rest spill to system RAM.",
+        effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
+        default: "",
+        when: "Leave it unset for normal use — every layer then stays on the GPU. Set a count when the model or context will not otherwise fit.",
+        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. 'auto' (-1) lets the engine choose, and it currently keeps every layer on the GPU."),
+        options: &[],
+    },
+    KnobInfo {
+        key: "offload_exec",
+        title: "Who multiplies a spilled layer",
+        summary: "Which engine executes the ops that read a spilled layer's weights: the GPU over PCIe, or the CPU.",
+        effect: "The CPU arm replaces a per-step read of every spilled weight over the link with a host-side GEMV, which is what makes a spill pay instead of costing. It is a per-step host sync (no hipGraph), and the GPU kernels are the faster engine once the bytes are resident.",
+        default: "pcie",
+        when: "Leave on PCIe unless a spilled layer's per-step link read is the bottleneck; 'cpu' is the arm the CPU-exec offload path exists for.",
+        note: Some("Decides who multiplies, never what is spilled: placement stays the 'GPU layers' row, and the KV cache stays in VRAM either way. Refused together with a retained-replay (Redline) backend, and unset/empty/unknown all fall back to pcie. Read once at load — changing it takes effect on the next serve/restart."),
+        options: &[
+            (
+                "pcie",
+                "'over PCIe' — `memory.offload_exec = pcie`: the GPU kernels read the host-mapped weights over the link and multiply.",
+            ),
+            (
+                "cpu",
+                "'on CPU' — `memory.offload_exec = cpu`: the CPU executes those GEMVs from system RAM; the GPU gets the result back.",
+            ),
+        ],
+    },
+    KnobInfo {
         key: "kv_cache",
         title: "KV cache precision",
         summary: "Precision/memory tradeoff for the attention key/value cache.",
@@ -74,10 +103,11 @@ pub const KNOBS: &[KnobInfo] = &[
             ("fwht4", "4-bit FWHT-rotated K + Q8 V. DFlash-safe."),
             ("fwht3", "3-bit FWHT-rotated, ~5.5x. Best compressed-yet-DFlash-safe."),
             ("fwht2", "2-bit FWHT. Smallest; for genuinely tight VRAM."),
-            ("asym4", "4-bit Givens basis. Legacy; degrades DFlash acceptance."),
-            ("asym3", "3-bit Givens. Legacy; avoid with DFlash."),
-            ("asym2", "2-bit Givens. Legacy; smallest + lowest quality."),
-            ("turbo / turbo2-4", "Legacy aliases for the asym tiers."),
+            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
+            ("asym4", "Deprecated (removal in 0.5.0): 4-bit Givens-era name; use fwht4."),
+            ("asym3", "Deprecated (removal in 0.5.0): 3-bit Givens-era name; use fwht3."),
+            ("asym2", "Deprecated (removal in 0.5.0): 2-bit Givens-era name; use fwht2."),
+            ("turbo / turbo2-4", "Deprecated (removal in 0.5.0) aliases; use fwhtN."),
         ],
     },
     KnobInfo {
@@ -158,13 +188,14 @@ pub const KNOBS: &[KnobInfo] = &[
             ("uncapped", "0 = no limit — model reasons until it stops (watch latency)."),
         ],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     KnobInfo {
         key: "prefill_compression",
-        title: "Prefill compression (pflash)",
+        title: "Prefill compression (PFlash, deprecated, removal in 0.5.0)",
         summary: "Compresses a long prompt's KV during prefill using a drafter's importance scoring.",
         effect: "Cuts prefill time and KV footprint on long prompts. Costs a little quality on what it drops, and does nothing without a drafter.",
         default: "off",
-        when: "auto = compress only past prefill_threshold tokens; always = every prefill; off = never.",
+        when: "Leave off. PFlash is deprecated (removal in 0.5.0) and not supported; prefix caching supersedes it. auto = compress only past prefill_threshold tokens; always = every prefill; off = never.",
         note: Some("Needs a prefill_drafter (.hfq path). With no drafter set, compression is disabled — the TUI warns when you turn it on."),
         options: &[
             ("off", "Never compress the prefill KV."),
@@ -172,9 +203,10 @@ pub const KNOBS: &[KnobInfo] = &[
             ("always", "Compress every eligible prefill (skips the threshold gate). Still bypassed without a drafter and on the DFlash/tool-call paths."),
         ],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     KnobInfo {
         key: "prefill_drafter",
-        title: "Prefill drafter",
+        title: "Prefill drafter (PFlash, deprecated)",
         summary: "Path to the small drafter model (.hfq) that scores prompt importance for pflash.",
         effect: "Required for prefill_compression to engage. Empty disables compression entirely.",
         default: "",
@@ -182,9 +214,10 @@ pub const KNOBS: &[KnobInfo] = &[
         note: Some("An empty drafter disables prefill_compression regardless of its setting (the TUI warns when you enable compression without one)."),
         options: &[],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
     KnobInfo {
         key: "prefill_threshold",
-        title: "Prefill threshold",
+        title: "Prefill threshold (PFlash, deprecated)",
         summary: "Token count above which auto-mode prefill compression kicks in.",
         effect: "Higher = only very long prompts compress; lower = compress sooner. Only relevant when prefill_compression=auto.",
         default: "32768",
@@ -244,13 +277,14 @@ pub const KNOBS: &[KnobInfo] = &[
             ("auto", "Screen on the supported arches (gfx906 + RDNA3/3.5) when MMQ is active."),
         ],
     },
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     KnobInfo {
         key: "cask",
-        title: "CASK (TriAttention eviction)",
-        summary: "KV-cache eviction policy that keeps a working set instead of the full context.",
-        effect: "Frees KV VRAM on long contexts. Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached.",
+        title: "CASK (deprecated, removal in 0.5.0)",
+        summary: "Deprecated since 0.4.0 and removed in 0.5.0: TriAttention KV-cache eviction. Not supported.",
+        effect: "Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached. Loading with CASK prints a deprecation warning.",
         default: "false",
-        when: "Enable only with a published sidecar and after validating output quality.",
+        when: "Leave false. Not a production or recommended setting.",
         note: Some("m-fold eviction + DFlash can produce a repetition attractor; validate together. Eviction needs a sidecar path, not just this toggle."),
         options: &[
             ("true", "m-fold eviction policy (needs a sidecar to actually evict)."),
@@ -260,14 +294,14 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "dflash_adaptive_b",
         title: "DFlash adaptive batch",
-        summary: "Lets DFlash adapt its draft batch size to recent acceptance.",
-        effect: "Can improve spec-decode throughput by sizing drafts to how well they're accepted. No correctness effect.",
-        default: "true",
-        when: "Leave on; only relevant when dflash_mode is active.",
-        note: None,
+        summary: "Lets DFlash adapt its draft verify-block width to recent acceptance.",
+        effect: "Follows the trailing 8-cycle acceptance depth (τ̂+2 rows), shrunk only past 2k context where the fixed full block loses throughput. This is not output-identical: realized tokens can differ from fixed-B (observed even at temp 0) because a narrower verify window moves window boundaries; per-position sampling stays target-lossless.",
+        default: "false",
+        when: "Opt in for long-context DFlash sessions after measuring your workload; off keeps the fixed full block. Mutually exclusive with the retained PM4 verify route (PM4 loads keep the fixed B=16 shape).",
+        note: Some("HIPFIRE_DFLASH_ADAPTIVE_B=0 forces the fixed block even when enabled. Short contexts always get the full block."),
         options: &[
-            ("true", "Size the draft batch to recent acceptance."),
-            ("false", "Fixed draft batch size."),
+            ("true", "Size the draft batch to recent acceptance (context-gated, seeded at full)."),
+            ("false", "Fixed draft batch size (default)."),
         ],
     },
     KnobInfo {
@@ -330,9 +364,12 @@ pub const KNOBS: &[KnobInfo] = &[
         key: "host",
         title: "Serve endpoint",
         summary: "The bind address (and port) of the OpenAI-compatible serve API.",
-        effect: "0.0.0.0 listens on all interfaces; 127.0.0.1 is local-only. Chat and API clients connect here.",
+        effect: "127.0.0.1 is local-only (the default); 0.0.0.0 listens on all interfaces. Chat and API clients connect here.",
+        // Must match `serve.host`'s config default — the serve surface is
+        // unauthenticated, so a LAN bind is an explicit operator choice.
+        // `defaults_match_config_defaults` pins this equality.
         default: "127.0.0.1",
-        when: "Use 127.0.0.1 to keep serve private to this machine; 0.0.0.0 to expose it on the network.",
+        when: "Set 0.0.0.0 to expose serve on the network; the default keeps it private to this machine.",
         note: Some("Paired with port (default 11435). Changes take effect on the next serve/restart."),
         options: &[],
     },

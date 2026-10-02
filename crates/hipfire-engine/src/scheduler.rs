@@ -796,19 +796,24 @@ pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
-pub fn resolve_batch_sampling(
+/// `max_tokens` a generate request resolves to when the wire omits it. Every
+/// generate route (sequential, continuous batch, multi-slot) uses this.
+pub const DEFAULT_GENERATE_MAX_TOKENS: usize = 4096;
+
+/// Effective `(temperature, top_p)` for a generate request on every route.
+/// Precedence per knob: explicit request field > the `.hfq`-baked author
+/// recommendation (`rec_*`) > the carrier's arch ladder.
+pub fn resolve_temp_top_p(
     msg: &serde_json::Value,
-    m: &hipfire_loader::LoadedModel,
-) -> BatchSampling {
-    let defaults = hipfire_loader::carrier_for(m.arch_id)
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
+) -> (f32, f32) {
+    let defaults = hipfire_loader::carrier_for(arch_id)
         .map(|c| c.sampling_defaults())
         .unwrap_or_default();
-    let (arch_default_temp, arch_default_top_p) = (defaults.temp, defaults.top_p);
-    let default_temp = m
-        .rec_temperature
-        .map(|x| x as f64)
-        .unwrap_or(arch_default_temp);
-    let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
+    let default_temp = rec_temperature.map(|x| x as f64).unwrap_or(defaults.temp);
+    let default_top_p = rec_top_p.map(|x| x as f64).unwrap_or(defaults.top_p);
     let temp = msg
         .get("temperature")
         .and_then(|v| v.as_f64())
@@ -817,6 +822,17 @@ pub fn resolve_batch_sampling(
         .get("top_p")
         .and_then(|v| v.as_f64())
         .unwrap_or(default_top_p) as f32;
+    (temp, top_p)
+}
+
+pub fn resolve_batch_sampling(
+    msg: &serde_json::Value,
+    m: &hipfire_loader::LoadedModel,
+) -> BatchSampling {
+    let defaults = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.sampling_defaults())
+        .unwrap_or_default();
+    let (temp, top_p) = resolve_temp_top_p(msg, m.arch_id, m.rec_temperature, m.rec_top_p);
     let default_repeat = defaults.repeat_penalty;
     let repeat_penalty = msg
         .get("repeat_penalty")

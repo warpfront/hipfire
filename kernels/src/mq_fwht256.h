@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Shared by gemv_mq4g256.hip and tensor_ops.hip (prepended by kernels.rs /
+// Shared by qwen4_gemv_mq4g256.hip and tensor_ops.hip (prepended by kernels.rs /
 // tensor_ops.rs): the in-wave 256-point FWHT of mq_rotate_x.
 
 #include <hip/hip_runtime.h>

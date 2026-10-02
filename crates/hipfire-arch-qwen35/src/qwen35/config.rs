@@ -8,6 +8,7 @@
 pub use hipfire_dispatch::pipeline::batched_attention::TreeVerifyCtx;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+use hipfire_config::memory::GpuLayerBudget;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::tp_shard::ShardConfig;
@@ -109,6 +110,10 @@ pub enum DflashFusionCtx {
 pub struct Qwen35Config {
     pub dim: usize,
     pub n_layers: usize,
+    /// Resident-tail split point for partial GPU offload. Layers `[0 .. i_gpu_start)`
+    /// spill to host-mapped system RAM; `[i_gpu_start .. n_layers)` stay device-resident. Set by the
+    /// Step 3 loader from the placement policy; `0` = fully resident (zero-diff default).
+    pub i_gpu_start: usize,
     pub vocab_size: usize,
     pub norm_eps: f32,
     pub eos_token: u32,
@@ -900,6 +905,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     let mut config = Qwen35Config {
         dim,
         n_layers: raw.num_hidden_layers,
+        i_gpu_start: 0,
         vocab_size: raw.vocab_size,
         norm_eps: raw.rms_norm_eps,
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 248044),
@@ -944,7 +950,157 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
     // of getting collapsed into a generic "bad metadata" fallback.
     apply_reap_plan(&mut config)?;
 
+    apply_offload_policy(&mut config);
+
     Ok(config)
+}
+
+/// Resident-tail split point for a configured budget.
+///
+/// Returns `i_gpu_start`, where layers `[0 .. i_gpu_start)` spill to host RAM and
+/// `[i_gpu_start .. n_layers)` stay on the GPU.
+///
+/// A resident count above the model's layer count keeps everything on the GPU
+/// (`saturating_sub` saturates). That is not an error, but it is not what was
+/// asked for either, so [`residency_report`] reports it rather than letting a
+/// configured budget do nothing in silence.
+fn offload_split(n_layers: usize, budget: GpuLayerBudget) -> usize {
+    match budget {
+        GpuLayerBudget::Full => 0,
+        GpuLayerBudget::Layers(resident) => n_layers.saturating_sub(resident),
+        // `auto` means "the engine decides", exactly as it does for every other
+        // config key. The engine currently decides to offload nothing: a placement
+        // decision needs measured device capacity and per-layer weight bytes, and
+        // at config construction there is no `Gpu` (the arch trait hands us
+        // `&Config`). Once that measurement is in hand it feeds
+        // `hipfire_config::memory::largest_fitting_tail` and the engine decides a
+        // real split — `auto`'s meaning does not change, only what it decides.
+        //
+        // It deliberately does not fail the load: a config value that breaks a
+        // model reads to a user as "the model is broken", and the whole point of
+        // `auto` is that it is always a safe choice.
+        GpuLayerBudget::Auto => 0,
+    }
+}
+
+/// Resolve partial-GPU-offload placement for this config, in place.
+///
+/// Placement is fixed for the model's lifetime, so it is decided here — once, at
+/// config construction — rather than per request. The split keeps a contiguous
+/// resident TAIL `[i_gpu_start .. n_layers)` and spills the prefix `[0 ..
+/// i_gpu_start)` to host-mapped system RAM; `load_layer_into` turns that into a
+/// per-layer `host_local` flag.
+///
+/// `Full` (the default, and the zero-diff regression guard) and `Auto` leave
+/// `i_gpu_start = 0`, so every layer stays device-resident and the load is
+/// byte-identical to stock. `Layers(n)` is pure arithmetic on `n_layers` and
+/// needs no device measurement, which is why it can be resolved here.
+///
+/// Infallible, and silent. Config parsing also runs for admission probes and
+/// for topologies that refuse a spill ([`offload_topology_refusal`]), so the
+/// residency line is printed by the single-GPU loader once the placement is
+/// actually applied ([`offload_residency_report`]), not here.
+fn apply_offload_policy(config: &mut Qwen35Config) {
+    config.i_gpu_start = offload_split(config.n_layers, hipfire_config::memory::gpu_layer_budget());
+}
+
+/// The load-time residency line for `config`'s resolved placement, for the
+/// single-GPU loader to print when it applies that placement. `None` only for
+/// the unset default (see [`residency_report`]).
+pub fn offload_residency_report(config: &Qwen35Config) -> Option<String> {
+    residency_report(
+        config.n_layers,
+        hipfire_config::memory::gpu_layer_budget(),
+        config.i_gpu_start,
+    )
+}
+
+/// Admission refusal for a partial-offload split the loader cannot honour.
+///
+/// Only the single-GPU dense loader places layers in host RAM. Under tp>1 the
+/// dense-TP and EP rank loaders keep every layer resident, so a configured
+/// spill would be announced and then ignored; under pp>1 the first band's
+/// layers would spill into host RAM mapped by device 0, a path nobody has run;
+/// on a MoE model only the attention and DeltaNet weights would spill while the
+/// expert stacks stay in VRAM. Each is refused before any teardown. `None` when
+/// nothing spills (unset, `auto`, or a budget of at least `n_layers`).
+pub fn offload_topology_refusal(config: &Qwen35Config, tp: usize, pp: usize) -> Option<String> {
+    offload_topology_refusal_for(
+        config.n_layers,
+        config.i_gpu_start,
+        config.num_experts,
+        tp,
+        pp,
+    )
+}
+
+fn offload_topology_refusal_for(
+    n_layers: usize,
+    i_gpu_start: usize,
+    num_experts: usize,
+    tp: usize,
+    pp: usize,
+) -> Option<String> {
+    if i_gpu_start == 0 {
+        return None;
+    }
+    let why = if tp > 1 {
+        format!("tp={tp} loads every layer on every rank and never places one in host RAM")
+    } else if pp > 1 {
+        format!(
+            "pp={pp} would place the first pipeline band's spilled layers in host RAM mapped \
+             by device 0, which has never been run"
+        )
+    } else if num_experts > 0 {
+        format!(
+            "this is a MoE model ({num_experts} experts); its expert weights would stay in VRAM \
+             and only the attention and DeltaNet weights would spill"
+        )
+    } else {
+        return None;
+    };
+    Some(format!(
+        "load refused: partial GPU offload (memory.gpu_layer_budget would spill {i_gpu_start} of \
+         {n_layers} layers to host RAM) supports single-GPU dense Qwen3.5 only; {why}. Unset \
+         memory.gpu_layer_budget (HIPFIRE_GPU_LAYER_BUDGET) for this model"
+    ))
+}
+
+/// The load-time residency report for a resolved placement.
+///
+/// `None` means "print nothing", and only the unset default may produce it: the
+/// absence of this line has to keep meaning exactly "nothing was configured,
+/// every layer is resident", or stock-vs-branch log diffs stop being readable.
+///
+/// Every other case is a user who configured something, so it is reported — the
+/// point of the function being separable is that these are testable without a
+/// GPU or a daemon. A configured budget that silently did nothing (a resident
+/// count above the model's layer count saturating to fully resident) is exactly
+/// what made this knob confusing.
+fn residency_report(n_layers: usize, budget: GpuLayerBudget, i_gpu_start: usize) -> Option<String> {
+    if i_gpu_start != 0 {
+        return Some(format!(
+            "  partial offload: {} resident / {} offloaded, i_gpu_start={}",
+            n_layers - i_gpu_start,
+            i_gpu_start,
+            i_gpu_start
+        ));
+    }
+    match budget {
+        GpuLayerBudget::Full => None,
+        GpuLayerBudget::Auto => Some(
+            "  partial offload: 'auto' defers placement to the engine, which currently keeps \
+             every layer on the GPU — set a layer count to offload"
+                .to_string(),
+        ),
+        GpuLayerBudget::Layers(resident) if resident > n_layers => Some(format!(
+            "  partial offload: gpu_layer_budget={resident} is more than this model's {n_layers} \
+             layers; keeping every layer on the GPU"
+        )),
+        GpuLayerBudget::Layers(_) => Some(format!(
+            "  partial offload: 0 offloaded ({n_layers} resident), i_gpu_start=0"
+        )),
+    }
 }
 
 /// Apply an optional REAP keep-map to a freshly parsed `Qwen35Config`.
@@ -1628,5 +1784,153 @@ mod tests {
         });
         let cfg4 = from_config_value(&inner4).unwrap();
         assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
+    }
+
+    /// The placement arithmetic, which had no test at all. `resident` counts
+    /// layers LEFT ON the GPU; `i_gpu_start` is where the spilled prefix ends, so
+    /// `offload_split(64, Layers(3)) == 61` is the contract the help text states.
+    #[test]
+    fn offload_split_maps_resident_count_to_spill_point() {
+        use hipfire_config::memory::GpuLayerBudget as B;
+        assert_eq!(
+            offload_split(64, B::Full),
+            0,
+            "unset keeps every layer resident"
+        );
+        assert_eq!(
+            offload_split(64, B::Auto),
+            0,
+            "auto is a placeholder = all resident"
+        );
+        assert_eq!(
+            offload_split(64, B::Layers(64)),
+            0,
+            "asking for all of them"
+        );
+        assert_eq!(offload_split(64, B::Layers(62)), 2, "2 spilled");
+        assert_eq!(offload_split(64, B::Layers(32)), 32, "32 spilled");
+        assert_eq!(offload_split(64, B::Layers(3)), 61, "3 on GPU, 61 spilled");
+        assert_eq!(
+            offload_split(64, B::Layers(0)),
+            64,
+            "0 resident spills everything"
+        );
+        // Overshoot saturates to fully resident instead of indexing out of range.
+        assert_eq!(
+            offload_split(64, B::Layers(200)),
+            0,
+            "more layers than the model has"
+        );
+        assert_eq!(
+            offload_split(1, B::Layers(999)),
+            0,
+            "single-layer model, large request"
+        );
+        // A model with no layers must not underflow either.
+        assert_eq!(offload_split(0, B::Layers(0)), 0, "degenerate model");
+    }
+
+    /// A spill the loader cannot honour (tp>1, pp>1, MoE) is refused; a
+    /// single-GPU dense spill, or any placement that spills nothing, is not.
+    #[test]
+    fn offload_topology_refusal_refuses_only_unhonourable_spills() {
+        // (n_layers, i_gpu_start, num_experts, tp, pp) -> refused?
+        let cases = [
+            ((64, 0, 0, 1, 1), false),
+            ((64, 0, 256, 4, 2), false),
+            ((64, 8, 0, 1, 1), false),
+            ((64, 8, 0, 2, 1), true),
+            ((64, 8, 0, 1, 2), true),
+            ((40, 8, 256, 1, 1), true),
+            ((40, 40, 256, 2, 1), true),
+        ];
+        for ((n, split, experts, tp, pp), refused) in cases {
+            let got = offload_topology_refusal_for(n, split, experts, tp, pp);
+            assert_eq!(
+                got.is_some(),
+                refused,
+                "{:?} -> {got:?}",
+                (n, split, experts, tp, pp)
+            );
+        }
+    }
+
+    /// Every reported case, offline. The unset default must stay silent, and each
+    /// configured case must say something — a configured budget that does nothing
+    /// with no log line is the confusing behaviour this guards against.
+    #[test]
+    fn residency_report_covers_every_case() {
+        use hipfire_config::memory::GpuLayerBudget as B;
+        assert_eq!(
+            residency_report(64, B::Full, 0),
+            None,
+            "unset must stay silent"
+        );
+
+        let spilling = residency_report(64, B::Layers(32), 32).unwrap();
+        assert!(
+            spilling.contains("32 resident / 32 offloaded"),
+            "{spilling}"
+        );
+        assert!(spilling.contains("i_gpu_start=32"), "{spilling}");
+
+        let all_spilled = residency_report(64, B::Layers(0), 64).unwrap();
+        assert!(
+            all_spilled.contains("0 resident / 64 offloaded"),
+            "{all_spilled}"
+        );
+
+        let auto = residency_report(64, B::Auto, 0).unwrap();
+        assert!(
+            auto.contains("defers placement to the engine"),
+            "auto must be reported as an engine decision, not silence: {auto}"
+        );
+        assert!(
+            !auto.contains("error"),
+            "auto is a note, not a failure: {auto}"
+        );
+
+        let overshoot = residency_report(64, B::Layers(200), 0).unwrap();
+        assert!(
+            overshoot.contains("more than this model's 64 layers"),
+            "an overshoot must say so rather than silently doing nothing: {overshoot}"
+        );
+
+        let all_resident = residency_report(64, B::Layers(64), 0).unwrap();
+        assert!(
+            all_resident.contains("0 offloaded"),
+            "explicitly keeping them all is reported; only unset is silent: {all_resident}"
+        );
+    }
+
+    #[test]
+    fn mrope_ctx_pos3_falls_back_to_decode_formula_past_the_prompt() {
+        // 7 prompt tokens at base 2: text(0,1), image 4x4 grid merged 2x2 (4
+        // tokens), trailing text. Un-offset phases are [0,0,0], [1,1,1],
+        // [2,2,2], [2,2,3], [2,3,2], [2,3,3], then the cursor jumps by
+        // max(lh,lw)=2 → [4,4,4]; everything is offset by base=2 here.
+        // rope_delta = (max 6 + 1) - (base 2 + len 7) = -2.
+        let positions = vec![
+            [2, 2, 2],
+            [3, 3, 3],
+            [4, 4, 4],
+            [4, 4, 5],
+            [4, 5, 4],
+            [4, 5, 5],
+            [6, 6, 6],
+        ];
+        let ctx = MropeCtx {
+            base: 2,
+            positions,
+            rope_delta: -2,
+            section: [11, 11, 10],
+        };
+        // Inside the prompt: the precomputed grid coordinate.
+        assert_eq!(ctx.pos3(4), [4, 4, 4]);
+        assert_eq!(ctx.pos3(8), [6, 6, 6]);
+        // Past the prompt (generated tokens): all three axes collapse to
+        // pos + rope_delta — the cursor resumes at max(image positions)+1 = 7.
+        assert_eq!(ctx.pos3(9), [7, 7, 7]);
+        assert_eq!(ctx.pos3(10), [8, 8, 8]);
     }
 }

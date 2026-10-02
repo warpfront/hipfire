@@ -1652,7 +1652,7 @@ pub fn attention_attend_batched(
             && stride == WIDENED_COMMIT_ROWS
             && (64..=8192).contains(&n)
             && (n <= WIDENED_COMMIT_ROWS || n % WIDENED_COMMIT_ROWS == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && gpu.fa2_gfx11_ctx_admitted(max_ctx_len)
             && start_pos.checked_add(n) == Some(max_ctx_len)
             && max_ctx_len <= kv_cache.physical_cap
             && tree_verify.is_none();
@@ -1738,7 +1738,9 @@ pub fn attention_attend_batched(
         );
     }
     if multirow {
-        debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
+        debug_assert!(
+            gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+        );
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
         gpu.kv_cache_write_q8_0_batched(

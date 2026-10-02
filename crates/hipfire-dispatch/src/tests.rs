@@ -2632,3 +2632,99 @@ fn codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine() {
         }
     }
 }
+
+// ── CPU-executed offload (memory.offload_exec=cpu) ────────────────────────────
+
+/// The seam's coverage table and the launcher's rotation table must agree: the
+/// CPU path applies `rotate_x` to a `Raw` activation exactly when the launcher
+/// would, so a dtype that maps to a `CpuQuant` while `dtype_rotation_plan` says
+/// something else would silently feed unrotated activations to rotated weights
+/// (or double-rotate them) — the silent-garbage failure mode, not an error.
+#[test]
+fn cpu_quant_rotation_agrees_with_plan() {
+    for dtype in [
+        DType::MQ4G256,
+        DType::MQ4G256V2,
+        DType::MQ4CG256,
+        DType::MQ6G256,
+        DType::MQ6G256V2,
+        DType::MQ5G256,
+        DType::MQ5G256V2,
+        DType::MQ3G256,
+        DType::MQ3G256V2,
+        DType::MQ3G256Lloyd,
+        DType::MQ2G256,
+        DType::MQ2G256V2,
+        DType::MQ2G256Lloyd,
+        DType::MQ2G256LloydU,
+        DType::MQ4G256Lloyd,
+        DType::HFQ6G256,
+        DType::HFQ4G256,
+        DType::HFQ4G128,
+        DType::HFQ3G256,
+        DType::HFQ3G128,
+        DType::HFQ2G256,
+        DType::HFQ2G128,
+        DType::TQ2G128,
+        DType::BQ1G128,
+        DType::Q8_0,
+        DType::F16,
+        DType::F32,
+        DType::BF16,
+    ] {
+        let q = crate::cpu_quant_for(dtype)
+            .unwrap_or_else(|| panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for"));
+        assert_eq!(
+            q.is_fwht_g256(),
+            dtype_rotation_plan(dtype) == RotationPlan::FwhtG256,
+            "{dtype:?}: CPU rotation disagrees with dtype_rotation_plan"
+        );
+    }
+}
+
+/// Formats the CPU must refuse, including ones that look adjacent to a covered
+/// format. Each of these has its own layout (codebook size, bit width, or a
+/// non-FWHT rotation) that `hipfire-cpu` does not implement, so a step over one
+/// stays on the GPU over PCIe.
+#[test]
+fn cpu_quant_refuses_unimplemented_formats() {
+    for dtype in [
+        DType::MQ8G256, // RotationPlan::Mq8Internal: int8 activation, not FWHT-f32
+        DType::MQ4G128, // RotationPlan::FwhtG128: a different transform
+        DType::HFP4G32, // per-row 16 B header + per-32 block scales
+        DType::MFP4G32,
+        DType::MFP4G32Lloyd,
+        DType::MFP4G32P,
+        DType::MFP4G32E8,
+        DType::MFP4G32E8SOA,
+        DType::ParoQ4G128, // Givens rotation on the activation
+        DType::Q4K,        // no dense HFQ artifact uses it
+        DType::Q8HFQ,      // padded rows (row_stride), not expressible in the group model
+        DType::Raw,
+    ] {
+        assert!(
+            crate::cpu_quant_for(dtype).is_none(),
+            "{dtype:?} must not be CPU-executed until its decode is transcribed"
+        );
+    }
+}
+
+/// The Redline refusal is a conjunction: it must fire for the configured
+/// conflict and for nothing else, or a plain CPU-exec run would fail to load.
+#[test]
+fn cpu_exec_redline_conflict_is_exactly_the_conjunction() {
+    use crate::cpu_exec_redline_conflict as conflict;
+    assert!(
+        conflict(true, 12, true),
+        "cpu + spill + replay is the conflict"
+    );
+    assert!(!conflict(false, 12, true), "pcie must never be refused");
+    assert!(
+        !conflict(true, 0, true),
+        "nothing spilled, nothing on the CPU"
+    );
+    assert!(
+        !conflict(true, 12, false),
+        "no replay controller: no conflict"
+    );
+}

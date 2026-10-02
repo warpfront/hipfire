@@ -2459,7 +2459,9 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
         // Each transpose wave consumes only its own private SCR region.
         // A wave barrier is sufficient; the later workgroup barrier publishes
         // completed K/V planes to all 24 compute waves.
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
         __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 
         if (wave < 8) {
             const int sub = wave >> 1;

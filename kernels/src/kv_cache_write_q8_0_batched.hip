@@ -14,6 +14,13 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     int batch_size,
     const KvSlotDesc* __restrict__ slot_descs,  // [n_slots] or nullptr = legacy
     const int* __restrict__ row_slot            // [batch_size] or nullptr = legacy
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    // Paged (slot-engine) module only: nonzero resolves legacy_v_base instead
+    // of legacy_k_base. The rotated-K tiers have DIFFERENT K/V strides, so
+    // their V arena's legacy slab offsets differ. No effect in paged mode (one
+    // block table serves both arenas).
+    , int use_v_base
+#endif
 ) {
     const int gid = blockIdx.x;           // Q8_0 block index within one position
     const int bid = blockIdx.y;           // batch index
@@ -51,7 +58,15 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     int q = __float2int_rn(val * inv_scale);
     q = max(-127, min(127, q));
 
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    unsigned char* out =
+        dst
+        + (use_v_base ? kv_offset_for_v(desc, pos, per_pos_bytes)
+                      : kv_offset_for_k(desc, pos, per_pos_bytes))
+        + gid * 34;
+#else
     unsigned char* out = dst + kv_offset_for_k(desc, pos, per_pos_bytes) + gid * 34;
+#endif
     if (tid == 0) *((_Float16*)(out)) = (_Float16)scale;
     out[2 + tid] = (unsigned char)(signed char)q;
 }

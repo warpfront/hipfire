@@ -4,5 +4,7 @@ pub mod windows;
 pub mod waits;
 pub mod hazards;
 pub mod lds;
+pub mod kernargs;
 pub mod barriers;
 pub mod resources;
+pub(crate) mod predicates;

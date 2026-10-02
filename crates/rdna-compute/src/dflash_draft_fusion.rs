@@ -13,7 +13,7 @@ use crate::{Gpu, GpuTensor};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
-const COLLAPSE_SRC: &str = include_str!("../../../kernels/src/dflash_draft_collapse.gfx1100.hip");
+pub(crate) const COLLAPSE_SRC: &str = include_str!("../../../kernels/src/dflash_draft_collapse.gfx1100.hip");
 
 /// Which overwrite GEMM the S7 fast path may use for one MQ4G256 dispatch.
 ///

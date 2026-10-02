@@ -182,6 +182,7 @@ impl Rocblas {
         ]);
         let lib = candidates
             .iter()
+            // SAFETY: libloading::Library::new maps librocblas by path; Library owns the mapping.
             .find_map(|name| unsafe { Library::new(name).ok() })
             .ok_or_else(|| RocblasError {
                 status: 0,
@@ -191,75 +192,91 @@ impl Rocblas {
                 ),
             })?;
 
-        unsafe {
-            let fn_create_handle: Symbol<unsafe extern "C" fn(*mut RocblasHandle) -> u32> = lib
+        // SAFETY: `lib` is live; symbol name matches rocBLAS C ABI.
+        let fn_create_handle: unsafe extern "C" fn(*mut RocblasHandle) -> u32 = unsafe {
+            let sym: Symbol<unsafe extern "C" fn(*mut RocblasHandle) -> u32> = lib
                 .get(b"rocblas_create_handle")
                 .map_err(|e| RocblasError {
                     status: 0,
                     context: format!("resolve rocblas_create_handle: {e}"),
                 })?;
-            let fn_destroy_handle: Symbol<unsafe extern "C" fn(RocblasHandle) -> u32> = lib
+            *sym
+        };
+        // SAFETY: `lib` is live; symbol name matches rocBLAS C ABI.
+        let fn_destroy_handle: unsafe extern "C" fn(RocblasHandle) -> u32 = unsafe {
+            let sym: Symbol<unsafe extern "C" fn(RocblasHandle) -> u32> = lib
                 .get(b"rocblas_destroy_handle")
                 .map_err(|e| RocblasError {
                     status: 0,
                     context: format!("resolve rocblas_destroy_handle: {e}"),
                 })?;
-            let fn_set_stream: Symbol<unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32> =
+            *sym
+        };
+        // SAFETY: `lib` is live; symbol name matches rocBLAS C ABI.
+        let fn_set_stream: unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32 = unsafe {
+            let sym: Symbol<unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32> =
                 lib.get(b"rocblas_set_stream").map_err(|e| RocblasError {
                     status: 0,
                     context: format!("resolve rocblas_set_stream: {e}"),
                 })?;
-            let fn_gemm_ex: Symbol<RocblasGemmExFn> =
+            *sym
+        };
+        // SAFETY: `lib` is live; symbol name matches rocBLAS C ABI.
+        let fn_gemm_ex: RocblasGemmExFn = unsafe {
+            let sym: Symbol<RocblasGemmExFn> =
                 lib.get(b"rocblas_gemm_ex").map_err(|e| RocblasError {
                     status: 0,
                     context: format!("resolve rocblas_gemm_ex: {e}"),
                 })?;
-            // Beta/deprecated in rocBLAS 5.5. Keep this optional: default GEMM
-            // remains usable when the installed library omits the symbol, but
-            // callers cannot mistake an unavailable discovery API for an empty
-            // solution list.
-            let fn_gemm_ex_get_solutions = lib
-                .get::<RocblasGemmExGetSolutionsFn>(b"rocblas_gemm_ex_get_solutions")
+            *sym
+        };
+        // Beta/deprecated in rocBLAS 5.5. Keep this optional: default GEMM
+        // remains usable when the installed library omits the symbol, but
+        // callers cannot mistake an unavailable discovery API for an empty
+        // solution list.
+        // SAFETY: optional symbol; `lib` is live. Missing symbol yields None.
+        let fn_gemm_ex_get_solutions = unsafe {
+            lib.get::<RocblasGemmExGetSolutionsFn>(b"rocblas_gemm_ex_get_solutions")
                 .ok()
-                .map(|symbol| *symbol);
-            // rocblas_dgemm is the typed FP64 entry point. It is resolved
-            // optionally so a library that only exposes gemm_ex (or no FP64
-            // at all) does not make Rocblas::load itself fail; callers that
-            // need FP64 should fall back to gemm_ex with F64 datatypes when
-            // this is None.
-            let fn_dgemm = lib
-                .get::<RocblasDgemmFn>(b"rocblas_dgemm")
+                .map(|symbol| *symbol)
+        };
+        // rocblas_dgemm is the typed FP64 entry point. It is resolved
+        // optionally so a library that only exposes gemm_ex (or no FP64
+        // at all) does not make Rocblas::load itself fail; callers that
+        // need FP64 should fall back to gemm_ex with F64 datatypes when
+        // this is None.
+        // SAFETY: optional symbol; `lib` is live. Missing symbol yields None.
+        let fn_dgemm = unsafe {
+            lib.get::<RocblasDgemmFn>(b"rocblas_dgemm")
                 .ok()
-                .map(|symbol| *symbol);
+                .map(|symbol| *symbol)
+        };
 
-            let fn_create_handle = *fn_create_handle;
-            let fn_destroy_handle = *fn_destroy_handle;
-            let fn_set_stream = *fn_set_stream;
-            let fn_gemm_ex = *fn_gemm_ex;
-
-            let mut handle: RocblasHandle = std::ptr::null_mut();
-            let st = fn_create_handle(&mut handle);
-            if st != ROCBLAS_STATUS_SUCCESS {
-                return Err(RocblasError {
-                    status: st,
-                    context: "rocblas_create_handle".into(),
-                });
-            }
-
-            Ok(Self {
-                _lib: lib,
-                handle,
-                fn_destroy_handle,
-                fn_set_stream,
-                fn_gemm_ex,
-                fn_gemm_ex_get_solutions,
-                fn_dgemm,
-            })
+        let mut handle: RocblasHandle = std::ptr::null_mut();
+        // SAFETY: fn resolved above; out-param is a stack local for the new handle.
+        let st = unsafe { fn_create_handle(&mut handle) };
+        if st != ROCBLAS_STATUS_SUCCESS {
+            return Err(RocblasError {
+                status: st,
+                context: "rocblas_create_handle".into(),
+            });
         }
+
+        Ok(Self {
+            _lib: lib,
+            handle,
+            fn_destroy_handle,
+            fn_set_stream,
+            fn_gemm_ex,
+            fn_gemm_ex_get_solutions,
+            fn_dgemm,
+        })
     }
 
     /// Bind this rocBLAS handle to a HIP stream so calls execute on it.
     pub fn set_stream(&self, stream: &Stream) -> RocblasResult<()> {
+        // SAFETY: handle is live from load; stream.as_raw() is a live HIP stream
+        // owned by the caller for the duration of subsequent rocBLAS work.
         let st = unsafe { (self.fn_set_stream)(self.handle, stream.as_raw()) };
         if st == ROCBLAS_STATUS_SUCCESS {
             Ok(())
@@ -612,6 +629,10 @@ impl Rocblas {
         Ok(Some(solutions))
     }
 
+    /// # Safety
+    ///
+    /// Same pointer/layout contract as [`Self::gemm_ex`]; `algo`/`solution_index`
+    /// must be valid for this problem when using solution-index mode.
     #[allow(clippy::too_many_arguments)]
     unsafe fn call_gemm_ex(
         &self,
@@ -702,15 +723,17 @@ fn checked_solution_count(count: i32) -> RocblasResult<usize> {
 
 impl Drop for Rocblas {
     fn drop(&mut self) {
-        unsafe {
-            if !self.handle.is_null() {
-                let _ = (self.fn_destroy_handle)(self.handle);
-            }
+        if !self.handle.is_null() {
+            // SAFETY: handle was created by rocblas_create_handle and not yet
+            // destroyed. SAFETY (unproven): no in-flight rocBLAS work still
+            // references this handle when Drop runs.
+            let _ = unsafe { (self.fn_destroy_handle)(self.handle) };
         }
     }
 }
 
-// The handle is bound to a GPU context; we don't share across threads without sync.
+// SAFETY: Rocblas owns an opaque handle bound to a GPU context. Send moves the
+// owner between threads; it is not Sync — concurrent use needs external sync.
 unsafe impl Send for Rocblas {}
 
 #[cfg(test)]

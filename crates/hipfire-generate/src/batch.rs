@@ -1257,11 +1257,9 @@ pub fn drive_qwen_continuous_batch(
                         format!("semantic finish lane {idx}: unexpected tool calls"),
                     );
                 }
-                let finish_reason = match finish.finish_reason {
-                    "length" => "length",
-                    "tool_calls" => "tool_calls",
-                    _ => "stop",
-                };
+                // The producer's semantic reason, unchanged: an open think
+                // that coincides with EOS is "error", not a clean "stop".
+                let finish_reason = finish.finish_reason;
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
                     lane.created_at,
@@ -3778,11 +3776,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                         format!("EP semantic finish lane {idx}: unexpected tool calls"),
                     );
                 }
-                let finish_reason = match finish.finish_reason {
-                    "length" => "length",
-                    "tool_calls" => "tool_calls",
-                    _ => "stop",
-                };
+                let finish_reason = finish.finish_reason;
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
                     lane.created_at,

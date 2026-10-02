@@ -3,33 +3,18 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
-use crate::quant_fwht::{cpu_fwht_128, cpu_fwht_256, gen_fwht_signs};
-use crate::quant_hfp4::{e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
+#[cfg(test)]
+use crate::quant_hfp4::e2m1_round;
+use crate::quant_fwht::cpu_fwht_256;
+#[cfg(test)]
+use crate::quant_fwht::cpu_fwht_128;
+use crate::quant_hfp4::{e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::path::Path;
 
 use crate::e8;
-use crate::e8::*;
 use crate::e8_gptq;
-use crate::e8_gptq::*;
-use crate::gguf_input;
-use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
+use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 /// Quantize one row of K FP32 weights to mfp4-E8 byte format.
 /// Same E4M3 scale as mfp4+P; per-32-weight-block data = 4 E8 codewords (u32 each).
@@ -264,13 +249,7 @@ pub(crate) fn quantize_mfpn_e8_row(row: &[f32], n: u32, quant_step: f32) -> Vec<
     out
 }
 
-pub(crate) fn quantize_mfp3g32_e8_row(row: &[f32]) -> Vec<u8> {
-    quantize_mfpn_e8_row(row, 3, e8::QUANT_STEP_MFP3)
-}
 
-pub(crate) fn quantize_mfp2g32_e8_row(row: &[f32]) -> Vec<u8> {
-    quantize_mfpn_e8_row(row, 2, e8::QUANT_STEP_MFP2)
-}
 
 /// mfpN-E8 2D: FWHT-rotate (same signs as mfp4-E8), then per-row encode.
 pub(crate) fn quantize_mfpn_e8_2d(
@@ -679,6 +658,7 @@ pub(crate) fn quantize_mfp4g32_e8_soa_2d(
     out
 }
 
+#[cfg(test)]
 /// 128-wide E8-SoA encoder.
 ///
 /// Same E8 lattice codec, same SoA wire layout, and the same byte geometry as
@@ -726,6 +706,7 @@ pub(crate) fn quantize_mfp4g32_e8_soa128_2d(
     out
 }
 
+#[cfg(test)]
 /// 128-wide AoS E8 encoder for reduction axes that 256 cannot tile.
 ///
 /// Same E8 lattice codec, same AoS wire layout and the same byte geometry as
@@ -770,6 +751,7 @@ pub(crate) fn quantize_mfp4g32_e8_g128_2d(
     out
 }
 
+#[cfg(test)]
 /// Row stride of the qt=42 AoS layout: `[16 B header][n_blocks x 17 B]`.
 ///
 /// Byte-identical to `MFP4G32E8` (qt=34), because the rotation width is not in
@@ -1178,12 +1160,12 @@ pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod awq_tests {
-    use super::*;
+    
     use crate::calibration::{awq_pre_scale_weights, compute_awq_scales};
-    use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
-    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
-    use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
-    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
+    
+    
+    
+    
 
     /// Verify geometric mean of computed AWQ scales is ~1.0 — the
     /// normalization in compute_awq_scales should center the scale
@@ -1294,7 +1276,7 @@ mod awq_tests {
 #[cfg(test)]
 mod hfp4_tests {
     use super::*;
-    use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
+    
     use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
     use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
 

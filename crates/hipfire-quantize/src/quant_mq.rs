@@ -3,35 +3,13 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
+#[cfg(test)]
+use crate::{hfq::QuantType, pipeline_gguf::GgufFormat, quant_fwht::gen_fwht_signs};
+use crate::quant_fwht::cpu_fwht_256;
 
-use crate::dequant::{e2m1_to_f32, e4m3_to_f32, ue8m0_to_scale};
-use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
-use crate::quant_hfp4::{e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-
-use crate::e8;
-use crate::e8_gptq;
 use crate::gguf_input;
-use crate::hfq::QuantType;
-use crate::pipeline_gguf::GgufFormat;
-use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
+use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
@@ -2460,6 +2438,7 @@ mod tq2g128_tests {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn quantize_tq2g128_gptq(
     f32_data: &[f32],
     col_weights: &[f32],
@@ -2620,26 +2599,11 @@ mod tq2g128_gptq_tests {
             .collect()
     }
 
-    /// `tq2_pack_stats` is the shipping guard's eye: it must count the two
-    /// things that silently broke real requants — how much of the model got
-    /// zeroed, and whether any out-of-set code was emitted.
-    #[test]
-    fn tq2_pack_stats_counts_zeros_and_out_of_set_codes() {
-        // One block, 128 codes. Byte 0 = codes [0,1,2,3] (LSB-first, 2 b each)
-        // = 0b11_10_01_00 = 0xE4. Remaining 31 bytes = 0x55 = codes [1,1,1,1],
-        // i.e. all zero-level.
-        let mut blk = vec![0u8; 34];
-        blk[0..2].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
-        blk[2] = 0xE4;
-        for b in blk.iter_mut().skip(3) {
-            *b = 0x55;
-        }
-
-        let st = tq2_pack_stats(&blk);
-        assert_eq!(st.n_codes, 128);
-        // Non-zero = code != 1 → the 0, 2 and 3 in byte 0.
-        assert_eq!(st.nonzero, 3);
-        assert_eq!(st.out_of_set, 1, "exactly one code 3");
+    /// Fraction of TQ2G128 codes (34 B/block: `[f16 d][32 B codes]`) that
+    /// decode to a non-zero level, i.e. code != 1.
+    fn nonzero_fraction(packed: &[u8]) -> f64 {
+        let codes = tq2_codes(packed);
+        codes.iter().filter(|&&c| c != 1).count() as f64 / codes.len() as f64
     }
 
     /// Raw 2-bit codes out of a TQ2G128 buffer (34 B/block: [f16 d][32 B qs]).
@@ -2716,7 +2680,7 @@ mod tq2g128_gptq_tests {
         let plain = quantize_tq2g128(&g);
         let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
 
-        let nz = tq2_pack_stats(&gptq).nonzero_fraction();
+        let nz = nonzero_fraction(&gptq);
         assert!(
             (0.45..=0.80).contains(&nz),
             "swept-scale ternary should keep roughly half the weights alive on \
@@ -2801,6 +2765,7 @@ mod bq1g128_tests {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn quantize_bq1g128_gptq(
     f32_data: &[f32],
     col_weights: &[f32],
@@ -3569,13 +3534,8 @@ mod mq2_lloyd_anchored_tests {
             .map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0)
             .collect();
         let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
-        for blk in out.chunks_exact(72) {
-            for &b in &blk[8..] {
-                for j in 0..4 {
-                    assert!(((b >> (j * 2)) & 0x3) <= 3);
-                }
-            }
-        }
+        // Two 256-weight groups: 8 header bytes + 64 bytes of 2-bit indices each.
+        assert_eq!(out.len(), 2 * 72);
         // Canonical hyphen and underscore aliases resolve to Mq2LloydAnchored,
         // remaining distinct from the affine MQ2V2 path.
         assert_eq!(
@@ -3592,158 +3552,6 @@ mod mq2_lloyd_anchored_tests {
         );
         assert_ne!(GgufFormat::Mq2LloydAnchored, GgufFormat::Mq2V2);
     }
-}
-
-/// Code-level statistics of a packed TQ2G128 buffer.
-#[derive(Default, Debug, Clone, Copy)]
-struct Tq2PackStats {
-    /// Codes decoding to a non-zero level (i.e. code != 1).
-    nonzero: u64,
-    /// Codes equal to 3 — outside the ternary set, decoding to +2d.
-    out_of_set: u64,
-    n_codes: u64,
-}
-
-impl Tq2PackStats {
-    fn add(&mut self, o: Tq2PackStats) {
-        self.nonzero += o.nonzero;
-        self.out_of_set += o.out_of_set;
-        self.n_codes += o.n_codes;
-    }
-    fn nonzero_fraction(&self) -> f64 {
-        if self.n_codes == 0 {
-            return 0.0;
-        }
-        self.nonzero as f64 / self.n_codes as f64
-    }
-}
-
-/// Count zero / non-zero / out-of-set codes in a TQ2G128 buffer
-/// (34 B per 128-weight block: `[f16 d][32 B codes]`, 4 codes per byte).
-fn tq2_pack_stats(data: &[u8]) -> Tq2PackStats {
-    let mut st = Tq2PackStats::default();
-    for blk in data.chunks_exact(34) {
-        for &byte in &blk[2..] {
-            for j in 0..4 {
-                let code = (byte >> (j * 2)) & 0x3;
-                st.n_codes += 1;
-                if code != 1 {
-                    st.nonzero += 1;
-                }
-                if code == 3 {
-                    st.out_of_set += 1;
-                }
-            }
-        }
-    }
-    st
-}
-
-/// Refuse to write a ternary model that the code histogram says is broken.
-///
-/// This is the cheap observable that would have caught both shipped defects
-/// immediately, without a GPU or an eval:
-///
-///   * `d = max|w|` as an ENCODER zeroed 83.7% of a real 27B requant (16.3%
-///     non-zero). Healthy is ~54% (Gaussian MSE optimum) to ~69% (PrismML's
-///     own Bonsai ternary). A model below `MIN_NONZERO` is not "lossy", it is
-///     mostly deleted.
-///   * code 3 decodes to `+2d` in both decoders, turning the quantizer into an
-///     asymmetric 4-level one. PrismML never emits it; neither should we.
-///
-/// `--allow-degenerate-ternary` (env HIPFIRE_ALLOW_DEGENERATE_TERNARY) downgrades
-/// this to a warning. Read at the CLI boundary, never inside the pipeline:
-/// a getenv racing another test's setenv in a threaded test binary is unsound.
-fn check_ternary_pack_health(st: Tq2PackStats, allow_degenerate: bool) {
-    const MIN_NONZERO: f64 = 0.25;
-    if st.n_codes == 0 {
-        return;
-    }
-    let nz = st.nonzero_fraction();
-    eprintln!(
-        "ternary pack health: {:.1}% non-zero codes ({} of {}), {} out-of-set",
-        nz * 100.0,
-        st.nonzero,
-        st.n_codes,
-        st.out_of_set
-    );
-    let degenerate = nz < MIN_NONZERO;
-    if !degenerate && st.out_of_set == 0 {
-        return;
-    }
-    let mut why = Vec::new();
-    if degenerate {
-        why.push(format!(
-            "only {:.1}% of codes are non-zero (expected >={:.0}%; healthy 54-69%) \
-             — {:.1}% of the model is zeroed",
-            nz * 100.0,
-            MIN_NONZERO * 100.0,
-            (1.0 - nz) * 100.0
-        ));
-    }
-    if st.out_of_set > 0 {
-        why.push(format!(
-            "{} codes are 3, which decodes to +2d (outside the ternary set)",
-            st.out_of_set
-        ));
-    }
-    let msg = why.join("; ");
-    if allow_degenerate {
-        eprintln!(
-            "WARNING: degenerate ternary pack ({msg}) — allowed by --allow-degenerate-ternary"
-        );
-        return;
-    }
-    eprintln!("error: refusing to write a degenerate ternary model: {msg}.");
-    eprintln!(
-        "       Set HIPFIRE_ALLOW_DEGENERATE_TERNARY=1 to write it anyway (it will \
-         not serve coherently)."
-    );
-    std::process::exit(3);
-}
-
-/// Per-input-column importance weights for a requantized tensor.
-///
-/// Returns the `--imatrix` row for `name` when one was supplied and its length
-/// is a usable multiple of the 128 group, else all-ones (a pure unweighted-MSE
-/// scale search). The GPTQ packers slice this as
-/// `col_weights[(b % blocks_per_row) * 128 ..][..128]`, so the length must be a
-/// multiple of 128 — an all-ones length-128 vector makes every block reuse the
-/// same (uniform) weights, which is exactly the no-imatrix behaviour.
-
-fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
-    if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
-        return Ok(());
-    }
-    let bpw = if matches!(format, GgufFormat::Binary) {
-        "1.14"
-    } else {
-        "2.125"
-    };
-    Err(format!(
-        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint into a \
-         UNIFORM {bpw}-bpw level set, which is a measured collapse — not a supported \
-         build.\n\
-         \n\
-         Measured on qwen3.6-27b (KLD vs the mq4 teacher, 8 chunks):\n\
-         \x20 ternary uniform            2.125 bpw  KLD 5.10  PPL 1436   (token soup)\n\
-         \x20 ternary + AWQ imatrix      2.125 bpw  KLD 2.24  PPL   86.6 (immediate EOS)\n\
-         \x20 mq2lloyd (non-uniform)     2.25  bpw  KLD 0.61  PPL   17.0 (usable)\n\
-         \x20 PrismML Bonsai ternary     2.125 bpw  KLD 0.54  PPL   16.7\n\
-         \n\
-         The bit budget is NOT the problem — the fixed uniform level set is. Q2_0/Q1_0 \
-         leave the encoder only the block scale to choose, and no scale search or \
-         importance weighting recovers it.\n\
-         \n\
-         For ~2 bpw from an ordinary checkpoint use --format mq2lloyd instead. \
-         Ternary/binary ship coherently as byte-verbatim passthrough of an \
-         already-transformed source (PrismML Bonsai Q2_0/Q1_0) — convert that GGUF \
-         directly.\n\
-         \n\
-         To do it anyway for research, pass --allow-lowbit-ptq or set \
-         HIPFIRE_ALLOW_LOWBIT_PTQ=1.",
-        format.label(),
-    ))
 }
 
 // ─── Maple native-ternary packing (MQ2G256LloydU, qt=51) ────────────────────
@@ -3843,6 +3651,7 @@ pub(crate) fn quantize_mq2g256_ternary_exact(f32_data: &[f32]) -> Result<Vec<u8>
     Ok(output)
 }
 
+#[cfg(test)]
 /// Dequantize `MQ2G256LloydU`. Identical to [`dequantize_mq2g256_lloyd_to_f32`]
 /// minus the `cpu_inv_fwht_256` step: these weights are already in the natural
 /// basis.

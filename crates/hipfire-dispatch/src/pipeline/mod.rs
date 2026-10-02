@@ -44,6 +44,8 @@ pub use layer_ops::{
     project_weight, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp, GatedDeltaNetOp,
     GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
     IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp,
+    qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
+    QsaProjectionHook,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, validate_steps, FusedPattern, GemvInput, Step,
@@ -108,7 +110,7 @@ fn select_grouped_route(
         table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
     };
     match policy.capability {
-        MoeRouteCapability::Qt44Qt53Grouped
+        MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
             if policy.capability.admitted_on()
                 && crate::families::moe::grouped_route_geometry_supported(
                     &policy,
@@ -2958,7 +2960,7 @@ fn decode_gate_side_stage(
                 shared_up_w.m,
                 p.router.k,
             ))?;
-        } else if route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+        } else if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
             && [&p.router, shared_expert_gate, shared_gate_w, shared_up_w]
                 .iter()
                 .all(|w| w.awq_scale.is_none() && w.k == p.router.k)
@@ -3114,7 +3116,7 @@ fn decode_gate_side_stage(
       // grouped route's consumers round what they read themselves (the top-10
       // router its logits, `shared_expert_activation_bf16_f32` the selector
       // and the shared gate/up), so no pass is owed here.
-    if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if p.recipe.bf16_round_trip() && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         // The decode step program is single-row (`build_moe_decode` binds
         // `batch_size: 1`), but every scratch buffer is sized for the prefill
         // chunk cap (512 rows). Rounding the whole buffer would carry 512x the
@@ -3173,7 +3175,7 @@ fn decode_route_gpu_stage(
       // the root-authoritative IDs (a per-rank re-ranking is exactly the
       // divergence this removes).
     if !skip_routing {
-        if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+        if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             hip!(gpu.moe_router_softmax_top10_f32(
                 p.router_logits,
                 p.topk_indices,
@@ -3230,7 +3232,7 @@ fn decode_route_gpu_stage(
             ))?;
         }
         // The grouped top-10 router stores its weights BF16-rounded itself.
-        if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
+        if p.recipe.bf16_round_trip() && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }
@@ -3262,7 +3264,7 @@ fn decode_shared_down_stage(
     // still ran above (fused with the router GEMV) — only the down/accumulate
     // is skipped here. Accumulates into `out_target` (= the EP partial when
     // `routed_out` is set, else `x_residual`).
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.skip_shared {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) && !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
             // Single-row decode consumes only selector scalar[0] for the
@@ -3511,7 +3513,7 @@ fn decode_gate_up_stage(
     // before representative MQ4V2/MQ6V2/V1 arms. Uniform shortcut only
     // when gate_up exact DType equality (per_expert_gate_up uniform).
     let gate_up_varies = gate_up_varies(p.dtypes.per_expert_gate_up.as_deref());
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
             .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
@@ -3727,7 +3729,7 @@ fn qt44_shared_activation_in_routed(
     p: &crate::families::moe::MoeParams<'_>,
     route: Option<MoeRouteCapability>,
 ) -> bool {
-    route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+    route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
         && p.recipe.bf16_round_trip()
         && !p.skip_shared
         && p.ep_mode == crate::families::moe::MoeEpMode::None
@@ -3743,7 +3745,7 @@ fn decode_activation_stage(
     route: Option<MoeRouteCapability>,
     shared_views: Option<(&GpuTensor, &GpuTensor)>,
 ) -> Result<(), DispatchError> {
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots =
             p.k.checked_mul(p.mi)
                 .ok_or_else(|| DispatchError::Hip("MoE routed slot width overflows".into()))?;
@@ -3863,7 +3865,7 @@ fn decode_down_stage(
     let out_target = target;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
             .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
@@ -4383,7 +4385,7 @@ fn decode_combine_stage(
     target: &GpuTensor,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         hip!(gpu.moe_down_combine_top10_batched(
             &down_expanded,
@@ -4406,7 +4408,7 @@ fn decode_combine_stage(
     // The grouped route's shared stage then adds into this same target with
     // `bf16_scaled_add`, which rounds the residual it reads: the round trip is
     // owed only when nothing follows (mirrors the grouped prefill combine).
-    let shared_add_follows = route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+    let shared_add_follows = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
         && p.recipe.shared_after_combine()
         && !p.skip_shared
         && p.ep_mode == crate::families::moe::MoeEpMode::None;

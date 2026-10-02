@@ -15,3 +15,4 @@ description = "saddle — target-agnostic model composition: grammar, KV, capabi
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }
+serde_json = { version = "1", features = ["preserve_order"] }

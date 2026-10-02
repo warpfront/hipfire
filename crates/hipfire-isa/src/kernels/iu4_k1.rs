@@ -3,7 +3,7 @@
 //! The eight (column-block, row-group) accumulators are contiguous V8 ranges.
 //! Each pair follows the pinned K1 arithmetic DAG: `float(C)-12582912`,
 //! `RN(scale*d)`, `RN(acc + scale*d*(float(C)-12582912))`.
-use crate::{Builder, KernargLayout, V, kernels::iu4_gemm::spec::MAGIC, reg::{Vb, Vp}, vopd::{Src0, VopdF32, VopdF32Op}};
+use crate::{Builder, KernargLayout, V, kernels::iu4_fold::MAGIC, reg::{Vb, Vp}, vopd::{Src0, VopdF32, VopdF32Op}};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Variant { FullSet, FullAdd, GateUpSilu }

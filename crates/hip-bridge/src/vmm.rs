@@ -4,6 +4,14 @@
 //! is invalid for addresses reserved through the VMM API. `VmmArena` therefore
 //! keeps physical handles and mapping ranges separate and requires an explicit
 //! [`VmmArena::release`] call.
+//!
+//! A released arena's virtual address range is never returned to the driver.
+//! On ROCm 7.14+/gfx1201 a VA that was mapped, unmapped, and mapped again keeps
+//! translating to its first backing: kernels read the previous owner's pages.
+//! `hipMemAddressFree` followed by a hint-less `hipMemAddressReserve` hands the
+//! same range back, so every model unload -> load in one process hit that.
+//! Keeping the range reserved (see [`retired_va_bytes`]) means no later
+//! reservation or `hipMalloc` can land on a VA the GPU has translated before.
 
 use crate::{
     DeviceBuffer, HipError, HipMemAccessDesc, HipMemAllocationProp, HipMemGenericAllocationHandle,
@@ -11,6 +19,60 @@ use crate::{
 };
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::sync::Mutex;
+
+/// Retired VA a process may accumulate before new reservations are refused.
+/// User VA is 47 bits (128 TiB); one model load reserves tens of GiB of KV.
+const RETIRED_VA_CAP_BYTES: usize = 64 << 40;
+
+/// Virtual ranges released by [`VmmArena::release`] but kept reserved.
+struct RetiredVa {
+    ranges: usize,
+    bytes: usize,
+}
+
+impl RetiredVa {
+    const fn new() -> Self {
+        Self {
+            ranges: 0,
+            bytes: 0,
+        }
+    }
+
+    fn retire(&mut self, bytes: usize) {
+        self.ranges += 1;
+        self.bytes += bytes;
+    }
+
+    fn admit(&self, requested_bytes: usize, cap_bytes: usize) -> HipResult<()> {
+        if self.bytes.saturating_add(requested_bytes) > cap_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM reserve of {requested_bytes} bytes refused: {} bytes of virtual address \
+                     space in {} ranges are retired by earlier unloads (cap {cap_bytes}); restart \
+                     the process to reclaim it",
+                    self.bytes, self.ranges
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+static RETIRED_VA: Mutex<RetiredVa> = Mutex::new(RetiredVa::new());
+
+fn retired_va() -> std::sync::MutexGuard<'static, RetiredVa> {
+    RETIRED_VA
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Bytes of virtual address space retired (kept reserved) by released arenas
+/// in this process.
+pub fn retired_va_bytes() -> usize {
+    retired_va().bytes
+}
 
 /// Deterministic, test-only fault injection for VMM teardown/access stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,8 +152,10 @@ pub struct VmmArena {
     releasing: bool,
 }
 
-// The HIP process address and allocation handles may move with model state.
-// Concurrent mutation is still excluded because VmmArena is not Sync.
+// SAFETY: VmmArena holds a device VA base and opaque HIP allocation handles that
+// may move with model state across threads. Concurrent mutation is excluded
+// because VmmArena is not Sync; callers must not free/unmap while another thread
+// still has in-flight work on the mapped prefix.
 unsafe impl Send for VmmArena {}
 
 impl VmmArena {
@@ -121,6 +185,7 @@ impl VmmArena {
             ));
         }
         let reserved_bytes = round_up(requested_bytes, granularity)?;
+        retired_va().admit(reserved_bytes, RETIRED_VA_CAP_BYTES)?;
         let base = hip.mem_address_reserve(reserved_bytes, granularity)?;
 
         Ok(Self {
@@ -147,6 +212,12 @@ impl VmmArena {
         self.reserved_bytes
     }
 
+    /// The primary physical allocation handle backing this arena, if any mapped
+    /// segment exists. Exposed so callers can query the handle's placement with
+    /// `HipRuntime::mem_get_handle_properties` (fail-closed host-located check).
+    pub fn primary_handle(&self) -> Option<HipMemGenericAllocationHandle> {
+        self.segments.first().and_then(|seg| seg.handle)
+    }
     pub const fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
     }
@@ -233,7 +304,11 @@ impl VmmArena {
         let prop = HipMemAllocationProp::device_pinned(self.owner_device);
         let handle = hip.mem_create(size, &prop)?;
         let address = offset_ptr(self.base, self.mapped_bytes);
+        // SAFETY: `address` is base+mapped_bytes within the live reserved VA;
+        // `size` is a granularity multiple and fits the remaining reserve;
+        // `handle` is a fresh owned allocation covering `size`, not yet mapped.
         if let Err(err) = unsafe { hip.mem_map(address, size, handle) } {
+            // SAFETY: map failed so no range references `handle`; release is exclusive.
             return match unsafe { hip.mem_release(handle) } {
                 Ok(()) => Err(err),
                 Err(cleanup) => {
@@ -254,6 +329,9 @@ impl VmmArena {
         // reservation base over the contiguous mapped prefix is accepted and
         // also ensures newly-added peer devices gain access to older segments.
         if let Err(err) = take_fault(VmmFaultKind::AccessReset).map_or_else(
+            // SAFETY: `self.base..+next_mapped` is the contiguous mapped prefix
+            // (just extended by mem_map); `access` lists only owner/peer devices
+            // already validated for peer access.
             || unsafe { hip.mem_set_access(self.base, next_mapped, &access) },
             Err,
         ) {
@@ -277,9 +355,12 @@ impl VmmArena {
                 handle: Some(handle),
                 mapped: true,
             };
+            // SAFETY: `address,size` is the segment just mapped; no kernels are
+            // scheduled on it yet (map_next is pre-use). Unmap before release.
             let cleanup_error = match unsafe { hip.mem_unmap(address, size) } {
                 Ok(()) => {
                     segment.mapped = false;
+                    // SAFETY: unmapped so no mapped range still references handle.
                     match unsafe { hip.mem_release(handle) } {
                         Ok(()) => {
                             segment.handle = None;
@@ -290,19 +371,21 @@ impl VmmArena {
                 }
                 Err(cleanup) => Some(cleanup),
             };
+            // Poison the arena even when cleanup succeeded: a retried map_next
+            // would map a new handle at `address`, which the GPU may still
+            // translate to the handle released above.
+            self.releasing = true;
             return match cleanup_error {
                 None => Err(err),
                 Some(cleanup) => {
                     self.segments.push(segment);
-                    self.releasing = true;
                     Err(combined_cleanup_error(err, cleanup))
                 }
             };
         }
 
         // Commit newly requested peer permissions only after the driver has
-        // accepted them. A failed expansion must remain retryable with the
-        // arena's previous permission set.
+        // accepted them.
         self.access_devices = next_access_devices;
         self.segments.push(VmmSegment {
             offset: self.mapped_bytes,
@@ -334,6 +417,8 @@ impl VmmArena {
                 ),
             ));
         }
+        // SAFETY: base is a live reserved VA; logical_bytes <= mapped_bytes
+        // (checked above). Borrowed wrapper must not outlive the arena or be freed.
         Ok(unsafe { DeviceBuffer::from_raw(self.base, logical_bytes) })
     }
 
@@ -366,7 +451,8 @@ impl VmmArena {
         ))
     }
 
-    /// Unmap every segment, release every physical handle, then free the VA.
+    /// Unmap every segment and release every physical handle. The VA range is
+    /// kept reserved and retired, never freed (see the module docs).
     /// Cleanup continues after an individual failure and returns the first one.
     pub fn release(&mut self, hip: &HipRuntime) -> HipResult<()> {
         if self.is_released() {
@@ -379,47 +465,42 @@ impl VmmArena {
         }
         hip.set_device(self.owner_device)?;
         let base = self.base;
-        let mut first_error = cleanup_segments(
+        let result = cleanup_segments(
             &mut self.segments,
             |offset, size| {
                 if let Some(err) = take_fault(VmmFaultKind::Unmap) {
                     return Err(err);
                 }
+                // SAFETY: offset/size come from tracked segments; release() already
+                // device_synchronize'd every access device so in-flight work is
+                // quiesced before unmap. base is the arena's reserved VA.
                 unsafe { hip.mem_unmap(offset_ptr(base, offset), size) }
             },
             |handle| {
                 if let Some(err) = take_fault(VmmFaultKind::Release) {
                     return Err(err);
                 }
+                // SAFETY: called after the segment's map is unmapped (cleanup_segments
+                // order); handle is owned and no mapped range should still reference it.
                 unsafe { hip.mem_release(handle) }
             },
-        )
-        .err();
+        );
 
         if self.segments.is_empty() {
-            match unsafe { hip.mem_address_free(self.base, self.reserved_bytes) } {
-                Ok(()) => {
-                    self.base = std::ptr::null_mut();
-                    self.reserved_bytes = 0;
-                    self.mapped_bytes = 0;
-                    self.access_devices.clear();
-                }
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
+            retired_va().retire(self.reserved_bytes);
+            self.base = std::ptr::null_mut();
+            self.reserved_bytes = 0;
+            self.mapped_bytes = 0;
+            self.access_devices.clear();
         }
 
-        match first_error {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        result
     }
 }
 
 fn offset_ptr(base: *mut c_void, offset: usize) -> *mut c_void {
+    // SAFETY: callers pass base from a live VmmArena reserve and offset within
+    // reserved_bytes (map_next / release segment bookkeeping). u8 add; no deref.
     unsafe { (base as *mut u8).add(offset) as *mut c_void }
 }
 
@@ -563,5 +644,21 @@ mod tests {
         assert!(take_fault(VmmFaultKind::Unmap).is_none());
         assert!(take_fault(VmmFaultKind::Release).is_none());
         assert!(take_fault(VmmFaultKind::AccessReset).is_none());
+    }
+
+    #[test]
+    fn retired_va_budget_admits_up_to_the_cap_then_refuses() {
+        let cap = 64usize << 20;
+        let mut retired = RetiredVa::new();
+        retired.admit(cap, cap).unwrap();
+        retired.retire(24 << 20);
+        retired.retire(8 << 20);
+        retired.admit(cap - (32 << 20), cap).unwrap();
+        let err = retired.admit(cap - (32 << 20) + 1, cap).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(&(32usize << 20).to_string()), "{message}");
+        assert!(message.contains("2 ranges"), "{message}");
+        assert!(message.contains("restart"), "{message}");
+        assert!(retired.admit(usize::MAX, cap).is_err());
     }
 }

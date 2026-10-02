@@ -14,8 +14,8 @@ use crate::serve::complete::{
 };
 use crate::serve::metrics::Metrics;
 use crate::serve::{is_batch_eligible_request, ServeShared};
-use crate::serve::{AdmissionError, AdmissionGuard};
-use crate::{list_local_models, unix_timestamp};
+use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
+use crate::{is_standalone_model, list_local_models, unix_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
@@ -37,7 +37,7 @@ use std::{
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -609,6 +609,62 @@ async fn serve_connection(
     }
 }
 
+/// Format one `/v1/models` entry.
+///
+/// `runtime` is `Some((load facts, effective ctx))` only for the resident
+/// model — the one whose KV capacity, hidden/vocab sizes and modalities are
+/// known from the daemon's load ack. A non-resident entry is an on-disk
+/// discovery candidate with no measured runtime facts, so it gets no
+/// `meta`/`architecture`; llama.cpp fills `meta` for the loaded model only,
+/// for the same reason. `created` (OpenAI-required) is supplied by the caller
+/// from the file mtime and is omitted when unavailable.
+fn model_entry(
+    id: &str,
+    created: Option<u64>,
+    runtime: Option<(&LoadedInfo, u64)>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "id": id,
+        "object": "model",
+        "owned_by": "hipfire",
+    });
+    if let Some(created) = created {
+        entry["created"] = serde_json::json!(created);
+    }
+    if let Some((loaded, n_ctx)) = runtime {
+        let mut meta = serde_json::Map::new();
+        if n_ctx > 0 {
+            meta.insert("n_ctx".to_owned(), serde_json::json!(n_ctx));
+        }
+        if loaded.n_embd > 0 {
+            meta.insert("n_embd".to_owned(), serde_json::json!(loaded.n_embd));
+        }
+        if loaded.n_vocab > 0 {
+            meta.insert("n_vocab".to_owned(), serde_json::json!(loaded.n_vocab));
+        }
+        if !meta.is_empty() {
+            entry["meta"] = serde_json::Value::Object(meta);
+        }
+        // `input_modalities` is what makes a harness enable image attachments;
+        // `vl` from the load ack is the post-gate truth (a tower skipped by
+        // `vision_mode=off` reports false). Gated on a known hidden size so the
+        // load window — resident id set, ack not yet in — cannot advertise
+        // text-only for a model whose facts are simply not known yet.
+        if loaded.n_embd > 0 {
+            let input_modalities = if loaded.vision {
+                vec!["text", "image"]
+            } else {
+                vec!["text"]
+            };
+            entry["architecture"] = serde_json::json!({
+                "input_modalities": input_modalities,
+                "output_modalities": ["text"],
+            });
+        }
+    }
+    entry
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     shared: Arc<ServeShared>,
@@ -625,6 +681,13 @@ async fn handle_request(
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
+            // Every fact here comes from `ServeMeta`, which `ensure_model`
+            // updates as the load completes. `/health` must NOT take
+            // `shared.runtime`: that mutex is held for the whole of a load
+            // (prewarm at startup and request-time loads alike), so reading
+            // through it would block this endpoint — the one every readiness
+            // probe polls — for the duration and report serve as down
+            // (`docs/SERVE.md` § "Detached readiness").
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             // 503 while the daemon is dead or being respawned, so probes and
             // service managers see that requests cannot be served.
@@ -635,7 +698,15 @@ async fn handle_request(
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
                 "token": meta.instance_token,
+                // Route capabilities: the resolved config the slot engine was
+                // built from (multi-slot, prefix cache, structured output).
+                "capabilities": shared.capabilities,
                 "native": true,
+                // Effective context of the resident model: the `max_seq` it was
+                // actually loaded with (KV capacity), not the registry policy
+                // and not the trained window. `null` while no model is resident
+                // (`n_ctx == 0`), so a client cannot read 0 as "zero context".
+                "n_ctx": (meta.n_ctx > 0).then_some(meta.n_ctx),
             });
             let status = if state == crate::serve::EngineState::Up {
                 200
@@ -680,18 +751,68 @@ async fn handle_request(
             resp
         }
         (Method::GET, "/v1/models") => {
-            let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            let local = match list_local_models(&runtime.paths, &runtime.registry) {
-                Ok(m) => m,
-                Err(e) => return openai_error(&e.to_string(), 500),
+            let (local, registry) = {
+                let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                let local = match list_local_models(&runtime.paths, &runtime.registry) {
+                    Ok(m) => m,
+                    Err(e) => return openai_error(&e.to_string(), 500),
+                };
+                (local, runtime.registry.clone())
             };
+            // The served facts come from `ServeMeta` (see `ServeMeta::n_ctx`):
+            // taking the runtime lock for them would hold this endpoint for the
+            // whole of a concurrent model load, since `ensure_model` runs with
+            // that lock held.
+            let (resident, n_ctx, loaded) = {
+                let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+                (meta.current_model.clone(), meta.n_ctx, meta.loaded.clone())
+            };
+            // Discovery contract: every id advertised here must be able to
+            // serve a completion. A sidecar cannot — `qwen3.8-27b-vision.hfq`
+            // embeds `"tokenizer": "{}"` and dies with `tokenizer metadata
+            // field missing or wrong type: model` AFTER a full 64-layer load,
+            // and the DFlash drafts are arch 20/22/23, not serve trunks. An
+            // OpenAI-compatible client picks from this list, so a doomed id
+            // here is a load failure the operator sees as a server fault.
+            // They stay pullable/runnable by tag and still show in `hipfire list`.
+            //
+            // The resident model is always advertised first, even when it is
+            // not a standalone file (a vision tower loaded by path, an
+            // unlisted-suffix tier, a symlinked artifact): it IS loaded, so
+            // naming it is the one id guaranteed to answer without a model
+            // switch. Its validity was established at load time, not by this
+            // filter.
+            let mut data: Vec<serde_json::Value> = Vec::new();
+            if let Some(id) = resident.clone() {
+                // OpenAI's `Model` requires `created`; a local artifact's only
+                // honest value is its file mtime, looked up from the on-disk
+                // listing (the resident is normally a listable file; a sidecar
+                // loaded by path still appears in the listing).
+                let created = local
+                    .iter()
+                    .find(|model| {
+                        model.registry_tag.as_deref() == Some(id.as_str())
+                            || model.name == id
+                            || model.path.to_string_lossy() == id
+                    })
+                    .map(|model| model.created)
+                    .filter(|created| *created > 0);
+                data.push(model_entry(&id, created, Some((&loaded, n_ctx))));
+            }
+            data.extend(
+                local
+                    .into_iter()
+                    .filter(|model| is_standalone_model(&model.path, &model.name, &registry))
+                    .map(|model| {
+                        let created = (model.created > 0).then_some(model.created);
+                        (model.registry_tag.unwrap_or(model.name), created)
+                    })
+                    .filter(|(id, _)| Some(id) != resident.as_ref())
+                    .map(|(id, created)| model_entry(&id, created, None)),
+            );
             let body = serde_json::json!({
                 "object": "list",
-                "data": local.into_iter().map(|model| serde_json::json!({
-                    "id": model.registry_tag.unwrap_or(model.name),
-                    "object": "model",
-                    "owned_by": "hipfire",
-                })).collect::<Vec<_>>()
+                "data": data,
             });
             json_response(body, 200)
         }
@@ -1267,6 +1388,7 @@ async fn handle_streaming(
             .pointer("/stream_options/include_usage")
             .and_then(|v| v.as_bool())
             == Some(true),
+        stall_timeout: shared.stream_stall_timeout,
     };
     let role = serde_json::json!({
         "id": sink.id,
@@ -1349,6 +1471,7 @@ async fn handle_nonstreaming(
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
     let staged_tx_for_worker = Arc::clone(&staged_tx);
+    let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
@@ -1375,9 +1498,9 @@ async fn handle_nonstreaming(
                         return Err(hipfire_client::ClientError::Cancelled);
                     }
                 }
-                match ack_rx.recv() {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                match wait_flush_ack(&ack_rx, stall_timeout) {
+                    Ok(()) => Ok(()),
+                    Err(()) => Err(hipfire_client::ClientError::Cancelled),
                 }
             };
             complete_request_cancellable(
@@ -1482,11 +1605,13 @@ impl RequestFailure {
     }
 }
 
-/// HTTP status for a failed completion. A typed daemon error maps on its wire
-/// `class`, never on its message: `validation`, `context_length` and
-/// `unsupported` are the client's to fix (400), `transient` is worth a retry
-/// (503), and every other class is a server fault (500). Only gateway-side
-/// errors, which carry no class, fall back to matching their message.
+/// HTTP status for a failed completion, by error TYPE, never by message. A
+/// typed daemon error maps on its wire `class`: `validation`,
+/// `context_length` and `unsupported` are the client's to fix (400),
+/// `transient` and the multi-slot engine's `overload` (capacity) are worth a
+/// retry (503), and every other class is a server fault (500). Gateway-side
+/// errors are 400 when they carry [`InvalidRequest`](crate::serve::InvalidRequest),
+/// 404 for [`ModelNotFound`](crate::serve::ModelNotFound), else 500.
 pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     use hipfire_client::error_class;
     let typed = error
@@ -1496,22 +1621,14 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     if let Some(typed) = typed {
         return match typed.class.as_str() {
             error_class::VALIDATION | error_class::CONTEXT_LENGTH | error_class::UNSUPPORTED => 400,
-            error_class::TRANSIENT => 503,
+            error_class::TRANSIENT | error_class::OVERLOAD => 503,
             _ => 500,
         };
     }
-    let lower = error.to_string().to_ascii_lowercase();
-    if lower.contains("model not found") {
-        404
-    } else if lower.contains("kv budget")
-        || lower.contains("max_tokens")
-        || lower.contains("invalid")
-        || lower.contains("required")
-        || lower.contains("endpoint adapter")
-        || lower.contains("lossy")
-        || lower.contains("malformed canonical tool call")
-    {
+    if error.chain().any(|cause| cause.is::<crate::serve::InvalidRequest>()) {
         400
+    } else if error.chain().any(|cause| cause.is::<crate::serve::ModelNotFound>()) {
+        404
     } else {
         500
     }
@@ -1536,7 +1653,11 @@ pub(crate) fn request_id() -> String {
 }
 
 pub(crate) fn sse_data(value: &serde_json::Value) -> Vec<u8> {
-    format!("data: {}\n\n", value).into_bytes()
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut bytes, value).expect("serializing a JSON value cannot fail");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
 }
 
 /// Commit point of one SSE response, shared by the handler and its worker.
@@ -1571,11 +1692,40 @@ struct SseSink {
     created: u64,
     model: String,
     include_usage: bool,
+    /// Multi-slot route only (`serve.stream_stall_timeout_ms`): how long a
+    /// consumer may leave the response channel full, or the terminal frame
+    /// unflushed, before the request is aborted and its permit released.
+    /// `None` (standard route) waits for as long as the connection lives.
+    stall_timeout: Option<Duration>,
+}
+
+/// How often a stalled send re-checks the channel.
+const STALL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Wait for a frame's flush ack. With a stall bound, a client that never
+/// reads the body is given up on after `stall_timeout` instead of pinning the
+/// worker and its admission permit.
+fn wait_flush_ack(
+    ack_rx: &std::sync::mpsc::Receiver<Result<(), ()>>,
+    stall_timeout: Option<Duration>,
+) -> Result<(), ()> {
+    let outcome = match stall_timeout {
+        None => ack_rx.recv().map_err(|_| ()),
+        Some(limit) => ack_rx.recv_timeout(limit).map_err(|error| {
+            if error == std::sync::mpsc::RecvTimeoutError::Timeout {
+                eprintln!(
+                    "[hipfire] response not flushed within serve.stream_stall_timeout_ms; aborting"
+                );
+            }
+        }),
+    };
+    outcome.and_then(|ack| ack)
 }
 
 impl SseSink {
     /// Send one frame, committing the response first if this is the first.
-    /// A dropped receiver maps to `Cancelled`.
+    /// A dropped receiver, or (multi-slot) a channel left full for the stall
+    /// timeout, maps to `Cancelled`.
     fn send(&self, chunk: ResponseChunk) -> Result<(), hipfire_client::ClientError> {
         if !self.committed.get() {
             // Only this worker ever rejects, and only after its last send, so
@@ -1583,9 +1733,34 @@ impl SseSink {
             let _ = commit_stream(&self.commit);
             self.committed.set(true);
         }
-        self.tx
-            .blocking_send(chunk)
-            .map_err(|_| hipfire_client::ClientError::Cancelled)
+        let Some(limit) = self.stall_timeout else {
+            return self
+                .tx
+                .blocking_send(chunk)
+                .map_err(|_| hipfire_client::ClientError::Cancelled);
+        };
+        let deadline = Instant::now() + limit;
+        let mut chunk = chunk;
+        loop {
+            match self.tx.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(hipfire_client::ClientError::Cancelled);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        eprintln!(
+                            "[hipfire] {}: stream consumer stalled past serve.stream_stall_timeout_ms; aborting",
+                            self.id
+                        );
+                        return Err(hipfire_client::ClientError::Cancelled);
+                    }
+                    std::thread::sleep(STALL_RETRY_INTERVAL.min(deadline - now));
+                    chunk = returned;
+                }
+            }
+        }
     }
 
     /// Forward one logical generate event. Delta-bearing events serialize to
@@ -1616,10 +1791,8 @@ impl SseSink {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
         self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
-        match ack_rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
-        }
+        wait_flush_ack(&ack_rx, self.stall_timeout)
+            .map_err(|()| hipfire_client::ClientError::Cancelled)
     }
 
     /// Close the body after `complete_request_cancellable`.
@@ -1947,8 +2120,8 @@ mod tests {
         ))
     }
 
-    /// A typed daemon error gets its status from `class`, whatever its text
-    /// says; only classless gateway errors are matched by message.
+    /// A typed daemon error gets its status from `class`, a gateway error
+    /// from its type; no message text is ever read.
     #[test]
     fn request_error_status_maps_daemon_class_before_message() {
         for (class, status) in [
@@ -1966,8 +2139,8 @@ mod tests {
                 "class {class}"
             );
         }
-        // Text that the gateway fallback reads as a client error does not
-        // override a server-fault class, and vice versa.
+        // Text that reads like a client error does not override a
+        // server-fault class, and vice versa.
         assert_eq!(
             request_error_status(&typed_daemon_error("internal", "invalid state: required")),
             500
@@ -1984,17 +2157,88 @@ mod tests {
             ),
             503
         );
-        // Classless gateway errors keep the message fallback.
+        // Gateway errors map by type, through context layers.
         assert_eq!(
-            request_error_status(&anyhow!("max_tokens must be between 1 and 393216")),
+            request_error_status(
+                &crate::serve::invalid_request!("unsupported tool_choice value: x")
+                    .context("projecting request")
+            ),
             400
         );
-        assert_eq!(request_error_status(&anyhow!("model not found: x")), 404);
+        assert_eq!(
+            request_error_status(&anyhow::Error::new(crate::serve::ModelNotFound(
+                "model not found: x".into()
+            ))),
+            404
+        );
+        // Untyped errors are server faults, whatever their wording.
+        for message in [
+            "boom",
+            "max_tokens must be between 1 and 393216",
+            "model not found: x",
+            "invalid state: required",
+        ] {
+            assert_eq!(request_error_status(&anyhow!("{message}")), 500, "{message}");
+        }
         assert_eq!(
             request_error_status(&anyhow::Error::new(hipfire_client::ClientError::Protocol(
-                "failed to serialize request".into()
+                "malformed canonical tool call: x".into()
             ))),
             500
         );
+    }
+
+    #[test]
+    fn model_entry_publishes_runtime_facts_only_for_the_resident_model() {
+        let loaded = LoadedInfo {
+            vision: false,
+            n_embd: 2048,
+            n_vocab: 248320,
+        };
+        let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
+        assert_eq!(resident["created"], serde_json::json!(1790385975u64));
+        assert_eq!(resident["meta"]["n_ctx"], serde_json::json!(82944u64));
+        assert_eq!(resident["meta"]["n_embd"], serde_json::json!(2048u64));
+        assert_eq!(resident["meta"]["n_vocab"], serde_json::json!(248320u64));
+        assert_eq!(
+            resident["architecture"]["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            resident["architecture"]["output_modalities"],
+            serde_json::json!(["text"])
+        );
+
+        // A non-resident candidate keeps only the spec-required fields plus
+        // `created`; nothing measured is advertised for it.
+        let candidate = model_entry("qwen3.6:27b", Some(1780057933), None);
+        assert_eq!(candidate["created"], serde_json::json!(1780057933u64));
+        assert!(candidate.get("meta").is_none());
+        assert!(candidate.get("architecture").is_none());
+    }
+
+    #[test]
+    fn model_entry_advertises_image_input_only_when_a_tower_loaded() {
+        let vision = LoadedInfo {
+            vision: true,
+            n_embd: 5120,
+            n_vocab: 248320,
+        };
+        let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
+        assert_eq!(
+            entry["architecture"]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn model_entry_omits_unmeasured_facts_before_the_load_ack() {
+        // Resident id set, ack not in yet: every runtime fact is unknown, so
+        // nothing may be invented — not even a text-only modality claim.
+        let empty = LoadedInfo::default();
+        let entry = model_entry("qwen3.5:2b", None, Some((&empty, 0)));
+        assert!(entry.get("created").is_none());
+        assert!(entry.get("meta").is_none());
+        assert!(entry.get("architecture").is_none());
     }
 }

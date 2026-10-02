@@ -794,8 +794,11 @@ mod tests {
     }
 
     #[test]
-    fn head_quant_parses_and_defaults_to_bf16() {
-        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Bf16);
+    fn head_quant_parses_and_defaults_to_q8() {
+        // q8 is the shipped default: it measures the SAME mean KL as bf16 on
+        // a 2048-token teacher-forced comparison and decodes ~23% faster, so
+        // a bf16 head is strictly dominated (see the enum's doc comment).
+        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Q8);
         assert_eq!(
             "bf16".parse::<MapleHeadQuant>().unwrap(),
             MapleHeadQuant::Bf16

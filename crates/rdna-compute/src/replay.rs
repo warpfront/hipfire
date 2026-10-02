@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hip_bridge::memory_effects::{self, MemoryEffects};
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
@@ -2845,6 +2846,39 @@ fn gfx1151_entry_acquire_policy_from_value(
     }
 }
 
+/// Pool for retained PM4 kernarg segments.
+///
+/// Default `vram`: a host-writable GPU-agent pool. Kernels whose prologue
+/// chains dependent kernarg `s_load`s otherwise pay host-memory latency on
+/// every round (gfx1100 H2: 1.4-1.6 ms/token of in-IB span).
+/// `HIPFIRE_PM4_KERNARG_POOL=host` keeps the CPU-agent fine-grained pool, as
+/// do small-BAR systems. The host patches these segments between replays, so
+/// VRAM placement relies on the IB entry ACQUIRE_MEM invalidating GL2 and the
+/// scalar cache; a gfx1151 non-system entry acquire keeps the host pool.
+fn retained_kernarg_pool(
+    device: &GpuDevice,
+    host_pool: &KernargPool,
+    entry_acquire: Gfx11EntryAcquirePolicy,
+) -> KernargPool {
+    let requested = hipfire_config::process_value("HIPFIRE_PM4_KERNARG_POOL")
+        .unwrap_or_else(|| "vram".to_owned());
+    let fallback = if requested.eq_ignore_ascii_case("host") {
+        "HIPFIRE_PM4_KERNARG_POOL=host".to_owned()
+    } else if entry_acquire != Gfx11EntryAcquirePolicy::System {
+        format!("entry acquire {entry_acquire:?} does not invalidate GL2")
+    } else {
+        match KernargPool::discover_host_writable_device_local(device) {
+            Ok(pool) => {
+                eprintln!("[redline] retained PM4 kernargs: pool=vram");
+                return pool;
+            }
+            Err(error) => format!("fallback: {error}"),
+        }
+    };
+    eprintln!("[redline] retained PM4 kernargs: pool=host ({fallback})");
+    host_pool.clone()
+}
+
 impl Pm4WaitPolicy {
     fn from_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -3547,14 +3581,52 @@ pub(crate) fn apply_kernarg_bindings_for_dispatch(
     Ok(())
 }
 
-/// Merge every engine-declared kernarg binding from the retained prefix into the
-/// prepared binding set.
+/// Every kernarg binding the retained replay of `launches[..prefix]` applies,
+/// sorted by `(dispatch, offset)`.
+///
+/// The single owner of the dynamic-slot set: the retained PM4 plan and the
+/// recorded-HIP oracle (`Gpu::replay_recorded_hip_prefix_at`) both build their
+/// bindings here, so the oracle Redline checks PM4 against re-derives exactly
+/// the fields PM4 patches. Three sources, one owner per `(dispatch, offset)`:
+/// the GDN requant frame of every GDN-family launch, the differential position
+/// bindings synthesized from two recordings, and each launch's engine-declared
+/// bindings.
+pub(crate) fn retained_kernarg_bindings(
+    launches: &[RecordedHipLaunch],
+    prefix: usize,
+    synthesized: &[(usize, ReplayKernargBinding)],
+) -> Result<Vec<(usize, ReplayKernargBinding)>, String> {
+    let mut bindings = Vec::new();
+    for (dispatch, launch) in launches.iter().take(prefix).enumerate() {
+        if is_gdn_kernel(&launch.kernel) {
+            // frames = max(1, nt * grid.z): the one helper that decides the
+            // reservation run length for every transport.
+            let frames = gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
+                .map_err(|reason| format!("{}: {reason}", launch.kernel))?;
+            bindings.push((
+                dispatch,
+                ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+            ));
+        }
+    }
+    bindings.extend(
+        synthesized
+            .iter()
+            .filter(|(dispatch, _)| *dispatch < prefix)
+            .copied(),
+    );
+    merge_declared_kernarg_bindings(launches, prefix, &mut bindings)?;
+    bindings.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.offset().cmp(&b.1.offset())));
+    Ok(bindings)
+}
+
+/// Merge every engine-declared kernarg binding from the retained prefix into
+/// `bindings`.
 ///
 /// One owner per `(dispatch, offset)`: a second binding for the same slot would
 /// patch it twice, so the collision is rejected rather than resolved by order.
-/// The recorded-HIP oracle does not need this — it reads each launch's declared
-/// bindings directly — but both transports must agree on which slots are
-/// dynamic, and this is where PM4 records that set.
+/// Only [`retained_kernarg_bindings`] calls this, so PM4 and the recorded-HIP
+/// oracle see the same declared set.
 fn merge_declared_kernarg_bindings(
     launches: &[RecordedHipLaunch],
     prefix: usize,
@@ -3589,10 +3661,19 @@ fn merge_declared_kernarg_bindings(
 }
 
 impl ReplayController {
-    /// Accessor for the synthesized position bindings (for testing and for
-    /// the recorded-HIP oracle to share the same binding set).
+    /// Accessor for the synthesized position bindings (tests; transports use
+    /// [`Self::retained_kernarg_bindings`]).
     pub(crate) fn synthesized_position_bindings(&self) -> &[(usize, ReplayKernargBinding)] {
         &self.synthesized_position_bindings
+    }
+
+    /// The complete retained binding set for the first `prefix` recorded
+    /// launches; see [`retained_kernarg_bindings`].
+    pub(crate) fn retained_kernarg_bindings(
+        &self,
+        prefix: usize,
+    ) -> Result<Vec<(usize, ReplayKernargBinding)>, String> {
+        retained_kernarg_bindings(&self.recorded, prefix, &self.synthesized_position_bindings)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4141,11 +4222,19 @@ enum PreparedPm4Graph {
 }
 
 impl PreparedPm4Graph {
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait_profiled_checked`].
     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
-        // SAFETY: checked variant with string conversion.
+        // SAFETY: checked variant with string conversion; caller upholds PM4 tape liveness.
         unsafe { self.replay_and_wait_profiled_checked() }.map_err(|(error, _)| error.to_string())
     }
 
+    /// # Safety
+    ///
+    /// Every pointer captured in the prepared PM4/IB tape must still refer to
+    /// live Hipfire allocations for this model instance; queues must be idle
+    /// enough for the underlying profiled replay helpers' quiescence contract.
     unsafe fn replay_and_wait_profiled_checked(
         &mut self,
     ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
@@ -4153,6 +4242,7 @@ impl PreparedPm4Graph {
             if let Self::Single(graph) = self {
                 // Execute the instrumented graph once. Reuse the same timestamp
                 // vector for whole-tape timing and the one-line legacy report.
+                // SAFETY: Single-queue tape + bindings still live; see method # Safety.
                 let (timing, spans) = unsafe { graph.replay_and_wait_dispatch_profiled_checked() }
                     .map_err(|(error, q)| (error, q))?;
                 static REPORTED: std::sync::atomic::AtomicBool =
@@ -4164,7 +4254,9 @@ impl PreparedPm4Graph {
             }
         }
         match self {
+            // SAFETY: prepared graph/tape still live; same contract as method # Safety.
             Self::Single(graph) => unsafe { graph.replay_and_wait_profiled_checked() },
+            // SAFETY: phased multi-queue tape still live; errors map to Proven quiescence.
             Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() }
                 .map_err(|error| (error, Quiescence::Proven)),
         }
@@ -4263,6 +4355,9 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
+    /// Last non-empty device-local kernarg segment; publishing it after the
+    /// per-replay patches makes every earlier BAR store GPU-visible.
+    kernarg_publish: Option<usize>,
     /// gfx1010 RELEASE_MEM/WAIT_REG_MEM fence word. Owned for the full
     /// executable lifetime of `graph` so the IB's absolute address stays valid
     /// through every replay; dropped only after queue quiescence via normal
@@ -4382,6 +4477,9 @@ impl PreparedPm4Replay {
                     error: error.to_string(),
                     quiescence: ReplayQuiescence::Proven,
                 })?;
+        }
+        if let Some(index) = self.kernarg_publish {
+            self.kernargs[index].publish_host_writes();
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
         unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(|(error, quiescence)| {
@@ -4518,6 +4616,10 @@ pub struct ReplayController {
     /// active; drained by the post-growth refresh before the next launch or
     /// replay. A replay that observes it armed fails closed (route re-armed).
     binding_refresh_pending: bool,
+    /// This thread's [`memory_effects`] tally when the open capture window
+    /// began, and the memory operations issued inside the last closed window.
+    window_effects_base: MemoryEffects,
+    window_effects: MemoryEffects,
     /// Shadow-only executor override for the next eligible forward.
     shadow_body_route: Option<ShadowBodyRoute>,
 }
@@ -4601,6 +4703,8 @@ impl ReplayController {
             binding_revision: BindingRevision(0),
             tape_resources: BTreeMap::new(),
             binding_refresh_pending: false,
+            window_effects_base: MemoryEffects::default(),
+            window_effects: MemoryEffects::default(),
         }
     }
 
@@ -4719,6 +4823,7 @@ impl ReplayController {
         self.binding_revision = BindingRevision(0);
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
+        self.window_effects = MemoryEffects::default();
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -4969,6 +5074,33 @@ impl ReplayController {
                 self.recorded.len()
             ));
         }
+        self.refuse_effect_incomplete_window()?;
+        // The linear AQL graph submits every recorded kernarg verbatim; only the
+        // GDN requant frame is patched per replay. A position-derived field or
+        // grid would replay at its capture-time value, so such a tape is the
+        // PM4 transport's (which applies every binding) or HIP's.
+        if let Some((dispatch, binding)) = self
+            .retained_kernarg_bindings(prefix)?
+            .into_iter()
+            .find(|(_, binding)| !matches!(binding, ReplayKernargBinding::GdnFrameU32 { .. }))
+        {
+            return Err(format!(
+                "linear AQL cannot rebind the position-derived kernarg at offset {} of dispatch \
+                 {dispatch} ({}); the tape needs the PM4 transport",
+                binding.offset(),
+                self.recorded[dispatch].kernel
+            ));
+        }
+        if let Some(launch) = self.recorded[..prefix]
+            .iter()
+            .find(|launch| launch.grid_binding.is_some())
+        {
+            return Err(format!(
+                "linear AQL cannot rebind the position-derived grid of {}; the tape needs the \
+                 PM4 transport",
+                launch.kernel
+            ));
+        }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
@@ -5209,6 +5341,7 @@ impl ReplayController {
                 self.recorded.len()
             ));
         }
+        self.refuse_effect_incomplete_window()?;
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
@@ -5226,6 +5359,7 @@ impl ReplayController {
         let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
+        let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
         let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
         let mut kernels = Vec::with_capacity(prefix);
@@ -5233,7 +5367,6 @@ impl ReplayController {
         let mut geometries = Vec::with_capacity(prefix);
         let mut bound_explicit_lens = Vec::with_capacity(prefix);
         let mut dynamic_gdn_frames = Vec::new();
-        let mut dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
         let mut dynamic_grids = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
@@ -5258,7 +5391,7 @@ impl ReplayController {
             }
             let kernel = resolved[&key].clone();
             let metadata = kernel.metadata();
-            let mut kernarg = pool
+            let mut kernarg = kernarg_pool
                 .allocate_for(metadata)
                 .map_err(|error| format!("allocate {symbol} kernarg: {error}"))?;
             // Slice 1: typed segments re-encode from `ReplayBindings` (byte-
@@ -5307,30 +5440,10 @@ impl ReplayController {
             device
                 .validate_geometry(geometry)
                 .map_err(|error| format!("{symbol}: {error}"))?;
-            let is_gdn = launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact");
-            if is_gdn {
-                if metadata.kernarg_segment_size < 80 {
-                    return Err(format!(
-                        "{symbol}: loader kernarg is too short for dynamic frame binding"
-                    ));
-                }
-                // Derive the exact reservation run length for this dispatch:
-                // frames = max(1, nt * grid.z) where nt is at kernarg offset 64
-                // and grid.z is the recorded third grid dimension. This is the
-                // single helper that decides consumption for PM4, recorded-blob,
-                // and binding construction.
-                let frames = gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
-                    .map_err(|reason| format!("{symbol}: {reason}"))?;
-                dynamic_kernarg_bindings.push((
-                    kernargs.len(),
-                    ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+            if is_gdn_kernel(&launch.kernel) && metadata.kernarg_segment_size < 80 {
+                return Err(format!(
+                    "{symbol}: loader kernarg is too short for dynamic frame binding"
                 ));
-                // New tapes rely solely on the typed binding above; the legacy
-                // `dynamic_gdn_frames` vector is left empty so replay has exactly
-                // one path that decides frame consumption. Old prepared objects
-                // with a populated legacy vector remain supported via the
-                // de-duplication check in `replay_and_wait_checked`.
             }
             if let Some(binding) = grid_binding_for_storage {
                 let grid_to_store = if self.prepared_max_position.is_some() {
@@ -5340,40 +5453,17 @@ impl ReplayController {
                 };
                 dynamic_grids.push((kernargs.len(), binding, grid_to_store, launch.block));
             }
-            // Admissibility: every position-dependent scalar must be either
-            // indirect via persistent buffer or covered by a declared binding.
-            // Currently only GDN frame is such a scalar; reject a GDN-family
-            // launch that somehow has no binding (would otherwise replay stale).
-            if is_gdn {
-                let has_gdn_binding = dynamic_kernarg_bindings
-                    .iter()
-                    .any(|(idx, _)| *idx == kernargs.len());
-                if !has_gdn_binding {
-                    return Err(format!(
-                        "{symbol}: GDN-family launch has no kernarg binding"
-                    ));
-                }
-            }
             kernels.push(kernel);
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
-        // Merge differential position bindings synthesized from two recordings.
-        // Both transports must emit the identical binding set through one code
-        // path; the position bindings are stored on the controller and merged
-        // here for PM4. The recorded-HIP path merges the same set via
-        // `apply_kernarg_bindings_for_dispatch`.
-        for (dispatch, binding) in &self.synthesized_position_bindings {
-            if *dispatch < prefix {
-                dynamic_kernarg_bindings.push((*dispatch, *binding));
-            }
-        }
-        // Engine-declared bindings travel with their launch and merge the same
-        // way. A slot with two owners would be patched twice, so it fails closed.
-        merge_declared_kernarg_bindings(&self.recorded, prefix, &mut dynamic_kernarg_bindings)
+        // GDN frames, synthesized position bindings and engine-declared
+        // bindings, from the one builder the recorded-HIP oracle also uses. New
+        // tapes leave the legacy `dynamic_gdn_frames` vector empty so replay has
+        // exactly one path that decides frame consumption.
+        let dynamic_kernarg_bindings = self
+            .retained_kernarg_bindings(prefix)
             .map_err(|reason| format!("retained PM4 kernarg bindings: {reason}"))?;
-        dynamic_kernarg_bindings
-            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.offset().cmp(&b.1.offset())));
 
         let gfx12_gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
@@ -6002,6 +6092,9 @@ impl ReplayController {
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
+            kernarg_publish: kernargs
+                .iter()
+                .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty()),
             kernargs,
             _dependency_fence: dependency_fence,
             dynamic_gdn_frames,
@@ -6191,6 +6284,8 @@ impl ReplayController {
         self.binding_revision = BindingRevision(0);
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
+        self.window_effects_base = memory_effects::snapshot();
+        self.window_effects = MemoryEffects::default();
         self.state = ReplayState::RecordingWarmup;
         Ok(())
     }
@@ -6201,6 +6296,7 @@ impl ReplayController {
         if self.state != ReplayState::RecordingWarmup {
             return Err("no replay capture is active");
         }
+        self.window_effects = memory_effects::snapshot().since(self.window_effects_base);
         let summary = self.capture_summary();
         self.state = if self.certified_speedups.len() >= 2 {
             ReplayState::ShadowValidated
@@ -6208,6 +6304,34 @@ impl ReplayController {
             ReplayState::Captured
         };
         Ok(summary)
+    }
+
+    /// The memory operations issued on this thread inside the open capture
+    /// window, or inside the last closed one.
+    pub fn capture_window_effects(&self) -> MemoryEffects {
+        if self.state == ReplayState::RecordingWarmup {
+            memory_effects::snapshot().since(self.window_effects_base)
+        } else {
+            self.window_effects
+        }
+    }
+
+    /// Refuse to prepare an automatic forward body whose window issued a device
+    /// copy, readback or memset: the tape replays dispatches only, so that
+    /// state would be missing on every replay. Every adapter treats a prepare
+    /// error as sticky fallback, so the route runs on HIP. Manual captures
+    /// (benchmarks, speculative verify bodies) delimit windows spanning several
+    /// forwards and keep their own contracts.
+    fn refuse_effect_incomplete_window(&self) -> Result<(), String> {
+        let effects = self.capture_window_effects();
+        if self.auto_lifecycle && !effects.replayable() {
+            return Err(format!(
+                "effect-incomplete capture: {} device copy(ies), {} readback(s) and {} \
+                 memset(s) inside the window are state the tape cannot replay",
+                effects.dtod, effects.dtoh, effects.memset
+            ));
+        }
+        Ok(())
     }
 
     pub fn capture_summary(&self) -> ReplayCaptureSummary {
@@ -7065,6 +7189,8 @@ mod tests {
         let resource_a = issuer.resource("fixture-a", 0x1_0000).expect("valid resource");
         let resource_b = issuer.resource("fixture-b", 0x2_0000).expect("valid resource");
         let mut bindings = ReplayBindings::new();
+        // SAFETY: synthetic non-deref'd addresses used only as binding identity
+        // in unit tests; sizes match the fixture resources; never launched.
         unsafe {
             bindings.bind_resource(
                 resource_a,
@@ -7130,6 +7256,8 @@ mod tests {
         // Simulate a survived relocation of allocation A (same size, new
         // base) at revision 1; B is untouched.
         let moved_a: u64 = base_a + 0x10_0000;
+        // SAFETY: synthetic relocated address for unit-test binding identity only;
+        // never dereferenced or launched.
         unsafe {
             bindings.bind_resource(
                 resource_a,
@@ -10151,6 +10279,39 @@ mod tests {
             .expect_err("second owner for one offset must be rejected");
         assert!(error.contains("already has an owner"), "{error}");
         assert_eq!(bindings.len(), 1, "the rejected binding is not pushed");
+    }
+
+    #[test]
+    fn linear_aql_refuses_a_tape_with_position_bindings() {
+        // Linear AQL submits recorded kernargs verbatim. A declared position
+        // field (here a QSA-style length) would replay frozen at the capture
+        // position, so prepare must refuse before any device work and leave the
+        // route unprepared.
+        let declared = [ReplayKernargBinding::PositionPlusU32 {
+            offset: 8,
+            addend: 1,
+        }];
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        for declared in [&[][..], &declared[..]] {
+            controller.record_hip_launch_with_accesses(
+                "qsa_select",
+                None,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                &[0u8; 16],
+                None,
+                declared,
+                None,
+                None,
+            );
+        }
+        controller.finish_capture().unwrap();
+        let error = controller
+            .prepare_linear_aql(0)
+            .expect_err("a position-bound tape must not prepare on linear AQL");
+        assert!(error.contains("offset 8 of dispatch 1"), "{error}");
+        assert_ne!(controller.state(), ReplayState::Ready);
     }
 
     #[test]

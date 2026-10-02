@@ -26,7 +26,8 @@ fn ir_arch(arch: &str) -> Result<peacemaker_ir::Arch> {
     match arch {
         "gfx1100" => Ok(peacemaker_ir::Arch::Gfx1100),
         "gfx1151" => Ok(peacemaker_ir::Arch::Gfx1151),
-        _ => Err(format!("M7 gfx11 certification does not cover {arch}")),
+        "gfx1201" => Ok(peacemaker_ir::Arch::Gfx1201),
+        _ => Err(format!("M7 certification does not cover {arch}")),
     }
 }
 
@@ -177,7 +178,9 @@ fn ds_ranges(name: &str, ops: &str) -> Option<Vec<(u32, u32)>> {
 /// Every DS access of every lane of `waves` waves of `symbol`, whose address
 /// VGPR the entry block (the straight-line code before the first label or
 /// branch) derives from the work-item id and which nothing after it
-/// redefines, ends at or before `limit` bytes. Returns the maximum end.
+/// redefines, ends at or before `limit` bytes. Returns the maximum end. A
+/// kernel without DS memory accesses passes only with no allocation
+/// (`limit == 0`).
 pub fn lds_bounds(source: &str, symbol: &str, waves: u32, limit: u32) -> Result<u32> {
     let marker = format!("\n{symbol}:\n");
     let start = source.find(&marker).ok_or_else(|| format!("{symbol}: missing kernel label"))? + marker.len();
@@ -222,7 +225,7 @@ pub fn lds_bounds(source: &str, symbol: &str, waves: u32, limit: u32) -> Result<
             }
         }
     }
-    if checked == 0 { return Err("no LDS access found".into()) }
+    if checked == 0 && limit != 0 { return Err("no LDS access found".into()) }
     Ok(end)
 }
 
@@ -246,6 +249,14 @@ mod tests {
     fn swizzle_is_not_an_lds_access() {
         let swizzle = K.replace(".Lk_end:", "\tv_cvt_f32_f16_e64 v9, v8.l\n\tds_swizzle_b32 v10, v9 offset:swizzle(BROADCAST,16,3)\n.Lk_end:");
         assert_eq!(lds_bounds(&swizzle, "k", 2, 1024).unwrap(), 256 + 248 + 256 + 8);
+    }
+    /// An LDS-free kernel (swizzles only) bounds at 0 bytes when it
+    /// allocates none; an allocation it never touches is refused.
+    #[test]
+    fn lds_free_kernel_needs_zero_allocation() {
+        let free = K.replace("\tds_load_2addr_b64 v[4:7], v2 offset1:32\n", "\tds_swizzle_b32 v10, v9 offset:swizzle(BROADCAST,16,3)\n");
+        assert_eq!(lds_bounds(&free, "k", 2, 0).unwrap(), 0);
+        assert!(lds_bounds(&free, "k", 2, 1024).is_err());
     }
     /// A scalar compare writes only SCC: the SGPR it reads stays known. A
     /// register-range write (an SMEM load, a 64-bit select) makes every

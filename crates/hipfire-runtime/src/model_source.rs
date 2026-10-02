@@ -184,6 +184,8 @@ impl std::error::Error for SourceError {
 pub(crate) trait SourceReaderImpl: Send + Sync {
     fn identity(&self) -> &SourceIdentity;
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError>;
+    /// Best-effort hint that `[offset, offset + len)` will be read soon.
+    fn advise_willneed(&self, _offset: u64, _len: u64) {}
 }
 
 /// A sealed, source-owned positional reader.
@@ -220,6 +222,12 @@ impl SourceReader {
     /// Immutable source seal checked by this reader.
     pub fn identity(&self) -> &SourceIdentity {
         self.inner.identity()
+    }
+
+    /// Best-effort hint that `[offset, offset + len)` (absolute) will be read
+    /// soon: the OS may start reading it into its page cache.
+    pub fn advise_willneed(&self, offset: u64, len: u64) {
+        self.inner.advise_willneed(offset, len)
     }
 }
 

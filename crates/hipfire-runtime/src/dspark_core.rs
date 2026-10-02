@@ -8,6 +8,30 @@ use crate::spec::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Drafter GEMM dispatch knobs, read once per process (the Q8/HFQ4 GEMM arms
+/// run per layer per window; a config lookup there is pure host overhead).
+struct DsparkGemmFlags {
+    /// `HIPFIRE_DSPARK_Q8_WMMA` (default on; `0` disables).
+    q8_wmma: bool,
+    /// `HIPFIRE_DSPARK_Q8_4W=0` opts out of the 4-wave Q8 WMMA kernel.
+    q8_4w_opt_out: bool,
+    /// `HIPFIRE_DSPARK_HFQ4_WMMA` (default on; `0` disables).
+    hfq4_wmma: bool,
+}
+
+static DSPARK_GEMM_FLAGS: std::sync::LazyLock<DsparkGemmFlags> = std::sync::LazyLock::new(|| {
+    let not_zero = |name: &str| {
+        hipfire_config::developer_var(name)
+            .map(|s| s != "0")
+            .unwrap_or(true)
+    };
+    DsparkGemmFlags {
+        q8_wmma: not_zero("HIPFIRE_DSPARK_Q8_WMMA"),
+        q8_4w_opt_out: !not_zero("HIPFIRE_DSPARK_Q8_4W"),
+        hfq4_wmma: not_zero("HIPFIRE_DSPARK_HFQ4_WMMA"),
+    }
+});
+
 // ── Per-window phase profiler (HIPFIRE_DSPARK_PROFILE=1) ─────────────────────
 // Gated behind an env var; zero overhead when disabled.
 #[derive(Default)]
@@ -483,16 +507,14 @@ fn gemv_auto_batched_wmma(
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
         DType::Q8_0 => {
-            let wmma_on = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
+            let flags = &*DSPARK_GEMM_FLAGS;
+            let wmma_on = flags.q8_wmma;
             if wmma_on && gpu.arch_caps.is_rdna4() {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out =
-                        hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out = flags.q8_4w_opt_out;
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -513,8 +535,7 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w =
-                        hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out_4w = flags.q8_4w_opt_out;
                     if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
@@ -569,10 +590,7 @@ fn gemv_auto_batched_wmma(
             // Gate on `has_wmma()` (false on CDNA3): `gemm_hfq4g256_wmma` is
             // wave32-WMMA and fails to COMPILE for gfx942, so without this
             // the DSpark path dies at JIT instead of using `gemm_hfq4g256`.
-            let wmma_on = gpu.arch_caps.has_wmma()
-                && hipfire_config::developer_var("HIPFIRE_DSPARK_HFQ4_WMMA")
-                    .map(|s| s != "0")
-                    .unwrap_or(true);
+            let wmma_on = gpu.arch_caps.has_wmma() && DSPARK_GEMM_FLAGS.hfq4_wmma;
             if wmma_on {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;

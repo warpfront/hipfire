@@ -30,6 +30,8 @@ typedef _Float16 __attribute__((ext_vector_type(2))) gc_h2;
 // __syncthreads also waits for every outstanding global access (WGP-mode
 // workgroup fence), which would drain the prefetch.
 #define GC_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
+// Wave-private LDS handoff: order this wave's stores before its loads.
+#define GC_WAVE_SYNC() do { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront"); __builtin_amdgcn_wave_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront"); } while (0)
 #define GC_WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)
 static __device__ __forceinline__ float gc_bf16r(float v) { return (float)(hip_bfloat16)v; }
 static __device__ __forceinline__ unsigned int gc_pack(float a, float b) {
@@ -195,19 +197,19 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
                 // P as A: rows via LDS (t_s scratch), as B: half-wave swap.
 #pragma unroll
                 for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)P[r];
-                __builtin_amdgcn_wave_barrier();
+                GC_WAVE_SYNC();
                 const gc_h16 pa = *(const gc_h16*)&t_s[l16][0];
                 const gc_h16 pbv = gc_c_to_b(P, hi);
-                __builtin_amdgcn_wave_barrier();
+                GC_WAVE_SYNC();
 #pragma unroll
                 for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
-                __builtin_amdgcn_wave_barrier();
+                GC_WAVE_SYNC();
                 const gc_h16 ta = *(const gc_h16*)&t_s[l16][0];
                 gc_f8 P2 = {0, 0, 0, 0, 0, 0, 0, 0};
                 P2 = GC_WMMA(pa, pbv, P2);
                 T = GC_WMMA(ta, gc_c_to_b(P2, hi), T);
                 P = P2;
-                __builtin_amdgcn_wave_barrier();
+                GC_WAVE_SYNC();
             }
 #pragma unroll
             for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];

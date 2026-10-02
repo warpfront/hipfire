@@ -18,10 +18,12 @@
 //! invariant: ordinary/default daemon load/generate remains byte-for-byte on the
 //! existing daemon path when `experimental_multi_slot` is absent.
 //!
-//! Load-time CPU preflight opens the HFQ, requires arch_id 5|6, rejects vision
-//! tensors/model, parses Qwen config/tokenizer/chat template, then spawns
-//! `SlotEngine`. Generate validates text-only supported wire fields and builds
-//! prompt/convo/continuation with the CLI `slots.rs` semantics.
+//! Load-time CPU preflight opens the HFQ, requires arch_id 5|6, records whether
+//! the HFQ has a vision tower, parses Qwen config/tokenizer/chat template, then
+//! spawns `SlotEngine`. Generate validates supported wire fields and builds
+//! prompt/convo/continuation with the CLI `slots.rs` semantics. Image turns
+//! are CPU-preprocessed here and submitted with `VisualData` for the engine's
+//! sequential M-RoPE path.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -47,7 +49,9 @@ use hipfire_runtime::prompt_frame::{
     continuation_suffix_tool_results, qwen35_grammar_on, AssistantPrefix, ChatFrame,
     JinjaChatFrame, Message, Role, ThinkMode, ToolCall,
 };
-use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest};
+use hipfire_runtime::serve::{
+    Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, VisualData,
+};
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 use hipfire_runtime::tokenizer::Tokenizer;
 
@@ -70,15 +74,158 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
     );
 }
 
+
+/// The per-arch multi-slot engine behind the four-method surface
+/// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
+///
+/// This enum is THE daemon-side arch dispatch point for slot mode. A new
+/// model family with a slot engine adds a variant here and a spawn arm —
+/// nothing else in this file may name a concrete engine type. The wire
+/// types (`SubmitRequest`, `Event`, `Continuation`, `VisualData`) already
+/// live family-neutral in `hipfire_runtime::serve`, so the variant only
+/// binds the engine itself.
+///
+/// Deliberately an enum, not a trait: with one implementation a trait would
+/// guess at the abstraction boundary. When a second family exists and the
+/// variants want behavior beyond these four calls, graduate this into a
+/// trait shaped by that port (the same driver-style rule the run-loop
+/// extraction follows — see `hipfire-arch-qwen35::serve_engine`).
+/// The per-arch multi-slot engine behind the four-method surface
+/// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
+///
+/// Slot-mode arch dispatch goes through `hipfire_loader::carrier_for`:
+/// the carrier that claims `arch_id` overrides `Carrier::spawn_slot_engine`
+/// and returns an arch-erased `Box<dyn SlotEngineHandle>`. `loader` depends
+/// on the arch crates, so the concrete engine is boxed there without a
+/// loader -> arch -> loader cycle — this file never names a concrete engine
+/// type. A new model family with a slot engine only adds a `spawn_slot_engine`
+/// override on its carrier; nothing here changes.
+type AnySlotEngine = Box<dyn hipfire_runtime::serve::SlotEngineHandle>;
+
+/// Resolve the carrier for `arch_id` and spawn its multi-slot engine. The
+/// family-neutral `SlotEngineConfig` carries every serve.* knob; the carrier
+/// maps it onto its own engine config. `Err` names the arch when no carrier
+/// provides a slot engine.
+fn spawn_slot_engine(
+    arch_id: u32,
+    cfg: SlotEngineConfig,
+) -> Result<AnySlotEngine, String> {
+    let carrier = hipfire_loader::carrier_for(arch_id).ok_or_else(|| {
+        format!("no carrier claims arch_id {arch_id} — slot mode cannot dispatch")
+    })?;
+    carrier.spawn_slot_engine(cfg).map_err(|e| {
+        format!("no multi-slot engine for arch_id {arch_id}: {e}")
+    })
+}
+
+/// Slot-engine load parameters parsed from a `load` message. The daemon's
+/// sequential arm keeps its own parsing; this owns the multi-slot route's.
+pub struct SlotLoadParams {
+    pub mtp_k: usize,
+    /// Raw `params.kv_mode` (empty = env/config), resolved engine-side
+    /// through `QWEN35_SLOTS_POLICY`.
+    pub kv_mode_raw: String,
+    /// Effective KV backend. The capability gate already refused anything but
+    /// legacy; it rides into `EngineConfig` so `Rig::build` fails closed on a
+    /// bypassed gate.
+    pub kv_backend: String,
+    /// Display name of the tier the engine will run, for the loaded ACK and
+    /// kv_mode diag.
+    pub kv_mode_resolved: &'static str,
+    pub dflash_draft: Option<PathBuf>,
+    pub dflash_required: bool,
+    /// Optional `params.max_batch_tokens` override. When present it wins over
+    /// the `serve.max_batch_tokens` process-config value — the CLI serve path
+    /// clamps the built-in default to the multi-slot scratch capacity and
+    /// passes the result on the wire, and the daemon must honour that clamp
+    /// rather than re-reading the unclamped OnceLock snapshot.
+    pub max_batch_tokens: Option<usize>,
+}
+
+impl SlotLoadParams {
+    pub fn from_load_msg(msg: &serde_json::Value) -> Self {
+        let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
+        let param_str = |k: &str| param(k).and_then(|v| v.as_str());
+        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth (default 4).
+        let mtp_mode = param_str("mtp_mode").unwrap_or("off");
+        let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
+            0
+        } else {
+            param("mtp_k").and_then(|v| v.as_u64()).unwrap_or(4) as usize
+        };
+        // Same precedence as the sequential loader: load param > env/config.
+        let kv_mode_raw = param_str("kv_mode").unwrap_or("").to_string();
+        let kv_backend = param_str("kv_backend").unwrap_or("legacy").to_string();
+        let kv_mode_resolved = {
+            let raw = if kv_mode_raw.is_empty() {
+                hipfire_runtime::config::get().kv_mode.clone()
+            } else {
+                kv_mode_raw.clone()
+            };
+            hipfire_runtime::kv_mode::qwen_k_display_name(
+                hipfire_runtime::kv_mode::resolve(
+                    &raw,
+                    &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
+                )
+                .mode,
+            )
+        };
+        // DFlash2 draft: HIPFIRE_DFLASH_DRAFT (non-empty wins, empty opts out)
+        // > params.draft; dflash_mode=off suppresses either way.
+        let dflash_mode = param_str("dflash_mode").unwrap_or("auto");
+        let raw_draft: Option<String> = match hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT")
+            .ok()
+            .as_deref()
+        {
+            Some("") => None,
+            Some(p) => Some(p.to_string()),
+            None => param_str("draft")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+        let dflash_draft = if dflash_mode == "off" {
+            if let Some(d) = raw_draft {
+                eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
+            }
+            None
+        } else {
+            raw_draft.map(PathBuf::from)
+        };
+        Self {
+            mtp_k,
+            kv_mode_raw,
+            kv_backend,
+            kv_mode_resolved,
+            dflash_draft,
+            dflash_required: dflash_mode == "on",
+            max_batch_tokens: param("max_batch_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
+        }
+    }
+}
+
 /// Daemon-owned slot backend. Owns one weight copy via SlotEngine.
 pub struct SlotBackend {
     chat_template: Option<String>,
-    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
+    engine: AnySlotEngine,
     tokenizer: Tokenizer,
     arch_str: String,
     dim: usize,
     layers: usize,
     vocab: usize,
+    is_vl: bool,
+    vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    /// Per-slot context cap handed to the engine at load. Admission-side
+    /// only (the engine re-enforces it per token); kept here so an
+    /// over-budget request can be rejected with an actionable message
+    /// before it occupies a slot.
+    cap_tokens: usize,
+    /// Sampling-default inputs shared with the sequential route
+    /// ([`resolve_slot_sampling`]): carrier arch ladder + `.hfq` recs.
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
     active: AtomicUsize,
     tool_grammar: bool,
     pending_tools: Mutex<PendingToolBroker>,
@@ -209,25 +356,158 @@ impl PendingToolBroker {
 
 impl SlotBackend {
     /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
-    /// `kv_mode`/`kv_backend` are the effective per-load values (already gated by
-    /// `validate_load_caps` to q8/legacy); they ride into `EngineConfig`
-    /// so `Rig::build` fails closed if a non-q8/non-legacy value arrives.
+    /// `kv_mode_raw`/`kv_backend` are the load's effective KV selector and
+    /// backend (already gated by `validate_load_caps` to the static tier
+    /// ladder and `legacy`); they ride into `EngineConfig` so `Rig::build`
+    /// fails closed if a tier-less or non-legacy value arrives.
+    ///
+    /// `vision_mode` / `vision` are the load's resolved vision-tower ladder
+    /// (`params.vision_mode` + `params.vision`/`HIPFIRE_VISION_SIDECAR`,
+    /// already gated by the caller). They exist because the multi-slot route
+    /// used to resolve the `.vl` sibling on its own, ignoring both — so a VL
+    /// trunk paid the tower's ~1 GB under the documented text-only default,
+    /// and an explicit `serve --vision` was dropped here.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         model_path: &str,
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
-        kv_mode: &str,
+        mtp_k: usize,
+        kv_mode_raw: &str,
         kv_backend: &str,
+        dflash_draft: Option<PathBuf>,
+        dflash_required: bool,
+        vision_mode: &str,
+        vision: Option<String>,
+        max_batch_tokens_override: Option<usize>,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
-        let preflight = cpu_preflight(model_path)?;
+        let preflight = cpu_preflight(model_path, vision_mode, vision.as_deref())?;
+        let arch_id = preflight.arch_id;
         let arch_str = preflight.arch_str.clone();
         let dim = preflight.dim;
         let layers = preflight.layers;
         let chat_template = preflight.chat_template;
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
+        let is_vl = preflight.is_vl;
+        let vision_config = preflight.vision_config;
+        let rec_temperature = preflight.rec_temperature;
+        let rec_top_p = preflight.rec_top_p;
+        // Read prefix cache config (spec §4.5–4.6). Keys are registered in
+        // hipfire-config as serve.prefix_cache / serve.prefix_cache_max_bytes
+        // with env HIPFIRE_SERVE_PREFIX_CACHE*. Default false/0.
+        let prefix_cache = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.prefix_cache")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+        let prefix_cache_max_bytes = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.prefix_cache_max_bytes")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        // Read the global trunk-row budget and minimum prefill quantum (spec
+        // §5.2 S2 / §5.3 S3). Keys are registered in hipfire-config as
+        // serve.max_batch_tokens / serve.prefill_min_tokens with env
+        // HIPFIRE_SERVE_MAX_BATCH_TOKENS / HIPFIRE_SERVE_PREFILL_MIN_TOKENS.
+        // Defaults 4096/1 (the registered config defaults).
+        let max_batch_tokens = max_batch_tokens_override
+            .or_else(|| {
+                hipfire_config::active_or_local_process_config()
+                    .values
+                    .get("serve.max_batch_tokens")
+                    .and_then(|v| {
+                        if let hipfire_config::ConfigValue::Integer(i) = v {
+                            Some(*i as usize)
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .unwrap_or(4096);
+        let prefill_min_tokens = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.prefill_min_tokens")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1);
+        // Read the bounded waiting room config (spec §5.3 S3). Keys are
+        // registered in hipfire-config as serve.max_queue /
+        // serve.max_queue_bytes / serve.queue_timeout_ms with env
+        // HIPFIRE_SERVE_MAX_QUEUE / HIPFIRE_SERVE_MAX_QUEUE_BYTES /
+        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults 64 / 256 MiB / 30000 ms
+        // (the registered config defaults). The CLI startup guard rejects
+        // serve.max_queue=0 for multi-slot; Rig::build also refuses
+        // WaitQueue::new(0, _) as a backstop.
+        let wait_max_count = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.max_queue")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(64);
+        let wait_max_bytes = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.max_queue_bytes")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(268435456);
+        let queue_timeout_ms = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.queue_timeout_ms")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(30000);
+        // Read the structured-output jump-forward flag (spec §7.3 G3).
+        // Key registered as serve.structured_jump_forward with env
+        // HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD. Default false — no
+        // behavior change on the constrained-decode path.
+        let structured_jump_forward = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.structured_jump_forward")
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+
+        let vl_path = preflight.vl_path;
         let tool_grammar = qwen35_grammar_on(
             hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
                 .ok()
@@ -239,19 +519,37 @@ impl SlotBackend {
         let cap_tokens = cap_tokens.max(1);
         let prefill_chunk = prefill_chunk.max(1).min(cap_tokens);
 
-        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-            hipfire_arch_qwen35::serve_engine::EngineConfig {
+        // Arch dispatch point: the carrier that claims `arch_id` spawns its
+        // multi-slot engine via `Carrier::spawn_slot_engine`. Everything
+        // downstream drives the family-neutral `SlotEngineHandle` surface
+        // only. `host_budget_bytes` / `swap_dir` are engine-policy constants
+        // the family-neutral config carries for the spawn arm.
+        let engine = spawn_slot_engine(
+            arch_id,
+            SlotEngineConfig {
                 model_path: PathBuf::from(model_path),
                 n_slots,
                 cap_tokens,
                 prefill_chunk,
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
-                kv_mode: kv_mode.to_string(),
+                mtp_k,
+                is_vl,
+                vl_path,
+                kv_mode_raw: kv_mode_raw.to_string(),
                 kv_backend: kv_backend.to_string(),
+                prefix_cache,
+                prefix_cache_max_bytes,
+                max_batch_tokens,
+                prefill_min_tokens,
+                wait_max_count,
+                wait_max_bytes,
+                queue_timeout_ms,
+                structured_jump_forward,
+                dflash_draft,
+                dflash_required,
             },
-        )
-        .map_err(|e| format!("SlotEngine spawn: {e}"))?;
+        )?;
 
         Ok(Self {
             engine,
@@ -261,6 +559,12 @@ impl SlotBackend {
             chat_template,
             layers,
             vocab,
+            is_vl,
+            vision_config,
+            cap_tokens,
+            arch_id,
+            rec_temperature,
+            rec_top_p,
             active: AtomicUsize::new(0),
             tool_grammar,
             pending_tools: Mutex::new(PendingToolBroker::default()),
@@ -278,6 +582,9 @@ impl SlotBackend {
     }
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+    pub fn is_vl(&self) -> bool {
+        self.is_vl
     }
 
     pub fn active_count(&self) -> usize {
@@ -331,7 +638,8 @@ impl SlotBackend {
     /// Generate handler for experimental slot mode.
     ///
     /// Requires `experimental_multi_slot=true` on the wire, validates
-    /// text-only fields, builds prompt/convo/continuation, submits with
+    /// supported wire fields (images allowed when the loaded model has a
+    /// vision encoder), builds prompt/convo/continuation, submits with
     /// sampling, streams token/reasoning, handles abort via keyed registry +
     /// close, and performs two-phase terminal commit with byte-identical done.
     pub fn handle_generate<W: std::io::Write>(
@@ -349,8 +657,11 @@ impl SlotBackend {
                 stdout,
                 Some(id),
                 "too many concurrent slot requests (bounded worker limit hit)",
-                "validation",
-                false,
+                // Overload, not validation: all slots busy is a transient
+                // capacity condition → HTTP 429 + Retry-After, not a
+                // client-fixable 400.
+                "overload",
+                true,
                 false,
             );
             let _ = stdout.flush();
@@ -406,17 +717,44 @@ impl SlotBackend {
             return Ok(());
         }
 
-        let temperature = msg
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32;
-        let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let (temperature, top_p, max_tokens, fit) =
+            match resolve_slot_sampling(msg, self.arch_id, self.rec_temperature, self.rec_top_p) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &err,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            };
         let top_k = msg.get("top_k").and_then(|v| v.as_i64()).unwrap_or(0);
         if !(0..=i32::MAX as i64).contains(&top_k) {
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
                 "top_k must fit a non-negative 32-bit integer",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
+        // The parallel sampler compiles 20- and 64-wide kernels; anything
+        // larger would be silently capped to a 64-candidate pool, so reject
+        // it up front instead. 0 keeps the engine default (20).
+        if top_k > 64 {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "invalid top_k: must be <= 64 (the sampler's widest compiled \
+                 kernel); use top_p / min_p for tighter shaping",
                 "validation",
                 false,
                 false,
@@ -444,10 +782,41 @@ impl SlotBackend {
             client_seed,
         );
 
-        let max_tokens = msg
-            .get("max_tokens")
+        // Token penalties, mirroring the sequential path's request parsing
+        // (main.rs): HF-style `repetition_penalty` is accepted as an alias,
+        // the window defaults to 128 like the sequential daemon, and the
+        // window is clamped to the engine's buffer capacity. min_p rides
+        // along — the slot sampler's kernel supports it.
+        let presence_penalty = msg
+            .get("presence_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0) as f32;
+        let frequency_penalty = msg
+            .get("frequency_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0) as f32;
+        let repeat_penalty = msg
+            .get("repeat_penalty")
+            .or_else(|| msg.get("repetition_penalty"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+            .max(1.0) as f32;
+        let repeat_window = msg
+            .get("repeat_window")
             .and_then(|v| v.as_u64())
-            .unwrap_or(512) as usize;
+            .unwrap_or(128)
+            // Mirror of the engine's REPEAT_WINDOW_MAX (the engine clamps
+            // again on admit; this keeps the emitted accepted-request view
+            // honest about the window that will actually apply).
+            .min(2048) as usize;
+        let min_p = msg
+            .get("min_p")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0) as f32;
+
         let max_think_tokens = msg
             .get("max_think_tokens")
             .and_then(|v| v.as_u64())
@@ -457,18 +826,12 @@ impl SlotBackend {
                     .and_then(|v| v.as_u64())
             });
 
-        if max_think_tokens.is_some_and(|n| n >= 2) {
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "finite reasoning caps not supported in experimental multi-slot (max_think_tokens >=2)",
-                "unsupported",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
+        // Finite caps (max_think_tokens >= 2) are ENFORCED on this route:
+        // once the cursor consumes the budget inside a think span, the
+        // grammar mask allows only the think close, forcing the span to end
+        // through the normal commit path (vLLM thinking_token_budget
+        // parity). Enforcement requires the tokenizer's special close id;
+        // engines without one fall back to uncapped thinking (documented).
 
         // --- Projected reasoning authority ---
         let has_think = self.tokenizer.special_token_id("<think>").is_some();
@@ -625,6 +988,18 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         }
+        if let Err(reason) = validate_tool_schema_bounds(tools) {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &reason,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
         let messages = match project_jinja_messages(msg) {
             Ok(messages) => messages,
             Err(reason) => {
@@ -672,69 +1047,127 @@ impl SlotBackend {
             .find(|message| message.role == Role::User)
             .expect("projection requires a user message");
 
-        let (prompt_tokens, started_in_think) =
-            if let Some(template) = self.chat_template.as_deref() {
-                let frame = JinjaChatFrame {
-                    tokenizer: &self.tokenizer,
-                    template,
-                    system: None,
-                    user: "",
-                    enable_thinking,
-                    bos_token: None,
-                    reasoning_strength: None,
-                    reasoning_effort: None,
-                };
-                let rendered = match frame.render_messages(&messages, tools, None) {
-                    Ok(rendered) => rendered,
-                    Err(reason) => {
-                        hipfire_engine::emit::emit_active_attempt_error(
-                            stdout,
-                            Some(id),
-                            &format!("multi_slot Jinja render failed: {reason}"),
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        return Ok(());
-                    }
-                };
-                let started = rendered.trim_end().ends_with("<think>");
-                (self.tokenizer.encode(&rendered), started)
-            } else {
-                if tools.is_some()
-                    || messages
-                        .iter()
-                        .any(|message| message.role == Role::Tool || !message.tool_calls.is_empty())
-                {
+        let slot_image = match extract_slot_image(msg) {
+            Ok(image) => image,
+            Err(reason) => {
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &reason,
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            }
+        };
+        if slot_image.is_some() && !self.is_vl() {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "model has no vision encoder",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
+
+        let mut visual_data = None;
+        let (prompt_tokens, started_in_think) = if let Some(image) = slot_image {
+            // The projected message view carries the system text; fall back to
+            // the top-level `system` field for prompt-only requests.
+            let system = messages
+                .iter()
+                .find(|m| m.role == Role::System)
+                .map(|m| m.content.as_str())
+                .or_else(|| msg.get("system").and_then(|v| v.as_str()));
+            match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
+                Ok((tokens, vd)) => {
+                    visual_data = Some(vd);
+                    (
+                        tokens,
+                        matches!(expected_prefix, AssistantPrefix::OpenThink),
+                    )
+                }
+                Err(reason) => {
                     hipfire_engine::emit::emit_active_attempt_error(
                         stdout,
                         Some(id),
-                        "tool requests require a model chat_template in experimental multi-slot",
-                        "unsupported",
+                        &reason,
+                        "validation",
                         false,
                         false,
                     );
                     let _ = stdout.flush();
                     return Ok(());
                 }
-                let (system, turns, _) = project_messages(msg).expect("validated projection");
-                let history: Vec<(Role, &str)> = turns
-                    .iter()
-                    .map(|(role, text)| (*role, text.as_str()))
-                    .collect();
-                let frame = ChatFrame {
-                    tokenizer: &self.tokenizer,
-                    system: system.as_deref(),
-                    user: &last_user.content,
-                    assistant_prefix: expected_prefix,
-                    raw: false,
-                };
-                (
-                    frame.build_multi_turn(&history),
-                    matches!(expected_prefix, AssistantPrefix::OpenThink),
-                )
+            }
+        } else if let Some(template) = self.chat_template.as_deref() {
+            let frame = JinjaChatFrame {
+                tokenizer: &self.tokenizer,
+                template,
+                system: None,
+                user: "",
+                enable_thinking,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
             };
+            let rendered = match frame.render_messages(&messages, tools, None) {
+                Ok(rendered) => rendered,
+                Err(reason) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("multi_slot Jinja render failed: {reason}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            };
+            let started = rendered.trim_end().ends_with("<think>");
+            (self.tokenizer.encode(&rendered), started)
+        } else {
+            if tools.is_some()
+                || messages
+                    .iter()
+                    .any(|message| message.role == Role::Tool || !message.tool_calls.is_empty())
+            {
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "tool requests require a model chat_template in experimental multi-slot",
+                    "unsupported",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            }
+            let (system, turns, _) = project_messages(msg).expect("validated projection");
+            let history: Vec<(Role, &str)> = turns
+                .iter()
+                .map(|(role, text)| (*role, text.as_str()))
+                .collect();
+            let frame = ChatFrame {
+                tokenizer: &self.tokenizer,
+                system: system.as_deref(),
+                user: &last_user.content,
+                assistant_prefix: expected_prefix,
+                raw: false,
+            };
+            (
+                frame.build_multi_turn(&history),
+                matches!(expected_prefix, AssistantPrefix::OpenThink),
+            )
+        };
+
         // Now prefix for continuation is expected_prefix but also must agree with started_in_think
         let prefix = if started_in_think {
             AssistantPrefix::OpenThink
@@ -760,6 +1193,39 @@ impl SlotBackend {
             return Ok(());
         }
         let prompt_len = prompt_tokens.len();
+        // A client that omitted max_tokens gets the default clamped to the
+        // room left after the prompt, exactly like the sequential route.
+        let max_tokens = hipfire_generate::common::fit_max_tokens_if(
+            fit,
+            max_tokens,
+            prompt_len,
+            self.cap_tokens,
+        );
+        // vLLM-style admission: prompt + generation budget must fit the
+        // slot's context cap. The engine's per-token ctx guard would stop
+        // the decode at the cap anyway, but that surfaces as a silently
+        // truncated answer; an explicit rejection up front tells the client
+        // the request was too large and by how much.
+        if prompt_len.saturating_add(max_tokens) > self.cap_tokens {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "request requires context {prompt_len} prompt + {max_tokens} max_tokens = {}, \
+                     exceeding the slot context cap of {} tokens — reduce max_tokens or shorten the prompt",
+                    // saturating: a direct-wire max_tokens = usize::MAX would
+                    // overflow a plain `prompt_len + max_tokens` and panic in
+                    // an overflow-checked build while the request is live.
+                    prompt_len.saturating_add(max_tokens),
+                    self.cap_tokens
+                ),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
         let tool_claim = match self
             .pending_tools
             .lock()
@@ -781,7 +1247,24 @@ impl SlotBackend {
             }
         };
         let claimed_session = tool_claim.as_ref().map(|claim| claim.session);
-        let continuation = if let Some(claim) = tool_claim {
+        // Extract JSON Schema for structured output (spec §7 G1/G2). The
+        // schema was already compiled and validated in validate_generate_caps;
+        // here we extract the raw schema Value to pass to the engine, which
+        // recompiles it into a per-request SchemaMatcher on admit.
+        let json_schema = msg
+            .get("response_format")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .filter(|&t| t == "json_schema")
+            .and_then(|_| {
+                msg.get("response_format")
+                    .and_then(|v| v.get("json_schema"))
+                    .and_then(|v| v.get("schema"))
+                    .cloned()
+            });
+        let continuation = if visual_data.is_some() {
+            Continuation::Cold
+        } else if let Some(claim) = tool_claim {
             Continuation::ToolResults {
                 tokens: continuation_suffix_tool_results(&self.tokenizer, &claim.results, prefix),
                 session: claim.session,
@@ -811,8 +1294,17 @@ impl SlotBackend {
         }
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
         let _ = batch_transition_to_queued(id, attempt_id, admission);
-
         let (tx, rx) = mpsc::channel::<Event>();
+        // Cancellation identity (spec §4.6 C6): a request parked in the
+        // engine's waiting room has no session id yet, so the abort path
+        // cancels it by this tag. (id, attempt_id) is unique per attempt.
+        let request_tag = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            attempt_id.hash(&mut h);
+            h.finish()
+        };
         let req = SubmitRequest {
             prompt_tokens,
             convo: convo.clone(),
@@ -822,6 +1314,26 @@ impl SlotBackend {
             top_p,
             top_k: top_k as i32,
             seed,
+            repeat_window,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            min_p,
+            visual_data,
+            json_schema,
+            started_in_think,
+            // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
+            // never enters a think span so the budget cannot engage.
+            think_budget: max_think_tokens
+                .filter(|&n| n >= 2)
+                .map(|n| n as usize)
+                .unwrap_or(usize::MAX),
+            // Canonical pending-input bytes (spec §5.3): the engine's wait
+            // queue charges its byte cap against this, so daemon-side
+            // waiters must carry the real prompt weight — a hardcoded 0
+            // (floored to 1 downstream) made the byte cap unbindable.
+            queue_bytes: canonical_prompt_bytes(msg),
+            request_tag,
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
@@ -903,11 +1415,21 @@ impl SlotBackend {
         let mut first_token = true;
 
         let mut done_reason: Option<(DoneReason, usize)> = None;
-        let mut rejected: Option<String> = None;
+        let mut rejected: Option<(hipfire_runtime::serve::RejectClass, String)> = None;
+        // Set when the engine channel dropped without a terminal event —
+        // the engine thread died (panic/GPU fault). Must NOT be reported as
+        // a normal stop: the client would see a clean-looking truncated
+        // answer while the session leaks resident on its slot.
+        let mut engine_died = false;
 
         loop {
             if batch_check_abort(id, attempt_id, admission) {
                 drop(rx);
+                // A request parked in the engine's waiting room has no
+                // session to close — cancel it by tag so it leaves the queue
+                // (and its queue-byte charge) immediately instead of being
+                // admitted against a dead receiver later (spec §4.6 C6/A11).
+                self.engine.cancel_waiting(request_tag);
                 if let Some(sess) = accepted_session.take() {
                     self.close_session(sess);
                 } else if let Some(session) = claimed_session {
@@ -928,10 +1450,11 @@ impl SlotBackend {
                         {
                             self.close_session(expected);
                             accepted_session = Some(session);
-                            rejected = Some(
+                            rejected = Some((
+                                hipfire_runtime::serve::RejectClass::Internal,
                                 "tool-result reentry was admitted on the wrong slot session"
                                     .to_string(),
-                            );
+                            ));
                             break;
                         }
                         accepted_session = Some(session);
@@ -959,28 +1482,61 @@ impl SlotBackend {
                         done_reason = Some((reason, generated));
                         break;
                     }
-                    Event::Rejected { reason } => {
-                        rejected = Some(reason);
+                    Event::Rejected { class, reason } => {
+                        rejected = Some((class, reason));
                         break;
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    engine_died = true;
+                    break;
+                }
             }
         }
 
-        if let Some(reason) = rejected {
+        if engine_died {
+            // The engine thread dropped its end without Done/Rejected. Close
+            // the session (its resident state is untrustworthy) and fail
+            // loudly — never a normal "stop" with partial tokens.
+            drop(rx);
+            if let Some(sess) = accepted_session.take() {
+                let _ = self.engine.close(sess);
+            }
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "multi_slot engine terminated without completing request {} \
+                     (engine thread exited; {produced} tokens were produced)",
+                    attempt_id
+                ),
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
+
+        if let Some((class, reason)) = rejected {
             drop(rx);
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
             } else if let Some(session) = claimed_session {
                 self.close_session(session);
             }
-            emit_qwen_ar_slot_error(
+            let kind = match class {
+                hipfire_runtime::serve::RejectClass::Overload => "overload",
+                hipfire_runtime::serve::RejectClass::Validation => "validation",
+                hipfire_runtime::serve::RejectClass::Internal => "internal",
+                hipfire_runtime::serve::RejectClass::Cancel => "cancel",
+            };
+            hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
-                id,
+                Some(id),
                 &format!("multi_slot rejected: {reason}"),
-                "internal",
+                kind,
                 false,
                 false,
             );
@@ -1004,7 +1560,14 @@ impl SlotBackend {
         }
         let summary = emitter.finish();
         render_events(summary.events, stdout, &mut terminal_tool_calls);
-        if matches!(summary.finish_reason, "malformed_protocol" | "open_think") {
+        // Multi-slot keeps failing closed on an unfinished tool call at any
+        // exit, under its previous `malformed_protocol` label.
+        let unsafe_reason = match summary.finish_reason {
+            "truncated_tool_call" => Some("malformed_protocol"),
+            r @ ("malformed_protocol" | "open_think") => Some(r),
+            _ => None,
+        };
+        if let Some(unsafe_reason) = unsafe_reason {
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
             } else if let Some(session) = claimed_session {
@@ -1013,7 +1576,7 @@ impl SlotBackend {
             emit_qwen_ar_slot_error(
                 stdout,
                 id,
-                &format!("unsafe multi_slot terminal: {}", summary.finish_reason),
+                &format!("unsafe multi_slot terminal: {unsafe_reason}"),
                 "generation",
                 false,
                 false,
@@ -1077,17 +1640,29 @@ impl SlotBackend {
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
 
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
-        let ticket = accepted_ticket.expect("accepted session binds a lane ticket");
+        let Some(ticket) = accepted_ticket else {
+            if let Some(sess) = accepted_session.take() {
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
+            emit_qwen_ar_slot_error(
+                stdout,
+                id,
+                "slot terminal without a bound lane ticket",
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        };
         let _ =
             batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
-        let mut commit_ready = pending_done.clone();
-        if let Some(map) = commit_ready.as_object_mut() {
-            map.insert(
-                "type".to_string(),
-                serde_json::Value::String("commit_ready".to_string()),
-            );
-        }
-        let _ = writeln!(stdout, "{}", commit_ready);
+        // commit_ready is the staged done with only `type` changed.
+        pending_done["type"] = serde_json::Value::String("commit_ready".to_string());
+        let _ = writeln!(stdout, "{}", pending_done);
+        pending_done["type"] = serde_json::Value::String("done".to_string());
         let _ = stdout.flush();
 
         let decision =
@@ -1129,25 +1704,94 @@ impl Drop for SlotGuard<'_> {
 // ── CPU preflight ────────────────────────────────────────────────────────────
 
 struct Preflight {
+    /// Raw HFQ arch id — the factory's dispatch key (5|6 = qwen3_5 today).
+    arch_id: u32,
     arch_str: String,
     dim: usize,
     layers: usize,
     vocab: usize,
     tokenizer: Tokenizer,
     chat_template: Option<String>,
+    is_vl: bool,
+    vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    /// Discovered .vl sidecar path. When set, the slot engine loads vision
+    /// weights from this file instead of the trunk HFQ.
+    vl_path: Option<PathBuf>,
+    /// `.hfq`-baked author sampling recommendation (`generation_config`).
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
 }
 
-fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
+fn cpu_preflight(
+    model_path: &str,
+    vision_mode: &str,
+    vision: Option<&str>,
+) -> Result<Preflight, String> {
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
-    if is_vision_hfq(&hfq) {
-        return Err("vision model not supported in experimental multi-slot".to_string());
+
+    // ── .vl sidecar discovery ──────────────────────────────────────────
+    // A .vl file is a standalone HFQM container with only vision tower
+    // tensors + config.vision_config metadata. Discovery order:
+    //   1. the caller's explicit sidecar (`params.vision` /
+    //      `HIPFIRE_VISION_SIDECAR`), already filtered by `vision_mode`
+    //   2. `<stem>.vl` sibling next to the trunk model
+    // When a .vl file is found, it takes precedence over inline vision
+    // tensors. If no .vl file exists, fall back to inline (backward compat).
+    //
+    // `vision_mode` is the SAME documented ladder the sequential load arm
+    // applies (`apply_vision_mode_gate`): `off` (the default) never wires a
+    // sidecar — not even an explicit one — so a text load pays no tower
+    // VRAM; `on` requires a tower to resolve. The multi-slot arm used to
+    // discover the sibling unconditionally, so a VL trunk paid the tower's
+    // ~1 GB even under the documented text-only default, and `serve --vision`
+    // was dropped on this route entirely.
+    let has_inline_vision = is_vision_hfq(&hfq);
+    let vl_path: Option<PathBuf> = if vision_mode == "off" {
+        None
+    } else {
+        vision
+            .map(PathBuf::from)
+            .or_else(|| discover_vl_sidecar(model_path))
+    };
+    if vision_mode == "on" && vl_path.is_none() && !has_inline_vision {
+        return Err(format!(
+            "vision_mode=on: no vision tower resolved for {model_path} \
+             (no explicit sidecar and no <stem>.vl sibling found)"
+        ));
     }
+    let is_vl = vl_path.is_some() || has_inline_vision;
+
+    // Read vision_config from the .vl file when present, else from the trunk.
+    let vision_config = if is_vl {
+        if let Some(vl) = &vl_path {
+            let vl_hfq =
+                HfqFile::open(vl).map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+            Some(
+                hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
+                    .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?,
+            )
+        } else {
+            Some(
+                hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
+                    .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?,
+            )
+        }
+    } else {
+        None
+    };
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq)
         .map_err(|e| format!("qwen config: {e}"))?;
     let tokenizer =
         Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
+    if is_vl {
+        for name in ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"] {
+            if tokenizer.special_token_id(name).is_none() {
+                return Err(format!("VL tokenizer missing {name} special token"));
+            }
+        }
+    }
     let chat_template = hfq.chat_template();
     if chat_template
         .as_deref()
@@ -1155,18 +1799,21 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     {
         return Err("empty chat_template".to_string());
     }
-    let arch_str = match hfq.arch_id {
-        5 => "qwen3_5".to_string(),
-        6 => "qwen3_5_moe".to_string(),
-        _ => unreachable!(),
-    };
+    let arch_str = hipfire_loader::arch_label(hfq.arch_id).to_string();
+    let rec = hfq.recommended_sampling();
     Ok(Preflight {
+        rec_temperature: rec.as_ref().and_then(|r| r.temperature),
+        rec_top_p: rec.as_ref().and_then(|r| r.top_p),
+        arch_id: hfq.arch_id,
         arch_str,
         dim: config.dim,
         layers: config.n_layers,
         vocab: config.vocab_size,
         tokenizer,
         chat_template,
+        is_vl,
+        vision_config,
+        vl_path,
     })
 }
 
@@ -1185,6 +1832,24 @@ pub fn validate_arch_id(arch_id: u32) -> Result<(), String> {
 pub fn is_vision_hfq(hfq: &HfqFile) -> bool {
     hfq.tensor_data("model.visual.patch_embed.proj.weight")
         .is_some()
+}
+
+/// Discover a `.vl` sidecar file for the given trunk model path.
+///
+/// Discovery order:
+/// 1. `HIPFIRE_VL_FILE` env var — explicit override (any path)
+/// 2. `<stem>.vl` sibling next to the trunk model, where `<stem>` also
+///    strips `.hfq` and a quant suffix (`model.mq4v2.hfq` → `model.vl`)
+///
+/// Returns `None` when no .vl file is found (caller falls back to inline
+/// vision tensors in the trunk for backward compat).
+///
+/// The probe list lives in [`hipfire_runtime::sidecar`] so the daemon, the
+/// loader and the CLI capability advertisement cannot drift apart — they
+/// already had three copies, and the `.vl` copies had lost the quant-suffix
+/// stripping the `.mtp` probe has.
+fn discover_vl_sidecar(model_path: &str) -> Option<PathBuf> {
+    hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
 pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
@@ -1222,17 +1887,11 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     if tp != 1 || pp != 1 {
         return Some("experimental multi-slot requires pp=tp=1".to_string());
     }
-    // The slot kernels currently own a fixed Q8 KV/state path and no
-    // speculative or eviction sidecars. Refuse instead of silently ignoring
-    // an ordinary serve configuration that the alternate backend cannot honor.
+    // The slot kernels own a fixed Q8 KV/state path plus the DFlash2
+    // spec-decode sidecar (`params.draft` + `dflash_mode`). Other
+    // speculative/eviction sidecars stay refused rather than silently
+    // ignored.
     let params = msg.get("params");
-    if params
-        .and_then(|p| p.get("draft"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
-        return Some("draft not supported in experimental multi-slot".to_string());
-    }
     if params
         .and_then(|p| p.get("drafter"))
         .and_then(|v| v.as_str())
@@ -1240,11 +1899,7 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("spec/drafter not supported in experimental multi-slot".to_string());
     }
-    for (key, label) in [
-        ("dflash_mode", "DFlash"),
-        ("mtp_mode", "MTP"),
-        ("prefill_compression", "PFlash"),
-    ] {
+    for (key, label) in [("prefill_compression", "PFlash")] {
         if params
             .and_then(|p| p.get(key))
             .and_then(|v| v.as_str())
@@ -1275,12 +1930,25 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
-    if params
+    // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
+    // fwht{2,3,4}) plus the flat 2-byte tiers bf16/f16; the per-load string
+    // must be one the slots policy accepts. Rejected here — loudly, before
+    // any GPU work — rather than silently downgraded to the q8 default by
+    // the engine-side resolve.
+    if let Some(raw) = params
         .and_then(|p| p.get("kv_mode"))
         .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.is_empty() && v != "q8")
+        .filter(|v| !v.is_empty())
     {
-        return Some("experimental multi-slot currently requires kv_mode=q8".to_string());
+        let resolved =
+            hipfire_runtime::kv_mode::resolve(raw, &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY);
+        if resolved.warning.is_some() {
+            return Some(format!(
+                "experimental multi-slot does not support kv_mode='{raw}' \
+                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16; 'auto'/unset \
+                 = q8)"
+            ));
+        }
     }
     if let Some(v) = params
         .and_then(|p| p.get("kv_backend"))
@@ -1316,9 +1984,70 @@ pub fn is_experimental_generate(msg: &serde_json::Value) -> bool {
     false
 }
 
+/// Effective `(temperature, top_p, max_tokens, max_tokens_fit)` for a slot
+/// generate request. Defaults are the sequential route's
+/// ([`hipfire_engine::scheduler::resolve_temp_top_p`],
+/// [`hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS`], wire
+/// `max_tokens_fit`); a present-but-malformed `max_tokens` is refused.
+pub(crate) fn resolve_slot_sampling(
+    msg: &serde_json::Value,
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
+) -> Result<(f32, f32, usize, bool), String> {
+    let (temperature, top_p) =
+        hipfire_engine::scheduler::resolve_temp_top_p(msg, arch_id, rec_temperature, rec_top_p);
+    let max_tokens = match msg.get("max_tokens") {
+        None | Some(serde_json::Value::Null) => {
+            hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS
+        }
+        Some(value) => match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
+            Some(v) if v > 0 => v,
+            _ => return Err("max_tokens must be a positive integer".to_owned()),
+        },
+    };
+    let fit = msg.get("max_tokens_fit").and_then(|v| v.as_bool()) == Some(true);
+    Ok((temperature, top_p, max_tokens, fit))
+}
+
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
-    if msg.get("image").is_some_and(|v| !v.is_null())
+    // Optional numeric controls must not silently fall back to defaults when
+    // present with the wrong JSON type. The parsing path uses as_f64/as_u64;
+    // validate the shape here before those Option chains erase intent.
+    for key in [
+        "temperature",
+        "top_p",
+        "repeat_penalty",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "min_p",
+    ] {
+        if let Some(value) = msg.get(key) {
+            if !value.is_null() && value.as_f64().is_none() {
+                return Some(format!("{key} must be a number"));
+            }
+        }
+    }
+    for key in ["top_k", "repeat_window", "max_think_tokens"] {
+        if let Some(value) = msg.get(key) {
+            if !value.is_null() && value.as_u64().is_none() {
+                return Some(format!("{key} must be a non-negative integer"));
+            }
+        }
+    }
+    if let Some(value) = msg.get("params").and_then(|p| p.get("max_think_tokens")) {
+        if !value.is_null() && value.as_u64().is_none() {
+            return Some("params.max_think_tokens must be a non-negative integer".to_string());
+        }
+    }
+    // Images and tools are each supported in experimental multi-slot, but
+    // not together: the VL prompt path splices image pads into a ChatFrame
+    // user body and cannot render a tool contract. Reject the combination
+    // rather than silently dropping the tools (spec §7.1).
+    let has_image = msg.get("image").is_some_and(|v| !v.is_null())
         || msg.get("image_base64").is_some_and(|v| !v.is_null())
+        || msg.get("image_url").is_some_and(|v| !v.is_null())
         || msg
             .get("messages")
             .and_then(|v| v.as_array())
@@ -1333,11 +2062,27 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                             })
                         })
                 })
-            })
+            });
+    if has_image
+        && msg
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .is_some_and(|tools| !tools.is_empty())
     {
-        return Some("images are not supported in experimental multi-slot".to_string());
+        return Some(
+            "images and tools together are not supported in experimental multi-slot".to_string(),
+        );
     }
-    if msg.get("stop").is_some_and(|v| !v.is_null()) {
+    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is
+    // semantically neutral — OpenAI-legal and a no-op. Refusing it 400s a
+    // request that asks for nothing. Only a non-empty stop is refused.
+    let stop_nonempty = match msg.get("stop") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    };
+    if stop_nonempty {
         return Some("custom stop not supported in experimental multi-slot".to_string());
     }
     if msg.get("logprobs").and_then(|v| v.as_bool()) == Some(true)
@@ -1345,20 +2090,80 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("logprobs not supported in experimental multi-slot".to_string());
     }
-    for (key, neutral) in [
-        ("repeat_penalty", 1.0),
-        ("presence_penalty", 0.0),
-        ("frequency_penalty", 0.0),
-        ("min_p", 0.0),
-    ] {
-        if msg
-            .get(key)
-            .and_then(|v| v.as_f64())
-            .is_some_and(|v| v != neutral)
-        {
+    // response_format: the ONLY supported type is json_schema (spec §7.1:
+    // "reject missing requested semantics. An optimization bypass is
+    // allowed, a silent semantic downgrade is not"). Any other type — e.g.
+    // json_object — used to fall through validation and run unconstrained.
+    let rf_type = msg
+        .get("response_format")
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str());
+    match rf_type {
+        None => {}
+        Some("json_schema") => {
+            // Compile the schema with the saddle-core JSON Schema subset
+            // compiler (spec §7 G1). Unsupported keywords, refs, regex,
+            // recursion, and combinators are rejected here before the
+            // request is submitted — no GPU work, no cache/session mutation
+            // (spec §5.4 S4). A valid subset schema passes; the engine
+            // recompiles on admit to build the per-request SchemaMatcher
+            // cursor (spec §7.2 G2).
+            let schema = msg
+                .get("response_format")
+                .and_then(|v| v.get("json_schema"))
+                .and_then(|v| v.get("schema"));
+            let schema = match schema {
+                Some(s) => s,
+                None => {
+                    return Some(
+                        "response_format json_schema requires a schema object \
+                         (spec §7 G1)"
+                            .to_string(),
+                    );
+                }
+            };
+            if let Err(e) =
+                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+            {
+                return Some(format!("response_format json_schema: {e}"));
+            }
+        }
+        Some(other) => {
             return Some(format!(
-                "non-neutral {key} not supported in experimental multi-slot"
+                "response_format type '{other}' is not supported in \
+                 experimental multi-slot (only json_schema)"
             ));
+        }
+    }
+    // Token penalties and min_p are implemented by the slot sampler (in-kernel
+    // repeat/presence/frequency over a per-slot recent-token window; min_p in
+    // the top-p tail), so non-neutral values are honored, not refused. Only
+    // out-of-range values are rejected here.
+    for (key, lo, hi) in [
+        ("repeat_penalty", 1.0, 2.0),
+        // `repetition_penalty` is the OpenAI alias the sampler read resolves
+        // (`.or_else(repetition_penalty)`); it must be range-checked too —
+        // otherwise `{"repetition_penalty": 0.5}` silently clamps to 1.0 and
+        // `{"repetition_penalty": 1e9}` reaches the sampler unclamped.
+        ("repetition_penalty", 1.0, 2.0),
+        ("presence_penalty", 0.0, 2.0),
+        ("frequency_penalty", 0.0, 2.0),
+        ("min_p", 0.0, 1.0),
+        // temperature/top_p are consumed by the sampler with no daemon-side
+        // check; only the HTTP gateway validated them. Mirror the ranges so
+        // a direct-wire client cannot push -5 / 1e300 (f32::INFINITY) in.
+        ("temperature", 0.0, 2.0),
+    ] {
+        if let Some(v) = msg.get(key).and_then(|v| v.as_f64()) {
+            if !(lo..=hi).contains(&v) {
+                return Some(format!("{key} must be within [{lo}, {hi}]"));
+            }
+        }
+    }
+    // top_p is (0, 1] — open at 0, so it cannot ride the inclusive table.
+    if let Some(v) = msg.get("top_p").and_then(|v| v.as_f64()) {
+        if !(v > 0.0 && v <= 1.0) {
+            return Some("top_p must be within (0, 1]".to_string());
         }
     }
     if msg
@@ -1368,20 +2173,57 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("reasoning_effort is not supported in experimental multi-slot".to_string());
     }
-    if msg
-        .get("max_think_tokens")
-        .and_then(|v| v.as_u64())
-        .is_some_and(|n| n >= 2)
-    {
-        return Some(
-            "finite reasoning caps not supported in experimental multi-slot (max_think_tokens >=2)"
-                .to_string(),
-        );
+    // max_think_tokens >= 2 is ACCEPTED here (was refused): the engine now
+    // enforces finite think budgets — the grammar cursor force-closes the
+    // span at the budget (vLLM thinking_token_budget parity). Enforced
+    // behavior must never be refused at the door.
+    // Fields the wire accepts but the engine never reads must be refused,
+    // not silently dropped: `n: 2` returning one completion is a silent
+    // semantic downgrade (spec §7.1). The check reads the value as a NUMBER,
+    // not as a u64: `n: 2.5` / `n: -1` deserialise as f64, and an `as_u64`
+    // gate let both through as a silent single completion — the same
+    // downgrade, spelled differently. Anything present that is not exactly
+    // numeric 1 is refused (a string `n` cannot be honoured either).
+    match msg.get("n") {
+        None => {}
+        Some(v) if v.is_null() => {}
+        Some(v) if v.as_f64() == Some(1.0) => {}
+        Some(_) => return Some("n != 1 not supported in experimental multi-slot".to_string()),
+    }
+    if msg.get("best_of").is_some_and(|v| !v.is_null()) {
+        return Some("best_of not supported in experimental multi-slot".to_string());
+    }
+    if msg.get("logit_bias").is_some_and(|v| !v.is_null()) {
+        return Some("logit_bias not supported in experimental multi-slot".to_string());
+    }
+    // `echo: false` (the OpenAI default, which this route honours by simply
+    // not echoing) passes; `echo: true` and any non-boolean spelling (whose
+    // intent cannot be read) are refused rather than silently ignored.
+    match msg.get("echo") {
+        None => {}
+        Some(v) if v.is_null() => {}
+        Some(v) if v.as_bool() == Some(false) => {}
+        Some(_) => return Some("echo not supported in experimental multi-slot".to_string()),
+    }
+    if msg.get("suffix").is_some_and(|v| !v.is_null()) {
+        return Some("suffix not supported in experimental multi-slot".to_string());
     }
     None
 }
 
 // ── Message projection (pure) ────────────────────────────────────────────────
+
+/// Canonical pending-input bytes charged to the admission queue (spec §5.3).
+///
+/// Charges the FULL serialized request, not just the prompt text: a large
+/// `response_format.json_schema.schema`, `logit_bias` map, or `suffix`
+/// payload otherwise bypasses the waiting-room byte cap entirely while
+/// still occupying the same queue slot and memory.
+pub fn canonical_prompt_bytes(msg: &serde_json::Value) -> u64 {
+    serde_json::to_vec(msg)
+        .map(|v| v.len() as u64)
+        .unwrap_or(u64::MAX)
+}
 
 /// FNV-1a 64 hash of user turn text.
 pub fn turn_hash(s: &str) -> u64 {
@@ -1602,6 +2444,53 @@ fn validate_projected_tool_policy(
     }
 }
 
+/// Refuse a tools array that would exceed the grammar compiler's input
+/// bounds. `Matcher::with_config` builds the tool grammar with an internal
+/// `expect` on these same bounds, so an over-bound request that slipped
+/// through here would panic the per-request worker thread (and the whole
+/// process on a panic=abort build). Validating at the trust boundary turns
+/// it into a typed 400. Mirrors `saddle_core::grammar::json`'s accounting:
+/// tool count, plus the byte total of every tool name and `required` entry.
+fn validate_tool_schema_bounds(tools: Option<&[serde_json::Value]>) -> Result<(), String> {
+    use saddle_core::grammar::json::{MAX_SCHEMA_BYTES, MAX_TOOL_SCHEMAS};
+    let Some(tools) = tools else { return Ok(()) };
+    if tools.len() > MAX_TOOL_SCHEMAS {
+        return Err(format!(
+            "tools: {} entries exceeds the grammar bound of {MAX_TOOL_SCHEMAS}",
+            tools.len()
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for (i, tool) in tools.iter().enumerate() {
+        let func = tool.get("function").unwrap_or(tool);
+        let name = func.get("name").and_then(serde_json::Value::as_str);
+        if let Some(n) = name {
+            if n.is_empty() {
+                return Err(format!("tools[{i}]: empty tool name"));
+            }
+            total_bytes += n.len();
+        }
+        if let Some(required) = func
+            .get("parameters")
+            .and_then(|p| p.get("required"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for r in required {
+                if let Some(s) = r.as_str() {
+                    total_bytes += s.len();
+                }
+            }
+        }
+    }
+    if total_bytes > MAX_SCHEMA_BYTES {
+        return Err(format!(
+            "tools: {total_bytes} bytes of names/required exceeds the grammar \
+             bound of {MAX_SCHEMA_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
 fn trailing_tool_results(
     messages: &[Message],
 ) -> Result<Vec<(Option<String>, String, String)>, String> {
@@ -1675,6 +2564,239 @@ pub fn build_convo_from_messages(messages: &[Message]) -> Vec<u64> {
     convo
 }
 
+/// Encoded base64 cap matching the sequential daemon (~40 MiB → ~30 MiB raw).
+const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
+
+#[derive(Debug)]
+enum SlotImage {
+    Path(String),
+    Base64(String),
+}
+
+fn extract_slot_image(msg: &serde_json::Value) -> Result<Option<SlotImage>, String> {
+    let image = msg.get("image").and_then(|v| v.as_str());
+    let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+    let image_url = msg.get("image_url").and_then(|v| v.as_str());
+    if image_base64.is_some() && image.is_some() {
+        eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
+    }
+    if let Some(b64) = image_base64 {
+        if b64.len() > MAX_BASE64_ENCODED_LEN {
+            return Err(format!(
+                "image payload exceeds maximum encoded size ({} bytes)",
+                MAX_BASE64_ENCODED_LEN
+            ));
+        }
+        return Ok(Some(SlotImage::Base64(b64.to_string())));
+    }
+    if let Some(path) = image {
+        return Ok(Some(SlotImage::Path(path.to_string())));
+    }
+    if let Some(url) = image_url {
+        // Only data-URLs are meaningful here (the CLI validates and forwards
+        // OpenAI-style image_url parts as image_base64). Apply the same size
+        // cap as image_base64 — this is a daemon-wire field, so without the
+        // cap a direct client could force an unbounded base64 decode — and
+        // give remote URLs an actionable message instead of a confusing
+        // base64-decode failure.
+        if url.len() > MAX_BASE64_ENCODED_LEN {
+            return Err(format!(
+                "image payload exceeds maximum encoded size ({} bytes)",
+                MAX_BASE64_ENCODED_LEN
+            ));
+        }
+        let trimmed = url.trim_start();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return Err(
+                "remote image URLs are not supported — download the image and \
+                 send it inline (data URL or base64)"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(SlotImage::Base64(url.to_string())));
+    }
+    Ok(None)
+}
+
+fn splice_vl_user_body(
+    vision_start_id: u32,
+    image_pad_id: u32,
+    vision_end_id: u32,
+    n_visual_tokens: usize,
+    nl: &[u32],
+    q_tokens: &[u32],
+) -> Vec<u32> {
+    let mut user_body = Vec::with_capacity(n_visual_tokens + q_tokens.len() + nl.len() + 2);
+    user_body.push(vision_start_id);
+    user_body.extend(std::iter::repeat(image_pad_id).take(n_visual_tokens));
+    user_body.push(vision_end_id);
+    user_body.extend_from_slice(nl);
+    user_body.extend_from_slice(q_tokens);
+    user_body
+}
+
+fn build_slot_mrope(
+    prompt_ids: &[u32],
+    image_pad_id: u32,
+    n_visual: usize,
+    grid_h: usize,
+    grid_w: usize,
+    spatial_merge_size: usize,
+) -> Result<(Vec<[i32; 3]>, i32), String> {
+    if n_visual == 0 || spatial_merge_size == 0 {
+        return Err("VL request has no visual tokens".to_string());
+    }
+    let start = prompt_ids
+        .iter()
+        .position(|&t| t == image_pad_id)
+        .ok_or_else(|| "no <|image_pad|> in the prompt despite n_visual > 0".to_string())?;
+    if start + n_visual > prompt_ids.len() {
+        return Err("image span runs past the prompt".to_string());
+    }
+    if !prompt_ids[start..start + n_visual]
+        .iter()
+        .all(|&t| t == image_pad_id)
+    {
+        return Err("image-pad run is not contiguous".to_string());
+    }
+    if prompt_ids[start + n_visual..].contains(&image_pad_id) {
+        return Err("more than one image-pad run (multi-image not wired)".to_string());
+    }
+    let merged = (grid_h / spatial_merge_size) * (grid_w / spatial_merge_size);
+    if merged != n_visual {
+        return Err(format!(
+            "merged grid {merged} != spliced visual tokens {n_visual}"
+        ));
+    }
+    let spans = [hipfire_arch_qwen35_vl::mrope::ImageSpan {
+        start,
+        len: n_visual,
+        grid_h,
+        grid_w,
+    }];
+    let built = hipfire_arch_qwen35_vl::mrope::build_mrope_positions(
+        prompt_ids.len(),
+        &spans,
+        spatial_merge_size,
+    );
+    if built.positions.len() != prompt_ids.len() {
+        return Err(format!(
+            "build_mrope_positions returned {} positions for {} tokens",
+            built.positions.len(),
+            prompt_ids.len()
+        ));
+    }
+    Ok((built.positions, built.rope_delta))
+}
+
+fn decode_image_base64(b64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+        match rest.split_once(',') {
+            Some((_, after)) => after,
+            None => return Err("malformed data URL: missing ',' separator".to_string()),
+        }
+    } else {
+        b64
+    };
+    Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64)
+        .map_err(|e| format!("failed to decode base64 image data: {e}"))
+}
+
+fn build_slot_vl_prompt(
+    backend: &SlotBackend,
+    image: &SlotImage,
+    system: Option<&str>,
+    prompt: &str,
+    assistant_prefix: AssistantPrefix,
+) -> Result<(Vec<u32>, VisualData), String> {
+    let vc = backend
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| "VL model missing vision_config".to_string())?;
+    let tokenizer = &backend.tokenizer;
+    let image_pad_id = tokenizer
+        .special_token_id("<|image_pad|>")
+        .ok_or_else(|| "VL tokenizer missing <|image_pad|>".to_string())?;
+    let vision_start_id = tokenizer
+        .special_token_id("<|vision_start|>")
+        .ok_or_else(|| "VL tokenizer missing <|vision_start|>".to_string())?;
+    let vision_end_id = tokenizer
+        .special_token_id("<|vision_end|>")
+        .ok_or_else(|| "VL tokenizer missing <|vision_end|>".to_string())?;
+
+    let (pixels, img_h, img_w) = match image {
+        SlotImage::Path(path) => hipfire_arch_qwen35_vl::image::load_and_preprocess(
+            std::path::Path::new(path),
+            vc.patch_size,
+            vc.spatial_merge_size,
+        )?,
+        SlotImage::Base64(b64) => {
+            let bytes = decode_image_base64(b64)?;
+            hipfire_arch_qwen35_vl::image::load_and_preprocess_from_bytes(
+                &bytes,
+                vc.patch_size,
+                vc.spatial_merge_size,
+            )?
+        }
+    };
+    let grid_h = img_h / vc.patch_size;
+    let grid_w = img_w / vc.patch_size;
+    let n_patches = grid_h * grid_w;
+    let n_visual_tokens = n_patches / (vc.spatial_merge_size * vc.spatial_merge_size);
+    if n_visual_tokens == 0 {
+        return Err("image produced no visual tokens".to_string());
+    }
+
+    let nl = tokenizer.encode("\n");
+    let q_tokens = tokenizer.encode(prompt);
+    let user_body = splice_vl_user_body(
+        vision_start_id,
+        image_pad_id,
+        vision_end_id,
+        n_visual_tokens,
+        &nl,
+        &q_tokens,
+    );
+    let prompt_tokens = ChatFrame {
+        tokenizer,
+        system,
+        user: "",
+        assistant_prefix,
+        raw: false,
+    }
+    .build_with_user_tokens(&user_body);
+
+    let (mrope_positions, rope_delta) = build_slot_mrope(
+        &prompt_tokens,
+        image_pad_id,
+        n_visual_tokens,
+        grid_h,
+        grid_w,
+        vc.spatial_merge_size,
+    )?;
+    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+        &pixels,
+        3,
+        img_h,
+        img_w,
+        vc.patch_size,
+        vc.temporal_patch_size,
+        vc.spatial_merge_size,
+    );
+    Ok((
+        prompt_tokens,
+        VisualData {
+            patches,
+            grid_h,
+            grid_w,
+            n_visual_tokens,
+            mrope_positions,
+            rope_delta,
+        },
+    ))
+}
+
 // ── Tests (pure, no GPU) ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1692,12 +2814,145 @@ mod tests {
         assert!(validate_arch_id(9).is_err());
     }
 
+    /// P10: a generate with no sampling fields resolves on the multi-slot
+    /// route to exactly what the sequential route resolves (arch ladder /
+    /// `.hfq` recs, default max_tokens 4096, the `max_tokens_fit` clamp) —
+    /// not the old slot-local 0.0 / 1.0 / 512 / no-fit.
     #[test]
-    fn generate_caps_rejects_images() {
+    fn slot_sampling_defaults_match_sequential_route() {
+        use hipfire_engine::scheduler::{resolve_temp_top_p, DEFAULT_GENERATE_MAX_TOKENS};
+        let bare = json!({"type": "generate", "max_tokens_fit": true});
+        for (rec_t, rec_p) in [(None, None), (Some(0.6), Some(0.95)), (Some(0.7), None)] {
+            let (seq_t, seq_p) = resolve_temp_top_p(&bare, 5, rec_t, rec_p);
+            let (t, p, max_tokens, fit) = resolve_slot_sampling(&bare, 5, rec_t, rec_p).unwrap();
+            assert_eq!((t, p), (seq_t, seq_p));
+            assert_eq!(max_tokens, DEFAULT_GENERATE_MAX_TOKENS);
+            assert!(fit);
+        }
+        // Pinned values: qwen35 ladder, then per-knob .hfq recs.
+        assert_eq!(resolve_slot_sampling(&bare, 5, None, None).unwrap().0, 0.3);
+        assert_eq!(resolve_slot_sampling(&bare, 5, None, None).unwrap().1, 0.8);
+        let partial = resolve_slot_sampling(&bare, 5, Some(0.7), None).unwrap();
+        assert_eq!((partial.0, partial.1), (0.7, 0.8));
+        // Explicit fields win over recs, and an explicit max_tokens is never
+        // marked for fitting.
+        let explicit = json!({"max_tokens": 64, "temperature": 0.0, "top_p": 1.0});
+        assert_eq!(
+            resolve_slot_sampling(&explicit, 5, Some(0.6), Some(0.95)).unwrap(),
+            (0.0, 1.0, 64, false)
+        );
+        assert!(resolve_slot_sampling(&json!({"max_tokens": 0}), 5, None, None).is_err());
+    }
+
+    #[test]
+    fn generate_caps_allows_images() {
         let m = json!({"image": "/tmp/a.png", "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m).is_some());
+        assert!(validate_generate_caps(&m).is_none());
         let m2 = json!({"image_base64": "abcd", "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m2).is_some());
+        assert!(validate_generate_caps(&m2).is_none());
+    }
+
+    #[test]
+    fn generate_caps_accepts_tool_turns_and_refuses_tools_with_images() {
+        // Tool turns are SUPPORTED on the slot route (upstream ad6004ac0:
+        // the daemon projects role=tool into the Jinja message list and the
+        // tool-call parser emits `tool_calls`). The gate that used to refuse
+        // a bare tool message is gone; the surviving refusal is the
+        // images+tools COMBINATION (the VL prompt path splices image pads
+        // into a user body and cannot render a tool contract).
+        let tool_turn = json!({"messages": [{"role": "tool", "content": "result",
+                                             "tool_call_id": "call_1"}],
+                               "experimental_multi_slot": true});
+        assert!(
+            validate_generate_caps(&tool_turn).is_none(),
+            "tool-result turns are supported and must not be refused here"
+        );
+        let assistant_call = json!({"messages": [{"role": "assistant", "tool_calls": [
+                                        {"id": "1", "function": {"name": "f"}}]}],
+                                    "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&assistant_call).is_none());
+        let both = json!({"image_base64": "abcd", "tools": [{"type": "function"}],
+                          "experimental_multi_slot": true});
+        let reason = validate_generate_caps(&both)
+            .expect("images+tools must stay refused (no VL tool contract)");
+        assert!(reason.contains("images and tools"), "unexpected: {reason}");
+    }
+
+    #[test]
+    fn extract_slot_image_prefers_base64() {
+        let msg = json!({"image": "/tmp/a.png", "image_base64": "abcd"});
+        match extract_slot_image(&msg).unwrap() {
+            Some(SlotImage::Base64(s)) => assert_eq!(s, "abcd"),
+            other => panic!("expected base64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn splice_vl_user_body_wraps_pads() {
+        let body = splice_vl_user_body(1, 2, 3, 4, &[10], &[20, 21]);
+        assert_eq!(body, vec![1, 2, 2, 2, 2, 3, 10, 20, 21]);
+    }
+
+    #[test]
+    fn build_slot_mrope_marks_image_span() {
+        let pad = 9u32;
+        let mut ids = vec![1, 2, pad, pad, pad, pad, 3, 4];
+        let (pos, delta) = build_slot_mrope(&ids, pad, 4, 4, 4, 2).unwrap();
+        assert_eq!(pos.len(), ids.len());
+        assert_eq!(pos[0], [0, 0, 0]);
+        assert_eq!(pos[2], [2, 2, 2]); // first visual: t=cursor, h=cursor+0, w=cursor+0
+        assert_ne!(delta, 0);
+        ids.push(pad);
+        assert!(build_slot_mrope(&ids, pad, 4, 4, 4, 2).is_err());
+    }
+
+    #[test]
+    fn build_slot_mrope_rejects_degenerate_and_mismatched_inputs() {
+        let pad = 9u32;
+        let ids = vec![1, pad, pad, pad, pad, 3];
+        // Merged grid ((8/2)*(8/2)=16) disagrees with the spliced token count (4).
+        assert!(build_slot_mrope(&ids, pad, 4, 8, 8, 2).is_err());
+        // Zero visual tokens.
+        assert!(build_slot_mrope(&ids, pad, 0, 4, 4, 2).is_err());
+        // Degenerate spatial merge size.
+        assert!(build_slot_mrope(&ids, pad, 4, 4, 4, 0).is_err());
+        // A second pad run after the first — multi-image is not wired.
+        let split = vec![pad, pad, 5, pad, pad];
+        assert!(build_slot_mrope(&split, pad, 4, 4, 4, 2).is_err());
+        // A prompt with no pad at all.
+        let no_pad = vec![1, 2, 3];
+        assert!(build_slot_mrope(&no_pad, pad, 4, 4, 4, 2).is_err());
+    }
+
+    #[test]
+    fn extract_slot_image_wraps_top_level_image_url_as_base64() {
+        let msg = json!({"image_url": "data:image/png;base64,aGVsbG8="});
+        match extract_slot_image(&msg).unwrap() {
+            Some(SlotImage::Base64(s)) => assert_eq!(s, "data:image/png;base64,aGVsbG8="),
+            other => panic!("expected base64, got {other:?}"),
+        }
+        let none = json!({"prompt": "hi"});
+        assert!(extract_slot_image(&none).unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_slot_image_rejects_oversized_base64() {
+        let big = "A".repeat(MAX_BASE64_ENCODED_LEN + 1);
+        let msg = json!({ "image_base64": big });
+        let err = extract_slot_image(&msg).unwrap_err();
+        assert!(err.contains("maximum encoded size"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn decode_image_base64_strips_data_urls_and_rejects_garbage() {
+        assert_eq!(
+            decode_image_base64("data:image/png;base64,aGVsbG8=").unwrap(),
+            b"hello"
+        );
+        assert_eq!(decode_image_base64("aGVsbG8=").unwrap(), b"hello");
+        // A data URL without the ',' separator fails closed.
+        assert!(decode_image_base64("data:image/png;base64").is_err());
+        assert!(decode_image_base64("not base64 !!!").is_err());
     }
 
     #[test]
@@ -1708,10 +2963,97 @@ mod tests {
         assert!(validate_generate_caps(&m2).is_some());
         let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m3).is_some());
-        let m4 = json!({"max_think_tokens": 5, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m4).is_some());
-        let m5 = json!({"max_think_tokens": 1, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m5).is_none());
+        // Finite think caps are ENFORCED (the grammar cursor force-closes the
+        // span at the budget) and are therefore never refused at the door —
+        // including the `1` no-thinking sentinel, whose contradiction with an
+        // open-think framing is raised later, in `handle_generate`'s projected
+        // reasoning authority, not by this wire-cap gate.
+        for cap in [json!(1), json!(5)] {
+            let m = json!({"max_think_tokens": cap, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_none(),
+                "max_think_tokens={cap} is enforced, not refused"
+            );
+        }
+    }
+    #[test]
+    fn generate_caps_rejects_every_non_unit_spelling_of_n_and_echo() {
+        // `n` is refused unless it is exactly the number 1: an `as_u64` gate
+        // silently accepted `2.5`/`-1`/"2" as a single completion (the
+        // semantic downgrade the refusal exists to prevent).
+        for bad in [json!(2), json!(2.5), json!(-1), json!(0), json!("2")] {
+            let m = json!({"n": bad, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_some(),
+                "n={bad} must be refused, not silently downgraded to one completion"
+            );
+        }
+        assert!(
+            validate_generate_caps(&json!({"n": 1, "experimental_multi_slot": true})).is_none()
+        );
+        assert!(
+            validate_generate_caps(&json!({"n": null, "experimental_multi_slot": true})).is_none()
+        );
+        // `echo: false` is the OpenAI default this route honours by not
+        // echoing; `true` and non-boolean spellings are refused.
+        assert!(
+            validate_generate_caps(&json!({"echo": false, "experimental_multi_slot": true}))
+                .is_none()
+        );
+        for bad in [json!(true), json!(1)] {
+            let m = json!({"echo": bad, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_some(),
+                "echo={bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_caps_accepts_valid_json_schema_rejects_unsupported() {
+        // A valid subset schema (object with typed properties) is accepted at
+        // validate_generate_caps — the saddle-core CompiledSchema compiler
+        // succeeds (spec §7 G1).
+        let m = json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}},
+            "experimental_multi_slot": true
+        });
+        assert!(
+            validate_generate_caps(&m).is_none(),
+            "valid json_schema response_format should be accepted"
+        );
+        // `response_format: {"type":"text"}` is OpenAI's DEFAULT type and
+        // means "unconstrained". The gateway maps it to "no response_format"
+        // before the wire (verified: E15 accepts it with HTTP 200), so a
+        // `text` type arriving at the DAEMON door is a second, ambiguous
+        // meaning and is refused rather than silently reinterpreted.
+        let m2 = json!({
+            "response_format": {"type": "text"},
+            "experimental_multi_slot": true
+        });
+        let reason = validate_generate_caps(&m2)
+            .expect("a text response_format must be refused at the daemon door");
+        assert!(reason.contains("is not supported"), "unexpected: {reason}");
+        // Unsupported $ref is rejected before submit (spec §7 G1, §5.4 S4).
+        let m3 = json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"$ref": "#/$defs/foo"}}},
+            "experimental_multi_slot": true
+        });
+        let reason = validate_generate_caps(&m3);
+        assert!(reason.is_some(), "unsupported $ref must be rejected");
+        assert!(
+            reason.unwrap().contains("response_format json_schema"),
+            "rejection must be typed as a json_schema error"
+        );
+        // Missing schema object is rejected.
+        let m4 = json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test"}},
+            "experimental_multi_slot": true
+        });
+        assert!(
+            validate_generate_caps(&m4).is_some(),
+            "json_schema without a schema object must be rejected"
+        );
     }
 
     #[test]
@@ -1722,7 +3064,7 @@ mod tests {
         assert!(validate_load_caps(&m2).is_some());
         let m3 = json!({"params": {"pp": 2}});
         assert!(validate_load_caps(&m3).is_some());
-        let m4 = json!({"params": {"draft": "some.hfq"}});
+        let m4 = json!({"params": {"drafter": "some.hfq"}});
         assert!(validate_load_caps(&m4).is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});
         assert!(validate_load_caps(&m5).is_some());
@@ -1934,17 +3276,52 @@ mod tests {
             "cask": false
         }});
         assert_eq!(validate_load_caps(&supported), None);
+        // The full static KV ladder plus the flat 2-byte native tiers is
+        // accepted (engine resolves it through the slots site policy); only
+        // strings the policy rejects — fp8 (no slot readers), garbage — are
+        // refused here, loudly, before any GPU work.
+        for kv in [
+            "asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "bf16", "f16", "auto",
+        ] {
+            assert_eq!(
+                validate_load_caps(&json!({"params": {"kv_mode": kv}})),
+                None,
+                "ladder tier {kv} must be accepted"
+            );
+        }
         for params in [
-            json!({"kv_mode": "asym3"}),
+            json!({"kv_mode": "fp8"}),
+            json!({"kv_mode": "garbage"}),
             json!({"kv_backend": "vmm"}),
-            json!({"dflash_mode": "auto"}),
-            json!({"mtp_mode": "on"}),
             json!({"ngram_draft": true}),
             json!({"cask": true}),
+            json!({"drafter": "some-drafter"}),
+            json!({"prefill_compression": "on"}),
         ] {
             assert!(
                 validate_load_caps(&json!({"params": params})).is_some(),
                 "unsupported params passed: {params}"
+            );
+        }
+        // MTP is now accepted in multi-slot (sequential per-slot path).
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"mtp_mode": "on"}})),
+            None,
+            "mtp_mode on should be accepted in multi-slot"
+        );
+        // DFlash2 is accepted: params.draft + dflash_mode auto/on route to
+        // the slot engine's spec-decode path.
+        for params in [
+            json!({"dflash_mode": "auto"}),
+            json!({"dflash_mode": "on"}),
+            json!({"dflash_mode": "off"}),
+            json!({"draft": "/path/to/draft.hfq"}),
+            json!({"draft": "/path/to/draft.hfq", "dflash_mode": "on"}),
+        ] {
+            assert_eq!(
+                validate_load_caps(&json!({"params": params})),
+                None,
+                "dflash params must be accepted: {params}"
             );
         }
     }
@@ -1952,10 +3329,22 @@ mod tests {
     #[test]
     fn generate_caps_rejects_silently_ignored_controls() {
         assert!(validate_generate_caps(&json!({"temperature": 0.7, "top_p": 0.9})).is_none());
+        // Penalties are honored by the slot sampler now: in-range values pass,
+        // out-of-range values are rejected.
         for request in [
             json!({"repeat_penalty": 1.05}),
-            json!({"presence_penalty": 0.1}),
+            json!({"presence_penalty": 1.5}),
             json!({"min_p": 0.05}),
+        ] {
+            assert!(
+                validate_generate_caps(&request).is_none(),
+                "supported request refused: {request}"
+            );
+        }
+        for request in [
+            json!({"repeat_penalty": 2.5}),
+            json!({"presence_penalty": -0.1}),
+            json!({"min_p": 1.5}),
             json!({"reasoning_effort": "high"}),
         ] {
             assert!(
@@ -1974,6 +3363,24 @@ mod tests {
             ]
         }))
         .is_none());
+    }
+
+    #[test]
+    fn generate_caps_rejects_malformed_numeric_controls() {
+        for request in [
+            json!({"temperature": "hot"}),
+            json!({"top_p": true}),
+            json!({"top_k": 1.5}),
+            json!({"repeat_window": -1}),
+            json!({"presence_penalty": []}),
+            json!({"max_think_tokens": "many"}),
+            json!({"params": {"max_think_tokens": -2}}),
+        ] {
+            assert!(
+                validate_generate_caps(&request).is_some(),
+                "malformed numeric control silently passed: {request}"
+            );
+        }
     }
 
     #[test]

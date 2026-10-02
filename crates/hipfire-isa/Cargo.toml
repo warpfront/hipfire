@@ -19,6 +19,7 @@ lift = ["dep:peacemaker-lift", "dep:peacemaker-ir"]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+peacemaker-author = { path = "../peacemaker-author" }
 radiowave = { path = "../radiowave", optional = true }
 peacemaker-lift = { path = "../peacemaker-lift", optional = true }
 peacemaker-ir = { path = "../peacemaker-ir", optional = true }

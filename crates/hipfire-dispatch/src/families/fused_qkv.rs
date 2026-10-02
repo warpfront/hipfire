@@ -10,6 +10,9 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// Select the fused qkv/z/beta/alpha kernel key for a packed weight container.
 pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
+        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
+        // read them at the 136 B HFQ4 stride and return noise at full speed.
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
@@ -26,6 +29,7 @@ pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
 /// Select the fused q/k/v kernel key for a packed weight container.
 pub fn fused_qkv_key_for(dt: DType) -> KernelKey {
     match dt {
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
@@ -42,6 +46,11 @@ pub fn fused_qkv_key_for(dt: DType) -> KernelKey {
 /// Select the fused gate/up kernel key for a packed weight container.
 pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
     match dtype {
+        // qt=15/qt=8 share the 200 B/group 6-bit container. The MoE shared
+        // expert prefill (AWQ A3B layers 0/1/38/39) reaches this with MQ6G256;
+        // the HFQ4 default below read it at the 136 B stride and the whole
+        // residual stream turned to noise ("!!!!" on every prompt).
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedGateUpHfq6G256,
         DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,

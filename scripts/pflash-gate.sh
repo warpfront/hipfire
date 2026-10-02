@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
+echo "warning: pflash-gate.sh is deprecated and will be removed in 0.5.0; PFlash is not supported" >&2
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt

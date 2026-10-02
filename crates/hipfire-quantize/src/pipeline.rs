@@ -3,26 +3,17 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
-
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use hipfire_quantize::float16::bf16_to_f32;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::calibration::*;
 use crate::cli::*;
 use crate::dequant::*;
-use crate::e8;
-use crate::e8_gptq;
 use crate::gguf_input;
 use crate::hfq::*;
 use crate::model_filter::*;
@@ -38,9 +29,7 @@ use crate::quant_mq4v2_lloyd::{
 };
 use crate::quant_q4::*;
 use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
+use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use hipfire_quantize::vision_sidecar::{
     VisionDtype, is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix,
@@ -52,10 +41,8 @@ use hipfire_runtime::hfq::{HfqFile as RuntimeHfqFile, HfqTensorInfo};
 struct PerTensorCtx<'a> {
     name: &'a str,
     file_idx: usize,
-    shape: &'a [usize],
     n_elements: usize,
     arch_id: u32,
-    dtype: &'a str,
     is_vision: bool,
 }
 struct MainQuantFlags {
@@ -121,7 +108,6 @@ struct MainQuantFlags {
 
 struct MainQuantOuter<'a> {
     kmap: &'a HashMap<String, QuantLevel>,
-    imatrix_gguf: &'a Option<gguf_input::GgufFile>,
     hessian_dir: &'a Option<PathBuf>,
 }
 
@@ -138,14 +124,6 @@ struct MainQuantState<'a> {
     spill: &'a mut Option<TensorSpill>,
 }
 
-struct FormatFlags {
-    use_f32_passthrough: bool,
-    use_bf16: bool,
-    use_q8: bool,
-    use_mixed: bool,
-    use_fast: bool,
-    use_q8hfq: bool,
-}
 
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
@@ -760,8 +738,56 @@ mod mqn_final_code_tests {
     }
 }
 
+/// Formats `handle_early_special_formats` consumes before the main pipeline.
+fn is_early_special_format(format: &str) -> bool {
+    matches!(
+        format,
+        "maple"
+            | "maple-preview"
+            | "maple-ternary"
+            | "deepseek4-dense-mfp4e8soa-overlay"
+            | "ds4-dense-e8soa-overlay"
+            | "deepseek4-dspark-e8soa"
+            | "ds4-dspark-e8soa"
+            | "deepseek4-dspark-mq2r"
+            | "qwen3-dspark-q8"
+            | "qwen35-dspark-q8"
+    )
+}
+
+/// Which `run()` path these arguments dispatch to (same precedence as `run()`).
+fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
+    use crate::cli::Route;
+    if args.flux_pipe.is_some() {
+        Route::Flux
+    } else if args.qwen4_flash_next {
+        Route::Qwen4
+    } else if args.mq4v2_final_codes.is_some()
+        || args.mq3v2_final_codes.is_some()
+        || args.mq2v2_final_codes.is_some()
+    {
+        Route::FinalCodes
+    } else if is_early_special_format(&args.format) {
+        Route::EarlySpecial
+    } else if args.input.as_deref().is_some_and(|i| is_gguf_input(Path::new(i))) {
+        Route::Gguf
+    } else if args.reap_overlay.is_some() {
+        Route::ReapOverlay
+    } else {
+        Route::Main
+    }
+}
+
 pub(crate) fn run() {
-    let args = QuantizeArgs::parse();
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = QuantizeArgs::command().get_matches();
+    let args = QuantizeArgs::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // Before every route: flux and qwen4 use rayon too.
+    setup_thread_pool(&args);
+    if let Err(e) = crate::cli::reject_unreachable(&matches, route_for(&args)) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
 
     // ── FLUX.1 component pack (HFQM) — separate surface from quantizing ────
     // Packs a diffusers FLUX.1 pipe into per-component HFQ files instead of
@@ -902,8 +928,6 @@ pub(crate) fn run() {
         entries.sort();
         eprintln!("fixed-tier overrides (CLI): {}", entries.join(","));
     }
-
-    setup_thread_pool(&args);
 
     let input_dir = args
         .input
@@ -1408,9 +1432,9 @@ pub(crate) fn run() {
     }
     if use_mq4_mq6exp {
         eprintln!(
-            "warning: --format mq4-mq6exp is deprecated. Use --format mq4 instead — \
-             K-map promotes expert FFNs (and edge layers) to MQ6 automatically. \
-             Proceeding as --format mq4."
+            "warning: --format mq4-mq6exp is deprecated. It writes MQ4G256 (v1, qt=13) \
+             dense tensors with K-map-promoted MQ6 experts — NOT --format mq4, which is \
+             MQ4G256V2 (qt=44). Use --format mq4v1 for the same v1 body."
         );
     }
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
@@ -1530,6 +1554,66 @@ pub(crate) fn run() {
     // in this patch.
     let awq_enabled = args.awq || args.awq_alpha.is_some() || args.awq_a4_aware || args.awq_a4_route_c2;
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
+    let main_route = route_for(&args) == crate::cli::Route::Main;
+    // ── Unknown --format ──
+    // The encoder chain ends in a legacy Q4F16G64 `else`; without this check a
+    // typo silently produced a qt=0 model. `q4f16` is the one spelling that
+    // asks for that arm on purpose.
+    let use_q4f16 = format == "q4f16";
+    let format_known = use_q8 || use_q4f16 || use_f32_passthrough || use_mixed || use_fast
+        || use_q8hfq || use_q4k_all || use_q4k_q8embed || use_mq8g256
+        || use_deepseek4_source_precision || use_deepseek4_mq2rxt_overlay
+        || use_mq4g256 || use_mq4v2 || use_mq4v2_lloyd || use_mq4c
+        || use_hfq4g256 || use_hfq3g256 || use_hfq3g128 || use_hfq2g256 || use_hfq2g128
+        || use_hfq_mixed || use_mq6g256 || use_mq5g256 || use_mq6g256v2 || use_mq5g256v2
+        || use_mq3g256v2 || use_mq2g256v2 || use_bf16 || use_f16
+        || use_mq4_mq2lloydexp || use_mq4_mq2glexp || use_mq4_mq2lloyd_native
+        || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap
+        || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq
+        || use_mq4_mq2lloyd_gptq_all || use_mq4_mq6exp
+        || use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq2g256_lloyd_anchored
+        || use_mq3g256_lloyd || use_mq4g256_lloyd || use_hfq6 || use_hfp4 || use_mfp4
+        || use_mfp4l || use_mfp4p || use_mfp4e8 || use_mfp4e8soa
+        || use_mfp3e8_gptq_fmt || use_mfp2e8_gptq_fmt;
+    if main_route && !format_known {
+        if GgufFormat::from_flag(format).is_some() {
+            eprintln!("error: --format {format} is only supported for GGUF weight input");
+        } else {
+            eprintln!("error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)");
+        }
+        std::process::exit(2);
+    }
+    // ── --imatrix with nothing to consume it ──
+    let imatrix_only_consumer = use_mq4_mqlloyd_tiered
+        || use_mq4_mq2lloyd_imatrix
+        || use_mq4_mqlloyd_antirez
+        || use_mq4_mqlloyd_antirez_gptq
+        || use_mq4_mq2lloyd_gptq_all
+        || use_moe_graded;
+    if main_route && args.imatrix.is_some() && !awq_enabled && !imatrix_only_consumer {
+        eprintln!(
+            "error: --imatrix has no effect with --format {format} unless --awq is given; remove it"
+        );
+        std::process::exit(2);
+    }
+    // ── REAP re-quant has only asymmetric encoders ──
+    if (args.reap_overlay.is_some() || args.reap_bake.is_some())
+        && (args.mq4v2_symmetric || args.mq3v2_symmetric || args.mq2v2_symmetric)
+    {
+        eprintln!(
+            "error: --reap-overlay/--reap-bake re-quantize with asymmetric encoders; \
+             --mq*v2-symmetric would be stamped but not applied; remove it"
+        );
+        std::process::exit(2);
+    }
+    // Formats whose encoder arm applies AWQ pre-scaling to dense tensors.
+    let awq_format = use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2glexp
+        || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix
+        || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez
+        || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all
+        || use_mq4v2 || use_mq4v2_lloyd || use_mq4c || use_mq5g256 || use_mq6g256v2
+        || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2 || use_mq3g256_lloyd
+        || use_mq2g256_lloyd_anchored || use_mq2g256_lloyd || use_mq3g256 || use_mq2g256;
     if (args.awq_a4_aware || args.awq_a4_route_c2) && !use_mq4v2 {
         eprintln!("error: A4-aware AWQ currently requires --format mq4v2");
         std::process::exit(1);
@@ -1643,13 +1727,7 @@ pub(crate) fn run() {
         "alternating" | "alt" | "1" => 1,
         "typed" | "2" => 2,
         "typed-gemma4" | "3" => 3,
-        _ => {
-            eprintln!(
-                "warning: unknown --kmap-mode '{}', using alternating",
-                args.kmap_mode
-            );
-            1
-        }
+        other => unreachable!("clap value_parser admitted --kmap-mode {other}"),
     };
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
@@ -1781,7 +1859,9 @@ pub(crate) fn run() {
     // with no quality benefit.
     {
         let raw_input = Path::new(input_dir);
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
         if is_gguf_input(raw_input) {
+            eprintln!("warning: GGUF weight input is deprecated and will be removed in 0.5.0; GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (imatrix.gguf input stays supported)");
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
                     "GGUF input: --format '{format}' not recognized. \
@@ -1904,6 +1984,23 @@ pub(crate) fn run() {
         );
         std::process::exit(2);
     }
+    // ── --awq with no encoder arm that applies it ──
+    // Cohere2/LFM2 have their own handlers with no AWQ code; otherwise AWQ
+    // needs an AWQ-capable --format, the 3D-MoE / MiniMax expert paths, or a
+    // fixed-tier override (whose MQ4 arm pre-scales).
+    if awq_enabled && main_route {
+        let tier_override = product_tier.is_some()
+            || crate::model_filter::fixed_tier_map_cli().is_some()
+            || hipfire_config::developer_var("HIPFIRE_FIXED_TIER").is_ok();
+        let consumer = awq_format || is_moe || is_gemma4 || is_minimax || tier_override;
+        if is_cohere2moe || is_lfm2moe || !consumer {
+            eprintln!(
+                "error: --awq has no effect with --format {format} on {arch_str}; \
+                 AWQ-capable formats: mq4/mq4v1/mq4v2/mq4c/mq4v2-lloyd/mq5/mq{{6,5,3,2}}v2/mq3/mq2/mq{{3,2}}-lloyd; remove --awq"
+            );
+            std::process::exit(2);
+        }
+    }
     // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
     // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
     // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
@@ -1989,8 +2086,16 @@ pub(crate) fn run() {
         );
     }
     if is_cohere2moe {
+        // The cohere2moe handler only knows these tiers; any other format
+        // used to fall through to Q8 experts without a word.
+        if !(use_q8 || use_f16 || use_bf16 || use_f32_passthrough || use_mq6g256 || use_mq4g256 || use_mq4v2) {
+            eprintln!(
+                "error: --format {format} is not supported for Cohere2-MoE; use one of q8, f16, bf16, oracle, mq6, mq4 (experts are written as MQ4G256, qt=13)"
+            );
+            std::process::exit(2);
+        }
         eprintln!(
-            "  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16."
+            "  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}, mq4 = MQ4G256 qt=13); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16."
         );
     }
 
@@ -2097,6 +2202,14 @@ pub(crate) fn run() {
     }
     if args.mq2v2_symmetric {
         metadata["mq2v2.symmetric"] = serde_json::json!(1);
+    }
+    if let Some(prov) = provenance(
+        args.input.as_deref().unwrap_or_default(),
+        format,
+        args.source_url.as_deref(),
+        args.license.as_deref(),
+    ) {
+        metadata["hipfire_provenance"] = prov;
     }
     if args.awq_fix_la_head_order {
         metadata["awq_la_out_head_order"] = serde_json::json!("qwen3.8-hf-kmajor-vminor");
@@ -2500,7 +2613,17 @@ pub(crate) fn run() {
     {
         None
     } else {
-        TensorSpill::new(spill_dir).ok()
+        match TensorSpill::new(spill_dir) {
+            Ok(spill) => Some(spill),
+            Err(e) => {
+                eprintln!(
+                    "error: cannot create tensor spill file in {}: {e} \
+                     (set HIPFIRE_SPILL_DIR to a writable dir, or HIPFIRE_NO_SPILL=1 to hold everything in RAM)",
+                    spill_dir.display()
+                );
+                std::process::exit(2);
+            }
+        }
     };
     let mut total_quant_error = 0.0f64;
     let mut max_quant_error = 0.0f32;
@@ -2573,12 +2696,6 @@ pub(crate) fn run() {
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
             continue;
-        }
-        if vision_group {
-            // include_vision is implied here. The tensor reaches the bottom-of-loop
-            // F16 fallback unchanged; this only records that the artifact carries a
-            // vision module, for the has_vision metadata flag (VL contract §4).
-            emitted_vision = true;
         }
         // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
         // towers + multimodal projectors; quantize only the text decoder.
@@ -2660,7 +2777,7 @@ pub(crate) fn run() {
             quantized_params += n_elements as u64;
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut spill) = spill {
-                maybe_spill(&mut hfq_tensors, spill, 2 * 1024 * 1024 * 1024);
+                spill_or_exit(&mut hfq_tensors, spill, 2 * 1024 * 1024 * 1024);
             }
             continue;
         }
@@ -2736,7 +2853,7 @@ pub(crate) fn run() {
                 quantized_params += n_elements as u64;
                 st_files[*file_idx].drop_tensor_pages(name);
                 if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                    spill_or_exit(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
                 }
                 continue;
             }
@@ -2813,10 +2930,8 @@ pub(crate) fn run() {
             let __ctx = PerTensorCtx {
                 name,
                 file_idx: *file_idx,
-                shape: &meta.shape,
                 n_elements,
                 arch_id,
-                dtype: &meta.dtype,
                 is_vision,
             };
             if handle_f32_passthrough(
@@ -2845,10 +2960,8 @@ pub(crate) fn run() {
             let __ctx = PerTensorCtx {
                 name,
                 file_idx: *file_idx,
-                shape: &meta.shape,
                 n_elements,
                 arch_id,
-                dtype: &meta.dtype,
                 is_vision,
             };
             if handle_bf16_passthrough(
@@ -2907,7 +3020,7 @@ pub(crate) fn run() {
             use_bf16,
             use_f16,
             use_mq6g256,
-            use_mq4g256,
+            use_mq4g256 || use_mq4v2,
             &fp8_scale_for,
             &st_files,
             &mut hfq_tensors,
@@ -3164,7 +3277,7 @@ pub(crate) fn run() {
                 quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
                 st_files[*file_idx].drop_tensor_pages(name);
                 if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                    spill_or_exit(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
                 }
                 continue;
             }
@@ -3288,7 +3401,7 @@ pub(crate) fn run() {
                 quantized_params += (logical_shape[0] * logical_shape[1]) as u64;
                 st_files[*file_idx].drop_tensor_pages(name);
                 if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                    spill_or_exit(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
                 }
                 continue;
             }
@@ -3306,10 +3419,8 @@ pub(crate) fn run() {
             let __ctx = PerTensorCtx {
                 name,
                 file_idx: *file_idx,
-                shape: &meta.shape,
                 n_elements,
                 arch_id,
-                dtype: &meta.dtype,
                 is_vision,
             };
             if handle_moe_expert_3d(
@@ -3438,7 +3549,7 @@ pub(crate) fn run() {
             });
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
-                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                spill_or_exit(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             continue;
         }
@@ -3473,7 +3584,7 @@ pub(crate) fn run() {
             });
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
-                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                spill_or_exit(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             continue;
         }
@@ -3541,7 +3652,6 @@ pub(crate) fn run() {
             };
             let outer = MainQuantOuter {
                 kmap: &kmap,
-                imatrix_gguf: &imatrix_gguf,
                 hessian_dir: &hessian_dir,
             };
             let mut state = MainQuantState {
@@ -3555,10 +3665,8 @@ pub(crate) fn run() {
             let ctx = PerTensorCtx {
                 name,
                 file_idx: *file_idx,
-                shape: &meta.shape,
                 n_elements,
                 arch_id,
-                dtype: &meta.dtype,
                 is_vision,
             };
             handle_main_quant(
@@ -3825,7 +3933,7 @@ pub(crate) fn run() {
     eprintln!("\nWriting: {}", output_path.display());
     // Final spill before writing
     if let Some(ref mut s) = spill {
-        maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
+        spill_or_exit(&mut hfq_tensors, s, 0); // spill everything remaining
     }
     write_hfq(
         output_path,
@@ -3834,7 +3942,13 @@ pub(crate) fn run() {
         &hfq_tensors,
         spill.as_mut(),
     )
-    .unwrap();
+    .unwrap_or_else(|e| {
+        eprintln!("error: writing {} failed: {e}; no output written", output_path.display());
+        if let Some(s) = spill.as_ref() {
+            let _ = std::fs::remove_file(s.path());
+        }
+        std::process::exit(2);
+    });
     if let Some(s) = spill {
         s.cleanup();
     }
@@ -4387,7 +4501,7 @@ fn try_handle_lfm2moe(
             *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
             st_files[file_idx].drop_tensor_pages(name);
             if let Some(s) = spill.as_mut() {
-                maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                spill_or_exit(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             return true;
         }
@@ -4475,7 +4589,7 @@ fn try_handle_lfm2moe(
             *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
             st_files[file_idx].drop_tensor_pages(name);
             if let Some(s) = spill.as_mut() {
-                maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                spill_or_exit(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             return true;
         }
@@ -4656,7 +4770,7 @@ fn handle_f32_passthrough(
         );
         st_files[ctx.file_idx].drop_tensor_pages(ctx.name);
         if let Some(sp) = spill.as_mut() {
-            maybe_spill(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+            spill_or_exit(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
         }
         return true;
     }
@@ -4684,7 +4798,7 @@ fn handle_f32_passthrough(
     });
     st_files[ctx.file_idx].drop_tensor_pages(ctx.name);
     if let Some(sp) = spill.as_mut() {
-        maybe_spill(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        spill_or_exit(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
     }
     true
 }
@@ -4770,7 +4884,7 @@ fn handle_bf16_passthrough(
     *quantized_params += ctx.n_elements as u64;
     st_files[ctx.file_idx].drop_tensor_pages(ctx.name);
     if let Some(sp) = spill.as_mut() {
-        maybe_spill(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        spill_or_exit(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
     }
     true
 }
@@ -4784,7 +4898,9 @@ fn handle_cohere2moe(
     use_bf16: bool,
     use_f16: bool,
     use_mq6g256: bool,
-    use_mq4g256: bool,
+    // Any MQ4 spelling (`mq4`, `mq4v2`, `mq4v1`, ...). The cohere2moe loader
+    // only has MQ4G256 (qt=13) expert kernels, so every spelling encodes v1.
+    use_mq4: bool,
     fp8_scale_for: &HashMap<String, (usize, String)>,
     st_files: &[SafetensorsFile],
     hfq_tensors: &mut Vec<HfqTensor>,
@@ -4857,7 +4973,7 @@ fn handle_cohere2moe(
             *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
             st_files[file_idx].drop_tensor_pages(name);
             if let Some(s) = spill.as_mut() {
-                maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                spill_or_exit(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             return true;
         }
@@ -4869,7 +4985,7 @@ fn handle_cohere2moe(
         } else if is_expert {
             if use_mq6g256 {
                 QuantType::MQ6G256
-            } else if use_mq4g256 {
+            } else if use_mq4 {
                 QuantType::MQ4G256
             } else {
                 QuantType::Q8F16
@@ -4919,7 +5035,7 @@ fn handle_cohere2moe(
         *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
         st_files[file_idx].drop_tensor_pages(name);
         if let Some(s) = spill.as_mut() {
-            maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            spill_or_exit(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
         }
         return true;
     }
@@ -4966,8 +5082,8 @@ fn handle_moe_expert_3d(
     ctx: &PerTensorCtx,
     meta: &TensorMeta,
     raw_data: &[u8],
-    is_moe: bool,
-    is_gemma4: bool,
+    _is_moe: bool,
+    _is_gemma4: bool,
     kmap: &HashMap<String, QuantLevel>,
     mq3_tier_layers: &std::collections::HashSet<usize>,
     imatrix_gguf: &Option<gguf_input::GgufFile>,
@@ -4999,40 +5115,40 @@ fn handle_moe_expert_3d(
     use_mq5g256: bool,
     use_hfq6: bool,
     use_hfq4g256: bool,
-    use_hfq3g256: bool,
-    use_hfq3g128: bool,
-    use_hfq2g256: bool,
-    use_hfq2g128: bool,
-    use_hfq_mixed: bool,
+    _use_hfq3g256: bool,
+    _use_hfq3g128: bool,
+    _use_hfq2g256: bool,
+    _use_hfq2g128: bool,
+    _use_hfq_mixed: bool,
     use_mfp4: bool,
     use_mfp4p: bool,
     use_mfp4e8: bool,
     use_mfp4e8soa: bool,
     use_mfp3e8_gptq_fmt: bool,
     use_mfp2e8_gptq_fmt: bool,
-    use_mq3g256: bool,
-    use_mq2g256: bool,
-    use_mq2g256_lloyd: bool,
-    use_mq3g256_lloyd: bool,
-    use_mq4g256_lloyd: bool,
-    use_hfp4: bool,
-    use_mfp4l: bool,
+    _use_mq3g256: bool,
+    _use_mq2g256: bool,
+    _use_mq2g256_lloyd: bool,
+    _use_mq3g256_lloyd: bool,
+    _use_mq4g256_lloyd: bool,
+    _use_hfp4: bool,
+    _use_mfp4l: bool,
     routed_gl: bool,
     imatrix_path: &Option<PathBuf>,
     bake_keep_active: bool,
     reap_bake_plan: &Option<hipfire_reap::plan::ReapPlan>,
-    reap_arch: reap_overlay::ReapArch,
+    _reap_arch: reap_overlay::ReapArch,
     st_files: &[SafetensorsFile],
-    fp8_scale_for: &HashMap<String, (usize, String)>,
+    _fp8_scale_for: &HashMap<String, (usize, String)>,
     hfq_tensors: &mut Vec<HfqTensor>,
     quantized_params: &mut u64,
     spill: &mut Option<TensorSpill>,
 ) -> bool {
     let name = ctx.name;
     let file_idx = ctx.file_idx;
-    let n_elements = ctx.n_elements;
-    let arch_id = ctx.arch_id;
-    let is_vision = ctx.is_vision;
+    let _n_elements = ctx.n_elements;
+    let _arch_id = ctx.arch_id;
+    let _is_vision = ctx.is_vision;
 
     // Guard: this handler is only valid for stacked 3D MoE expert tensors
     // ([n_experts, ..., ...] named *.experts.{gate_up,down}_proj). Anything
@@ -5799,7 +5915,7 @@ fn handle_moe_expert_3d(
     // Drop source pages and spill quantized data after each expert batch.
     st_files[file_idx].drop_tensor_pages(name);
     if let Some(s) = spill.as_mut() {
-        maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
+        spill_or_exit(hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
     }
     true
 }
@@ -5850,7 +5966,7 @@ fn emit_vision_f32_vector(
         spilled_len: 0,
     });
     if let Some(sp) = state.spill.as_mut() {
-        maybe_spill(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        spill_or_exit(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
     }
     true
 }
@@ -5867,11 +5983,11 @@ fn handle_main_quant(
 ) {
     let name = ctx.name;
     let n_elements = ctx.n_elements;
-    let is_vision = ctx.is_vision;
-    let arch_id = ctx.arch_id;
-    let vision_quant = flags.vision_quant.as_str();
-    let is_gemma4_family = flags.is_gemma4_family;
-    let q8_conv1d_default = flags.q8_conv1d_default;
+    let _is_vision = ctx.is_vision;
+    let _arch_id = ctx.arch_id;
+    let _vision_quant = flags.vision_quant.as_str();
+    let _is_gemma4_family = flags.is_gemma4_family;
+    let _q8_conv1d_default = flags.q8_conv1d_default;
     if should_quantize(name) && n_elements >= 32 {
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, &fp8_scale_for, &st_files);
@@ -7857,7 +7973,7 @@ fn handle_main_quant(
             spilled_len: 0,
         });
         if let Some(sp) = state.spill.as_mut() {
-            maybe_spill(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+            spill_or_exit(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
         }
     }
 }
@@ -7960,7 +8076,6 @@ mod handle_main_quant_f16_fallback_tests {
         let kmap: HashMap<String, QuantLevel> = HashMap::new();
         let outer = MainQuantOuter {
             kmap: &kmap,
-            imatrix_gguf: &None,
             hessian_dir: &None,
         };
         let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
@@ -7991,10 +8106,8 @@ mod handle_main_quant_f16_fallback_tests {
             let ctx = PerTensorCtx {
                 name,
                 file_idx: 0,
-                shape: &shape,
                 n_elements,
                 arch_id: 6,
-                dtype: "F16",
                 is_vision: false,
             };
             handle_main_quant(
@@ -8035,10 +8148,8 @@ mod handle_main_quant_f16_fallback_tests {
             let ctx = PerTensorCtx {
                 name,
                 file_idx: 0,
-                shape: &shape,
                 n_elements,
                 arch_id: 6,
-                dtype: "BF16",
                 is_vision: false,
             };
             handle_main_quant(
@@ -8097,10 +8208,8 @@ mod handle_main_quant_f16_fallback_tests {
             let ctx = PerTensorCtx {
                 name,
                 file_idx: 0,
-                shape: &shape,
                 n_elements,
                 arch_id: 6,
-                dtype: "F16",
                 is_vision: false,
             };
             handle_main_quant(
@@ -8126,7 +8235,6 @@ mod handle_main_quant_f16_fallback_tests {
         let kmap: HashMap<String, QuantLevel> = HashMap::new();
         let outer = MainQuantOuter {
             kmap: &kmap,
-            imatrix_gguf: &None,
             hessian_dir: &None,
         };
         let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
@@ -8156,10 +8264,8 @@ mod handle_main_quant_f16_fallback_tests {
         let ctx = PerTensorCtx {
             name,
             file_idx: 0,
-            shape: &shape,
             n_elements,
             arch_id: 6,
-            dtype: "F32",
             is_vision: false,
         };
         handle_main_quant(
@@ -8180,287 +8286,80 @@ mod handle_main_quant_f16_fallback_tests {
         let expected = f16_bytes_of(&vals);
         assert_eq!(hfq_tensors[0].data, expected);
     }
-}
 
-// ---- Low-bit HFQ requant helpers (ported from pr-597) ----
-#[derive(Default, Clone)]
-struct Attribution {
-    source_url: Option<String>,
-    license: Option<String>,
-    modifications: Vec<String>,
-}
-
-/// Parse `--source-url` / `--license` for redistributable artifacts.
-fn attribution_from_args(args: &QuantizeArgs) -> Attribution {
-    Attribution {
-        source_url: args.source_url.clone(),
-        license: args.license.clone(),
-        modifications: Vec::new(),
+    /// `--format mq4-mq6exp` announces its dense body as MQ4G256 v1; pin that
+    /// a plain 2-D weight really is written as qt=13, not MQ4G256V2.
+    #[test]
+    fn mq4_mq6exp_dense_weight_is_mq4g256_v1() {
+        let mut flags = flags_for_mq4();
+        flags.use_mq4g256 = false;
+        flags.use_mq4_mq6exp = true;
+        let kmap: HashMap<String, QuantLevel> = HashMap::new();
+        let outer = MainQuantOuter {
+            kmap: &kmap,
+            hessian_dir: &None,
+        };
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let (mut qp, mut te, mut me, mut ng) = (0u64, 0f64, 0f32, 0u64);
+        let mut spill: Option<TensorSpill> = None;
+        let name = "model.layers.10.self_attn.q_proj.weight";
+        let shape = vec![4usize, 256];
+        let vals: Vec<f32> = (0..1024).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01).collect();
+        let raw = f16_bytes_of(&vals);
+        let mut state = MainQuantState {
+            hfq_tensors: &mut hfq_tensors,
+            quantized_params: &mut qp,
+            total_quant_error: &mut te,
+            max_quant_error: &mut me,
+            _n_quant_groups: &mut ng,
+            spill: &mut spill,
+        };
+        let ctx = PerTensorCtx {
+            name,
+            file_idx: 0,
+            n_elements: 1024,
+            arch_id: 6,
+            is_vision: false,
+        };
+        handle_main_quant(
+            &ctx,
+            &meta("F16", shape.clone()),
+            &raw,
+            &flags,
+            &outer,
+            &mut state,
+            &HashMap::new(),
+            &Vec::new(),
+        );
+        assert_eq!(hfq_tensors.len(), 1);
+        assert_eq!(hfq_tensors[0].quant_type, QuantType::MQ4G256);
     }
 }
 
-/// Provenance fields common to every `.hfq` this tool writes.
-///
-/// Shared by the `.hfq` requant path and the GGUF path so a published artifact
-/// is traceable no matter which produced it — a `.hfq` is a frozen snapshot of
-/// the convert path, and when convert changes the artifact silently goes stale.
-/// Provenance fields common to every `.hfq` this tool writes.
-///
-/// Shared by the `.hfq` requant path and the GGUF path so a published artifact
-/// is traceable no matter which produced it — a `.hfq` is a frozen snapshot of
-/// the convert path, and when convert changes the artifact silently goes stale.
-fn base_provenance(source: &str, format_label: &str, attr: &Attribution) -> serde_json::Value {
-    let built_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+/// `hipfire_provenance` object for a redistributable artifact, or `None` when
+/// neither `--source-url` nor `--license` was given (the default build stays
+/// byte-identical). Carries no timestamp so a rebuild reproduces the bytes.
+fn provenance(
+    source: &str,
+    format: &str,
+    source_url: Option<&str>,
+    license: Option<&str>,
+) -> Option<serde_json::Value> {
+    if source_url.is_none() && license.is_none() {
+        return None;
+    }
     let mut m = serde_json::Map::new();
     m.insert("source".into(), source.into());
-    m.insert("format".into(), format_label.into());
-    m.insert("built_unix".into(), built_unix.into());
+    m.insert("format".into(), format.into());
     m.insert("tool".into(), "hipfire-quantize".into());
     m.insert("tool_version".into(), env!("CARGO_PKG_VERSION").into());
-    m.insert(
-        "git_commit".into(),
-        option_env!("HIPFIRE_GIT_COMMIT")
-            .unwrap_or("unknown")
-            .into(),
-    );
-    if let Some(u) = &attr.source_url {
-        m.insert("source_url".into(), u.clone().into());
+    if let Some(u) = source_url {
+        m.insert("source_url".into(), u.into());
     }
-    if let Some(l) = &attr.license {
-        m.insert("license".into(), l.clone().into());
+    if let Some(l) = license {
+        m.insert("license".into(), l.into());
     }
-    if !attr.modifications.is_empty() {
-        m.insert("modifications".into(), attr.modifications.clone().into());
-    }
-    serde_json::Value::Object(m)
-}
-/// Stamp build provenance into an .hfq's metadata JSON.
-///
-/// Inserted as a `hipfire_provenance` object immediately after the opening
-/// brace, so every source key survives byte-for-byte (the runtime parses this
-/// as a `serde_json::Value` and reads named keys, so an extra top-level key is
-/// inert — see `qwen35::config_from_metadata_json`).
-///
-/// This exists because of a concrete failure: the 2026-07-16 SP-E canary
-/// scored a Bonsai ternary .hfq built BEFORE that day's norm-bias fix and
-/// reported KLD 6.15 for a model that actually measures 0.61. Nothing in the
-/// artifact or the result table could reveal the staleness. Now it can.
-fn stamp_provenance(metadata_json: &str, prov: &serde_json::Value) -> String {
-    let body = serde_json::to_string(prov).unwrap_or_else(|_| "{}".to_string());
-    let trimmed = metadata_json.trim_start();
-    match trimmed.strip_prefix('{') {
-        // `{}` (or `{ }`) — no trailing comma, there is nothing after us.
-        Some(rest) if rest.trim_start().starts_with('}') => {
-            format!("{{\"hipfire_provenance\":{body}{rest}")
-        }
-        Some(rest) => format!("{{\"hipfire_provenance\":{body},{rest}"),
-        // Not an object; leave it alone rather than corrupt it.
-        None => metadata_json.to_string(),
-    }
-}
-
-fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
-    if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
-        return Ok(());
-    }
-    let bpw = if matches!(format, GgufFormat::Binary) {
-        "1.14"
-    } else {
-        "2.125"
-    };
-    Err(format!(
-        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint into a \
-         UNIFORM {bpw}-bpw level set, which is a measured collapse — not a supported \
-         build.\n\
-         \n\
-         Measured on qwen3.6-27b (KLD vs the mq4 teacher, 8 chunks):\n\
-         \x20 ternary uniform            2.125 bpw  KLD 5.10  PPL 1436   (token soup)\n\
-         \x20 ternary + AWQ imatrix      2.125 bpw  KLD 2.24  PPL   86.6 (immediate EOS)\n\
-         \x20 mq2lloyd (non-uniform)     2.25  bpw  KLD 0.61  PPL   17.0 (usable)\n\
-         \x20 PrismML Bonsai ternary     2.125 bpw  KLD 0.54  PPL   16.7\n\
-         \n\
-         The bit budget is NOT the problem — the fixed uniform level set is. Q2_0/Q1_0 \
-         leave the encoder only the block scale to choose, and no scale search or \
-         importance weighting recovers it.\n\
-         \n\
-         For ~2 bpw from an ordinary checkpoint use --format mq2lloyd instead. \
-         Ternary/binary ship coherently as byte-verbatim passthrough of an \
-         already-transformed source (PrismML Bonsai Q2_0/Q1_0) — convert that GGUF \
-         directly.\n\
-         \n\
-         To do it anyway for research, pass --allow-lowbit-ptq or set \
-         HIPFIRE_ALLOW_LOWBIT_PTQ=1.",
-        format.label(),
-    ))
-}
-
-/// Code-level statistics of a packed TQ2G128 buffer.
-#[derive(Default, Debug, Clone, Copy)]
-struct Tq2PackStats {
-    /// Codes decoding to a non-zero level (i.e. code != 1).
-    nonzero: u64,
-    /// Codes equal to 3 — outside the ternary set, decoding to +2d.
-    out_of_set: u64,
-    n_codes: u64,
-}
-
-impl Tq2PackStats {
-    fn add(&mut self, o: Tq2PackStats) {
-        self.nonzero += o.nonzero;
-        self.out_of_set += o.out_of_set;
-        self.n_codes += o.n_codes;
-    }
-    fn nonzero_fraction(&self) -> f64 {
-        if self.n_codes == 0 {
-            return 0.0;
-        }
-        self.nonzero as f64 / self.n_codes as f64
-    }
-}
-
-/// Count zero / non-zero / out-of-set codes in a TQ2G128 buffer
-/// (34 B per 128-weight block: `[f16 d][32 B codes]`, 4 codes per byte).
-fn tq2_pack_stats(data: &[u8]) -> Tq2PackStats {
-    let mut st = Tq2PackStats::default();
-    for blk in data.chunks_exact(34) {
-        for &byte in &blk[2..] {
-            for j in 0..4 {
-                let code = (byte >> (j * 2)) & 0x3;
-                st.n_codes += 1;
-                if code != 1 {
-                    st.nonzero += 1;
-                }
-                if code == 3 {
-                    st.out_of_set += 1;
-                }
-            }
-        }
-    }
-    st
-}
-
-/// Refuse to write a ternary model that the code histogram says is broken.
-///
-/// This is the cheap observable that would have caught both shipped defects
-/// immediately, without a GPU or an eval:
-///
-///   * `d = max|w|` as an ENCODER zeroed 83.7% of a real 27B requant (16.3%
-///     non-zero). Healthy is ~54% (Gaussian MSE optimum) to ~69% (PrismML's
-///     own Bonsai ternary). A model below `MIN_NONZERO` is not "lossy", it is
-///     mostly deleted.
-///   * code 3 decodes to `+2d` in both decoders, turning the quantizer into an
-///     asymmetric 4-level one. PrismML never emits it; neither should we.
-///
-/// `--allow-degenerate-ternary` (env HIPFIRE_ALLOW_DEGENERATE_TERNARY) downgrades
-/// this to a warning. Read at the CLI boundary, never inside the pipeline:
-/// a getenv racing another test's setenv in a threaded test binary is unsound.
-fn check_ternary_pack_health(st: Tq2PackStats, allow_degenerate: bool) {
-    const MIN_NONZERO: f64 = 0.25;
-    if st.n_codes == 0 {
-        return;
-    }
-    let nz = st.nonzero_fraction();
-    eprintln!(
-        "ternary pack health: {:.1}% non-zero codes ({} of {}), {} out-of-set",
-        nz * 100.0,
-        st.nonzero,
-        st.n_codes,
-        st.out_of_set
-    );
-    let degenerate = nz < MIN_NONZERO;
-    if !degenerate && st.out_of_set == 0 {
-        return;
-    }
-    let mut why = Vec::new();
-    if degenerate {
-        why.push(format!(
-            "only {:.1}% of codes are non-zero (expected >={:.0}%; healthy 54-69%) \
-             — {:.1}% of the model is zeroed",
-            nz * 100.0,
-            MIN_NONZERO * 100.0,
-            (1.0 - nz) * 100.0
-        ));
-    }
-    if st.out_of_set > 0 {
-        why.push(format!(
-            "{} codes are 3, which decodes to +2d (outside the ternary set)",
-            st.out_of_set
-        ));
-    }
-    let msg = why.join("; ");
-    if allow_degenerate {
-        eprintln!(
-            "WARNING: degenerate ternary pack ({msg}) — allowed by --allow-degenerate-ternary"
-        );
-        return;
-    }
-    eprintln!("error: refusing to write a degenerate ternary model: {msg}.");
-    eprintln!(
-        "       Set HIPFIRE_ALLOW_DEGENERATE_TERNARY=1 to write it anyway (it will \
-         not serve coherently)."
-    );
-    std::process::exit(3);
-}
-
-/// Per-input-column importance weights for a requantized tensor.
-///
-/// Returns the `--imatrix` row for `name` when one was supplied and its length
-/// is a usable multiple of the 128 group, else all-ones (a pure unweighted-MSE
-/// scale search). The GPTQ packers slice this as
-/// `col_weights[(b % blocks_per_row) * 128 ..][..128]`, so the length must be a
-/// multiple of 128 — an all-ones length-128 vector makes every block reuse the
-/// same (uniform) weights, which is exactly the no-imatrix behaviour.
-
-// Minimal wiring stubs to make TQ2/BQ1 guarded PTQ routes searchable and preserve corrected behavior
-pub(crate) fn lowbit_guarded_ptq_path(
-    format: crate::pipeline_gguf::GgufFormat,
-    allow_lowbit: bool,
-) {
-    if let Err(msg) = lowbit_ptq_gate(format, allow_lowbit) {
-        eprintln!("{}", msg);
-        std::process::exit(1);
-    }
-}
-pub(crate) fn lowbit_health_agg_example(data: &[u8], allow_degenerate: bool) {
-    let st = tq2_pack_stats(data);
-    check_ternary_pack_health(st, allow_degenerate);
-}
-pub(crate) fn awq_imatrix_alpha_for_lowbit(args: &crate::cli::QuantizeArgs) -> Option<f32> {
-    args.awq_imatrix.filter(|a| *a > 0.0)
-}
-pub(crate) fn provenance_stamp_for_lowbit(
-    metadata_json: &str,
-    source: &str,
-    format_label: &str,
-    attr: &Attribution,
-) -> String {
-    let prov = base_provenance(source, format_label, attr);
-    stamp_provenance(metadata_json, &prov)
-}
-/// TQ2/BQ1 are RotationPlan::None — AWQ x/s fold-out is disabled for these formats
-pub(crate) fn is_lowbit_no_rotation(format: crate::pipeline_gguf::GgufFormat) -> bool {
-    matches!(
-        format,
-        crate::pipeline_gguf::GgufFormat::Ternary | crate::pipeline_gguf::GgufFormat::Binary
-    )
-}
-
-pub(crate) fn hfq_requant_to_tq2_example(
-    f32_data: &[f32],
-    col_weights: &[f32],
-) -> (Vec<u8>, QuantType, u32) {
-    let q = quantize_tq2g128_gptq(f32_data, col_weights, 0.0);
-    (q, QuantType::TQ2G128, 128)
-}
-pub(crate) fn hfq_requant_to_bq1_example(
-    f32_data: &[f32],
-    col_weights: &[f32],
-) -> (Vec<u8>, QuantType, u32) {
-    let q = quantize_bq1g128_gptq(f32_data, col_weights, 0.0);
-    (q, QuantType::BQ1G128, 128)
+    Some(serde_json::Value::Object(m))
 }
 
 #[cfg(test)]
@@ -8670,6 +8569,7 @@ mod pipeline_tests {
     }
 }
 
+#[cfg(test)]
 /// Public pipeline round-trip for HFQ4-G128 with M>1, K=704.
 /// Proves the row-stride contract: encoded byte length matches M*ceil(K/128)*72,
 /// each row payload equals independent per-row packing (no cross-row groups),

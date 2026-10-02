@@ -156,6 +156,6 @@ cat "$OUTDIR/result-table.md"
 if (( ${#missing[@]} )); then
   echo
   echo "INCOMPLETE — ${#missing[@]} arm(s) had no model on disk: ${missing[*]}"
-  echo "Build them first (hipfire-quantize --input \$TEACHER --format ternary|binary [--awq-imatrix 0.55])."
+  echo "Build them first (hipfire-quantize --input \$TEACHER --format ternary|binary)."
 fi
 echo "=== DONE ($MODE fixture=$FIXTURE_KEY) ==="; date

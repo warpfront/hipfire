@@ -85,6 +85,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | NixOS notes | [`docs/NIXOS.md`](NIXOS.md) | shipped / ref-pinned | |
 | Perf claim protocol (warmup, fresh-process, noise) | [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) | shipped / ref-pinned | Numbers live in measured owners, not here. |
 | Bench-suite layout | [`docs/methodology/bench-suite.md`](methodology/bench-suite.md) | shipped / ref-pinned | |
+| CPU-exec offload benchmark handoff (`memory.offload_exec`) | [`docs/methodology/cpu-exec-offload-benchmark-handoff.md`](methodology/cpu-exec-offload-benchmark-handoff.md) | shipped / ref-pinned | Method, fixture identity and gotchas for the pcie-vs-cpu A/B; results live in `docs/perf-checkpoints/`. |
 | Arch-port validation procedure (channel / speed) | [`docs/methodology/arch-port-validation.md`](methodology/arch-port-validation.md) | shipped / ref-pinned | Does not restore retired coherence-gate batteries. |
 | Perf-arch working discipline | [`docs/methodology/perf-arch-discipline.md`](methodology/perf-arch-discipline.md) | shipped / ref-pinned | |
 | Kernel Atlas methodology | [`docs/methodology/kernel-atlas.md`](methodology/kernel-atlas.md) | shipped / ref-pinned | |
@@ -101,12 +102,14 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | DeepSeek4 PR body archive | [`docs/deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | |
 | Multi-GPU bring-up lessons | [`docs/multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | |
 | HFP4 format note | [`docs/quant-formats/hfp4.md`](quant-formats/hfp4.md) | shipped / ref-pinned | Current HFP4/MFP4 owners are shipped / ref-pinned; some reserved aliases remain planned. Broader quant authority stays `QUANTIZATION.md`. |
+| CPU SIMD coverage map | [`docs/quant-formats/cpu-simd-coverage.md`](quant-formats/cpu-simd-coverage.md) | shipped / ref-pinned | Which AVX2 row dot each `CpuQuant` gets and under which gate. Authority for the CPU-exec offload path's vector coverage; the qt allocation itself stays `qt-register.txt`. |
 | MoE AWQ working notes | [`docs/moe-awq/`](moe-awq/) | historical | |
 | MI300X rental runbook | [`docs/rental/MI300X-RENTAL-RUNBOOK.md`](rental/MI300X-RENTAL-RUNBOOK.md) | historical | |
 | Relicense / governance records | [`docs/governance/`](governance/) | historical | Legal/historical; do not rewrite. |
 | Design-time architecture drafts | [`docs/design/`](design/) | planned | Directory policy is planned intent. Member exceptions: some branch-implemented LFM/Redline designs and measured baseline notes may coexist; none are product defaults. Historical member bodies stay disposition-only. |
 | Implementation plans and PRDs | [`docs/plans/`](plans/) | planned | Directory policy is planned intent. Member exceptions: measured results ledgers may appear; recency ≠ authority. |
 | Narrow specs | [`docs/specs/`](specs/) | planned | Intent/spec records; promote only via shipped owners. |
+| Shared-prefix serving integration | [`docs/specs/2026-09-05-serving-cache-scheduler-spec.md`](specs/2026-09-05-serving-cache-scheduler-spec.md) | planned | vLLM/SGLang-inspired paged ownership, hybrid-state reuse, fair scheduling and structured generation; extends the multi-slot spec, not a runtime admission. |
 | Investigations | [`docs/investigations/`](investigations/) | historical | Discovery trails including measured research; not product defaults. |
 | Reviews | [`docs/reviews/`](reviews/) | historical | Review archives. |
 | Lessons learned | [`docs/lessons_learned/`](lessons_learned/) | historical | Postmortems. |

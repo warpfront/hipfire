@@ -422,7 +422,9 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
     // from host-side sizes BEFORE any upload — see module doc.
     let slabs_bytes: u64 = descs
         .iter()
-        .map(|d| d.cap as u64 * per_pos_bytes as u64)
+        .map(|d| {
+            rdna_compute::kv_slots::legacy_cap(d.seq_len as usize) as u64 * per_pos_bytes as u64
+        })
         .sum();
     let total_alloc_bytes: u64 = 2 * arena.len() as u64 // k_cache + v_cache
         + (descs.len() * std::mem::size_of::<KvSlotDesc>()) as u64 // d_descs
@@ -520,8 +522,9 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
         .iter()
         .enumerate()
         .map(|(slot, &sl)| {
-            let off = descs[slot].k_base as usize;
-            let len = descs[slot].cap as usize * per_pos_bytes;
+            let off = descs[slot].legacy_k_base as usize;
+            let len =
+                rdna_compute::kv_slots::legacy_cap(descs[slot].seq_len as usize) * per_pos_bytes;
             let slab_k = gpu
                 .upload_raw(&arena[off..off + len], &[len])
                 .expect("slab k");

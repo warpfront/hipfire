@@ -69,6 +69,7 @@ fn run() -> Result<(), String> {
 fn usage() -> &'static str {
     "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
      peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]\n\
+     peacemaker audit --lds-barrier PATH...   (CPU-only: every *.hsaco/*.co under PATH; fails on lds_store_unwaited_at_barrier or an unliftable module)\n\
      peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)"
 }
 
@@ -126,7 +127,9 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     Ok(())
 }
 
-fn run_audit(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+fn run_audit(args: impl Iterator<Item=String>) -> Result<(), String> {
+    let mut args = args.peekable();
+    if args.next_if_eq("--lds-barrier").is_some() { return run_lds_barrier(args.map(PathBuf::from).collect()); }
     let mut options = AuditOptions::default();
     while let Some(option) = args.next() {
         if option == "--sweep-profiles" { options.sweep_profiles = true; continue; }
@@ -148,6 +151,55 @@ fn run_audit(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     let markdown = options.markdown.clone().unwrap_or_else(|| options.input.with_extension("audit.md"));
     audit::run(options)?;
     println!("{}\n{}", json.display(), markdown.display());
+    Ok(())
+}
+
+/// `audit --lds-barrier`: the `lds_store_unwaited_at_barrier` pass over code
+/// objects (cached JIT blobs, `kernels/compiled/<arch>`). One row per arch;
+/// every site and every module the lifter rejects is printed and fails.
+fn run_lds_barrier(roots: Vec<PathBuf>) -> Result<(), String> {
+    fn collect(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        if path.is_dir() {
+            let mut entries: Vec<_> = fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?
+                .map(|e| e.map(|e| e.path())).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            entries.sort();
+            for entry in entries { collect(&entry, out)?; }
+        } else if path.extension().is_some_and(|x| x == "hsaco" || x == "co") {
+            out.push(path.to_owned());
+        }
+        Ok(())
+    }
+    if roots.is_empty() { return Err(usage().into()); }
+    let mut files = Vec::new();
+    for root in &roots { collect(root, &mut files)?; }
+    if files.is_empty() { return Err(format!("no *.hsaco or *.co under {roots:?}")); }
+    #[derive(Default)]
+    struct Row { modules: usize, barrier_modules: usize, kernels: usize, barrier_kernels: usize, barriers: usize, sites: usize }
+    let mut rows = std::collections::BTreeMap::<String, Row>::new();
+    let (mut rejected, mut sites) = (Vec::new(), 0usize);
+    for file in &files {
+        let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        match audit::lds_barrier_scan(&bytes) {
+            Ok(scan) => {
+                let row = rows.entry(scan.arch.clone()).or_default();
+                row.modules += 1; row.barrier_modules += usize::from(scan.barriers > 0);
+                row.kernels += scan.kernels; row.barrier_kernels += scan.barrier_kernels;
+                row.barriers += scan.barriers; row.sites += scan.sites.len();
+                for site in &scan.sites {
+                    sites += 1;
+                    println!("{} {} {} pc {:#x}: {}", audit::LDS_BARRIER_FINDING, file.display(), site.kernel, site.pc, site.detail);
+                }
+            }
+            Err(error) => rejected.push(format!("{}: {error}", file.display())),
+        }
+    }
+    println!("| arch | modules | with barriers | kernels | with barriers | barriers | {} |\n|---|---:|---:|---:|---:|---:|---:|", audit::LDS_BARRIER_FINDING);
+    for (arch, r) in &rows {
+        println!("| {arch} | {} | {} | {} | {} | {} | {} |", r.modules, r.barrier_modules, r.kernels, r.barrier_kernels, r.barriers, r.sites);
+    }
+    for line in &rejected { println!("unchecked {line}"); }
+    println!("{} files: {} checked, {} unchecked, {sites} {}", files.len(), files.len() - rejected.len(), rejected.len(), audit::LDS_BARRIER_FINDING);
+    if sites != 0 || !rejected.is_empty() { return Err(format!("lds-barrier audit failed: {sites} sites, {} unchecked modules", rejected.len())); }
     Ok(())
 }
 

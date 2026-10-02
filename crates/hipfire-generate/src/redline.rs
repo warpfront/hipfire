@@ -3619,10 +3619,6 @@ fn redline_qwen4_snapshot(
     logits: &rdna_compute::GpuTensor,
 ) -> Result<RedlineQwen4Snapshot, String> {
     let config = &bundle.config;
-    let full_width = config
-        .num_key_value_heads
-        .checked_mul(config.head_dim)
-        .ok_or("Qwen4 snapshot: full K/V width overflows")?;
     let raw_width = config
         .indexer_kv_heads
         .checked_mul(config.indexer_head_dim)
@@ -3655,8 +3651,8 @@ fn redline_qwen4_snapshot(
     let mut lengths = Vec::with_capacity(state.qsa.len());
     for (layer, qsa) in state.qsa.iter().enumerate() {
         let active = [
-            ("full_keys", &qsa.full_keys, qsa.full_len, full_width),
-            ("full_values", &qsa.full_values, qsa.full_len, full_width),
+            ("full_keys", &qsa.full_keys, qsa.full_len, qsa.full_row_units),
+            ("full_values", &qsa.full_values, qsa.full_len, qsa.full_row_units),
             ("raw_keys", &qsa.raw_index_keys, qsa.raw_len, raw_width),
             ("pooled_keys", &qsa.pooled_keys, qsa.pooled_len, raw_width),
         ];
@@ -3913,19 +3909,16 @@ fn redline_shadow_qwen4(
         }));
     }
 
-    // The recorded-HIP oracle is the captured blob itself: it re-executes the
-    // recorded kernargs and substitutes position through the controller's
-    // synthesized-binding calibration. The Qwen4 route declares its position
-    // bindings in the program instead, so the oracle is exact at the position it
-    // was captured at — one window, the same geometry the capture used — while
-    // the retained transport carries the multi-position claim.
+    // The recorded-HIP oracle re-executes the captured kernargs with the same
+    // binding set the retained plan patches (synthesized and program-declared
+    // position bindings), so it is compared at every window the retained arm is.
     let (oracle_arm, oracle_host_us) = redline_qwen4_arm(
         gpu,
         bundle,
         Some(rdna_compute::replay::ShadowBodyRoute::HipOracle),
         context,
-        1,
-        0,
+        iterations,
+        position_step,
     )?;
     let (hip_arm, hip_host_us) = redline_qwen4_arm(
         gpu,
@@ -3942,6 +3935,7 @@ fn redline_shadow_qwen4(
         windows.push(serde_json::json!({
             "position": hip_arm[i].position,
             "pm4": redline_qwen4_row(&replay_arm[i], &hip_arm[i], hip_tokens),
+            "recorded_hip": redline_qwen4_row(&oracle_arm[i], &hip_arm[i], hip_tokens),
         }));
     }
     let prepared_identity = identity
@@ -3961,7 +3955,7 @@ fn redline_shadow_qwen4(
         })
         .unwrap_or_else(|| serde_json::json!({"missing": true}));
     let bit_exact = replay_arm == hip_arm;
-    let oracle_bit_exact = oracle_arm[0] == hip_arm[0];
+    let oracle_bit_exact = oracle_arm == hip_arm;
     let compared_bytes = replay_arm
         .first()
         .map_or(0, RedlineQwen4Snapshot::compared_bytes);
@@ -4014,14 +4008,6 @@ fn redline_shadow_qwen4(
         "parity": {
             "q8_byte_parity_invalid": false,
             "windows": windows,
-            "blob": {
-                "position": hip_arm[0].position,
-                "recorded_hip": redline_qwen4_row(
-                    &oracle_arm[0],
-                    &hip_arm[0],
-                    hip_arm[0].argmax,
-                ),
-            },
         },
         "host_us": {
             "pm4": replay_host_us,

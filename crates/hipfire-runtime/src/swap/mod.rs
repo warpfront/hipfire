@@ -130,6 +130,7 @@ mod manager_tests {
                 model_hash: 1,
                 kv_dtype_tag: 1,
                 per_pos_bytes: 4,
+                per_pos_v_bytes: 4,
                 n_fa_layers: 1,
                 dn_layout_version: 1,
                 cap: 64,

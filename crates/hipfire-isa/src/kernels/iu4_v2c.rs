@@ -34,22 +34,20 @@
 //! == 0`, `K % 256 == 0`, `M * 4 < 2^24`; kernargs `A, Xq, Y, M, K, N`
 //! (gate/up: `G, U, Xq, H, M, K, N` with `M` the gate row count), Y/H
 //! token-major `[N][M]` f32.
-use super::iu4_gemm::{ds_offsets, lit, region::{self, Binding, Region}, s, sr, v, vr};
+use super::common::{lit, mem, op, s, sr, v, vr};
+use super::iu4_fold::{GROUP_BYTES, MAGIC, MAGIC_NEG, REBIAS, XBLK_BYTES};
+use super::iu4_gemm::{ds_offsets, region::{self, Binding, Region}};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
-    insn::{Instruction, MemoryClass, Sop, Wmma}, lds::Transition,
-    reg::{Live, RegRef}, vopd::{Operand, VopdF32, VopdOp}};
+    insn::{Instruction, MemoryClass, Wmma},
+    reg::Live, vopd::{Operand, VopdF32, VopdOp}};
+use peacemaker_author::{Free, Gfx1100, Gfx11Waits, LdsWrite, MmaIu4, Pending, Published, Ring, Scc, State, Wave, WgUniform,
+    Workgroup, Writing, prime, rotate};
 
 pub const THREADS: u16 = 256;
 pub const LDS_BYTES: u32 = 32768;
 pub const SLOT_BYTES: u32 = 16384;
 pub const A_BYTES: u32 = 8192;
 pub const VGPR_CEILING: u16 = 192;
-pub const MAGIC: u32 = 0x4b40_0000;
-/// `-12582912.0f`: `float(C) = bits(C + magic) - 1.5*2^23` exactly.
-pub const MAGIC_NEG: u32 = 0xcb40_0000;
-pub const REBIAS: u32 = 0x8888_8888;
-pub const GROUP_BYTES: u32 = 136;
-pub const XBLK_BYTES: u32 = 72;
 
 pub const K_BEGIN: &str = ".Lv2c_k_begin";
 pub const K_LOOP: &str = ".Lv2c_k_loop";
@@ -165,15 +163,7 @@ const SILU_TEMPS: u8 = 9;
 /// Staging A base: the tile's rows (SET/ADD) or this wave's gate/up rows.
 fn stage_base(epi: Epi) -> u8 { if epi.silu() { Regs::SS } else { Regs::SA } }
 
-const SLOT_A: [usize; 2] = [0, 2];
-const SLOT_X: [usize; 2] = [1, 3];
 
-pub(super) fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
-}
-pub(super) fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()).memory(class))
-}
 pub(super) fn off(o: u32) -> Result<String, String> {
     if o > 4095 { return Err(format!("global offset {o} exceeds the gfx11 13-bit signed field")) }
     Ok(if o == 0 { String::new() } else { format!(" offset:{o}") })
@@ -247,15 +237,24 @@ fn plan(epi: Epi) -> Result<RegPlan, String> {
     Ok(p)
 }
 
-fn declare_lds(b: &mut Builder) -> Result<(), String> {
-    for (i, (name, base, len)) in [("A0", 0, A_BYTES), ("X0", A_BYTES, A_BYTES), ("A1", SLOT_BYTES, A_BYTES), ("X1", SLOT_BYTES + A_BYTES, A_BYTES)].into_iter().enumerate() {
-        if b.lds.add(name, base, len)? != i { return Err("LDS slot order".into()) }
-    }
-    Ok(())
+/// LDS tags: the A (weight) and X (activation) halves of each 16 KiB slot.
+pub enum A {}
+pub enum X {}
+type Wg<'b> = Workgroup<'b, Gfx1100, Builder>;
+type Wv<'b> = Wave<'b, Gfx1100, Builder>;
+/// The K loop's steady state: slot `e%2` of each ring published, the other free.
+type Rings = (Ring<A, Published, Free>, Ring<X, Published, Free>);
+
+/// Slots A0, X0, A1, X1 (builder slot ids 0..3); slot 0 is written first.
+fn declare_lds(wg: &mut Wg) -> Result<(Ring<A, Free, Free>, Ring<X, Free, Free>), String> {
+    let (a0, x0) = (wg.lds("A0", 0, A_BYTES)?, wg.lds("X0", A_BYTES, A_BYTES)?);
+    let (a1, x1) = (wg.lds("A1", SLOT_BYTES, A_BYTES)?, wg.lds("X1", SLOT_BYTES + A_BYTES, A_BYTES)?);
+    Ok((Ring::new(a0, a1), Ring::new(x0, x1)))
 }
 
 /// Kernel arguments, workgroup bases and every lane-invariant offset.
-fn prologue(b: &mut Builder, epi: Epi) -> Result<(), String> {
+fn prologue(wg: &mut Wg, epi: Epi, (ra, rx): (Ring<A, Free, Free>, Ring<X, Free, Free>)) -> Result<Rings, String> {
+    let b = wg.isa();
     let (t0, t1, t64) = (Regs::T0, Regs::T1, Regs::T64);
     let ar = args(epi);
     // gfx11 llvm-objdump spells a zero SMEM offset `null`; parse-back compares canonical text.
@@ -393,8 +392,9 @@ fn prologue(b: &mut Builder, epi: Epi) -> Result<(), String> {
     stage_loads(b, epi, 0)?;
     for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", Regs::MAGIC + j, lit(MAGIC)), &[v(Regs::MAGIC + j)], &[])?; }
     for r in 0..64u8 { op(b, format!("v_mov_b32_e32 v{}, 0", Regs::ACC + r), &[v(Regs::ACC + r)], &[])?; }
-    stage_store(b, 0)?;
-    b.barrier(&[Transition::Ready(SLOT_A[0]), Transition::Ready(SLOT_X[0])])
+    let ((ra, pa), (rx, px)) = stage_store(wg, ra, rx)?;
+    let (da, dx) = wg.wait_all((pa, px))?;
+    wg.barrier((prime(ra, da), prime(rx, dx)))
 }
 
 /// Global loads of the next epoch's staging packet. `a_imm` selects the K
@@ -405,42 +405,50 @@ fn stage_loads(b: &mut Builder, epi: Epi, a_imm: u32) -> Result<(), String> {
     b.clause(|b| { for i in 0..4u8 { global_load(b, 2, Regs::STX + 2 * i, Regs::X_OFF, Regs::SX, 16 * u32::from(i))?; } Ok(()) })
 }
 
-/// Rebias A and publish the staged packet into slot `slot`: each store fills
-/// one 256-byte block (slices 2i and 2i+1 of fragment block `wave`).
-fn stage_store(b: &mut Builder, slot: usize) -> Result<(), String> {
+/// A ring's next buffer with its pending stores.
+type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx11Waits, LdsWrite<R>>);
+
+/// Rebias A and publish the staged packet into the rings' next slot: each
+/// store fills one 256-byte block (slices 2i and 2i+1 of fragment block `wave`).
+fn stage_store<C: State>(w: &mut Wv, ra: Ring<A, C, Free>, rx: Ring<X, C, Free>) -> Result<(Staged<A, C>, Staged<X, C>), String> {
+    let slot = ra.next_index();
     for r in 0..8u8 {
         let x = Regs::STA + r;
-        op(b, format!("v_xor_b32_e32 v{x}, {}, v{x}", lit(REBIAS)), &[v(x)], &[v(x)])?;
+        op(w.isa(), format!("v_xor_b32_e32 v{x}, {}, v{x}", lit(REBIAS)), &[v(x)], &[v(x)])?;
     }
-    for (regs, addr, slot_id) in [(Regs::STA, Regs::ST_A[slot], SLOT_A[slot]), (Regs::STX, Regs::ST_X[slot], SLOT_X[slot])] {
-        for pair in 0..2u8 {
-            let (d0, d1) = (regs + 4 * pair, regs + 4 * pair + 2);
-            let text = format!("ds_store_2addr_b64 v{addr}, v[{d0}:{}], v[{d1}:{}]{}", d0 + 1, d1 + 1, ds_offsets(64 * u32::from(pair), 64 * u32::from(pair) + 32));
-            b.ds_store(slot_id, Instruction::new(text, vec![], vec![v(addr), vr(d0, 2), vr(d1, 2)]).memory(MemoryClass::DsStore))?;
-        }
-    }
-    Ok(())
+    let store = |regs: u8, addr: u8, pair: u8| {
+        let (d0, d1) = (regs + 4 * pair, regs + 4 * pair + 2);
+        let text = format!("ds_store_2addr_b64 v{addr}, v[{d0}:{}], v[{d1}:{}]{}", d0 + 1, d1 + 1, ds_offsets(64 * u32::from(pair), 64 * u32::from(pair) + 32));
+        Instruction::new(text, vec![], vec![v(addr), vr(d0, 2), vr(d1, 2)]).memory(MemoryClass::DsStore)
+    };
+    let mut a = w.begin_write(ra);
+    for pair in 0..2u8 { a = w.ds_store(a, store(Regs::STA, Regs::ST_A[slot], pair))?; }
+    let mut x = w.begin_write(rx);
+    for pair in 0..2u8 { x = w.ds_store(x, store(Regs::STX, Regs::ST_X[slot], pair))?; }
+    Ok((a, x))
 }
 
-/// Fragment loads of step `i = 8a + s` from slot `slot`: the X fragments of
-/// slice s (c = 0,1 and c = 2,3) and, at even s, the A pair (s, s+1).
-fn step_loads(b: &mut Builder, slot: usize, i: usize) -> Result<(), String> {
+/// Fragment loads of step `i = 8a + s` from the rings' current slot: the X
+/// fragments of slice s (c = 0,1 and c = 2,3) and, at even s, the A pair (s, s+1).
+fn step_loads(w: &mut Wv, ra: &Ring<A, Published, Free>, rx: &Ring<X, Published, Free>, i: usize) -> Result<(), String> {
+    let slot = ra.cur_index();
     let (a, s_) = ((i / 8) as u32, (i % 8) as u32);
     if s_ % 2 == 0 {
         let dst = Regs::AV[(i / 2) % 2];
         let base = Regs::AB[slot];
         let o = a * 128 + 16 * s_;
-        b.ds_load(SLOT_A[slot], Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(o, o + 16)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
+        w.ds_load_cur(ra, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(o, o + 16)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
     }
     for half in 0..2usize {
         let dst = Regs::XV[i % 2] + 4 * half as u8;
         let base = Regs::XB[slot][half];
-        b.ds_load(SLOT_X[slot], Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(16 * s_, 16 * s_ + 128)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
+        w.ds_load_cur(rx, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(16 * s_, 16 * s_ + 128)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
     }
     Ok(())
 }
 
-fn step_wmma(b: &mut Builder, i: usize) -> Result<(), String> {
+fn step_wmma<T: MmaIu4>(w: &mut Wave<T, Builder>, i: usize) -> Result<(), String> {
+    let b = w.isa();
     let a = V::<2>(Regs::AV[(i / 2) % 2] + 2 * (i % 2) as u8);
     for c in 0..4u8 {
         let dst = V::<8>(Regs::C + 8 * c);
@@ -519,11 +527,13 @@ fn fold(b: &mut Builder, epi: Epi, a: u8) -> Result<(), String> {
     Ok(())
 }
 
-/// One K128 epoch reading slot `p` (epoch parity p). With `next`, the
-/// staging packet of epoch e+1 is loaded, published into slot 1-p and the
-/// barrier hands the slots over; the last epoch has neither. `touch` (ADD
-/// touch, last two epochs) loads residual lines `touch` and `touch + 1`.
-fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result<(), String> {
+/// One K128 epoch reading the rings' current slot `p` (epoch parity p).
+/// With `next`, the staging packet of epoch e+1 is loaded, published into
+/// slot 1-p and the barrier rotates the rings; the last epoch has neither.
+/// `touch` (ADD touch, last two epochs) loads residual lines `touch` and `touch + 1`.
+fn epoch(wg: &mut Wg, epi: Epi, (ra, rx): Rings, next: bool, touch: bool) -> Result<Rings, String> {
+    let p = ra.cur_index();
+    let b = wg.isa();
     // Current-epoch metadata first: in-order VMcnt returns it before the packet.
     let scale_loads: &[(u8, u8)] = if epi.silu() { &[(Regs::WS, Regs::SA), (Regs::WSU, Regs::SU)] } else { &[(Regs::WS, Regs::SA)] };
     for &(dst, base) in scale_loads {
@@ -531,8 +541,9 @@ fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result
             &[v(dst)], &[v(Regs::LWS), sr(base, 2)], MemoryClass::VmemLoad)?;
     }
     for c in 0..4u8 { global_load(b, 1, Regs::DC + c, Regs::LXS, Regs::SX, 16 * XBLK_BYTES * u32::from(c))?; }
-    if touch { touch_window(b, p)?; }
+    if touch { touch_window(wg, p)?; }
     if next {
+        let b = wg.isa();
         if p == 1 {
             // Epoch e+1 starts the next 136-byte A group.
             let bases: &[u8] = if epi.silu() { &[Regs::SA, Regs::SU, Regs::SS] } else { &[Regs::SA] };
@@ -548,25 +559,27 @@ fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result
     // Pass 0's scale broadcast issues after step 3 (its f16 scale load has
     // had 16 WMMA issue slots), pass 1's right after fold pass 0 released
     // the broadcast registers; both retire under the following WMMA steps.
-    step_loads(b, p, 0)?;
+    step_loads(wg, &ra, &rx, 0)?;
     for i in 0..16 {
-        if i + 1 < 16 { step_loads(b, p, i + 1)?; }
-        step_wmma(b, i)?;
-        if i == 3 { scales(b, epi, 0)?; }
+        if i + 1 < 16 { step_loads(wg, &ra, &rx, i + 1)?; }
+        step_wmma(wg, i)?;
+        if i == 3 { scales(wg.isa(), epi, 0)?; }
         if i == 7 {
-            fold(b, epi, 0)?;
-            scales(b, epi, 1)?;
+            fold(wg.isa(), epi, 0)?;
+            scales(wg.isa(), epi, 1)?;
         }
+    }
+    if !next {
+        fold(wg.isa(), epi, 1)?;
+        return Ok((ra, rx))
     }
     // Publish the staged packet before fold pass 1 (slot 1-p was retired by
     // the previous barrier), so its LGKM drain hides under the fold: this
     // measured 0.3-0.6% faster on gate/up than publishing after the fold.
-    if next { stage_store(b, 1 - p)?; }
-    fold(b, epi, 1)?;
-    if next {
-        b.barrier(&[Transition::Retire(SLOT_A[p]), Transition::Retire(SLOT_X[p]), Transition::Ready(SLOT_A[1 - p]), Transition::Ready(SLOT_X[1 - p])])?;
-    }
-    Ok(())
+    let ((ra, pa), (rx, px)) = stage_store(wg, ra, rx)?;
+    fold(wg.isa(), epi, 1)?;
+    let (da, dx) = wg.wait_all((pa, px))?;
+    wg.barrier((rotate(ra, da), rotate(rx, dx)))
 }
 
 /// ADD residual touch, every loop epoch: loop trip t (the trip-count SGPR, which
@@ -575,42 +588,48 @@ fn epoch(b: &mut Builder, epi: Epi, p: usize, next: bool, touch: bool) -> Result
 /// line i (32*i tokens past `TOFF`). EXEC is empty outside the window, so
 /// the body stays one straight-line trip; the load always counts on VMcnt
 /// and rides ahead of the staging packet, whose wait retires it.
-fn touch_window(b: &mut Builder, p: usize) -> Result<(), String> {
+fn touch_window(w: &mut Wv, p: usize) -> Result<(), String> {
     let (t0, t1) = (Regs::T0, Regs::T1);
-    op(b, format!("s_add_i32 s{t0}, s{}, -6", Regs::TRIPS), &[s(t0)], &[s(Regs::TRIPS)])?;
-    op(b, format!("s_cmp_lt_u32 s{t0}, 2"), &[], &[s(t0)])?;
-    op(b, "s_cselect_b32 exec_lo, -1, 0", &[], &[])?;
-    op(b, format!("s_lshl_b32 s{t1}, s{t0}, 1"), &[s(t1)], &[s(t0)])?;
-    op(b, format!("s_sub_i32 s{t1}, {}, s{t1}", 2 + p), &[s(t1)], &[s(t1)])?;
-    op(b, format!("s_mul_i32 s{t1}, s{t1}, s{}", Regs::M128), &[s(t1)], &[s(t1), s(Regs::M128)])?;
-    op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::STB, Regs::SY), &[s(Regs::STB)], &[s(Regs::SY), s(t1)])?;
-    op(b, format!("s_addc_u32 s{}, s{}, 0", Regs::STB + 1, Regs::SY + 1), &[s(Regs::STB + 1)], &[s(Regs::SY + 1)])?;
-    let sink = Regs::TSINK;
-    mem(b, format!("global_load_b32 v{sink}, v{}, s[{}:{}]", Regs::TOFF, Regs::STB, Regs::STB + 1),
-        &[v(sink)], &[v(Regs::TOFF), sr(Regs::STB, 2)], MemoryClass::VmemLoad)?;
-    op(b, "s_mov_b32 exec_lo, -1", &[], &[])
+    op(w.isa(), format!("s_add_i32 s{t0}, s{}, -6", Regs::TRIPS), &[s(t0)], &[s(Regs::TRIPS)])?;
+    let window = w.scmp(Instruction::new(format!("s_cmp_lt_u32 s{t0}, 2"), vec![], vec![s(t0)]))?;
+    w.exec_if(window, |w| {
+        let b = w.isa();
+        op(b, format!("s_lshl_b32 s{t1}, s{t0}, 1"), &[s(t1)], &[s(t0)])?;
+        op(b, format!("s_sub_i32 s{t1}, {}, s{t1}", 2 + p), &[s(t1)], &[s(t1)])?;
+        op(b, format!("s_mul_i32 s{t1}, s{t1}, s{}", Regs::M128), &[s(t1)], &[s(t1), s(Regs::M128)])?;
+        op(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::STB, Regs::SY), &[s(Regs::STB)], &[s(Regs::SY), s(t1)])?;
+        op(b, format!("s_addc_u32 s{}, s{}, 0", Regs::STB + 1, Regs::SY + 1), &[s(Regs::STB + 1)], &[s(Regs::SY + 1)])?;
+        let sink = Regs::TSINK;
+        mem(b, format!("global_load_b32 v{sink}, v{}, s[{}:{}]", Regs::TOFF, Regs::STB, Regs::STB + 1),
+            &[v(sink)], &[v(Regs::TOFF), sr(Regs::STB, 2)], MemoryClass::VmemLoad)
+    })
 }
 
-fn kloop(b: &mut Builder, epi: Epi) -> Result<(), String> {
-    b.label(K_BEGIN)?;
-    if !b.ledger.is_empty() { return Err(format!("prologue left memory operations pending at the K loop: {:?}", b.ledger.shape())) }
-    op(b, format!("s_cmp_eq_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
-    op(b, format!("s_cbranch_scc1 {TAIL}"), &[], &[])?;
-    b.loop_(K_LOOP, |b| {
-        let touch = epi == Epi::Add;
-        epoch(b, epi, 0, true, touch)?;
-        epoch(b, epi, 1, true, touch)?;
-        op(b, format!("s_add_i32 s{0}, s{0}, -1", Regs::TRIPS), &[s(Regs::TRIPS)], &[s(Regs::TRIPS)])?;
-        op(b, format!("s_cmp_lg_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
-        op(b, format!("s_cbranch_scc1 {K_LOOP}"), &[], &[])
+/// The trip counter `TRIPS = K/256 - 1` derives from the `K` kernel argument only.
+fn trips_cmp(wg: &mut Wg, cmp: &str) -> Result<WgUniform<Scc>, String> {
+    wg.scmp_wg_uniform(Instruction::new(format!("{cmp} s{}, 0", Regs::TRIPS), vec![], vec![s(Regs::TRIPS)]))
+}
+
+fn kloop(wg: &mut Wg, epi: Epi, rings: Rings) -> Result<Rings, String> {
+    wg.label(K_BEGIN)?;
+    if !wg.isa().ledger.is_empty() { return Err(format!("prologue left memory operations pending at the K loop: {:?}", wg.isa().ledger.shape())) }
+    let no_trip = trips_cmp(wg, "s_cmp_eq_u32")?;
+    let rings = wg.wg_skip_if(no_trip, TAIL, rings, |wg, rings| {
+        let rings = wg.loop_carried(K_LOOP, rings, |wg, rings| {
+            let touch = epi == Epi::Add;
+            let rings = epoch(wg, epi, rings, true, touch)?;
+            let rings = epoch(wg, epi, rings, true, touch)?;
+            op(wg.isa(), format!("s_add_i32 s{0}, s{0}, -1", Regs::TRIPS), &[s(Regs::TRIPS)], &[s(Regs::TRIPS)])?;
+            Ok((rings, trips_cmp(wg, "s_cmp_lg_u32")?))
+        })?;
+        wg.label(K_LOOP_END)?;
+        // Both paths into the tail (no trip, or after the loop) arrive with an
+        // empty ledger, so its waits hold on either.
+        if !wg.isa().ledger.is_empty() { return Err("K loop exit leaves memory operations pending".into()) }
+        Ok(rings)
     })?;
-    b.label(K_LOOP_END)?;
-    // Both paths into the tail (no trip, or after the loop) arrive with an
-    // empty ledger, so its waits hold on either.
-    if !b.ledger.is_empty() { return Err("K loop exit leaves memory operations pending".into()) }
-    b.label(TAIL)?;
-    epoch(b, epi, 0, true, false)?;
-    epoch(b, epi, 1, false, false)
+    let rings = epoch(wg, epi, rings, true, false)?;
+    epoch(wg, epi, rings, false, false)
 }
 
 /// Lane (hi, lr) owns rows 8hi..8hi+7 of each fragment for one token; two
@@ -691,16 +710,18 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, plan(spec.epi)?);
     b.enable_delay_alu();
-    declare_lds(&mut b)?;
+    let mut wg = Wg::new(&mut b)?;
+    let rings = declare_lds(&mut wg)?;
+    let end = wg.exit(END)?;
     // PRIO (gate/up only): prologue and K loop at wave priority 1, the SiLU
     // epilogue at 0. On the ADD entry the same split starves the epilogue
     // (K6144 +1.8%), and SET is neutral.
-    if spec.epi.silu() { op(&mut b, "s_setprio 1", &[], &[])?; }
-    prologue(&mut b, spec.epi)?;
-    kloop(&mut b, spec.epi)?;
-    epilogue(&mut b, spec.epi)?;
-    b.label(END)?;
-    b.push(Sop::End.encode(spec.arch)?)?;
+    if spec.epi.silu() { op(wg.isa(), "s_setprio 1", &[], &[])?; }
+    let rings = prologue(&mut wg, spec.epi, rings)?;
+    // The last epoch's slot stays published: nothing writes LDS after it.
+    let _published = kloop(&mut wg, spec.epi, rings)?;
+    epilogue(wg.isa(), spec.epi)?;
+    wg.end(end)?;
     b.finish()
 }
 

@@ -4,11 +4,16 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
 
 ## Prerequisites
 
-- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP development stack.
-  hipfire JIT-compiles kernels, so a runtime-only install is insufficient: the
-  selected ROCm root must provide `lib/libamdhip64.so` (and
-  `libhsa-runtime64.so`), `include/hip/hip_runtime.h`, and `bin/hipcc`.
-  Install a supported AMD ROCm HIP runtime, development headers, and device
+- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP stack. A release-tag
+  install on an admitted GPU (gfx1201, gfx1100, gfx1151, gfx906, gfx942) can
+  use the tag's prebuilt [kernel pack](#prebuilt-kernel-packs) for the kernel
+  registry, and installs with only the HIP runtime (`lib/libamdhip64.so`,
+  `libhsa-runtime64.so`) and `bin/rocm_agent_enumerator`. Kernels outside the
+  registry still JIT on first use. On gfx1201 the registry covers Qwen3.8 H2
+  AR, MTP and DFlash `hipfire run` without a device compiler; other models and
+  routes can still JIT, so running models generally needs hipcc. The selected
+  ROCm root should therefore also provide `include/hip/hip_runtime.h` and
+  `bin/hipcc`. Install a supported AMD ROCm HIP runtime, development headers, and device
   compiler via
   [AMD's live install selector](https://rocm.docs.amd.com/en/latest/install/rocm.html)
   (choose packages for your GPU, OS, and ROCm version — package names drift;
@@ -17,8 +22,11 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
   [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
   **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
   hardcode a required release — install a supported stack for your GPU.
-- **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
-- **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
+- **Windows (recommended): WSL2 with ROCm 7.2.1 and AMD's ROCDXG library.**
+  hipfire runs as the ordinary Linux build inside the distro; see
+  [Windows — WSL2](#windows--wsl2-recommended) for the driver, ROCm and
+  `librocdxg` steps and the supported GPU list.
+- **Windows (native, best-effort):** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`). Slower and narrower than WSL2; see [the limits](#windows--native-best-effort).
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
@@ -76,16 +84,151 @@ Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
-The installer detects GPU arch and ROCm, builds the daemon and native CLI,
-then packages exact-source registry kernels with `hipfire-kernel-pack`'s shared
-compiler into `~/.hipfire/bin/kernels/compiled/<arch>/`. Each `.hsaco` requires
-a matching `.index.json`; re-run the installer after upgrading an older install.
+The installer detects GPU arch and ROCm and builds the daemon and native CLI.
+With `--tag` (or a tag-named `--ref`) on an admitted GPU it then installs the
+tag's [prebuilt kernel pack](#prebuilt-kernel-packs); otherwise, or when the
+pack cannot be used, it packages exact-source registry kernels with
+`hipfire-kernel-pack`'s shared compiler. Either way the result is
+`~/.hipfire/bin/kernels/compiled/<arch>/`, where each `.hsaco` requires a
+matching `.index.json`; re-run the installer after upgrading an older install.
 The bin directory can be added to `PATH`; reload the shell afterward.
 
 GPUs not in the admitted registry remain JIT-only and need hipcc at runtime;
 they cannot run with `HIPFIRE_NO_DEVICE_COMPILER=1`.
 
-### Windows — select a branch, tag, or commit
+### Prebuilt kernel packs
+
+Each release tag carries one pack per admitted architecture, built from the
+tag's exact commit by `scripts/build-kernel-pack.sh` (hipcc, no GPU):
+
+| Release asset | Contents |
+|---|---|
+| `hipfire-kernels-<tag>-<arch>.tar.gz` | `manifest.json` and `<arch>/` with every registry module's `.hsaco`, `.hash` and `.index.json` |
+| `hipfire-kernels-<tag>-<arch>.tar.gz.sha256` | `sha256sum` line for the tarball |
+| `hipfire-kernels-<tag>-<arch>.manifest.json` | copy of the manifest: commit, ROCm and HIP version, compiler identity, code-object version, admitted ROCm range |
+
+`install.sh --tag <tag>` (also `--ref <tag>` and `hipfire update --tag <tag>`)
+downloads the pack for the detected arch and installs it only when all of
+these hold; otherwise it says why and compiles locally with hipcc:
+
+- the tarball matches the published SHA-256, and holds only flat regular files;
+- the manifest names the same tag, arch and commit as the checkout, and the
+  runtime's kernel cache ABI;
+- the local ROCm version (`<root>/.info/version`) is inside the manifest's
+  range — by default the build's `major.minor` up to the next major release;
+- a local hipcc, if any, is the same build that compiled the pack (a different
+  one would make the runtime reject and recompile every kernel), and the
+  active hipfire config selects the same kernel flags;
+- every registry module's index matches the checked-out sources, recipe and
+  object bytes, and the directory holds nothing else.
+
+Pass `--compile-kernels` to skip the pack. `--kernel-pack-url` points at another
+directory or URL holding the assets (`https://…`, `file:///…`, or a plain
+path), for mirrors and offline installs:
+
+```bash
+bash install.sh --tag v0.4.0 --kernel-pack-url file:///srv/hipfire-packs/v0.4.0
+```
+
+`hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
+runs the same download and checks on an existing install, for example to
+restore kernels on a machine without hipcc.
+
+Maintainers: the tag-triggered `release-kernel-packs` workflow
+(`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
+attaches the assets to the release. The default image,
+`rocm/dev-ubuntu-26.04:10.0.0-full`, carries the same ROCm 10.0.0 packages
+(HIP 7.15.26333) as the project's GPU hosts, so its packs admit ROCm
+[10.0, 11.0) and install on hosts with that hipcc. A pack only installs where
+the local hipcc, if any, is the build that compiled it; hosts on another ROCm
+compile locally. Repository variables choose another image
+(`HIPFIRE_ROCM_IMAGE`) and, optionally, a wider admitted range
+(`HIPFIRE_PACK_ROCM_MIN` and `HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To
+publish from a local toolchain instead:
+
+```bash
+scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.0 --out dist gfx1201    # or a subset
+gh release upload v0.4.0 dist/hipfire-kernels-v0.4.0-*
+```
+
+The script compiles `git archive` of the tag's commit with a fresh `HOME` and
+no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
+and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
+declares a range other than the default; it must contain the build's ROCm.
+
+### Windows — WSL2 (recommended)
+
+WSL2 is the supported way to run hipfire on Windows. Inside the distro hipfire
+is the Linux build (Linux installer, `hipfire update`, file locks, signals);
+ROCm reaches the GPU through AMD's ROCDXG library and Microsoft's DXCore
+device `/dev/dxg`, while the Windows Adrenalin driver owns the card. AMD's
+current method (ROCm 7.2.1, ROCDXG; the older `amdgpu-install --usecase=wsl`
+/ roc4wsl packaging stops at ROCm 7.2) is documented in
+[WSL How-to — Use ROCm on Radeon](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/howto_wsl.html),
+[WSL How-to — Use ROCm on Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html)
+and the [librocdxg Quickstart](https://github.com/ROCm/librocdxg#quickstart):
+
+1. On Windows 11, install **AMD Software: Adrenalin Edition 26.2.2 for
+   WSL2** ([release notes](https://www.amd.com/en/resources/support-articles/release-notes/RN-RAD-WIN-26-2-2.html)).
+   It is the first driver with Ryzen Strix / Strix Halo support on WSL; the
+   Radeon [WSL support matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/wsl/wsl_compatibility.html)
+   lists 26.1.1 as the minimum for discrete cards.
+2. Install WSL2 with **Ubuntu 24.04 or 22.04**
+   ([Microsoft: install WSL](https://learn.microsoft.com/en-us/windows/wsl/install)).
+3. In the distro, install the **ROCm 7.2.1** packages with the
+   [ROCm Linux quick start](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html).
+   Install ROCm userspace only; there is no Linux kernel driver to install
+   under WSL.
+4. Install **librocdxg** (1.2.x for ROCm 7.2.x): the prebuilt
+   `rocdxg-roct_<version>_amd64.deb` from the
+   [librocdxg releases](https://github.com/ROCm/librocdxg/releases)
+   (`sudo dpkg -i rocdxg-roct_<version>_amd64.deb`), or build it from source
+   as the Quickstart describes. Its source now lives in
+   [rocm-systems](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocr-runtime/libhsakmt/src/dxg).
+5. ROCm releases before 7.13 (so 7.2.1) need DXG detection switched on. Add it
+   to your shell profile so the hipfire daemon inherits it:
+
+   ```bash
+   echo 'export HSA_ENABLE_DXG_DETECTION=1' >> ~/.bashrc && source ~/.bashrc
+   ```
+6. Check that `rocminfo` lists your GPU as an agent (`Name: gfx1201`, …),
+   then run the [Linux installer](#linux--master-or-beta-in-one-command)
+   inside the distro.
+
+Supported GPUs for ROCm 7.2.x on WSL (librocdxg 1.2.0 matrix; hipfire's tuned
+targets are gfx1201, gfx1100 and gfx1151):
+
+| arch | products |
+|---|---|
+| gfx1201 | Radeon AI PRO R9700, RX 9070, RX 9070 XT, RX 9070 GRE |
+| gfx1200 | RX 9060, RX 9060 XT |
+| gfx1100 | RX 7900 XTX, RX 7900 XT, RX 7900 GRE, PRO W7900 (incl. Dual Slot), PRO W7800 (incl. 48GB) |
+| gfx1101 | RX 7800 XT, PRO W7700 |
+| gfx1151 | Ryzen AI Max+ 395, Ryzen AI Max 390, Ryzen AI Max 385 (Strix Halo) |
+| gfx1150 | Ryzen AI 9 HX 375, Ryzen AI 9 HX 370, Ryzen AI 9 365 |
+
+What differs from native Linux until each piece is certified on WSL hardware:
+
+- The daemon identifies cards from HIP's UUID and PCI address (there is no
+  KFD topology), so `hardware.devices` is refused; select cards with
+  `HIP_VISIBLE_DEVICES`. AMD does not support multi-GPU under WSL.
+- The retained Redline PM4 default falls back to the HIP graph with one
+  `[redline] retained default refused` log line (about 4–6% slower decode on
+  the routes that default to PM4), and an explicit `replay.backend=redline`
+  is refused. `HIPFIRE_UNSAFE_WSL_REDLINE=1` lifts this; it is **unsafe
+  until certified**.
+- The KV cache uses the legacy backend; an explicit `kv_backend=vmm` is
+  refused. `HIPFIRE_UNSAFE_WSL_VMM_KV=1` lifts this; it is **unsafe until
+  certified** (WDDM VA growth may alias earlier KV pages, as it does on native
+  Windows).
+- Host RAM guards see the WSL VM's memory. On Strix Halo the GPU pool is also
+  bounded by the `.wslconfig` `memory=` setting
+  ([ROCm#6022](https://github.com/ROCm/ROCm/issues/6022)); raise it for large
+  models. `rocm-smi`/`amd-smi` are limited and the ROCm profiler and debugger
+  are unsupported under WSL.
+
+### Windows — native (best-effort)
 
 ```powershell
 # Current master:
@@ -113,13 +256,38 @@ atomically replace the running executable; re-run `install.ps1` with the
 desired selector instead.
 
 Builds `daemon.exe` and the native CLI from the same selected source revision
-under `~\.hipfire\src`; hipcc from the HIP SDK is required to package exact
-registry sources. The installer runs `daemon.exe --precompile` to produce
-indexed packages in `~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run
-`install.ps1` after upgrading: copying bare `.hsaco` files is insufficient.
+under `~\.hipfire\src`. With `-Tag` (or a tag-named `-Ref`) on an admitted GPU
+the installer runs `hipfire kernel-pack install` for the tag's
+[prebuilt kernel pack](#prebuilt-kernel-packs) (`-KernelPackUrl` overrides the
+download location, `-CompileKernels` skips it). Otherwise, or when the pack
+cannot be used, hipcc from the HIP SDK packages exact registry sources: the
+installer runs `daemon.exe --precompile` to produce indexed packages in
+`~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run `install.ps1` after
+upgrading: copying bare `.hsaco` files is insufficient.
 
 Unsupported GPU architectures likewise require hipcc JIT at runtime; the
 installer does not copy bare checkout objects into the installed cache.
+
+Native Windows is best-effort: it builds and runs, but it is slower and
+narrower than WSL2 on the same card. Known limits:
+
+- **No Redline PM4.** The Windows HIP SDK ships no ROCr (`libhsa-runtime64`),
+  so decode runs on the HIP graph: about 4–6% slower than the Linux/WSL PM4
+  default (gfx1201 Qwen3.8 27B tg128 at 8K: ≈38.2 instead of 40.3 tok/s).
+  An explicit `replay.backend=redline` is refused.
+- **Legacy KV only.** HIP VMM growth is not certified on Windows; automatic
+  KV selects legacy and `kv_backend=vmm` is refused.
+- **No tensor or pipeline parallel**: the HIP SDK has no RCCL. One GPU per
+  daemon; `hardware.devices` is unavailable, so select the card with
+  `HIP_VISIBLE_DEVICES`.
+- GPU locks are `LockFileEx` files under `%ProgramData%\hipfire\locks`
+  (or `HIPFIRE_LOCK_DIR`); a second daemon on the same card reports the
+  holder PID, as on Linux.
+- hipfire resolves its home and kernel cache from `HOME`; when `HOME` is not
+  set they land in the current directory. Set it once with
+  `setx HOME "%USERPROFILE%"`.
+- `hipfire update` is Linux-only (re-run `install.ps1`), and `hipfire stop`
+  cannot find a native `serve` process; stop it with Ctrl-C.
 
 ### Source checkout
 
@@ -239,7 +407,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 |---|---|---|
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
-| `kv_cache` | `auto` | Resolves via registry `default_kv_mode`, else `q8` |
+| `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
 | `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
@@ -260,20 +428,17 @@ another installed target still declares it (see [CLI.md](CLI.md)).
 
 ## Long context (optional)
 
-CASK/TriAttention eviction is experimental and disabled by default. It is
-**not** required for short prompts. When deliberately testing it for long
-context on limited VRAM:
-
-1. Prefer models whose `pull` ships a `.triattn.bin` sidecar, **or** generate one: `hipfire sidecar-gen <model>`.
-2. Set `cask_sidecar` to that exact path. Enable `cask` separately only when m-folding is intended.
-3. Read constraints (A3B, DFlash + m-fold) in [CONFIG.md](CONFIG.md) before enabling on MoE or with DFlash. `cask_auto_attach` remains `false` unless explicitly opted in.
+Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
+pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
+eviction is deprecated and will be removed in 0.5.0 — off by default, not
+supported, and not a recommended route to long context.
 
 ### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
 
 On 24GB GPUs, Q8 KV is about 10,880 B/token across 10 full-attention layers,
 plus O(N) flash partials (~2,064 B/token), ~25 MiB DeltaNet state, and multi-GiB
 fixed HIP/graph overhead. **50K Q8 is tight but physically feasible**; **200K Q8
-is not a 24GB-class configuration** — it needs >32GB-class VRAM or CASK/compressed
+is not a 24GB-class configuration** — it needs >32GB-class VRAM or compressed
 KV. Some historical 131K sidecar benches clamped physical capacity to ~2432
 tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
@@ -303,6 +468,6 @@ tail -f ~/.hipfire/serve.log
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
 | [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
-| [CONFIG.md](CONFIG.md) | All config keys and experimental CASK/TriAttention opt-ins |
+| [CONFIG.md](CONFIG.md) | All config keys |
 | [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
 | [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |

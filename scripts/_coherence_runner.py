@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # hipfire — see LICENSE and NOTICE in the project root.
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — retired coherence-gate battery driver; historical reproduction only (docs/VALIDATION.md)
 
 """_coherence_runner.py — shared driver for coherence-gate-*.sh scripts.
 
@@ -142,6 +143,7 @@ def extract_text(out_bytes: bytes) -> str:
 
 
 def main() -> int:
+    print("warning: _coherence_runner.py is deprecated and will be removed in 0.5.0; retired coherence-gate battery, not acceptance evidence (docs/VALIDATION.md)", file=sys.stderr)
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--model", required=True)

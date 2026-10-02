@@ -2,8 +2,10 @@
 //! token/row metadata. Staging map (hipcc K1's, bank-swizzled): lane `tid`
 //! moves 8 bytes of slab row `R = r * round_rows + tid / 4`, quad `tid % 4`,
 //! to fragment-order slot `st_ldsoff + r * round_rows * 32`.
-use super::{Gen, Tile, ds_offset, ds_offsets, mem, op, s, sr, v, vr};
+use super::{Gen, MetaD, MetaS, PayA, PayW, Staged, Tile, Wv, ds_offset, ds_offsets};
+use crate::kernels::{common::{mem, op, s, sr, v, vr}, iu4_fold::{GROUP_BYTES, XBLK_BYTES}};
 use crate::{Builder, insn::{Instruction, MemoryClass}};
+use peacemaker_author::{Free, Ring, State};
 
 /// `buffer_load_b{32,64}` with an optional scalar offset (objdump spelling).
 pub(crate) fn vload(b: &mut Builder, dst: u8, width: u8, voff: u8, srd: u8, soff: Option<u8>, offset: u32) -> Result<(), String> {
@@ -16,14 +18,11 @@ pub(crate) fn vload(b: &mut Builder, dst: u8, width: u8, voff: u8, srd: u8, soff
     mem(b, format!("{name} {d}, v{voff}, s[{}:{}], {so} offen{off}", srd, srd + 3), &[vr(dst, width)], &uses, MemoryClass::VmemLoad)
 }
 
-/// A DS store touching one or more slots; every touched slot takes its
-/// `Publishing` transition.
-pub(crate) fn ds_store(b: &mut Builder, slots: &[usize], text: String, uses: Vec<crate::reg::RegRef>) -> Result<(), String> {
-    for &slot in &slots[1..] { b.lds.store(slot)? }
-    b.ds_store(slots[0], Instruction::new(text, vec![], uses).memory(MemoryClass::DsStore))
+fn ds_store(text: String, uses: Vec<crate::reg::RegRef>) -> Instruction {
+    Instruction::new(text, vec![], uses).memory(MemoryClass::DsStore)
 }
-pub(crate) fn ds_load(b: &mut Builder, slot: usize, text: String, dst: crate::reg::RegRef, addr: u8) -> Result<(), String> {
-    b.ds_load(slot, Instruction::new(text, vec![dst], vec![v(addr)]).memory(MemoryClass::DsLoad))
+pub(crate) fn ds_load(text: String, dst: crate::reg::RegRef, addr: u8) -> Instruction {
+    Instruction::new(text, vec![dst], vec![v(addr)]).memory(MemoryClass::DsLoad)
 }
 
 /// Scalar offset and immediate of staging round `r` of activation slab
@@ -31,7 +30,7 @@ pub(crate) fn ds_load(b: &mut Builder, slot: usize, text: String, dst: crate::re
 pub(crate) fn a_offset(g: &Gen, slab: u32, r: usize) -> (Option<u8>, u32) {
     let rows = r as u32 * g.tile.round_rows();
     match g.a_slab1 {
-        None => (None, 8 + 32 * slab + rows * super::spec::BLOCK_I4_128),
+        None => (None, 8 + 32 * slab + rows * XBLK_BYTES),
         Some(s1) => ((slab == 1).then_some(s1), rows * 32),
     }
 }
@@ -43,7 +42,7 @@ pub(crate) fn fetch_slab1(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Stri
 
 /// Fetch the next group's even block before `goff` advances at trip end.
 pub(crate) fn fetch_slab1_next_group(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    fetch_slab1_at(b, g, 0, super::spec::GROUP_BYTES + 40)
+    fetch_slab1_at(b, g, 0, GROUP_BYTES + 40)
 }
 
 fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Result<(), String> {
@@ -62,7 +61,7 @@ fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Res
 /// Issue next-block token scale and packed row header before B1: neither
 /// payload register is still live after the preceding block's B2 publication.
 pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
-    let header = if h == 0 { 4 } else { super::spec::GROUP_BYTES };
+    let header = if h == 0 { 4 } else { GROUP_BYTES };
     b.clause(|b| {
         vload(b, g.ds_nx, 1, g.ds_voff, g.srd_a[h ^ 1], None, 0)?;
         vload(b, g.sz_nx, 1, g.sz_voff, g.srd_z, Some(g.goff), header)
@@ -72,7 +71,7 @@ pub(crate) fn fetch_next_meta(b: &mut Builder, g: &Gen, h: usize) -> Result<(), 
 /// Next-block slab-0 fetch epoch after B1 of block `h`.
 pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
     // Next (group, half) relative to the current group offset in `goff`.
-    let next = if h == 0 { 64 } else { super::spec::GROUP_BYTES };
+    let next = if h == 0 { 64 } else { GROUP_BYTES };
     b.clause(|b| {
         for (r, &dst) in g.a_pf.iter().enumerate() {
             let (soff, offset) = a_offset(g, 0, r);
@@ -93,43 +92,46 @@ pub(crate) fn flip_weights(b: &mut Builder, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
-/// Publish the staged slab in `A_pf/W_pf` to slot `slot`.
-pub(crate) fn publish_slab(b: &mut Builder, g: &Gen, slot: usize) -> Result<(), String> {
-    flip_weights(b, g)?;
+/// Publish the staged slab in `A_pf/W_pf` to the payload rings' next slot.
+pub(crate) fn publish_slab<C: State>(w: &mut Wv, g: &Gen, ra: Ring<PayA, C, Free>, rw: Ring<PayW, C, Free>) -> Result<(Staged<PayA, C>, Staged<PayW, C>), String> {
+    let slot = ra.next_index();
+    flip_weights(w.isa(), g)?;
     let l = g.layout;
     let step = g.tile.round_rows() / 16; // 512-byte units per staging round
-    let (a, w) = (l.a[slot] / 512, l.w[slot] / 512);
-    let (sa, sw) = (g.slot_a[slot], g.slot_w[slot]);
+    let (a, wo) = (l.a[slot] / 512, l.w[slot] / 512);
+    let (mut sa, mut sw) = (w.begin_write(ra), w.begin_write(rw));
     match g.tile {
         Tile::T128x128x8 => for r in 0..g.a_pf.len() {
             let (ar, wr) = (g.a_pf[r], g.w_pf[r]);
-            ds_store(b, &[sa, sw], format!("ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}", g.st_lds, ar, ar + 1, wr, wr + 1,
-                ds_offsets(a + step * r as u32, w + step * r as u32)), vec![v(g.st_lds), vr(ar, 2), vr(wr, 2)])?;
+            (sa, sw) = w.ds_store2(sa, sw, ds_store(format!("ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}", g.st_lds, ar, ar + 1, wr, wr + 1,
+                ds_offsets(a + step * r as u32, wo + step * r as u32)), vec![v(g.st_lds), vr(ar, 2), vr(wr, 2)]))?;
         },
         Tile::T256x128x16 => {
             let ar = g.a_pf[0];
-            ds_store(b, &[sa], format!("ds_store_b64 v{}, v[{}:{}]{}", g.st_lds, ar, ar + 1, ds_offset(l.a[slot])), vec![v(g.st_lds), vr(ar, 2)])?;
+            sa = w.ds_store(sa, ds_store(format!("ds_store_b64 v{}, v[{}:{}]{}", g.st_lds, ar, ar + 1, ds_offset(l.a[slot])), vec![v(g.st_lds), vr(ar, 2)]))?;
             let (w0, w1) = (g.w_pf[0], g.w_pf[1]);
-            ds_store(b, &[sw], format!("ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}", g.st_lds, w0, w0 + 1, w1, w1 + 1,
-                ds_offsets(w, w + step)), vec![v(g.st_lds), vr(w0, 2), vr(w1, 2)])?;
+            sw = w.ds_store(sw, ds_store(format!("ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}", g.st_lds, w0, w0 + 1, w1, w1 + 1,
+                ds_offsets(wo, wo + step)), vec![v(g.st_lds), vr(w0, 2), vr(w1, 2)]))?;
         }
     }
-    Ok(())
+    Ok((sa, sw))
 }
 
 /// Publish the next block's `d` (token plane) and converted `sc` (row plane).
 /// Rows past M and tokens past N carry harmless values: they only reach
 /// outputs the epilogue never stores (tokens read 0 through the descriptor).
-pub(crate) fn publish_meta(b: &mut Builder, g: &Gen, plane: usize) -> Result<(), String> {
-    op(b, format!("v_cvt_f32_f16_e64 v{0}, v{0}.l", g.sz_nx), &[v(g.sz_nx)], &[v(g.sz_nx)])?;
+pub(crate) fn publish_meta<C: State>(w: &mut Wv, g: &Gen, rd: Ring<MetaD, C, Free>, rs: Ring<MetaS, C, Free>) -> Result<(Staged<MetaD, C>, Staged<MetaS, C>), String> {
+    let plane = rd.next_index();
+    op(w.isa(), format!("v_cvt_f32_f16_e64 v{0}, v{0}.l", g.sz_nx), &[v(g.sz_nx)], &[v(g.sz_nx)])?;
     let l = g.layout;
-    let (sd, sz) = (g.slot_ds[plane], g.slot_sz[plane]);
+    let (sd, sz) = (w.begin_write(rd), w.begin_write(rs));
     if g.meta_ds == g.meta_sz {
-        ds_store(b, &[sd, sz], format!("ds_store_2addr_stride64_b32 v{}, v{}, v{}{}", g.meta_ds, g.ds_nx, g.sz_nx,
-            ds_offsets(l.ds[plane] / 256, l.sz[plane] / 256)), vec![v(g.meta_ds), v(g.ds_nx), v(g.sz_nx)])
+        w.ds_store2(sd, sz, ds_store(format!("ds_store_2addr_stride64_b32 v{}, v{}, v{}{}", g.meta_ds, g.ds_nx, g.sz_nx,
+            ds_offsets(l.ds[plane] / 256, l.sz[plane] / 256)), vec![v(g.meta_ds), v(g.ds_nx), v(g.sz_nx)]))
     } else {
-        ds_store(b, &[sd], format!("ds_store_b32 v{}, v{}{}", g.meta_ds, g.ds_nx, ds_offset(l.ds[plane])), vec![v(g.meta_ds), v(g.ds_nx)])?;
-        ds_store(b, &[sz], format!("ds_store_b32 v{}, v{}{}", g.meta_sz, g.sz_nx, ds_offset(l.sz[plane])), vec![v(g.meta_sz), v(g.sz_nx)])
+        let sd = w.ds_store(sd, ds_store(format!("ds_store_b32 v{}, v{}{}", g.meta_ds, g.ds_nx, ds_offset(l.ds[plane])), vec![v(g.meta_ds), v(g.ds_nx)]))?;
+        let sz = w.ds_store(sz, ds_store(format!("ds_store_b32 v{}, v{}{}", g.meta_sz, g.sz_nx, ds_offset(l.sz[plane])), vec![v(g.meta_sz), v(g.sz_nx)]))?;
+        Ok((sd, sz))
     }
 }
 

@@ -436,6 +436,9 @@ fn load_layer(
         candidates: flat_name_candidates,
         read_proj: load_weight_tensor,
         layer: i,
+        // qwen2 is always fully resident — no offload support.
+        host_local: false,
+        read_proj_host: None,
     };
 
     Ok(Qwen2LayerWeights {

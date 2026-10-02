@@ -293,6 +293,32 @@ fn main() {
             );
             write_hfq(out, arch, &serde_json::to_string(&meta).unwrap(), &tensors).expect("write");
         }
+        "vl-extract" => {
+            // Extract vision tower tensors + config.vision_config metadata
+            // into a standalone .vl file. The .vl is a standard HFQM
+            // container with only model.visual.* tensors; the daemon and
+            // carrier auto-discover it as a <stem>.vl sibling.
+            let inp = argv
+                .get(2)
+                .expect("usage: hfq vl-extract <in.mq4> <out.vl>");
+            let out = argv.get(3).expect("out path");
+            let (arch, meta_json, tensors) = load_all(inp);
+            let kept: Vec<Tensor> = tensors
+                .into_iter()
+                .filter(|t| t.name.starts_with("model.visual."))
+                .collect();
+            assert!(
+                !kept.is_empty(),
+                "no vision tensors (model.visual.*) found in {inp}"
+            );
+            eprintln!("extracting {} vision tensor(s) → {out}", kept.len());
+            for t in &kept {
+                eprintln!("  {}", t.name);
+            }
+            // Keep the full metadata (config.vision_config is inside config).
+            write_hfq(out, arch, &meta_json, &kept).expect("write");
+            eprintln!("done. Place {out} next to the trunk model as <stem>.vl for auto-discovery.");
+        }
         _ => {
             eprintln!(
                 "hfq — HFQ container tool\n\
@@ -300,7 +326,8 @@ fn main() {
                  \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>)\n\
                  \x20 hfq meta-get <file> [--key <k>]\n\
                  \x20 hfq meta-overlay <file> --metadata-file <f>\n\
-                 \x20 hfq rearch <in> <out> --arch-id <id>"
+                 \x20 hfq rearch <in> <out> --arch-id <id>\n\
+                 \x20 hfq vl-extract <in.mq4> <out.vl>"
             );
             std::process::exit(1);
         }

@@ -1,4 +1,5 @@
-use super::{BEGIN, LOOP, LOOP_END, EPILOGUE, Builder, Spec, fold, op, publish, so};
+use super::{BEGIN, LOOP, LOOP_END, EPILOGUE, Builder, Spec, fold, publish};
+use crate::kernels::common::{op, sop};
 use crate::{insn::Wmma, lds::Transition, reg::V};
 
 fn step(b:&mut Builder,unit:usize,st:usize,first:bool,slot:usize)->Result<(),String>{
@@ -59,7 +60,7 @@ fn block(b:&mut Builder,spec:Spec,next:bool,first:bool)->Result<(),String>{
     } else {
         b.barrier(&[Transition::Retire(1)])?;
     }
-    so(b,"s_add_co_i32 s85, s85, 1",&[85],&[85])?;
+    sop(b,"s_add_co_i32 s85, s85, 1",&[85],&[85])?;
     b.wait_all()?;
     Ok(())
 }
@@ -69,15 +70,15 @@ pub(super) fn emit(b:&mut Builder,spec:Spec)->Result<(),String>{
     // C=0 is the hardware WMMA's inline operand only for the first K16;
     // subsequent instructions carry the same 128 VGPRs as their SrcC.
     block(b,spec,true,true)?;
-    so(b,"s_add_co_i32 s86, s84, -2",&[86],&[84])?;
-    so(b,"s_lshr_b32 s86, s86, 1",&[86],&[86])?;
-    so(b,"s_cmp_eq_u32 s86, 0",&[],&[86])?;
+    sop(b,"s_add_co_i32 s86, s84, -2",&[86],&[84])?;
+    sop(b,"s_lshr_b32 s86, s86, 1",&[86],&[86])?;
+    sop(b,"s_cmp_eq_u32 s86, 0",&[],&[86])?;
     op(b,format!("s_cbranch_scc1 {LOOP_END}"),&[],&[])?;
     b.loop_(LOOP,|b|{
         block(b,spec,true,false)?;
         block(b,spec,true,false)?;
-        so(b,"s_add_co_i32 s86, s86, -1",&[86],&[86])?;
-        so(b,"s_cmp_lg_u32 s86, 0",&[],&[86])?;
+        sop(b,"s_add_co_i32 s86, s86, -1",&[86],&[86])?;
+        sop(b,"s_cmp_lg_u32 s86, 0",&[],&[86])?;
         op(b,format!("s_cbranch_scc1 {LOOP}"),&[],&[])
     })?;
     b.label(LOOP_END)?;

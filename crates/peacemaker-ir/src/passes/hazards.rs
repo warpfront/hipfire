@@ -7,11 +7,10 @@
 //! * `gfx12_sgpr`: SALU-def/VALU-use SGPR tracking. The state machine is
 //!   `hazard.rs` verbatim (memory clears, tracked-pair marks, demand
 //!   reporting with self-clear). Where the builder *emits* the demanded
-//!   `s_wait_alu`, the whole-program replay *verifies* it: a demand at
-//!   instruction `i` is satisfied by an `s_wait_alu` with the matching
-//!   depctr field at 0 on the reaching path (current block plus the
-//!   single-predecessor chain, stopping at memory clears). Absent on that
-//!   path it is an obligation.
+//!   `s_wait_alu`, the whole-program replay *verifies* it. Actual decoded
+//!   guards retire pending writes on their reaching paths. Block inputs
+//!   join every predecessor and loop back edge at a fixed point; a guard
+//!   on another arm, or before a newer write, cannot satisfy a demand.
 //! * `gfx11_wave32`: gfx1100 TRANS→VALU forwarding (`s_waitcnt_depctr
 //!   va_vdst(0)`), both gfx11 targets' VCMPX→PERMLANE interlock, and WMMA
 //!   chaining, using LLVM `AMDGPU.td` target feature sets and
@@ -40,6 +39,10 @@ use crate::state::{Obligation, ObligationKind};
 pub enum HazardError {
     #[error("hazard tables cover gfx1100/gfx1151/gfx1201 wave32 only (got {0:?} {1:?})")]
     Unsupported(Arch, Wave),
+    #[error("SGPR hazard replay needs a built CFG")]
+    MissingCfg,
+    #[error("SGPR hazard replay did not converge in {walks} CFG sweeps")]
+    NoFixpoint { walks: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +77,7 @@ fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
 /// Port of `hipfire-isa` `Gfx12Sgpr`: tracks SGPR pairs read by VALU and
 /// written by SALU/VALU, demanding `depctr_*_sdst(0)` / `depctr_va_vcc(0)`
 /// before a cross-pipe reread. Clears on vector/scalar memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gfx12Sgpr {
     tracked: [bool; 64],
     salu: [bool; 128],
@@ -96,6 +99,18 @@ impl Default for Gfx12Sgpr {
 }
 
 impl Gfx12Sgpr {
+    fn join(&mut self, other: &Self) {
+        for (a,b) in self.tracked.iter_mut().zip(other.tracked) { *a |= b; }
+        for (a,b) in self.salu.iter_mut().zip(other.salu) { *a |= b; }
+        for (a,b) in self.valu.iter_mut().zip(other.valu) { *a |= b; }
+        self.vcc_salu |= other.vcc_salu;
+        self.vcc_valu |= other.vcc_valu;
+    }
+    fn wait(&mut self, bits: u16) {
+        if bits & 1 == 0 { self.salu.fill(false); self.vcc_salu = false; }
+        if bits >> 1 & 1 == 0 { self.vcc_valu = false; }
+        if bits >> 9 & 7 == 0 { self.valu.fill(false); }
+    }
     pub fn clear_on_memory(&mut self) {
         self.salu.fill(false);
         self.valu.fill(false);
@@ -267,44 +282,6 @@ impl Gfx11Hazards {
     }
 }
 
-/// Demanded wait satisfied by an `s_wait_alu` in the layout stream?
-/// Searches backward from `index` to the nearest preceding vector/scalar
-/// memory instruction (exclusive). The SGPR tracker itself runs linearly
-/// over layout and resets at vector/scalar memory, so both the tracked
-/// definitions behind the demand and any wait satisfying it lie after that
-/// reset; producers (the builder at push time, LLVM's hazard pass) emit the
-/// wait adjacently on the using path. A wait older than the reset cannot
-/// satisfy post-reset tracking, and anything past it is out of scope.
-fn wait_present(body: &Body, arch: Arch, index: usize, demand: &str) -> bool {
-    let matches = |inst: &Inst| {
-        inst.op.name(arch) == Some("s_wait_alu")
-            && inst.operands.iter().any(|operand| {
-                let bits = match operand {
-                    Operand::Imm(ImmField::Sopp(n) | ImmField::Sopk(n)) => *n as u16,
-                    _ => return false,
-                };
-                match demand {
-                    "depctr_sa_sdst(0)" => bits & 1 == 0,
-                    "depctr_va_vcc(0)" => bits >> 1 & 1 == 0,
-                    "depctr_va_sdst(0)" => bits >> 9 & 7 == 0,
-                    _ => false,
-                }
-            })
-    };
-    for back in (0..index).rev() {
-        let id = body.layout[back];
-        let Some(inst) = body.insts.get(id) else {
-            continue;
-        };
-        if matches(inst) {
-            return true;
-        }
-        if matches!(pipe_of(inst, arch), Pipeline::Vmem | Pipeline::Smem) {
-            return false;
-        }
-    }
-    false
-}
 
 /// One demanded-but-absent `s_wait_alu`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,7 +304,7 @@ pub fn analyze(body: &Body, arch: Arch, wave: Wave) -> Result<HazardAnalysis, Ha
     }
     let mut analysis = HazardAnalysis::default();
     match arch {
-        Arch::Gfx1201 => run_sgpr(body, arch, &mut analysis),
+        Arch::Gfx1201 => run_sgpr(body, arch, wave, &mut analysis)?,
         Arch::Gfx1100 | Arch::Gfx1151 => run_gfx11(body, arch, &mut analysis),
         _ => return Err(HazardError::Unsupported(arch, wave)),
     }
@@ -429,35 +406,106 @@ fn run_gfx11(body: &Body, arch: Arch, analysis: &mut HazardAnalysis) {
     }
 }
 
-fn run_sgpr(body: &Body, arch: Arch, analysis: &mut HazardAnalysis) {
-    let mut machine = Gfx12Sgpr::default();
-    for (pos, id) in body.layout.iter().enumerate() {
-        let Some(inst) = body.insts.get(*id) else {
-            continue;
-        };
+fn sgpr_block(body: &Body, arch: Arch, wave: Wave, block: &crate::cfg::Block,
+    machine: &mut Gfx12Sgpr, mut analysis: Option<&mut HazardAnalysis>) {
+    for &id in &body.layout[block.range.0..block.range.1] {
+        let Some(inst) = body.insts.get(id) else { continue };
         if matches!(inst.effects.control, Control::EndPgm) {
-            machine = Gfx12Sgpr::default();
+            *machine = Gfx12Sgpr::default();
             continue;
         }
-        let pipe = pipe_of(inst, arch);
-        // The builder's only call site feeds `false, false` (`lib.rs:63`):
-        // vcc tracking exists in the machine but no producer feeds it, and
-        // deriving it from implicit effects false-positives on KT48 carry
-        // chains and vcc branches (verified). Same for the test helper below.
-        for demand in machine.step(
-            pipe, &inst.effects.uses, &inst.effects.defs, false, false,
-        ) {
-            if !wait_present(body, arch, pos, demand) {
-                analysis.missing.push(MissingWait { inst: *id, wait: demand.into() });
+        if inst.op.name(arch) == Some("s_wait_alu") {
+            for operand in &inst.operands {
+                if let Operand::Imm(ImmField::Sopp(bits) | ImmField::Sopk(bits)) = operand {
+                    machine.wait(*bits as u16);
+                }
+            }
+            continue;
+        }
+        // Encoding rows use 64-bit slots for lane masks in both wave sizes.
+        // Use the kernel's metadata-selected wave width, unlike genuine
+        // 64-bit scalar data operands, which remain two registers.
+        let mask_len = match wave { Wave::Wave32 => 1, Wave::Wave64 => 2 };
+        let name = inst.op.name(arch).unwrap_or("");
+        let mut uses = smallvec::SmallVec::<[RegRef; 4]>::new();
+        let mut defs = smallvec::SmallVec::<[RegRef; 2]>::new();
+        let mask_input = name.starts_with("v_cndmask_")
+            || (name.starts_with("v_") && name.contains("_co_ci_"));
+        let mask_output = name.starts_with("v_cmp") || name.starts_with("v_div_scale_")
+            || (name.starts_with("v_") && name.contains("_co_"));
+        let use_refs = if mask_input {
+            let mask = inst.operands.last().and_then(|operand| match operand {
+                Operand::Reg(reg) => Some(*reg), _ => None,
+            });
+            uses.extend(inst.effects.uses.iter().map(|reg| {
+                let mut reg = *reg;
+                if Some(reg) == mask && reg.kind == Kind::S { reg.len = mask_len; }
+                reg
+            }));
+            uses.as_slice()
+        } else { inst.effects.uses.as_slice() };
+        let def_refs = if mask_output {
+            defs.extend(inst.effects.defs.iter().map(|reg| {
+                let mut reg = *reg;
+                if reg.kind == Kind::S { reg.len = mask_len; }
+                reg
+            }));
+            defs.as_slice()
+        } else { inst.effects.defs.as_slice() };
+        // Same explicit capability boundary as the builder: VCC is not
+        // producer-tracked here.
+        let prior = machine.clone();
+        for demand in machine.step(pipe_of(inst, arch), use_refs, def_refs, false, false) {
+            // A missing guard is not an imaginary wait. Keep unresolved
+            // writes pending so later consumers also see the real state.
+            match demand {
+                "depctr_sa_sdst(0)" => {
+                    for (a,b) in machine.salu.iter_mut().zip(prior.salu) { *a |= b; }
+                    machine.vcc_salu |= prior.vcc_salu;
+                }
+                "depctr_va_sdst(0)" => { for (a,b) in machine.valu.iter_mut().zip(prior.valu) { *a |= b; } }
+                "depctr_va_vcc(0)" => machine.vcc_valu |= prior.vcc_valu,
+                _ => unreachable!("closed SGPR demand set"),
+            }
+            if let Some(analysis) = &mut analysis {
+                analysis.missing.push(MissingWait { inst: id, wait: demand.into() });
                 analysis.obligations.push(Obligation {
-                    kind: ObligationKind::Hazard,
-                    insts: vec![*id],
+                    kind: ObligationKind::Hazard, insts: vec![id],
                     rule_id: format!("sgpr-{}", demand.replace(['(', ')'], "")),
-                    text: format!("SGPR read needs {demand} on the reaching path"),
+                    text: format!("SGPR read needs {demand} on a reaching CFG path"),
                 });
             }
         }
     }
+}
+
+fn run_sgpr(body: &Body, arch: Arch, wave: Wave, analysis: &mut HazardAnalysis) -> Result<(), HazardError> {
+    if body.layout.is_empty() { return Ok(()); }
+    if body.blocks.is_empty() { return Err(HazardError::MissingCfg); }
+    let mut inputs = vec![None; body.blocks.len()];
+    let mut outputs = inputs.clone();
+    let mut fixed = false;
+    for _ in 0..256 {
+        let mut changed = false;
+        for (index, block) in body.blocks.iter().enumerate() {
+            let mut at = (index == 0).then(Gfx12Sgpr::default);
+            for from in &block.preds {
+                if let Some(s) = &outputs[from.0] {
+                    if let Some(at) = &mut at { at.join(s); } else { at = Some(s.clone()); }
+                }
+            }
+            let next = at.clone().map(|mut s| { sgpr_block(body, arch, wave, block, &mut s, None); s });
+            changed |= next != outputs[index];
+            inputs[index] = at;
+            outputs[index] = next;
+        }
+        if !changed { fixed = true; break; }
+    }
+    if !fixed { return Err(HazardError::NoFixpoint { walks: 256 }); }
+    for (block, input) in body.blocks.iter().zip(inputs) {
+        if let Some(mut state) = input { sgpr_block(body, arch, wave, block, &mut state, Some(analysis)); }
+    }
+    Ok(())
 }
 
 /// ROCm LLVM GCNHazardRecognizer.cpp::fixWMMAHazards searches across
@@ -546,6 +594,89 @@ pub fn sgpr_demands(body: &Body, arch: Arch) -> Vec<(InstId, Vec<&'static str>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sgpr_probe(ops: &[(&str, Vec<Operand>)]) -> (Body, HazardAnalysis) {
+        use crate::{inst::FormFields, operand::Modifiers, provenance::Provenance};
+        let arch = Arch::Gfx1201;
+        let mut body = Body::default();
+        for (name, operands) in ops {
+            let row = crate::isa::table(arch).iter().find(|row| row.name == *name).expect(name);
+            let inst = Inst::from_parts(arch, row.op, row.form, FormFields::None,
+                smallvec::SmallVec::from_vec(operands.clone()), Modifiers::default(),
+                None, Provenance::default()).unwrap();
+            body.layout.push(body.insts.insert(inst));
+        }
+        crate::passes::cfg::build_blocks(&mut body, arch).unwrap();
+        let found = analyze(&body, arch, Wave::Wave32).unwrap();
+        (body, found)
+    }
+    fn sgpr_read() -> (&'static str, Vec<Operand>) {
+        ("v_add_nc_u32_e32", vec![
+            Operand::Reg(RegRef {kind:Kind::V,base:0,len:1}),
+            Operand::Reg(RegRef {kind:Kind::S,base:4,len:1}),
+            Operand::Reg(RegRef {kind:Kind::V,base:1,len:1})])
+    }
+    fn sgpr_write() -> (&'static str, Vec<Operand>) {
+        ("s_mov_b32", vec![Operand::Reg(RegRef {kind:Kind::S,base:4,len:1}),
+            Operand::Inline(crate::operand::InlineConst::Integer(1))])
+    }
+    fn sa_wait() -> (&'static str, Vec<Operand>) {
+        ("s_wait_alu", vec![Operand::Imm(ImmField::Sopp(0xff9eu16 as i16))])
+    }
+    fn branch(name: &'static str, offset: i16) -> (&'static str, Vec<Operand>) {
+        (name, vec![Operand::Imm(ImmField::Sopp(offset))])
+    }
+
+
+    #[test]
+    fn explicit_lane_mask_width_preserves_wave64_and_real_scalar_pairs() {
+        let s = |base, len| Operand::Reg(RegRef { kind: Kind::S, base, len });
+        let v = |base, len| Operand::Reg(RegRef { kind: Kind::V, base, len });
+        let one = Operand::Inline(crate::operand::InlineConst::Integer(1));
+        let (body, _) = sgpr_probe(&[
+            ("v_add_nc_u32_e32", vec![v(0,1), s(1,1), v(1,1)]),
+            ("s_mov_b32", vec![s(1,1), one.clone()]),
+            ("v_cndmask_b32_e64", vec![v(2,1), v(0,1), v(1,1), s(0,2)]),
+            ("v_lshlrev_b64_e64", vec![v(4,2), one, s(0,2)]),
+            ("s_endpgm", vec![]),
+        ]);
+        for (wave, expected) in [(Wave::Wave32, vec![body.layout[3]]),
+            (Wave::Wave64, vec![body.layout[2], body.layout[3]])] {
+            let mut found = HazardAnalysis::default();
+            run_sgpr(&body, Arch::Gfx1201, wave, &mut found).unwrap();
+            assert_eq!(found.missing.iter().map(|m| m.inst).collect::<Vec<_>>(), expected);
+        }
+    }
+    #[test]
+    fn gfx12_sgpr_loop_head_keeps_backedge_write() {
+        let (body, found) = sgpr_probe(&[sgpr_read(), sgpr_write(), branch("s_cbranch_scc1",-3), ("s_endpgm",vec![])]);
+        assert!(found.missing.iter().any(|m|m.inst == body.layout[0] && m.wait == "depctr_sa_sdst(0)"), "{found:?}");
+        let (_, guarded) = sgpr_probe(&[sa_wait(), sgpr_read(), sgpr_write(), branch("s_cbranch_scc1",-4), ("s_endpgm",vec![])]);
+        assert!(guarded.obligations.is_empty(), "{guarded:?}");
+    }
+
+    #[test]
+    fn gfx12_guard_on_one_arm_does_not_cover_the_other() {
+        let (body, found) = sgpr_probe(&[sgpr_read(), sgpr_write(), branch("s_cbranch_scc1",2),
+            sa_wait(), branch("s_branch",1), sgpr_read(), ("s_endpgm",vec![])]);
+        assert!(found.missing.iter().any(|m|m.inst == body.layout[5]), "{found:?}");
+        let (_, guarded) = sgpr_probe(&[sgpr_read(), sgpr_write(), branch("s_cbranch_scc1",2),
+            sa_wait(), branch("s_branch",2), sa_wait(), sgpr_read(), ("s_endpgm",vec![])]);
+        assert!(guarded.obligations.is_empty(), "{guarded:?}");
+    }
+
+    #[test]
+    fn gfx12_unreachable_write_does_not_infect_join() {
+        let (_, found) = sgpr_probe(&[sgpr_read(), branch("s_branch",2), sgpr_write(),
+            ("s_endpgm",vec![]), sgpr_read(), ("s_endpgm",vec![])]);
+        assert!(found.obligations.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn gfx12_guard_before_new_write_is_not_reusable() {
+        let (body, found) = sgpr_probe(&[sgpr_read(), sa_wait(), sgpr_write(), sgpr_read(), ("s_endpgm",vec![])]);
+        assert!(found.missing.iter().any(|m|m.inst == body.layout[3]), "{found:?}");
+    }
 
     /// Gfx12Sgpr tracks the builder's exact demand sequence.
     #[test]

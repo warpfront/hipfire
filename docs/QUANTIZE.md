@@ -1,9 +1,11 @@
 # Quantize
 
 `hipfire quantize` is the user-facing wrapper around the CPU-only
-`hipfire-quantize` binary. It converts HuggingFace safetensors, a local
-model directory, or a GGUF file into hipfire’s HFQM container (extensions
-`.mq4`, `.hf4`, `.mq6`, …). The daemon mmaps the result directly.
+`hipfire-quantize` binary. It converts HuggingFace safetensors or a local
+model directory into hipfire’s HFQM container (extensions `.mq4`, `.hf4`,
+`.mq6`, …). The daemon mmaps the result directly. GGUF **weight** input is
+deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. A llama.cpp
+`imatrix.gguf` (`--imatrix`) stays supported.
 
 Design / math / wire IDs: [QUANTIZATION.md](QUANTIZATION.md).
 Magnum V2 specs: [quant-formats/mq4-v2.md](quant-formats/mq4-v2.md),
@@ -107,7 +109,12 @@ Directory needs `config.json` plus one or more `.safetensors` files. The
 quantizer accepts many architectures; inference only runs if a carrier/loader
 exists for that `arch_id` (see [architecture-ids.md](architecture-ids.md)).
 
-## From GGUF
+## From GGUF (deprecated, removal in 0.5.0)
+
+**Deprecated since 0.4.0, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.**
+A GGUF weight input prints
+`warning: GGUF weight input is deprecated and will be removed in 0.5.0; … (imatrix.gguf input stays supported)`.
+Quantize from the original safetensors instead. `--imatrix <file.gguf>` is not affected.
 
 ```bash
 hipfire quantize ./tinyllama.Q4_K_M.gguf \
@@ -262,20 +269,14 @@ not a guarantee):
 
 Peak RAM is roughly `max(tensor elements) × 4` (one tensor dequantized to f32).
 
-## After quantizing: CASK sidecar
+## Deprecated: CASK sidecar (removal in 0.5.0)
 
-For long-context CASK eviction calibration:
-
-```bash
-hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
-# or via registered tag:
-hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
-```
-
-Writes `my-finetune.mq4.triattn.bin` beside the model by default. The daemon
-does not attach it by default. Set `cask_sidecar` to the exact path, or opt into
-sibling discovery with `cask_auto_attach=true`. Set `cask=true` separately only
-when core-aware m-folding is intended. See [CONFIG.md](CONFIG.md).
+CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
+not a post-quantize step and not supported. Until then,
+`hipfire sidecar-gen <model> --corpus <file>` still writes
+`<model>.triattn.bin` (with a deprecation warning); nothing
+attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
+[CONFIG.md](CONFIG.md).
 
 ## Related
 

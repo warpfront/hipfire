@@ -22,7 +22,9 @@ pub mod region;
 pub mod gdn_epilogue;
 
 pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
-use crate::{Builder, Emitted, KernelSpec, RegPlan, insn::{Instruction, MemoryClass, Sop}, reg::{Kind, Live, RegRef}};
+use crate::{Builder, Emitted, KernelSpec, RegPlan, reg::Live};
+use crate::kernels::common::op;
+use peacemaker_author::{Free, Gfx1201, Gfx12Waits, LdsWrite, Pending, Published, Ring, Wave, Workgroup, Writing};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -35,19 +37,6 @@ pub(crate) const END: &str = ".Liu4_end";
 /// Fused projection only: the QKV tiles' GDN preparation (after the stores).
 pub(crate) const GDN: &str = ".Liu4_gdn";
 
-pub(crate) fn v(n: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len: 1 } }
-pub(crate) fn vr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len } }
-pub(crate) fn s(n: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len: 1 } }
-pub(crate) fn sr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len } }
-/// Literal spelling as llvm-objdump prints it: inline integers in decimal,
-/// everything else in hex, so parse-back compares canonical text.
-pub(crate) fn lit(x: u32) -> String { if x <= 64 { x.to_string() } else if x as i32 >= -16 && (x as i32) < 0 { (x as i32).to_string() } else { format!("{x:#x}") } }
-pub(crate) fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
-}
-pub(crate) fn mem(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef], class: MemoryClass) -> Result<(), String> {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()).memory(class))
-}
 /// DS offset fields spelled as objdump prints them (zero fields omitted).
 pub(crate) fn ds_offsets(o0: u32, o1: u32) -> String {
     let mut t = String::new();
@@ -86,8 +75,6 @@ pub(crate) struct Gen {
     /// `ALayout::Slab` only: the SGPR holding `32 * N`, the byte distance
     /// from a token's slab-0 plane entry to its slab-1 entry.
     pub a_slab1: Option<u8>,
-    // LDS slot ids
-    pub slot_a: [usize; 2], pub slot_w: [usize; 2], pub slot_ds: [usize; 2], pub slot_sz: [usize; 2],
 }
 
 pub(crate) const PRO_TEMPS: u8 = 24;
@@ -126,7 +113,6 @@ impl Gen {
             goff: 46, trips: 47, rs: 48, bs: 49, wave: 50, gpr136: 51, mm1: 52, hs: 53,
             tmp: 56, epi_s: 64,
             a_slab1: (spec.act == ALayout::Slab).then_some(2),
-            slot_a: [0, 2], slot_w: [1, 3], slot_ds: [4, 5], slot_sz: [6, 7],
         }
     }
 
@@ -186,17 +172,32 @@ impl Gen {
         Ok(p)
     }
 
-    fn declare_lds(&self, b: &mut Builder) -> Result<(), String> {
+    /// Slots A0, W0, A1, W1, DS0, DS1, SZ0, SZ1 (builder ids 0..7) as four
+    /// two-buffer rings; buffer 0 of each is written first.
+    fn declare_lds(&self, wg: &mut Wg) -> Result<(Ring<PayA, Free, Free>, Ring<PayW, Free, Free>, Ring<MetaD, Free, Free>, Ring<MetaS, Free, Free>), String> {
         let l = self.layout;
-        let slots = [("A0", l.a[0], l.a_bytes), ("W0", l.w[0], l.w_bytes), ("A1", l.a[1], l.a_bytes), ("W1", l.w[1], l.w_bytes),
-            ("DS0", l.ds[0], l.ds_bytes), ("DS1", l.ds[1], l.ds_bytes), ("SZ0", l.sz[0], l.sz_bytes), ("SZ1", l.sz[1], l.sz_bytes)];
-        for (i, (name, base, len)) in slots.into_iter().enumerate() {
-            if b.lds.add(name, base, len)? != i { return Err("LDS slot order".into()) }
-        }
+        let (a0, w0) = (wg.lds("A0", l.a[0], l.a_bytes)?, wg.lds("W0", l.w[0], l.w_bytes)?);
+        let (a1, w1) = (wg.lds("A1", l.a[1], l.a_bytes)?, wg.lds("W1", l.w[1], l.w_bytes)?);
+        let (d0, d1) = (wg.lds("DS0", l.ds[0], l.ds_bytes)?, wg.lds("DS1", l.ds[1], l.ds_bytes)?);
+        let (s0, s1) = (wg.lds("SZ0", l.sz[0], l.sz_bytes)?, wg.lds("SZ1", l.sz[1], l.sz_bytes)?);
         if l.end > l.launch { return Err("LDS layout exceeds the launch size".into()) }
-        Ok(())
+        Ok((Ring::new(a0, a1), Ring::new(w0, w1), Ring::new(d0, d1), Ring::new(s0, s1)))
     }
 }
+
+/// LDS tags: activation and weight payload of one 64-K slab, the token
+/// scale (`d`) plane and the converted row-scale (`sc`) plane.
+pub enum PayA {}
+pub enum PayW {}
+pub enum MetaD {}
+pub enum MetaS {}
+pub(crate) type Wg<'b> = Workgroup<'b, Gfx1201, Builder>;
+pub(crate) type Wv<'b> = Wave<'b, Gfx1201, Builder>;
+/// Steady state at a block boundary: each ring's current buffer published,
+/// the next one free.
+pub(crate) type Lds = (Ring<PayA, Published, Free>, Ring<PayW, Published, Free>, Ring<MetaD, Published, Free>, Ring<MetaS, Published, Free>);
+/// A ring's next buffer with its pending stores.
+pub(crate) type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrite<R>>);
 
 /// Emit one kernel symbol. The result is a complete single-kernel `.s`.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
@@ -208,19 +209,22 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         workgroup_size: spec.tile.threads() as u16, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut b = Builder::new(kspec, g.plan()?);
-    g.declare_lds(&mut b)?;
+    let mut wg = Wg::new(&mut b)?;
+    let lds = g.declare_lds(&mut wg)?;
+    let end = wg.exit(END)?;
     // Every symbol runs its K-loop at wave priority 1 and drops to 0 for its
     // epilogue (`epilogue::emit`; the fused projection keeps its stores at 1
     // and drops at the QKV tiles' GDN epilogue, `gdn_epilogue`), so
     // co-resident K-loops win issue arbitration over a finishing tile.
     // Scheduling only; every result bit is unchanged.
-    op(&mut b, "s_setprio 1", &[], &[])?;
-    prologue::emit(&mut b, &g)?;
-    kloop::emit(&mut b, &g)?;
-    epilogue::emit(&mut b, &g)?;
-    if spec.epi == Epi::QkvzaGdn { gdn_epilogue::emit(&mut b, &g)?; }
-    b.label(END)?;
-    b.push(Sop::End.encode(spec.arch)?)?;
+    op(wg.isa(), "s_setprio 1", &[], &[])?;
+    let lds = prologue::emit(&mut wg, &g, &end, lds)?;
+    let lds = kloop::emit(&mut wg, &g, lds)?;
+    epilogue::emit(&mut wg, &g, &end)?;
+    // Only the fused projection reuses the LDS after the K loop: its QKV
+    // tiles continue at the GDN label the epilogue's exit branch skips to.
+    if spec.epi == Epi::QkvzaGdn { gdn_epilogue::emit(&mut wg, &g, lds)?; }
+    wg.end(end)?;
     b.finish()
 }
 

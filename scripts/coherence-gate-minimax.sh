@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — retired coherence-gate battery; historical reproduction only (docs/VALIDATION.md)
+echo "warning: coherence-gate-minimax.sh is deprecated and will be removed in 0.5.0; retired coherence-gate battery, not acceptance evidence (docs/VALIDATION.md)" >&2
 # coherence-gate-minimax.sh — MiniMax-M2 prefill coherence gate via the DAEMON
 # chat template (the real serving path), not raw greedy prompts.
 #

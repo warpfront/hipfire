@@ -149,16 +149,40 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         unsafe { std::env::set_var("HIPFIRE_ROCM_STRICT", "1") };
     }
 
+    // A tag (or a tag-named --ref) selects that release's prebuilt kernel
+    // pack; --compile-kernels keeps local compilation.
+    let pack_tag = kernel_pack_tag(&args);
+
     // --- 4a. Resolve ROCm root (no mutation) ---
-    let rocm_root =
-        resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes)?;
-    ensure_rocm_complete(&rocm_root)?;
+    // A kernel pack needs only the HIP runtime. Without a device compiler the
+    // install proceeds on a runtime-only root and fails later only if the
+    // pack turns out to be unusable.
+    let (rocm_root, has_compiler) =
+        match resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes) {
+            Ok(root) => (root, true),
+            Err(error) => match pack_tag.and_then(|_| runtime_only_root(args.rocm_root.as_deref())) {
+                Some(root) => (root, false),
+                None => return Err(error),
+            },
+        };
+    if has_compiler {
+        ensure_rocm_complete(&rocm_root)?;
+    }
     ensure_not_interrupted()?;
 
     // Print resolved provenance before any heavy work so a failing install
     // report always contains it. Uses the same toolchain resolver as
     // hipfire-rocm-resolve so output stays consistent.
-    {
+    if !has_compiler {
+        let version = hipfire_config::rocm::version_for_root(&rocm_root)
+            .unwrap_or_else(|| "unknown".to_string());
+        let runtime = hipfire_config::rocm::runtime_library(&rocm_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".to_string());
+        eprintln!("ROCm root:       {} (version {version})", rocm_root.display());
+        eprintln!("HIPCC:           none (kernels must come from the release kernel pack)");
+        eprintln!("HIP runtime:     {runtime}");
+    } else {
         let toolchain = hipfire_config::rocm::resolve_toolchain_for_explicit(
             Some(&rocm_root),
             hipcc_override,
@@ -222,6 +246,13 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
             gpu_arch.as_deref().unwrap_or("unknown")
         );
         println!("Profile:         {profile}");
+        println!(
+            "Kernels:         {}",
+            pack_tag.map_or_else(
+                || "compile locally".to_owned(),
+                |tag| format!("release pack {tag} (compile locally if unusable)")
+            )
+        );
         println!("Install prefix:  {}", bin_dir.display());
         eprint!("Continue? [Y/n] ");
         io::stderr().flush()?;
@@ -308,13 +339,60 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         err
     })?;
 
-    if let Some(arch) = gpu_arch.as_deref().filter(|arch| {
+    let pack = match (pack_tag, gpu_arch.as_deref()) {
+        (Some(tag), Some(arch)) if rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(&arch) => {
+            let base = args
+                .kernel_pack_url
+                .clone()
+                .unwrap_or_else(|| crate::kernel_pack::default_base_url(tag));
+            let rocm_version = hipfire_config::rocm::version_for_root(&rocm_root)
+                .or_else(hipfire_config::rocm::version);
+            let dest = bin_dir.join("kernels").join("compiled").join(arch);
+            match crate::kernel_pack::install(&crate::kernel_pack::PackRequest {
+                tag,
+                arch,
+                commit: &commit,
+                dest: &dest,
+                base: &base,
+                rocm_version: rocm_version.as_deref(),
+            }) {
+                Ok(manifest) => {
+                    eprintln!(
+                        "Installed kernel pack {tag} for {arch}: {} modules from `{}`, SHA-256 and every index verified against this checkout",
+                        manifest.modules, manifest.toolchain_id
+                    );
+                    Some(manifest)
+                }
+                Err(reason) => {
+                    eprintln!("Kernel pack {tag} not used: {reason}");
+                    None
+                }
+            }
+        }
+        (Some(tag), None) => {
+            eprintln!("Kernel pack {tag} not used: GPU architecture not detected (pass --gpu-arch ARCH)");
+            None
+        }
+        _ => None,
+    };
+    if pack.is_some() {
+        // Installed and verified above; nothing to compile.
+    } else if let Some(arch) = gpu_arch.as_deref().filter(|arch| {
         !rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(arch)
     }) {
         eprintln!(
             "No indexed kernel registry for {arch}; hipcc remains required for JIT on this GPU."
         );
+    } else if !has_compiler {
+        rollback_replacements(&replacements);
+        bail!(
+            "no usable kernel pack and no device compiler to build kernels locally; install ROCm's hipcc, \
+             or pass --rocm-root PATH / --hipcc PATH (HIPFIRE_HIPCC)"
+        );
     } else {
+        if pack_tag.is_some() {
+            eprintln!("Compiling kernels locally with hipcc");
+        }
         // The daemon packages the exact registry through KernelCompiler::pack_to,
         // the same indexed publisher used by hipfire-kernel-pack. Failure is
         // required: never leave an unindexed compiler-free installation behind.
@@ -389,6 +467,11 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         "hipcc": hipcc_override.map(|p| p.to_string_lossy().into_owned()),
         "strict_rocm": strict,
         "profile": profile,
+        "kernel_pack": pack.as_ref().map(|manifest| json!({
+            "tag": manifest.tag,
+            "toolchain_id": manifest.toolchain_id,
+            "rocm_range": [manifest.rocm_min, manifest.rocm_max_exclusive],
+        })),
         "installed_at": installed_at,
     });
     if let Err(err) = write_install_json(&paths.root, &record) {
@@ -674,6 +757,41 @@ fn metadata_ref(args: &crate::SetupArgs) -> String {
         .or(args.commit.as_ref())
         .cloned()
         .unwrap_or_else(|| "local".to_owned())
+}
+
+/// Release whose kernel pack to install: `--tag`, or a `--ref` that names a
+/// tag (a branch or commit simply has no pack and falls back). `None` with
+/// `--compile-kernels`.
+fn kernel_pack_tag(args: &crate::SetupArgs) -> Option<&str> {
+    if args.compile_kernels {
+        return None;
+    }
+    args.tag.as_deref().or(args.reference.as_deref())
+}
+
+/// A ROCm root with the HIP runtime but no device compiler, enough to run a
+/// prebuilt kernel pack. An explicit root is taken as given; otherwise the
+/// candidates must share one runtime library.
+fn runtime_only_root(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(root) = explicit {
+        return hipfire_config::rocm::runtime_library(root)
+            .is_some()
+            .then(|| canonicalize_or_keep(root));
+    }
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for root in hipfire_config::rocm::roots() {
+        let Some(library) = hipfire_config::rocm::runtime_library(&root) else {
+            continue;
+        };
+        let library = canonicalize_or_keep(&library);
+        if !found.iter().any(|(_, seen)| *seen == library) {
+            found.push((canonicalize_or_keep(&root), library));
+        }
+    }
+    match found.len() {
+        1 => found.pop().map(|(root, _)| root),
+        _ => None,
+    }
 }
 
 fn read_numbered_selection(count: usize, label: &str) -> Result<usize> {

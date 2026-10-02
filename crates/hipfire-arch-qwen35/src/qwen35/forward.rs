@@ -975,6 +975,41 @@ fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
     dim.max(hidden_dim).max(v_dim)
 }
 
+/// Number of F32 elements in the shared flash-attention partials buffer.
+///
+/// Legacy sizing (every arch except the measured gfx1100 split below):
+/// `batch_mult` query rows at the smallest of the Q8 decode tile, 128 and the
+/// batched-attention tile.
+///
+/// Exact gfx1100 whose Q8 decode tile is finer than the batched tile (tile32
+/// vs tile128 through 8K): single-token decode and batched attention never
+/// use the buffer at the same time, so it holds the larger of one decode row
+/// at the decode tile and `batch_mult` rows (default 32) at the batched tile.
+/// Batched launchers sub-batch by the buffer's capacity, so the smaller
+/// buffer only costs extra launches past 32 rows.
+fn qwen35_flash_partials_len(
+    arch: &str,
+    n_heads: usize,
+    head_dim: usize,
+    kv_max_seq: usize,
+    q8_decode_tile: usize,
+    batched_tile: usize,
+    configured_batch: Option<usize>,
+) -> usize {
+    let stride = 2 + head_dim;
+    if arch == "gfx1100" && q8_decode_tile < batched_tile {
+        let decode_elems = n_heads * kv_max_seq.div_ceil(q8_decode_tile) * stride;
+        let batched_elems =
+            configured_batch.unwrap_or(32) * n_heads * kv_max_seq.div_ceil(batched_tile) * stride;
+        return decode_elems.max(batched_elems);
+    }
+    // See llama.rs: also floor against the batched-attention tile, since a
+    // smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and would undersize
+    // this same buffer.
+    let tile_size = q8_decode_tile.min(128).min(batched_tile);
+    configured_batch.unwrap_or(16) * n_heads * kv_max_seq.div_ceil(tile_size) * stride
+}
+
 impl Qwen35Scratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
         // Flash partials are sized for up to 8192 ctx. Override via new_with_kv_max.
@@ -1102,6 +1137,8 @@ impl Qwen35Scratch {
             // Q8 decode experiments and the fixed tile_size=128 paths.
             // n_heads * max_tiles * (2 + head_dim) floats per batched query
             // position; total buffer = batch_mult × per-position-bytes.
+            // Exact gfx1100 through 8K sizes decode and batched rows
+            // separately; see `qwen35_flash_partials_len`.
             //
             // batch_mult is the maximum query positions a single FA dispatch
             // can fit; the dispatcher (`launch_asym_flash_batched`) reads the
@@ -1120,30 +1157,33 @@ impl Qwen35Scratch {
             // worst-case shape; CASK-on workloads (small physical_cap) are
             // unaffected because the buffer is already tiny there.
             //
+            // On the gfx1100 tile32/tile128 split the legacy formula
+            // incidentally gave 64 batched rows; 16 regressed prefill, 32
+            // keeps it and halves the buffer.
+            //
             // Override with HIPFIRE_FLASH_PARTIALS_BATCH for tuning. Power of
             // two preferred (matches FA dispatcher chunking).
             flash_partials: {
-                let tile_size = rdna_compute::attention::q8_flash_tile_size(
+                let q8_decode_tile = rdna_compute::attention::q8_flash_tile_size(
                     &gpu.arch,
                     config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
                     kv_max_seq,
-                )
-                .min(128)
-                // See llama.rs: also floor against the batched-attention tile,
-                // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
-                // would undersize this same buffer.
-                .min(gpu.attn_tile_size());
-                let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-                let batch_mult = hipfire_runtime::config::get()
+                );
+                let configured_batch = hipfire_runtime::config::get()
                     .flash_partials_batch
-                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
-                    .unwrap_or(16);
-                tracked_tensor!(gpu.alloc_tensor(
-                    &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
-                    DType::F32,
-                ))
+                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH);
+                let n = qwen35_flash_partials_len(
+                    &gpu.arch,
+                    config.n_heads,
+                    config.head_dim,
+                    kv_max_seq,
+                    q8_decode_tile,
+                    gpu.attn_tile_size(),
+                    configured_batch,
+                );
+                tracked_tensor!(gpu.alloc_tensor(&[n], DType::F32))
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -1419,6 +1459,61 @@ fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     requested && compact_offset == 0
 }
 
+/// Identity of the caller buffers the AR hipGraph bakes at capture: the
+/// model (embedding and lm_head), every KV tensor, every DeltaNet state
+/// tensor and every scratch buffer. The graph replays captured device
+/// pointers and ignores the buffers a later call passes, so a replay is valid
+/// only for the same allocations. A caller that passes a new `DeltaNetState`
+/// (or KV cache / scratch) for the next request must get a fresh capture, not
+/// a replay that reads and writes the previous request's state. Never 0 (the
+/// unbound value of `GraphState::ar_forward_binding`).
+fn ar_graph_binding(
+    weights: &Qwen35Weights,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+    s: &Qwen35Scratch,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |p: *mut std::ffi::c_void| h = (h ^ p as u64).wrapping_mul(0x100_0000_01b3);
+    mix(weights.token_embd.buf.as_ptr());
+    mix(weights.output.buf.buf.as_ptr());
+    for t in kv_cache.k_gpu.iter().chain(&kv_cache.v_gpu) {
+        mix(t.buf.as_ptr());
+    }
+    for t in dn_state
+        .s_matrices
+        .iter()
+        .chain(&dn_state.s_scales)
+        .chain(&dn_state.conv_states)
+        .chain(&dn_state.s_ef_residual)
+    {
+        mix(t.buf.as_ptr());
+    }
+    mix(s.pos_buf.as_ptr());
+    mix(s.pos_buf3.as_ptr());
+    for t in [
+        &s.x, &s.tmp, &s.dn_qkv, &s.dn_z, &s.dn_alpha, &s.dn_beta, &s.dn_conv_out, &s.dn_q,
+        &s.dn_k, &s.dn_v, &s.dn_q_raw, &s.dn_k_raw, &s.dn_attn_out, &s.dn_normed, &s.fa_q_full,
+        &s.fa_q, &s.fa_gate, &s.fa_k, &s.fa_v, &s.fa_attn_out, &s.o, &s.gate_ffn, &s.up,
+        &s.ffn_hidden, &s.ffn_out, &s.logits, &s.sample_buf, &s.repeat_buf, &s.x_rot,
+        &s.flash_partials,
+    ] {
+        mix(t.buf.as_ptr());
+    }
+    for t in [
+        &s.moe_router_logits, &s.moe_scalar_buf, &s.moe_x_rot, &s.moe_gate_up_buf,
+        &s.moe_gate_buf, &s.moe_up_buf, &s.moe_ffn_hidden, &s.moe_ffn_out, &s.moe_gate_batch,
+        &s.moe_up_batch, &s.moe_rot_batch, &s.moe_topk_indices, &s.moe_topk_weights,
+        &s.moe_down_expanded,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        mix(t.buf.as_ptr());
+    }
+    h.max(1)
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -1570,11 +1665,25 @@ pub fn forward_scratch(
     }
     // MoE models require `experimental.graph.moe` in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    let use_graph = ar_graph_test
+    let graph_would_be_used = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
         && (config.num_experts == 0 || allow_moe);
+    // A CPU-executed step (memory.offload_exec=cpu over a spilled prefix) is a
+    // host sync point — a D2H and an H2D around the multiplication — so it can
+    // neither be recorded into a hipGraph nor replayed out of one. Take the
+    // non-captured path for the model's whole lifetime instead.
+    let cpu_blocks_capture = hipfire_dispatch::cpu_offload_active(config.i_gpu_start);
+    if graph_would_be_used && cpu_blocks_capture {
+        hipfire_dispatch::log_capture_disabled_once();
+    }
+    let use_graph = graph_would_be_used && !cpu_blocks_capture;
+    let binding = if use_graph {
+        ar_graph_binding(weights, kv_cache, dn_state, scratch)
+    } else {
+        0
+    };
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -1621,12 +1730,17 @@ pub fn forward_scratch(
             }
         };
     }
-    if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
+    if use_graph
+        && gpu.graphs.ar_forward_replay_enabled
+        && gpu.graphs.graph_exec.is_some()
+        && gpu.graphs.ar_forward_binding == binding
+    {
         // ── Replay path: graph captured + kernels clean. Cheapest path: pos
         // memcpy + graph replay. The graph is position-agnostic (pos via
         // pos_buf), so replay is correct across positions and requests as long
         // as the buffers are the plain-AR continuation — which the spec markers
-        // + verify invalidation guarantee. ──
+        // + verify invalidation guarantee — and this call passes the buffers
+        // the graph was captured with (`ar_graph_binding`). ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graphs
@@ -1647,7 +1761,8 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
         // ── Capture + launch: kernels are clean but caller has not committed
-        // a replay yet (or graph_exec is None). Drop any prior captured graph,
+        // a replay yet (or graph_exec is None, or this call's buffers differ
+        // from the captured binding). Drop any prior captured graph,
         // record a fresh one, and launch it for this forward's output. After
         // the caller signals end_decode_turn(), the most recent capture is
         // promoted to the replay graph for the next decode turn. ──
@@ -1670,6 +1785,7 @@ pub fn forward_scratch(
             gpu.device_id,
             gpu.active_stream.as_ref().unwrap(),
         )?;
+        gpu.graphs.ar_forward_binding = binding;
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
         if ar_graph_trace_enabled() {
@@ -5808,6 +5924,35 @@ mod tests {
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
+    }
+
+    #[test]
+    fn flash_partials_split_sizing_is_exact_gfx1100_only() {
+        // Legacy: batch rows at min(q8 tile, 128, batched tile).
+        let legacy = |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
+
+        // gfx1100 Qwen3.8-27B at 8K (Q8 decode tile32, batched tile128): 32
+        // batched rows at tile128 dominate one tile32 decode row, half the
+        // legacy 16 x tile32 buffer (101,449,728 B).
+        let len = |arch, heads, kv, q8, batched, cfg| {
+            4 * qwen35_flash_partials_len(arch, heads, 256, kv, q8, batched, cfg)
+        };
+        assert_eq!(legacy(24, 8_192, 32), 101_449_728);
+        assert_eq!(len("gfx1100", 24, 8_192, 32, 128, None), 50_724_864);
+        // An explicit HIPFIRE_FLASH_PARTIALS_BATCH is the batched row count;
+        // one decode row at tile32 still bounds it from below.
+        assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(1)), 6_340_608);
+        assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(64)), 101_449_728);
+        // Past 8K gfx1100 decodes at tile128 too: legacy sizing.
+        assert_eq!(len("gfx1100", 24, 65_536, 128, 128, None), legacy(24, 65_536, 128));
+
+        // Every other arch keeps the legacy buffer, including the shapes whose
+        // decode tile is finer than the batched tile.
+        assert_eq!(len("gfx1201", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
+        assert_eq!(len("gfx1151", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
+        assert_eq!(len("gfx1201", 8, 8_192, 16, 128, None), legacy(8, 8_192, 16));
+        assert_eq!(len("gfx1151", 16, 2_048, 32, 128, None), legacy(16, 2_048, 32));
+        assert_eq!(len("gfx1101", 24, 8_192, 32, 128, None), legacy(24, 8_192, 32));
     }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {

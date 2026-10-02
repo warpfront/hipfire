@@ -1,0 +1,234 @@
+{
+ "schema": "railgun-admitted-programs",
+ "version": 1,
+ "admission": "crates/hipfire-runtime/src/config.rs retained_redline_default: the sealed default Redline programs, one per (route, arch)",
+ "programs": [
+  {
+   "id": "qwen35-dense-h2-gfx1201",
+   "arch": "gfx1201",
+   "route": "Qwen3.5 dense (any weight format), single GPU, plain AR, no drafter: hipfire-runtime config.rs retained_redline_default (gfx1201 && qwen3_5)",
+   "golden": {
+    "sequence_hash": "4fb1c4344ce8b35d",
+    "launches": 755,
+    "unique_kernels": 19,
+    "source": "beta 3ca372671 gfx1201 Qwen3.6-27B decode fusions (3be1cdbe9, 899 -> 755 launches/token): /home/kaden/qcal/perf/decode-1201-r2/report.md §1 (H2 27B fp8 KV)"
+   },
+   "nodes_from": {
+    "capture": "/home/kaden/qcal/railgun/m1p/out/capture/ctx512.json",
+    "sequence_hash": "4fb1c4344ce8b35d",
+    "launches": 755,
+    "matches_golden": true,
+    "note": "railgun/m1p daemon Redline capture (paced PostDispatchNop(64) tape, 74,871 dwords); module = content-keyed artifact stem {module}.{jit_cache_key}.hsaco"
+   },
+   "nodes": [
+    ["fused_rmsnorm_mq_rotate_awq_g12dec", "fused_rmsnorm_mq_rotate_awq_g12dec"],
+    ["fused_qkvza_mq4g256v2", "fused_qkvza_hfq4g256_mq4v2"],
+    ["fused_sigmoid_alpha_gate_f32", "fused_sigmoid_alpha_gate"],
+    ["conv1d_silu_split_qknorm_b256", "conv1d_silu_split_qknorm_b256"],
+    ["gated_delta_net_q8_compact3_b2", "gated_delta_net_q8_compact3_b2"],
+    ["gated_norm_mq_rotate_awq_k6144_gfx1201", "gated_norm_mq_rotate_awq_k6144_gfx1201"],
+    ["gemv_mq4g256v2_residual", "gemv_hfq4g256_residual_mq4v2"],
+    ["fused_gate_up_mq4g256v2", "fused_gate_up_hfq4g256_mq4v2"],
+    ["fused_silu_mul_mq_rotate_awq", "fused_silu_mul_mq_rotate_awq"],
+    ["fused_qkv_mq4g256v2", "fused_qkv_hfq4g256_mq4v2"],
+    ["qwen36_27b_fa_prep_gfx1201", "qwen36_27b_fa_prep_gfx1201"],
+    ["kv_cache_write_fp8_e4m3", "kv_cache_write_fp8_e4m3"],
+    ["attention_flash_fp8_e4m3_tile_gqa_gfx1201", "attention_flash_fp8_e4m3_tile_gqa_gfx1201"],
+    ["attention_flash_reduce_dsplit_gfx1201", "attention_flash_reduce_dsplit_gfx1201"],
+    ["sigmoid_mul_f32", "sigmoid_mul"],
+    ["rotate_x_mq_awq", "rotate_x_mq_awq"],
+    ["rmsnorm_f32_rowsplit", "rmsnorm_f32_rowsplit"],
+    ["mq_rotate_x", "mq_rotate_x"],
+    ["gemv_mq4g256v2_multirow_r2", "gemv_hfq4g256_multirow_default_mq4v2"]
+   ]
+  },
+  {
+   "id": "qwen36-a3b-mq4r-gfx1100",
+   "arch": "gfx1100",
+   "route": "MQ4R, single GPU: hipfire-runtime config.rs mq4r_redline_default (gfx1100); sealed fixture qwen36-a3b-mq4r-gfx1100-tg128-q8-pm4",
+   "golden": {
+    "sequence_hash": "9a15e1013970b7d7",
+    "launches": 603,
+    "unique_kernels": 22,
+    "source": "registry/redline-golden-v1.json"
+   },
+   "nodes_from": {
+    "capture": "hipx:/home/kaden/redline-results/gfx1030-guard-8dbdac414/gfx1100-parity.json",
+    "sequence_hash": "43754a60ca25f47c",
+    "launches": 604,
+    "matches_golden": false,
+    "note": "Redline parity capture; module = legacy artifact stem {module}.hsaco; pre-reseal capture: no capture of the resealed golden exists on hipx/hiptrx"
+   },
+   "nodes": [
+    ["fused_rmsnorm_mq_rotate_vecsum", "fused_rmsnorm_mq_rotate_vecsum"],
+    ["fused_qkvza_hfq4g256_k2048", "fused_qkvza_hfq4g256_k2048_gfx1100"],
+    ["fused_sigmoid_alpha_gate_f32", "fused_sigmoid_alpha_gate"],
+    ["conv1d_silu_split_qknorm_b256", "conv1d_silu_split_qknorm_b256"],
+    ["gated_delta_net_q8_compact2_b2", "gated_delta_net_q8_compact2_b2"],
+    ["gated_norm_mq_rotate_gfx1100", "gated_norm_mq_rotate_gfx1100"],
+    ["gemv_hfq4g256_residual", "gemv_hfq4g256_residual_stage_x32_gfx1100"],
+    ["moe_router_softmax_topk_k8_wave64_exact", "moe_router_softmax_topk_k8_wave64_exact"],
+    ["fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate"],
+    ["gemv_hfq4g256_residual_sigmoid_scaled_gpu", "gemv_hfq4g256_residual_sigmoid_buffer_gfx1100"],
+    ["gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc", "gemv_hfq4g256_moe_gate_up_indexed_cpol_slc"],
+    ["gemv_hfq4g256_moe_down_k8_indexed_batched_expanded", "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"],
+    ["moe_down_combine_rmsnorm_mq_rotate_vecsum", "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100"],
+    ["fused_qkv_hfq4g256", "fused_qkv_hfq4g256"],
+    ["qwen35_fa_prep_gfx1100", "qwen35_fa_prep_gfx1100"],
+    ["kv_cache_write_q8_0_pair", "kv_cache_write_q8_0_pair"],
+    ["attention_flash_q8_0_tile", "attention_flash_q8_0_tile"],
+    ["attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100", "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"],
+    ["moe_down_combine_k8_batched", "moe_down_combine_k8_batched"],
+    ["rmsnorm_f32", "rmsnorm"],
+    ["mq_rotate_x", "gemv_mq4g256"],
+    ["gemv_hfq4g256", "gemv_hfq4g256_rdna3"]
+   ]
+  },
+  {
+   "id": "qwen36-a3b-mq4r-gfx1151",
+   "arch": "gfx1151",
+   "route": "MQ4R, single GPU: hipfire-runtime config.rs mq4r_redline_default (gfx1151); sealed fixture qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4",
+   "golden": {
+    "sequence_hash": "42f566b752920679",
+    "launches": 604,
+    "unique_kernels": 23,
+    "source": "registry/redline-golden-v1.json"
+   },
+   "nodes_from": {
+    "capture": "hipx:/home/kaden/redline-results/gfx1030-guard-8dbdac414/gfx1151-parity.json",
+    "sequence_hash": "42f566b752920679",
+    "launches": 604,
+    "matches_golden": true,
+    "note": "Redline parity capture; module = legacy artifact stem {module}.hsaco"
+   },
+   "nodes": [
+    ["fused_rmsnorm_mq_rotate_vecsum", "fused_rmsnorm_mq_rotate_vecsum"],
+    ["fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151", "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"],
+    ["fused_sigmoid_alpha_gate_f32", "fused_sigmoid_alpha_gate"],
+    ["conv1d_silu_split_qknorm_b256", "conv1d_silu_split_qknorm_b256"],
+    ["gated_delta_net_q8_compact2_b2", "gated_delta_net_q8_compact2_b2"],
+    ["gated_norm_mq_rotate_gfx1151", "gated_norm_mq_rotate_gfx1151"],
+    ["gemv_hfq4g256_residual_rt_low_gfx1151", "gemv_hfq4g256_residual_rt_low_gfx1151"],
+    ["fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151", "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151"],
+    ["moe_router_softmax_topk_k8_wave64_exact", "moe_router_softmax_topk_k8_wave64_exact"],
+    ["fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate"],
+    ["gemv_hfq4g256_residual_sigmoid_scaled_gpu", "gemv_hfq4g256_residual_scaled"],
+    ["gemv_hfq4g256_moe_gate_up_k8_indexed", "gemv_hfq4g256_moe_gate_up_indexed"],
+    ["gemv_hfq4g256_moe_down_k8_indexed_batched_expanded", "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"],
+    ["moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151", "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151"],
+    ["fused_qkv_hfq4g256", "fused_qkv_hfq4g256"],
+    ["qwen35_fa_prep_gfx1151", "qwen35_fa_prep_gfx1151"],
+    ["kv_cache_write_q8_0_pair", "kv_cache_write_q8_0_pair"],
+    ["attention_flash_q8_0_tile", "attention_flash_q8_0_tile"],
+    ["attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151", "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"],
+    ["moe_down_combine_k8_batched", "moe_down_combine_k8_batched"],
+    ["rmsnorm_f32", "rmsnorm"],
+    ["mq_rotate_x", "gemv_mq4g256"],
+    ["gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151", "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"]
+   ]
+  },
+  {
+   "id": "qwen36-a3b-mq4r-gfx1201",
+   "arch": "gfx1201",
+   "route": "MQ4R, single GPU: hipfire-runtime config.rs mq4r_redline_default (gfx1201); sealed fixture qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4",
+   "golden": {
+    "sequence_hash": "c3e02aad4cf40828",
+    "launches": 693,
+    "unique_kernels": 22,
+    "source": "registry/redline-golden-v1.json"
+   },
+   "nodes_from": {
+    "capture": "hiptrx:/home/kaden/redline-results/gfx1030-guard-8dbdac414/gfx1201-parity.json",
+    "sequence_hash": "3318ffca3daf2338",
+    "launches": 733,
+    "matches_golden": false,
+    "note": "Redline parity capture; module = legacy artifact stem {module}.hsaco; pre-reseal capture: no capture of the resealed golden exists on hipx/hiptrx"
+   },
+   "nodes": [
+    ["fused_rmsnorm_mq_rotate", "fused_rmsnorm_mq_rotate"],
+    ["fused_qkvza_hfq4g256", "fused_qkvza_hfq4g256"],
+    ["fused_sigmoid_alpha_gate_f32", "fused_sigmoid_alpha_gate"],
+    ["conv1d_silu_split_qknorm_b256", "conv1d_silu_split_qknorm_b256"],
+    ["gated_delta_net_q8_compact2_b2", "gated_delta_net_q8_compact2_b2"],
+    ["gated_norm_f32", "gated_norm"],
+    ["mq_rotate_x", "gemv_mq4g256"],
+    ["gemv_hfq4g256_residual", "gemv_hfq4g256_residual"],
+    ["moe_router_softmax_topk_k8_wave64", "moe_router_softmax_topk_k8_wave64"],
+    ["fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate"],
+    ["gemv_hfq4g256_residual_sigmoid_scaled_gpu", "gemv_hfq4g256_residual_scaled"],
+    ["gemv_hfq4g256_moe_gate_up_k8_indexed", "gemv_hfq4g256_moe_gate_up_indexed"],
+    ["gemv_hfq4g256_moe_down_k8_indexed_batched_expanded", "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"],
+    ["moe_down_combine_k8_batched", "moe_down_combine_k8_batched"],
+    ["fused_qkv_hfq4g256", "fused_qkv_hfq4g256"],
+    ["deinterleave_f32", "deinterleave"],
+    ["rmsnorm_f32", "rmsnorm"],
+    ["rope_partial_halfsplit_f32", "rope_partial_halfsplit"],
+    ["kv_cache_write_q8_0", "kv_cache_write_q8_0"],
+    ["attention_flash_q8_0_tile", "attention_flash_q8_0_tile"],
+    ["attention_flash_q8_0_reduce", "attention_flash_q8_0_reduce"],
+    ["sigmoid_mul_f32", "sigmoid_mul"],
+    ["gemv_hfq4g256_multirow_r2", "gemv_hfq4g256_multirow_default"]
+   ]
+  },
+  {
+   "id": "deepseek4-mq2r-gfx1151",
+   "arch": "gfx1151",
+   "route": "DeepSeek4 MQ2R, single GPU, plain AR, no drafter: hipfire-runtime config.rs retained_redline_default (gfx1151 && deepseek4 && .mq2r)",
+   "golden": {
+    "sequence_hash": "6907000390144547465",
+    "launches": 2320,
+    "unique_kernels": 32,
+    "source": "registry/deepseek4-mq2r-gfx1151-v2.json routes.gfx1151_v2.accepted_tape"
+   },
+   "nodes_from": {
+    "capture": "registry/deepseek4-mq2r-gfx1151-v2.json routes.gfx1151_v2.accepted_tape.symbols",
+    "sequence_hash": "6907000390144547465",
+    "launches": 2320,
+    "matches_golden": true,
+    "note": "the accepted tape records symbols only; module = the rdna_compute::kernel_registry module whose DS4 launcher emits the symbol"
+   },
+   "nodes": [
+    ["compressor_add_ape_f32_buf", "compressor_add_ape_buf"],
+    ["compressor_overlap_concat_f32", "compressor_overlap_concat"],
+    ["compressor_softmax_pool_f32_buf", "compressor_softmax_pool_f32_buf"],
+    ["deepseek4_attn_swa_buf", "deepseek4_attn_swa_buf"],
+    ["deepseek4_attn_swa_topk_scoregrid_f32_buf", "deepseek4_attn_swa_topk_scoregrid_f32_buf"],
+    ["deepseek4_fused_silu_mul_clamp_mq_rotate", "deepseek4_fused_silu_mul_clamp_mq_rotate"],
+    ["deepseek4_moe_topk_bias_aware_f32", "deepseek4_moe_topk_bias_aware"],
+    ["deepseek4_silu_mul_clamp_f32", "deepseek4_silu_mul_clamp"],
+    ["deepseek4_topk_kv_gather_f32_buf", "deepseek4_topk_kv_gather_f32_buf"],
+    ["deepseek4_topk_kv_gather_identity_f32_buf", "deepseek4_topk_kv_gather_identity_f32_buf"],
+    ["fused_rmsnorm_mq_rotate_plain_nox", "fused_rmsnorm_mq_rotate_plain_nox"],
+    ["gemv_mfp4g32_e8_soa_grouped_gfx1151", "gemv_mfp4g32_e8_soa_grouped_gfx1151"],
+    ["gemv_mfp4g32_e8_soa_u4", "gemv_mfp4g32_e8_soa_u4"],
+    ["gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed", "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"],
+    ["gemv_mq2g256_lloyd_moe_gate_up_k8_indexed", "gemv_mq2g256_lloyd_moe_gate_up_indexed"],
+    ["hash_router_normalize_f32_buf", "hash_router_normalize_f32_buf"],
+    ["hc_compute_control_vec4_finalize", "hc_compute_control_vec4_finalize"],
+    ["hc_head_compute_pre", "hc_head_compute_pre"],
+    ["hc_input_map_4stream", "hc_input_map_4stream"],
+    ["hc_mix_4stream", "hc_mix_4stream"],
+    ["indexer_relu_score_f32_buf", "indexer_relu_score_f32_buf"],
+    ["indexer_top_k_buf_parallel", "indexer_top_k_buf_parallel"],
+    ["mq_rotate_x", "gemv_mq4g256"],
+    ["rmsnorm_f32", "rmsnorm"],
+    ["rmsnorm_f32_at_slot_buf", "rmsnorm_f32_at_slot_buf"],
+    ["rope_tail_interleaved_f32", "rope_tail_interleaved"],
+    ["rope_tail_yarn_interleaved_at_slot_buf_f32", "rope_tail_yarn_interleaved_at_slot_buf"],
+    ["rope_tail_yarn_interleaved_wide_f32", "rope_tail_yarn_interleaved_wide"],
+    ["sqrt_softplus_f32", "sqrt_softplus_f32"],
+    ["state_overlap_shift_f32_buf", "state_overlap_shift_f32_buf"],
+    ["state_ring_write_f32_buf", "state_ring_write_f32_buf"],
+    ["swa_ring_write_f32_buf", "swa_ring_write_f32_buf"]
+   ]
+  }
+ ],
+ "railgun_kernels": {
+  "source": "rdna_compute::kernel_registry::railgun_entries: the copy kernels railgun lowers Node::Copy / Node::CopyBatch to (crates/railgun/src/copy.rs, kernels/src/railgun_copy.hip); any railgun program with a copy node launches them",
+  "archs": ["gfx1201", "gfx1100", "gfx1151"],
+  "nodes": [
+   ["railgun_copy", "railgun_copy"],
+   ["railgun_copy_batch", "railgun_copy"]
+  ]
+ }
+}

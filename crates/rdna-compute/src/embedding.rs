@@ -224,6 +224,7 @@ impl Gpu {
         )
     }
 
+
     /// Batched F16 embedding lookup. Copies N rows of an F16 table into
     /// `output[n × dim]` (F32), reading token ids from a device buffer so the
     /// caller's chain stays GPU-resident. The F16→F32 widening is exact, so the
@@ -348,7 +349,11 @@ impl Gpu {
         {
             return Err(HipError::new(0, "embedding MQv2 shape/dtype mismatch"));
         }
-        let format = if table.dtype == DType::MQ4G256V2 { 44usize } else { 53usize };
+        let format = if table.dtype == DType::MQ4G256V2 {
+            44usize
+        } else {
+            53usize
+        };
         let groups = if format == 44 {
             dim.checked_div(256)
                 .ok_or_else(|| HipError::new(0, "qt44 embedding width is not 256-aligned"))?
@@ -407,7 +412,6 @@ impl Gpu {
             self.rotate_x_mq_128_v2(rotated, output, dim, n)
         }
     }
-
 
     /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
     /// launch, reading token ids from a device buffer. hipGraph-capture-safe:
@@ -542,4 +546,55 @@ impl Gpu {
             },
         )
     }
+
+    /// VL batched prefill: overwrite `output` rows whose `ext_index` entry is
+    /// non-negative with `ext_index[r]`-th row of the per-row matrix at
+    /// `row_ptr[r]` (null = skip). Run right after the token-embedding
+    /// lookup so image-pad rows end up carrying vision embeddings.
+    /// Graph-capture safe: pure kernel launch, all inputs from device
+    /// buffers the caller refreshes per step outside the graph.
+    pub fn embedding_scatter_ext_batched(
+        &mut self,
+        output: &GpuTensor,
+        ext_index: &GpuTensor,
+        row_ptr: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_scatter_ext_f32",
+            kernels::EMBEDDING_SCATTER_EXT_SRC,
+            "embedding_scatter_ext_f32",
+        )?;
+
+        let mut op = output.buf.as_ptr();
+        let mut ip = ext_index.buf.as_ptr();
+        let mut rp = row_ptr.buf.as_ptr();
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut op as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_scatter_ext_f32",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(op);
+                b.push_ptr(ip);
+                b.push_ptr(rp);
+                b.push_i32(d);
+                b
+            },
+        )
+    }
+
 }

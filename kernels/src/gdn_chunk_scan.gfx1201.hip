@@ -111,7 +111,22 @@ __device__ __forceinline__ gs_bfrag gs_frag_g(const unsigned short*p,unsigned st
 #else
 #define GS_G12_PIPE 0
 #endif
-#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
+// LDS-only workgroup barrier: the "local" fences keep in-flight global
+// prefetches in flight. Each wave waits for its own LDS ops before it signals:
+// s_wait_dscnt 0 on gfx12 (clang has no builtin for it, so the intrinsic is
+// bound by name; the legacy s_waitcnt is deprecated there), lgkmcnt(0) with
+// vmcnt/expcnt left open (s_waitcnt 0xFC07) on gfx11. The fence's own wait is
+// a soft wait that SIInsertWaitcnts may erase as redundant without seeing
+// loop-carried stores (llvm/llvm-project#220357), after which a read past the
+// barrier could overtake another wave's queued store (the gfx1151 VerifyAttn
+// race). The explicit wait cannot be erased.
+#if GDN_CHUNK_GFX12
+extern "C" __device__ void gs_wait_dscnt(unsigned short) __asm("llvm.amdgcn.s.wait.dscnt");
+#define GS_WAIT_LDS() gs_wait_dscnt(0)
+#else
+#define GS_WAIT_LDS() __builtin_amdgcn_s_waitcnt(0xFC07)
+#endif
+#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");GS_WAIT_LDS();__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
 
 struct __attribute__((aligned(16))) GsLds{
  unsigned short score[GS_C][GS_AP];

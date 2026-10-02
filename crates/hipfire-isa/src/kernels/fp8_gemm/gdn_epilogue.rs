@@ -20,7 +20,8 @@
 //! one head (lane = 4 channels) and 8 consecutive tokens. The conv+SiLU is
 //! the exhaustively proven lean region (`Region::conv_silu_lean`); the norms
 //! are the imported goldens.
-use super::{Builder, mem, op, s, so, sr, v, vo, vr, vload};
+use super::{Builder, vo, vload};
+use crate::kernels::common::{mem, op, s, sop, sr, v, vr};
 use super::gdn_region::{self, Binding, Half, Region};
 use crate::{insn::{Instruction, MemoryClass}, lds::Transition, ledger::Counter};
 
@@ -87,20 +88,20 @@ const OUTOFF: u8 = 101;
 const RAWOFF: u8 = 102;
 
 fn descriptor(b: &mut Builder, dst: u8, lo: u8, records: Option<&str>) -> Result<(), String> {
-    so(b, format!("s_mov_b32 s{dst}, s{lo}"), &[dst], &[lo])?;
-    so(b, format!("s_and_b32 s{}, s{}, 0xffff", dst + 1, lo + 1), &[dst + 1], &[lo + 1])?;
+    sop(b, format!("s_mov_b32 s{dst}, s{lo}"), &[dst], &[lo])?;
+    sop(b, format!("s_and_b32 s{}, s{}, 0xffff", dst + 1, lo + 1), &[dst + 1], &[lo + 1])?;
     match records {
         Some(r) => op(b, format!("s_mov_b32 s{}, {r}", dst + 2), &[s(dst + 2)], &[])?,
-        None => so(b, format!("s_mov_b32 s{}, -1", dst + 2), &[dst + 2], &[])?,
+        None => sop(b, format!("s_mov_b32 s{}, -1", dst + 2), &[dst + 2], &[])?,
     }
-    so(b, format!("s_mov_b32 s{}, 0x31004000", dst + 3), &[dst + 3], &[])
+    sop(b, format!("s_mov_b32 s{}, 0x31004000", dst + 3), &[dst + 3], &[])
 }
 /// `dst = (x + k) mod 19` for x < 19, k <= 19 (one conditional subtraction).
 fn mod19(b: &mut Builder, dst: u8, x: u8, k: u32) -> Result<(), String> {
-    if k == 0 { so(b, format!("s_mov_b32 s{dst}, s{x}"), &[dst], &[x])?; } else { so(b, format!("s_add_co_i32 s{dst}, s{x}, {k}"), &[dst], &[x])?; }
-    so(b, format!("s_sub_co_i32 s{S2}, s{dst}, {RING_ROWS}"), &[S2], &[dst])?;
-    so(b, format!("s_cmp_ge_u32 s{dst}, {RING_ROWS}"), &[], &[dst])?;
-    so(b, format!("s_cselect_b32 s{dst}, s{S2}, s{dst}"), &[dst], &[S2, dst])
+    if k == 0 { sop(b, format!("s_mov_b32 s{dst}, s{x}"), &[dst], &[x])?; } else { sop(b, format!("s_add_co_i32 s{dst}, s{x}, {k}"), &[dst], &[x])?; }
+    sop(b, format!("s_sub_co_i32 s{S2}, s{dst}, {RING_ROWS}"), &[S2], &[dst])?;
+    sop(b, format!("s_cmp_ge_u32 s{dst}, {RING_ROWS}"), &[], &[dst])?;
+    sop(b, format!("s_cselect_b32 s{dst}, s{S2}, s{dst}"), &[dst], &[S2, dst])
 }
 fn ds_store_b128(b: &mut Builder, slot: usize, addr: u8, data: u8, offset: u32) -> Result<(), String> {
     let off = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
@@ -145,7 +146,7 @@ fn norm_bind(r: &Region) -> Result<Binding, String> {
 /// Load ring row `(R + k) mod 19` of this head into window slot `slot`.
 fn load_row(b: &mut Builder, g: usize, k: u8, slot: u8) -> Result<(), String> {
     mod19(b, S0, R, u32::from(k))?;
-    so(b, format!("s_mul_i32 s{S0}, s{S0}, {ROW_BYTES:#x}"), &[S0], &[S0])?;
+    sop(b, format!("s_mul_i32 s{S0}, s{S0}, {ROW_BYTES:#x}"), &[S0], &[S0])?;
     vo(b, format!("v_add_nc_u32_e32 v{VPA}, s{S0}, v{VP}"), &[VPA], &[VP], &[S0])?;
     ds_load_b128(b, g, ROWS + 4 * slot, VPA)
 }
@@ -161,18 +162,18 @@ fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str, j: u8) -> Result<()
     load_row(b, g, 3, (j + 3) % 4)?;
     // Raw row for the completion pass: tile positions 0..2 / 125..127 and the
     // last three tokens. Others (and tokens >= N) go past num_records.
-    so(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
-    so(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
-    so(b, format!("s_cmp_ge_u32 s{T}, 0x7d"), &[], &[T])?;
-    so(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
-    so(b, format!("s_or_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
-    so(b, format!("s_add_co_i32 s{S1}, s{TG}, 3"), &[S1], &[TG])?;
-    so(b, format!("s_cmp_ge_u32 s{S1}, s31"), &[], &[S1, 31])?;
-    so(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
-    so(b, format!("s_or_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
-    so(b, format!("s_mul_i32 s{RAWOFF}, s{TG}, 0xa000"), &[RAWOFF], &[TG])?;
-    so(b, format!("s_cmp_eq_u32 s{S0}, 0"), &[], &[S0])?;
-    so(b, format!("s_cselect_b32 s{RAWOFF}, s{}, s{RAWOFF}", RAWD + 2), &[RAWOFF], &[RAWD + 2, RAWOFF])?;
+    sop(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
+    sop(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
+    sop(b, format!("s_cmp_ge_u32 s{T}, 0x7d"), &[], &[T])?;
+    sop(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
+    sop(b, format!("s_or_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
+    sop(b, format!("s_add_co_i32 s{S1}, s{TG}, 3"), &[S1], &[TG])?;
+    sop(b, format!("s_cmp_ge_u32 s{S1}, s31"), &[], &[S1, 31])?;
+    sop(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
+    sop(b, format!("s_or_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
+    sop(b, format!("s_mul_i32 s{RAWOFF}, s{TG}, 0xa000"), &[RAWOFF], &[TG])?;
+    sop(b, format!("s_cmp_eq_u32 s{S0}, 0"), &[], &[S0])?;
+    sop(b, format!("s_cselect_b32 s{RAWOFF}, s{}, s{RAWOFF}", RAWD + 2), &[RAWOFF], &[RAWD + 2, RAWOFF])?;
     // The token offset rides in VOFFSET: raw-buffer range checks cover it.
     vo(b, format!("v_add_nc_u32_e32 v{VRAWA}, s{RAWOFF}, v{VRAW}"), &[VRAWA], &[VRAW], &[RAWOFF])?;
     mem(b, format!("buffer_store_b128 {}, v{VRAWA}, s[{RAWD}:{}], null offen", vr(cur, 4), RAWD + 3),
@@ -183,9 +184,9 @@ fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str, j: u8) -> Result<()
         gdn_region::emit_interleaved(b, &re.conv, &binds)?;
     }
     // Head norm (q, k) or plain conversion (v), selected by the tile's class.
-    so(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
+    sop(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
     op(b, format!("s_cbranch_scc1 {ENTRY}_v_{tag}"), &[], &[])?;
-    so(b, format!("s_cmp_eq_u32 s{CLASS}, 1"), &[], &[CLASS])?;
+    sop(b, format!("s_cmp_eq_u32 s{CLASS}, 1"), &[], &[CLASS])?;
     op(b, format!("s_cbranch_scc1 {ENTRY}_k_{tag}"), &[], &[])?;
     gdn_region::emit_interleaved(b, &re.norm_q, &[norm_bind(&re.norm_q)?])?;
     op(b, format!("s_branch {ENTRY}_norm_{tag}"), &[], &[])?;
@@ -196,21 +197,21 @@ fn token(b: &mut Builder, g: usize, re: &Regions, tag: &str, j: u8) -> Result<()
     gdn_region::emit_interleaved(b, &re.cvt_v, &[norm_bind(&re.cvt_v)?])?;
     b.label(&format!("{ENTRY}_norm_{tag}"))?;
     // FP16 q/k/v: tile heads 0..2 of tiles after the first belong to the completion pass.
-    so(b, format!("s_mul_i32 s{OUTOFF}, s{TG}, s{TOKSTRIDE}"), &[OUTOFF], &[TG, TOKSTRIDE])?;
-    so(b, format!("s_add_co_i32 s{OUTOFF}, s{OUTOFF}, s{HEAD0}"), &[OUTOFF], &[OUTOFF, HEAD0])?;
-    so(b, "s_cmp_lg_u32 s82, 0", &[], &[82])?;
-    so(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
-    so(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
-    so(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
-    so(b, format!("s_and_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
-    so(b, format!("s_cmp_eq_u32 s{S0}, 0"), &[], &[S0])?;
-    so(b, format!("s_cselect_b32 s{OUTOFF}, s{OUTOFF}, s{}", OUTD + 2), &[OUTOFF], &[OUTOFF, OUTD + 2])?;
+    sop(b, format!("s_mul_i32 s{OUTOFF}, s{TG}, s{TOKSTRIDE}"), &[OUTOFF], &[TG, TOKSTRIDE])?;
+    sop(b, format!("s_add_co_i32 s{OUTOFF}, s{OUTOFF}, s{HEAD0}"), &[OUTOFF], &[OUTOFF, HEAD0])?;
+    sop(b, "s_cmp_lg_u32 s82, 0", &[], &[82])?;
+    sop(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
+    sop(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
+    sop(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
+    sop(b, format!("s_and_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
+    sop(b, format!("s_cmp_eq_u32 s{S0}, 0"), &[], &[S0])?;
+    sop(b, format!("s_cselect_b32 s{OUTOFF}, s{OUTOFF}, s{}", OUTD + 2), &[OUTOFF], &[OUTOFF, OUTD + 2])?;
     vo(b, format!("v_add_nc_u32_e32 v{VOUTA}, s{OUTOFF}, v{VOUT}"), &[VOUTA], &[VOUT], &[OUTOFF])?;
     mem(b, format!("buffer_store_b64 {}, v{VOUTA}, s[{OUTD}:{}], null offen", vr(PACK, 2), OUTD + 3),
         &[], &[vr(PACK, 2), v(VOUTA), sr(OUTD, 4)], MemoryClass::VmemStore)?;
     // Next token.
-    so(b, format!("s_add_co_i32 s{T}, s{T}, 1"), &[T], &[T])?;
-    so(b, format!("s_add_co_i32 s{TG}, s{TG}, 1"), &[TG], &[TG])?;
+    sop(b, format!("s_add_co_i32 s{T}, s{T}, 1"), &[T], &[T])?;
+    sop(b, format!("s_add_co_i32 s{TG}, s{TG}, 1"), &[TG], &[TG])?;
     mod19(b, R, R, 1)
 }
 
@@ -220,72 +221,72 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
     mem(b, "s_load_b256 s[32:39], s[0:1], 0x60", &[sr(KA, 4), sr(KA + 4, 4)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
     mem(b, "s_load_b128 s[40:43], s[0:1], 0x80", &[sr(KA + 8, 4)], &[sr(0, 2)], MemoryClass::SmemLoad)?;
     // Class of this row tile (M0 = 10240 = 2048 q + 2048 k + 6144 v rows).
-    so(b, "s_cmp_ge_u32 s83, 8", &[], &[83])?;
-    so(b, format!("s_cselect_b32 s{CLASS}, 1, 0"), &[CLASS], &[])?;
-    so(b, "s_cmp_ge_u32 s83, 16", &[], &[83])?;
-    so(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
-    so(b, format!("s_add_co_i32 s{CLASS}, s{CLASS}, s{S0}"), &[CLASS], &[CLASS, S0])?;
+    sop(b, "s_cmp_ge_u32 s83, 8", &[], &[83])?;
+    sop(b, format!("s_cselect_b32 s{CLASS}, 1, 0"), &[CLASS], &[])?;
+    sop(b, "s_cmp_ge_u32 s83, 16", &[], &[83])?;
+    sop(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
+    sop(b, format!("s_add_co_i32 s{CLASS}, s{CLASS}, s{S0}"), &[CLASS], &[CLASS, S0])?;
     // First head of the tile within its q/k/v tensor, as an out byte offset.
-    so(b, format!("s_lshl_b32 s{S0}, s{CLASS}, 4"), &[S0], &[CLASS])?;
-    so(b, format!("s_lshl_b32 s{HEAD0}, s83, 1"), &[HEAD0], &[83])?;
-    so(b, format!("s_sub_co_i32 s{HEAD0}, s{HEAD0}, s{S0}"), &[HEAD0], &[HEAD0, S0])?;
-    so(b, format!("s_lshl_b32 s{HEAD0}, s{HEAD0}, 8"), &[HEAD0], &[HEAD0])?;
-    so(b, format!("s_movk_i32 s{TOKSTRIDE}, 0x1000"), &[TOKSTRIDE], &[])?;
-    so(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
-    so(b, format!("s_cselect_b32 s{TOKSTRIDE}, 0x3000, s{TOKSTRIDE}"), &[TOKSTRIDE], &[TOKSTRIDE])?;
+    sop(b, format!("s_lshl_b32 s{S0}, s{CLASS}, 4"), &[S0], &[CLASS])?;
+    sop(b, format!("s_lshl_b32 s{HEAD0}, s83, 1"), &[HEAD0], &[83])?;
+    sop(b, format!("s_sub_co_i32 s{HEAD0}, s{HEAD0}, s{S0}"), &[HEAD0], &[HEAD0, S0])?;
+    sop(b, format!("s_lshl_b32 s{HEAD0}, s{HEAD0}, 8"), &[HEAD0], &[HEAD0])?;
+    sop(b, format!("s_movk_i32 s{TOKSTRIDE}, 0x1000"), &[TOKSTRIDE], &[])?;
+    sop(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
+    sop(b, format!("s_cselect_b32 s{TOKSTRIDE}, 0x3000, s{TOKSTRIDE}"), &[TOKSTRIDE], &[TOKSTRIDE])?;
     // Output base: Q, K or V.
-    so(b, format!("s_cmp_eq_u32 s{CLASS}, 0"), &[], &[CLASS])?;
+    sop(b, format!("s_cmp_eq_u32 s{CLASS}, 0"), &[], &[CLASS])?;
     op(b, format!("s_cselect_b64 s[{S1}:{S2}], s[{}:{}], s[{}:{}]", KA + 4, KA + 5, KA + 6, KA + 7), &[s(S1), s(S2)], &[sr(KA + 4, 4)])?;
-    so(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
+    sop(b, format!("s_cmp_eq_u32 s{CLASS}, 2"), &[], &[CLASS])?;
     op(b, format!("s_cselect_b64 s[{S1}:{S2}], s[{}:{}], s[{S1}:{S2}]", KA + 8, KA + 9), &[s(S1), s(S2)], &[sr(KA + 8, 2), s(S1), s(S2)])?;
     descriptor(b, OUTD, S1, None)?;
-    so(b, format!("s_mov_b32 s{CLAMP}, 0x43000000"), &[CLAMP], &[])?;
-    so(b, format!("s_mul_i32 s{}, s31, s{TOKSTRIDE}", OUTD + 2), &[OUTD + 2], &[31, TOKSTRIDE])?;
+    sop(b, format!("s_mov_b32 s{CLAMP}, 0x43000000"), &[CLAMP], &[])?;
+    sop(b, format!("s_mul_i32 s{}, s31, s{TOKSTRIDE}", OUTD + 2), &[OUTD + 2], &[31, TOKSTRIDE])?;
     descriptor(b, CWD, KA, None)?;
     descriptor(b, CSD, KA + 2, None)?;
     descriptor(b, RAWD, 18, None)?;
-    so(b, format!("s_mul_i32 s{}, s31, 0xa000", RAWD + 2), &[RAWD + 2], &[31])?;
-    so(b, format!("s_mov_b32 s{LANESEL}, 0x76543210"), &[LANESEL], &[])?;
+    sop(b, format!("s_mul_i32 s{}, s31, 0xa000", RAWD + 2), &[RAWD + 2], &[31])?;
+    sop(b, format!("s_mov_b32 s{LANESEL}, 0x76543210"), &[LANESEL], &[])?;
     // Per-lane constants.
-    so(b, format!("s_lshr_b32 s{HD}, s88, 1"), &[HD], &[88])?;
-    so(b, format!("s_and_b32 s{SUB}, s88, 1"), &[SUB], &[88])?;
+    sop(b, format!("s_lshr_b32 s{HD}, s88, 1"), &[HD], &[88])?;
+    sop(b, format!("s_and_b32 s{SUB}, s88, 1"), &[SUB], &[88])?;
     vo(b, format!("v_and_b32_e32 v{VL}, 15, v{TID}"), &[VL], &[TID], &[])?;
     vo(b, format!("v_lshrrev_b32_e32 v{VC}, 4, v{TID}"), &[VC], &[TID], &[])?;
     vo(b, format!("v_and_b32_e32 v{VC}, 1, v{VC}"), &[VC], &[VC], &[])?;
     vo(b, format!("v_lshlrev_b32_e32 v{VC}, 5, v{VC}"), &[VC], &[VC], &[])?;
-    so(b, format!("s_lshl_b32 s{S0}, s88, 8"), &[S0], &[88])?;
+    sop(b, format!("s_lshl_b32 s{S0}, s88, 8"), &[S0], &[88])?;
     vo(b, format!("v_add_nc_u32_e32 v{VC}, s{S0}, v{VC}"), &[VC], &[VC], &[S0])?;
     vo(b, format!("v_and_b32_e32 v{VP}, 31, v{TID}"), &[VP], &[TID], &[])?;
     vo(b, format!("v_lshlrev_b32_e32 v{VP}, 4, v{VP}"), &[VP], &[VP], &[])?;
-    so(b, format!("s_lshl_b32 s{S0}, s{HD}, 9"), &[S0], &[HD])?;
+    sop(b, format!("s_lshl_b32 s{S0}, s{HD}, 9"), &[S0], &[HD])?;
     vo(b, format!("v_add_nc_u32_e32 v{VP}, s{S0}, v{VP}"), &[VP], &[VP], &[S0])?;
     vo(b, format!("v_and_b32_e32 v{VOUT}, 31, v{TID}"), &[VOUT], &[TID], &[])?;
     vo(b, format!("v_lshlrev_b32_e32 v{VOUT}, 3, v{VOUT}"), &[VOUT], &[VOUT], &[])?;
-    so(b, format!("s_lshl_b32 s{S0}, s{HD}, 8"), &[S0], &[HD])?;
+    sop(b, format!("s_lshl_b32 s{S0}, s{HD}, 8"), &[S0], &[HD])?;
     vo(b, format!("v_add_nc_u32_e32 v{VOUT}, s{S0}, v{VOUT}"), &[VOUT], &[VOUT], &[S0])?;
-    so(b, format!("s_lshl_b32 s{S0}, s83, 10"), &[S0], &[83])?;
+    sop(b, format!("s_lshl_b32 s{S0}, s83, 10"), &[S0], &[83])?;
     vo(b, format!("v_add_nc_u32_e32 v{VRAW}, s{S0}, v{VP}"), &[VRAW], &[VP], &[S0])?;
     vo(b, format!("v_lshlrev_b32_e32 v{VWOFF}, 2, v{VRAW}"), &[VWOFF], &[VRAW], &[])?;
     // conv taps of this lane's four channels: w[tap][c] = conv_w[(ch + c) * 4 + tap].
     for c in 0..4u8 { for tap in 0..4u8 { vload(b, W + 4 * tap + c, 1, VWOFF, CWD, None, u32::from(c) * 16 + u32::from(tap) * 4)?; } }
     // The K-loop's last barrier retired every staging slot.
-    b.lds.relayout()?;
-    let g = b.lds.add("gdn_ring", 0, RING_BYTES)?;
-    so(b, format!("s_mov_b32 s{BLK}, 0"), &[BLK], &[])?;
-    so(b, format!("s_mov_b32 s{RB}, 3"), &[RB], &[])?;
+    b.lds_relayout()?;
+    let g = b.lds_slot("gdn_ring", 0, RING_BYTES)?;
+    sop(b, format!("s_mov_b32 s{BLK}, 0"), &[BLK], &[])?;
+    sop(b, format!("s_mov_b32 s{RB}, 3"), &[RB], &[])?;
     b.wait_all()?;
     b.loop_(&format!("{ENTRY}_block"), |b| {
-        so(b, format!("s_and_b32 s{TT}, s{BLK}, 3"), &[TT], &[BLK])?;
-        so(b, format!("s_lshr_b32 s{HALF}, s{BLK}, 2"), &[HALF], &[BLK])?;
+        sop(b, format!("s_and_b32 s{TT}, s{BLK}, 3"), &[TT], &[BLK])?;
+        sop(b, format!("s_lshr_b32 s{HALF}, s{BLK}, 2"), &[HALF], &[BLK])?;
         // W: the token half holding tokens 16b..16b+15 stores column block b % 4.
-        so(b, format!("s_cmp_lg_u32 s89, s{HALF}"), &[], &[89, HALF])?;
+        sop(b, format!("s_cmp_lg_u32 s89, s{HALF}"), &[], &[89, HALF])?;
         op(b, format!("s_cbranch_scc1 {ENTRY}_w_skip"), &[], &[])?;
         vo(b, format!("v_add_nc_u32_e32 v{VA}, s{RB}, v{VL}"), &[VA], &[VL], &[RB])?;
         vo(b, format!("v_subrev_nc_u32_e32 v{VPA}, {RING_ROWS}, v{VA}"), &[VPA], &[VA], &[])?;
         vo(b, format!("v_min_u32_e32 v{VA}, v{VA}, v{VPA}"), &[VA], &[VA, VPA], &[])?;
         vo(b, format!("v_mad_u32_u24 v{VA}, v{VA}, {ROW_BYTES:#x}, v{VC}"), &[VA], &[VA, VC], &[])?;
         for tt in 0..4u8 {
-            so(b, format!("s_cmp_eq_u32 s{TT}, {tt}"), &[], &[TT])?;
+            sop(b, format!("s_cmp_eq_u32 s{TT}, {tt}"), &[], &[TT])?;
             op(b, format!("s_cbranch_scc1 {ENTRY}_w{tt}"), &[], &[])?;
         }
         for tt in 0..4u8 {
@@ -298,11 +299,11 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
         b.label(&format!("{ENTRY}_w_done"))?;
         // Halo rows 0..2 (tokens -3..-1) before block 0: the conv ring for the
         // first tile, zeros elsewhere (those three outputs are the completion pass's).
-        so(b, format!("s_cmp_lg_u32 s{BLK}, 0"), &[], &[BLK])?;
+        sop(b, format!("s_cmp_lg_u32 s{BLK}, 0"), &[], &[BLK])?;
         op(b, format!("s_cbranch_scc1 {ENTRY}_w_skip"), &[], &[])?;
-        so(b, format!("s_cmp_lg_u32 s{SUB}, 0"), &[], &[SUB])?;
+        sop(b, format!("s_cmp_lg_u32 s{SUB}, 0"), &[], &[SUB])?;
         op(b, format!("s_cbranch_scc1 {ENTRY}_w_skip"), &[], &[])?;
-        so(b, "s_cmp_lg_u32 s82, 0", &[], &[82])?;
+        sop(b, "s_cmp_lg_u32 s82, 0", &[], &[82])?;
         op(b, format!("s_cbranch_scc1 {ENTRY}_halo_zero"), &[], &[])?;
         vo(b, format!("v_mul_u32_u24_e32 v{VPA}, 3, v{VRAW}"), &[VPA], &[VRAW], &[])?;
         for c in 0..4u8 { for k in 0..3u8 {
@@ -319,34 +320,34 @@ pub(super) fn emit(b: &mut Builder) -> Result<(), String> {
         b.label(&format!("{ENTRY}_w_skip"))?;
         b.barrier(&[Transition::Ready(g)])?;
         // P: wave rg owns head rg >> 1 and tokens 16b + 8(rg & 1) .. +7.
-        so(b, format!("s_cmp_lg_u32 s89, s{HALF}"), &[], &[89, HALF])?;
+        sop(b, format!("s_cmp_lg_u32 s89, s{HALF}"), &[], &[89, HALF])?;
         op(b, format!("s_cbranch_scc1 {ENTRY}_p_skip"), &[], &[])?;
-        so(b, format!("s_lshl_b32 s{T}, s{BLK}, 4"), &[T], &[BLK])?;
-        so(b, format!("s_lshl_b32 s{S0}, s{SUB}, 3"), &[S0], &[SUB])?;
-        so(b, format!("s_add_co_i32 s{T}, s{T}, s{S0}"), &[T], &[T, S0])?;
-        so(b, format!("s_add_co_i32 s{TG}, s82, s{T}"), &[TG], &[82, T])?;
+        sop(b, format!("s_lshl_b32 s{T}, s{BLK}, 4"), &[T], &[BLK])?;
+        sop(b, format!("s_lshl_b32 s{S0}, s{SUB}, 3"), &[S0], &[SUB])?;
+        sop(b, format!("s_add_co_i32 s{T}, s{T}, s{S0}"), &[T], &[T, S0])?;
+        sop(b, format!("s_add_co_i32 s{TG}, s82, s{T}"), &[TG], &[82, T])?;
         // Row of token t0-3 = t0 mod 19 = (RB + 16 + 8*sub) mod 19.
         mod19(b, R, RB, 16)?;
-        so(b, format!("s_add_co_i32 s{R}, s{R}, s{S0}"), &[R], &[R, S0])?;
+        sop(b, format!("s_add_co_i32 s{R}, s{R}, s{S0}"), &[R], &[R, S0])?;
         mod19(b, R, R, 0)?;
         // Window rows t0-3..t0-1 into slots 0..2; the loop body starts empty.
         for k in 0..3u8 { load_row(b, g, k, k)?; }
         b.wait(Counter::Ds, 0)?;
-        so(b, format!("s_mov_b32 s{J}, 2"), &[J], &[])?;
+        sop(b, format!("s_mov_b32 s{J}, 2"), &[J], &[])?;
         b.loop_(&format!("{ENTRY}_token"), |b| {
             for j in 0..4u8 { token(b, g, &re, &format!("l{j}"), j)?; }
             b.release_store_sources()?;
-            so(b, format!("s_add_co_i32 s{J}, s{J}, -1"), &[J], &[J])?;
-            so(b, format!("s_cmp_lg_u32 s{J}, 0"), &[], &[J])?;
+            sop(b, format!("s_add_co_i32 s{J}, s{J}, -1"), &[J], &[J])?;
+            sop(b, format!("s_cmp_lg_u32 s{J}, 0"), &[], &[J])?;
             op(b, format!("s_cbranch_scc1 {ENTRY}_token"), &[], &[])
         })?;
         b.label(&format!("{ENTRY}_p_skip"))?;
         b.barrier(&[Transition::Retire(g)])?;
         // Every block starts from an empty ledger (loop fixpoint).
         b.release_store_sources()?;
-        so(b, format!("s_add_co_i32 s{BLK}, s{BLK}, 1"), &[BLK], &[BLK])?;
+        sop(b, format!("s_add_co_i32 s{BLK}, s{BLK}, 1"), &[BLK], &[BLK])?;
         mod19(b, RB, RB, 16)?;
-        so(b, format!("s_cmp_lg_u32 s{BLK}, 8"), &[], &[BLK])?;
+        sop(b, format!("s_cmp_lg_u32 s{BLK}, 8"), &[], &[BLK])?;
         op(b, format!("s_cbranch_scc1 {ENTRY}_block"), &[], &[])
     })?;
     b.wait_all()

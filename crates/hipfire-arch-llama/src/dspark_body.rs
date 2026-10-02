@@ -311,6 +311,9 @@ fn load_drafter_layer(
         candidates: bare_name_candidates,
         read_proj: load_weight_tensor_pread,
         layer: i,
+        // DSpark drafter sidecar is always fully resident — no offload support.
+        host_local: false,
+        read_proj_host: None,
     };
     load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
         .map_err(|e| format!("qwen3_dspark layer {i}: {e:?}"))

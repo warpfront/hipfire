@@ -398,12 +398,14 @@ accepted sets differ by carrier). Concrete modes include:
 | Mode | Role (summary) |
 |---|---|
 | `q8` | Q8_0 K and V |
-| `asym2` / `asym3` / `asym4` | Lower-bit rotated/Lloyd K; V typically wider |
-| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers |
+| `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
+| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
+| `asym2` / `asym3` / `asym4` | **Legacy** Givens-rotated Lloyd K + Q8 V. On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
-**Qwen-family `auto` / unset** (arch-aware, Qwen only): targets **q8/q8** on
-every arch except exact `gfx1201`, where eligible single-GPU Qwen routes keep
-native **fp8/fp8**. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+**Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
+exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
+no adaptive, no CASK); **q8/q8** everywhere else, gfx1100 and gfx1151
+included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
 `--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
 
@@ -424,6 +426,25 @@ model. Private draft caches (DFlash/MTP) are owned separately and do not
 relabel the trunk backend. Exact quant layouts and math:
 [`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear layers (DeltaNet) use fixed
 recurrent state instead of FA KV for those layers.
+
+**VMM virtual-address lifetime:** a released `VmmArena` unmaps its segments and
+frees its physical handles, but never returns its virtual range to the driver
+(`hipMemAddressFree` is not called). The range stays reserved for the life of
+the process and is counted by `hip_bridge::retired_va_bytes()`. On ROCm 10.0 (HIP 7.15), a VA can
+keep translating to its first backing after `hipMemUnmap` + `hipMemMap` of
+another handle: kernels read stale pages even after `hipDeviceSynchronize`.
+In the 80 × 2 MiB repro that is every page on gfx1201 (R9700), 84% on gfx1100
+(7900 XTX), and none on gfx1151 (Strix Halo). The exact
+trigger is not isolated; a replay of hipfire's own release → re-reserve
+sequence got the same VA back but read no stale pages. A hint-less `hipMemAddressReserve` after a free
+returns exactly the freed range, so without retirement every unload → load in
+one daemon (model swap, serve idle eviction, `max_seq` change, failed-load
+retry) would re-map VAs the GPU had translated before. Retired VA is cheap:
+Qwen3.8-27B at `max_seq` 4096 retires 192 MiB per load (about 8 GiB at 256K).
+New reservations are refused with a restart hint once 64 TiB is retired, half
+of the 128 TiB user VA space. Growth inside a live arena only ever maps
+fresh offsets. A failed access reset in `map_next` poisons the arena instead of
+letting a retry map a new handle at the address it just unmapped.
 
 ## Observability hooks
 

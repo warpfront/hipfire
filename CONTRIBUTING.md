@@ -209,6 +209,40 @@ unreproducible — see
   usage, K-tile depth — anything a reader needs to understand the
   perf shape without inspecting `--save-temps` output.
 
+### Release cadence and PR cutoff
+
+Starting after 0.4.0, hipfire releases on a fixed, published schedule. That way contributors know exactly when a merged PR will ship and can plan around it.
+
+- **One release per week, alternating between Tuesday and Sunday.** Weeks run Sunday to Saturday, and a week never has both a Sunday and a Tuesday release. So a Tuesday release is followed by the next Sunday (5 days later), and a Sunday release by the Tuesday of the *following* week (9 days later). Each release bumps the patch version by 0.0.1:
+
+  | Version | Release date |
+  |---|---|
+  | 0.4.1 | Tuesday 2026-10-06 |
+  | 0.4.2 | Sunday 2026-10-11 |
+  | 0.4.3 | Tuesday 2026-10-20 |
+  | 0.4.4 | Sunday 2026-10-25 |
+  | 0.4.5 | Tuesday 2026-11-03 |
+  | 0.4.6 | Sunday 2026-11-08 |
+
+  The same pattern continues after that.
+- **Packaging deadline:** each release is packaged and published by **11:59 PM MST on its release day**. That's 06:59 UTC the following day; for 0.4.1, it's by 11:59 PM MST Tuesday 10/06, which is 06:59 UTC Wednesday 10/07.
+- **Features** always go into the *upcoming* release. They land on `beta`, which is packaged and released on the next release day.
+- **Bug fixes** can go into the current release and the upcoming one.
+- **Cutoff:** a PR filed before **11:59 PM MST (UTC−7) on the day before a release date** is incorporated into that release. MST is fixed year-round (no daylight saving), so the cutoff is always **06:59 UTC on release day**:
+
+  | Zone | Summer time (Europe until Oct 25, US until Nov 1, 2026) | Winter time (after that, until spring) |
+  |---|---|---|
+  | UTC | 06:59, release day | 06:59, release day |
+  | US Pacific | 11:59 PM PDT, day before | 10:59 PM PST, day before |
+  | US Mountain | 12:59 AM MDT, release day | 11:59 PM MST, day before |
+  | US Eastern | 2:59 AM EDT, release day | 1:59 AM EST, release day |
+  | Central Europe | 08:59 CEST, release day | 07:59 CET, release day |
+  | India | 12:29 IST, release day | 12:29 IST, release day |
+  | China | 14:59 CST, release day | 14:59 CST, release day |
+
+  For 0.4.1 that means before 06:59 UTC on Tuesday 2026-10-06 (11:59 PM MST, Monday 10/05).
+- **Every PR still has to pass the gates in this document.** A PR filed before the cutoff that doesn't pass rolls to the next release.
+
 ---
 
 ## Crate topology

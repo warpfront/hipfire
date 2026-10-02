@@ -73,7 +73,7 @@ fn main() {
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch,
         Qwen35Weights,
     };
-    use hipfire_arch_qwen35::slot_batch::SlotBatch;
+    use hipfire_runtime::slot_batch::SlotBatch;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
@@ -327,8 +327,11 @@ fn main() {
         let mut dn_states: Vec<DeltaNetState> = (0..n_slots)
             .map(|_| DeltaNetState::new(gpu, config).expect("candidate: DeltaNetState::new"))
             .collect();
-        let mut desc_staging =
-            SlotDescStaging::new(gpu, n_slots, max_batch).expect("candidate: SlotDescStaging::new");
+        let mut desc_staging = SlotDescStaging::new(gpu, n_slots, max_batch, 0)
+            .expect("candidate: SlotDescStaging::new");
+        // q8 tier, no rotation tables — this harness compares against the
+        // q8 sequential reference.
+        let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
         let pbs = PrefillBatchScratch::new(gpu, config, max_batch)
             .expect("candidate: PrefillBatchScratch::new");
         let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 64, CAP_TOKENS)
@@ -366,6 +369,7 @@ fn main() {
                 &k_arenas,
                 &v_arenas,
                 &mut desc_staging,
+                &kv_tier,
                 &pbs,
                 &scratch,
                 &logits_out,

@@ -114,6 +114,8 @@ KNOWN_KV_MODES = {
     "turbo4",
     "turbo3",
     "turbo2",
+    # Qwen4 (Flash-Next) QSA fp8 K/V; exact-gfx1201 sites only.
+    "fp8",
 }
 KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
 

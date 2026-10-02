@@ -1096,6 +1096,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1161,7 +1167,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hip-bridge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -1170,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-cohere2moe"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1183,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-deepseek4"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1200,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-diffusion"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "fancy-regex 0.14.0",
  "half",
@@ -1220,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-dots-ocr"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
@@ -1233,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-gemma4"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1245,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-lfm2-vl"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -1272,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
@@ -1284,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-maple"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1297,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-minimax"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1311,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-muse-glimmer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1323,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1336,11 +1342,12 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35-vl",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
@@ -1353,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1367,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen4"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1383,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-runtime",
  "rdna-compute",
@@ -1391,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "regex",
  "serde",
@@ -1400,13 +1407,14 @@ dependencies = [
 
 [[package]]
 name = "hipfire-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
  "bytes",
  "clap",
  "ctrlc",
+ "flate2",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",
@@ -1428,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-config",
  "serde_json",
@@ -1438,21 +1446,30 @@ dependencies = [
 
 [[package]]
 name = "hipfire-config"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "hipfire-cpu"
+version = "0.4.1"
+dependencies = [
+ "half",
+ "rayon",
 ]
 
 [[package]]
 name = "hipfire-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "hip-bridge",
  "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-engine",
  "hipfire-generate",
@@ -1461,6 +1478,7 @@ dependencies = [
  "hipfire-runtime",
  "libc",
  "rdna-compute",
+ "saddle-core",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -1468,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "md5",
  "regex",
@@ -1478,17 +1496,18 @@ dependencies = [
 
 [[package]]
 name = "hipfire-dispatch"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "hipfire-cpu",
  "rdna-compute",
  "smallvec",
 ]
 
 [[package]]
 name = "hipfire-dispatch-tests"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
@@ -1497,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-ds4-parent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1511,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-engine"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -1524,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-generate"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "hip-bridge",
@@ -1557,8 +1576,9 @@ dependencies = [
 
 [[package]]
 name = "hipfire-isa"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
+ "peacemaker-author",
  "peacemaker-ir",
  "peacemaker-lift",
  "radiowave",
@@ -1569,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-loader"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-cohere2moe",
@@ -1596,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-pflash"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35",
@@ -1608,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "byteorder",
  "clap",
@@ -1628,13 +1648,14 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "ureq",
 ]
 
 [[package]]
 name = "hipfire-reap"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-config",
  "hipfire-runtime",
@@ -1644,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-registry"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-config",
  "serde",
@@ -1656,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "byteorder",
  "half",
@@ -1674,6 +1695,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-engine",
@@ -1702,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-tui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1718,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-xdna"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "parking_lot",
@@ -1726,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -2425,8 +2447,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "peacemaker-author"
+version = "0.4.1"
+dependencies = [
+ "trybuild",
+]
+
+[[package]]
 name = "peacemaker-ir"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "insta",
  "petgraph",
@@ -2438,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "peacemaker-lift"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "insta",
  "object",
@@ -2707,12 +2736,65 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radiowave"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun"
+version = "0.4.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "railgun-corpus",
+ "rdna-compute",
+ "redline-rocr",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun-cert"
+version = "0.4.1"
+dependencies = [
+ "peacemaker-ir",
+ "peacemaker-lift",
+ "radiowave",
+ "railgun-corpus",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun-corpus"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "railgun-jitcorpus"
+version = "0.4.1"
+dependencies = [
+ "hipfire-config",
+ "railgun-cert",
+ "railgun-corpus",
+ "rdna-compute",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2900,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
@@ -2922,7 +3004,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redline"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "libloading",
@@ -2930,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "redline-dispatch"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -2942,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "redline-rocr"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hipfire-config",
  "libloading",
@@ -3099,15 +3181,16 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saddle-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
+ "serde_json",
 ]
 
 [[package]]
 name = "saddle-lab"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -3129,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "saddle-quant"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "memmap2",
@@ -3438,6 +3521,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-tuple"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "876fef147edbcbddc8ac5cbbba92c7b86519e314e86638596c09673b2ed01e7f"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3448,6 +3537,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
 ]
 
 [[package]]
@@ -3644,10 +3742,25 @@ dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime",
+ "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c96ecdfa941c8fc4fcaed14f99ada8ebed502eef533015095a07e3301d4c3c"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -3655,6 +3768,15 @@ name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
 ]
@@ -3746,6 +3868,21 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "trybuild"
+version = "1.0.121"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0cabaa10be1917331a313866bd94526343e03c77bcf69144b62b072ad35d47c"
+dependencies = [
+ "glob",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "target-tuple",
+ "termcolor",
+ "toml 1.1.3+spec-1.1.0",
 ]
 
 [[package]]

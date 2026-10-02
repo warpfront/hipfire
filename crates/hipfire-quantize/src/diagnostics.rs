@@ -3,36 +3,14 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
-
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 use crate::calibration::awq_eligible;
 use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
-use crate::e8;
-use crate::e8_gptq;
-use crate::gguf_input;
 use crate::hfq::*;
 use crate::quant_e8::*;
 use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
-use crate::quant_hfp4::*;
 use crate::quant_mq::*;
-use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
+use hipfire_quantize::float16::f16_to_f32;
 
 mod gptq_damping_probe {
     //! Offline GPTQ-Lloyd damping sweep. Runs the GPTQ-Lloyd quant pipeline
@@ -47,7 +25,7 @@ mod gptq_damping_probe {
     //!   cargo test -p hipfire-quantize gptq_damping_probe -- --nocapture
     use super::*;
     use crate::quant_fwht::gen_fwht_signs;
-    use crate::quant_fwht::quantize_mq4g256;
+    
     use crate::quant_mq::quantize_mq2g256_lloyd;
 
     /// Deterministic Box-Muller-from-LCG Gaussian sampler — no external dep.
@@ -1465,7 +1443,6 @@ mod hfq_block_diag {
     pub(crate) struct TensorInfo {
         name: String,
         quant_type: u8,
-        shape: Vec<u32>,
         data_offset: usize,
         data_size: usize,
     }
@@ -1586,11 +1563,8 @@ mod hfq_block_diag {
             pos += 1;
             let n_dims = mmap[pos] as usize;
             pos += 1;
-            let mut shape = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
-                pos += 4;
-            }
+            // Skip the u32 shape dims.
+            pos += 4 * n_dims;
             // Skip group_size u32.
             pos += 4;
             let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
@@ -1598,7 +1572,6 @@ mod hfq_block_diag {
             tensors.push(TensorInfo {
                 name,
                 quant_type,
-                shape,
                 data_offset: cum,
                 data_size,
             });

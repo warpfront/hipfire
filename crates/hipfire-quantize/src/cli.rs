@@ -3,38 +3,19 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
+use std::path::PathBuf;
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::e8;
-use crate::e8_gptq;
-use crate::gguf_input;
-use crate::reap_overlay;
 use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
+    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file. For
+    /// Hugging Face model directory or model ID. A GGUF weight file is
+    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. For
     /// `--qwen4-flash-next`, use a local directory/file or the immutable
     /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
     /// `main`, tags, and short revisions are rejected. Not used by
@@ -44,6 +25,7 @@ pub(crate) struct QuantizeArgs {
         value_name = "PATH_OR_MODEL_ID",
         required_unless_present = "flux_pipe"
     )]
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (GGUF weight input only; imatrix.gguf stays)
     pub input: Option<String>,
 
     /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
@@ -76,20 +58,15 @@ pub(crate) struct QuantizeArgs {
     /// ENTIRETY every decoded token — 622 MB of BF16 at 205 GB/s, 90% of this
     /// box's achievable DRAM bandwidth and 36% of the decode token. It is the
     /// only bandwidth-bound part of the model, so this carrier is a decode-speed
-    /// decision, not a fidelity one. `bf16` (default) preserves existing
-    /// behaviour; `q8` is 331 MB, `mq4` is 195 MB.
+    /// decision, not a fidelity one.
     ///
-    /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
-    /// per token — a RAM question, not a bandwidth one), the ternary expert
-    /// path, or the router.
-    /// Default is q8, not bf16. Measured on gfx1151 against a bf16 reference
+    /// Default is `q8` (331 MB). Measured on gfx1151 against a bf16 reference
     /// (2048 teacher-forced tokens): q8 and bf16 heads give the IDENTICAL mean
     /// KL of 0.0511, but q8 decodes 23% faster (144.6 vs 117.6 tok/s). A bf16
     /// head is therefore strictly dominated -- it costs throughput and buys
-    /// exactly zero accuracy. mq4 (qt=30 Lloyd, 5.0 bpw) is +10.4% decode over
-    /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
-    /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
-    /// the same swap buys 49% rather than 10%.
+    /// exactly zero accuracy. mq4v2 (qt=44, 4.25 bpw, FWHT-rotated) is +10.4%
+    /// decode over q8 but +51% mean KL and -2.7pp top-1, which is a poor trade
+    /// on this stack.
     ///
     /// `mq4` (qt=30) is DEPRECATED and no longer selectable: mq4v2 (qt=44)
     /// beats it on every axis -- lower KL (0.0744 vs 0.0772), faster (165.8 vs
@@ -134,18 +111,6 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "COMPONENT", default_value = "all")]
     pub flux_component: String,
 
-    /// Reuse the source checkpoint's AWQ sidecars as an imatrix for the
-    /// low-bit packers' column weighting. Value is the alpha the source was
-    /// AWQ-built with (see `awq_col_weights`); defaults to the CLI's own
-    /// --awq default. Off entirely when the flag is absent.
-    #[arg(long, value_name = "ALPHA", num_args = 0..=1, default_missing_value = "0.55")]
-    pub awq_imatrix: Option<f32>,
-
-    /// Requantize an ordinary checkpoint down to ternary/binary anyway.
-    /// See `lowbit_ptq_gate` — this is a measured collapse regime.
-    #[arg(long, env = "HIPFIRE_ALLOW_LOWBIT_PTQ")]
-    pub allow_lowbit_ptq: bool,
-
     /// Upstream URL recorded in the output's `hipfire_provenance`.
     #[arg(long, value_name = "URL")]
     pub source_url: Option<String>,
@@ -153,11 +118,6 @@ pub(crate) struct QuantizeArgs {
     /// SPDX license recorded in the output's `hipfire_provenance`.
     #[arg(long, value_name = "SPDX")]
     pub license: Option<String>,
-
-    /// Write a ternary model even if the pack-health check says it is
-    /// degenerate (see `check_ternary_pack_health`). Research escape hatch.
-    #[arg(long, env = "HIPFIRE_ALLOW_DEGENERATE_TERNARY")]
-    pub allow_degenerate_ternary: bool,
 
     /// Emit only tensors selected by a REAP plan.
     #[arg(long, value_name = "PLAN_DIR", conflicts_with = "reap_bake")]
@@ -285,8 +245,9 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub kmap_dense: bool,
 
-    /// K-map policy: full, alternating/alt, or typed.
-    #[arg(long, default_value = "alternating", value_name = "MODE")]
+    /// K-map policy: full, alternating/alt, typed, or typed-gemma4 (0-3).
+    #[arg(long, default_value = "alternating", value_name = "MODE",
+          value_parser = ["full", "alternating", "alt", "typed", "typed-gemma4", "0", "1", "2", "3"])]
     pub kmap_mode: String,
 
     /// Permit research-only uniform MQ2 output.
@@ -348,5 +309,177 @@ pub(crate) fn guard_qwen3_arch_override(auto_arch_id: u32, arch_id: u32, force_a
              and the qwen35-crate dispatch. Pass --force-arch-id to override anyway."
         );
         std::process::exit(1);
+    }
+}
+
+/// The mutually exclusive paths `run()` dispatches to. Each reads a different
+/// subset of the CLI; a flag set for a path that never reads it is an error
+/// rather than a silent no-op (see [`reject_unreachable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// `--flux-pipe` component packing.
+    Flux,
+    /// `--qwen4-flash-next` streaming artifact.
+    Qwen4,
+    /// `--mq{4,3,2}v2-final-codes` import into an existing HFQ.
+    FinalCodes,
+    /// `--format maple|ds4-dense-e8soa-overlay|ds4-dspark-e8soa|qwen3-dspark-q8`.
+    EarlySpecial,
+    /// Deprecated GGUF weight input.
+    Gguf,
+    /// `--reap-overlay` selective re-quant.
+    ReapOverlay,
+    /// The safetensors quantize pipeline (including `--reap-bake`).
+    Main,
+}
+
+use Route::*;
+
+const EVERY: &[Route] = &[Flux, Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
+
+/// Clap argument id → the routes that read it. Every argument of
+/// [`QuantizeArgs`] must appear (enforced by a test).
+pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
+    ("input", &[Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
+    ("output", EVERY),
+    ("threads", EVERY),
+    ("qwen4_flash_next", &[Qwen4]),
+    ("qwen4_component_mode", &[Qwen4]),
+    ("format", &[EarlySpecial, Gguf, Main]),
+    ("head_quant", &[EarlySpecial]),
+    ("head_only", &[EarlySpecial]),
+    ("arch_id", &[Gguf, ReapOverlay, Main]),
+    ("force_arch_id", &[Gguf, ReapOverlay, Main]),
+    ("flux_pipe", &[Flux]),
+    ("flux_component", &[Flux]),
+    ("source_url", &[ReapOverlay, Main]),
+    ("license", &[ReapOverlay, Main]),
+    ("reap_overlay", &[ReapOverlay]),
+    ("reap_bake", &[Main]),
+    ("reap_out", &[ReapOverlay, Main]),
+    ("reap_arch", &[ReapOverlay, Main]),
+    // Qwen4 reads these once the symmetric requant lands on that path.
+    ("imatrix", &[Qwen4, Main]),
+    ("awq_alpha", &[Qwen4, Main]),
+    ("mq4v2_symmetric", &[Qwen4, Main]),
+    ("hessian_dir", &[Main]),
+    ("tier_ratio", &[Main]),
+    ("q8_router", &[Main]),
+    ("no_q8_conv1d", &[Main]),
+    ("no_q8_router", &[Main]),
+    ("no_kmap", &[Gguf, Main]),
+    ("uniform", &[Gguf, Main]),
+    ("awq", &[Main]),
+    ("awq_fix_la_head_order", &[Main]),
+    ("awq_a4_aware", &[Main]),
+    ("awq_a4_route_c2", &[Main]),
+    ("awq_a4_signed_capture", &[Main]),
+    ("awq_a4_source_sha", &[Main]),
+    ("mq3v2_symmetric", &[Main]),
+    ("mq2v2_symmetric", &[Main]),
+    ("mq4v2_final_codes", &[FinalCodes]),
+    ("mq3v2_final_codes", &[FinalCodes]),
+    ("mq2v2_final_codes", &[FinalCodes]),
+    ("kmap_dense", &[Gguf, Main]),
+    ("kmap_mode", &[Gguf, Main]),
+    ("allow_mq2", &[Gguf, Main]),
+    ("allow_mq2_lloyd", &[Gguf, Main]),
+    ("allow_mq3_lloyd", &[Gguf, Main]),
+    ("allow_mq4_lloyd", &[Gguf, Main]),
+    ("include_vision", &[Main]),
+    ("vision_quant", &[Main]),
+    ("include_prefix", &[Main]),
+    ("vision_only", &[Main]),
+    ("tier", &[Gguf, Main]),
+    ("fixed_tier", &[Gguf, Main]),
+];
+
+fn route_label(route: Route) -> &'static str {
+    match route {
+        Flux => "--flux-pipe",
+        Qwen4 => "--qwen4-flash-next",
+        FinalCodes => "--mq*v2-final-codes",
+        EarlySpecial => "this --format",
+        Gguf => "GGUF weight input",
+        ReapOverlay => "--reap-overlay",
+        Main => "the safetensors quantize path",
+    }
+}
+
+/// Err for the first flag given on the command line (clap defaults and
+/// environment values do not count) that `route` never reads.
+pub(crate) fn reject_unreachable(matches: &clap::ArgMatches, route: Route) -> Result<(), String> {
+    for (id, routes) in FLAG_ROUTES {
+        if routes.contains(&route) {
+            continue;
+        }
+        if matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine) {
+            return Err(format!(
+                "--{} has no effect with {}; remove it",
+                id.replace('_', "-"),
+                route_label(route)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn matches(argv: &[&str]) -> clap::ArgMatches {
+        QuantizeArgs::command()
+            .try_get_matches_from(std::iter::once("hipfire-quantize").chain(argv.iter().copied()))
+            .unwrap()
+    }
+
+    #[test]
+    fn every_cli_flag_has_a_route() {
+        for arg in QuantizeArgs::command().get_arguments() {
+            let id = arg.get_id().as_str();
+            if id == "help" || id == "version" {
+                continue;
+            }
+            assert!(
+                FLAG_ROUTES.iter().any(|(k, _)| *k == id),
+                "--{id} has no FLAG_ROUTES entry; declare which routes read it"
+            );
+        }
+        for (id, _) in FLAG_ROUTES {
+            assert!(
+                QuantizeArgs::command().get_arguments().any(|a| a.get_id() == *id),
+                "FLAG_ROUTES names unknown argument {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_route_rejects_a_flag_it_never_reads() {
+        let cases: &[(Route, &[&str], &str)] = &[
+            (Flux, &["--flux-pipe", "p", "--output", "o", "--format", "mq4"], "--format"),
+            (Qwen4, &["--qwen4-flash-next", "--input", "i", "--output", "o", "--tier", "xt"], "--tier"),
+            (FinalCodes, &["--mq4v2-final-codes", "r", "--input", "i", "--output", "o", "--awq"], "--awq"),
+            (EarlySpecial, &["--format", "maple", "--input", "i", "--output", "o", "--mq4v2-symmetric"], "--mq4v2-symmetric"),
+            (Gguf, &["--input", "m.gguf", "--output", "o", "--imatrix", "x"], "--imatrix"),
+            (ReapOverlay, &["--reap-overlay", "p", "--input", "i", "--output", "o", "--format", "mq4"], "--format"),
+            (Main, &["--input", "i", "--output", "o", "--head-only"], "--head-only"),
+        ];
+        for (route, argv, flag) in cases {
+            let err = reject_unreachable(&matches(argv), *route).unwrap_err();
+            assert!(err.starts_with(&format!("{flag} has no effect")), "{route:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn defaults_and_readable_flags_pass() {
+        // `--format` has a default and `--kmap-mode` too: unset ⇒ not rejected.
+        reject_unreachable(&matches(&["--flux-pipe", "p", "--output", "o"]), Flux).unwrap();
+        reject_unreachable(
+            &matches(&["--input", "i", "--output", "o", "--format", "mq4", "--awq", "--imatrix", "x"]),
+            Main,
+        )
+        .unwrap();
     }
 }

@@ -426,6 +426,7 @@ impl DeepseekV4Config {
                 .get("hipfire_quant_recipe")
                 .and_then(|value| value.as_str())
                 .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
         let mq2r = mq2rxt
             || hfq
                 .path()

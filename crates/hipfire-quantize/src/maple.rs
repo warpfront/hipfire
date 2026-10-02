@@ -46,11 +46,13 @@ pub(crate) enum MapleTensorPolicy {
 /// let a RAM decision silently change output quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum MapleHeadQuant {
-    /// Carry the head verbatim as BF16 (qt=16). The default: existing behaviour.
-    #[default]
+    /// Carry the head verbatim as BF16 (qt=16). NOT the default: q8 measures
+    /// identical mean KL and ~23% faster decode, but stays selectable for
+    /// reproducing pre-e8fd55750 artifacts.
     Bf16,
     /// Q8_0 / Q8F16 (qt=3), 34 B per 32 weights = 1.0625 bpw. 331 MB.
-    /// NOT FWHT-rotated — `dtype_rotation_plan(Q8_0) == None`.
+    /// NOT FWHT-rotated — `dtype_rotation_plan(Q8_0) == None`. The default.
+    #[default]
     Q8,
     /// MQ4-G256-Lloyd (qt=30), 160 B per 256 weights = 5.0 bpw. 195 MB.
     /// **FWHT-rotated**: the weights are encoded against FWHT-256-rotated
@@ -113,10 +115,7 @@ impl MapleHeadQuant {
 /// Per-row ternary summary, for provenance and for the convert log.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TernaryRowStats {
-    pub rows: usize,
     pub nonzero_frac: f64,
-    pub scale_min: f32,
-    pub scale_max: f32,
 }
 
 /// Route a Maple tensor by name.
@@ -235,8 +234,6 @@ pub(crate) fn classify_ternary_rows(data: &[f32], k: usize) -> Result<TernaryRow
     }
     let rows = data.len() / k;
     let mut nonzero = 0usize;
-    let mut scale_min = f32::INFINITY;
-    let mut scale_max = 0.0f32;
 
     for r in 0..rows {
         let row = &data[r * k..(r + 1) * k];
@@ -262,21 +259,9 @@ pub(crate) fn classify_ternary_rows(data: &[f32], k: usize) -> Result<TernaryRow
                 }
             }
         }
-        if let Some(s) = scale {
-            scale_min = scale_min.min(s);
-            scale_max = scale_max.max(s);
-        }
-    }
-    if !scale_min.is_finite() {
-        // Every row was all-zero. Legal (a fully pruned tensor) but worth
-        // reporting as 0 rather than INFINITY.
-        scale_min = 0.0;
     }
     Ok(TernaryRowStats {
-        rows,
         nonzero_frac: nonzero as f64 / data.len() as f64,
-        scale_min,
-        scale_max,
     })
 }
 
@@ -323,9 +308,6 @@ mod tests {
         let mut data = ternary_row(k, 0.0125, 0);
         data.extend(ternary_row(k, 0.0625, 1));
         let st = classify_ternary_rows(&data, k).unwrap();
-        assert_eq!(st.rows, 2);
-        assert_eq!(st.scale_min, 0.0125);
-        assert_eq!(st.scale_max, 0.0625);
         assert!(st.nonzero_frac > 0.6 && st.nonzero_frac < 0.7);
     }
 
@@ -361,7 +343,6 @@ mod tests {
         let data = vec![0.0f32; k];
         let st = classify_ternary_rows(&data, k).unwrap();
         assert_eq!(st.nonzero_frac, 0.0);
-        assert_eq!(st.scale_min, 0.0);
     }
 
     #[test]

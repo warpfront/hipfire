@@ -546,6 +546,7 @@ pub(crate) fn lloyd_max_fit_e4m3(
     (levels, mse_hist)
 }
 
+#[cfg(test)]
 /// True iff every level equals some value in S (within 1e-12).
 pub(crate) fn levels_in_e4m3_r(levels: &[f32; 16]) -> bool {
     let r = lloyd_e4m3_representable_r();

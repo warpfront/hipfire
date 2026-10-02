@@ -446,8 +446,11 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         // The register-use audit covers every builder symbol that reuses
         // registers across phases: F2 and the fused A4 GDN projection.
         let gdn_iu4=contract.symbol.contains("_iu4_qkvzagdn_");
-        let gfx11=matches!(arch,"gfx1100"|"gfx1151");
-        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || gfx11 {
+        // gfx11 builder kernels and the gfx1201 Qwen4 MoE family carry M7's
+        // lift identity and analyses (M7's gfx1201 tables).
+        let m7_cert=matches!(arch,"gfx1100"|"gfx1151")
+            || arch=="gfx1201" && contract.symbol.starts_with("qwen4_moe_");
+        if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || m7_cert {
             let mut highest_v=0u32;
             let mut highest_s=0u32;
             let mut in_symbol=false;
@@ -496,10 +499,10 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
             shape.launch_dynamic_lds_bytes=Some(dynamic);
             shape.max_lds_access_end=Some(max_end);
         }
-        if gfx11 {
-            // Every gfx11 builder kernel: an all-lane LDS bound over the launch
-            // allocation, then M7's lift/emit identity and analyses.
-            let dynamic=contract.launch_dynamic_lds_bytes.ok_or("gfx11 contract missing launch dynamic LDS bytes")?;
+        if m7_cert {
+            // An all-lane LDS bound over the launch allocation, then M7's
+            // lift/emit identity and analyses.
+            let dynamic=contract.launch_dynamic_lds_bytes.ok_or("M7-certified contract missing launch dynamic LDS bytes")?;
             let source_text=fs::read_to_string(source).map_err(|e|e.to_string())?;
             let waves=workgroup_size(&source_text,&contract.symbol)?.div_ceil(32);
             let max_end=crate::pm_check::lds_bounds(&source_text,&contract.symbol,waves,kd.group_segment_size+dynamic)?;

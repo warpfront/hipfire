@@ -20,7 +20,7 @@ use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
 use rdna_compute::{Gpu, GpuTensor};
 use smallvec::SmallVec;
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
 
 const INLINE_STEP_CAPACITY: usize = 32;
@@ -133,6 +133,13 @@ pub(super) struct MoeStepState<'a> {
     route_stamp: Cell<Option<RouteStamp>>,
     shared_gate: Option<GpuTensor>,
     shared_up: Option<GpuTensor>,
+    /// H8a: the routed target's zero fill was absorbed; the qt44 combine
+    /// writes it from +0.0 and clears this.
+    initial_zero: Cell<bool>,
+    /// H4 level 3: the paired HC write the shared down may carry (taken by the
+    /// stage), and whether it did.
+    hc_write: RefCell<Option<super::qt44_qt53_prefill::HcSharedDown>>,
+    hc_folded: Cell<bool>,
 }
 
 impl<'a> MoeStepState<'a> {
@@ -185,6 +192,9 @@ impl<'a> MoeStepState<'a> {
             route_stamp: Cell::new(route_stamp),
             shared_gate,
             shared_up,
+            initial_zero: Cell::new(false),
+            hc_write: RefCell::new(None),
+            hc_folded: Cell::new(false),
         }
     }
 
@@ -222,6 +232,34 @@ impl<'a> MoeStepState<'a> {
             }
         };
         Ok((params, selection))
+    }
+
+    /// Whether the qt44 combine of this call can take over `clear`'s zero
+    /// fill (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201):
+    /// the combine writes every element `clear` zeroes, into that very
+    /// tensor, nothing else writes it before the combine, and nothing is
+    /// recorded or captured (a retained tape keeps the clear's shape).
+    fn absorbs_clear(&self, gpu: &Gpu, clear: &super::layer_ops::ClearOp<'_>) -> bool {
+        if !gpu.flags.qwen4_moe_combine_zinit_enabled()
+            || gpu.replay.is_recording()
+            || gpu.replay.retained_body_active()
+            || gpu.graphs.capture_mode
+        {
+            return false;
+        }
+        let Ok((params, selection)) = self.prefill_parts() else {
+            return false;
+        };
+        let target = params.routed_out.unwrap_or(params.x_batch);
+        selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+            && matches!(params.prelude.normalization, MoeNormalization::Provided)
+            && super::qt44_qt53_prefill::combine_initial_zero_applies(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+            )
+            && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
+            && Some(clear.elements) == params.batch_size.checked_mul(params.down_m)
     }
 
     fn shared_views(&self) -> Result<(&GpuTensor, &GpuTensor), DispatchError> {
@@ -410,7 +448,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::input_basis(
                 gpu,
                 params,
@@ -498,7 +536,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
-                if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+                if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
                     return super::qt44_qt53_prefill::router_projection(gpu, params);
                 }
                 let prelude = &params.prelude;
@@ -691,7 +729,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::shared_gate_up(gpu, params);
         }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
@@ -717,7 +755,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::shared_activation(
                 gpu,
                 params,
@@ -747,7 +785,15 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+            // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
+            // shared down's GEMM epilogue when this call admits it.
+            if let Some(hc) = self.state.hc_write.take() {
+                if super::qt44_qt53_prefill::shared_down_hc(gpu, params, &hc)? {
+                    self.state.hc_folded.set(true);
+                    return Ok(());
+                }
+            }
             return super::qt44_qt53_prefill::shared_down(gpu, params);
         }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
@@ -761,7 +807,7 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
@@ -784,7 +830,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::gate_up(
                 gpu,
                 params,
@@ -808,7 +854,7 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: unscatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
@@ -825,7 +871,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::activation(
                 gpu,
                 params,
@@ -856,7 +902,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
@@ -897,12 +943,13 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             return super::qt44_qt53_prefill::combine(
                 gpu,
                 params,
                 selection.resolution.use_path2,
                 selection.path2_m_total,
+                self.state.initial_zero.take(),
             );
         }
         let canonical_slot_order = matches!(
@@ -1013,7 +1060,7 @@ fn lower_decode<'a>(
         let combine_after_down = params.ep_mode
             != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
-            && (matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped))
+            && (selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
                 || !down_self_combines)
             && !params.defer_routed_combine;
         if combine_after_down {
@@ -1038,7 +1085,7 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
-    if matches!(selection.route, Some(MoeRouteCapability::Qt44Qt53Grouped)) {
+    if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
             &mut steps,
@@ -1149,6 +1196,48 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+}
+
+/// [`execute`] for a call preceded by `Step::Clear(clear)` and, optionally,
+/// followed by the HC write `hc` whose gates are ready.
+///
+/// H8a (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): when the qt44 combine can start
+/// from +0.0 into exactly the cleared target, the zero fill is not launched;
+/// otherwise it runs here, first, exactly as the separate step would have.
+/// The decision is made once from the same predicate the combine stage
+/// re-checks, and the call fails loudly if an absorbed fill was not consumed
+/// by the combine (the target would otherwise be left uncleared).
+///
+/// H4 level 3 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): `hc` is offered to the shared
+/// down stage, which folds it into its GEMM epilogue when it fits.  Returns
+/// whether it did; the caller then skips the write.  When the stage declines
+/// (or never runs), nothing was launched for it and the write runs unfused.
+pub(super) fn execute_after_clear(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+    clear: &super::layer_ops::ClearOp<'_>,
+    hc: Option<&super::layer_ops::HyperWriteOp<'_>>,
+) -> Result<bool, DispatchError> {
+    let state = MoeStepState::new(call);
+    let absorbed = state.absorbs_clear(gpu, clear);
+    if !absorbed {
+        super::layer_ops::execute_clear(gpu, clear)?;
+    }
+    state.initial_zero.set(absorbed);
+    if let Some(write) = hc {
+        *state.hc_write.borrow_mut() = super::qt44_qt53_prefill::HcSharedDown::offer(write);
+    }
+    let steps = match call.protocol() {
+        MoeProtocol::IndexedDecode => lower_decode(&state)?,
+        MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
+    };
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)?;
+    if state.initial_zero.get() {
+        return Err(DispatchError::Hip(
+            "sealed moe: the absorbed target clear was not consumed by the combine".into(),
+        ));
+    }
+    Ok(state.hc_folded.get())
 }
 
 /// Execute only the canonical slot-order combine for a validated EP call.

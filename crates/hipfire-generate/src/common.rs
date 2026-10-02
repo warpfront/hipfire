@@ -730,6 +730,17 @@ pub fn qwen_dflash_hit_length_cap(
     generated >= max_tokens && !decoded_eot && !semantic_stop
 }
 
+/// Wire `finish_reason` for a route without tool calls or stop sequences:
+/// `"length"` when the budget ran out, `"stop"` otherwise. A decoded EOT on
+/// the final budget token is a stop, not a length cap (AR parity).
+pub fn length_or_stop(generated: usize, max_tokens: usize, decoded_eot: bool) -> &'static str {
+    if generated >= max_tokens && !decoded_eot {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 /// Shared ctx-capacity margin for the spec entry guard (`generate_dflash`
 /// AR fallback) and the in-loop guard (`generate_spec` hard error). A
 /// request fits only when prompt + budget + one full draft block fits the
@@ -1709,6 +1720,7 @@ std::thread_local! {
         const { std::cell::Cell::new(false) };
     static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static EVICTION_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // Test-only fault points for the vision (Qwen35-VL / dots.ocr) generation
@@ -1778,15 +1790,29 @@ pub fn take_generation_fault_after_first_decode() -> bool {
     GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
 }
 
+/// Arm (or disarm) the Qwen AR KV-eviction fault: the next eviction step
+/// fails as a HIP error would.
+#[doc(hidden)]
+pub fn arm_eviction_fault(armed: bool) {
+    EVICTION_FAULT.with(|c| c.set(armed));
+}
+
+/// Take the armed KV-eviction fault, disarming it.
+#[doc(hidden)]
+pub fn take_eviction_fault() -> bool {
+    EVICTION_FAULT.with(|c| c.replace(false))
+}
+
 /// Arm the generation fault hooks from a daemon `generate` request carrying
-/// `test_fault_after_prefill` / `test_fault_after_first_decode` booleans.
-/// Missing or non-boolean fields disarm. Test-only wiring; the hooks are
-/// default-off and one-shot.
+/// `test_fault_after_prefill` / `test_fault_after_first_decode` /
+/// `test_fault_eviction` booleans. Missing or non-boolean fields disarm.
+/// Test-only wiring; the hooks are default-off and one-shot.
 #[doc(hidden)]
 pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
     let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
     arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
+    arm_eviction_fault(flag("test_fault_eviction"));
     #[cfg(feature = "serve-fault-inject")]
     hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(flag(
         "test_fault_after_expert_mutation",
@@ -1798,6 +1824,7 @@ pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
 pub fn disarm_generation_faults() {
     arm_generation_fault_after_prefill(false);
     arm_generation_fault_after_first_decode(false);
+    arm_eviction_fault(false);
     #[cfg(feature = "serve-fault-inject")]
     hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(false);
 }

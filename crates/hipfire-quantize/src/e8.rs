@@ -13,6 +13,7 @@
 // Total = 32 bits.  Decode recovers e[7] LSB from parity of sum(e[0..7]).
 
 pub const QUANT_STEP: f32 = 0.88;
+#[cfg(test)]
 /// E8_SIGMA: std-dev of the FWHT-normalized weight distribution (used in tests).
 pub const E8_SIGMA: f32 = 1.7;
 

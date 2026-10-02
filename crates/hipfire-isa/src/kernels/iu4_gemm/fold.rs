@@ -1,7 +1,8 @@
 //! Fold wiring for the K-loop: which physical ranges hold the scale rows and
 //! products at fold time, the phase-B placement of the two fold stages, and
 //! the (closed, never emitted into a product module) `K256Pow2` re-seed.
-use super::{Gen, op, v};
+use super::Gen;
+use crate::kernels::common::{op, v};
 use crate::{Builder, V, kernels::iu4_k1::{self, FoldRegisters}};
 
 /// Accumulator order of a WMMA bundle: row group 0 over the four column

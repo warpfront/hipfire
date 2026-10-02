@@ -1,5 +1,5 @@
 use smallvec::SmallVec;
-use crate::{cfg::{BarrierKind, Cond}, inst::{Arch, Form, Inst, Opcode, ValidateError}, lds::LdsAccess, operand::{Operand, Special}, reg::{Kind, RegRef}, wait::{Counter, CounterSet}};
+use crate::{cfg::{BarrierKind, Cond}, inst::{Arch, Form, Inst, Opcode, ValidateError}, lds::LdsAccess, operand::{CachePolicy, Operand, Special}, reg::{Kind, RegRef}, wait::{Counter, CounterSet}};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ImplicitSet { pub reads: u8, pub writes: u8 }
 impl ImplicitSet {
@@ -49,12 +49,14 @@ impl Effects {
     /// Single table source for authoring and lifted instruction effects.
     /// Physical register widths come from decoded operands; implicit reads and
     /// writes, counter membership and opcode-specific accumulator uses come
-    /// from the target's opcode table.
-    pub fn from_table(arch: Arch, op: Opcode, form: Form, operands: &[Operand]) -> Result<Self, ValidateError> {
+    /// from the target's opcode table. `cpol` selects a VMEM atomic's returning
+    /// or non-returning form (its `@rtn` destination slot and counter rules).
+    pub fn from_table(arch: Arch, op: Opcode, form: Form, operands: &[Operand], cpol: &CachePolicy) -> Result<Self, ValidateError> {
         let row = crate::isa::lookup(arch, op, form)
             .ok_or(ValidateError::UnknownOpcode { op, form })?;
+        let returns = crate::isa::atomic_returns(arch, cpol);
         let mut out = Self::default();
-        let mut field_names = row.grammar.split(',').map(|s| s.split(':').next().unwrap_or(""));
+        let mut field_names = row.slots(returns).map(|(name, _)| name);
         // CMPX encodes the fixed EXEC destination as VDST, but it is not an operand.
         if form == Form::Vop3 && row.name.starts_with("v_cmpx_") {
             field_names.next();
@@ -110,8 +112,7 @@ impl Effects {
             else if name == "s_clause" { Control::Clause }
             else if name == "s_delay_alu" { Control::Delay }
             else { Control::None };
-        for pair in row.counter.split(',') {
-            let Some((counter, units)) = pair.split_once(':') else { continue };
+        for (counter, units) in row.counter_rules(returns) {
             let counter = match counter {
                 "Km" => Counter::Km, "Ds" => Counter::Ds, "Load" => Counter::Load,
                 "Store" => Counter::Store, "Sample" => Counter::Sample, "Bvh" => Counter::Bvh,
@@ -129,6 +130,9 @@ impl Effects {
                 else if name.starts_with("flat_store") { (MemClass::FlatStore, OrderType::Store) }
                 else if name.starts_with("global_load") || name.starts_with("buffer_load") || name.starts_with("scratch_load") { (MemClass::VmemLoad, OrderType::Load) }
                 else if name.starts_with("global_store") || name.starts_with("buffer_store") || name.starts_with("scratch_store") { (MemClass::VmemStore, OrderType::Store) }
+                else if name.starts_with("global_atomic") || name.starts_with("buffer_atomic") {
+                    (MemClass::VmemAtomic { returns }, if returns { OrderType::Load } else { OrderType::Store })
+                }
                 else { return Err(ValidateError::Operand(format!("unclassified memory rule for {name}"))); };
             let mem = out.mem.get_or_insert_with(|| MemEffect {
                 class, counters: CounterSet::default(), in_order_type: order,

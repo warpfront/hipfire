@@ -2886,6 +2886,7 @@ fn verify_resolved_devices(devices: &[Gpu]) -> HipResult<()> {
                 logical: gpu.device_id as usize,
                 arch: gpu.hip.get_arch(gpu.device_id)?,
                 pci_bus_id: gpu.hip.device_pci_bus_id(gpu.device_id)?,
+                uuid: None,
             })
         })
         .collect::<HipResult<Vec<_>>>()?;

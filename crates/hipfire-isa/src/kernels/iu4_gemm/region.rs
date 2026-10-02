@@ -9,7 +9,7 @@
 //! instantiated per element. Only the registers, the interleaving of
 //! independent elements, the VOPD packing of their VOP2 operations and hazard
 //! waits are chosen here; every element keeps its ops in golden order.
-use super::op;
+use crate::kernels::common::op;
 use crate::{Builder, reg::{Kind, RegRef}, vopd::{self, VopdF32, VopdOp}};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -491,7 +491,7 @@ mod tests {
             group_segment_fixed_size: 0, wave32: true, cu_mode: false };
         let mut b = Builder::new(spec, p);
         emit_interleaved(&mut b, &Region::silu().unwrap(), binds).unwrap();
-        b.program.instructions.iter().map(|i| i.text.clone()).collect()
+        b.program().instructions.iter().map(|i| i.text.clone()).collect()
     }
 
     /// Interleaving and VOPD packing only: the stream is exactly each

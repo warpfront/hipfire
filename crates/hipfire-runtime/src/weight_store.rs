@@ -761,6 +761,23 @@ pub fn upload_pooled_bytes(
     tensor.shape = logical_shape.to_vec();
     Ok(tensor)
 }
+
+/// Upload one resident-class payload according to its declared residency:
+/// device-pooled for [`WeightResidency::Resident`], pinned device-mapped host
+/// RAM for [`WeightResidency::HostMapped`].
+fn upload_resident_bytes(
+    gpu: &mut Gpu,
+    residency: WeightResidency,
+    bytes: &[u8],
+    logical_shape: &[usize],
+) -> hip_bridge::HipResult<GpuTensor> {
+    match residency {
+        WeightResidency::HostMapped => gpu.upload_raw_host_mapped(bytes, logical_shape),
+        WeightResidency::Resident | WeightResidency::ExternalRows { .. } => {
+            upload_pooled_bytes(gpu, bytes, logical_shape)
+        }
+    }
+}
 /// Maximum host staging allocation for a range upload. The final device tensor
 /// is allocated once; only this bounded staging buffer is proportional to the
 /// source range.
@@ -1527,7 +1544,12 @@ where
                         fulfill_entry_error(entry, reason),
                     ));
                 }
-                let tensor = match upload_pooled_bytes(gpu, bytes, &entry.logical_shape) {
+                let tensor = match upload_resident_bytes(
+                    gpu,
+                    entry.residency,
+                    bytes,
+                    &entry.logical_shape,
+                ) {
                     Ok(mut tensor) => {
                         tensor.dtype = dtype;
                         tensor
@@ -1604,7 +1626,12 @@ where
                         fulfill_entry_error(entry, reason),
                     ));
                 }
-                let tensor = match upload_pooled_bytes(gpu, &bytes, &entry.logical_shape) {
+                let tensor = match upload_resident_bytes(
+                    gpu,
+                    entry.residency,
+                    &bytes,
+                    &entry.logical_shape,
+                ) {
                     Ok(mut tensor) => {
                         tensor.dtype = dtype;
                         tensor
@@ -1711,6 +1738,16 @@ where
                         ));
                     }
                     continue;
+                }
+                if entry.residency == WeightResidency::HostMapped {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            "host-mapped residency needs a borrowed or owned payload, not a source range",
+                        ),
+                    ));
                 }
                 let tensor =
                     match upload_range_pooled(gpu, &descriptor, dtype, &entry.logical_shape) {

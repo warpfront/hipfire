@@ -10,6 +10,7 @@
 
 use std::sync::OnceLock;
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — MQ4R route selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
 /// Automatic Redline runtime default for single-GPU MQ4R models.
 pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usize) -> bool {
     matches!(gpu_arch, "gfx1100" | "gfx1151" | "gfx1201")
@@ -33,7 +34,11 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
 /// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
 /// (no drafter): its retained PM4 decode tape is byte-identical to the HIP
-/// AR graph. `replay.backend = "hip"` opts out.
+/// AR graph. `replay.backend = "hip"` opts out. A Qwen3.5 process configured
+/// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
+/// `memory.gpu_layer_budget` layer count) gets no retained default: its spilled
+/// layers' GEMVs run on the host between GPU launches, which a retained tape
+/// does not record.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -43,6 +48,9 @@ pub fn retained_redline_default(
     has_drafter: bool,
 ) -> bool {
     if model_arch.eq_ignore_ascii_case("muse_glimmer") {
+        return false;
+    }
+    if model_arch.eq_ignore_ascii_case("qwen3_5") && cpu_offload_configured() {
         return false;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
@@ -56,6 +64,7 @@ pub fn retained_redline_default(
     {
         return true;
     }
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
     gpu_arch.eq_ignore_ascii_case("gfx1151")
         && model_arch.eq_ignore_ascii_case("deepseek4")
         && pp == 1
@@ -65,6 +74,11 @@ pub fn retained_redline_default(
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+}
+
+fn cpu_offload_configured() -> bool {
+    use hipfire_config::memory::{gpu_layer_budget, offload_exec, GpuLayerBudget, OffloadExec};
+    offload_exec() == OffloadExec::Cpu && matches!(gpu_layer_budget(), GpuLayerBudget::Layers(_))
 }
 
 #[derive(Debug, Clone)]

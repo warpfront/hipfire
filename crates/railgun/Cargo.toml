@@ -1,0 +1,31 @@
+[package]
+name = "railgun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "railgun certified dispatch programs: program model (design §1.1); MC copy nodes and copy kernels; M1 kernel nodes from certified facts, the gfx12 cache table, PM4 boundary plan and the G7 shadow diff"
+publish = false
+
+# A runtime crate: it must never reach peacemaker, dev-dependencies included
+# (checked by peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
+[dependencies]
+railgun-corpus = { path = "../railgun-corpus" }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+# GPU examples (`examples/g4_probe.rs`, `--features g4-probe`).
+[dev-dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+rdna-compute = { path = "../rdna-compute" }
+redline-rocr = { path = "../redline-rocr" }
+serde_json.workspace = true
+sha2.workspace = true
+
+[features]
+# `examples/g4_probe.rs`: the G4 cache-visibility silicon probe (design §5 G4).
+g4-probe = []
+
+[[example]]
+name = "g4_probe"
+required-features = ["g4-probe"]

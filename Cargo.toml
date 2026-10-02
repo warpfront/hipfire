@@ -3,6 +3,11 @@ resolver = "2"
 members = [
     "crates/peacemaker-ir",
     "crates/peacemaker-lift",
+    "crates/peacemaker-author",
+    "crates/railgun",
+    "crates/railgun-cert",
+    "crates/railgun-corpus",
+    "crates/railgun-jitcorpus",
     "crates/hipfire-isa",
     "crates/hip-bridge",
     "crates/va-bridge",
@@ -39,6 +44,7 @@ members = [
     "crates/redline-dispatch",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
+    "crates/hipfire-cpu",
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",
@@ -53,7 +59,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 # Outbound license for the work as a whole. Individual files whose authors
 # have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.

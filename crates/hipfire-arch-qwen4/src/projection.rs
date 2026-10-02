@@ -45,6 +45,10 @@ pub(crate) struct ProjectionView {
     pub(crate) m: usize,
     pub(crate) k: usize,
     pub(crate) row_stride: usize,
+    /// Placement of the allocation the view was cut from. The view's own
+    /// buffer is `Borrowed` and must not claim host ownership, so routing reads
+    /// the owner's residency from here instead of `Gpu::host_located(view)`.
+    pub(crate) host_mapped: bool,
 }
 
 impl ProjectionView {
@@ -55,6 +59,7 @@ impl ProjectionView {
             m,
             k,
             row_stride: row_stride(source.dtype, k),
+            host_mapped: source.buf.is_host_mapped(),
         }
     }
 
@@ -72,6 +77,7 @@ impl ProjectionView {
             m,
             k,
             row_stride: row_stride(dtype, k),
+            host_mapped: source.buf.is_host_mapped(),
         }
     }
 
@@ -94,6 +100,31 @@ impl ProjectionView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A routed expert view is a `Borrowed` byte view, yet it must report the
+    /// placement of its host-mapped owner — that is what selects the NT8
+    /// host-mapped expert GEMMs. A device owner must stay device.
+    #[test]
+    fn packed_view_reports_owner_placement() {
+        let mut backing = vec![0u8; 256];
+        let ptr = backing.as_mut_ptr().cast();
+        // SAFETY: descriptors only; no kernel reads them and `DeviceBuffer`
+        // has no Drop, so nothing is freed.
+        let host = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(ptr, 256) },
+            shape: vec![256],
+            dtype: DType::F32,
+        };
+        let view = ProjectionView::from_packed(&host, 64, 64, DType::F32, 1, 64);
+        assert!(!view.tensor.buf.is_host_mapped(), "a borrowed view must not claim host ownership");
+        assert!(view.host_mapped);
+        let device = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, 256) },
+            shape: vec![256],
+            dtype: DType::F32,
+        };
+        assert!(!ProjectionView::from_packed(&device, 64, 64, DType::F32, 1, 64).host_mapped);
+    }
 
     /// The stride the arch hands the dispatcher is a second implementation of
     /// the artifact boundary's row geometry.  These are the expert K and the

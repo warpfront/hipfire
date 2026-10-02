@@ -92,7 +92,7 @@ const QWEN4_Q8_MARKERS: &[&str] = &["embed_tokens.weight"];
 /// (`Qwen4GpuForward::decode_q8`) while prefill keeps the BF16 source — Q8 in
 /// the file cost the prefill route +0.0021 KLD (HC) and short-prompt prefill
 /// 46% (shared expert, no fast exact multi-row Q8 GEMM) for no decode speed.
-const QWEN4_LM_HEAD: &str = "lm_head.weight";
+pub(crate) const QWEN4_LM_HEAD: &str = "lm_head.weight";
 
 fn qwen4_q8_dtype(name: &str) -> bool {
     QWEN4_Q8_MARKERS.iter().any(|marker| name.ends_with(marker))
@@ -793,9 +793,11 @@ impl Qwen4Manifest {
         for (layer_idx, kind) in config.layer_types.iter().copied().enumerate() {
             state.push(match kind {
                 LayerType::LinearAttention => StateEntry::new(StateKind::Recurrent, layer_idx),
+                // Full K/V plus raw/pooled index keys; their storage format is
+                // resolved at load (`resolve_qsa_format`, memory.kv_cache).
                 LayerType::FullAttention => StateEntry::new(
                     StateKind::Kv {
-                        quant: "f32-qsa-full-raw-pooled".into(),
+                        quant: "qsa-full-raw-pooled".into(),
                     },
                     layer_idx,
                 ),

@@ -1,0 +1,5 @@
+error[E0599]: no method named `barrier` found for mutable reference `&mut Wave<'_, Gfx1100, B>` in the current scope
+ --> tests/ui/barrier_in_wave_scope.rs:8:11
+  |
+8 |         w.barrier(())?;
+  |           ^^^^^^^ method not found in `&mut Wave<'_, Gfx1100, B>`

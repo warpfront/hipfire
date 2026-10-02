@@ -1489,7 +1489,7 @@ pub fn generate_vl(
     // split. `emitted_bytes` above becomes the bytes-FED-to-filter cursor —
     // the filter holds back partial UTF-8/marker tails internally, so the
     // old valid-prefix arithmetic is gone.
-    let mut vl_filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+    let mut vl_filter = EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config());
     let mut vl_think = ThinkOutputRouter::new(started_in_think);
     // Think-depth tracking via token IDs (not UTF-8 rfind).
     // The previous implementation decoded the full streamed output to a
@@ -1503,6 +1503,8 @@ pub fn generate_vl(
     // attractor loops that the think cap and repeat penalty miss.
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+    // A terminator ended the turn (vs. the budget running out).
+    let mut decoded_eot = false;
 
     'vl_generate: while generated < max_tokens {
         // Decode-side client-cancel poll — roll back synchronously (same
@@ -1625,16 +1627,12 @@ pub fn generate_vl(
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[emitted_bytes..];
         emitted_bytes = all_bytes.len();
-        if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes) {
-            break;
-        }
-        if next_token == config.eos_token {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-        if tokenizer.is_terminator(next_token) {
+        if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes)
+            || next_token == config.eos_token
+            || im_end_token == Some(next_token)
+            || tokenizer.is_terminator(next_token)
+        {
+            decoded_eot = true;
             break;
         }
 
@@ -1796,6 +1794,7 @@ pub fn generate_vl(
                             new_bytes,
                         ) {
                             generated += 1;
+                            decoded_eot = true;
                             break 'vl_generate;
                         }
                         generated += 1;
@@ -1967,6 +1966,7 @@ pub fn generate_vl(
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated, max_tokens, decoded_eot),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
@@ -2330,6 +2330,7 @@ pub fn generate_vl_dots_ocr(
     // tokens on a table-heavy page). The proven ocr_e2e path decodes
     // straight to EOS without a guard; see DotsOcr::loop_guard_overrides.
 
+    let mut decoded_eot = false;
     while generated < max_tokens {
         if check_abort(id) {
             dots_ar_cancel(state, gpu, stdout, id, generated);
@@ -2346,6 +2347,7 @@ pub fn generate_vl_dots_ocr(
             return;
         }
         if eos_set.contains(&next) {
+            decoded_eot = true;
             break;
         }
         emit_committed_event(stdout, id, next, generated, t0.elapsed().as_millis() as u64);
@@ -2420,6 +2422,7 @@ pub fn generate_vl_dots_ocr(
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated, max_tokens, decoded_eot),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
@@ -2542,6 +2545,9 @@ pub fn run_dots_ocr_ngram_loop(
     // committed tail from each `spec.step` (seed re-echo already stripped).
     let mut window: Vec<u32> = vec![first_token];
 
+    let mut decoded_eot = false;
+    // The context ran out before the budget did: still a truncation.
+    let mut ctx_exhausted = false;
     'outer: loop {
         for &tok in &window {
             if generated >= max_tokens {
@@ -2549,6 +2555,7 @@ pub fn run_dots_ocr_ngram_loop(
             }
             // EOS is never streamed (matches the AR loop's pre-emit break).
             if eos_set.contains(&tok) {
+                decoded_eot = true;
                 break 'outer;
             }
             emit_committed_event(stdout, id, tok, generated, t0.elapsed().as_millis() as u64);
@@ -2590,6 +2597,7 @@ pub fn run_dots_ocr_ngram_loop(
         // Context-overflow guard (matches generate_spec): one window writes up
         // to `block_size` KV slots.
         if position.saturating_add(block_size) >= ctx_capacity {
+            ctx_exhausted = true;
             break;
         }
         let max_emit = max_tokens.saturating_sub(generated);
@@ -2633,7 +2641,8 @@ pub fn run_dots_ocr_ngram_loop(
         // whole tail in `verify_block`.
         position += step.emit.len();
         seed_token = step.next_seed;
-        window = step.emit.to_vec();
+        window.clear();
+        window.extend_from_slice(&step.emit);
     }
 
     let decode_s = t_gen.elapsed().as_secs_f64();
@@ -2672,6 +2681,11 @@ pub fn run_dots_ocr_ngram_loop(
         "tau": (tau * 100.0).round() / 100.0,
         "cycles": spec_cycles,
         "attempt_id": active_attempt_id(),
+        "finish_reason": if ctx_exhausted {
+            "length"
+        } else {
+            crate::common::length_or_stop(generated, max_tokens, decoded_eot)
+        },
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
@@ -2827,6 +2841,7 @@ pub fn generate_dots_ocr_text(
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
 
+    let mut decoded_eot = false;
     while generated < max_tokens {
         // Cancel poll: the image path has one per iteration; the text path
         // previously ran to `max_tokens` uninterruptibly.
@@ -2835,6 +2850,7 @@ pub fn generate_dots_ocr_text(
             return;
         }
         if eos_set.contains(&next) {
+            decoded_eot = true;
             break;
         }
         emit_committed_event(stdout, id, next, generated, t0.elapsed().as_millis() as u64);
@@ -2911,6 +2927,7 @@ pub fn generate_dots_ocr_text(
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated, max_tokens, decoded_eot),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
@@ -2931,7 +2948,7 @@ mod tests {
     /// Drive byte chunks through the VL typed-emission pipeline and collect
     /// (channel, text) wire events parsed back from the JSONL lines.
     fn drive(started_in_think: bool, chunks: &[&[u8]]) -> Vec<(String, String)> {
-        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut filter = EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config());
         let mut think = ThinkOutputRouter::new(started_in_think);
         let mut out = Vec::new();
         for chunk in chunks {
@@ -3025,7 +3042,7 @@ mod tests {
     fn hostile_request_id_stays_json_escaped() {
         // The old hand-rolled envelope spliced `id` into the JSON unescaped;
         // the typed emitters must survive a quote-bearing id.
-        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut filter = EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config());
         let mut think = ThinkOutputRouter::new(false);
         let mut out = Vec::new();
         let _ = vl_route_decode_text(&mut out, "bad\"id\\", &mut filter, &mut think, b"text");
@@ -3041,7 +3058,7 @@ mod tests {
 
     #[test]
     fn ordinary_emit_returns_false() {
-        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut filter = EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config());
         let mut think = ThinkOutputRouter::new(false);
         let mut out = Vec::new();
         let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, b"hello");
@@ -3053,7 +3070,7 @@ mod tests {
 
     #[test]
     fn stop_marker_returns_true_and_emits_preceding_text_without_leakage() {
-        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut filter = EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config());
         let mut think = ThinkOutputRouter::new(false);
         let mut out = Vec::new();
         let payload = b"visible answer<|im_end|>";
@@ -3076,7 +3093,7 @@ mod tests {
         // ` <` is a partial prefix of `<|im_end|>`; EosFilter holds it mid-stream
         // and only at finish should it be treated as ordinary prose and routed
         // through ThinkOutputRouter.
-        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut filter = EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config());
         let mut think = ThinkOutputRouter::new(false);
         let mut out = Vec::new();
         let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, b"hello <");
@@ -3543,6 +3560,7 @@ pub fn generate_lfm2_vl(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
+    let mut decoded_eot = false;
     loop {
         if check_abort(id) {
             eprintln!("[daemon/vl-lfm2] aborted mid-decode");
@@ -3554,6 +3572,7 @@ pub fn generate_lfm2_vl(
         let next_tok =
             hipfire_arch_deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_toks.contains(&next_tok) {
+            decoded_eot = true;
             break;
         }
         let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -3562,6 +3581,7 @@ pub fn generate_lfm2_vl(
             tokenizer.decode(&[next_tok]).trim(),
             "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>"
         ) {
+            decoded_eot = true;
             break;
         }
         // Multi-byte characters span tokens: emit only completed text.
@@ -3624,6 +3644,7 @@ pub fn generate_lfm2_vl(
         "prefill_ms": prefill_ms,
         "total_ms": t_turn.elapsed().as_millis().max(1),
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated_count, max_tokens, decoded_eot),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {

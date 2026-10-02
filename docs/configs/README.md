@@ -70,6 +70,7 @@ concatenation operation; merge the desired keys or use `hipfire config set`
 | `HIPFIRE_DFLASH_MODE=auto` | `speculation.dflash = "auto"` |
 | `HIPFIRE_MTP_MODE=on` | `speculation.mtp = "on"` |
 | `HIPFIRE_MTP_K=3` | `speculation.mtp_k = 3` |
+| `HIPFIRE_MTP_NGRAM=1` | `speculation.mtp_ngram = "on"` |
 | `HIPFIRE_PROMPT_CACHE_CAP=64` | `memory.prompt_cache_capacity = 64` |
 | `HIPFIRE_DEVICES=3` | `hardware.devices = "3"`; startup resolves PCI-order card 3 and applies `ROCR_VISIBLE_DEVICES=<its UUID, or ROCr ordinal>` with `HIP_VISIBLE_DEVICES=0` |
 | `HIPFIRE_REPLAY_BACKEND=redline` | `replay.backend = "redline"` |

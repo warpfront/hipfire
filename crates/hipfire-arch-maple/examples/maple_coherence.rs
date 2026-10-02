@@ -158,6 +158,7 @@ fn parse_args() -> Args {
                 kv_mode = argv[i + 1].clone();
                 i += 2;
             }
+
             "--temp" => {
                 temp = argv[i + 1].parse().expect("--temp");
                 i += 2;

@@ -301,7 +301,7 @@ fn pack_component(
             data,
             spilled_len: 0,
         });
-        maybe_spill(&mut tensors, &mut spill, SPILL_THRESHOLD);
+        maybe_spill(&mut tensors, &mut spill, SPILL_THRESHOLD).map_err(|e| format!("flux pack: spill: {e}"))?;
     }
 
     write_hfq(out, arch_id, &metadata, &tensors, Some(&mut spill))
@@ -424,7 +424,7 @@ fn component_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    
 
     /// One safetensors entry: `(name, little-endian bytes, dtype, shape)`.
     type NamedTensor = (String, Vec<u8>, String, Vec<usize>);

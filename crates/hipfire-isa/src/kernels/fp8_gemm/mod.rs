@@ -10,8 +10,8 @@ mod gdn_epilogue;
 pub mod gdn_region;
 
 pub use spec::{ActScale, Epi, Spec};
-use crate::{Arch, Builder, BuilderProof, Emitted, KernelSpec, RegPlan,
-    insn::{Instruction, MemoryClass}, reg::{Kind, Live, RegRef}};
+use crate::{Arch, Builder, BuilderProof, Emitted, KernelSpec, RegPlan, insn::{Instruction, MemoryClass}, reg::Live};
+use crate::kernels::common::{mem, op, s, sr, v, vr};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -21,19 +21,6 @@ const LOOP_END: &str = ".Lfp8_loop_end";
 const EPILOGUE: &str = ".Lfp8_epilogue";
 const END: &str = ".Lfp8_end";
 
-fn v(n:u8)->RegRef { RegRef { kind:Kind::V,base:n,len:1 } }
-fn vr(n:u8,len:u8)->RegRef { RegRef { kind:Kind::V,base:n,len } }
-fn s(n:u8)->RegRef { RegRef { kind:Kind::S,base:n,len:1 } }
-fn sr(n:u8,len:u8)->RegRef { RegRef { kind:Kind::S,base:n,len } }
-fn op(b:&mut Builder,text:impl Into<String>,defs:&[RegRef],uses:&[RegRef])->Result<(),String> {
-    b.push(Instruction::new(text,defs.to_vec(),uses.to_vec()))
-}
-fn mem(b:&mut Builder,text:impl Into<String>,defs:&[RegRef],uses:&[RegRef],class:MemoryClass)->Result<(),String> {
-    b.push(Instruction::new(text,defs.to_vec(),uses.to_vec()).memory(class))
-}
-fn so(b:&mut Builder,text:impl Into<String>,defs:&[u8],uses:&[u8])->Result<(),String> {
-    op(b,text,&defs.iter().map(|&n|s(n)).collect::<Vec<_>>(),&uses.iter().map(|&n|s(n)).collect::<Vec<_>>())
-}
 fn vo(b:&mut Builder,text:impl Into<String>,defs:&[u8],uses:&[u8],su:&[u8])->Result<(),String> {
     op(b,text,&defs.iter().map(|&n|v(n)).collect::<Vec<_>>(),&uses.iter().map(|&n|v(n)).chain(su.iter().map(|&n|s(n))).collect::<Vec<_>>())
 }
@@ -85,7 +72,7 @@ fn plan()->Result<RegPlan,String>{
 }
 fn declare_lds(b:&mut Builder)->Result<(),String>{
     for (id,(name,base,len)) in [("A0",0,8192),("A1",8192,8192),("R0",16384,1024),("R1",17408,1024),("D0",18432,512),("D1",18944,512)].into_iter().enumerate(){
-        if b.lds.add(name,base,len)?!=id {return Err("LDS slot order".into())}
+        if b.lds_slot(name,base,len)?!=id {return Err("LDS slot order".into())}
     }
     Ok(())
 }
@@ -102,7 +89,7 @@ pub fn emit(spec:Spec)->Result<Emitted,String>{
     kloop::emit(&mut b,spec)?;
     epilogue::emit(&mut b,spec)?;
     b.label(END)?;
-    b.push(crate::insn::Sop::End.encode(Arch::Gfx1201)?)?;
+    b.control(crate::insn::Sop::End.encode(Arch::Gfx1201)?)?;
     b.finish()
 }
 #[derive(Serialize)]

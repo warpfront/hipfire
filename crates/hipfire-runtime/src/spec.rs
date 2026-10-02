@@ -1462,8 +1462,10 @@ pub struct FinishSummary {
     /// Final events to render (e.g. trailing visible Token + held ToolCalls).
     pub events: Vec<ClientEvent>,
     /// The emitter's finish reason (`stop`, `tool_calls`, `malformed_protocol`,
-    /// or `open_think`); the caller may override with `length` on a pure
-    /// token-cap exit.
+    /// `truncated_tool_call` — output ended inside a tool call — or
+    /// `open_think`); the caller may override with `length` on a pure
+    /// token-cap exit, which also wins over `truncated_tool_call` and
+    /// `open_think`.
     pub finish_reason: &'static str,
     /// Number of tool calls parsed this turn (for the `done` envelope).
     /// Zero when malformed or when calls must stay suppressed.

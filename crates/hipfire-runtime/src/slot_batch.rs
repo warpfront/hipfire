@@ -24,6 +24,22 @@ pub struct SlotBatch {
     pub positions: Vec<i32>,
     /// Slot index for each flat row.
     pub row_slot: Vec<i32>,
+    /// Per-row absolute M-RoPE phases `[t, h, w]`, aligned with the flat rows.
+    ///
+    /// Empty = the step runs 1D RoPE off `positions`. When non-empty it MUST
+    /// have one entry per row and the forward dispatches the batched M-RoPE
+    /// kernel instead. Rows of plain text slots carry `[p, p, p]` (p = the
+    /// row's position), which the M-RoPE kernel reduces to bit-identical
+    /// angles — so a mixed text+VL step can run the one kernel for everyone.
+    /// KV addressing and causal bounds still read `positions`; only the RoPE
+    /// phase differs.
+    pub pos3: Vec<[i32; 3]>,
+    /// Per-row index into that row's slot's external-embedding matrix (the
+    /// vision tower's output for the request), or -1 to use the token
+    /// embedding table. Empty = no external rows this step. Only VL prefill
+    /// rows carry a non-negative index, and they must appear in prompt order
+    /// so indices line up with the request's visual token stream.
+    pub ext_emb: Vec<i32>,
 }
 
 impl SlotBatch {

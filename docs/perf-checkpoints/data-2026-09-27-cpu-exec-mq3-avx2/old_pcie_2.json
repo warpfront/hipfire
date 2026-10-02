@@ -1,0 +1,101 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/path/to/models/qwen3.8-27b.mq3-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 4374,
+    "vram_total_mb": 16304,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 16182,
+  "max_tokens": 64,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 59,
+  "prompt_md5": "5835c71e471849b4a72e1dc8e39695e7",
+  "prompt_chars": 215,
+  "warnings": [
+    "prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 13.2,
+    "mean": 13.16,
+    "min": 13.1,
+    "max": 13.2,
+    "stdev": 0.04898979485566339
+  },
+  "prefill_tok_s": {
+    "median": 93.3,
+    "mean": 93.3,
+    "min": 92.7,
+    "max": 94.0,
+    "stdev": 0.4427188724235724
+  },
+  "wall_tok_s": {
+    "median": 11.7,
+    "mean": 11.66,
+    "min": 11.6,
+    "max": 11.7,
+    "stdev": 0.04898979485566339
+  },
+  "ttft_ms": {
+    "median": 632.7,
+    "mean": 632.5600000000001,
+    "min": 627.8,
+    "max": 636.5,
+    "stdev": 2.9736173257499163
+  },
+  "samples": {
+    "decode": [
+      13.2,
+      13.2,
+      13.1,
+      13.2,
+      13.1
+    ],
+    "prefill": [
+      94.0,
+      93.0,
+      93.5,
+      92.7,
+      93.3
+    ],
+    "wall": [
+      11.7,
+      11.7,
+      11.6,
+      11.7,
+      11.6
+    ],
+    "ttft_ms": [
+      627.8,
+      634.6,
+      631.2,
+      636.5,
+      632.7
+    ]
+  }
+}

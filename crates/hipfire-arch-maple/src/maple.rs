@@ -24,7 +24,7 @@
 
 use crate::config::MapleConfig;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::kv_mode::KvMode;
+use hipfire_runtime::kv_mode::{KvMode, MAPLE_POLICY};
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -727,9 +727,12 @@ fn flash_partial_tile(gpu: &Gpu, cfg: &MapleConfig) -> usize {
 }
 
 impl MapleState {
+    /// Default-construction shim. The KV mode routes through `MAPLE_POLICY`
+    /// (currently bf16) — hard-coding a tier here would silently hand a
+    /// future caller a stale default that diverges from the shipped policy.
     pub fn new(gpu: &mut Gpu, cfg: &MapleConfig) -> Result<Self, String> {
         let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
-        Self::new_with_max_seq(gpu, cfg, max_seq, KvMode::Q8)
+        Self::new_with_max_seq(gpu, cfg, max_seq, MAPLE_POLICY.default)
     }
 
     /// `kv_mode` must already be resolved through `MAPLE_POLICY` — this is the

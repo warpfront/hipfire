@@ -600,7 +600,35 @@ impl Qwen4Config {
     pub fn qsa_selected_capacity(&self) -> usize {
         self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)
     }
+
+    /// Bytes of one QSA layer's context-sized arenas at `max_seq` in
+    /// `format`: full K and V rows, raw index keys, and pooled index keys.
+    /// The trunk has `n_full_layers()` of these and an attached MTP head one
+    /// more (always F32).
+    pub fn qsa_context_arena_bytes(
+        &self,
+        max_seq: usize,
+        format: rdna_compute::tensor_ops::QsaKvFormat,
+    ) -> Option<usize> {
+        let kv_row = format.kv_row_bytes(self.num_key_value_heads, self.head_dim);
+        let raw = self.indexer_kv_heads.checked_mul(self.indexer_head_dim)?;
+        let index_row = raw.checked_mul(format.index_dtype().size())?;
+        let pooled_rows = max_seq.div_ceil(self.indexer_compress_ratio);
+        max_seq
+            .checked_mul(kv_row.checked_mul(2)?.checked_add(index_row)?)?
+            .checked_add(pooled_rows.checked_mul(index_row)?)
+    }
 }
+
+/// Largest context a Qwen4 load admits: the model's native
+/// `max_position_embeddings`. Past 15,360 pooled blocks (61,440 tokens) the
+/// QSA selector keeps its score rows in global memory instead of LDS; whether
+/// a context fits is decided by the state allocation, which names the MiB it
+/// needed when it does not.
+pub const QWEN4_MAX_CONTEXT: usize = 262_144;
+
+/// Context a Qwen4 load gets when `max_seq` is omitted.
+pub const QWEN4_DEFAULT_CONTEXT: usize = 32768;
 
 pub(crate) fn compact_test_config() -> Qwen4Config {
     let layers: Vec<_> = (0..48)

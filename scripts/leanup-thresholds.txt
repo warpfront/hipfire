@@ -40,12 +40,19 @@ required_features_daemon    == 0
 # there fits under it. Paid down when the arm's branch duplication is factored.
 # RATCHET-RAISE 5355 -> 5362: the gfx1201 retained-decode PM4 pacing scope
 # (0466dbd01, HIPFIRE_GFX1201_PM4_PACING) added 14 lines after #778 measured 5348.
-daemon_lines                <= 5362
+# RATCHET-RAISE 5362 -> 5377: the 0.4.0 deprecation pass (chore/deprecate-050,
+# 355eeb987) added the daemon load warnings for deprecated KV names and PFlash
+# plus their lifecycle markers (+23 lines, 5358 -> 5381 on land); fold/flash-next
+# took 4 back. The warnings go with the surfaces they announce in 0.5.0.
+daemon_lines                <= 5377
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
 # 28 of these are invoked by scripts or CI gates and are meant to stay.
-ungated_examples            <= 48
+# RATCHET-RAISE 61 -> 63: `rdna-compute/verify_attn_oracle` (VerifyAttn byte oracle, gfx1201/gfx1100)
+# and `hipfire-arch-qwen35/mq4_prefill_state_oracle` (#794 cross-process state oracle), test-only
+# correctness oracles that their gates and docs invoke without `--features lab`.
+ungated_examples            <= 63
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is
@@ -109,4 +116,10 @@ bypass_slack                == 0
 
 # Total across all arch crates. Redundant given the rows, kept so the descent is
 # visible in this file's diff. Lower it when you bank a migration.
-bypass_total                <= 205
+# RATCHET-RAISE 304 -> 305: the "+1 pending from the SCS port PR series" already
+# recorded on the hipfire-arch-qwen35 ledger row, now carried by the SCS fold.
+# Banked 305 -> 296 with fold/flash-next: #755's sealed MoE prefill moved into
+# dispatch (qwen35 -5, cohere2moe -6), plus hipfire-arch-qwen4's 2 recorded rows.
+# Banked 296 -> 206 with PR #795: Qwen3.5 layer bodies run as declarative
+# hipfire_dispatch Steps (qwen35 -90).
+bypass_total                <= 206

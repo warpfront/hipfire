@@ -194,6 +194,22 @@ pub trait Carrier: Send + Sync {
     ) -> Option<bool> {
         None
     }
+
+    /// Spawn this arch's multi-slot engine, arch-erased as a
+    /// [`hipfire_runtime::serve::SlotEngineHandle`]. This is the daemon's
+    /// single slot-mode dispatch — it resolves `carrier_for(arch_id)` and
+    /// calls this rather than naming `hipfire_arch_qwen35::serve_engine`.
+    /// `loader` depends on the arch crates, so the concrete engine can be
+    /// boxed here without a loader->arch->loader cycle.
+    ///
+    /// Default: `Err` (arch has no multi-slot engine). Only the qwen35
+    /// carrier overrides today (arch_id 5|6).
+    fn spawn_slot_engine(
+        &self,
+        _cfg: hipfire_runtime::serve::SlotEngineConfig,
+    ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
+        Err(format!("{}: no multi-slot engine", self.name()))
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
@@ -432,6 +448,7 @@ const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemm
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 pub enum Eviction {
     Plain(EvictionCtx),
@@ -1887,7 +1904,7 @@ fn build_qwen35_eviction(
             _ => format!("read error ({e}): {sidecar_path}"),
         };
         format!(
-            "cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)"
+            "cask sidecar load failed — {why} (CASK is deprecated and will be removed in 0.5.0; not supported; regen: hipfire sidecar-gen, or clear memory.cask.sidecar)"
         )
     })?;
     let fa_layer_ids: Vec<usize> = config
@@ -2366,10 +2383,24 @@ pub fn load_model_with_kv_backend(
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     load_model_with_gemma4_drafter(
-        path, max_seq, deepseek4_experts_per_token, deepseek4_compute_placement,
-        draft_path, None, None, GEMMA4_EAGLE_DRAFT_LEN, kv_mode_override,
-        None, None, kv_backend_override, kv_adaptive_override, state_quant_override, cask,
-        pp, spec, gpu,
+        path,
+        max_seq,
+        deepseek4_experts_per_token,
+        deepseek4_compute_placement,
+        draft_path,
+        None,
+        None,
+        GEMMA4_EAGLE_DRAFT_LEN,
+        kv_mode_override,
+        None,
+        None,
+        kv_backend_override,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        spec,
+        gpu,
     )
 }
 
@@ -2411,6 +2442,9 @@ pub fn load_model_with_gemma4_drafter(
         draft_path,
         gpu.arch.as_str(),
         None,
+        // No per-request vision_mode on this entry point — preserve the
+        // sibling probe (auto).
+        "auto",
         head_path,
         max_seq,
         crate::admission::KvBackendHints {
@@ -2420,7 +2454,10 @@ pub fn load_model_with_gemma4_drafter(
             qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
             kv_adaptive: kv_adaptive_override,
             cask: Some(cask),
-            deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
+            deepseek4_heterogeneous: !matches!(
+                deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            ),
             vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
             free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
         },
@@ -2454,7 +2491,6 @@ pub fn load_model_with_gemma4_drafter(
         None,
         kv_mode_override,
         kv_k_override,
-        kv_v_override,
         kv_adaptive_override,
         state_quant_override,
         cask,
@@ -2488,7 +2524,6 @@ pub fn load_admitted_with_gemma4_drafter(
     mtp_path: Option<&Path>,
     kv_mode_override: Option<&str>,
     kv_k_override: Option<&str>,
-    kv_v_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
@@ -2500,10 +2535,12 @@ pub fn load_admitted_with_gemma4_drafter(
         source,
         kv_backend,
         qwen_default_q8,
+        kv_v,
         max_seq,
         sequence,
         carrier,
         vision_path,
+        vision_mode,
         ..
     } = admission;
     let carrier =
@@ -2516,19 +2553,22 @@ pub fn load_admitted_with_gemma4_drafter(
     let mut ctx = LoadCtx {
         path,
         max_seq,
-        sequence: sequence.as_ref().map(|s| hipfire_runtime::loader_api::SequenceHint {
-            model_ctx: s.model_ctx,
-            automatic: s.bound != "user",
-            card_cap: 0,
-        }),
+        sequence: sequence
+            .as_ref()
+            .map(|s| hipfire_runtime::loader_api::SequenceHint {
+                model_ctx: s.model_ctx,
+                automatic: s.bound != "user",
+                card_cap: 0,
+            }),
         deepseek4_compute_placement,
         deepseek4_experts_per_token,
         draft_path,
         vision_path,
         mtp_path: mtp_path.map(Path::to_path_buf),
+        vision_mode,
         kv_mode_override,
         kv_k_override,
-        kv_v_override,
+        kv_v_override: kv_v.as_deref(),
         qwen_default_q8,
         kv_backend,
         kv_adaptive_override,
@@ -2548,7 +2588,13 @@ pub fn load_admitted_with_gemma4_drafter(
         if let Some(measured) = ctx.sequence {
             s.card_cap = measured.card_cap;
             s.max_seq = result.max_seq;
-            s.bound = if !measured.automatic { "user" } else if measured.model_ctx <= measured.card_cap { "model" } else { "card" };
+            s.bound = if !measured.automatic {
+                "user"
+            } else if measured.model_ctx <= measured.card_cap {
+                "model"
+            } else {
+                "card"
+            };
         }
         s
     });
@@ -3137,31 +3183,57 @@ pub fn load_model_ep_with_kv_mode(
     // dispatches on arch_id, so the admission retains the arch_id decision and
     // the per-rank file re-open happens inside the EP load (unchanged).
     let hip = hip_bridge::HipRuntime::load().ok();
-    let gpu_arch = hip.as_ref().and_then(|h| h.get_arch(0).ok()).unwrap_or_default();
+    let gpu_arch = hip
+        .as_ref()
+        .and_then(|h| h.get_arch(0).ok())
+        .unwrap_or_default();
     let vmm_runtime_available = hip.as_ref().is_some_and(|h| {
         (0..tp).all(|rank| {
             h.get_arch(rank as i32).ok().as_deref() == Some(gpu_arch.as_str())
                 && h.mem_get_allocation_granularity(
                     &hip_bridge::HipMemAllocationProp::device_pinned(rank as i32),
                     hip_bridge::HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
-                ).is_ok()
+                )
+                .is_ok()
         })
     });
     let admission = crate::admission::admit_source(
-        path, tp, 1, crate::admission::KvBackendRequest::from_override(kv_backend)?,
-        None, &gpu_arch, None, None, max_seq,
+        path,
+        tp,
+        1,
+        crate::admission::KvBackendRequest::from_override(kv_backend)?,
+        None,
+        &gpu_arch,
+        None,
+        "auto",
+        None,
+        max_seq,
         crate::admission::KvBackendHints {
-            kv_mode, kv_k: None, kv_v: None,
+            kv_mode,
+            kv_k: None,
+            kv_v: None,
             qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
-            kv_adaptive: None, cask: None,
-            deepseek4_heterogeneous: false, vmm_runtime_available,
+            kv_adaptive: None,
+            cask: None,
+            deepseek4_heterogeneous: false,
+            vmm_runtime_available,
             free_vram_bytes: None, // EP has no single-card KV capacity envelope.
         },
     )?;
     let warning = crate::admission::legacy_warning(
-        admission.kv_backend, admission.kv_backend_reason.as_deref()
+        admission.kv_backend,
+        admission.kv_backend_reason.as_deref(),
     );
-    let loaded = load_model_ep_admitted(admission, path, max_seq, tp, kv_mode, None, None, state_quant);
+    let loaded = load_model_ep_admitted(
+        admission,
+        path,
+        max_seq,
+        tp,
+        kv_mode,
+        None,
+        None,
+        state_quant,
+    );
     if loaded.is_ok() {
         if let Some(warning) = warning {
             eprintln!("{warning}");
@@ -3197,7 +3269,17 @@ pub fn load_model_ep_admitted(
             kv_backend,
         ),
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, Some(kv_backend.as_str()), state_quant),
+        5 | 6 => load_model_ep_qwen35(
+            path,
+            max_seq,
+            tp,
+            kv_mode,
+            kv_k,
+            kv_v,
+            qwen_default_q8,
+            Some(kv_backend.as_str()),
+            state_quant,
+        ),
         // Backstop: `admit_source` above already refused every other arch_id.
         // Route through the shared constructor (not `unreachable!`) so the
         // refusal survives a future edit that drops the early classification,
@@ -3644,17 +3726,34 @@ fn load_model_ep_qwen35(
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
         drop(hfq_probe);
-        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, kv_k, kv_v, qwen_default_q8, kv_backend, state_quant);
+        return load_model_tp_qwen35_dense(
+            path,
+            max_seq,
+            tp,
+            kv_mode,
+            kv_k,
+            kv_v,
+            qwen_default_q8,
+            kv_backend,
+            state_quant,
+        );
     }
-    if let Some(reason) = qwen35_ep_moe_topology_refusal(hfq_probe.arch_id, config.num_experts, tp) {
+    if let Some(reason) = qwen35_ep_moe_topology_refusal(hfq_probe.arch_id, config.num_experts, tp)
+    {
         return Err(reason);
     }
     let state_quant_resolved = parse_state_quant(state_quant)?;
     let config_mode = hipfire_runtime::config::get();
     let kv_raw = kv_mode.unwrap_or(config_mode.kv_mode.as_str());
     let pair = kv_mode::resolve_kv_pair(
-        kv_raw, kv_k, kv_v, &kv_mode::QWEN35_TP_POLICY, "multi-gpu", qwen_default_q8
-    ).map_err(|e| format!("Qwen EP KV: {e}"))?;
+        kv_raw,
+        kv_k,
+        kv_v,
+        &kv_mode::QWEN35_TP_POLICY,
+        "multi-gpu",
+        qwen_default_q8,
+    )
+    .map_err(|e| format!("Qwen EP KV: {e}"))?;
     let kv_mode_resolved = pair.k();
     let Some(v_mode) = pair.v() else {
         return Err("Qwen native KV has no multi-GPU constructor".into());
@@ -3897,8 +3996,14 @@ fn load_model_tp_qwen35_dense(
     let config_mode = hipfire_runtime::config::get();
     let kv_raw = kv_mode.unwrap_or(config_mode.kv_mode.as_str());
     let pair = kv_mode::resolve_kv_pair(
-        kv_raw, kv_k, kv_v, &kv_mode::QWEN35_TP_POLICY, "multi-gpu", qwen_default_q8
-    ).map_err(|e| format!("Qwen dense TP KV: {e}"))?;
+        kv_raw,
+        kv_k,
+        kv_v,
+        &kv_mode::QWEN35_TP_POLICY,
+        "multi-gpu",
+        qwen_default_q8,
+    )
+    .map_err(|e| format!("Qwen dense TP KV: {e}"))?;
     let kv_mode_resolved = pair.k();
     let Some(v_mode) = pair.v() else {
         return Err("Qwen native KV has no multi-GPU constructor".into());
@@ -4531,6 +4636,7 @@ mod ep_admission_tests {
             None,
             arch,
             None,
+            "auto",
             None,
             4096,
             admission::KvBackendHints::without_device(),
@@ -4564,8 +4670,15 @@ mod ep_admission_tests {
         let before_response = active.request();
         let mut effects = LoadEffects::default();
 
-        attempt_candidate_swap(&candidate, 3, admission::KvBackendRequest::Automatic, "gfx1201", &mut active, &mut effects)
-            .expect_err("Qwen3.5 MoE EP tp=3 candidate must refuse before teardown");
+        attempt_candidate_swap(
+            &candidate,
+            3,
+            admission::KvBackendRequest::Automatic,
+            "gfx1201",
+            &mut active,
+            &mut effects,
+        )
+        .expect_err("Qwen3.5 MoE EP tp=3 candidate must refuse before teardown");
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.identity, before_identity);
         assert_eq!(active.request(), before_response);
@@ -4621,6 +4734,18 @@ mod lfm2_batch_admission_tests {
 #[cfg(test)]
 mod registry_tests {
     use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
+
+    /// `arch_label` is the one wire name for the load ACK, `diag` and the
+    /// multi-slot preflight: a loaded dots-ocr model must never report the
+    /// `qwen3` fallback.
+    #[test]
+    fn arch_label_names_vision_and_slot_arches() {
+        use super::arch_label;
+        assert_eq!(arch_label(8), "dots-ocr");
+        assert_eq!(arch_label(5), "qwen3_5");
+        assert_eq!(arch_label(6), "qwen3_5_moe");
+        assert_eq!(arch_label(0), "qwen3");
+    }
 
     #[test]
     fn deepseek4_kv_mode_is_truthful_and_fail_closed() {
@@ -5609,5 +5734,21 @@ mod registry_tests {
             vec!["low", "medium", "xhigh"],
             "supported rungs must be exactly the Qwen3.8 contract"
         );
+    }
+}
+
+#[cfg(all(test, feature = "arch-qwen35"))]
+mod mtp_sidecar_probe_tests {
+    use std::path::Path;
+
+    #[test]
+    fn loader_probe_includes_stem_sidecar_for_mq4v2_hfq() {
+        // finish_qwen35_load uses find_mtp_sidecar; pin the product spelling
+        // `qwen3.5-4b.mq4v2.hfq` → `qwen3.5-4b.mtp` so a last-extension-only
+        // probe cannot silently return.
+        let c = hipfire_arch_qwen35::mtp_head::mtp_sidecar_candidates(Path::new(
+            "/models/qwen3.5-4b.mq4v2.hfq",
+        ));
+        assert!(c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")), "{c:?}");
     }
 }

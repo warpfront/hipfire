@@ -4,23 +4,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
-
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::fs::File;
-use std::io::Write;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32};
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
-use crate::e8;
-use crate::e8_gptq;
-use crate::gguf_input;
-use crate::reap_overlay;
 
 pub(crate) fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {

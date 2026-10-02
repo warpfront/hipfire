@@ -197,21 +197,28 @@ MQ3-Lloyd 112 B/group, MQ4-Lloyd 160 B/group).
 ## KV cache
 
 K and V are quantized differently: K enters softmax (errors exponentiate); V is
-already attention-weighted. Live modes store **V as Q8** and compress **K**:
+already attention-weighted. Split modes store **V as Q8** (or Lloyd V via
+`--kv-v`) and compress **K**; native `fp8`/`bf16` store K and V in one layout:
 
 | Mode | K | V | Notes |
 |---|---|---|---|
-| `q8` | Q8_0 (G32) | Q8_0 | Default fall-through; DFlash-safe |
-| `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Same byte layout family as legacy asym; FWHT basis matches MQ drafts → better DFlash acceptance |
-| `asym4` / `asym3` / `asym2` | Givens + Lloyd-Max K | Q8_0 | **Legacy**; degrades DFlash acceptance vs fwht* |
-| `turbo` / `turbo2` / `turbo3` / `turbo4` | aliases | | Map to asym3 / asym2 / asym3 / asym4 |
+| `q8` | Q8_0 (G32) | Q8_0 | `auto` default wherever native fp8 does not apply (gfx1100, gfx1151, …); DFlash-safe |
+| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 (H24/Hkv4/D256, single GPU, no adaptive/CASK) |
+| `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts → better DFlash acceptance |
+| `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Legacy spellings** | Q8_0 | On Qwen they are aliases: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the Givens constructors |
+| `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Legacy**; Qwen `--kv-k` only; degrades DFlash acceptance vs fwht* |
 
-**Default resolution** (`crates/hipfire-cli/src/main.rs`):
+**Default resolution** (`load_params` in `crates/hipfire-cli/src/main.rs`,
+then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
 
-1. `HIPFIRE_KV_MODE` env
-2. Per-model config `kv_cache`
-3. Registry `default_kv_mode` when config is `auto`
-4. Else **`q8`**
+1. CLI `--kv-mode`
+2. `HIPFIRE_KV_MODE` env, then per-model / global config `kv_cache`
+3. Registry `default_kv_mode` when no user layer sets `kv_cache` and the
+   card's value is not `q8` (a `q8` card value is left to `auto`)
+4. Else `auto`, resolved by the architecture: Qwen native **fp8** on
+   native-eligible exact gfx1201, **q8** on every other Qwen load
+   (gfx1100, gfx1151, …); other families keep their own default (Maple
+   bf16, DeepSeek V4 f32, others q8)
 
 There is **no** live per-arch `archDefaults` table (removed). Compressed modes
 are opt-in via registry cards or explicit config — not guessed from GPU VRAM.

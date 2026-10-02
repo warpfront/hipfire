@@ -77,6 +77,12 @@ pub const AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE: u32 = 6;
 pub const AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT: u32 = 7;
 pub const AMD_MEMORY_POOL_STANDARD_FLAG: u32 = 0;
 pub const AMD_MEMORY_POOL_EXECUTABLE_FLAG: u32 = 1 << 2;
+/// `HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS` (`hsa_amd_agent_memory_pool_info_t`).
+pub const AMD_AGENT_MEMORY_POOL_INFO_ACCESS: u32 = 0;
+/// `hsa_amd_memory_pool_access_t`.
+pub const AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED: u32 = 0;
+pub const AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT: u32 = 1;
+pub const AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT: u32 = 2;
 
 pub const EXECUTABLE_SYMBOL_INFO_TYPE: u32 = 0;
 pub const SYMBOL_KIND_KERNEL: u32 = 1;
@@ -190,6 +196,8 @@ pub type ProfilingGetAsyncCopyTimeFn =
 pub type AgentIterateMemoryPoolsFn =
     unsafe extern "C" fn(Agent, Option<MemoryPoolCallback>, *mut c_void) -> Status;
 pub type MemoryPoolGetInfoFn = unsafe extern "C" fn(MemoryPool, u32, *mut c_void) -> Status;
+pub type AgentMemoryPoolGetInfoFn =
+    unsafe extern "C" fn(Agent, MemoryPool, u32, *mut c_void) -> Status;
 pub type MemoryPoolAllocateFn =
     unsafe extern "C" fn(MemoryPool, usize, u32, *mut *mut c_void) -> Status;
 pub type MemoryPoolFreeFn = unsafe extern "C" fn(*mut c_void) -> Status;
@@ -276,6 +284,9 @@ pub struct Symbols {
     pub profiling_get_async_copy_time: Option<ProfilingGetAsyncCopyTimeFn>,
     pub agent_iterate_memory_pools: AgentIterateMemoryPoolsFn,
     pub memory_pool_get_info: MemoryPoolGetInfoFn,
+    /// `hsa_amd_agent_memory_pool_get_info`; optional so its absence only
+    /// disables device-local retained kernargs (host-pool fallback).
+    pub agent_memory_pool_get_info: Option<AgentMemoryPoolGetInfoFn>,
     pub memory_pool_allocate: MemoryPoolAllocateFn,
     pub memory_pool_free: MemoryPoolFreeFn,
     pub agents_allow_access: AgentsAllowAccessFn,
@@ -400,6 +411,10 @@ impl Symbols {
                 AgentIterateMemoryPoolsFn
             ),
             memory_pool_get_info: symbol!("hsa_amd_memory_pool_get_info", MemoryPoolGetInfoFn),
+            agent_memory_pool_get_info: optional_symbol!(
+                "hsa_amd_agent_memory_pool_get_info",
+                AgentMemoryPoolGetInfoFn
+            ),
             memory_pool_allocate: symbol!("hsa_amd_memory_pool_allocate", MemoryPoolAllocateFn),
             memory_pool_free: symbol!("hsa_amd_memory_pool_free", MemoryPoolFreeFn),
             agents_allow_access: symbol!("hsa_amd_agents_allow_access", AgentsAllowAccessFn),

@@ -1,8 +1,10 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{END, Epi, Gen, Tile, lit, mem, op, publish, s, sr, v};
-use crate::{Builder, insn::MemoryClass, lds::Transition};
+use super::{Epi, Gen, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg, publish};
+use crate::kernels::common::{lit, mem, op, s, sop, sr, v};
+use crate::{Builder, insn::{Instruction, MemoryClass}};
+use peacemaker_author::{End, Free, Ring, prime};
 
 /// SALU unsigned 32-bit division, LLVM's AMDGPU expansion: a float
 /// reciprocal refined once, then two quotient corrections. Exact for all
@@ -30,16 +32,14 @@ fn udiv(b: &mut Builder, num: u8, den: u8, q: u8, r: u8, x: u8, y: u8) -> Result
     Ok(())
 }
 
-fn sop(b: &mut Builder, text: String, d: &[u8], u: &[u8]) -> Result<(), String> {
-    op(b, text, &d.iter().map(|&n| s(n)).collect::<Vec<_>>(), &u.iter().map(|&n| s(n)).collect::<Vec<_>>())
-}
 /// VALU helper: `vdst` defined, `vuse`/`suse` read.
 fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Result<(), String> {
     let uses = vuse.iter().map(|&n| v(n)).chain(suse.iter().map(|&n| s(n))).collect::<Vec<_>>();
     op(b, text, &[v(vdst)], &uses)
 }
 
-pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
+pub(crate) fn emit(wg: &mut Wg, g: &Gen, end: &End, (ra, rw, rd, rs): (Ring<PayA, Free, Free>, Ring<PayW, Free, Free>, Ring<MetaD, Free, Free>, Ring<MetaS, Free, Free>)) -> Result<Lds, String> {
+    let b = wg.isa();
     let a = g.args;
     let silu = g.spec.epi.is_silu();
     let tile = g.tile;
@@ -79,10 +79,12 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     }
     // Tiles past the problem exit (none for the host grid; kept for safety).
     sop(b, format!("s_lshl_b32 s54, s{}, {}", a.m, u32::from(silu)), &[54], &[a.m])?;
-    sop(b, format!("s_cmp_ge_u32 s{}, s54", g.rs), &[], &[g.rs, 54])?;
-    op(b, format!("s_cbranch_scc1 {END}"), &[], &[])?;
-    sop(b, format!("s_cmp_ge_u32 s{}, s{}", g.bs, a.n), &[], &[g.bs, a.n])?;
-    op(b, format!("s_cbranch_scc1 {END}"), &[], &[])?;
+    // rs/bs come from the workgroup ids and kernel arguments only.
+    let outside = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_ge_u32 s{}, s54", g.rs), vec![], vec![s(g.rs), s(54)]))?;
+    wg.exit_if(outside, end)?;
+    let outside = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_ge_u32 s{}, s{}", g.bs, a.n), vec![], vec![s(g.bs), s(a.n)]))?;
+    wg.exit_if(outside, end)?;
+    let b = wg.isa();
 
     // Scalars: M-1 (row clamp), 136 * K/256 (row stride), loop trips, h-rows.
     sop(b, format!("s_add_co_i32 s{}, s{}, -1", g.mm1, a.m), &[g.mm1], &[a.m])?;
@@ -250,13 +252,14 @@ pub(crate) fn emit(b: &mut Builder, g: &Gen) -> Result<(), String> {
     }
     for i in (0..8u8).step_by(2) {
         let r = g.magic + i;
-        op(b, format!("v_dual_mov_b32 v{r}, {m} :: v_dual_mov_b32 v{}, {m}", r + 1, m = lit(super::spec::MAGIC)), &[v(r), v(r + 1)], &[])?;
+        op(b, format!("v_dual_mov_b32 v{r}, {m} :: v_dual_mov_b32 v{}, {m}", r + 1, m = lit(crate::kernels::iu4_fold::MAGIC)), &[v(r), v(r + 1)], &[])?;
     }
-    publish::publish_slab(b, g, 0)?;
-    publish::publish_meta(b, g, 0)?;
-    b.barrier_signal(&[Transition::Ready(g.slot_a[0]), Transition::Ready(g.slot_w[0]), Transition::Ready(g.slot_ds[0]), Transition::Ready(g.slot_sz[0])])?;
+    let ((ra, pa), (rw, pw)) = publish::publish_slab(wg, g, ra, rw)?;
+    let ((rd, pd), (rs, ps)) = publish::publish_meta(wg, g, rd, rs)?;
+    let (da, dw, dd, ds) = wg.wait_all((pa, pw, pd, ps))?;
+    let arrived = wg.signal((prime(ra, da), prime(rw, dw), prime(rd, dd), prime(rs, ds)))?;
     // Seed the ring: every subsequent slab-1 fetch is issued by its
     // predecessor after the slab-0 payload has been published.
-    publish::fetch_slab1(b, g, 0)?;
-    b.barrier_wait()
+    publish::fetch_slab1(wg.isa(), g, 0)?;
+    wg.wait_arrived(arrived)
 }

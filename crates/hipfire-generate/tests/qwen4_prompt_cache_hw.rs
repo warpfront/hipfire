@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Qwen4 (Flash-Next) prompt-cache hardware tests.
+//! Qwen4 (Flash-Next) prompt-cache and MTP hardware tests.
 //!
-//! Both tests are `#[ignore]`d: they need a real HIP GPU, the Flash-Next
+//! Every test is `#[ignore]`d: they need a real HIP GPU, the Flash-Next
 //! model (`HIPFIRE_QWEN4_CACHE_MODEL`, default
 //! `~/.hipfire/models/qwen3.8-flash-next.mq4.hfq`) and a release daemon
 //! (`HIPFIRE_DAEMON_BIN`, default `target/release/daemon`).
@@ -13,7 +13,8 @@
 //! turn's `messages` purely extend the previous turn, then asserts the
 //! `cached_tokens` pattern on each `done`: a pure extension reuses the prefix,
 //! except an MTP turn right after an AR turn (the AR decode does not feed the
-//! MTP head, so that hit is demoted to a cold miss).
+//! MTP head, so that hit is demoted to a cold miss).  A third test checks that
+//! seeded sampled MTP emits seeded AR's exact text.
 
 #![allow(clippy::all)]
 
@@ -189,27 +190,30 @@ fn load(s: &mut Session, model: &str, mtp: bool, context: &str) {
     }
 }
 
-/// One committed turn: returns (`done` event, concatenated token text).
+/// One committed turn with `sampling` (temperature/seed/penalty fields merged
+/// into the request): returns (`done` event, concatenated token text).
 fn turn(
     s: &mut Session,
     id: &str,
     attempt: u64,
     messages: &[Value],
-    temperature: f64,
+    sampling: &Value,
     context: &str,
 ) -> (Value, String) {
     let prompt = messages.last().unwrap()["content"].clone();
-    s.send(&serde_json::json!({
+    let mut request = serde_json::json!({
         "type": "generate",
         "id": id,
         "attempt_id": attempt,
         "prompt": prompt,
         "messages": messages,
-        "temperature": temperature,
-        "seed": 12345,
         "max_tokens": 96,
         "thinking_enabled": false,
-    }));
+    });
+    for (key, value) in sampling.as_object().expect("sampling is an object") {
+        request[key] = value.clone();
+    }
+    s.send(&request);
     let mut text = String::new();
     loop {
         let e = s.recv(context);
@@ -228,10 +232,10 @@ fn turn(
     }
 }
 
-/// Run the five-turn conversation; `temps[i]` picks turn `i`'s sampling
-/// (0.0 → greedy, native MTP when loaded; > 0 → AR). Returns per-turn
-/// (`cached_tokens`, `mtp` marker).
-fn conversation(extra_env: &[(&str, &str)], mtp: bool, temps: [f64; 5]) -> Vec<(u64, bool)> {
+/// Run the five-turn greedy conversation; `penalties[i]` is turn `i`'s
+/// repeat penalty (1.0 → native MTP when loaded; anything else → AR, which
+/// applies it). Returns per-turn (`cached_tokens`, `mtp` marker).
+fn conversation(extra_env: &[(&str, &str)], mtp: bool, penalties: [f64; 5]) -> Vec<(u64, bool)> {
     let Some(model) = model_path() else {
         return Vec::new();
     };
@@ -240,7 +244,7 @@ fn conversation(extra_env: &[(&str, &str)], mtp: bool, temps: [f64; 5]) -> Vec<(
     load(&mut s, &model, mtp, "load");
     let mut messages: Vec<Value> = Vec::new();
     let mut out = Vec::new();
-    for (i, (user, temp)) in USERS.iter().zip(temps).enumerate() {
+    for (i, (user, penalty)) in USERS.iter().zip(penalties).enumerate() {
         messages.push(serde_json::json!({ "role": "user", "content": user }));
         let context = format!("turn {}", i + 1);
         let (done, text) = turn(
@@ -248,7 +252,7 @@ fn conversation(extra_env: &[(&str, &str)], mtp: bool, temps: [f64; 5]) -> Vec<(
             &format!("q4c-{i}"),
             i as u64 + 1,
             &messages,
-            temp,
+            &serde_json::json!({ "temperature": 0.0, "repeat_penalty": penalty, "seed": 12345 }),
             &context,
         );
         let cached = done
@@ -256,7 +260,7 @@ fn conversation(extra_env: &[(&str, &str)], mtp: bool, temps: [f64; 5]) -> Vec<(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let is_mtp = done.get("mtp").and_then(|v| v.as_bool()) == Some(true);
-        eprintln!("{context}: T={temp} cached={cached} mtp={is_mtp} text={text:?}");
+        eprintln!("{context}: RP={penalty} cached={cached} mtp={is_mtp} text={text:?}");
         assert!(
             !text.trim().is_empty(),
             "{context}: empty text; done={done}"
@@ -272,7 +276,7 @@ fn conversation(extra_env: &[(&str, &str)], mtp: bool, temps: [f64; 5]) -> Vec<(
 #[ignore = "requires real HIP GPU + HIPFIRE_QWEN4_CACHE_MODEL (qwen3.8-flash-next) + release daemon"]
 fn qwen4_mtp_ar_prompt_cache_alternation() {
     let _g = lock();
-    let turns = conversation(&[], true, [0.0, 0.0, 0.7, 0.0, 0.0]);
+    let turns = conversation(&[], true, [1.0, 1.0, 1.1, 1.0, 1.0]);
     if turns.is_empty() {
         return;
     }
@@ -297,7 +301,7 @@ fn qwen4_mtp_ar_prompt_cache_alternation() {
 #[ignore = "requires real HIP GPU + HIPFIRE_QWEN4_CACHE_MODEL (qwen3.8-flash-next) + release daemon"]
 fn qwen4_ar_prompt_cache_reuses_prefix() {
     let _g = lock();
-    let turns = conversation(&[], false, [0.0; 5]);
+    let turns = conversation(&[], false, [1.0; 5]);
     if turns.is_empty() {
         return;
     }
@@ -308,7 +312,58 @@ fn qwen4_ar_prompt_cache_reuses_prefix() {
         "AR turns 2-5 hit: {cached:?}"
     );
 
-    let disabled = conversation(&[("HIPFIRE_QWEN_PROMPT_CACHE", "0")], false, [0.0; 5]);
+    let disabled = conversation(&[("HIPFIRE_QWEN_PROMPT_CACHE", "0")], false, [1.0; 5]);
     let cached: Vec<u64> = disabled.iter().map(|t| t.0).collect();
     assert!(cached.iter().all(|&c| c == 0), "cache disabled: {cached:?}");
+}
+
+/// Seeded sampled MTP must emit seeded AR's exact tokens on both verify
+/// routes: every emitted token is one draw from the shared sampler RNG, and
+/// a 2..8-row verify forward is bitwise the single-row decode. The code case
+/// is a batched-verify row that once rounded the final HC read differently.
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_QWEN4_CACHE_MODEL (qwen3.8-flash-next) + release daemon"]
+fn qwen4_seeded_sampled_mtp_matches_ar() {
+    let _g = lock();
+    let Some(model) = model_path() else {
+        return;
+    };
+    let model = model.to_string_lossy().into_owned();
+    let prose = "Write a short story opening about a lighthouse keeper who finds a strange object on the beach.";
+    let code = "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two example calls.";
+    let cases: Vec<(&str, f64, u64)> = (1..=4u64)
+        .map(|seed| (prose, 0.7, seed))
+        .chain([(code, 1.0, 6)])
+        .collect();
+    let run = |mtp: bool, incremental: &str| -> Vec<String> {
+        let mut s = Session::spawn(&[
+            ("HIPFIRE_QWEN_PROMPT_CACHE", "0"),
+            ("HIPFIRE_MTP_INCREMENTAL", incremental),
+        ]);
+        load(&mut s, &model, mtp, "load");
+        let mut texts = Vec::new();
+        for (index, &(prompt, temperature, seed)) in cases.iter().enumerate() {
+            let context = format!("mtp={mtp} incremental={incremental} case={index}");
+            let messages = [serde_json::json!({ "role": "user", "content": prompt })];
+            let sampling =
+                serde_json::json!({ "temperature": temperature, "top_p": 0.95, "seed": seed });
+            let attempt = index as u64 + 1;
+            let (done, text) = turn(
+                &mut s,
+                &format!("q4s-{index}"),
+                attempt,
+                &messages,
+                &sampling,
+                &context,
+            );
+            let is_mtp = done.get("mtp").and_then(|v| v.as_bool()) == Some(true);
+            assert_eq!(is_mtp, mtp, "{context}: route; done={done}");
+            texts.push(text);
+        }
+        s.close("unload");
+        texts
+    };
+    let ar = run(false, "1");
+    assert_eq!(run(true, "1"), ar, "interleaved verify");
+    assert_eq!(run(true, "0"), ar, "batched verify");
 }

@@ -6,7 +6,7 @@ use std::{io::Write,process::{Command,Stdio}};
 #[test]fn sgpr_hazard_tracks_only_valu_read_pairs(){let mut h=Gfx12Sgpr::default();let s=|base|RegRef{kind:Kind::S,base,len:1};assert!(h.step(Pipeline::Salu,&[],&[s(10)],false,false).is_empty());assert!(h.step(Pipeline::Vmem,&[s(10)],&[],false,false).is_empty());assert!(h.step(Pipeline::Valu,&[s(10)],&[],false,false).is_empty());assert!(h.step(Pipeline::Salu,&[],&[s(10)],false,false).is_empty());assert_eq!(h.step(Pipeline::Salu,&[s(10)],&[],false,false),["depctr_sa_sdst(0)"]);assert!(h.step(Pipeline::Valu,&[],&[s(10)],false,false).is_empty());assert_eq!(h.step(Pipeline::Valu,&[s(10)],&[],false,false),["depctr_va_sdst(0)"]);h.step(Pipeline::Salu,&[],&[s(10)],false,false);h.step(Pipeline::Smem,&[],&[],false,false);assert!(h.step(Pipeline::Valu,&[s(10)],&[],false,false).is_empty())}
 #[test]fn ledger_retains_partial_load_and_ds_waits(){let r=|base|RegRef{kind:Kind::V,base,len:1};let mut ledger=Ledger::default();for n in [7,79,91,83]{ledger.record(Arch::Gfx1201,&Instruction::new("global_load_b32",vec![r(n)],vec![]).memory(MemoryClass::VmemLoad))}for (n,expected) in [(7,3),(79,2),(91,1),(83,0)]{let req=ledger.required(&Instruction::new("v_xor",vec![r(100)],vec![r(n)]));assert_eq!(req[0].0,Counter::Load);assert_eq!(req[0].1,expected);ledger.wait(Counter::Load,expected)}for n in [71,75,79]{ledger.record(Arch::Gfx1201,&Instruction::new("ds_load_b64",vec![r(n)],vec![]).memory(MemoryClass::DsLoad))}let req=ledger.required(&Instruction::new("v_wmma",vec![r(3)],vec![r(75)]));assert_eq!(req[0].0,Counter::Ds);assert_eq!(req[0].1,1);ledger.wait(Counter::Ds,1);let req=ledger.required(&Instruction::new("v_wmma",vec![r(3)],vec![r(79)]));assert_eq!(req[0].1,0)}
 #[test]fn reg_lifetimes_and_budget(){let mut p=RegPlan::new(8,8).unwrap();p.v::<4>("a",0,Live::Whole).unwrap();assert!(p.v::<2>("alias",2,Live::Whole).is_err());assert!(p.v::<8>("too_large",2,Live::Whole).is_err());assert!(p.s::<4>("srd",2,Live::Whole).is_err())}
-#[test]fn assembler_golden_tables(){let mc="/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";for (arch,file,table) in [("gfx1201",include_str!("golden/gfx1201.txt"),hipfire_isa::insn::GFX1201_GOLDEN),("gfx1100",include_str!("golden/gfx1100.txt"),hipfire_isa::insn::GFX1100_GOLDEN)]{let lines:Vec<_>=file.lines().collect();assert_eq!(lines,table);let mut child=Command::new(mc).args(["-triple=amdgcn-amd-amdhsa",&format!("-mcpu={arch}"),"-show-encoding"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();child.stdin.take().unwrap().write_all(file.as_bytes()).unwrap();let output=child.wait_with_output().unwrap();assert!(output.status.success(),"{arch}: {}",String::from_utf8_lossy(&output.stderr));let text=String::from_utf8(output.stdout).unwrap();assert_eq!(text.matches("encoding: [").count(),lines.len(),"{arch} output:\n{text}")}}
+#[test]fn assembler_golden_tables(){if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }let mc="/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";for (arch,file,table) in [("gfx1201",include_str!("golden/gfx1201.txt"),hipfire_isa::insn::GFX1201_GOLDEN),("gfx1100",include_str!("golden/gfx1100.txt"),hipfire_isa::insn::GFX1100_GOLDEN)]{let lines:Vec<_>=file.lines().collect();assert_eq!(lines,table);let mut child=Command::new(mc).args(["-triple=amdgcn-amd-amdhsa",&format!("-mcpu={arch}"),"-show-encoding"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();child.stdin.take().unwrap().write_all(file.as_bytes()).unwrap();let output=child.wait_with_output().unwrap();assert!(output.status.success(),"{arch}: {}",String::from_utf8_lossy(&output.stderr));let text=String::from_utf8(output.stdout).unwrap();assert_eq!(text.matches("encoding: [").count(),lines.len(),"{arch} output:\n{text}")}}
 
 #[test]
 fn lds_slot_publication_and_split_barrier() {
@@ -42,6 +42,7 @@ fn raw_instruction_immediates_cannot_evade_architecture_table() {
 
 #[test]
 fn gfx1151_uses_the_gfx11_encoding_table() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     let file = include_str!("golden/gfx1100.txt");
     let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
         .args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1151", "-show-encoding"])
@@ -84,11 +85,11 @@ fn builder_combines_simultaneous_load_and_ds_waits() {
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut builder = Builder::new(spec, plan);
-    let slot = builder.lds.add("A0", 0, 256).unwrap();
+    let slot = builder.lds_slot("A0", 0, 256).unwrap();
     builder.ds_store(slot, Instruction::new("ds_store_b32 v2, v0", vec![], vec![address.reg(), value.reg()]).memory(MemoryClass::DsStore)).unwrap();
     builder.push(Instruction::new("global_load_b32 v1, v2, s[0:1]", vec![loaded.reg()], vec![address.reg(), srd.reg()]).memory(MemoryClass::VmemLoad)).unwrap();
     builder.push(Instruction::new("v_mov_b32 v0, v1", vec![value.reg()], vec![loaded.reg()])).unwrap();
-    let combined: Vec<_> = builder.program.instructions.iter().filter(|i| i.mnemonic()=="s_wait_loadcnt_dscnt").collect();
+    let combined: Vec<_> = builder.program().instructions.iter().filter(|i| i.mnemonic()=="s_wait_loadcnt_dscnt").collect();
     assert_eq!(combined.len(), 1);
     assert_eq!(combined[0].text, "s_wait_loadcnt_dscnt 0x0");
     assert_eq!(builder.waits.iter().filter(|p| p.insn==combined[0].text).count(), 2);
@@ -116,7 +117,7 @@ fn wmma_to_wmma_ab_dependency_inserts_nop() {
         "v_wmma_i32_16x16x32_iu4 v[12:19], v[0:1], v[10:11], 0 neg_lo:[1,1,0]",
         vec![second.reg()], vec![RegRef { kind: Kind::V, base: 0, len: 2 }, b.reg()],
     )).unwrap();
-    assert_eq!(builder.program.instructions[1].text, "v_nop");
+    assert_eq!(builder.program().instructions[1].text, "v_nop");
     assert_eq!(builder.hazards[0].rule, "WMMA destination feeds next WMMA A/B or SWMMAC index");
 }
 
@@ -140,11 +141,11 @@ fn global_visibility_is_explicit_not_implied_by_lds_barrier() {
     };
     let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
     builder.barrier(&[]).unwrap();
-    assert_eq!(builder.program.instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 0);
+    assert_eq!(builder.program().instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 0);
     builder.barrier_with_scope(&[], MemoryScope::Workgroup).unwrap();
-    assert_eq!(builder.program.instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 1);
+    assert_eq!(builder.program().instructions.iter().filter(|i| i.mnemonic()=="global_inv").count(), 1);
     assert!(builder.push(Instruction::new("s_barrier_signal -1", vec![], vec![])).is_err());
-    builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+    builder.control(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
     assert_eq!(builder.finish().unwrap().proof.barriers.len(), 2);
 }
 
@@ -166,6 +167,7 @@ fn gfx11_trans_use_is_gfx1100_only_and_vmem_sgpr_needs_no_nop() {
 
 #[test]
 fn typed_instruction_families_encode_on_both_architectures() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     use hipfire_isa::insn::{Wmma, Smem, Global, Vop1};
     use hipfire_isa::reg::S;
     for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
@@ -190,6 +192,7 @@ fn typed_instruction_families_encode_on_both_architectures() {
 
 #[test]
 fn hip_hidden_kernarg_metadata_assembles() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     use hipfire_isa::{Builder, KernelSpec, KernargLayout};
     let spec = KernelSpec {
         kernel_id: "metadata_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
@@ -198,7 +201,7 @@ fn hip_hidden_kernarg_metadata_assembles() {
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: true, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
-    builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+    builder.control(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
     let emitted = builder.finish().unwrap();
     assert!(emitted.s_text.contains(".amdhsa_system_sgpr_workgroup_id_y 1"));
     let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
@@ -211,6 +214,7 @@ fn hip_hidden_kernarg_metadata_assembles() {
 
 #[test]
 fn gfx11_descriptor_extras_assemble() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     use hipfire_isa::{Builder, KernelSpec, KernargLayout};
     for arch in [Arch::Gfx1100, Arch::Gfx1151] {
         let spec = KernelSpec {
@@ -219,7 +223,7 @@ fn gfx11_descriptor_extras_assemble() {
             user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 32, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
         };
         let mut builder = Builder::new(spec, RegPlan::new(8, 8).unwrap());
-        builder.push(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
+        builder.control(Instruction::new("s_endpgm", vec![], vec![])).unwrap();
         let emitted = builder.finish().unwrap();
         let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
             .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={}", arch.name()), "-filetype=obj", "-o", "/dev/null"])

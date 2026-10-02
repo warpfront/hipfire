@@ -4,25 +4,11 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
-use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::quant_fwht::cpu_fwht_256;
 use crate::dequant::e2m1_to_f32;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::fs::File;
-use std::io::Write;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
-use crate::e8;
-use crate::e8_gptq;
-use crate::gguf_input;
-use crate::reap_overlay;
+use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 // ─── HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale) ────────────────
 //

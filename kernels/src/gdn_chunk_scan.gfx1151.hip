@@ -44,7 +44,16 @@ __device__ __forceinline__ gs_bfrag gs_frag(const unsigned short*p,int pitch,int
 #pragma unroll
  for(int e=0;e<16;++e)u.h[e]=p[r*pitch+k0+e];
  return u.v;}
-#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
+// LDS-only workgroup barrier: the "local" fences keep in-flight global
+// prefetches in flight. Each wave waits for its own LDS ops (lgkmcnt(0), vmcnt
+// and expcnt left open: gfx11 s_waitcnt 0xFC07) before it signals. The fence's
+// own wait is a soft s_waitcnt that SIInsertWaitcnts may erase as redundant
+// without seeing loop-carried stores (llvm/llvm-project#220357); in WGP mode
+// the waves span both CUs, whose LDS queues are not ordered, so a read after
+// the barrier could overtake another wave's queued store (the gfx1151
+// VerifyAttn race). The explicit wait cannot be erased.
+#define GS_WAIT_LGKM0 0xFC07
+#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");__builtin_amdgcn_s_waitcnt(GS_WAIT_LGKM0);__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
 
 struct __attribute__((aligned(16))) GsLds{
  unsigned short score[GS_C][GS_AP];

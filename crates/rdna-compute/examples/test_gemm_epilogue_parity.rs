@@ -652,6 +652,7 @@ fn run_cell(
         addin: matches!(combo, Combo::Addin | Combo::GatedAddin).then_some(&op.addin),
         gate: matches!(combo, Combo::Gated | Combo::GatedAddin).then_some(&op.gate),
         residual: matches!(combo, Combo::Gated | Combo::GatedAddin).then_some(&op.resid),
+        ..Default::default()
     };
     let bias_arg = if with_bias { Some(&op.bias) } else { None };
     gpu.gemm_f16_x_f16_wmma_lds_epi_ld(

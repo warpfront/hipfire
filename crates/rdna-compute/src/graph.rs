@@ -116,6 +116,12 @@ pub struct GraphState {
     pub ar_forward_blobs: Vec<Vec<u8>>,
     pub ar_forward_kernel_dirty: bool,
     pub ar_forward_replay_enabled: bool,
+    /// Caller-defined identity of the buffers baked into `graph_exec` (the
+    /// qwen35 `forward_scratch` binding of weights, KV cache, DeltaNet state
+    /// and scratch). Zero means unbound: every AR capture resets it, and only
+    /// the capturing caller sets it. A replay must see the binding it was
+    /// captured with; the graph ignores the buffers a later call passes.
+    pub ar_forward_binding: u64,
     /// One-shot AR-graph eligibility, CONSUMED (reset to **true**) on read in
     /// `forward_scratch`. Plain sequential single-token decode is eligible by
     /// default; the spec-decode / MTP / verify callers set it FALSE right before
@@ -190,6 +196,7 @@ impl GraphState {
         mark_graph_captured();
         self.captured_graph = Some(graph);
         self.graph_exec = Some(exec);
+        self.ar_forward_binding = 0;
         // Take OWNERSHIP of this graph's kernarg blobs out of the shared
         // `capture_blobs` (mirrors `end_verify_graph_capture`). The heap
         // allocations move with the Vec, so the graph nodes' kernarg pointers

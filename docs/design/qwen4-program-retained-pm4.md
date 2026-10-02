@@ -262,7 +262,7 @@ here rather than an optimization.
 
 | Quantity | Value | Source |
 |---|---|---|
-| `max_seq` | exactly 2048 (admission requires it) | `crates/hipfire-loader/src/admission.rs` |
+| `max_seq` | 2048 (the automatic value; admission requires ≥ 2048 since 2026-09-30, exactly 2048 when this was written) | `crates/hipfire-loader/src/admission.rs` |
 | `compress` / `budget` | 4 / 2048 | `crates/hipfire-arch-qwen4/src/config.rs` |
 | indexer heads / kv heads / index_dim | 4 / 1 / 128 | same |
 | main heads / kv heads / head_dim | 24 / 2 / 256 | same |
@@ -867,19 +867,20 @@ positions. What was added:
    prepares the transport it chooses rather than the one the controller is
    configured with.
 3. **`--qwen4` mode in `scripts/redline_daemon_harness.py`**, gating
-   `QWEN4_EXACT_FIELDS` per position plus the capture-position oracle row.
+   `QWEN4_EXACT_FIELDS` per position for both the retained arm and the
+   recorded-HIP oracle.
 
 Two semantics worth stating, both learned by running it:
 
-- **The recorded-HIP oracle is exact only at its capture position.** It
-  substitutes position through the controller's *synthesized-binding
-  calibration*; the Qwen4 route instead **declares** its position bindings in
-  the program (G1/G2), which the oracle path does not read. So the oracle is
-  compared once, at the capture geometry, while the retained transport carries
-  the multi-position claim — which is the stronger half anyway. Observed
-  directly: with the tape captured at position 128, the oracle matched HIP at
-  the capture window and diverged from 129 onward, while the retained arm stayed
-  bit-exact at 129–133.
+- **The recorded-HIP oracle applies the retained binding set.** It originally
+  substituted position only through the controller's *synthesized-binding
+  calibration* and ignored the bindings the Qwen4 program **declares** (G1/G2),
+  so it was exact only at its capture position: with the tape captured at
+  position 128, it matched HIP at the capture window and diverged from 129
+  onward while the retained arm stayed bit-exact at 129–133. The oracle and the
+  PM4 plan now build their bindings through one helper
+  (`replay::retained_kernarg_bindings`: GDN frames, synthesized and declared
+  bindings), and the oracle is compared at every window.
 - **`prepared_route_identity` now follows the installed plan**, not the
   configured transport. It previously answered `None` for a PM4 plan on a
   controller whose configured transport was AQL — i.e. it could report an
@@ -1011,7 +1012,12 @@ reuse of the earlier one.
 the capture window (`effect-incomplete — … 1 memset(s)`), while a capture later
 in the same process reports zero. The plan still prepares, and gates 4–6 hold on
 those processes, which is consistent with a first-use lazy initialisation rather
-than per-token state. It is not yet named, so it stays open.
+than per-token state. *Closed 2026-10-01:* the memset is the one-time zeroing of
+the fused GDN rotation's head-pair counters (`tensor_ops::ensure_gdn_pair_counters`).
+The kernel resets those counters on every launch, so the memset was harmless. The
+retained-body boundary now runs it before arming the window. An automatic capture
+whose window holds any device copy, readback or memset is now refused at
+prepare (`ReplayController::refuse_effect_incomplete_window`).
 
 **Disposition:** this is evidence for gates 1–8 at this head, with gate 7
 collected at context 128 only. It is **not** a promotion or an admission:

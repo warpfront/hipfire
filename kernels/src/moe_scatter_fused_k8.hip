@@ -67,38 +67,17 @@ extern "C" __global__ void moe_scatter_fused_k8(
     }
     __syncthreads();
 
-    // ── Phase 2: pad + exclusive prefix-sum ──
-    // A block-wide scan over contiguous per-thread expert ranges: integer
-    // sums, so the offsets equal the serial walk's exactly.
-    __shared__ int wave_totals[32];
-    const int per = (num_experts + bdim - 1) / bdim;
-    const int first = tid * per;
-    const int last = min(first + per, num_experts);
-    int local = 0;
-    for (int e = first; e < last; ++e) {
-        local += ((s_workspace[e] + block_m - 1) / block_m) * block_m;
-    }
-    const int lane = tid & 31;
-    const int wave = tid >> 5;
-    const int waves = (bdim + 31) >> 5;
-    int inclusive = local;
-    for (int offset = 1; offset < 32; offset <<= 1) {
-        const int up = __shfl_up(inclusive, offset, 32);
-        if (lane >= offset) inclusive += up;
-    }
-    if (lane == 31 || tid == bdim - 1) wave_totals[wave] = inclusive;
-    __syncthreads();
+    // ── Phase 2: pad + exclusive prefix-sum (serial in thread 0 — E ≤ 256) ──
     if (tid == 0) {
-        for (int w = 1; w < waves; ++w) wave_totals[w] += wave_totals[w - 1];
-        expert_offsets[num_experts] = wave_totals[waves - 1]; // M_total
-    }
-    __syncthreads();
-    int acc = inclusive - local + (wave > 0 ? wave_totals[wave - 1] : 0);
-    for (int e = first; e < last; ++e) {
-        const int padded = ((s_workspace[e] + block_m - 1) / block_m) * block_m;
-        expert_offsets[e] = acc;
-        expert_token_counts[e] = padded;
-        acc += padded;
+        int acc = 0;
+        for (int i = 0; i < num_experts; i++) {
+            const int raw = s_workspace[i];
+            const int padded = ((raw + block_m - 1) / block_m) * block_m;
+            expert_offsets[i] = acc;
+            expert_token_counts[i] = padded;
+            acc += padded;
+        }
+        expert_offsets[num_experts] = acc; // M_total
     }
     __syncthreads();
 

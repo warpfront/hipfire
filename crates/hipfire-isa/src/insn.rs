@@ -48,6 +48,27 @@ impl Instruction {
         }
         Ok(())
     }
+    /// One plain instruction for a raw `push`: a single assembler statement
+    /// (no line break, no label, no directive, lower-case mnemonic) that
+    /// neither changes control flow nor touches a barrier. Branches, the
+    /// program end and barriers are emitted by the typed core (`Auth`) or
+    /// the untyped builder entry points.
+    pub fn check_raw(&self)->Result<(),String> {
+        if self.text.chars().any(|c|c.is_control()&&c!='\t') {return Err(format!("{:?} is not a single assembler statement",self.text))}
+        let mnemonic=self.mnemonic();
+        if !mnemonic.starts_with(|c:char|c.is_ascii_lowercase())||!mnemonic.chars().all(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||c=='_') {
+            return Err(format!("{mnemonic:?} is not an instruction mnemonic"))
+        }
+        if control_flow(mnemonic) {return Err(format!("{mnemonic} changes control flow: branches and the program end go through the typed core"))}
+        if mnemonic.contains("barrier") {return Err(format!("{mnemonic} is a barrier: barriers go through the typed core"))}
+        Ok(())
+    }
+}
+/// Branches, calls, returns, traps and the program end: every SOPP/SOP1
+/// instruction that moves the program counter other than to the next one.
+pub fn control_flow(mnemonic:&str)->bool {
+    ["s_branch","s_cbranch","s_setpc","s_swappc","s_call","s_rfe","s_endpgm","s_trap","s_sethalt","s_sendmsghalt","s_subvector_loop","s_code_end"]
+        .iter().any(|p|mnemonic.starts_with(p))
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Sop { Clause(u8), WaitLoad(u8), WaitDs(u8), WaitKm(u8), WaitStore(u8), End, Dealloc }
 impl Sop { pub fn encode(self,arch:Arch)->Result<Instruction,String> { let t=match self {

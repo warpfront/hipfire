@@ -6,6 +6,9 @@
 //! hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen.
 //! Modeled after rustane's ane-bridge — no link-time dependency on libamdhip64.
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
+
 mod error;
 mod ffi;
 mod kernarg;
@@ -19,12 +22,15 @@ pub use error::{
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-pub use ffi::launch_counters;
+pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
+pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_LOCATION_TYPE_DEVICE,
+    HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
@@ -33,7 +39,7 @@ pub use rocsolver::{
     RocblasDiagonal, RocblasFill, Rocsolver, RocsolverError, RocsolverResult,
     ROCSOLVER_STATUS_SUCCESS,
 };
-pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
+pub use vmm::{clear_vmm_faults, inject_vmm_fault, retired_va_bytes, VmmArena, VmmFaultKind};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]
@@ -83,6 +89,11 @@ pub struct DeviceBuffer {
 enum DeviceBufferOwnership {
     HipMalloc,
     Vmm,
+    /// Owner of a `hipHostMalloc(hipHostMallocMapped)` allocation: system RAM the
+    /// GPU dereferences over PCIe. Released with `hipHostFree`, and — unlike a
+    /// host-located VMM arena — it is NOT charged against the device heap, which
+    /// is the whole point of the offload path using it.
+    HostMapped,
     Borrowed,
 }
 
@@ -105,6 +116,10 @@ impl DeviceBuffer {
 
     pub fn is_borrowed(&self) -> bool {
         self.ownership == DeviceBufferOwnership::Borrowed
+    }
+
+    pub fn is_host_mapped(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::HostMapped
     }
 
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
@@ -134,6 +149,27 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Vmm,
+        }
+    }
+
+    /// Create the unique owner descriptor for a mapped host allocation.
+    ///
+    /// `ptr` is the **device-visible** address (what kernels are handed), which
+    /// `hipHostGetDevicePointer` may alias differently from the host pointer that
+    /// `hipHostMalloc` returned. The host pointer is what `hipHostFree` needs, so
+    /// the owner of a host-mapped allocation must register `(ptr -> host_ptr)`
+    /// with the `Gpu` that will free it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the device-visible alias of a live `hipHostMalloc` buffer of
+    /// at least `size` bytes, freed exactly once through its registered host
+    /// pointer.
+    pub unsafe fn from_host_mapped(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
+        DeviceBuffer {
+            ptr,
+            size,
+            ownership: DeviceBufferOwnership::HostMapped,
         }
     }
 
@@ -191,8 +227,10 @@ impl DeviceBuffer {
     }
 }
 
-// DeviceBuffer is Send — GPU pointers can be sent between threads.
-// They are NOT Sync — concurrent access requires stream synchronization.
+// SAFETY: DeviceBuffer is a raw GPU address plus size/ownership tag. Sending
+// the handle between threads is fine; the pointees stay on the device. It is
+// not Sync: concurrent use of the same allocation requires external stream
+// synchronization (aliasing + in-flight lifetime are the caller's contract).
 unsafe impl Send for DeviceBuffer {}
 
 #[cfg(test)]
@@ -201,20 +239,24 @@ mod device_buffer_tests {
 
     #[test]
     fn raw_and_alias_buffers_are_borrowed() {
+        // SAFETY: dangling non-null ptr is never dereferenced; tests only check ownership tags.
         let raw = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) };
         assert!(raw.is_borrowed());
         assert!(!raw.is_hip_allocation());
         assert!(!raw.is_vmm_owner());
 
+        // SAFETY: alias must not outlive `raw`; both stay on the stack for this test.
         let alias = unsafe { raw.alias() };
         assert!(alias.is_borrowed());
     }
 
     #[test]
     fn vmm_owner_marker_is_distinct_from_views() {
+        // SAFETY: dangling non-null ptr is never dereferenced; tests only check ownership tags.
         let owner = unsafe { DeviceBuffer::from_vmm_owner(std::ptr::dangling_mut(), 4096) };
         assert!(owner.is_vmm_owner());
         assert!(!owner.is_borrowed());
+        // SAFETY: alias must not outlive `owner`; both stay on the stack for this test.
         let view = unsafe { owner.alias() };
         assert!(view.is_borrowed());
         assert!(!view.is_vmm_owner());

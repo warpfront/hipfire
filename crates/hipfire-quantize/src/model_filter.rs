@@ -3,29 +3,10 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
-
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use crate::e8;
-use crate::e8_gptq;
-use crate::gguf_input;
-use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
@@ -311,15 +292,6 @@ pub(crate) fn validate_env_fixed_tier_or_exit() {
     }
 }
 
-/// Strict parser for HIPFIRE_Q8_CLASSES / --q8-classes. Returns trimmed list.
-pub(crate) fn parse_q8_classes(spec: &str) -> Result<Vec<String>, String> {
-    validate_q8_classes_spec(spec)?;
-    Ok(spec
-        .split(',')
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .collect())
-}
 
 /// Strict parser for HIPFIRE_FIXED_TIER / --fixed-tier. Returns class->dtype map.
 pub(crate) fn parse_fixed_tier(spec: &str) -> Result<HashMap<String, String>, String> {
@@ -533,9 +505,6 @@ pub(crate) fn fixed_tier_map_cli() -> Option<HashMap<String, String>> {
     FIXED_TIER_CLI.get().cloned().flatten()
 }
 
-pub(crate) fn is_fixed_tier_cli_set() -> bool {
-    FIXED_TIER_CLI.get().is_some()
-}
 
 static PRODUCT_TIER_CLI: OnceLock<Option<ProductTier>> = OnceLock::new();
 

@@ -87,6 +87,13 @@ impl Model {
         )
         .map_err(|e| format!("qwen4 manifest fulfillment: {e}"))?;
         let vocab = receipt.config.vocab_size;
+        let state_format = hipfire_arch_qwen4::resolve_state_format(
+            &hipfire_runtime::config::get().kv_mode,
+            // Qwen3.5's DeltaNet `state_quant` knob: auto (q8) or fp32.
+            &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+            &gpu,
+            &receipt.config,
+        )?;
         let mut bundle = Qwen4Bundle::assemble_with_metadata(
             receipt.config,
             transaction,
@@ -94,6 +101,7 @@ impl Model {
             &mut gpu,
             n_ctx,
             receipt.ple,
+            state_format,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle

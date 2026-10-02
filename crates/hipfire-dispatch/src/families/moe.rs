@@ -107,6 +107,12 @@ pub struct MoeRouteFormats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRouteCapability {
     Qt44Qt53Grouped,
+    /// The same fixed-shape route over an expert set whose every QT44/QT53
+    /// header was verified symmetric (`zp == -8*sc`) on the device after
+    /// load. Declared from that verification only, never from a dtype; it
+    /// lowers exactly like [`Self::Qt44Qt53Grouped`] except that the opt-in
+    /// symmetric IU4 prefill arm may take the routed experts.
+    Qt44Qt53GroupedSymmetric,
 }
 
 impl MoeRouteCapability {
@@ -114,8 +120,14 @@ impl MoeRouteCapability {
     /// is enabled; the fixed geometry and format contract is checked separately.
     pub(crate) fn admitted_on(self) -> bool {
         match self {
-            Self::Qt44Qt53Grouped => cfg!(feature = "deltanet"),
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => cfg!(feature = "deltanet"),
         }
+    }
+
+    /// Either QT44/QT53 grouped declaration: both lower through the same
+    /// fixed-shape stages.
+    pub fn is_qt44_qt53_grouped(self) -> bool {
+        matches!(self, Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric)
     }
 }
 
@@ -143,7 +155,7 @@ pub(crate) fn grouped_route_geometry_supported(
         routed_intermediate: 640,
         shared_intermediate: 640,
     };
-    matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped)
+    policy.capability.is_qt44_qt53_grouped()
         && geometry == fixed_geometry
         && experts == geometry.experts
         && top_k == geometry.top_k
@@ -708,6 +720,13 @@ pub trait RoutedExpertWeights {
     fn immutable_identity(&self) -> Option<u64> {
         None
     }
+
+    /// Whether the routed experts live in host-mapped memory. Expert views are
+    /// borrowed byte views, so the owner's placement must be carried here; a
+    /// layer's experts share one residency. `false` by default.
+    fn host_mapped(&self) -> bool {
+        false
+    }
 }
 
 /// Everything the MoE decode executor arm reads, marshaled by the model from
@@ -1036,6 +1055,16 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 
 // ── Qwen3.5 softmax-top-k MoE prefill parameters (Ship 4.2) ──
 
+/// Static VRAM pointer tables for a full-layer prefill DMA stage.
+/// Live expert bindings still name the original mapped owners. The down
+/// launcher releases this parity buffer before combine/shared work begins.
+#[derive(Clone, Copy)]
+pub struct MoeStageTables<'a> {
+    pub gate_up: &'a GpuTensor,
+    pub down: &'a GpuTensor,
+    pub free: &'a hip_bridge::Event,
+}
+
 /// Parameters for the qwen35 batched/prefill MoE routed-expert block.
 ///
 /// Distinct from [`MoeBiasAwarePrefillParams`] — qwen35 uses softmax top-k
@@ -1086,6 +1115,8 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Prefill-only table override; decode and live-binding validation ignore it.
+    pub expert_stage_ptrs: Option<MoeStageTables<'a>>,
     /// Exact live expert owners bound to the sealed load-time identity.
     pub routed_experts: &'a dyn RoutedExpertWeights,
     /// Route A MoE-AWQ: per-routed-expert down `awq_scale` pointer table (see

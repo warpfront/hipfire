@@ -589,6 +589,7 @@ fn admit_and_load(
         None,
         gpu.arch.as_str(),
         vision,
+        "auto",
         None,
         max_seq,
         hipfire_loader::admission::KvBackendHints {
@@ -613,7 +614,6 @@ fn admit_and_load(
         None,
         None,
         hipfire_loader::GEMMA4_EAGLE_DRAFT_LEN,
-        None,
         None,
         None,
         None,

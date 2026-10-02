@@ -1571,17 +1571,22 @@ impl Gpu {
     /// Sample one token per slot from `[n_slots x vocab]` logits.
     ///
     /// Takes the existing `argmax_f32_batched` fast path when every slot is
-    /// greedy; otherwise samples each slot with its own parameters. Per-slot
-    /// dispatch is correct but not optimal — a fused kernel is a later
-    /// optimisation, and SP2 is explicitly components-not-performance.
-    /// `params` is `&mut` because each sampling slot's RNG state advances with
-    /// the token it drew: reusing the entry seed every step redraws the same
-    /// uniform forever, which collapses a temperature slot onto one fixed
-    /// quantile of its own distribution.
+    /// greedy and unpenalized; otherwise samples each slot with its own
+    /// parameters. Per-slot dispatch is correct but not optimal — a fused
+    /// kernel is a later optimisation, and SP2 is explicitly
+    /// components-not-performance. `params` is `&mut` because each sampling
+    /// slot's RNG state advances with the token it drew: reusing the entry
+    /// seed every step redraws the same uniform forever, which collapses a
+    /// temperature slot onto one fixed quantile of its own distribution.
+    ///
+    /// `repeat_bufs` holds one per-slot penalty window buffer (u32 token ids,
+    /// most recent last); only penalized slots read theirs, and the caller is
+    /// responsible for uploading each penalized slot's window before the call.
     pub fn sample_per_slot(
         &mut self,
         logits: &GpuTensor,
         params: &mut [SlotSampleParams],
+        repeat_bufs: &[GpuTensor],
         n_slots: usize,
         vocab: usize,
         out_tokens: &GpuTensor,
@@ -1591,7 +1596,12 @@ impl Gpu {
             n_slots,
             "sample_per_slot: one SlotSampleParams per slot required"
         );
-        if all_greedy(params) {
+        assert_eq!(
+            repeat_bufs.len(),
+            n_slots,
+            "sample_per_slot: one repeat-window buffer per slot required"
+        );
+        if all_greedy(params) && !any_penalized(params) {
             // NOTE: argmax_f32_batched's real signature is
             // (data, result, n=reduction_dim, batch_size), i.e. vocab comes
             // before n_slots — the brief's illustrative call had these
@@ -1601,7 +1611,7 @@ impl Gpu {
         }
         for i in 0..n_slots {
             let mut p = params[i];
-            self.sample_slot_row(logits, i, vocab, &mut p, out_tokens)?;
+            self.sample_slot_row(logits, i, vocab, &mut p, &repeat_bufs[i], out_tokens)?;
             params[i] = p;
         }
         Ok(())
@@ -1614,19 +1624,36 @@ impl Gpu {
     /// takes the exact single-row argmax rather than routing through
     /// `sample_top_p_pf` with temperature 0 — this keeps a greedy slot's
     /// result identical to what it would get on the all-greedy fast path,
-    /// regardless of which other slots in the batch are sampling.
+    /// regardless of which other slots in the batch are sampling. A penalized
+    /// greedy row instead runs the exact `sample_apply_repeat_penalty` prepass
+    /// and THEN the exact argmax: penalize-then-argmax is what the sequential
+    /// engine's CPU sampler computes, and the fused sampler's softmax path
+    /// would diverge from it at near-ties.
     fn sample_slot_row(
         &mut self,
         logits: &GpuTensor,
         i: usize,
         vocab: usize,
         p: &mut SlotSampleParams,
+        repeat_buf: &GpuTensor,
         out_tokens: &GpuTensor,
     ) -> HipResult<()> {
         let row = logits.sub_offset(i * vocab, vocab);
         let out_row = out_tokens.sub_offset(i, 1);
 
-        let token_id: u32 = if p.temperature == 0.0 {
+        let token_id: u32 = if p.temperature == 0.0 && !p.penalized() {
+            self.argmax_f32(&row, vocab)?
+        } else if p.temperature == 0.0 {
+            let window = p.repeat_window.max(0) as usize;
+            self.apply_repeat_penalty_row(
+                &row,
+                repeat_buf,
+                vocab,
+                window,
+                p.repeat_penalty,
+                p.presence_penalty,
+                p.frequency_penalty,
+            )?;
             self.argmax_f32(&row, vocab)?
         } else {
             // Existing sample_top_p kernel, dispatched per row. `sample_top_p`
@@ -1634,35 +1661,96 @@ impl Gpu {
             // `_pf` directly lets each slot's own top_k through rather than
             // silently discarding it, without introducing a new kernel.
             let result_buf = self.alloc_tensor(&[2], DType::F32)?;
-            let repeat_buf = self.alloc_tensor(&[1], DType::F32)?;
             let top_k = if p.top_k > 0 {
                 Some(p.top_k as u32)
             } else {
                 None
             };
+            let min_p = if p.min_p > 0.0 { Some(p.min_p) } else { None };
             let sample_result = self.sample_top_p_pf(
                 &row,
                 &result_buf,
-                &repeat_buf,
+                repeat_buf,
                 vocab,
                 p.temperature,
                 p.top_p,
                 p.rng_state(),
-                0,   // repeat_window: no cross-slot repetition history here
-                1.0, // repeat_penalty: 1.0 == disabled (kernel checks `> 1.0`)
-                0.0, // presence_penalty: disabled
-                0.0, // frequency_penalty: disabled
+                p.repeat_window.max(0) as usize,
+                p.repeat_penalty,
+                p.presence_penalty,
+                p.frequency_penalty,
                 top_k,
-                None, // min_p: disabled
+                min_p,
             );
             self.free_tensor(result_buf)?;
-            self.free_tensor(repeat_buf)?;
             let (token_id, next_rng) = sample_result?;
             p.seed = next_rng;
             token_id
         };
 
         self.hip.memcpy_htod(&out_row.buf, &token_id.to_ne_bytes())
+    }
+
+    /// Launch the standalone token-penalty prepass (`sample_apply_repeat_penalty`
+    /// from the parallel-sampler module) on one logits row, in place. Shares the
+    /// module/function names with `sample_top_p_parallel_impl`, so the module is
+    /// compiled at most once per process whichever path reaches it first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_repeat_penalty_row(
+        &mut self,
+        row: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab: usize,
+        window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<()> {
+        // The kernel reads repeat_buf[0..window] as u32 token ids with no
+        // internal bound — a window larger than the buffer is an OOB device
+        // read. The engine clamps to REPEAT_WINDOW_MAX, but this is a public
+        // API: refuse an over-capacity window here rather than read past the
+        // allocation.
+        assert!(
+            window <= repeat_buf.numel(),
+            "apply_repeat_penalty_row: window {window} exceeds repeat_buf \
+             capacity {} tokens",
+            repeat_buf.numel()
+        );
+        self.bind_thread()?;
+        if !self.functions.contains_key("sample_apply_repeat_penalty") {
+            let src = sample_top_p_parallel_src();
+            self.ensure_kernel("sample_top_p_parallel", &src, "sample_apply_repeat_penalty")?;
+        }
+        let func = &self.functions["sample_apply_repeat_penalty"];
+        let mut lp = row.buf.as_ptr();
+        let mut rp = repeat_buf.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut rw = window as i32;
+        let mut rpen = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void,
+            &mut rpen as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut fp as *mut _ as *mut c_void,
+        ];
+        // Same launch shape as the parallel sampler's prepass step: 1 block ×
+        // 256 threads striding the window. The kernel is blockDim-agnostic.
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
     }
 }
 
@@ -1677,10 +1765,26 @@ pub struct SlotSampleParams {
     /// 0.0 means greedy/argmax for this slot.
     pub temperature: f32,
     pub top_p: f32,
-    /// 0 disables top-k for this slot.
+    /// Top-k cap for this slot, 1..=64 (the sampler's widest compiled kernel
+    /// gathers 64 candidates). 0 keeps the engine default (20) — it does NOT
+    /// disable top-k.
     pub top_k: i32,
     /// RNG state, advanced by every non-greedy draw.
     pub seed: u32,
+    /// Recency window for the token penalties below, in recent tokens. The
+    /// engine uploads exactly this many entries (most recent last) into the
+    /// slot's repeat buffer before each sampling step; 0 disables all token
+    /// penalties for the slot.
+    pub repeat_window: i32,
+    /// Multiplicative recency-weighted repeat penalty; 1.0 = off.
+    pub repeat_penalty: f32,
+    /// OpenAI flat presence penalty — the mechanism that suppresses
+    /// block-level repetition loops on long generations; 0.0 = off.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty, scaled by in-window occurrence count; 0.0 = off.
+    pub frequency_penalty: f32,
+    /// min-p cutoff; 0.0 = off.
+    pub min_p: f32,
 }
 
 impl SlotSampleParams {
@@ -1693,6 +1797,16 @@ impl SlotSampleParams {
             self.seed
         }
     }
+
+    /// True when this slot's token penalties change the sampled distribution
+    /// at all. A nonzero window with every penalty at its neutral value is
+    /// not penalized (the kernel's per-token branches all no-op).
+    pub fn penalized(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty > 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
+    }
 }
 
 /// True when every slot is greedy, so the batch can take the argmax fast path.
@@ -1701,46 +1815,95 @@ pub fn all_greedy(params: &[SlotSampleParams]) -> bool {
     params.iter().all(|p| p.temperature == 0.0)
 }
 
+/// True when no slot carries an active token penalty, so greedy rows can keep
+/// the bare-argmax path and the batch needs no repeat-window uploads.
+pub fn any_penalized(params: &[SlotSampleParams]) -> bool {
+    params.iter().any(|p| p.penalized())
+}
+
 #[cfg(test)]
 mod slot_sample_tests {
     use super::*;
 
+    /// Neutral sampling params for test constructors.
+    fn neutral() -> SlotSampleParams {
+        SlotSampleParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+            repeat_window: 0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
+        }
+    }
+
     #[test]
-    fn params_struct_is_16_bytes_repr_c() {
-        // Uploaded straight to the GPU as a table, like KvSlotDesc.
-        assert_eq!(std::mem::size_of::<SlotSampleParams>(), 16);
+    fn params_struct_layout_is_stable() {
+        // Consumed host-side per-slot (kernel args are passed individually),
+        // but repr(C) keeps the layout contract stable: 9 x 4-byte fields.
+        assert_eq!(std::mem::size_of::<SlotSampleParams>(), 36);
         assert_eq!(std::mem::align_of::<SlotSampleParams>(), 4);
+    }
+
+    #[test]
+    fn penalized_matches_kernel_phase0_gate() {
+        // Mirrors the kernel's `any_penalty && repeat_window > 0` exactly.
+        let base = SlotSampleParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+            repeat_window: 128,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
+        };
+        assert!(!base.penalized());
+        assert!(!any_penalized(&[base]));
+        let mut p = base;
+        p.repeat_window = 0;
+        p.presence_penalty = 1.5;
+        // No window = no penalties, whatever the values say.
+        assert!(!p.penalized());
+        let mut p = base;
+        p.presence_penalty = 1.5;
+        assert!(p.penalized());
+        let mut p = base;
+        p.repeat_penalty = 1.05;
+        assert!(p.penalized());
+        let mut p = base;
+        p.frequency_penalty = 0.2;
+        assert!(p.penalized());
     }
 
     #[test]
     fn all_greedy_is_detectable_as_a_fast_path() {
         let greedy = vec![
             SlotSampleParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 0,
                 seed: 1,
+                ..neutral()
             },
             SlotSampleParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 0,
                 seed: 2,
+                ..neutral()
             },
         ];
         assert!(all_greedy(&greedy));
         let mixed = vec![
             SlotSampleParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 0,
                 seed: 1,
+                ..neutral()
             },
             SlotSampleParams {
                 temperature: 0.7,
                 top_p: 0.95,
                 top_k: 20,
                 seed: 2,
+                ..neutral()
             },
         ];
         assert!(
@@ -1756,6 +1919,7 @@ mod slot_sample_tests {
             top_p: 0.95,
             top_k: 20,
             seed: 0,
+            ..neutral()
         };
         assert_ne!(dead.rng_state(), 0);
         let live = SlotSampleParams { seed: 1234, ..dead };

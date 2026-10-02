@@ -803,6 +803,7 @@ pub fn forward_batch(
                     x_rot_batch: &ffn_x_rot,
                     expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
                     expert_down_ptrs: &m.expert_down_ptrs,
+                    expert_stage_ptrs: None,
                     routed_experts: m,
                     expert_down_awq_ptrs: None,
                     expert_dtype_tags: None,

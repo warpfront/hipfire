@@ -37,11 +37,15 @@
 //!   residual tile is touched over epochs `E-16..E-9` like `_add_touch`.
 //! - SiLU `G, U, Xq, Y, M, K, N`, grid `[N/256, 2M/256]`; `Y = h [N][M]`,
 //!   `h = g / (1 + expf(-g)) * u` with hipcc's exact expf/fdiv expansion.
-use super::iu4_gemm::{ds_offsets, lit, s, sr, v, vr};
-use super::iu4_v2c::{mem, off, op};
+use super::common::{add64, add64_imm, lit, mem, op, s, sop, sr, v, vr};
+use super::iu4_fold::{self, GROUP_BYTES, MAGIC, REBIAS, XBLK_BYTES};
+use super::iu4_gemm::ds_offsets;
+use super::iu4_v2c::off;
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
-    insn::{Instruction, MemoryClass, Sop, Wmma}, lds::Transition,
+    insn::{Instruction, MemoryClass, Sop, Wmma},
     reg::Live, vopd::{Operand, VopdF32, VopdOp}};
+use peacemaker_author::{Free, Gfx1151, Gfx11Waits, LdsWrite, MmaIu4, Pending, Published, Ring, Scc, State, Wave, WgUniform,
+    Workgroup, Writing, prime, rotate};
 
 pub const THREADS: u16 = 512;
 pub const WAVES: u32 = 16;
@@ -50,12 +54,6 @@ pub const LDS_BYTES: u32 = 65536;
 pub const SLOT_BYTES: u32 = 32768;
 pub const A_BYTES: u32 = 16384;
 pub const VGPR_CEILING: u16 = 256;
-pub const MAGIC: u32 = 0x4b40_0000;
-/// `-12582912.0f`: `float(C) = bits(C + magic) - 1.5*2^23` exactly.
-pub const MAGIC_NEG: u32 = 0xcb40_0000;
-pub const REBIAS: u32 = 0x8888_8888;
-pub const GROUP_BYTES: u32 = 136;
-pub const XBLK_BYTES: u32 = 72;
 /// ADD residual touch window: epochs `E-TOUCH_LEAD .. E-TOUCH_LEAD+8`.
 pub const TOUCH_LEAD: u32 = 16;
 /// Smallest K the ADD entry accepts (its touch window must fit the loop).
@@ -144,8 +142,6 @@ impl Regs {
 /// Kernel-argument SGPRs of one entry.
 struct Args { a: u8, u: Option<u8>, xq: u8, y: u8, m: u8, k: u8, n: u8, gshift: Option<u8> }
 
-const SLOT_A: [usize; 2] = [0, 2];
-const SLOT_X: [usize; 2] = [1, 3];
 /// SiLU elements folded per interleaved group.
 const SILU_GROUP: u8 = 8;
 const SILU_TEMPS: u8 = 6;
@@ -266,38 +262,35 @@ impl Gen {
     }
 }
 
-fn declare_lds(b: &mut Builder) -> Result<(), String> {
-    for (i, (name, base, len)) in [("A0", 0, A_BYTES), ("X0", A_BYTES, A_BYTES), ("A1", SLOT_BYTES, A_BYTES), ("X1", SLOT_BYTES + A_BYTES, A_BYTES)].into_iter().enumerate() {
-        if b.lds.add(name, base, len)? != i { return Err("LDS slot order".into()) }
-    }
-    Ok(())
-}
+/// LDS tags: the A (weight) and X (activation) halves of each 32 KiB slot.
+pub enum A {}
+pub enum X {}
+type Wg<'b> = Workgroup<'b, Gfx1151, Builder>;
+type Wv<'b> = Wave<'b, Gfx1151, Builder>;
+/// The K loop's steady state: slot `e%2` of each ring published, the other free.
+type Rings = (Ring<A, Published, Free>, Ring<X, Published, Free>);
+/// A ring's next buffer with its pending stores.
+type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx11Waits, LdsWrite<R>>);
 
-fn salu(b: &mut Builder, text: String, defs: &[u8], uses: &[u8]) -> Result<(), String> {
-    op(b, text, &defs.iter().map(|&r| s(r)).collect::<Vec<_>>(), &uses.iter().map(|&r| s(r)).collect::<Vec<_>>())
+/// Slots A0, X0, A1, X1 (builder slot ids 0..3); slot 0 is written first.
+fn declare_lds(wg: &mut Wg) -> Result<(Ring<A, Free, Free>, Ring<X, Free, Free>), String> {
+    let (a0, x0) = (wg.lds("A0", 0, A_BYTES)?, wg.lds("X0", A_BYTES, A_BYTES)?);
+    let (a1, x1) = (wg.lds("A1", SLOT_BYTES, A_BYTES)?, wg.lds("X1", SLOT_BYTES + A_BYTES, A_BYTES)?);
+    Ok((Ring::new(a0, a1), Ring::new(x0, x1)))
 }
 
 /// `dst = base + x*y` (64-bit), `x*y` as a full 64-bit product.
 fn mul_add64(b: &mut Builder, dst: u8, base: u8, x: u8, y: u8) -> Result<(), String> {
     let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
-    salu(b, format!("s_mul_i32 s{lo}, s{x}, s{y}"), &[lo], &[x, y])?;
-    salu(b, format!("s_mul_hi_u32 s{hi}, s{x}, s{y}"), &[hi], &[x, y])?;
-    salu(b, format!("s_add_u32 s{dst}, s{base}, s{lo}"), &[dst], &[base, lo])?;
-    salu(b, format!("s_addc_u32 s{}, s{}, s{hi}", dst + 1, base + 1), &[dst + 1], &[base + 1, hi])
-}
-
-fn add64_imm(b: &mut Builder, reg: u8, imm: u32) -> Result<(), String> {
-    salu(b, format!("s_add_u32 s{reg}, s{reg}, {}", lit(imm)), &[reg], &[reg])?;
-    salu(b, format!("s_addc_u32 s{0}, s{0}, 0", reg + 1), &[reg + 1], &[reg + 1])
-}
-
-fn add64_sreg(b: &mut Builder, reg: u8, x: u8) -> Result<(), String> {
-    salu(b, format!("s_add_u32 s{reg}, s{reg}, s{x}"), &[reg], &[reg, x])?;
-    salu(b, format!("s_addc_u32 s{0}, s{0}, 0", reg + 1), &[reg + 1], &[reg + 1])
+    sop(b, format!("s_mul_i32 s{lo}, s{x}, s{y}"), &[lo], &[x, y])?;
+    sop(b, format!("s_mul_hi_u32 s{hi}, s{x}, s{y}"), &[hi], &[x, y])?;
+    sop(b, format!("s_add_u32 s{dst}, s{base}, s{lo}"), &[dst], &[base, lo])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", dst + 1, base + 1), &[dst + 1], &[base + 1, hi])
 }
 
 /// Kernel arguments, tile bases and every lane-invariant offset.
-fn prologue(b: &mut Builder, g: &Gen) -> Result<(), String> {
+fn prologue(wg: &mut Wg, g: &Gen, (ra, rx): (Ring<A, Free, Free>, Ring<X, Free, Free>)) -> Result<Rings, String> {
+    let b = wg.isa();
     let a = &g.args;
     let (t0, t1) = (Regs::T0, Regs::T1);
     // gfx11 llvm-objdump spells a zero SMEM offset `null`; parse-back compares canonical text.
@@ -316,74 +309,74 @@ fn prologue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     op(b, format!("v_readfirstlane_b32 s{}, v1", Regs::WAVE), &[s(Regs::WAVE)], &[v(1)])?;
     op(b, "v_and_b32_e32 v3, 15, v2", &[v(3)], &[v(2)])?;
     op(b, "v_lshrrev_b32_e32 v4, 4, v2", &[v(4)], &[v(2)])?;
-    salu(b, format!("s_lshr_b32 s{}, s{}, 2", Regs::WR, Regs::WAVE), &[Regs::WR], &[Regs::WAVE])?;
-    salu(b, format!("s_and_b32 s{}, s{}, 3", Regs::WC, Regs::WAVE), &[Regs::WC], &[Regs::WAVE])?;
+    sop(b, format!("s_lshr_b32 s{}, s{}, 2", Regs::WR, Regs::WAVE), &[Regs::WR], &[Regs::WAVE])?;
+    sop(b, format!("s_and_b32 s{}, s{}, 3", Regs::WC, Regs::WAVE), &[Regs::WC], &[Regs::WAVE])?;
     // row_bytes = (K/256)*136; trips = K/256 - 1 whole two-epoch trips before
     // the tail pair (ADD: K/256 - 8 before the touch phase).
-    salu(b, format!("s_lshr_b32 s{}, s{}, 8", Regs::ROWB, a.k), &[Regs::ROWB], &[a.k])?;
-    salu(b, format!("s_add_i32 s{}, s{}, {}", Regs::TRIPS, Regs::ROWB, if g.add() { "-8" } else { "-1" }), &[Regs::TRIPS], &[Regs::ROWB])?;
-    salu(b, format!("s_mulk_i32 s{}, {}", Regs::ROWB, lit(GROUP_BYTES)), &[Regs::ROWB], &[Regs::ROWB])?;
+    sop(b, format!("s_lshr_b32 s{}, s{}, 8", Regs::ROWB, a.k), &[Regs::ROWB], &[a.k])?;
+    sop(b, format!("s_add_i32 s{}, s{}, {}", Regs::TRIPS, Regs::ROWB, if g.add() { "-8" } else { "-1" }), &[Regs::TRIPS], &[Regs::ROWB])?;
+    sop(b, format!("s_mulk_i32 s{}, {}", Regs::ROWB, lit(GROUP_BYTES)), &[Regs::ROWB], &[Regs::ROWB])?;
     if let Some(gs) = a.gshift {
         // Grouped raster: row tile y*G + x%G, token tile x/G.
-        salu(b, format!("s_lshl_b32 s{t0}, 1, s{gs}"), &[t0], &[gs])?;
-        salu(b, format!("s_add_i32 s{t0}, s{t0}, -1"), &[t0], &[t0])?;
-        salu(b, format!("s_and_b32 s{t0}, s{}, s{t0}", Regs::WGX), &[t0], &[Regs::WGX, t0])?;
-        salu(b, format!("s_lshl_b32 s{}, s{}, s{gs}", Regs::BY, Regs::WGY), &[Regs::BY], &[Regs::WGY, gs])?;
-        salu(b, format!("s_add_i32 s{0}, s{0}, s{t0}", Regs::BY), &[Regs::BY], &[Regs::BY, t0])?;
-        salu(b, format!("s_lshr_b32 s{}, s{}, s{gs}", Regs::BX, Regs::WGX), &[Regs::BX], &[Regs::WGX, gs])?;
+        sop(b, format!("s_lshl_b32 s{t0}, 1, s{gs}"), &[t0], &[gs])?;
+        sop(b, format!("s_add_i32 s{t0}, s{t0}, -1"), &[t0], &[t0])?;
+        sop(b, format!("s_and_b32 s{t0}, s{}, s{t0}", Regs::WGX), &[t0], &[Regs::WGX, t0])?;
+        sop(b, format!("s_lshl_b32 s{}, s{}, s{gs}", Regs::BY, Regs::WGY), &[Regs::BY], &[Regs::WGY, gs])?;
+        sop(b, format!("s_add_i32 s{0}, s{0}, s{t0}", Regs::BY), &[Regs::BY], &[Regs::BY, t0])?;
+        sop(b, format!("s_lshr_b32 s{}, s{}, s{gs}", Regs::BX, Regs::WGX), &[Regs::BX], &[Regs::WGX, gs])?;
     }
     let (by, bx) = (g.by(), g.bx());
     if let Some(u) = a.u {
         // t0 = row0/2: the tile's h rows (and its gate/up row window).
-        salu(b, format!("s_lshl_b32 s{t0}, s{by}, 7"), &[t0], &[by])?;
+        sop(b, format!("s_lshl_b32 s{t0}, s{by}, 7"), &[t0], &[by])?;
         // Staging wave w owns tile fragment w: (w odd ? U : G) rows t0 + 16*(w/2).
-        salu(b, format!("s_lshr_b32 s{t1}, s{}, 1", Regs::WAVE), &[t1], &[Regs::WAVE])?;
-        salu(b, format!("s_lshl_b32 s{t1}, s{t1}, 4"), &[t1], &[t1])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
-        salu(b, format!("s_bitcmp1_b32 s{}, 0", Regs::WAVE), &[], &[Regs::WAVE])?;
+        sop(b, format!("s_lshr_b32 s{t1}, s{}, 1", Regs::WAVE), &[t1], &[Regs::WAVE])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{t1}, 4"), &[t1], &[t1])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_bitcmp1_b32 s{}, 0", Regs::WAVE), &[], &[Regs::WAVE])?;
         op(b, format!("s_cselect_b64 s[{}:{}], s[{u}:{}], s[{}:{}]", Regs::T64, Regs::T64 + 1, u + 1, a.a, a.a + 1), &[sr(Regs::T64, 2)], &[sr(u, 2), sr(a.a, 2)])?;
         mul_add64(b, Regs::SS, Regs::T64, t1, Regs::ROWB)?;
         // Scale words: gate (word 0) and up (word 1) rows t0 + 32*wr + lane part.
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 5", Regs::WR), &[t1], &[Regs::WR])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 5", Regs::WR), &[t1], &[Regs::WR])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
         mul_add64(b, Regs::SW0, a.a, t1, Regs::ROWB)?;
         mul_add64(b, Regs::SW1, u, t1, Regs::ROWB)?;
     } else {
         // t0 = row0. Staging wave w owns rows t0 + 16w.
-        salu(b, format!("s_lshl_b32 s{t0}, s{by}, 8"), &[t0], &[by])?;
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::WAVE), &[t1], &[Regs::WAVE])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_lshl_b32 s{t0}, s{by}, 8"), &[t0], &[by])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::WAVE), &[t1], &[Regs::WAVE])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
         mul_add64(b, Regs::SS, a.a, t1, Regs::ROWB)?;
         // Scale words 0/1: rows t0 + 64*wr (+16 for word 1) + lane part.
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 6", Regs::WR), &[t1], &[Regs::WR])?;
-        salu(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 6", Regs::WR), &[t1], &[Regs::WR])?;
+        sop(b, format!("s_add_u32 s{t1}, s{t0}, s{t1}"), &[t1], &[t0, t1])?;
         mul_add64(b, Regs::SW0, a.a, t1, Regs::ROWB)?;
-        salu(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::ROWB), &[t1], &[Regs::ROWB])?;
-        salu(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SW1, Regs::SW0), &[Regs::SW1], &[Regs::SW0, t1])?;
-        salu(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SW1 + 1, Regs::SW0 + 1), &[Regs::SW1 + 1], &[Regs::SW0 + 1])?;
+        sop(b, format!("s_lshl_b32 s{t1}, s{}, 4", Regs::ROWB), &[t1], &[Regs::ROWB])?;
+        sop(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SW1, Regs::SW0), &[Regs::SW1], &[Regs::SW0, t1])?;
+        sop(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SW1 + 1, Regs::SW0 + 1), &[Regs::SW1 + 1], &[Regs::SW0 + 1])?;
     }
     // X base: Xq + (256*bx)*72.
-    salu(b, format!("s_mul_i32 s{t1}, s{bx}, {}", lit(TILE * XBLK_BYTES)), &[t1], &[bx])?;
-    salu(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SX, a.xq), &[Regs::SX], &[a.xq, t1])?;
-    salu(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, a.xq + 1), &[Regs::SX + 1], &[a.xq + 1])?;
-    salu(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, a.n, lit(XBLK_BYTES)), &[Regs::N72], &[a.n])?;
-    salu(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, a.m), &[Regs::M64], &[a.m])?;
+    sop(b, format!("s_mul_i32 s{t1}, s{bx}, {}", lit(TILE * XBLK_BYTES)), &[t1], &[bx])?;
+    sop(b, format!("s_add_u32 s{}, s{}, s{t1}", Regs::SX, a.xq), &[Regs::SX], &[a.xq, t1])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", Regs::SX + 1, a.xq + 1), &[Regs::SX + 1], &[a.xq + 1])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, {}", Regs::N72, a.n, lit(XBLK_BYTES)), &[Regs::N72], &[a.n])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 6", Regs::M64, a.m), &[Regs::M64], &[a.m])?;
     // Y base: Y + 4*(256*bx*M + t0), 64-bit (t0 = row0, or row0/2 for h).
     let (lo, hi) = (Regs::MUL, Regs::MUL + 1);
-    salu(b, format!("s_lshl_b32 s{t1}, s{bx}, 8"), &[t1], &[bx])?;
-    salu(b, format!("s_mul_hi_u32 s{hi}, s{t1}, s{}", a.m), &[hi], &[t1, a.m])?;
-    salu(b, format!("s_mul_i32 s{lo}, s{t1}, s{}", a.m), &[lo], &[t1, a.m])?;
-    salu(b, format!("s_add_u32 s{lo}, s{lo}, s{t0}"), &[lo], &[lo, t0])?;
-    salu(b, format!("s_addc_u32 s{hi}, s{hi}, 0"), &[hi], &[hi])?;
+    sop(b, format!("s_lshl_b32 s{t1}, s{bx}, 8"), &[t1], &[bx])?;
+    sop(b, format!("s_mul_hi_u32 s{hi}, s{t1}, s{}", a.m), &[hi], &[t1, a.m])?;
+    sop(b, format!("s_mul_i32 s{lo}, s{t1}, s{}", a.m), &[lo], &[t1, a.m])?;
+    sop(b, format!("s_add_u32 s{lo}, s{lo}, s{t0}"), &[lo], &[lo, t0])?;
+    sop(b, format!("s_addc_u32 s{hi}, s{hi}, 0"), &[hi], &[hi])?;
     op(b, format!("s_lshl_b64 s[{lo}:{hi}], s[{lo}:{hi}], 2"), &[sr(lo, 2)], &[sr(lo, 2)])?;
-    salu(b, format!("s_add_u32 s{}, s{}, s{lo}", Regs::SY, a.y), &[Regs::SY], &[a.y, lo])?;
-    salu(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, a.y + 1), &[Regs::SY + 1], &[a.y + 1, hi])?;
+    sop(b, format!("s_add_u32 s{}, s{}, s{lo}", Regs::SY, a.y), &[Regs::SY], &[a.y, lo])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, s{hi}", Regs::SY + 1, a.y + 1), &[Regs::SY + 1], &[a.y + 1, hi])?;
     if g.early {
         // Token fragment c's Y base = SY + c*16*M*4 (M64 bytes per fragment).
         let mut prev = Regs::SY;
         for r in Regs::SYC {
-            salu(b, format!("s_add_u32 s{r}, s{prev}, s{}", Regs::M64), &[r], &[prev, Regs::M64])?;
-            salu(b, format!("s_addc_u32 s{}, s{}, 0", r + 1, prev + 1), &[r + 1], &[prev + 1])?;
+            sop(b, format!("s_add_u32 s{r}, s{prev}, s{}", Regs::M64), &[r], &[prev, Regs::M64])?;
+            sop(b, format!("s_addc_u32 s{}, s{}, 0", r + 1, prev + 1), &[r + 1], &[prev + 1])?;
             prev = r;
         }
     }
@@ -437,11 +430,12 @@ fn prologue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     stage_loads(b, 0)?;
     for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", Regs::MAGIC + j, lit(MAGIC)), &[v(Regs::MAGIC + j)], &[])?; }
     for r in 0..128u8 { op(b, format!("v_mov_b32_e32 v{}, 0", Regs::ACC + r), &[v(Regs::ACC + r)], &[])?; }
-    stage_store(b, 0)?;
-    b.barrier(&[Transition::Ready(SLOT_A[0]), Transition::Ready(SLOT_X[0])])?;
-    step_loads(b, 0, 0)?;
-    if g.sched == Sched::Early { head(b, 0, true, false)?; }
-    Ok(())
+    let ((ra, pa), (rx, px)) = stage_store(wg, ra, rx)?;
+    let (da, dx) = wg.wait_all((pa, px))?;
+    let (ra, rx) = wg.barrier((prime(ra, da), prime(rx, dx)))?;
+    step_loads(wg, &ra, &rx, 0)?;
+    if g.sched == Sched::Early { head(wg.isa(), 0, true, false)?; }
+    Ok((ra, rx))
 }
 
 fn global_load_b64(b: &mut Builder, dst: u8, voff: u8, base: u8, offset: u32) -> Result<(), String> {
@@ -458,44 +452,49 @@ fn stage_loads(b: &mut Builder, a_imm: u32) -> Result<(), String> {
     b.clause(|b| { for i in 0..4u8 { global_load_b64(b, Regs::STX + 2 * i, Regs::X_OFF, Regs::SX, 16 * u32::from(i))?; } Ok(()) })
 }
 
-/// Rebias A and publish the staged packet into slot `slot`: store `i` fills
-/// one 256-byte block (slices 2i and 2i+1 of fragment block `wave`). One
-/// address register serves both slots through the 16-bit DS offset.
-fn stage_store(b: &mut Builder, slot: usize) -> Result<(), String> {
+/// Rebias A and publish the staged packet into the rings' next slot: store
+/// `i` fills one 256-byte block (slices 2i and 2i+1 of fragment block
+/// `wave`). One address register serves both slots through the 16-bit DS offset.
+fn stage_store<C: State>(w: &mut Wv, ra: Ring<A, C, Free>, rx: Ring<X, C, Free>) -> Result<(Staged<A, C>, Staged<X, C>), String> {
+    let slot = ra.next_index();
     for r in 0..8u8 {
         let x = Regs::STA + r;
-        op(b, format!("v_xor_b32_e32 v{x}, {}, v{x}", lit(REBIAS)), &[v(x)], &[v(x)])?;
+        op(w.isa(), format!("v_xor_b32_e32 v{x}, {}, v{x}", lit(REBIAS)), &[v(x)], &[v(x)])?;
     }
-    for (regs, region, slot_id) in [(Regs::STA, 0, SLOT_A[slot]), (Regs::STX, A_BYTES, SLOT_X[slot])] {
-        for i in 0..4u8 {
-            let d = regs + 2 * i;
-            let o = slot as u32 * SLOT_BYTES + region + 256 * u32::from(i);
-            let text = format!("ds_store_b64 v{}, {}{}", Regs::ST, vr(d, 2), if o == 0 { String::new() } else { format!(" offset:{o}") });
-            b.ds_store(slot_id, Instruction::new(text, vec![], vec![v(Regs::ST), vr(d, 2)]).memory(MemoryClass::DsStore))?;
-        }
-    }
-    Ok(())
+    let store = |regs: u8, region: u32, i: u8| {
+        let d = regs + 2 * i;
+        let o = slot as u32 * SLOT_BYTES + region + 256 * u32::from(i);
+        let text = format!("ds_store_b64 v{}, {}{}", Regs::ST, vr(d, 2), if o == 0 { String::new() } else { format!(" offset:{o}") });
+        Instruction::new(text, vec![], vec![v(Regs::ST), vr(d, 2)]).memory(MemoryClass::DsStore)
+    };
+    let mut a = w.begin_write(ra);
+    for i in 0..4u8 { a = w.ds_store(a, store(Regs::STA, 0, i))?; }
+    let mut x = w.begin_write(rx);
+    for i in 0..4u8 { x = w.ds_store(x, store(Regs::STX, A_BYTES, i))?; }
+    Ok((a, x))
 }
 
-/// Fragment loads of step `i = 8a + s` from slot `slot`: the X fragments of
-/// slice s (c = 0,1 and c = 2,3) and, at even s, the A pair (s, s+1).
-fn step_loads(b: &mut Builder, slot: usize, i: usize) -> Result<(), String> {
+/// Fragment loads of step `i = 8a + s` from the rings' current slot: the X
+/// fragments of slice s (c = 0,1 and c = 2,3) and, at even s, the A pair (s, s+1).
+fn step_loads<N: State>(w: &mut Wv, ra: &Ring<A, Published, N>, rx: &Ring<X, Published, N>, i: usize) -> Result<(), String> {
+    let slot = ra.cur_index();
     let (a, s_) = ((i / 8) as u32, (i % 8) as u32);
     if s_ % 2 == 0 {
         let dst = Regs::AV[(i / 2) % 2];
         let base = Regs::AB[slot][(a / 2) as usize];
         let o = (a % 2) * 128 + 16 * s_;
-        b.ds_load(SLOT_A[slot], Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(o, o + 16)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
+        w.ds_load_cur(ra, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(o, o + 16)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
     }
     for half in 0..2usize {
         let dst = Regs::XV[i % 2] + 4 * half as u8;
         let base = Regs::XB[slot][half];
-        b.ds_load(SLOT_X[slot], Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(16 * s_, 16 * s_ + 128)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
+        w.ds_load_cur(rx, Instruction::new(format!("ds_load_2addr_b64 {}, v{base}{}", vr(dst, 4), ds_offsets(16 * s_, 16 * s_ + 128)), vec![vr(dst, 4)], vec![v(base)]).memory(MemoryClass::DsLoad))?;
     }
     Ok(())
 }
 
-fn step_wmma(b: &mut Builder, i: usize) -> Result<(), String> {
+fn step_wmma<T: MmaIu4>(w: &mut Wave<T, Builder>, i: usize) -> Result<(), String> {
+    let b = w.isa();
     let a = V::<2>(Regs::AV[(i / 2) % 2] + 2 * (i % 2) as u8);
     for c in 0..4u8 {
         let dst = V::<8>(Regs::C + 8 * c);
@@ -526,29 +525,7 @@ fn scales(b: &mut Builder, a: u8) -> Result<(), String> {
 /// Fold pass `a`: sum[a][c][j] = fma(d_c * sc_j, C[c][j] - 1.5*2^23, sum),
 /// with the pass's row scales already broadcast into SCF by `scales(a)`.
 fn fold(b: &mut Builder, a: u8, dc: u8) -> Result<(), String> {
-    for c in 0..4u8 {
-        // t_j = d_c * sc_j paired with C[c][j^1] += -1.5*2^23 (opposite
-        // destination parity, distinct src1 banks); then the fmac pairs,
-        // each at least four packets after the products it reads.
-        // Element j's product sits at t + (j^2): acc and C of element j are
-        // both in VGPR bank j%4, so an fmac half then reads that bank twice
-        // and bank (j^2)%4 once instead of bank j%4 three times (HaloR2
-        // price list: fmac packets cost 2.3-2.9 cycles, mul/add ~1.1).
-        let t = Regs::T;
-        let ts = |j: u8| t + (j ^ 2);
-        for j in 0..8u8 {
-            let mul = VopdOp { op: VopdF32::Mul, dst: ts(j), src0: Operand::V(dc + c), src1: Regs::SCF + j };
-            let cf = Regs::C + 8 * c + (j ^ 1);
-            let add = VopdOp { op: VopdF32::Add, dst: cf, src0: Operand::Lit(MAGIC_NEG), src1: cf };
-            b.vopd(mul, add)?;
-        }
-        let acc = Regs::ACC + 8 * (4 * a + c);
-        for j in (0..8u8).step_by(2) {
-            let x = VopdOp { op: VopdF32::Fmac, dst: acc + j, src0: Operand::V(ts(j)), src1: Regs::C + 8 * c + j };
-            let y = VopdOp { op: VopdF32::Fmac, dst: acc + j + 1, src0: Operand::V(ts(j + 1)), src1: Regs::C + 8 * c + j + 1 };
-            b.vopd(x, y)?;
-        }
-    }
+    for c in 0..4u8 { iu4_fold::fold_pass(b, Regs::C + 8 * c, Regs::ACC + 8 * (4 * a + c), Regs::SCF, dc + c, Regs::T)?; }
     Ok(())
 }
 
@@ -575,37 +552,56 @@ fn head(b: &mut Builder, p: usize, stage: bool, touch: bool) -> Result<(), Strin
         if p == 1 {
             // Epoch e+1 starts the next 136-byte A group.
             for base in [Regs::SS, Regs::SW0, Regs::SW1] { add64_imm(b, base, GROUP_BYTES)?; }
-            if touch { add64_sreg(b, Regs::STB, Regs::M64)?; }
+            if touch { add64(b, Regs::STB, Regs::STB, Regs::M64)?; }
         }
-        add64_sreg(b, Regs::SX, Regs::N72)?;
+        add64(b, Regs::SX, Regs::SX, Regs::N72)?;
         stage_loads(b, if p == 0 { 64 } else { 0 })?;
     }
     Ok(())
 }
 
-/// One K128 epoch reading slot `p` (epoch parity p). With `next`, the
-/// staged packet is published into slot 1-p after pass 2 (its LDS stores
-/// drain under pass 3's WMMAs) and the barrier hands the slots over; the
-/// last epoch has neither. `succ_stages`: epoch e+1 has a successor too
-/// (the early schedule issues e+1's head here). Pass 0's scale broadcast
-/// issues after WMMA step `scales0_step`, pass a+1's right after fold pass
-/// a released the broadcast registers.
-fn epoch(b: &mut Builder, g: &Gen, p: usize, next: bool, succ_stages: bool, touch: bool) -> Result<(), String> {
+/// An epoch's rings: still reading only, or with the next packet published
+/// into the next slot (its stores pending) while the current one is read.
+enum Epoch { Reading(Rings), Publishing(Staged<A, Published>, Staged<X, Published>) }
+fn loads(w: &mut Wv, e: &Epoch, i: usize) -> Result<(), String> {
+    match e {
+        Epoch::Reading((ra, rx)) => step_loads(w, ra, rx, i),
+        Epoch::Publishing((ra, _), (rx, _)) => step_loads(w, ra, rx, i),
+    }
+}
+fn publish(w: &mut Wv, e: Epoch) -> Result<Epoch, String> {
+    match e {
+        Epoch::Reading((ra, rx)) => { let (a, x) = stage_store(w, ra, rx)?; Ok(Epoch::Publishing(a, x)) }
+        Epoch::Publishing(..) => Err("epoch publishes its packet twice".into()),
+    }
+}
+
+/// One K128 epoch reading the rings' current slot `p` (epoch parity p).
+/// With `next`, the staged packet is published into slot 1-p after pass 2
+/// (its LDS stores drain under pass 3's WMMAs) and the barrier rotates the
+/// rings; the last epoch has neither. `succ_stages`: epoch e+1 has a
+/// successor too (the early schedule issues e+1's head here). Pass 0's
+/// scale broadcast issues after WMMA step `scales0_step`, pass a+1's right
+/// after fold pass a released the broadcast registers.
+fn epoch(wg: &mut Wg, g: &Gen, rings: Rings, next: bool, succ_stages: bool, touch: bool) -> Result<Rings, String> {
     let sched = g.sched;
-    if sched != Sched::Early { head(b, p, next, touch)?; }
+    let p = rings.0.cur_index();
+    if sched != Sched::Early { head(wg.isa(), p, next, touch)?; }
     // Early stores (SET): in the last epoch, pass a's final sums are stored
     // one b128 per WMMA step of pass a+1, spreading the tile's Y writes over
     // the epoch instead of bursting them after it.
     let mut pending: Vec<(u8, u8, u8)> = Vec::new();
+    let mut e = Epoch::Reading(rings);
     for i in 0..32 {
-        if i + 1 < 32 { step_loads(b, p, i + 1)?; }
-        step_wmma(b, i)?;
+        if i + 1 < 32 { loads(wg, &e, i + 1)?; }
+        step_wmma(wg, i)?;
+        let b = wg.isa();
         if let Some((a, c, q)) = pending.pop() { early_store(b, a, c, q)?; }
         if i == g.scales0_step() { scales(b, 0)?; }
         if i % 8 == 7 && i < 31 {
             fold(b, (i / 8) as u8, Regs::DC[p])?;
             scales(b, (i / 8) as u8 + 1)?;
-            if next && i / 8 == PUBLISH_AFTER_PASS { stage_store(b, 1 - p)?; }
+            if next && i / 8 == PUBLISH_AFTER_PASS { e = publish(wg, e)?; }
             if g.early && !next {
                 let a = (i / 8) as u8;
                 for c in (0..4u8).rev() { for q in (0..2u8).rev() { pending.push((a, c, q)); } }
@@ -613,53 +609,69 @@ fn epoch(b: &mut Builder, g: &Gen, p: usize, next: bool, succ_stages: bool, touc
         }
     }
     if !pending.is_empty() { return Err("early stores left pending".into()) }
-    if next {
-        b.barrier(&[Transition::Retire(SLOT_A[p]), Transition::Retire(SLOT_X[p]), Transition::Ready(SLOT_A[1 - p]), Transition::Ready(SLOT_X[1 - p])])?;
-        step_loads(b, 1 - p, 0)?;
-        if sched == Sched::Early { head(b, 1 - p, succ_stages, false)?; }
-    }
-    fold(b, 3, Regs::DC[p])
+    let rings = match (e, next) {
+        (Epoch::Publishing((ra, pa), (rx, px)), true) => {
+            let (da, dx) = wg.wait_all((pa, px))?;
+            let (ra, rx) = wg.barrier((rotate(ra, da), rotate(rx, dx)))?;
+            step_loads(wg, &ra, &rx, 0)?;
+            if sched == Sched::Early { head(wg.isa(), 1 - p, succ_stages, false)?; }
+            (ra, rx)
+        }
+        (Epoch::Reading(rings), false) => rings,
+        _ => return Err("epoch publication does not match its successor".into()),
+    };
+    fold(wg.isa(), 3, Regs::DC[p])?;
+    Ok(rings)
+}
+
+/// The trip counter is `K`-derived or a constant: workgroup-uniform.
+fn trips_cmp(wg: &mut Wg, cmp: &str) -> Result<WgUniform<Scc>, String> {
+    wg.scmp_wg_uniform(Instruction::new(format!("{cmp} s{}, 0", Regs::TRIPS), vec![], vec![s(Regs::TRIPS)]))
 }
 
 /// A counted loop of two-epoch trips over `Regs::TRIPS`, skipped at zero
 /// trips when `may_be_empty`.
-fn phase(b: &mut Builder, g: &Gen, head: &str, touch: bool, may_be_empty: bool) -> Result<(), String> {
+fn phase(wg: &mut Wg, g: &Gen, head: &str, touch: bool, may_be_empty: bool, rings: Rings) -> Result<Rings, String> {
     let (head, end) = (g.label(head), g.label(&format!("{head}_end")));
     // Whatever the schedule leaves in flight at a trip boundary (the next
     // epoch's step-0 loads, and with `Early` its head) is in flight on entry,
-    // on every back-edge (`Builder::loop_` checks it) and on exit.
-    let entry = b.ledger.shape();
+    // on every back-edge (the builder's loop fixpoint checks it) and on exit.
+    let entry = wg.isa().ledger.shape();
+    let trips = |wg: &mut Wg, rings: Rings| -> Result<Rings, String> {
+        let rings = wg.loop_carried(&head, rings, |wg, rings| {
+            let rings = epoch(wg, g, rings, true, true, touch)?;
+            let rings = epoch(wg, g, rings, true, true, touch)?;
+            op(wg.isa(), format!("s_add_i32 s{0}, s{0}, -1", Regs::TRIPS), &[s(Regs::TRIPS)], &[s(Regs::TRIPS)])?;
+            Ok((rings, trips_cmp(wg, "s_cmp_lg_u32")?))
+        })?;
+        // Both paths to the end label (no trip, or after the loop) arrive with
+        // the same pending loads, so the waits after it hold on either.
+        if wg.isa().ledger.shape() != entry { return Err(format!("{head} exit ledger differs from its entry")) }
+        Ok(rings)
+    };
     if may_be_empty {
-        op(b, format!("s_cmp_eq_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
-        op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+        let no_trip = trips_cmp(wg, "s_cmp_eq_u32")?;
+        return wg.wg_skip_if(no_trip, &end, rings, trips)
     }
-    b.loop_(&head, |b| {
-        epoch(b, g, 0, true, true, touch)?;
-        epoch(b, g, 1, true, true, touch)?;
-        op(b, format!("s_add_i32 s{0}, s{0}, -1", Regs::TRIPS), &[s(Regs::TRIPS)], &[s(Regs::TRIPS)])?;
-        op(b, format!("s_cmp_lg_u32 s{}, 0", Regs::TRIPS), &[], &[s(Regs::TRIPS)])?;
-        op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
-    })?;
-    // Both paths to the end label (no trip, or after the loop) arrive with
-    // the same pending loads, so the waits after it hold on either.
-    if b.ledger.shape() != entry { return Err(format!("{head} exit ledger differs from its entry")) }
-    b.label(&end)
+    let rings = trips(wg, rings)?;
+    wg.label(&end)?;
+    Ok(rings)
 }
 
-fn kloop(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    b.label(&g.label("k_begin"))?;
-    phase(b, g, "k_loop", false, true)?;
+fn kloop(wg: &mut Wg, g: &Gen, rings: Rings) -> Result<Rings, String> {
+    wg.label(&g.label("k_begin"))?;
+    let mut rings = phase(wg, g, "k_loop", false, true, rings)?;
     if g.add() {
         // Touch trips (epochs E-16..E-9), then the three trips before the tail.
-        op(b, format!("s_mov_b32 s{}, 4", Regs::TRIPS), &[s(Regs::TRIPS)], &[])?;
-        op(b, format!("s_mov_b64 s[{}:{}], s[{}:{}]", Regs::STB, Regs::STB + 1, Regs::SY, Regs::SY + 1), &[sr(Regs::STB, 2)], &[sr(Regs::SY, 2)])?;
-        phase(b, g, "touch_loop", true, false)?;
-        op(b, format!("s_mov_b32 s{}, 3", Regs::TRIPS), &[s(Regs::TRIPS)], &[])?;
-        phase(b, g, "late_loop", false, false)?;
+        op(wg.isa(), format!("s_mov_b32 s{}, 4", Regs::TRIPS), &[s(Regs::TRIPS)], &[])?;
+        op(wg.isa(), format!("s_mov_b64 s[{}:{}], s[{}:{}]", Regs::STB, Regs::STB + 1, Regs::SY, Regs::SY + 1), &[sr(Regs::STB, 2)], &[sr(Regs::SY, 2)])?;
+        rings = phase(wg, g, "touch_loop", true, false, rings)?;
+        op(wg.isa(), format!("s_mov_b32 s{}, 3", Regs::TRIPS), &[s(Regs::TRIPS)], &[])?;
+        rings = phase(wg, g, "late_loop", false, false, rings)?;
     }
-    b.label(&g.label("tail"))?;
-    epoch(b, g, 0, true, false, false)?;
-    epoch(b, g, 1, false, false, false)
+    wg.label(&g.label("tail"))?;
+    let rings = epoch(wg, g, rings, true, false, false)?;
+    epoch(wg, g, rings, false, false, false)
 }
 
 /// One b128 of pass `a`, token fragment `c`, row quad `q` (SET): Y bases are
@@ -747,9 +759,17 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
 /// checks and the IEEE `fdiv` expansion with f32 denormals enabled). The
 /// eight elements are interleaved op by op.
 fn silu_group(b: &mut Builder, gate: u8, up: u8) -> Result<(), String> {
-    const TMP: u8 = 160;
-    let t = |k: u8, i: u8| TMP + SILU_TEMPS * k + i;
-    let (m_under, m_over, m_num) = (|k: u8| Regs::MASK + 2 * k, |k: u8| Regs::MASK + 2 * (SILU_GROUP + k), |k: u8| Regs::MASK + 2 * (2 * SILU_GROUP + k));
+    silu_mul(b, gate, up, 160, Regs::MASK, SILU_GROUP)
+}
+
+/// [`silu_group`]'s DAG over the `n` elements `gate..gate+n` / `up..up+n`
+/// (h written over the gate values), interleaved op by op: the builder's one
+/// SiLU emitter for gfx11 and gfx12. Element `k` uses the temporaries
+/// `tmp + 6k ..+6` and the lane-mask pairs `mask + 2k` (underflow),
+/// `mask + 2(n+k)` (overflow), `mask + 2(2n+k)` (numerator scale).
+pub(crate) fn silu_mul(b: &mut Builder, gate: u8, up: u8, tmp: u8, mask: u8, n: u8) -> Result<(), String> {
+    let t = |k: u8, i: u8| tmp + SILU_TEMPS * k + i;
+    let (m_under, m_over, m_num) = (|k: u8| mask + 2 * k, |k: u8| mask + 2 * (n + k), |k: u8| mask + 2 * (2 * n + k));
     type Step<'a> = &'a dyn Fn(&mut Builder, u8) -> Result<(), String>;
     let steps: [Step; 26] = [
         // ph = RN(-log2e * g); pl = fma(-log2e, g, -ph); pl = fma(-log2e_lo, g, pl)
@@ -788,7 +808,7 @@ fn silu_group(b: &mut Builder, gate: u8, up: u8) -> Result<(), String> {
         &|b, k| op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", gate + k, t(k, 5), up + k), &[v(gate + k)], &[v(t(k, 5)), v(up + k)]),
     ];
     for step in steps {
-        for k in 0..SILU_GROUP { step(b, k)?; }
+        for k in 0..n { step(b, k)?; }
     }
     Ok(())
 }
@@ -803,17 +823,20 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, g.plan()?);
     b.enable_delay_alu();
-    declare_lds(&mut b)?;
-    prologue(&mut b, &g)?;
-    kloop(&mut b, &g)?;
-    epilogue(&mut b, &g)?;
-    b.label(&g.label("end"))?;
+    let mut wg = Wg::new(&mut b)?;
+    let rings = declare_lds(&mut wg)?;
+    let end = wg.exit(&g.label("end"))?;
+    let rings = prologue(&mut wg, &g, rings)?;
+    // The last epoch's slot stays published: nothing writes LDS after it.
+    let _published = kloop(&mut wg, &g, rings)?;
+    epilogue(wg.isa(), &g)?;
     // One CTA per WGP: release the VGPRs before the epilogue's stores drain
     // so the next CTA's waves launch (hipcc emits the same message).
     // M7 models `s_sendmsg` as reading M0; the message carries no data.
-    op(&mut b, "s_mov_b32 m0, 0", &[], &[])?;
-    b.push(Sop::Dealloc.encode(spec.arch)?)?;
-    b.push(Sop::End.encode(spec.arch)?)?;
+    wg.end_with(end, |w| {
+        op(w.isa(), "s_mov_b32 m0, 0", &[], &[])?;
+        w.isa().push(Sop::Dealloc.encode(spec.arch)?)
+    })?;
     b.finish()
 }
 

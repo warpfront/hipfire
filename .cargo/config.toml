@@ -24,6 +24,11 @@ fmt = ["use-scripts-fmt-changed-sh-instead-of-cargo-fmt"]
 
 # Windows gives the main thread a 1 MB stack unless the linker says otherwise,
 # which is not enough for the CLI's startup path (hipfire --version
-# stack-overflows). Reserve 32 MB. No effect on other targets.
-[target.'cfg(windows)']
+# stack-overflows). Reserve 32 MB. No effect on other targets. `/STACK:` is a
+# link.exe/lld-link flag; the mingw (gnu) toolchain links through gcc/ld and
+# takes `--stack` instead.
+[target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "link-args=/STACK:33554432"]
+
+[target.'cfg(all(windows, target_env = "gnu"))']
+rustflags = ["-C", "link-args=-Wl,--stack,33554432"]

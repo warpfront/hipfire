@@ -81,6 +81,13 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "thinking_budget",
         kind: FieldKind::Enum(THINKING_BUDGET),
     },
+    // Also an easy row with no spec, so it was equally uneditable. The values come
+    // from the schema's own list rather than a local copy, so this cannot drift
+    // from what `set_cli` accepts.
+    FieldSpec {
+        key: "reasoning_effort",
+        kind: FieldKind::Enum(hipfire_config::REASONING_EFFORTS),
+    },
     FieldSpec {
         key: "chat_template",
         kind: FieldKind::FreeStr {
@@ -108,6 +115,27 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
             min: 512,
             max: 524288,
         },
+    },
+    // Present in `config::easy_keys()`, so the Settings editor offers it as an
+    // inline-editable row; without a spec here Enter falls through to "not
+    // editable from the TUI" and no value can be typed. `min: -1` matches the
+    // schema (negative is the reserved auto spelling). Clearing: the editor seeds
+    // its buffer from the *current* value, so an emptied buffer is the unset
+    // spelling — `write_value` maps empty input on a nullable field to clear — and
+    // a typed `null` is the config/CLI spelling rather than something the buffer
+    // can reach once a value exists (typing appends to the seed).
+    FieldSpec {
+        key: "gpu_layer_budget",
+        kind: FieldKind::Int {
+            min: -1,
+            max: 65536,
+        },
+    },
+    // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
+    // which is also what its own field validates against, so the two cannot drift.
+    FieldSpec {
+        key: "offload_exec",
+        kind: FieldKind::Enum(hipfire_config::OFFLOAD_EXECS),
     },
     FieldSpec {
         key: "flash_mode",
@@ -167,10 +195,21 @@ pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteErro
         key: key.to_owned(),
         value: raw.to_owned(),
     })?;
-    let config_value = schema.parse_cli(raw).map_err(|_| WriteError::Invalid {
+    let invalid = || WriteError::Invalid {
         key: key.to_owned(),
         value: raw.to_owned(),
-    })?;
+    };
+    let config_value = match schema.parse_cli(raw) {
+        Ok(value) => value,
+        // An empty buffer on a field that cannot hold the empty string is the
+        // *unset* spelling, not a typo: the editor opens empty exactly when the
+        // stored value is null (`App::current_setting_value` reads "" for an
+        // unset key), so Enter on a row the user never typed into must clear the
+        // key rather than be rejected. A `FreeStr` field accepts "" directly and
+        // never reaches this arm.
+        Err(_) if raw.trim().is_empty() => schema.parse_cli("null").map_err(|_| invalid())?,
+        Err(_) => return Err(invalid()),
+    };
     let json = to_json(&config_value);
     write_config_value(path, schema.key, config_value)?;
     Ok(json)
@@ -319,6 +358,65 @@ mod tests {
         assert!(write_value(&path, "port", "70000").is_err());
         assert!(write_value(&path, "kv_cache", "magic4").is_err());
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An empty buffer is the *unset* spelling on a field that cannot hold the
+    /// empty string — the editor opens empty exactly when the stored value is
+    /// null, so Enter on a row the user never typed into must clear it (a no-op
+    /// when it was already unset) instead of flooding an error. A free-string
+    /// field keeps meaning the empty string.
+    #[test]
+    fn empty_input_clears_a_nullable_field_but_stays_empty_for_a_string() {
+        let (root, path) = temp_config();
+        assert_eq!(
+            write_value(&path, "gpu_layer_budget", "").unwrap(),
+            Value::Null,
+            "empty on a nullable integer must clear, not be rejected"
+        );
+        assert_eq!(
+            write_value(&path, "gpu_layer_budget", "   ").unwrap(),
+            Value::Null,
+            "whitespace-only input is the same unset spelling"
+        );
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert!(
+            loaded.layer.get("gpu_layer_budget").is_none(),
+            "cleared key is off disk"
+        );
+
+        // A free string keeps the empty string as a value.
+        assert_eq!(
+            write_value(&path, "prefill_drafter", "").unwrap(),
+            Value::String(String::new())
+        );
+        // And a genuinely bad value is still rejected.
+        assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
+        // The empty-means-clear retry must not hand a non-nullable enum a clear
+        // spelling it does not have in the schema (`pcie|cpu`).
+        assert!(
+            write_value(&path, "offload_exec", "").is_err(),
+            "empty input must not make a non-nullable enum clearable"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The option list a user can cycle through must be what the schema accepts:
+    /// a value the schema accepts but the TUI omits is unselectable, and one the
+    /// TUI offers but the schema rejects is a dead end.
+    #[test]
+    fn offload_exec_options_are_the_schema_values() {
+        let (root, path) = temp_config();
+        let spec = field_spec("offload_exec").expect("offload_exec has a spec");
+        let FieldKind::Enum(options) = spec.kind else {
+            panic!("offload_exec must be an enum row, got {:?}", spec.kind);
+        };
+        assert_eq!(options, hipfire_config::OFFLOAD_EXECS);
+        for value in options {
+            write_value(&path, "offload_exec", value)
+                .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
+        }
+        assert!(write_value(&path, "offload_exec", "gpu").is_err());
         let _ = fs::remove_dir_all(root);
     }
 

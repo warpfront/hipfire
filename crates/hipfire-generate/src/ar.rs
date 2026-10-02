@@ -268,17 +268,6 @@ pub fn qwen_ar_finish_route(
     }
 }
 
-/// EosFilter config for Qwen AR contract-v2 producer path. EosFilter owns
-/// UTF-8/EOT filtering only; ThinkOutputRouter owns think-channel routing.
-pub fn qwen_ar_eos_filter_config() -> EosFilterConfig {
-    EosFilterConfig {
-        strip_think: false,
-        started_in_think: false,
-        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
-        holdback_prefixes: Vec::new(),
-    }
-}
-
 /// Apply one filter observe step into the semantic router. Returns
 /// `Ok(true)` when the filter signals Stop / EmitAndStop (decoded EOT)
 /// so the caller can break the decode loop without emitting marker text.
@@ -569,7 +558,7 @@ impl QwenArSemanticProducer {
     ) -> Self {
         Self {
             id: id.into(),
-            filter: EosFilter::new(qwen_ar_eos_filter_config()),
+            filter: EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config()),
             think_router: ThinkOutputRouter::new(started_in_think),
             router: if tool_protocol_enabled {
                 ToolOutputRouter::new()
@@ -797,6 +786,49 @@ pub fn qwen_ar_forward_fail_action() -> QwenArForwardFailAction {
 
 pub fn qwen_ar_forward_fail_message(phase: &str, err: impl std::fmt::Display) -> String {
     format!("{phase}: {err}")
+}
+
+/// One KV-eviction step at the write slot `*seq_pos` just advanced to; moves
+/// it to the compacted physical slot when the policy evicts. A failure is
+/// returned, never unwrapped: a transient HIP error mid-request fails the
+/// request closed ([`qwen_ar_eviction_fail_closed`]) instead of panicking
+/// the daemon. `evict` is the policy call (`Ok(None)` without a policy).
+pub fn qwen_ar_evict<E: std::fmt::Debug>(
+    seq_pos: &mut usize,
+    evict: impl FnOnce(usize) -> Result<Option<hipfire_runtime::triattn::EvictionResult>, E>,
+) -> Result<(), String> {
+    if crate::common::take_eviction_fault() {
+        return Err("injected fault: eviction".to_owned());
+    }
+    match evict(*seq_pos) {
+        Ok(Some(result)) => {
+            *seq_pos = result.new_physical;
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+/// Fail-closed terminal for a failed [`qwen_ar_evict`]: attested rollback
+/// and one correlated `gpu` error — no done, no cache store, no panic.
+pub fn qwen_ar_eviction_fail_closed(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    phase: &str,
+    err: &str,
+) {
+    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        &format!("KV eviction failed ({phase}): {err}"),
+        "gpu",
+        false,
+        &ep,
+    );
 }
 
 /// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
@@ -1683,14 +1715,19 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
         16 => {
-            // Qwen4 native MTP is a strictly greedy, explicitly requested
-            // route. Any sampler control, adaptive state, or force-AR switch
-            // keeps the request on the ordinary Qwen4 producer.
+            // Qwen4 native MTP verifies greedy picks, or, at temperature > 0,
+            // per-row target draws when the drafter supports sampled verify.
+            // At temperature 0 the AR producer reduces to argmax and ignores
+            // top_p/top_k/min_p (see `greedy_on_gpu` in
+            // `generate_ar_with_forward`), so their presence on the wire must
+            // not demote the request: serve forwards top_p/top_k whenever the
+            // client or the registry sets one. Penalties move the target
+            // distribution and the verify does not apply them, so non-neutral
+            // ones, adaptive KV, or a force-AR switch keep the request on the
+            // ordinary Qwen4 producer.
             let spec_ok = i.has_speculator
                 && i.speculator_is_mtp
-                && i.temp <= 1e-6
-                && !i.user_explicit_sampling
-                && !i.min_p.is_some_and(|p| p > 0.0)
+                && (i.temp <= 1e-6 || i.supports_temp_swor)
                 && !i.nonneutral_penalties
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off
@@ -2013,7 +2050,8 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled);
     let mut streamed_tokens = Vec::new();
     let mut generated = 0usize;
-    let mut bytes_fed_to_filter = 0usize;
+    // Raw bytes of `streamed_tokens`, grown one token at a time.
+    let mut stream_bytes: Vec<u8> = Vec::new();
     let mut natural_stop = false;
     let t_decode = Instant::now();
 
@@ -2041,10 +2079,12 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             }
         };
 
-        let previous_bytes = bytes_fed_to_filter;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         let classify = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
+            let fed = stream_bytes.len();
+            tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
+            let new_bytes = &stream_bytes[fed..];
             semantic.commit_and_classify(
                 stdout,
                 next_token,
@@ -2056,9 +2096,6 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
                         next_token,
                         QwenArRawCommitDisposition::ClassifiedVisible,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = all_bytes[previous_bytes.min(all_bytes.len())..].to_vec();
-                    bytes_fed_to_filter = all_bytes.len();
                     (position, new_bytes)
                 },
                 |position, out| {
@@ -4470,12 +4507,9 @@ pub fn generate(
                         }
                     }
                 }
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                {
-                    m.seq_pos = new_phys;
+                if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| ev.maybe_evict(gpu, kv, at)) {
+                    qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "prefill", &err);
+                    return;
                 }
                 remaining = rest;
             }
@@ -4841,7 +4875,10 @@ pub fn generate(
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
-        let mut bytes_fed_to_filter = 0usize;
+        // Raw bytes of `streamed_tokens`, grown one token at a time
+        // (`decode_token_bytes_into`) instead of re-decoding the whole
+        // history every token. Its length is the filter's fed offset.
+        let mut stream_bytes: Vec<u8> = Vec::new();
         // Increment-A semantic producer: sole authority for client-visible text
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
@@ -4964,9 +5001,12 @@ pub fn generate(
             }
             // Incremental UTF-8 + filter routing via producer-owned
             // commit-then-classify. Raw commit (conversation/stream/seq_pos)
-            // runs inside the closure before fallible classify; decode delta
-            // is computed after the real push.
-            let prev_fed = bytes_fed_to_filter;
+            // runs inside the closure before fallible classify; the token's
+            // bytes are appended to the stream buffer and handed over as its
+            // delta.
+            let fed = stream_bytes.len();
+            tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
+            let new_bytes = &stream_bytes[fed..];
             let elapsed_ms = t0.elapsed().as_millis() as u64;
             match semantic.commit_and_classify(
                 stdout,
@@ -4979,9 +5019,6 @@ pub fn generate(
                         next_token,
                         QwenArRawCommitDisposition::ClassifiedVisible,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = all_bytes[prev_fed..].to_vec();
-                    bytes_fed_to_filter = all_bytes.len();
                     (pos, new_bytes)
                 },
                 |pos, out| {
@@ -5010,14 +5047,12 @@ pub fn generate(
                     ckpt_max(),
                 );
             }
-            if let Some(ref ev) = m.eviction {
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                {
-                    m.seq_pos = new_phys;
-                }
+            if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                Some(ev) => ev.maybe_evict(gpu, kv, at),
+                None => Ok(None),
+            }) {
+                qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "decode", &err);
+                return;
             }
             // Adaptive KV: downshift K/V precision as seq_pos crosses capacity
             // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
@@ -5088,8 +5123,7 @@ pub fn generate(
                 || force_answer_latched
                 || max_total_think > 0
             {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let raw_str = std::str::from_utf8(&stream_bytes).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
@@ -5180,9 +5214,12 @@ pub fn generate(
                         if grammar_active {
                             grammar_matcher.advance(&tokenizer.decode(&[t]));
                         }
-                        let prev_fed = bytes_fed_to_filter;
+                        let fed = stream_bytes.len();
+                        tokenizer.decode_token_bytes_into(t, &mut stream_bytes);
+                        let new_bytes = &stream_bytes[fed..];
                         let elapsed_ms = t0.elapsed().as_millis() as u64;
-                        match semantic.commit_and_classify(
+                        let mut evict_failure = None;
+                        let classified = semantic.commit_and_classify(
                             stdout,
                             t,
                             || {
@@ -5193,24 +5230,25 @@ pub fn generate(
                                     t,
                                     QwenArRawCommitDisposition::ClassifiedVisible,
                                 );
-                                if let Some(ref ev) = m.eviction {
-                                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                                        new_physical: new_phys,
-                                        ..
-                                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                                    {
-                                        m.seq_pos = new_phys;
-                                    }
+                                if let Err(err) =
+                                    qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                                        Some(ev) => ev.maybe_evict(gpu, kv, at),
+                                        None => Ok(None),
+                                    })
+                                {
+                                    evict_failure = Some(err);
                                 }
-                                let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                                let new_bytes = all_bytes[prev_fed..].to_vec();
-                                bytes_fed_to_filter = all_bytes.len();
                                 (pos, new_bytes)
                             },
                             |pos, out| {
                                 crate::common::emit_committed_event(out, id, t, pos, elapsed_ms);
                             },
-                        ) {
+                        );
+                        if let Some(err) = evict_failure {
+                            qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "think close", &err);
+                            return;
+                        }
+                        match classified {
                             Ok(true) => {
                                 generated += 1;
                                 break;
@@ -5270,8 +5308,7 @@ pub fn generate(
                 // answer with a system-alert string. Check the raw decoded
                 // text rather than token IDs since <think> tokenizes as a
                 // multi-token sequence in Qwen3.5's vocab.
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let raw_str = std::str::from_utf8(&stream_bytes).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 if !in_think {
                     emit_qwen_ar_info(
@@ -5370,9 +5407,14 @@ pub fn generate(
                             }
                             return;
                         }
-                        let prev_fed = bytes_fed_to_filter;
+                        let fed = stream_bytes.len();
+                        tokenizer.decode_token_bytes_into(tok, &mut stream_bytes);
+                        // Injected text still goes through producer filter/router
+                        // so think markers never leak on the contract-v2 wire.
+                        let new_bytes = &stream_bytes[fed..];
                         let elapsed_ms = t0.elapsed().as_millis() as u64;
-                        match semantic.commit_and_classify(
+                        let mut evict_failure = None;
+                        let classified = semantic.commit_and_classify(
                             stdout,
                             tok,
                             || {
@@ -5383,26 +5425,25 @@ pub fn generate(
                                     tok,
                                     QwenArRawCommitDisposition::ClassifiedVisible,
                                 );
-                                if let Some(ref ev) = m.eviction {
-                                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                                        new_physical: new_phys,
-                                        ..
-                                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                                    {
-                                        m.seq_pos = new_phys;
-                                    }
+                                if let Err(err) =
+                                    qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                                        Some(ev) => ev.maybe_evict(gpu, kv, at),
+                                        None => Ok(None),
+                                    })
+                                {
+                                    evict_failure = Some(err);
                                 }
-                                // Injected text still goes through producer filter/router
-                                // so think markers never leak on the contract-v2 wire.
-                                let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
-                                let new_bytes2 = all_bytes2[prev_fed..].to_vec();
-                                bytes_fed_to_filter = all_bytes2.len();
-                                (pos, new_bytes2)
+                                (pos, new_bytes)
                             },
                             |pos, out| {
                                 crate::common::emit_committed_event(out, id, tok, pos, elapsed_ms);
                             },
-                        ) {
+                        );
+                        if let Some(err) = evict_failure {
+                            qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "budget alert", &err);
+                            return;
+                        }
+                        match classified {
                             Ok(true) => {
                                 generated += 1;
                                 break;
@@ -5550,14 +5591,12 @@ pub fn generate(
                         |_pos, _out| {},
                     )
                     .expect("hidden commit never classifies");
-                if let Some(ref ev) = m.eviction {
-                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                        new_physical: new_phys,
-                        ..
-                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                    {
-                        m.seq_pos = new_phys;
-                    }
+                if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                    Some(ev) => ev.maybe_evict(gpu, kv, at),
+                    None => Ok(None),
+                }) {
+                    qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "trailer", &err);
+                    return;
                 }
             }
         }
@@ -5814,12 +5853,11 @@ pub fn generate(
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
-        // `bytes_fed_to_filter` is the index into the freshly-decoded
-        // byte stream past which we have not yet handed bytes to the
-        // filter. The filter owns UTF-8 boundary buffering and any
-        // future arch quirks (Gemma 4 marker holdback, strip-think,
-        // byte-level stop_at); see crates/engine/src/eos_filter.rs.
-        let mut bytes_fed_to_filter = 0usize;
+        // Raw bytes of `streamed_tokens`, grown one token at a time; each
+        // token's delta goes to the filter, which owns UTF-8 boundary
+        // buffering and any future arch quirks (Gemma 4 marker holdback,
+        // strip-think, byte-level stop_at); see crates/engine/src/eos_filter.rs.
+        let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
 
         for _ in 0..max_tokens {
@@ -5842,9 +5880,9 @@ pub fn generate(
                 streamed_tokens.len() - 1,
                 t0.elapsed().as_millis() as u64,
             );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
+            let fed = stream_bytes.len();
+            tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
+            let new_bytes = &stream_bytes[fed..];
             if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
                 let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(

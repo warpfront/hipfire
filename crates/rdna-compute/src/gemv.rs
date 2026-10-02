@@ -50,7 +50,18 @@ mod awq_rcp_planes_tests {
         let hi = 1_048_576.0f32;
         let below = f32::from_bits(lo.to_bits() - 1);
         let above = f32::from_bits(hi.to_bits() + 1);
-        let awq = [3.0f32, -0.1, lo, below, hi, above, 0.0, f32::INFINITY, f32::NAN, 1.0];
+        let awq = [
+            3.0f32,
+            -0.1,
+            lo,
+            below,
+            hi,
+            above,
+            0.0,
+            f32::INFINITY,
+            f32::NAN,
+            1.0,
+        ];
         let p = awq_rcp_planes(&awq);
         let k = awq.len();
         assert_eq!(p.len(), 3 * k);
@@ -63,7 +74,10 @@ mod awq_rcp_planes_tests {
                 let err = (r as f64 + rl as f64) * a as f64 - 1.0;
                 assert!(err.abs() <= 2f64.powi(-47), "a={a} err={err}");
             } else {
-                assert!(r.is_nan() && rl.is_nan(), "a={a} must fall back to the divide");
+                assert!(
+                    r.is_nan() && rl.is_nan(),
+                    "a={a} must fall back to the divide"
+                );
             }
         }
     }
@@ -94,10 +108,13 @@ pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
     static SHIFT: LazyLock<Result<i32, String>> = LazyLock::new(|| {
         let raw = hipfire_config::developer_var("HIPFIRE_FP8_ROW_SCALE_SHIFT")
             .unwrap_or_else(|_| "0".to_owned());
-        let shift = raw.parse::<i32>()
+        let shift = raw
+            .parse::<i32>()
             .map_err(|_| format!("HIPFIRE_FP8_ROW_SCALE_SHIFT: invalid integer {raw:?}"))?;
         if ![-1, 0, 1, 2, 3].contains(&shift) {
-            return Err(format!("HIPFIRE_FP8_ROW_SCALE_SHIFT: unsupported shift {shift}"));
+            return Err(format!(
+                "HIPFIRE_FP8_ROW_SCALE_SHIFT: unsupported shift {shift}"
+            ));
         }
         Ok(shift)
     });
@@ -119,7 +136,6 @@ pub enum SigmoidGate<'a> {
     /// left by `FaPrepQOut::Fp8Codes` with no gate copy.
     QGateInterleaved(&'a GpuTensor),
 }
-
 
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
     let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
@@ -864,7 +880,9 @@ impl Gpu {
                 .scratch
                 .paro_fused_scratch
                 .as_ref()
-                .map_or(true, |bufs| bufs.iter().any(|b| b.buf.size() < needed_bytes));
+                .map_or(true, |bufs| {
+                    bufs.iter().any(|b| b.buf.size() < needed_bytes)
+                });
             if will_grow {
                 self.invalidate_for_scratch_growth();
             }
@@ -2319,15 +2337,18 @@ impl Gpu {
             .ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
     }
 
-    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
-    /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
+    /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256.
+    ///
+    /// `x` must be **pre-rotated** — one `mq_rotate_x` pass over x, not per row —
+    /// because the kernel's inner loop is the plain HFQ4-G256 dot product and does
+    /// no rotation of its own. (The sign tables belong to `mq_rotate_x`, not here:
+    /// passing them as kernargs shifted `m`/`k` out of their slots, which is why
+    /// this wrapper's callers saw an all-zero result.)
     pub fn gemv_mq4g256(
         &mut self,
         a_raw: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
-        signs1: &GpuTensor,
-        signs2: &GpuTensor,
         m: usize,
         k: usize,
     ) -> HipResult<()> {
@@ -2337,16 +2358,12 @@ impl Gpu {
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
-        let mut s1_ptr = signs1.buf.as_ptr();
-        let mut s2_ptr = signs2.buf.as_ptr();
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
             &mut y_ptr as *mut _ as *mut c_void,
-            &mut s1_ptr as *mut _ as *mut c_void,
-            &mut s2_ptr as *mut _ as *mut c_void,
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
@@ -2777,8 +2794,11 @@ impl Gpu {
         // gfx1201 / gfx1151 / gfx1100 decode: K/256 workgroups, each redoing the row's reduction
         // and rotating one group (bit-identical to the one-workgroup launch).
         let group_grid = self.flags.dec_norm_grids_enabled() && k % 256 == 0;
-        let (module, source, shared_mem) =
-            if group_grid { awq_norm_dec_kernel() } else { awq_norm_kernel() };
+        let (module, source, shared_mem) = if group_grid {
+            awq_norm_dec_kernel()
+        } else {
+            awq_norm_kernel()
+        };
         self.ensure_kernel(module, source, module)?;
         let grid_x = if group_grid { (k / 256) as u32 } else { 1 };
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -3409,7 +3429,15 @@ impl Gpu {
             if f.y == x.buf.as_ptr() && f.m == k && f.n == batch_size {
                 self.residual_fold_pending = None;
                 return self.fused_rmsnorm_rotate_mq_i4_fold_batched(
-                    x, f.delta, weight, awq, x_rot, reservation, k, eps, batch_size,
+                    x,
+                    f.delta,
+                    weight,
+                    awq,
+                    x_rot,
+                    reservation,
+                    k,
+                    eps,
+                    batch_size,
                 );
             }
             self.flush_residual_fold()?;
@@ -3529,7 +3557,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// [`Self::fused_rmsnorm_rotate_mq_i4_batched`] fused with the residual
@@ -3630,7 +3660,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 slices-2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128`
@@ -3664,8 +3696,9 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let v2 = self.flags.g12_norm_enabled();
         let slab = awq.is_some() && v2 && self.a4_slab_active();
-        let fdiv =
-            slab && crate::gemm::a4_rms_fdiv_enabled() && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
+        let fdiv = slab
+            && crate::gemm::a4_rms_fdiv_enabled()
+            && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
         let (module, source, kernel) = match (awq.is_some(), v2) {
             (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
@@ -4029,7 +4062,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
         self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(
-            gate, Some(up), awq, Some(x_rot), k, batch_size,
+            gate,
+            Some(up),
+            awq,
+            Some(x_rot),
+            k,
+            batch_size,
         )
     }
 
@@ -4197,7 +4235,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let mut xrp = x_rot.map(|x_rot| x_rot.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|x_rot| x_rot.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut x8p = x_fp8_ptr;
         let mut sump = half_sums_ptr;
         let mut sclp = row_scales_ptr;
@@ -4233,8 +4273,20 @@ impl Gpu {
                 &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         };
-        let bytes = ((if h_input { if bf16_h { 2 } else { 4 } } else { 8 }) * k
-            + k * 4 + k + (k / 256) * 2 * 4 + 4) * batch_size;
+        let bytes = ((if h_input {
+            if bf16_h {
+                2
+            } else {
+                4
+            }
+        } else {
+            8
+        }) * k
+            + k * 4
+            + k
+            + (k / 256) * 2 * 4
+            + 4)
+            * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -4289,8 +4341,6 @@ impl Gpu {
             scale_mode: 1,
         })
     }
-
-
 
     /// C2 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` sidecar.
     /// `x_rot = None` skips the f32 store. `awq = Some` selects the AWQ twin.
@@ -4404,7 +4454,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
     /// F1-lite h-producer: [`Self::fused_silu_mul_rotate_mq_i4_batched`]'s
     /// AWQ twin with phase 1 reading h = silu(gate)*up (FP32 [N][K], formed
@@ -4483,11 +4535,16 @@ impl Gpu {
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ];
-        let bytes = (k * if bf16_h { 2 } else { 4 } + k * 4 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
+        let bytes =
+            (k * if bf16_h { 2 } else { 4 } + k * 4 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            if tokfast { [batch_size as u32, n_groups, 1] } else { [n_groups, batch_size as u32, 1] },
+            if tokfast {
+                [batch_size as u32, n_groups, 1]
+            } else {
+                [n_groups, batch_size as u32, 1]
+            },
             [32, 1, 1],
             0,
             &mut params,
@@ -4632,7 +4689,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// Route A MoE-AWQ — per-routed-expert variant of
@@ -4783,7 +4842,11 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (module, src, kernel) = if n_heads == 48 {
-            match (self.arch_caps.is_gfx1100(), self.arch_caps.is_gfx1201(), awq_scale.is_some()) {
+            match (
+                self.arch_caps.is_gfx1100(),
+                self.arch_caps.is_gfx1201(),
+                awq_scale.is_some(),
+            ) {
                 (true, _, true) => (
                     "gated_norm_mq_rotate_awq_k6144_gfx1100",
                     kernels::gated_norm_mq_rotate_awq_k6144_gfx1100_src(),
@@ -4978,19 +5041,34 @@ impl Gpu {
         let bf16 = x_fmt == crate::norm::GdnScanOut::Bf16;
         let slab = awq.is_some() && v2 && self.a4_slab_active();
         let (module, source) = match (awq.is_some(), v2, bf16) {
-            (true, false, false) => ("gated_norm_mq_rotate_awq_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC),
-            (false, false, false) => ("gated_norm_mq_rotate_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC),
+            (true, false, false) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
+            ),
+            (false, false, false) => (
+                "gated_norm_mq_rotate_i4_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC,
+            ),
             (true, true, false) if slab => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_v2_slab",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC,
             ),
-            (true, true, false) => ("gated_norm_mq_rotate_awq_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC),
-            (false, true, false) => ("gated_norm_mq_rotate_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC),
+            (true, true, false) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
+            ),
+            (false, true, false) => (
+                "gated_norm_mq_rotate_i4_gfx12_v2",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC,
+            ),
             (true, false, true) => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_xbf16",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_XBF16_SRC,
             ),
-            (false, false, true) => ("gated_norm_mq_rotate_i4_gfx12_xbf16", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC),
+            (false, false, true) => (
+                "gated_norm_mq_rotate_i4_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC,
+            ),
             (true, true, true) if slab => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SLAB_SRC,
@@ -5016,7 +5094,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -5046,7 +5126,8 @@ impl Gpu {
             .into_iter(),
         );
         let blocks_k = k / 128;
-        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
             + blocks_k * 72
             - if bf16 { k * 2 } else { 0 })
             * batch_size;
@@ -5369,13 +5450,22 @@ impl Gpu {
         let v2 = self.arch_caps.is_gfx1100()
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true);
         let (module, source) = match (awq.is_some(), v2) {
-            (true, false) => ("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC),
-            (false, false) => ("gated_norm_mq_rotate_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC),
+            (true, false) => (
+                "gated_norm_mq_rotate_awq_i4_gfx11",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC,
+            ),
+            (false, false) => (
+                "gated_norm_mq_rotate_i4_gfx11",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC,
+            ),
             (true, true) => (
                 "gated_norm_mq_rotate_awq_i4_gfx1100_v2",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC,
             ),
-            (false, true) => ("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC),
+            (false, true) => (
+                "gated_norm_mq_rotate_i4_gfx1100_v2",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC,
+            ),
         };
         let kernel = module;
         // v2: two 256-groups (one per wave) per 64-thread workgroup.
@@ -5389,7 +5479,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -5419,7 +5511,8 @@ impl Gpu {
             .into_iter(),
         );
         let blocks_k = k / 128;
-        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
             + blocks_k * 72)
             * batch_size;
         let timer = crate::profile::begin_timer(
@@ -5465,7 +5558,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// The HC read's four-branch mix (`hyper_read_projected`) of `rows` rows
@@ -5496,7 +5591,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "hyper_read_projected_rotate_f32";
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, FUNC)?;
+        self.ensure_kernel("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, FUNC)?;
         self.ensure_mq_signs()?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -5604,34 +5699,38 @@ impl Gpu {
     /// Batched `rotate_x_mq`. Grid.y is the batch dim.
     /// `rotate_x_mq_batched` into the shared FP16 X scratch (gfx11 wave32):
     /// the rotated rows rounded to F16 as `convert_f32_to_f16` would, for the
-    /// MQ WMMA GEMMs' `*_xf16` entries.  Valid until the next FP16 conversion.
-    /// `x` is F32 or BF16.
+    /// MQ WMMA GEMMs' `*_xf16` entries, at row pitch `ldo` (>= k) elements.
+    /// Valid until the next FP16 conversion.  `x` is F32 or BF16.
     pub fn rotate_x_mq_batched_f16(
         &mut self,
         x: &GpuTensor,
         k: usize,
         batch_size: usize,
+        ldo: usize,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
+        assert!(ldo >= k, "rotate_x_mq_batched_f16: pitch {ldo} < K {k}");
         let func = if x.dtype == DType::BF16 {
             "mq_rotate_x_bf16_f16"
         } else {
             "mq_rotate_x_f16"
         };
-        self.ensure_kernel("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, func)?;
         self.ensure_mq_signs()?;
-        let out = self.qwen4_f16_x_scratch(k * batch_size)?;
+        let out = self.qwen4_f16_x_scratch(ldo * batch_size)?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let xp = x.buf.as_ptr();
         let op = out.buf.as_ptr();
         let kv = k as i32;
+        let ldv = ldo as i32;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
+            &ldv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             func,
@@ -5646,6 +5745,7 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_i32(kv);
+                b.push_i32(ldv);
                 b
             },
         )?;
@@ -5799,8 +5899,7 @@ impl Gpu {
             ]
         };
         let blocks_k = k / 128;
-        let bytes =
-            (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let bytes = (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fwht",
@@ -5839,7 +5938,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 slices-3 IU4 producer: standalone FWHT rotate + in-register
@@ -5883,7 +5984,9 @@ impl Gpu {
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut xp = x_in.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
@@ -5912,8 +6015,7 @@ impl Gpu {
             ]
         };
         let blocks_k = k / 128;
-        let bytes =
-            (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let bytes = (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fwht",
@@ -5952,7 +6054,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
     /// gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ
     /// divide. Emits MQ4v2 FP8 prepared planes; the opt-in in-register
@@ -6120,11 +6224,8 @@ impl Gpu {
             ]
             .into_iter(),
         );
-        let bytes = (k * 4 * (if gate.is_some() { 3 } else { 2 })
-            + k
-            + (k / 256) * 2 * 4
-            + 4)
-            * batch_size;
+        let bytes =
+            (k * 4 * (if gate.is_some() { 3 } else { 2 }) + k + (k / 256) * 2 * 4 + 4) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
@@ -6238,7 +6339,9 @@ impl Gpu {
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i4p = reservation.ptr();
@@ -6318,15 +6421,23 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (source, kernel) = if awq.is_some() {
-            (FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX12_SRC, "fused_rmsnorm_mq_rotate_awq_i8_gfx12")
+            (
+                FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i8_gfx12",
+            )
         } else {
-            (FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC, "fused_rmsnorm_mq_rotate_i8_gfx12")
+            (
+                FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_i8_gfx12",
+            )
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut xp = x.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i8p = reservation.ptr();
@@ -6386,7 +6497,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 A8 down-proj producer: [`Self::fused_silu_hin_rotate_mq_i4_batched`]'s
@@ -6410,7 +6523,11 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         const KERNEL: &str = "fused_silu_mul_mq_rotate_awq_i8_hin_gfx12";
-        self.ensure_kernel(KERNEL, FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX12_SRC, KERNEL)?;
+        self.ensure_kernel(
+            KERNEL,
+            FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX12_SRC,
+            KERNEL,
+        )?;
         let mut hp = h.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -6454,7 +6571,9 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 A8 LA `wo` producer: [`Self::gated_norm_rotate_mq_i4_gfx12_batched`]'s
@@ -6498,9 +6617,15 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (source, kernel) = if awq.is_some() {
-            (GATED_NORM_MQ_ROTATE_AWQ_I8_GFX12_SRC, "gated_norm_mq_rotate_awq_i8_gfx12")
+            (
+                GATED_NORM_MQ_ROTATE_AWQ_I8_GFX12_SRC,
+                "gated_norm_mq_rotate_awq_i8_gfx12",
+            )
         } else {
-            (GATED_NORM_MQ_ROTATE_I8_GFX12_SRC, "gated_norm_mq_rotate_i8_gfx12")
+            (
+                GATED_NORM_MQ_ROTATE_I8_GFX12_SRC,
+                "gated_norm_mq_rotate_i8_gfx12",
+            )
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut xp = x.buf.as_ptr();
@@ -6509,7 +6634,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut i8p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -6535,7 +6662,8 @@ impl Gpu {
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ]);
-        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
             + (k / 128) * 136)
             * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
@@ -6572,7 +6700,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 A8 FA out-proj producer: [`Self::sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched`]'s
@@ -6603,7 +6733,9 @@ impl Gpu {
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i8p = reservation.ptr();
@@ -6649,7 +6781,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
     /// gfx11 FA output producer: exact sigmoid multiply + AWQ/FWHT rotate +
     /// in-register `block_i4_128`, under the `_gfx11` entry symbol. The old
@@ -6686,7 +6820,9 @@ impl Gpu {
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i4p = reservation.ptr();
@@ -6738,9 +6874,10 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
-
 
     /// FWHT-128 rotation for qt53 activations.
     ///
@@ -15539,7 +15676,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
-            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            kernels::gemv_mq4g256v2_moe_gate_up_k8_indexed_batched_src(self.arch_caps.is_gfx1151()),
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
         )?;
         let pp = expert_ptrs.buf.as_ptr();
@@ -17299,7 +17436,7 @@ impl Gpu {
         // four per block (132 -> 218 GB/s against gemv_q8_0_wide).
         if self.arch_caps.is_gfx1151() && k == 320 {
             const FUNC: &str = "gemv_q8_0_k320_staged";
-            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17326,7 +17463,11 @@ impl Gpu {
         // math on rows staged through LDS, four per block (bitwise).
         if self.arch_caps.is_gfx1151() && k == 640 {
             const FUNC: &str = "gemv_q8_0_wide_k640_staged";
-            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "qwen4_gemv_q8_0_wide",
+                kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                FUNC,
+            )?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17379,7 +17520,7 @@ impl Gpu {
         // values; 226 -> 241 GB/s on the Qwen4 LM head).
         if self.arch_caps.is_gfx1151() && k == 2560 {
             const FUNC: &str = "gemv_q8_0_k2560_staged";
-            self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
             let mut params = [
                 &a_ptr as *const _ as *mut c_void,
                 &x_ptr as *const _ as *mut c_void,
@@ -17440,7 +17581,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "gemv_q8_0_k2560_staged_pair";
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, FUNC)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
         let p0 = a0.buf.as_ptr();
         let p1 = a1.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -17762,7 +17903,7 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            kernels::gemv_bf16_xf32_src(self.arch_caps.is_gfx1151()),
             "gemv_bf16_xf32",
         )?;
 
@@ -17821,8 +17962,8 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
             "gemv_bf16_xf32_k4",
         )?;
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
@@ -17846,7 +17987,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0_k8")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "gemv_q8_0_k8",
+        )?;
         self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
     }
 
@@ -17883,7 +18028,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -17937,8 +18082,8 @@ impl Gpu {
         let chunk = n.div_ceil(GROUPS);
         let (module, src, rescore) = match head.dtype {
             DType::Q8_0 => (
-                "gemv_q8_0",
-                kernels::GEMV_Q8_0_SRC,
+                "qwen4_gemv_q8_0",
+                kernels::QWEN4_GEMV_Q8_0_SRC,
                 "topk8_rescore_q8_0_k2560",
             ),
             DType::MQ6G256V2 => (
@@ -17957,7 +18102,11 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(1, "topk8_rescore_k2560 shape"));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "topk8_partial_f32")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "topk8_partial_f32",
+        )?;
         self.ensure_kernel(module, src, rescore)?;
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
@@ -18049,7 +18198,11 @@ impl Gpu {
         if k != 2560 && k != 320 {
             // gemv_q8_0's small-K wide kernel, per row.
             const FUNC: &str = "gemv_q8_0_wide_rows";
-            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, FUNC)?;
+            self.ensure_kernel(
+                "qwen4_gemv_q8_0_wide",
+                kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                FUNC,
+            )?;
             let a_ptr = a_raw.buf.as_ptr();
             let x_ptr = x.buf.as_ptr();
             let y_ptr = y.buf.as_ptr();
@@ -18085,7 +18238,7 @@ impl Gpu {
         } else {
             ("gemv_q8_0_k320_staged_rows", m.div_ceil(2) as u32, 64u32)
         };
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, func)?;
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -18124,7 +18277,11 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "quantize_bf16_q8_0")?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "quantize_bf16_q8_0",
+        )?;
         let blocks = (m * k / 32) as i32;
         let out = self.alloc_tensor(&[m * k / 32 * 34], DType::Q8_0)?;
         let w_ptr = weight.buf.as_ptr();
@@ -18155,6 +18312,26 @@ impl Gpu {
                 Err(error)
             }
         }
+    }
+
+    /// `(F32 scratch, packed output)` bytes [`Self::requant_g256`] allocates
+    /// for an `[m, k]` weight; `None` for a non-MQ-G256-V2 target. The
+    /// scratch goes back to the device (not the pool) when the requant
+    /// returns, so only the packed output stays allocated.
+    pub fn requant_g256_bytes(m: usize, k: usize, target: DType) -> Option<(usize, usize)> {
+        let bits = match target {
+            DType::MQ2G256V2 => 2,
+            DType::MQ3G256V2 => 3,
+            DType::MQ4G256V2 => 4,
+            DType::MQ5G256V2 => 5,
+            DType::MQ6G256V2 => 6,
+            _ => return None,
+        };
+        let n = m.checked_mul(k)?;
+        Some((
+            n.checked_mul(std::mem::size_of::<f32>())?,
+            (n / 256).checked_mul(8 + 32 * bits)?,
+        ))
     }
 
     /// Requantize a row-major `[m, k]` weight into an MQ{2,3,4,5,6}G256V2
@@ -18196,10 +18373,13 @@ impl Gpu {
         if m == 0 || !k.is_multiple_of(256) {
             return bad("needs m > 0 and K % 256 == 0");
         }
+        let Some((_, out_bytes)) = Self::requant_g256_bytes(m, k, target) else {
+            return bad("weight size overflows");
+        };
         self.bind_thread()?;
         let n = m * k;
         let values = self.alloc_tensor(&[n], DType::F32)?;
-        let out = self.alloc_tensor(&[n / 256 * (8 + 32 * bits as usize)], target)?;
+        let out = self.alloc_tensor(&[out_bytes], target)?;
         let run = |gpu: &mut Self,
                    func: &str,
                    src: &GpuTensor,
@@ -18238,7 +18418,10 @@ impl Gpu {
             run(self, "requant_pack_mqg256v2", &values, &out, n / 128, bits)?;
             self.hip.device_synchronize()
         })();
-        let freed = self.free_tensor(values);
+        // Back to the device, not the pool: a pooled vocab x hidden F32
+        // scratch (2.5 GB for a 248k x 2560 head) sits in a size bucket no
+        // later allocation reuses.
+        let freed = self.release_tensor_immediate(values);
         match result.and(freed) {
             Ok(()) => Ok(out),
             Err(error) => {
@@ -18310,7 +18493,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "gemv_bf16_xf32_bf16_scaled_add";
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, FUNC)?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            FUNC,
+        )?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let r_ptr = residual.buf.as_ptr();
@@ -18348,8 +18535,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "gemv_bf16_xf32",
-            kernels::GEMV_BF16_XF32_SRC,
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
             "gemv_bf16_xf32_x4",
         )?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
@@ -18495,7 +18682,11 @@ impl Gpu {
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
-        self.ensure_kernel("gemv_bf16_xf32", kernels::GEMV_BF16_XF32_SRC, func)?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            func,
+        )?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);
@@ -20254,10 +20445,11 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (v2_src, v2_module) =
-            kernels::gemv_mq6g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-        let module_v2 = format!("{}_mq6v2", v2_module);
-        self.ensure_kernel(&module_v2, v2_src, "gemv_mq6g256v2_x4")?;
+        self.ensure_kernel(
+            "qwen4_gemv_mq6g256v2",
+            kernels::QWEN4_GEMV_MQ6G256V2_SRC,
+            "gemv_mq6g256v2_x4",
+        )?;
         let a = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);

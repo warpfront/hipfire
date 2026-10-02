@@ -24,11 +24,14 @@ use hipfire_dispatch::pipeline::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::spec::SpecGrammar;
+use rdna_compute::tensor_ops::QsaKvFormat;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::fmt;
 
 const MTP_BRANCHES: usize = 4;
+/// Prompt tokens per batched MTP K/V append ([`Qwen4MtpGpu::append_rows`]).
+pub(crate) const MTP_APPEND_ROWS: usize = 256;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -41,11 +44,12 @@ fn invalid(message: impl Into<String>) -> MtpGpuError {
     MtpGpuError::Invalid(message.into())
 }
 
-/// One-row HC read of the MTP streams into `hc_mixed`.
+/// `rows`-row HC read of the MTP streams into `hc_mixed`.
 fn hc_read<'a>(
     read: &Qwen4HyperReadWeights<'a>,
     scratch: &'a MtpGpuScratch,
     config: &Qwen4Config,
+    rows: usize,
 ) -> HyperReadOp<'a> {
     HyperReadOp {
         state_bf16: false,
@@ -58,7 +62,7 @@ fn hc_read<'a>(
         up: &scratch.hc_up,
         mixed: &scratch.hc_mixed,
         bf16_scratch: &scratch.hc_bf16,
-        rows: 1,
+        rows,
         branches: config.hc_count,
         hidden: config.hidden_size,
         low_rank: config.hc_lowrank,
@@ -137,8 +141,10 @@ impl From<DispatchError> for MtpGpuError {
     }
 }
 
-/// Fixed operator buffers for one MTP token.  Every field is allocated once
-/// when the model's MTP capability is attached; calls only create subviews.
+/// Fixed operator buffers for `rows` MTP tokens (one for decode steps,
+/// [`MTP_APPEND_ROWS`] for the batched prompt append).  Every field is
+/// allocated once when the model's MTP capability is attached; calls only
+/// create subviews.  The MoE buffers are single-token.
 pub struct MtpGpuScratch {
     token_ids: GpuTensor,
     embedding_rot: GpuTensor,
@@ -181,8 +187,16 @@ pub struct MtpGpuScratch {
     host_token_bytes: [u8; 4],
 }
 
+/// Allocations of one [`MtpGpuScratch`], in field order.
+const MTP_SCRATCH_TENSORS: usize = 36;
+
 impl MtpGpuScratch {
-    fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, MtpGpuError> {
+    /// Element count and dtype of each scratch tensor for `rows` token rows,
+    /// in field order.
+    fn shapes(
+        config: &Qwen4Config,
+        rows: usize,
+    ) -> Result<[(usize, DType); MTP_SCRATCH_TENSORS], MtpGpuError> {
         let hidden = config.hidden_size;
         let wide = MTP_BRANCHES
             .checked_mul(hidden)
@@ -202,66 +216,71 @@ impl MtpGpuScratch {
             .checked_mul(config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
         let max_rotation = wide.max(hidden).max(config.hc_lowrank).max(q_width);
-        let mut allocated = Vec::new();
-        let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), MtpGpuError> {
-            allocated.push(gpu.zeros(shape, dtype)?);
-            Ok(())
-        };
-        let result = (|| {
-            alloc(&[std::mem::size_of::<i32>()], DType::Raw)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[wide], DType::F32)?;
-            alloc(&[config.hc_lowrank], DType::F32)?;
-            alloc(&[hc_up], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[config.hc_count], DType::F32)?;
-            alloc(
-                &[hidden.max(config.hc_lowrank).max(q_width).max(kv_width)],
+        let routed = config.num_experts_per_tok * config.moe_intermediate_size;
+        Ok([
+            (rows * std::mem::size_of::<i32>(), DType::Raw),
+            (rows * hidden, DType::F32),
+            (rows * hidden, DType::F32),
+            (rows * hidden, DType::F32),
+            (rows * wide, DType::F32),
+            (rows * hidden, DType::F32),
+            (rows * wide, DType::F32),
+            (rows * wide, DType::F32),
+            (wide, DType::F32),
+            (rows * wide, DType::F32),
+            (rows * config.hc_lowrank, DType::F32),
+            (hc_up.max(rows * wide), DType::F32),
+            (rows * hidden, DType::F32),
+            (config.hc_count, DType::F32),
+            (
+                hidden.max(config.hc_lowrank).max(q_width).max(kv_width),
                 DType::BF16,
-            )?;
-            alloc(&[max_rotation], DType::F32)?;
-            alloc(&[index_width], DType::F32)?;
-            alloc(&[2 * q_width], DType::F32)?;
-            alloc(&[kv_width], DType::F32)?;
-            alloc(&[kv_width], DType::F32)?;
-            alloc(&[q_width], DType::F32)?;
-            alloc(
-                &[config.qsa_selected_capacity() * std::mem::size_of::<i32>()],
+            ),
+            (rows * max_rotation, DType::F32),
+            (rows * index_width, DType::F32),
+            (rows * 2 * q_width, DType::F32),
+            (rows * kv_width, DType::F32),
+            (rows * kv_width, DType::F32),
+            (rows * q_width, DType::F32),
+            (
+                rows * config.qsa_selected_capacity() * std::mem::size_of::<i32>(),
                 DType::Raw,
-            )?;
-            alloc(&[config.num_experts], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(&[2 * config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[config.moe_intermediate_size], DType::F32)?;
-            alloc(&[hidden], DType::F32)?;
-            alloc(
-                &[config.num_experts_per_tok * config.moe_intermediate_size],
+            ),
+            (config.num_experts, DType::F32),
+            (hidden, DType::F32),
+            (2 * config.moe_intermediate_size, DType::F32),
+            (config.moe_intermediate_size, DType::F32),
+            (config.moe_intermediate_size, DType::F32),
+            (config.moe_intermediate_size, DType::F32),
+            (hidden, DType::F32),
+            (routed, DType::F32),
+            (routed, DType::F32),
+            (routed, DType::F32),
+            (config.num_experts_per_tok, DType::F32),
+            (config.num_experts_per_tok, DType::F32),
+            (
+                config.num_experts_per_tok * hidden + hidden.div_ceil(4),
                 DType::F32,
-            )?;
-            alloc(
-                &[config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32,
-            )?;
-            alloc(
-                &[config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32,
-            )?;
-            alloc(&[config.num_experts_per_tok], DType::F32)?;
-            alloc(&[config.num_experts_per_tok], DType::F32)?;
-            alloc(
-                &[config.num_experts_per_tok * hidden + hidden.div_ceil(4)],
-                DType::F32,
-            )?;
-            alloc(&[config.shared_expert_intermediate_size.max(1)], DType::F32)?;
+            ),
+            (config.shared_expert_intermediate_size.max(1), DType::F32),
+        ])
+    }
+
+    /// Device bytes [`Self::new`] allocates for `rows` token rows.
+    fn device_bytes(config: &Qwen4Config, rows: usize) -> Result<usize, MtpGpuError> {
+        Ok(Self::shapes(config, rows)?
+            .iter()
+            .map(|&(elements, dtype)| elements * dtype.size())
+            .sum())
+    }
+
+    fn new(gpu: &mut Gpu, config: &Qwen4Config, rows: usize) -> Result<Self, MtpGpuError> {
+        let shapes = Self::shapes(config, rows)?;
+        let mut allocated = Vec::with_capacity(MTP_SCRATCH_TENSORS);
+        let result = (|| {
+            for (elements, dtype) in shapes {
+                allocated.push(gpu.zeros(&[elements], dtype)?);
+            }
             Ok::<(), MtpGpuError>(())
         })();
         if let Err(error) = result {
@@ -593,6 +612,23 @@ impl MtpGpuState {
             position: self.position,
             step_index: self.step_index,
         }
+    }
+    /// Device bytes [`Self::new`] allocates: the context-sized QSA arenas,
+    /// then the selection and wide-hidden carry, twice with their snapshot
+    /// backups.
+    fn device_bytes(config: &Qwen4Config, max_seq: usize) -> Option<usize> {
+        let carry = config
+            .qsa_selected_capacity()
+            .checked_mul(std::mem::size_of::<i32>())?
+            .checked_add(std::mem::size_of::<i32>())?
+            .checked_add(
+                MTP_BRANCHES
+                    .checked_mul(config.hidden_size)?
+                    .checked_mul(std::mem::size_of::<f32>())?,
+            )?;
+        config
+            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)?
+            .checked_add(carry.checked_mul(2)?)
     }
     pub(crate) fn new(
         gpu: &mut Gpu,
@@ -957,6 +993,8 @@ impl MtpGpuState {
 /// Model-owned native MTP operator and state.
 pub struct Qwen4MtpGpu {
     pub(crate) scratch: MtpGpuScratch,
+    /// [`MTP_APPEND_ROWS`]-row buffers of the batched prompt append.
+    append_scratch: MtpGpuScratch,
     pub(crate) state: MtpGpuState,
     pub(crate) moe: Qwen4MoeLayerRuntime,
     pub(crate) max_seq: usize,
@@ -988,7 +1026,44 @@ pub(crate) enum MtpStep {
     Append,
 }
 
+/// Draft ranking policy (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`) and row
+/// layout of the MTP draft head.
+fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout) {
+    let policy = DraftHeadPolicy::parse(
+        &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
+            .unwrap_or_else(|_| "mq2r".to_string()),
+    );
+    let layout = DraftHeadLayout {
+        vocab: config.vocab_size,
+        hidden: config.hidden_size,
+        front: DRAFT_FRONT,
+        special: config.eos_token_id as usize,
+        full_hold: DRAFT_FULL_HOLD,
+    };
+    (policy, layout)
+}
+
 impl Qwen4MtpGpu {
+    /// `(resident, load scratch)` device bytes [`Self::new`] takes at
+    /// `max_seq` for a language head stored as `head_dtype`: what the
+    /// attached head keeps, and the draft head's build scratch on top of it
+    /// (`DraftHead::device_bytes`), released before `new` returns.
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        max_seq: usize,
+        head_dtype: DType,
+    ) -> Option<(usize, usize)> {
+        let (policy, layout) = draft_head_config(config);
+        let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
+        let resident = MtpGpuScratch::device_bytes(config, 1)
+            .ok()?
+            .checked_add(MtpGpuScratch::device_bytes(config, MTP_APPEND_ROWS).ok()?)?
+            .checked_add(MtpGpuState::device_bytes(config, max_seq)?)?
+            .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
+            .checked_add(draft)?;
+        Some((resident, scratch))
+    }
+
     pub(crate) fn new(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -999,10 +1074,18 @@ impl Qwen4MtpGpu {
         if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
-        let scratch = MtpGpuScratch::new(gpu, config)?;
+        let scratch = MtpGpuScratch::new(gpu, config, 1)?;
+        let append_scratch = match MtpGpuScratch::new(gpu, config, MTP_APPEND_ROWS) {
+            Ok(append_scratch) => append_scratch,
+            Err(error) => {
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        };
         let state = match MtpGpuState::new(gpu, config, max_seq) {
             Ok(state) => state,
             Err(error) => {
+                let _ = append_scratch.free_gpu(gpu);
                 let _ = scratch.free_gpu(gpu);
                 return Err(error);
             }
@@ -1011,21 +1094,12 @@ impl Qwen4MtpGpu {
             Ok(moe) => moe,
             Err(error) => {
                 let _ = state.free_gpu(gpu);
+                let _ = append_scratch.free_gpu(gpu);
                 let _ = scratch.free_gpu(gpu);
                 return Err(error.into());
             }
         };
-        let policy = DraftHeadPolicy::parse(
-            &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
-                .unwrap_or_else(|_| "mq2r".to_string()),
-        );
-        let layout = DraftHeadLayout {
-            vocab: config.vocab_size,
-            hidden: config.hidden_size,
-            front: DRAFT_FRONT,
-            special: config.eos_token_id as usize,
-            full_hold: DRAFT_FULL_HOLD,
-        };
+        let (policy, layout) = draft_head_config(config);
         let draft = weights
             .resident(&weights.root.lm_head)
             .map_err(MtpGpuError::from)
@@ -1035,12 +1109,14 @@ impl Qwen4MtpGpu {
             Err(error) => {
                 let _ = moe.free_gpu(gpu);
                 let _ = state.free_gpu(gpu);
+                let _ = append_scratch.free_gpu(gpu);
                 let _ = scratch.free_gpu(gpu);
                 return Err(error);
             }
         };
         Ok(Self {
             scratch,
+            append_scratch,
             state,
             moe,
             max_seq,
@@ -1051,6 +1127,7 @@ impl Qwen4MtpGpu {
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         let Self {
             scratch,
+            append_scratch,
             state,
             moe,
             draft,
@@ -1058,10 +1135,12 @@ impl Qwen4MtpGpu {
         } = self;
         let draft_error = draft.free_gpu(gpu);
         let scratch_error = scratch.free_gpu(gpu);
+        let append_scratch_error = append_scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.free_gpu(gpu);
         draft_error
             .or(scratch_error)
+            .or(append_scratch_error)
             .or(state_error)
             .or(moe_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
@@ -1237,6 +1316,8 @@ impl Qwen4MtpGpu {
                 k_norm: qsa.k_norm,
                 output: qsa.output,
                 state: IndexedAttentionState {
+                    // The one MTP layer keeps the exact F32 QSA state.
+                    format: QsaKvFormat::F32,
                     full_keys: &state.full_keys,
                     full_values: &state.full_values,
                     raw_index_keys: &state.raw_index_keys,
@@ -1352,8 +1433,9 @@ impl Qwen4MtpGpu {
                 output: &scratch.wide,
                 rows: MTP_BRANCHES,
                 width: hidden,
+                group: MTP_BRANCHES,
             }));
-            steps.push(Step::HyperRead(hc_read(&attn.read, scratch, config)));
+            steps.push(Step::HyperRead(hc_read(&attn.read, scratch, config, 1)));
             steps.push(Step::IndexedAttention(attention));
             if let Some(moe) = moe {
                 steps.push(Step::HyperWrite(hc_write(
@@ -1362,7 +1444,7 @@ impl Qwen4MtpGpu {
                     scratch,
                     config,
                 )));
-                steps.push(Step::HyperRead(hc_read(&mlp.read, scratch, config)));
+                steps.push(Step::HyperRead(hc_read(&mlp.read, scratch, config, 1)));
                 steps.push(Step::Clear(ClearOp {
                     tensor: &scratch.moe_output,
                     elements: hidden,
@@ -1375,7 +1457,7 @@ impl Qwen4MtpGpu {
                     config,
                 )));
                 if step == MtpStep::Predict {
-                    steps.push(Step::HyperRead(hc_read(&final_read, scratch, config)));
+                    steps.push(Step::HyperRead(hc_read(&final_read, scratch, config, 1)));
                 }
             }
             validate_steps(gpu, &steps)?;
@@ -1404,6 +1486,176 @@ impl Qwen4MtpGpu {
         state.selected_len = selected_len;
         state.step_index = state.step_index.wrapping_add(1);
         Ok(next_token)
+    }
+
+    /// [`MtpStep::Append`] for up to [`MTP_APPEND_ROWS`] consecutive prompt
+    /// tokens in one step program: `backbone_hidden` holds their wide target
+    /// hidden rows (`tokens.len() * hc_count * hidden` F32).  Appends the same
+    /// K/V and index-key cache rows as one append per token, through the
+    /// multi-row projection routes (draft-side numerics only: the target
+    /// verifies every draft).
+    pub(crate) fn append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        tokens: &[u32],
+        backbone_hidden: &GpuTensor,
+        position: usize,
+    ) -> Result<(), MtpGpuError> {
+        let rows = tokens.len();
+        let hidden = config.hidden_size;
+        let wide = MTP_BRANCHES * hidden;
+        if rows == 0 || rows > MTP_APPEND_ROWS {
+            return Err(invalid(format!(
+                "MTP append of {rows} rows is outside 1..={MTP_APPEND_ROWS}"
+            )));
+        }
+        if backbone_hidden.dtype != DType::F32 || backbone_hidden.numel() != rows * wide {
+            return Err(invalid(format!(
+                "MTP append hidden must be F32 with {} elements",
+                rows * wide
+            )));
+        }
+        if position != self.state.position {
+            return Err(invalid(format!(
+                "MTP position mismatch: expected {}, got {position}",
+                self.state.position
+            )));
+        }
+        if position + rows > self.max_seq {
+            return Err(invalid("MTP append exceeds QSA capacity"));
+        }
+        let mut token_bytes = Vec::with_capacity(rows * 4);
+        for &token in tokens {
+            self.draft.observe(token);
+            token_bytes.extend_from_slice(&(token as i32).to_ne_bytes());
+        }
+        let scratch = &self.append_scratch;
+        gpu.memcpy_htod_auto(&scratch.token_ids.buf, &token_bytes)?;
+
+        let (full_len, raw_len, pooled_len, selected_len, next_position) = {
+            let state = &self.state;
+            let ctx = DispatchCtx::new(gpu);
+            let attn = hyper_desc(weights, &weights.mtp.attn_hyper)?;
+            let qsa = qsa_desc(weights, &weights.mtp.attention)?;
+            // HyperNorm takes its row count from the tensor length.
+            let token_embedding = scratch.token_embedding.sub_offset(0, rows * hidden);
+            let embedding_norm = scratch.embedding_norm.sub_offset(0, rows * hidden);
+            let hidden_norm = scratch.hidden_norm.sub_offset(0, rows * wide);
+            let attention = IndexedAttentionOp {
+                indexer_qk: qsa.indexer_qk,
+                indexer_q_norm: qsa.indexer_q_norm,
+                indexer_k_norm: qsa.indexer_k_norm,
+                q: qsa.q,
+                k: qsa.k,
+                v: qsa.v,
+                q_norm: qsa.q_norm,
+                k_norm: qsa.k_norm,
+                output: qsa.output,
+                state: IndexedAttentionState {
+                    format: QsaKvFormat::F32,
+                    full_keys: &state.full_keys,
+                    full_values: &state.full_values,
+                    raw_index_keys: &state.raw_index_keys,
+                    pooled_keys: &state.pooled_keys,
+                    selected_indices: &state.selected_indices,
+                    full_capacity: state.full_capacity,
+                    raw_capacity: state.raw_capacity,
+                    pooled_capacity: state.pooled_capacity,
+                    selected_capacity: state.selected_capacity,
+                    position_capacity: state.full_capacity,
+                    full_len: state.full_len,
+                    raw_len: state.raw_len,
+                    pooled_len: state.pooled_len,
+                    selected_len: state.selected_len,
+                    position: state.position,
+                },
+                input: &scratch.hc_mixed,
+                index_scratch: &scratch.index,
+                qgate_scratch: &scratch.q_and_gate,
+                k_scratch: &scratch.qsa_k,
+                v_scratch: &scratch.qsa_v,
+                qsa_output: &scratch.qsa_output,
+                selected_scratch: &scratch.qsa_selected,
+                attention_output: &scratch.projected_embedding,
+                bf16_scratch: &scratch.hc_bf16,
+                rows,
+                index_heads: config.indexer_n_heads,
+                index_kv_heads: config.indexer_kv_heads,
+                index_dim: config.indexer_head_dim,
+                budget: config.indexer_budget,
+                compress: config.indexer_compress_ratio,
+                heads: config.num_attention_heads,
+                kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                input_width: hidden,
+                rotation: &scratch.rotation,
+                mode: IndexedAttentionMode::AppendOnly,
+            };
+            let lengths = attention.next_lengths()?;
+            let steps = [
+                Step::Embed(EmbeddingOp {
+                    table: weights.resident(&weights.root.embedding)?,
+                    rotated: &scratch.embedding_rot,
+                    token_ids: &scratch.token_ids,
+                    output: &token_embedding,
+                    rows,
+                    dim: hidden,
+                }),
+                Step::HyperNorm(HyperNormOp {
+                    input: &token_embedding,
+                    norm_weight: weights.resident(&weights.mtp.pre_fc_norm_embedding)?,
+                    normalized: &embedding_norm,
+                    branches: 1,
+                    hidden,
+                    state_bf16: false,
+                }),
+                Step::Project(ProjectOp {
+                    weight: dense_ref(weights, &weights.mtp.fc_embedding)?,
+                    input: &embedding_norm,
+                    output: &scratch.projected_embedding,
+                    rows,
+                    rotation: Some(&scratch.rotation),
+                }),
+                Step::HyperNorm(HyperNormOp {
+                    input: backbone_hidden,
+                    norm_weight: weights.resident(&weights.mtp.pre_fc_norm_hidden)?,
+                    normalized: &hidden_norm,
+                    branches: MTP_BRANCHES,
+                    hidden,
+                    state_bf16: false,
+                }),
+                Step::Project(ProjectOp {
+                    weight: dense_ref(weights, &weights.mtp.fc_hidden)?,
+                    input: &hidden_norm,
+                    output: &scratch.projected_hidden,
+                    rows: rows * MTP_BRANCHES,
+                    rotation: Some(&scratch.rotation),
+                }),
+                Step::BroadcastAdd(BroadcastAddOp {
+                    rows_input: &scratch.projected_hidden,
+                    row: &scratch.projected_embedding,
+                    output: &scratch.wide,
+                    rows: rows * MTP_BRANCHES,
+                    width: hidden,
+                    group: MTP_BRANCHES,
+                }),
+                Step::HyperRead(hc_read(&attn.read, scratch, config, rows)),
+                Step::IndexedAttention(attention),
+            ];
+            validate_steps(gpu, &steps)?;
+            execute_validated_steps(gpu, &ctx, &steps)?;
+            lengths
+        };
+        let state = &mut self.state;
+        state.position = next_position;
+        state.full_len = full_len;
+        state.raw_len = raw_len;
+        state.pooled_len = pooled_len;
+        state.selected_len = selected_len;
+        state.step_index = state.step_index.wrapping_add(rows);
+        Ok(())
     }
 }
 
@@ -1514,7 +1766,8 @@ mod tests {
             return;
         };
         let config = compact_test_config();
-        let mut target = Qwen4State::new(&mut gpu, &config, 8).expect("compact target state");
+        let mut target = Qwen4State::new(&mut gpu, &config, 8, crate::state::Qwen4StateFormat::F32)
+            .expect("compact target state");
         let mut mtp = MtpGpuState::new(&mut gpu, &config, 8).expect("compact MTP state");
         let target_recurrent_size = target.gdn[0].recurrent.byte_size();
         let mut target_bytes = vec![0u8; target_recurrent_size];

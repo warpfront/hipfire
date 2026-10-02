@@ -86,14 +86,14 @@ impl Inst {
             if split == 0 || split >= operands.len() {
                 return Err(ValidateError::Operand("VOPD operand split is outside the packet".into()));
             }
-            let mut x = Effects::from_table(arch, op, form, &operands[..split])?;
-            let y = Effects::from_table(arch, *y_op, Form::Vopd, &operands[split..])?;
+            let mut x = Effects::from_table(arch, op, form, &operands[..split], &mods.cpol)?;
+            let y = Effects::from_table(arch, *y_op, Form::Vopd, &operands[split..], &mods.cpol)?;
             x.defs.extend(y.defs);
             x.uses.extend(y.uses);
             x.implicit.reads |= y.implicit.reads;
             x.implicit.writes |= y.implicit.writes;
             x
-        } else { Effects::from_table(arch, op, form, &operands)? };
+        } else { Effects::from_table(arch, op, form, &operands, &mods.cpol)? };
         let inst = Self { op, form, fields, operands, mods, literal, effects, prov };
         inst.validate(arch)?;
         Ok(inst)

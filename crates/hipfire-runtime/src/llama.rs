@@ -1574,6 +1574,26 @@ pub fn weight_gemv_swiglu_residual(
         lloyd_lut_c16: w_down.lloyd_lut_c16,
     };
     match w_down.gpu_dtype {
+        // ── CPU-executed offload (`memory.offload_exec=cpu`) ─────────────────
+        // The SiLU is not a weight-reading op, so it stays on the GPU; the
+        // down-projection and its residual accumulate then run on the CPU over
+        // the host-mapped weight bytes. This is the one op family that fuses the
+        // GEMV into a kernel the seam cannot see, so it splits here rather than
+        // widening the seam.
+        _ if hipfire_dispatch::host_mapped_cpu_capable(gpu, &wr) => {
+            gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
+            // `wr` above carries `awq_scale: None` because the fused GPU arm gets
+            // the sidecar through `w_down` (`fused_silu_mul_rotate_mq_for`).
+            // The CPU path has to apply that division itself, so hand it the real
+            // sidecar: the activation here is the raw (unrotated) SiLU output,
+            // exactly what `fused_silu_mul_rotate_mq_awq` divides before rotating.
+            let wr_cpu = WeightRef {
+                awq_scale: w_down.awq_scale.as_ref(),
+                ..wr
+            };
+            hipfire_dispatch::run_host_mapped_gemv_residual(gpu, &wr_cpu, ffn_hidden_scratch, x)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+        }
         DType::MQ4G256
         | DType::MQ4G256V2
         // qt=52: same FWHT input contract as qt=44; the residual GEMV is the

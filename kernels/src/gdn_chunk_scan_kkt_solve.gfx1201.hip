@@ -317,7 +317,10 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
             const int xn=lane&15;
 #pragma unroll
             for(int e=0;e<8;++e)s.tmp[wave*16+xn][gk_acc_row(lane,e)]=gk_to_bf(x[e]);
+            // Wave-private LDS handoff: order this wave's stores before its loads.
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE,"wavefront");
             __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"wavefront");
             gk_f8 y=gk_zero();
             y=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,origin+16,origin+16,lane),
                      gk_frag_shared(&s.tmp[0][0],36,wave*16,0,lane),y);

@@ -12,6 +12,7 @@ use crate::ple::PleHistory;
 use hipfire_dispatch::pipeline::GdnRowCapture;
 use rdna_compute::tensor_ops::{
     copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers,
+    GdnStateFormat, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -150,16 +151,22 @@ pub struct ReferenceHyperConnectionState {
     pub feedback: Vec<f32>,
 }
 
-/// A production GDN state block.  The tensors are F32 and must be freed by
-/// `Qwen4State::free_gpu`; no `Drop` attempts to call HIP.
+/// A production GDN state block: the recurrent state in the state's
+/// `GdnStateFormat` (F32, or a Raw Q8 slot) and the F32 convolution history.
+/// The tensors must be freed by `Qwen4State::free_gpu`; no `Drop` attempts
+/// to call HIP.
 pub struct GdnGpuState {
     pub recurrent: GpuTensor,
     pub conv: GpuTensor,
 }
 
 /// A production QSA block.  Full K/V and raw/indexer buffers are allocated at
-/// max sequence capacity once; `*_len` fields are active append lengths.
+/// max sequence capacity once; `*_len` fields are active append lengths. The
+/// K/V arenas hold `format`'s rows (`full_row_units` tensor units per token)
+/// and the raw/pooled index keys its `index_dtype`.
 pub struct QsaGpuState {
+    pub format: QsaKvFormat,
+    pub full_row_units: usize,
     pub full_keys: GpuTensor,
     pub full_values: GpuTensor,
     pub raw_index_keys: GpuTensor,
@@ -203,6 +210,84 @@ impl QsaGpuState {
             position: self.position_capacity,
         }
     }
+}
+
+/// The QSA state format for a `memory.kv_cache` request on `gpu`
+/// ([`hipfire_runtime::kv_mode::resolve_qwen4`]): `bf16` is the exact
+/// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 and a head
+/// geometry its kernels implement (head_dim 256, an even KV-head count).
+/// `auto` is fp8 where both hold and the reference state elsewhere; an
+/// explicit request the device or model cannot serve is refused, never
+/// rewritten.
+pub fn resolve_qsa_format(
+    request: &str,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+) -> Result<QsaKvFormat, String> {
+    use hipfire_runtime::kv_mode::{resolve_qwen4, KvMode};
+    let (kv_heads, head_dim) = (config.num_key_value_heads, config.head_dim);
+    let fp8_geometry = QsaKvFormat::Fp8.supports(kv_heads, head_dim);
+    let auto = matches!(request.trim(), "" | "auto");
+    match resolve_qwen4(request, &gpu.arch)?.mode {
+        KvMode::Fp8 if fp8_geometry => Ok(QsaKvFormat::Fp8),
+        KvMode::Fp8 if auto => Ok(QsaKvFormat::F32),
+        KvMode::Fp8 => Err(format!(
+            "qwen4: fp8 QSA K/V needs head_dim 256 and an even KV-head count \
+             (have {kv_heads} x {head_dim}); use bf16"
+        )),
+        _ => Ok(QsaKvFormat::F32),
+    }
+}
+
+/// The GDN recurrent state format for a `state_quant` request (Qwen3.5's
+/// DeltaNet knob): `auto`/`q8` is Qwen3.5's Q8 state where its kernels apply
+/// (128x128 heads), `fp32` the exact reference state. An explicit request the
+/// model cannot serve is refused, never rewritten.
+pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStateFormat, String> {
+    let (key_dim, value_dim) = (config.linear_key_head_dim, config.linear_value_head_dim);
+    let q8 = GdnStateFormat::Q8.supports(key_dim, value_dim);
+    match request.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" if q8 => Ok(GdnStateFormat::Q8),
+        "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
+        "q8" | "int8" if q8 => Ok(GdnStateFormat::Q8),
+        "q8" | "int8" => Err(format!(
+            "qwen4: q8 GDN state needs 128x128 heads (have {key_dim} x {value_dim}); use fp32"
+        )),
+        other => Err(format!(
+            "qwen4: unsupported GDN state_quant '{other}' (expected auto|q8|fp32)"
+        )),
+    }
+}
+
+/// Storage formats of a Qwen4 request state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Qwen4StateFormat {
+    /// QSA K/V and index keys ([`resolve_qsa_format`]).
+    pub qsa: QsaKvFormat,
+    /// GDN recurrent states ([`resolve_gdn_format`]).
+    pub gdn: GdnStateFormat,
+}
+
+impl Qwen4StateFormat {
+    /// The exact F32 reference state.
+    pub const F32: Self = Self {
+        qsa: QsaKvFormat::F32,
+        gdn: GdnStateFormat::F32,
+    };
+}
+
+/// Both state formats: `kv_request` is `memory.kv_cache`, `state_request`
+/// the `state_quant` load option.
+pub fn resolve_state_format(
+    kv_request: &str,
+    state_request: &str,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+) -> Result<Qwen4StateFormat, String> {
+    Ok(Qwen4StateFormat {
+        qsa: resolve_qsa_format(kv_request, gpu, config)?,
+        gdn: resolve_gdn_format(state_request, config)?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +347,7 @@ impl Qwen4StateSnapshotArena {
         let result = (|| -> Result<(), StateError> {
             for layer in gdn {
                 allocated.push(
-                    gpu.zeros(&layer.recurrent.shape, DType::F32)
+                    gpu.zeros(&layer.recurrent.shape, layer.recurrent.dtype)
                         .map_err(StateError::Hip)?,
                 );
                 allocated.push(
@@ -289,7 +374,7 @@ impl Qwen4StateSnapshotArena {
                     .checked_mul(raw_width)
                     .ok_or(StateError::DimensionOverflow)?;
                 allocated.push(
-                    gpu.zeros(&[circular_elements], DType::F32)
+                    gpu.zeros(&[circular_elements], layer.raw_index_keys.dtype)
                         .map_err(StateError::Hip)?,
                 );
                 allocated.push(
@@ -440,7 +525,9 @@ impl Qwen4StateSnapshotArena {
                 .partial_capacity
                 .checked_mul(raw_width)
                 .ok_or(StateError::DimensionOverflow)?;
-            if self.qsa_raw_circular[index].numel() != expected_raw {
+            if self.qsa_raw_circular[index].numel() != expected_raw
+                || self.qsa_raw_circular[index].dtype != layer.raw_index_keys.dtype
+            {
                 return Err(StateError::SnapshotShape);
             }
         }
@@ -531,6 +618,9 @@ pub struct Qwen4State {
     row_capture_rows: usize,
     /// Live ring slot of every GDN layer's recurrent state.
     gdn_live: usize,
+    /// Storage of every GDN layer's recurrent state (and its ring slots).
+    gdn_format: GdnStateFormat,
+    gdn_value_heads: usize,
     /// Set only around a speculative verify forward.
     pub(crate) row_capture_armed: bool,
     model_id: u64,
@@ -540,21 +630,41 @@ pub struct Qwen4State {
 
 impl Qwen4State {
     /// Allocate all mutable device buffers once.  QSA full K/V and raw key
-    /// buffers are fixed-capacity arenas; only active lengths are mutable.
+    /// buffers are fixed-capacity arenas in `format.qsa`, the GDN recurrent
+    /// states in `format.gdn`; only active lengths are mutable.
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_seq_len: usize,
+        format: Qwen4StateFormat,
     ) -> Result<Self, StateError> {
         config.validate().map_err(StateError::Config)?;
+        let qsa_format = format.qsa;
+        if !qsa_format.supports(config.num_key_value_heads, config.head_dim) {
+            return Err(StateError::Config(format!(
+                "QSA {} K/V does not support {} KV heads x {}",
+                qsa_format.name(),
+                config.num_key_value_heads,
+                config.head_dim
+            )));
+        }
         if max_seq_len == 0 || max_seq_len > config.max_position_embeddings {
             return Err(StateError::InvalidCapacity);
         }
-        let gdn_recurrent = config
-            .linear_num_value_heads
-            .checked_mul(config.linear_value_head_dim)
-            .and_then(|v| v.checked_mul(config.linear_key_head_dim))
-            .ok_or(StateError::DimensionOverflow)?;
+        let gdn_format = format.gdn;
+        if !gdn_format.supports(config.linear_key_head_dim, config.linear_value_head_dim) {
+            return Err(StateError::Config(format!(
+                "GDN {} state needs 128x128 heads, not {} x {}",
+                gdn_format.name(),
+                config.linear_key_head_dim,
+                config.linear_value_head_dim
+            )));
+        }
+        let gdn_recurrent = gdn_format.state_units(
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        );
         let conv_channels = config
             .linear_num_key_heads
             .checked_mul(config.linear_key_head_dim)
@@ -574,6 +684,7 @@ impl Qwen4State {
             .num_key_value_heads
             .checked_mul(config.head_dim)
             .ok_or(StateError::DimensionOverflow)?;
+        let full_row_units = qsa_format.kv_row_units(config.num_key_value_heads, config.head_dim);
         let raw_width = config
             .indexer_kv_heads
             .checked_mul(config.indexer_head_dim)
@@ -589,7 +700,7 @@ impl Qwen4State {
                 match kind {
                     LayerType::LinearAttention => {
                         allocated.push(
-                            gpu.zeros(&[gdn_recurrent], DType::F32)
+                            gpu.zeros(&[gdn_recurrent], format.gdn.dtype())
                                 .map_err(StateError::Hip)?,
                         );
                         allocated.push(
@@ -599,7 +710,7 @@ impl Qwen4State {
                     }
                     LayerType::FullAttention => {
                         let full_elements = max_seq_len
-                            .checked_mul(full_width)
+                            .checked_mul(full_row_units)
                             .ok_or(StateError::DimensionOverflow)?;
                         let raw_elements = max_seq_len
                             .checked_mul(raw_width)
@@ -619,10 +730,10 @@ impl Qwen4State {
                             .checked_mul(std::mem::size_of::<i32>())
                             .ok_or(StateError::DimensionOverflow)?;
                         for (elements, dtype) in [
-                            (full_elements, DType::F32),
-                            (full_elements, DType::F32),
-                            (raw_elements, DType::F32),
-                            (pooled_elements, DType::F32),
+                            (full_elements, qsa_format.kv_dtype()),
+                            (full_elements, qsa_format.kv_dtype()),
+                            (raw_elements, qsa_format.index_dtype()),
+                            (pooled_elements, qsa_format.index_dtype()),
                             (partial_key_elements, DType::F32),
                             (partial_value_elements, DType::F32),
                             (selected_bytes, DType::Raw),
@@ -702,6 +813,8 @@ impl Qwen4State {
                     let partial_values = next_tensor();
                     let selected_indices = next_tensor();
                     qsa.push(QsaGpuState {
+                        format: qsa_format,
+                        full_row_units,
                         full_keys,
                         full_values,
                         raw_index_keys,
@@ -777,6 +890,8 @@ impl Qwen4State {
             row_capture_output: None,
             row_capture_rows: 0,
             gdn_live: 0,
+            gdn_format: format.gdn,
+            gdn_value_heads: config.linear_num_value_heads,
             row_capture_armed: false,
             model_id,
             reset_epoch: 0,
@@ -892,11 +1007,11 @@ impl Qwen4State {
                 if rows > 0 {
                     let bytes = rows
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     let source_offset = (layer.raw_len - rows)
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     copies.push(CopyRegion {
                         dst: &arena.qsa_raw_circular[index].buf,
@@ -990,11 +1105,11 @@ impl Qwen4State {
                 if rows > 0 {
                     let bytes = rows
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     let destination_offset = (mark.raw_len - rows)
                         .checked_mul(raw_width)
-                        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                        .and_then(|v| v.checked_mul(layer.raw_index_keys.dtype.size()))
                         .ok_or(StateError::DimensionOverflow)?;
                     copies.push(CopyRegion {
                         dst: &layer.raw_index_keys.buf,
@@ -1123,6 +1238,34 @@ impl Qwen4State {
         first.map_or(Ok(()), |error| Err(StateError::Hip(error)))
     }
 
+    /// Device bytes [`Self::ensure_row_capture`] allocates for `rows`-row
+    /// blocks: per GDN layer a two-half recurrent-state ring, the input rows
+    /// and the recurrence inputs, then one output block and the pointer
+    /// table. The single-slot recurrent state each ring replaces is freed
+    /// into the GPU pool, which keeps it.
+    pub(crate) fn row_capture_bytes(config: &Qwen4Config, rows: usize) -> Option<usize> {
+        if rows < 2 {
+            return Some(0);
+        }
+        let value_heads = config.linear_num_value_heads;
+        let state = value_heads
+            .checked_mul(config.linear_value_head_dim)?
+            .checked_mul(config.linear_key_head_dim)?;
+        let qkv = (2 * config.linear_num_key_heads)
+            .checked_mul(config.linear_key_head_dim)?
+            .checked_add(value_heads.checked_mul(config.linear_value_head_dim)?)?;
+        let layer = (2 * rows)
+            .checked_mul(state)?
+            .checked_add(rows.checked_mul(qkv)?)?
+            .checked_add(rows.checked_mul(qkv.checked_add(2 * value_heads)?)?)?;
+        let gdn_layers = config.n_linear_layers();
+        gdn_layers
+            .checked_mul(layer)?
+            .checked_add(rows.checked_mul(value_heads * GDN_HEAD_DIM)?)?
+            .checked_mul(std::mem::size_of::<f32>())?
+            .checked_add(gdn_layers.checked_mul(2 * std::mem::size_of::<u64>())?.max(1))
+    }
+
     /// Allocate the few-row verify rollback points for blocks of up to
     /// `rows` rows (`conv_history` = convolution kernel - 1). Only called
     /// where the GDN route captures rows (see `GatedDeltaNetOp::row_capture`).
@@ -1140,7 +1283,7 @@ impl Qwen4State {
         for layer in &self.gdn {
             let state = layer.recurrent.numel();
             let ring = gpu
-                .zeros(&[2 * rows * state], DType::F32)
+                .zeros(&[2 * rows * state], layer.recurrent.dtype)
                 .map_err(StateError::Hip)?;
             gpu.copy_d2d(
                 &layer.recurrent,
@@ -1152,7 +1295,7 @@ impl Qwen4State {
             let inputs = gpu
                 .zeros(&[rows * qkv], DType::F32)
                 .map_err(StateError::Hip)?;
-            let value_heads = state / (GDN_HEAD_DIM * GDN_HEAD_DIM);
+            let value_heads = self.gdn_value_heads;
             let recurrence = gpu
                 .zeros(&[rows * (qkv + 2 * value_heads)], DType::F32)
                 .map_err(StateError::Hip)?;
@@ -1306,12 +1449,13 @@ impl Qwen4State {
                 });
             }
             let qkv = conv / conv_history;
-            let value_heads = state / (GDN_HEAD_DIM * GDN_HEAD_DIM);
+            let value_heads = self.gdn_value_heads;
             gated_delta_rollback_layers(
                 gpu,
                 &GatedDeltaRollbackLayers {
                     table,
                     discard: output,
+                    format: self.gdn_format,
                     layers: self.gdn.len(),
                     rows,
                     keep,
@@ -1320,6 +1464,7 @@ impl Qwen4State {
                     qkv_width: qkv,
                     key_heads: (qkv - value_heads * GDN_HEAD_DIM) / (2 * GDN_HEAD_DIM),
                     value_heads,
+                    position: start + keep - 1,
                 },
             )
             .map_err(StateError::Hip)?;
@@ -1494,7 +1639,7 @@ mod tests {
 
     fn new_compact_state(gpu: &mut Gpu) -> Qwen4State {
         let config = crate::config::compact_test_config();
-        Qwen4State::new(gpu, &config, 8).expect("compact Qwen4 state")
+        Qwen4State::new(gpu, &config, 8, Qwen4StateFormat::F32).expect("compact Qwen4 state")
     }
 
     #[test]

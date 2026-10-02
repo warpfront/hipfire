@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/halo_verify_attn_race.rs:15:48
+   |
+15 |         let (ring,) = wg.barrier((rotate(ring, st),))?;
+   |                                   ------       ^^ expected `Drained<LdsWrite<KTile>>`, found `Pending<Gfx11Waits, LdsWrite<KTile>>`
+   |                                   |
+   |                                   arguments to this function are incorrect
+   |
+   = note: expected struct `Drained<LdsWrite<KTile>>`
+              found struct `peacemaker_author::Pending<Gfx11Waits, LdsWrite<KTile>>`
+note: function defined here
+  --> src/lds.rs
+   |
+   | pub fn rotate<R: 'static>(ring: Ring<R, Published, Writing>, drained: Drained<LdsWrite<R>>) -> Rotate<R> {
+   |        ^^^^^^

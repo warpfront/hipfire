@@ -88,18 +88,29 @@ def resolve_model_default(explicit, tag, registry_path, field, fallback, explici
 
 
 def resolve_kv_mode(explicit, tag, registry_path):
-    """Resolve the cache mode from an explicit override or the model registry."""
-    return resolve_model_default(
+    """Resolve the cache mode the product would load, unless --kv overrides it.
+
+    Mirrors the product KV precedence (docs/QUANTIZATION.md): a registry
+    ``default_kv_mode`` applies only when it is not ``q8``; a ``q8`` card value
+    is left to ``auto`` (native fp8 on eligible gfx1201, Q8 elsewhere). Writing
+    the registry ``q8`` as an explicit ``kv_cache`` would certify Q8 instead of
+    the shipped default.
+    """
+    kv, source = resolve_model_default(
         explicit, tag, registry_path, "default_kv_mode", "auto", "explicit(--kv)")
+    if explicit is None and kv == "q8":
+        return "auto", f"{source}:q8->auto"
+    return kv, source
 
 
-def _tag_load_policy(canonical_tag):
+def _tag_load_policy(canonical_tag, entry=None):
     """Automatic load policy keyed by canonical registry tag.
 
     Mirrors hipfire-registry's generation-only tag policy (not wire fields).
     Context is resolved by loader admission from model metadata and card
     capacity; only an explicit user max_seq reaches the sparse TOML.
-      - Qwen3.5 / 3.6 / 3.8 targets → max_tokens=81920
+      - Qwen3.5 / 3.6 / 3.8 targets → max_tokens=81920, except Qwen3.8
+        entries with arch_id=16 (Qwen4 / Flash-Next), which take no policy
       - DeepSeek V4 Flash targets → max_tokens=393216
       - other tags and draft/dflash sidecars → no policy.
     """
@@ -110,6 +121,8 @@ def _tag_load_policy(canonical_tag):
         return {}
     family = tag.split(":", 1)[0]
     if family in ("qwen3.5", "qwen3.6", "qwen3.8"):
+        if (entry or {}).get("arch_id") == 16:
+            return {}
         return {"max_tokens": 81920}
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return {"max_tokens": 393216}
@@ -159,7 +172,7 @@ def resolve_max_tokens(explicit, tag, registry_path):
         print(f"  [warn] could not resolve max_tokens policy from {registry_path}: {e}",
               file=sys.stderr)
         canonical, entry = tag, {}
-    policy = _tag_load_policy(canonical) if entry else {}
+    policy = _tag_load_policy(canonical, entry) if entry else {}
     if "max_tokens" in policy:
         return policy["max_tokens"], f"tag-policy({canonical})"
     return 2048, "default(2048)"
@@ -321,7 +334,7 @@ def build_config(args):
             f"serve_harness: --ngram on is exclusive; got dflash={dflash} mtp={args.mtp}. "
             "Pick one speculative mechanism."
         )
-    # Opt-in long-gated ngram-mod composition inside native MTP (harness/env only).
+    # Opt-in long-gated ngram-mod composition inside native MTP (TOML `speculation.mtp_ngram`; the harness drives it by env).
     # Not a separate speculation selector: TOML stays mode=mtp; daemon sees
     # HIPFIRE_MTP_NGRAM + HIPFIRE_NGRAM_MOD_*. Requires --mtp on, greedy sampling,
     # thinking off; exclusive with standalone --ngram / --dflash on and with
@@ -1034,6 +1047,16 @@ def apply_observed_kv_backend(cfg, txt):
             else:
                 cfg["kv_backend_warning"] = None
 
+    if cfg.get("kv_mode_effective"):
+        cfg["kv_mode_effective_src"] = "loaded ACK"
+    else:
+        # The loaded ACK is not echoed into every serve log; the loader's own
+        # "KV cache: requested mode=…, effective KV=…" line is the same fact.
+        m = re.search(r"KV cache: requested mode=\S+?, effective KV=(\w+)", txt or "")
+        if m:
+            cfg["kv_mode_effective"] = m.group(1)
+            cfg["kv_mode_effective_src"] = "serve log 'KV cache: ... effective KV'"
+
     _emit_legacy_kv_backend_notice(cfg, log_txt=txt)
     return cfg.get("kv_backend_effective"), cfg.get("kv_backend_effective_reason")
 
@@ -1086,6 +1109,21 @@ def stamp_kv_backend_out_fields(rows, cfg):
         if isinstance(row, dict):
             row.update(meta)
     return rows
+
+
+def kv_mode_report_line(cfg):
+    """One report-header line naming the KV mode this run actually certifies.
+
+    The requested value is usually ``auto`` (the product default), which is not a
+    mode: it resolves to native fp8 or Q8 at load. The loaded ACK (or the loader's
+    "effective KV" log line) is the authority, so say so when it was observed and say plainly when it was not.
+    """
+    eff = cfg.get("kv_mode_effective")
+    if eff:
+        src = cfg.get("kv_mode_effective_src", "loaded ACK")
+        return f"  kv_mode_resolved={eff} (observed in {src}; requested {cfg['kv']} [{cfg.get('kv_source', 'unknown')}])"
+    return (f"  kv_mode_resolved=UNOBSERVED (requested {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]; "
+            "no loaded ACK or KV-cache log line seen, e.g. --no-spawn)")
 
 
 
@@ -1340,7 +1378,8 @@ def _self_test_kv_resolution():
     """Prove registry defaults, aliases, explicit overrides, and fallback."""
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
         json.dump({
-            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"}},
+            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"},
+                       "qwen3.8:27b-mq4-xts": {"default_kv_mode": "q8"}},
             "aliases": {"deepseek4:mq2r": "deepseek-v4-flash:mq2r"},
         }, tmp)
         path = tmp.name
@@ -1350,6 +1389,11 @@ def _self_test_kv_resolution():
         assert resolve_kv_mode("f16", "deepseek4:mq2r", path) == (
             "f16", "explicit(--kv)")
         assert resolve_kv_mode(None, "missing", path) == ("auto", "default(auto)")
+        # A registry q8 is left to the product's auto (fp8 on gfx1201), not pinned.
+        assert resolve_kv_mode(None, "qwen3.8:27b-mq4-xts", path) == (
+            "auto", "registry(qwen3.8:27b-mq4-xts):q8->auto")
+        assert resolve_kv_mode("q8", "qwen3.8:27b-mq4-xts", path) == (
+            "q8", "explicit(--kv)")
     finally:
         os.unlink(path)
     print("serve_harness: kv-resolution self-test OK", flush=True)
@@ -1581,7 +1625,8 @@ def _self_test_load_defaults():
         assert cfg["max_seq_source"] == "automatic(model/card)"
         assert cfg["max_tokens"] == 81920
         assert cfg["max_tokens_source"] == "tag-policy(qwen3.8:27b)"
-        assert cfg["kv"] == "q8"
+        assert cfg["kv"] == "auto"
+        assert cfg["kv_source"] == "registry(qwen3.8:27b):q8->auto"
         with tempfile.TemporaryDirectory() as home:
             Path(home, ".hipfire").mkdir()
             _write_native_config(cfg, home)
@@ -1701,6 +1746,12 @@ def _self_test_load_defaults():
             show_config(cfg_fp8)
         assert "kv_mode       : fp8 [observed(loaded)]" in buf.getvalue()
         assert stamp_kv_backend_out_fields([{}], cfg_fp8)[0]["kv_mode"] == "fp8"
+        assert "kv_mode_resolved=fp8 (observed in loaded ACK; requested auto" in kv_mode_report_line(cfg_fp8)
+        assert "kv_mode_resolved=UNOBSERVED (requested auto" in kv_mode_report_line(build_config(_ns()))
+        # No loaded ACK in the serve log: the loader's own effective-KV line still names the mode.
+        cfg_log = build_config(_ns())
+        apply_observed_kv_backend(cfg_log, "  KV cache: requested mode=auto, effective KV=fp8\n")
+        assert "kv_mode_resolved=fp8 (observed in serve log" in kv_mode_report_line(cfg_log)
 
         # Once-per-load legacy warning + --out row metadata (list shape preserved).
         cfg_leg = build_config(_ns(kv_backend="legacy"))
@@ -2364,7 +2415,7 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1")
-    # Experimental long-gated ngram-mod inside native MTP (harness-only; no TOML key).
+    # Experimental long-gated ngram-mod inside native MTP (TOML key `speculation.mtp_ngram`; the harness drives the env override).
     # Opt-off must clear inherited vars so a parent shell cannot contradict preflight.
     if cfg.get("mtp_ngram") == "on":
         env["HIPFIRE_MTP_NGRAM"] = "1"
@@ -3775,6 +3826,7 @@ def run(cfg, args):
     bmd5, bpath = _daemon_binary_md5()
     if bmd5:
         print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    print(kv_mode_report_line(cfg), flush=True)
     # ---- Tool round-trip + ATEM leak gate (always checked when tool_calls involved) ----
     for idx, r in enumerate(g):
         if r.get("atem_leak"):
@@ -3854,7 +3906,8 @@ def main():
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default=None,
-                    help="cache mode override; omitted resolves the registry default")
+                    help="cache mode override; omitted resolves what the product loads "
+                         "(registry non-q8 default_kv_mode, else auto)")
     ap.add_argument(
         "--kv-backend",
         default=None,
@@ -4096,6 +4149,7 @@ def main():
                 flush=True,
             )
         _assert_serve_path_proofs(cfg, args.serve_log, offset=log_offset)
+    print(kv_mode_report_line(cfg), flush=True)
     cfg["_serve_log_offset"] = log_offset
     rows = run(cfg, args)
     if not args.no_spawn:

@@ -207,6 +207,21 @@ pub struct ScratchState {
     pub paro_fused_scratch: Option<Vec<GpuTensor>>,
     pub fp16_x_scratch: Option<DeviceBuffer>,
     pub fp16_x_scratch_bytes: usize,
+    /// Global score rows for the QSA block selector when an arena's pooled
+    /// block count exceeds its dynamic-LDS row (contexts past 61,440 tokens):
+    /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.
+    pub qsa_select_scores: Option<DeviceBuffer>,
+    pub qsa_select_scores_bytes: usize,
+    /// F32 dequantization of one Q8 GDN state for the chunked prefill route.
+    pub gdn_state_f32: Option<DeviceBuffer>,
+    pub gdn_state_f32_bytes: usize,
+    /// F16 K and block-transposed V of the QSA cache rows the gathered WMMA
+    /// attention reads (`tensor_ops::qsa_gathered_wmma`). Its own slot, not
+    /// the shared FP16 X scratch: Qwen4 reserves it for the whole context at
+    /// load (`tensor_ops::reserve_qsa_gathered_wmma_scratch`), so no captured
+    /// graph or recorded tape ever sees it move.
+    pub qsa_gather_f16: Option<DeviceBuffer>,
+    pub qsa_gather_f16_bytes: usize,
     pub fp16_x_source_ptr: *mut c_void,
     pub fp8_x_scratch: Option<DeviceBuffer>,
     pub fp8_x_scratch_bytes: usize,
@@ -230,6 +245,20 @@ pub struct ScratchState {
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
     pub int8_mmq_generation: u64,
+    /// Qwen4 symmetric IU4 MoE stable-grouping scratch: `[L]` local ranks,
+    /// `[E, C]` per-chunk counts and `[E, C + 1]` chunk prefixes (`C =
+    /// ceil(L / 256)`), one allocation laid out by [`qwen4_moe_group_layout`].
+    /// Every word a grouping reads is written earlier in the same invocation,
+    /// so it needs no init. Grows-never-shrinks; reserved before capture by
+    /// [`ScratchState::reserve_qwen4_moe_group`].
+    pub qwen4_moe_group_scratch: Option<DeviceBuffer>,
+    pub qwen4_moe_group_scratch_bytes: usize,
+    /// Qwen4 symmetric IU4 MoE down sidecar: compact flat-slot `[K/128, L]`
+    /// `block_i4_128`. K = 640 is not a multiple of 256, so it cannot share
+    /// `int4_mmq_x_scratch`; generation-checked like it.
+    pub qwen4_moe_down_i4_scratch: Option<DeviceBuffer>,
+    pub qwen4_moe_down_i4_scratch_bytes: usize,
+    pub qwen4_moe_down_i4_generation: u64,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
     pub mq4v2_fp8_x_scratch: Option<DeviceBuffer>,
@@ -524,6 +553,16 @@ fn grow_scratch_buffer(
     Ok(())
 }
 
+/// [`grow_scratch_buffer`] for slots owned outside this module's helpers.
+pub(crate) fn grow_scratch_slot(
+    hip: &HipRuntime,
+    slot: &mut Option<DeviceBuffer>,
+    have_bytes: &mut usize,
+    needed: usize,
+) -> HipResult<()> {
+    grow_scratch_buffer(hip, slot, have_bytes, needed)
+}
+
 /// True when [`grow_scratch_buffer`] would replace the slot: the early-return
 /// condition factored out so `Gpu` callers can invalidate captured graphs
 /// BEFORE delegating. Single source of truth — the two sites cannot drift.
@@ -610,6 +649,29 @@ pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
 pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     let blocks_k = k / 128;
     blocks_k * n * 72
+}
+
+/// Byte offsets of the stable-grouping scratch for `slots` routed slots over
+/// `experts` experts: `[slots]` ranks, `[experts, chunks]` counts, then
+/// `[experts, chunks + 1]` chunk prefixes, `chunks = ceil(slots / 256)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4MoeGroupLayout {
+    pub chunks: usize,
+    pub partial_offset: usize,
+    pub prefix_offset: usize,
+    pub bytes: usize,
+}
+
+pub fn qwen4_moe_group_layout(slots: usize, experts: usize) -> Qwen4MoeGroupLayout {
+    let chunks = slots.div_ceil(256);
+    let partial_offset = slots * 4;
+    let prefix_offset = partial_offset + experts * chunks * 4;
+    Qwen4MoeGroupLayout {
+        chunks,
+        partial_offset,
+        prefix_offset,
+        bytes: prefix_offset + experts * (chunks + 1) * 4,
+    }
 }
 
 #[inline]
@@ -1685,6 +1747,67 @@ impl ScratchState {
         })
     }
 
+    /// Grow the Qwen4 symmetric IU4 MoE grouping scratch to hold the layout
+    /// of `max_slots` routed slots over `experts` experts (every smaller
+    /// slot count fits). Callers reserve the forward's maximum before graph
+    /// capture so a captured grouping never reallocates.
+    pub fn reserve_qwen4_moe_group(
+        &mut self,
+        hip: &HipRuntime,
+        max_slots: usize,
+        experts: usize,
+    ) -> HipResult<()> {
+        let needed = qwen4_moe_group_layout(max_slots, experts).bytes;
+        grow_scratch_buffer(
+            hip,
+            &mut self.qwen4_moe_group_scratch,
+            &mut self.qwen4_moe_group_scratch_bytes,
+            needed,
+        )
+    }
+
+    /// Grow the Qwen4 symmetric IU4 MoE down sidecar for `[k/128, n]`
+    /// `block_i4_128` and bump its generation (`k % 128 == 0`). The producer
+    /// writes every live slot's blocks; the reservation launches nothing.
+    pub fn reserve_qwen4_moe_down_i4(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int4MmqReservation> {
+        if k == 0 || n == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_qwen4_moe_down_i4: need k%128==0 and n>0",
+            ));
+        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.qwen4_moe_down_i4_scratch,
+            &mut self.qwen4_moe_down_i4_scratch_bytes,
+            k / 128 * n * 72,
+        )?;
+        self.qwen4_moe_down_i4_generation = self.qwen4_moe_down_i4_generation.wrapping_add(1);
+        Ok(Int4MmqReservation {
+            ptr: self.qwen4_moe_down_i4_scratch.as_ref().unwrap().as_ptr(),
+            k,
+            n,
+            generation: self.qwen4_moe_down_i4_generation,
+        })
+    }
+
+    /// Live generation + pointer of the down sidecar, for
+    /// [`Int4MmqPrepared::checked_ptr`].
+    #[inline]
+    pub fn qwen4_moe_down_i4_live(&self) -> (u64, *mut c_void) {
+        let ptr = self
+            .qwen4_moe_down_i4_scratch
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        (self.qwen4_moe_down_i4_generation, ptr)
+    }
+
     /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_int8_mmq_x(
@@ -1735,6 +1858,14 @@ impl ScratchState {
         )?;
         if let Some(t) = timer { t.finish(hip); }
         Ok(yp)
+    }
+
+    /// Reserve the existing 144-byte DS4 slot without issuing a quantizer.
+    /// Caller must invalidate graphs before growth and overwrite every block.
+    pub(crate) fn reserve_packed_mq4(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<*mut c_void> {
+        let needed = q8_1_mmq_x_needed(k, n);
+        grow_scratch_buffer(hip, &mut self.q8_1_mmq_x_scratch, &mut self.q8_1_mmq_x_scratch_bytes, needed)?;
+        Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
     pub fn reserve_int8_mmq(&mut self, hip: &HipRuntime, k: usize, n: usize) -> HipResult<Int8MmqReservation> {

@@ -174,20 +174,10 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|t| *t == LayerType::FullAttention)
         .collect();
 
-    // Typed `kv_v_override` wins; developer HIPFIRE_KV_V only when no typed V.
-    let kv_v_env = if ctx.kv_v_override.filter(|s| !s.is_empty()).is_some() {
-        String::new()
-    } else {
-        hipfire_config::developer_var("HIPFIRE_KV_V").unwrap_or_default()
-    };
+    // `kv_v_override` is admission's resolved V (typed > HIPFIRE_KV_V); never
+    // re-read the env here or VMM sizing and the loaded pair can diverge.
     let k_raw = ctx.kv_k_override.filter(|s| !s.is_empty());
-    let v_raw = ctx
-        .kv_v_override
-        .filter(|s| !s.is_empty())
-        .or_else(|| match kv_v_env.as_str() {
-            "" | "q8" => None,
-            other => Some(other),
-        });
+    let v_raw = ctx.kv_v_override.filter(|s| !s.is_empty());
     let kv_adaptive_spec = ctx
         .kv_adaptive_override
         .filter(|s| !s.is_empty())

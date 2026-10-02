@@ -23,19 +23,25 @@
  0 peacemaker-ir
  0 radiowave
  0 redline
+ 0 railgun-corpus
  1 hip-bridge
  1 hipfire-client
  2 hipfire-isa
  1 hipfire-registry
  1 hsa-bridge
+ 1 peacemaker-author
  1 peacemaker-lift
  1 redline-rocr
  1 va-bridge
+ 1 railgun
  2 hipfire-tui
  2 redline-dispatch
+ 2 railgun-cert
+ 3 hipfire-cpu
  3 rdna-compute
  4 hipfire-dispatch
  4 saddle-core
+ 4 railgun-jitcorpus
  5 hipfire-runtime
  6 hipfire-arch-cohere2moe
  6 hipfire-arch-diffusion

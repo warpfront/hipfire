@@ -78,6 +78,18 @@ pub struct EosFilterConfig {
     pub holdback_prefixes: Vec<Vec<u8>>,
 }
 
+/// The Qwen3.5/3.6 semantic-v2 filter, shared by AR, VL and the spec
+/// (DFlash/MTP) emitter: EosFilter owns UTF-8/EOT filtering only; think
+/// routing belongs to `ThinkOutputRouter`, so no `strip_think`.
+pub fn qwen35_eos_filter_config() -> EosFilterConfig {
+    EosFilterConfig {
+        strip_think: false,
+        started_in_think: false,
+        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
+        holdback_prefixes: Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct EosFilterState {
     /// Raw input bytes not yet fully consumed by the transform cursor.

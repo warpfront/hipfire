@@ -32,7 +32,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::swap::snapshot::{
         capture_slot, restore_slot, SlotSnapshot, SnapshotStamp,
@@ -102,7 +102,7 @@ fn main() {
         v_arenas.push(gpu.zeros(&[arena_bytes], DType::Raw).expect("v arena"));
     }
     let mut dn_states = vec![DeltaNetState::new(&mut gpu, &config).expect("dn state")];
-    let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch).expect("staging");
+    let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch, 0).expect("staging");
     let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("pbs");
     let scratch =
         Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("scratch");
@@ -126,12 +126,21 @@ fn main() {
         remaining_prompt: prompt.clone(),
         next_pos: 0,
         decoding: false,
+        vl_prefill: None,
+        spec: SpecKind::None,
+        spec_cycles: 0,
+        spec_committed: 0,
+        spec_retire_fails: 0,
+        pos3_delta: 0,
     }];
     let mut sched = Scheduler {
         chunk_size: prompt.len(),
+        vl_sequential: false,
+        prefill_cursor: 0,
     };
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
     let mut graph = SlotDecodeGraph::new();
-    let batch = sched.next_batch(&mut work);
+    let batch = sched.next_batch(&mut work, usize::MAX, 1);
     forward_batch_slots_graphed(
         &mut gpu,
         &weights,
@@ -142,6 +151,7 @@ fn main() {
         &k_arenas,
         &v_arenas,
         &mut desc_staging,
+        &kv_tier,
         &pbs,
         &scratch,
         &logits_out,
@@ -160,9 +170,10 @@ fn main() {
         model_hash: 0xDEAD_BEEF,
         kv_dtype_tag: 1,
         per_pos_bytes: per_pos_bytes as u32,
+        per_pos_v_bytes: per_pos_bytes as u32,
         n_fa_layers: n_fa_layers as u32,
         dn_layout_version: 1,
-        cap: pool.descriptors()[0].cap as u32,
+        cap: pool.cap_tokens() as u32,
         dn_bytes,
     };
     println!(

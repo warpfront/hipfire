@@ -367,5 +367,21 @@ v_sub_co_u32	vop3	0x301	VDST:32,SDST:64,SRC0:32,SRC1:32	VDST,SDST	SRC0,SRC1	-	-	
 v_wmma_f32_16x16x16_f16	vop3p	0x40	VDST:256,SRC0:256,SRC1:256,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_f32_16x16x16_f16 v[146:153], v[204:211], v[162:169], v[146:153]	CC404092 1E4B45CC	w0_extra:ignored:0x800000:0x0
 v_wmma_i32_16x16x16_iu4	vop3p	0x45	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu4 v[114:121], v[146:147], v[150:151], v[0:7] neg_lo:[1,1,0]	CC454072 7C032D92	w0_extra:ignored:0x800000:0x0
 v_wmma_i32_16x16x16_iu8	vop3p	0x44	VDST:256,SRC0:128,SRC1:128,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu8 v[140:147], v[16:19], v[32:35], v[0:7] neg_lo:[1,1,0] clamp	CC44C08C 7C024110	w0_extra:ignored:0x800000:0x0
+# attention_verify_wmma.gfx1151 (lds_store_unwaited_at_barrier fixture); samples are that object's words, re-encoded by llvm-mc -mcpu=gfx1100.
+buffer_load_u16	buffer	0x12	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Vm:1	buffer_load_u16 v158, v116, s[16:19], 0 offen	E0480000 80449E74	-
+v_cvt_f16_i16_e32	vop1	0x51	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_cvt_f16_i16_e32 v116.h, v116.l	7FE8A374	w0_extra:ignored:0x10000:0x0
+v_mul_f16_e32	vop2	0x35	VDST:16,SRC0:16,VSRC1:16	VDST	SRC0,VSRC1,VDST	-	-	v_mul_f16_e32 v13.l, v70.l, v13.l	6A1A1B46	-
 # Non-runtime LLVM-MC conformance probe: the V_NOP between VCMPX and PERMLANE is not a safe separator.
 v_nop_e32	vop1	0x0	-	-	-	-	-	v_nop_e32	7E000000	-
+# railgun M0a (2026-09-29): rows for opcodes in the M0a decode sequences, derived from the named same-shape sibling row; sample/encoding from pinned llvm-mc.
+s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_or_saveexec_b64 s[4:5], -1	BE8423C1	-
+s_cmpk_lt_u32	sopk	0xd	SDST:32,SIMM16:16	-	SDST,SIMM16	scc:w	-	s_cmpk_lt_u32 s24, 0x100	B6980100	-
+flat_load_b32	flat	0x14	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b32 v33, v[1:2] offset:8	DC500008 217C0001	-
+flat_load_b64	flat	0x15	VDST:64,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b64 v[17:18], v[1:2]	DC540000 117C0001	-
+buffer_gl1_inv	buffer	0x2c	-	-	-	-	-	buffer_gl1_inv	E0B00000 00000000	-
+s_bcnt1_i32_b32	sop1	0x18	SDST:32,SSRC0:32	SDST	SSRC0	scc:w	-	s_bcnt1_i32_b32 s3, s6	BE831806	-
+v_cmp_u_f32_e64	vop3	0x18	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_u_f32_e64 s0, v4, v3	D4180000 02020704	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+# railgun pm-atomics (2026-09-29): gfx11 GLOBAL atomics (RDNA3 opcodes 51/52/53). GLC=1 is the returning form: VDST@rtn is present and the atomic counts on vmcnt; GLC=0 has no destination and counts on vscnt. Samples are the DS4 gfx1151 encodings (pinned llvm-mc).
+global_atomic_swap_b32	global	0x33	VDST@rtn:32,ADDR:64,VSRC:32,SADDR:64	VDST	ADDR,VSRC,SADDR	-	Vm:1@rtn,Vs:1@nortn	global_atomic_swap_b32 v13, v12, s[6:7] offset:4	DCCE0004 00060C0D	-
+global_atomic_cmpswap_b32	global	0x34	VDST@rtn:32,ADDR:64,VSRC:64,SADDR:64	VDST	ADDR,VSRC,SADDR	-	Vm:1@rtn,Vs:1@nortn	global_atomic_cmpswap_b32 v0, v2, v[0:1], s[0:1] glc	DCD24000 00000002	-
+global_atomic_add_u32	global	0x35	VDST@rtn:32,ADDR:64,VSRC:32,SADDR:64	VDST	ADDR,VSRC,SADDR	-	Vm:1@rtn,Vs:1@nortn	global_atomic_add_u32 v2, v10, v2, s[4:5] glc	DCD64000 0204020A	-

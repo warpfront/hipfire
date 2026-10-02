@@ -610,6 +610,14 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[LDS_DWORDS - 2]);
     const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[LDS_DWORDS - 1]);
     const int seq_len = gmax + 1;
+#if !FA2_FILL
+    // The mailbox dwords are the V plane's last two, and the tile loop's
+    // first V fill (Transition 2) writes them. Without this barrier a wave
+    // still before its mailbox load can read V data as gmax/gmin: a wrong
+    // key range, or a wild K read. The fill path's barrier before its first
+    // V store already orders it.
+    __syncthreads();
+#endif
 
 #if FA2_FILL
     // ---- Transitions 2-3: warp-specialized fill (see FA2_FILL helpers) ----

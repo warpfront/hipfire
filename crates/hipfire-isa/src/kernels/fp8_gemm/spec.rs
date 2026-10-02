@@ -11,7 +11,6 @@ pub struct Spec { pub arch: Arch, pub act_scale: ActScale, pub epi: Epi }
 
 pub const VGPR_CEILING: u16 = 192;
 pub const LDS_BYTES: u32 = 19_456;
-pub const SRD_WORD3: u32 = 0x3100_4000;
 pub const GDN_KERNARG_BYTES: u32 = 144;
 
 impl ActScale {

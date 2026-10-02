@@ -1922,9 +1922,13 @@ struct KernargPoolInner {
     cpu: Option<abi::Agent>,
     granule: usize,
     alignment: usize,
-    /// True for GPU-agent (VRAM) pools: buffer writes must go through
-    /// `hsa_amd_memory_copy`, not host pointer stores.
+    /// True for GPU-agent (VRAM) pools. Host stores reach them through the
+    /// BAR (large BAR / UMA only) and must be published with
+    /// [`KernargBuffer::publish_host_writes`] before the GPU reads them.
     device_local: bool,
+    /// The CPU agent must be granted access per allocation
+    /// (`HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT`).
+    grant_host_access: bool,
 }
 
 impl KernargPool {
@@ -2047,24 +2051,24 @@ impl KernargPool {
                     granule,
                     alignment,
                     device_local: false,
+                    grant_host_access: false,
                 }),
             });
         }
         Err(RuntimeError::NoKernargPool)
     }
 
-    /// Discover a GPU-agent (VRAM) pool for the retained indirect buffer.
+    /// Discover a GPU-agent (VRAM) pool for retained PM4 data.
     ///
-    /// The default [`KernargPool::discover`] pool is CPU-agent global — the
-    /// command processor re-fetches the retained PM4 IB over the host
-    /// interface on EVERY replay. A device-local pool lets the CP fetch the
-    /// tape from VRAM instead. Requires a GPU-agent GLOBAL pool with runtime
-    /// allocation allowed; coarse-grained preferred (true VRAM), fine-grained
-    /// accepted (UMA, e.g. Strix Halo). Buffers from this pool are written via
-    /// `hsa_amd_memory_copy` — host pointer stores are invalid on dGPU VRAM.
+    /// The default [`KernargPool::discover`] pool is CPU-agent global, so the
+    /// GPU reaches it over the host interface on EVERY replay. Requires a
+    /// GPU-agent GLOBAL pool with runtime allocation allowed; coarse-grained
+    /// preferred (true VRAM), fine-grained accepted (UMA, e.g. Strix Halo).
+    /// Host stores into these buffers go through the BAR and are valid only
+    /// when the CPU agent may access the pool; retained kernargs therefore use
+    /// [`Self::discover_host_writable_device_local`], which checks that.
     ///
-    /// Only the IB belongs here: timestamps/semaphores read by the host stay
-    /// on the CPU-agent pool.
+    /// Timestamps/semaphores read by the host stay on the CPU-agent pool.
     pub fn discover_device_local(device: &GpuDevice) -> Result<Self, RuntimeError> {
         unsafe extern "C" fn collect(pool: abi::MemoryPool, data: *mut c_void) -> abi::Status {
             // SAFETY: context is a live vector for synchronous iteration.
@@ -2152,6 +2156,7 @@ impl KernargPool {
                         granule,
                         alignment,
                         device_local: true,
+                        grant_host_access: false,
                     }),
                 });
             }
@@ -2173,10 +2178,69 @@ impl KernargPool {
                     granule,
                     alignment,
                     device_local: true,
+                    grant_host_access: false,
                 }),
             });
         }
         Err(RuntimeError::NoKernargPool)
+    }
+
+    /// Discover a GPU-agent pool for retained kernarg segments that the host
+    /// patches in place between replays.
+    ///
+    /// Same pool choice as [`Self::discover_device_local`], additionally
+    /// requiring that the CPU agent may access it (large-BAR dGPU or UMA), so
+    /// the per-replay position/frame patches stay plain host stores. Fails
+    /// with [`RuntimeError::DeviceLocalPoolNotHostWritable`] on small-BAR
+    /// systems; callers fall back to [`Self::discover`].
+    pub fn discover_host_writable_device_local(device: &GpuDevice) -> Result<Self, RuntimeError> {
+        let cpu = device.cpu.as_ref().ok_or(RuntimeError::NoCpuAgent)?;
+        let query = device.runtime.symbols.agent_memory_pool_get_info.ok_or(
+            RuntimeError::DeviceLocalPoolNotHostWritable(
+                "hsa_amd_agent_memory_pool_get_info is unavailable",
+            ),
+        )?;
+        let mut pool = Self::discover_device_local(device)?;
+        let mut access = abi::AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED;
+        // SAFETY: both handles are live and the output is the documented
+        // 32-bit `hsa_amd_memory_pool_access_t`.
+        let status = unsafe {
+            query(
+                cpu.handle,
+                pool.inner.pool,
+                abi::AMD_AGENT_MEMORY_POOL_INFO_ACCESS,
+                (&mut access as *mut u32).cast(),
+            )
+        };
+        check_status(
+            &device.runtime.symbols,
+            "hsa_amd_agent_memory_pool_get_info",
+            status,
+        )?;
+        let grant_host_access = match access {
+            abi::AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT => false,
+            abi::AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT => true,
+            _ => {
+                return Err(RuntimeError::DeviceLocalPoolNotHostWritable(
+                    "the CPU agent can never access the device-local pool (small BAR)",
+                ));
+            }
+        };
+        if hipfire_config::developer_var_os("HIPFIRE_REDLINE_POOL_DEBUG")
+            .is_some_and(|v| v != "0" && !v.is_empty())
+        {
+            eprintln!(
+                "[redline] retained-kernarg pool: handle=0x{:x} owner=GPU-agent cpu_access={access} \
+                 grant_host_access={grant_host_access} granule={} alignment={}",
+                pool.inner.pool.0, pool.inner.granule, pool.inner.alignment,
+            );
+        }
+        Arc::get_mut(&mut pool.inner)
+            .ok_or(RuntimeError::InvalidRuntimeObject(
+                "freshly discovered kernarg pool is shared",
+            ))?
+            .grant_host_access = grant_host_access;
+        Ok(pool)
     }
 
     pub fn allocate_for(&self, metadata: KernelMetadata) -> Result<KernargBuffer, RuntimeError> {
@@ -2275,12 +2339,19 @@ impl KernargPool {
                 address: pointer.as_ptr() as usize,
             });
         }
-        // SAFETY: the allocation came from this pool and the GPU agent is a
-        // valid access target; flags are reserved and therefore null.
+        // A host-writable device-local pool whose CPU access is disallowed by
+        // default also grants the CPU agent, so host kernarg stores are
+        // within the HSA access contract.
+        let (agents, agent_count) = match (self.inner.grant_host_access, self.inner.cpu) {
+            (true, Some(cpu)) => ([self.inner.gpu, cpu], 2),
+            _ => ([self.inner.gpu, self.inner.gpu], 1),
+        };
+        // SAFETY: the allocation came from this pool and every listed agent is
+        // a valid access target; flags are reserved and therefore null.
         let status = unsafe {
             (self.inner.runtime.symbols.agents_allow_access)(
-                1,
-                &self.inner.gpu,
+                agent_count,
+                agents.as_ptr(),
                 ptr::null(),
                 pointer.as_ptr().cast(),
             )
@@ -2352,6 +2423,32 @@ impl KernargBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.length == 0
+    }
+
+    /// True when the buffer lives in a GPU-agent (VRAM) pool.
+    pub fn is_device_local(&self) -> bool {
+        self.device_local
+    }
+
+    /// Publish host stores to a device-local segment before the next doorbell.
+    ///
+    /// Stores through the BAR are write-combined and posted. A full fence
+    /// drains the CPU write-combining buffers, and reading one byte back
+    /// through the BAR cannot complete before every earlier posted write to
+    /// the device has landed (ROCclr's readback rule for device kernargs). One
+    /// call therefore covers every device-local buffer written before it.
+    /// Host-pool buffers need nothing and return immediately.
+    pub fn publish_host_writes(&self) {
+        if !self.device_local {
+            return;
+        }
+        let Some(pointer) = self.pointer else {
+            return;
+        };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: a non-null pointer owns `length >= 1` readable bytes.
+        let _ = unsafe { ptr::read_volatile(pointer.as_ptr().add(self.length - 1)) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
@@ -2962,6 +3059,7 @@ pub enum RuntimeError {
     ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
+    DeviceLocalPoolNotHostWritable(&'static str),
     InvalidKernargAlignment(usize),
     KernargAlignmentNotMet {
         required: usize,
@@ -3072,6 +3170,9 @@ impl fmt::Display for RuntimeError {
                 f,
                 "no allocatable fine-grained host pool with KERNARG_INIT was found"
             ),
+            Self::DeviceLocalPoolNotHostWritable(reason) => {
+                write!(f, "device-local pool is not host-writable: {reason}")
+            }
             Self::InvalidKernargAlignment(alignment) => {
                 write!(f, "kernel reported invalid kernarg alignment {alignment}")
             }

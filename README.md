@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.3.1" src="https://img.shields.io/badge/stable-v0.3.1-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.3.1-f04b24?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.4.0" src="https://img.shields.io/badge/stable-v0.4.0-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.0-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="82 curated model entries" src="https://img.shields.io/badge/registry-82%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
@@ -25,15 +25,18 @@
 </p>
 
 ```bash
-hipfire pull qwen3.5:4b
-hipfire serve qwen3.5:4b -d
-hipfire chat qwen3.5:4b
+hipfire pull qwen3.8:27b-mq4-xts
+hipfire serve qwen3.8:27b-mq4-xts -d
+hipfire chat qwen3.8:27b-mq4-xts
 ```
+
+That pulls about 15 GB and wants a 24 GB+ card or Strix Halo. On smaller cards,
+start with `qwen3.5:4b` (or `qwen3.5:9b`) in the same commands.
 
 One-shot inference uses the same model registry and serving stack:
 
 ```bash
-hipfire run qwen3.5:4b "What is the capital of France?"
+hipfire run qwen3.8:27b-mq4-xts "What is the capital of France?"
 ```
 
 Image generation (first release; RDNA3/3.5 measured):
@@ -46,13 +49,26 @@ hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
 The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
 only by default; set `serve.host` to listen on other interfaces).
 
-Current stable release: **v0.3.1**, headlined by DFlash prompt-cache
-repair, registry draft sidecars, Ornith 1.5, sealed MoE execution
-contracts, gfx1201 long-context DFlash, tool turns on daemon slots, and
-first-release image generation (FLUX). See [CHANGELOG.md](CHANGELOG.md).
+Current stable release: **[v0.4.0](https://github.com/warpfront/hipfire/releases/tag/v0.4.0)**.
 
-The upcoming [v0.4.0 KV migration](CHANGELOG.md) is documented under Unreleased;
-v0.3.1 remains the latest tagged stable release.
+**Flagship: Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (symmetric MQ4V2 XT with
+per-group AWQ and GPTQ scale refits). `hipfire pull qwen3.8:27b-mq4-xts`
+fetches the target plus its DFlash draft sidecar. On v0.4.0 it gets:
+
+- **Prefill on one R9700 (gfx1201):** pp8192 ≈ 5,120 tok/s with native fp8 KV
+  as the `auto` default, and 4,464 / 3,804 / 2,940 tok/s at 32K / 64K / 128K.
+- **gfx11 prefill:** pp8192 ≈ 2,985 tok/s on the 7900 XTX and 1,141 tok/s on
+  Strix Halo; FA2 now covers prompts past 32K.
+- **Speculative decode:** the model's MTP head is on by default when present
+  (codeedit 39.3 → 68.1 tok/s on the R9700, same text), and VerifyAttn speeds up
+  long-context DFlash/MTP verify (Halo at 32K: DFlash 9.6 → 27.0 tok/s).
+
+Also in v0.4.0: **Qwen3.8 Flash-Next** MoE at its full **262K** context on one
+R9700 (tp=1, host-mapped experts) and on Strix Halo; **prebuilt kernel packs**
+in the installer; and serve/API hardening (loopback bind by default, daemon
+respawn, SIGTERM drain, typed errors). Numbers are self-measured on ROCm 10.0;
+fixtures and methods are in the release notes. See [CHANGELOG.md](CHANGELOG.md)
+and the [v0.4.0 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.0).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -138,7 +154,8 @@ The registry currently contains 80 curated model entries. Run
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
-| Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b-mq4-xts` (symmetric XT), `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
+| Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b-mq4-xts` (symmetric XT, flagship), `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
+| Qwen 3.8 Flash-Next | `qwen3.8:flash-next` (canonical); 262K context on one R9700 (gfx1201, tp=1, routed experts host-mapped) and on Strix Halo (gfx1151) |
 | Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | Ornith 1.5 | `ornith-1.5:35b-a3b` (MQ4 default), `ornith-1.5:35b-a3b-mq4r` / `ornith-1.5:fast` (MQ4R) |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
@@ -233,12 +250,11 @@ roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
 not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
 389 tok/s) and leaves a fourth card free.
 
-Experimental long-context compression and eviction are opt-in. PFlash is off
-by default, TriAttention sidecars do not auto-attach, and CASK m-folding is
-disabled. Generate a sidecar with `hipfire sidecar-gen <model>`, then set
-`memory.cask.sidecar` to its exact path (or explicitly enable
-`memory.cask.auto_attach`). Set `memory.cask.enabled=true` only when m-folding
-is intended. See [CONFIG.md](docs/CONFIG.md) for details.
+PFlash (prefill compression) is deprecated and will be removed in 0.5.0: off
+by default, not supported; enabling it prints a deprecation warning.
+CASK / TriAttention KV eviction is deprecated and will be removed in 0.5.0:
+off by default, not supported, and not a recommended setting; loading with a
+CASK option prints a deprecation warning.
 
 ## Install
 
@@ -253,10 +269,14 @@ curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/in
 ```
 
 RDNA4 requires ROCm 6.4 or newer. gfx1151 requires ROCm 7.2 or newer.
+Release-tag installs (`install.sh` / `install.ps1`, or `hipfire update --tag`)
+download a verified prebuilt kernel pack for the detected arch when it admits;
+otherwise they fall back to local hipcc. See
+[Prebuilt kernel packs](docs/GETTING_STARTED.md#prebuilt-kernel-packs).
 Run `hipfire --version` for a concise build ID or `hipfire version` to compare
 the installed binary, managed source checkout, and daemon. Managed Linux
 installs can switch revisions with `hipfire update @beta`,
-`hipfire update --tag v0.2.1`, or `hipfire update --commit <sha>`.
+`hipfire update --tag v0.4.0`, or `hipfire update --commit <sha>`.
 
 To uninstall a managed Linux install while keeping downloaded models and
 settings:
@@ -358,13 +378,13 @@ the prefill MMQ redesign log is at
 | [NIXOS.md](docs/NIXOS.md) | NixOS flake, module, dev shell |
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
-| [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
-| [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
+| [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors (GGUF input deprecated) |
+| [CONFIG.md](docs/CONFIG.md) | Every config key and env override |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
 | [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
-| [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
+| [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, KV cache modes (q8 / fp8 / fwht; legacy asym), FWHT math |
 | [CONTAINER.md](docs/CONTAINER.md) | Runtime and GPU gate-runner containers |
 | [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
@@ -394,7 +414,9 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
+See [CONTRIBUTING.md](CONTRIBUTING.md), including
+[Release cadence and PR cutoff](CONTRIBUTING.md#release-cadence-and-pr-cutoff)
+(weekly releases alternating Tuesday/Sunday). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
 `./scripts/no-gpu-ci.sh`; it does not replace the hardware gates.
 **There is no single canonical correctness gate** — the retired

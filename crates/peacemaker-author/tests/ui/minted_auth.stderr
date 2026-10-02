@@ -1,0 +1,10 @@
+error[E0624]: associated function `mint` is private
+ --> tests/ui/minted_auth.rs:7:28
+  |
+7 |         let minted = Auth::mint();
+  |                            ^^^^ private associated function
+  |
+ ::: src/backend.rs
+  |
+  |     pub(crate) fn mint() -> Self {
+  |     ---------------------------- private associated function defined here

@@ -113,6 +113,10 @@ sha2.workspace = true
 # despite each arch crate already depending on hipfire-runtime.
 [dev-dependencies]
 # SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
+sha2.workspace = true
+# `tests/cpu_quant_cross_check.rs`: holds `hipfire-cpu`'s transcription of the
+# canonical decoder to the decoder itself, over the real fixture tensors.
+hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
@@ -567,6 +571,10 @@ name = "test_serve_tool_reentry"
 required-features = ["lab"]
 
 [[example]]
+name = "test_serve_prefix_cache"
+required-features = ["lab"]
+
+[[example]]
 name = "test_swap_equivalence"
 required-features = ["lab"]
 
@@ -718,4 +726,12 @@ required-features = ["lab"]
 
 [[example]]
 name = "tmp_iu4_gfx12_v3_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "test_e4_engine_repro"
+required-features = ["lab"]
+
+[[example]]
+name = "a13_repro"
 required-features = ["lab"]

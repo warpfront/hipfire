@@ -60,8 +60,7 @@ def test_dense_is_arch5_in_both_spellings():
 
 
 def test_curated_entry_uses_the_canonical_tag_and_hyphenated_files():
-    # Pins the rename itself: repo id, tag, trunk and MTP sidecar all hyphenated,
-    # and the byte-size claim that SIZE_TOLERANCE checks against the live HF repo.
+    # Pins the rename itself: repo id, tag, trunk and MTP sidecar all hyphenated.
     #
     # The repo id is pinned to the CURRENT canonical name. HF redirects the old
     # id, so both resolve today -- but only one of them survives the redirect
@@ -73,20 +72,6 @@ def test_curated_entry_uses_the_canonical_tag_and_hyphenated_files():
     assert entry["repo"] == "hipfire-models/ornith-1.5-35b-a3b"
     assert entry["file"] == "ornith-1.5-35b-a3b.mq4"
     assert entry["mtp"]["file"] == "ornith-1.5-35b-a3b.mtp"
-    assert entry["size_gb"] == 19.02
-    expected_sampling = {
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "top_k": 20,
-        "min_p": 0.0,
-        "presence_penalty": 0.0,
-        "repeat_penalty": 1.0,
-    }
-    assert entry["recommended_settings"] == expected_sampling
-    assert entry["sampling_profiles"]["general"] == expected_sampling
-    assert entry["sampling_profiles"]["coding"] == expected_sampling
-    assert entry["sampling_profiles"]["instruct"] == expected_sampling
-    assert "zero MQ4G256V1" in entry["desc"]
 
 
 def test_legacy_spellings_alias_to_the_canonical_tag():

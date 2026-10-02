@@ -91,14 +91,15 @@ fn q8_flash_default_tile_size(
 const Q8_FLASH_REDUCE_SHARED_FLOATS: usize = 32 * 1024 / 4;
 
 fn q8_flash_reduce_safe_tile_size(tile_size: usize, head_dim: usize, max_seq: usize) -> usize {
-    let tile_capacity = Q8_FLASH_REDUCE_SHARED_FLOATS.saturating_sub(head_dim).max(1);
+    let tile_capacity = Q8_FLASH_REDUCE_SHARED_FLOATS
+        .saturating_sub(head_dim)
+        .max(1);
     if max_seq <= tile_capacity.saturating_mul(tile_size) {
         tile_size
     } else {
         max_seq.div_ceil(tile_capacity).next_power_of_two()
     }
 }
-
 
 /// Architecture- and shape-aware tile geometry for scalar Q8 decode attention.
 ///
@@ -119,7 +120,9 @@ pub fn q8_flash_tile_size(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
-        .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq));
+        .unwrap_or_else(|| {
+            q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq)
+        });
     q8_flash_reduce_safe_tile_size(preferred, head_dim, max_seq)
 }
 
@@ -128,6 +131,18 @@ pub fn q8_flash_tile_size(
 /// 8-byte position-bounds pair at 49,920 (`attention_q8_0_fa2_gqa.gfx1201.hip`).
 const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
 const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
+
+/// Context ceiling of the gfx1201 Q8 FA2 prefill body: the model's 262144
+/// positions (the same bound as dispatch's native-fp8 FA2 arms). The body's
+/// causal bound comes from `positions[]` and its K/V offsets are 64-bit, so
+/// nothing in the kernel depends on this value.
+pub const GFX12_Q8_FA2_MAX_CTX: usize = 262_144;
+
+/// Upper context bound of dispatch's default gfx12 query16 Q8 prefill
+/// envelope. At or below it the gfx1201 Q8 FA2 admission is unchanged;
+/// above it FA2 is the default and also takes chunk tails (see
+/// [`Gpu::gfx12_q8_fa2_prefill_admitted`]).
+pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
 
 /// Output of a Q-resident attention launch: the f32 rows, or (A4 epilogue
 /// twin) the Q/gate rows, output-projection AWQ scales and A4 slab.
@@ -168,7 +183,9 @@ fn check_native_kv_capacity(
     if have < need {
         return Err(hip_bridge::HipError::new(
             0,
-            &format!("{what}: cache holds {have} bytes, need {need} (tokens={tokens} row={row_bytes})"),
+            &format!(
+                "{what}: cache holds {have} bytes, need {need} (tokens={tokens} row={row_bytes})"
+            ),
         ));
     }
     Ok(())
@@ -304,6 +321,193 @@ fn replay_stable_tile_count(
     }
 }
 
+/// KV storage read by the batched flash tile a VerifyAttn launch replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyKv {
+    Q8,
+    Fp8,
+}
+
+/// VerifyAttn Stage-0 kernel set of one arch: GQA-shared split-K twins of
+/// `attention_flash_{q8_0,fp8_e4m3}_tile_batched` (one KV scan per kv head for
+/// [`VERIFY_GQA_ROWS`] query rows x 6 q heads) plus the parallel twin of
+/// `attention_flash_asym_reduce_batched`. Partials and output are
+/// byte-identical to that pair; the contract (entry ABI, grid, live range,
+/// arithmetic) is in `kernels/src/attention_verify_gqa.gfx1201.hip`. A gfx11
+/// twin adds one row here. `rows_q8` is the optional twin of the multi-row
+/// tile `attention_flash_q8_0_rows{8,4}_d8` (same grid plus the reference's
+/// rows per block), for arches whose eager Q8 verify runs that kernel.
+struct VerifyGqaKernels {
+    module: &'static str,
+    src: &'static str,
+    tile_q8: Option<&'static str>,
+    tile_fp8: Option<&'static str>,
+    rows_q8: Option<&'static str>,
+    reduce: &'static str,
+    /// What the split count aims for; see [`VerifySplitTarget`].
+    split_target: VerifySplitTarget,
+}
+
+/// Split-count target of a VerifyAttn launch: the fixed grid is
+/// `[row_groups * n_kv_heads, splits]` and each workgroup loops over tiles
+/// `y, y + splits, ...` of its row group's live range.
+#[derive(Clone, Copy)]
+enum VerifySplitTarget {
+    /// This many workgroups (all 8 waves of a workgroup run).
+    Workgroups(usize),
+    /// This many active waves: the kernel runs one wave per query row of a
+    /// row group, so a chunk of `rows` rows has `rows * n_kv_heads` waves per
+    /// split.
+    Waves(usize),
+}
+
+const VERIFY_GQA_GFX1201: VerifyGqaKernels = VerifyGqaKernels {
+    module: "attention_verify_gqa_gfx1201",
+    src: kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC,
+    tile_q8: Some("attention_verify_gqa_q8_gfx1201"),
+    tile_fp8: Some("attention_verify_gqa_fp8_gfx1201"),
+    rows_q8: None,
+    reduce: "attention_verify_reduce_gfx1201",
+    split_target: VerifySplitTarget::Workgroups(256),
+};
+
+const VERIFY_GQA_GFX1100: VerifyGqaKernels = VerifyGqaKernels {
+    module: "attention_verify_gqa_gfx1100",
+    src: kernels::ATTENTION_VERIFY_GQA_GFX1100_SRC,
+    tile_q8: Some("attention_verify_gqa_q8_gfx1100"),
+    tile_fp8: None,
+    rows_q8: Some("attention_verify_gqa_q8_rows_gfx1100"),
+    reduce: "attention_verify_reduce_gfx1100",
+    // Measured on the XTX (B=4/16 at 8K/32K, 768..4608 waves): 4608 fastest
+    // at B=16 32K (1.283 ms vs 1.448 at 2048) and B=4 32K.
+    split_target: VerifySplitTarget::Waves(4608),
+};
+
+fn verify_gqa_kernels(gpu: &Gpu) -> Option<&'static VerifyGqaKernels> {
+    if gpu.arch_caps.is_gfx1201() {
+        Some(&VERIFY_GQA_GFX1201)
+    } else if gpu.arch_caps.is_gfx1100() {
+        Some(&VERIFY_GQA_GFX1100)
+    } else {
+        None
+    }
+}
+
+/// Which reference a VerifyAttn launch twins.
+#[derive(Clone, Copy)]
+enum VerifyGqaRef {
+    /// `attention_flash_{q8_0,fp8_e4m3}_tile_batched`.
+    Tile(VerifyKv),
+    /// `attention_flash_q8_0_rows{8,4}_d8` with this many rows per block.
+    Rows(usize),
+}
+
+/// Query rows one VerifyAttn workgroup serves (compile-time in the kernel).
+const VERIFY_GQA_ROWS: usize = 8;
+/// Largest verify block VerifyAttn admits (DFlash B <= 16, MTP K+1, ngram).
+const VERIFY_GQA_MAX_ROWS: usize = 32;
+
+/// Grid-y (split count) of a VerifyAttn launch. It depends on the context only
+/// through `max_tiles`, which under HIP-graph capture is the physical-capacity
+/// tile count, so a captured verify graph (keyed by batch size) always gets the
+/// capped value. The split count never changes output bytes.
+fn verify_gqa_splits(
+    target: VerifySplitTarget,
+    max_tiles: usize,
+    rows: usize,
+    n_kv_heads: usize,
+) -> usize {
+    let (target, per_split) = match target {
+        VerifySplitTarget::Workgroups(n) => (n, rows.div_ceil(VERIFY_GQA_ROWS) * n_kv_heads),
+        VerifySplitTarget::Waves(n) => (n, rows * n_kv_heads),
+    };
+    let cap = target.div_ceil(per_split.max(1)).max(1);
+    max_tiles.clamp(1, cap)
+}
+
+/// VerifyAttn kernel set of the gfx11 WMMA flash prefill
+/// (`attention_q8_0_flash_prefill_wmma_slots`, legacy single slot), the route
+/// every gfx1151 speculative verify takes: a context-parallel S = Q.K^T launch
+/// (f16 S tiles to scratch) and a per-16-dim-chunk online-softmax + P.V walk
+/// that writes `out` directly. Output is byte-identical to the reference; the
+/// contract is in `kernels/src/attention_verify_wmma.gfx1151.hip`.
+struct VerifyWmmaKernels {
+    module: &'static str,
+    src: &'static str,
+    qk: &'static str,
+    /// P.V walkers, indexed by [`VerifyWmmaPv`].
+    pv: [&'static str; 2],
+}
+
+const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
+    module: "attention_verify_wmma_gfx1151",
+    src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
+    qk: "attention_verify_wmma_qk_gfx1151",
+    pv: ["attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151"],
+};
+
+fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
+    if gpu.arch == "gfx1151" {
+        Some(&VERIFY_WMMA_GFX1151)
+    } else {
+        None
+    }
+}
+
+/// Query rows of one reference WMMA query tile (and of one VerifyAttn row group).
+const VERIFY_WMMA_ROWS: usize = 16;
+/// Keys per reference WMMA key tile (one f16 S tile in scratch).
+const VERIFY_WMMA_KEYS: usize = 16;
+/// f16 S tiles per (row group, kv head): the reference's 6 heads x 16 rows.
+const VERIFY_WMMA_FRAGS: usize = 6;
+
+/// P.V walker of the gfx1151 WMMA VerifyAttn twin (Halo sweep: the two that
+/// win at B 1 / 4 and at B 16, out of 24 chunk-width x softmax-split x
+/// prefetch-depth variants).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyWmmaPv {
+    /// One 16-dim chunk per workgroup, each pair's 16-key softmax step split
+    /// across the wave's two 16-lane rows, 4 tiles of loads in flight.
+    Chunk1Split4 = 0,
+    /// Two 16-dim chunks per workgroup, whole softmax step in both rows, 2
+    /// tiles of loads in flight.
+    Chunk2Whole2 = 1,
+}
+
+impl VerifyWmmaPv {
+    pub const ALL: [VerifyWmmaPv; 2] = [VerifyWmmaPv::Chunk1Split4, VerifyWmmaPv::Chunk2Whole2];
+
+    /// 16-dim chunks per workgroup.
+    fn chunks(self) -> usize {
+        match self {
+            VerifyWmmaPv::Chunk1Split4 => 1,
+            VerifyWmmaPv::Chunk2Whole2 => 2,
+        }
+    }
+}
+
+/// Launch geometry of the gfx1151 WMMA VerifyAttn twin. It never changes the
+/// output bytes (the oracle sweeps it); production uses
+/// [`VerifyWmmaGeometry::default`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyWmmaGeometry {
+    /// Pack (head, row) pairs densely into ceil(6*rows/16) WMMA fragments
+    /// instead of the reference's 6 head fragments of 16 rows.
+    pub packed: bool,
+    /// Waves the S = Q.K^T launch aims for; its split count (grid y) is this
+    /// over the waves of one split, capped by the scratch tile stride.
+    pub qk_waves: usize,
+    /// P.V walker; `None` = [`VerifyWmmaPv::Chunk2Whole2`] from 4 fragments
+    /// (row group 0 of 10+ rows) up, [`VerifyWmmaPv::Chunk1Split4`] below.
+    pub pv: Option<VerifyWmmaPv>,
+}
+
+impl Default for VerifyWmmaGeometry {
+    fn default() -> Self {
+        Self { packed: true, qk_waves: 160, pv: None }
+    }
+}
+
 /// Opt-in gate for the WMMA flash-attention prefill path.
 fn is_wmma_fa_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_WMMA_FA", false)
@@ -327,6 +531,42 @@ fn flash_rows_per_block(batch_size: usize) -> usize {
         .into_iter()
         .find(|&r| r <= batch_size)
         .unwrap_or(0)
+}
+
+#[inline]
+fn q8_multirow_arch_supported(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+}
+
+/// `head_dim` envelope of a batched flash-tile kernel, inclusive.
+///
+/// The launcher-level check (`positive multiple of 32, <= 512`) describes the
+/// q8/bf16 tile kernels only: they carry `float mq[16]` with
+/// `dpt = head_dim / 32` dims per lane. The rotated tiers are narrower, and
+/// routing a wider head through them is a silent-wrong-attention class:
+///
+/// * `asym2`/`asym4`/`fwht2`/`fwht4` index `mq[8]` / `out_vec[8]` as
+///   `half * 4 + i` with `n_halves = head_dim / 128`, so head_dim must be
+///   128 or 256 (head_dim 384/512 writes past the arrays — device stack
+///   corruption).
+/// * `asym3`/`fwht3` hardwire 8 dims per lane (`d0 = tid * 8`) over a 3-bit
+///   packing, i.e. head_dim == 256.
+/// * `asym3_tile_hd512` early-returns unless `head_dim == 512`; a mismatch
+///   leaves the reduce folding stale partials, so 512 is the only sound value.
+/// * the asym4 WMMA variants document "supports {128, 256}".
+/// * everything else keeps the generic `[32, 512]` bound.
+fn batched_tile_head_dim_envelope(tile_func_name: &str) -> (usize, usize) {
+    match tile_func_name {
+        "attention_flash_asym3_tile_batched" | "attention_flash_fwht3_tile_batched" => (256, 256),
+        "attention_flash_asym3_tile_hd512_batched" => (512, 512),
+        "attention_flash_asym2_tile_batched"
+        | "attention_flash_asym4_tile_batched"
+        | "attention_flash_fwht2_tile_batched"
+        | "attention_flash_fwht4_tile_batched"
+        | "attention_flash_asym4_wmma_tile_batched"
+        | "attention_flash_asym4_wmma_tile_batched_gfx12" => (128, 256),
+        _ => (32, 512),
+    }
 }
 
 impl Gpu {
@@ -1717,6 +1957,32 @@ impl Gpu {
         }
     }
 
+    /// Load descriptor kernel `symbol` from `body` and return the function to
+    /// launch. Descriptor-less launches (every default route) get the default
+    /// module: legacy 24-byte descriptor header, module name `symbol`, source
+    /// bytes, JIT cache key and code object all unchanged from before paging.
+    /// Launches with real slot descriptors (the multi-slot engine) get the
+    /// paged module: the 32-byte block-table header and the kernel renamed to
+    /// `paged_symbol` (see `kernels::kv_slot_desc_paged_source`).
+    pub(crate) fn ensure_kv_slot_kernel(
+        &mut self,
+        symbol: &'static str,
+        paged_symbol: &'static str,
+        body: &str,
+        paged: bool,
+    ) -> HipResult<&'static str> {
+        let func = if paged { paged_symbol } else { symbol };
+        if !self.functions.contains_key(func) {
+            let src = if paged {
+                kernels::kv_slot_desc_paged_source(body, symbol, paged_symbol)
+            } else {
+                kernels::kv_slot_desc_source(body, false)
+            };
+            self.ensure_kernel(func, &src, func)?;
+        }
+        Ok(func)
+    }
+
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
     ///
     /// `slot_descs` / `row_slot`: when both `Some`, `row_slot[b]` selects the
@@ -1735,6 +2001,7 @@ impl Gpu {
         batch_size: usize,
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        use_v_base: bool,
     ) -> HipResult<()> {
         assert_eq!(
             slot_descs.is_some(),
@@ -1744,28 +2011,23 @@ impl Gpu {
              sequence's KV into slot 0's slab."
         );
         self.bind_thread()?;
-        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
-        // compile happens in a cache dir with no -I to kernels/src. Strip the
-        // directive and prepend the header body instead (same pattern as
-        // attention_q8_0_kv_batched_masked_slots). Guarded behind the
-        // functions cache check so the format!/replace allocation only runs
-        // once, not on every launch of this hot path.
-        if !self.functions.contains_key("kv_cache_write_q8_0_batched") {
-            let stripped =
-                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
-            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel(
-                "kv_cache_write_q8_0_batched",
-                &src,
-                "kv_cache_write_q8_0_batched",
-            )?;
-        }
+        // Descriptor launches (the slot engine) run the paged module, which
+        // also takes `use_v_base`; descriptor-less launches run the default
+        // module, unchanged from before paging.
+        let paged = slot_descs.is_some();
+        let func = self.ensure_kv_slot_kernel(
+            "kv_cache_write_q8_0_batched",
+            "kv_cache_write_q8_0_batched_paged",
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            paged,
+        )?;
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut vb = use_v_base as i32;
         let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
             Some(t) => t.buf.as_ptr(),
             None => std::ptr::null_mut(),
@@ -1784,11 +2046,14 @@ impl Gpu {
             &mut desc_ptr as *mut _ as *mut c_void,
             &mut rs_ptr as *mut _ as *mut c_void,
         ];
+        if paged {
+            params.push(&mut vb as *mut _ as *mut c_void);
+        }
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let desc_raw = desc_ptr; // alias for move into closure
         let rs_raw = rs_ptr; // alias for move into closure
         self.launch_maybe_blob(
-            "kv_cache_write_q8_0_batched",
+            func,
             [total_blocks, batch_size as u32, 1],
             [32, 1, 1],
             0,
@@ -1803,6 +2068,9 @@ impl Gpu {
                 b.push_i32(bs);
                 b.push_ptr(desc_raw);
                 b.push_ptr(rs_raw);
+                if paged {
+                    b.push_i32(vb);
+                }
                 b
             },
         )
@@ -1822,6 +2090,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.kv_cache_write_q8_0_batched_slots(
             dst, src, positions, n_kv_heads, head_dim, batch_size, None, None,
+            /*use_v_base=*/ false,
         )
     }
     /// Batched native fp8-E4M3 KV write (F slice, gfx1201-only): one wave per
@@ -1841,7 +2110,10 @@ impl Gpu {
         self.bind_thread()?;
         let row = fp8_e4m3_row_bytes(n_kv_heads, head_dim);
         check_native_kv_capacity(dst, 1, row, "kv_cache_write_fp8_e4m3_batched")?;
-        if !self.functions.contains_key("kv_cache_write_fp8_e4m3_batched") {
+        if !self
+            .functions
+            .contains_key("kv_cache_write_fp8_e4m3_batched")
+        {
             let stripped = kernels::KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC
                 .replace("#include \"kv_slot_desc.h\"", "");
             let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
@@ -1865,8 +2137,8 @@ impl Gpu {
             &hd as *const _ as *mut c_void,
             &bs as *const _ as *mut c_void,
         ];
-        let bytes = crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim)
-            * batch_size;
+        let bytes =
+            crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "kv_write",
@@ -2219,7 +2491,6 @@ impl Gpu {
             },
         )
     }
-
     /// Flat BF16 KV write for single-token decode. Launched twice by the
     /// caller (once for K, once for V), exactly like `kv_cache_write_q8_0`.
     ///
@@ -2304,20 +2575,13 @@ impl Gpu {
              sequence's KV into slot 0's slab."
         );
         self.bind_thread()?;
-        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
-        // compile happens in a cache dir with no -I to kernels/src. Strip the
-        // directive and prepend the header body, same as the Q8 sibling.
-        // Guarded on the functions cache so the format!/replace runs once.
-        if !self.functions.contains_key("kv_cache_write_bf16_batched") {
-            let stripped =
-                kernels::KV_CACHE_WRITE_BF16_SRC.replace("#include \"kv_slot_desc.h\"", "");
-            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel(
-                "kv_cache_write_bf16_batched",
-                &src,
-                "kv_cache_write_bf16_batched",
-            )?;
-        }
+        // Descriptor launches run the paged module (see ensure_kv_slot_kernel).
+        let func = self.ensure_kv_slot_kernel(
+            "kv_cache_write_bf16_batched",
+            "kv_cache_write_bf16_batched_paged",
+            kernels::KV_CACHE_WRITE_BF16_SRC,
+            slot_descs.is_some(),
+        )?;
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
@@ -2346,7 +2610,137 @@ impl Gpu {
         let desc_raw = desc_ptr;
         let rs_raw = rs_ptr;
         self.launch_maybe_blob(
-            "kv_cache_write_bf16_batched",
+            func,
+            [grid, batch_size as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
+                b
+            },
+        )
+    }
+
+    /// Flat F16 (IEEE fp16) KV write for single-token decode. Launched twice
+    /// by the caller (once for K, once for V), exactly like
+    /// `kv_cache_write_bf16` — identical flat layout, only the dtype
+    /// conversion differs.
+    pub fn kv_cache_write_f16(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // The decode and batched entry points share ONE translation unit, and
+        // that file `#include`s kv_slot_desc.h for the batched one. Same
+        // strip-and-prepend handling as the bf16 wrapper.
+        if !self.functions.contains_key("kv_cache_write_f16") {
+            let stripped =
+                kernels::KV_CACHE_WRITE_F16_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel("kv_cache_write_f16", &src, "kv_cache_write_f16")?;
+        }
+        let d = dst.buf.as_ptr();
+        let s = src.buf.as_ptr();
+        let p = pos_buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &d as *const _ as *mut c_void,
+            &s as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let grid = (n_kv_heads * head_dim).div_ceil(64) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_f16",
+            [grid, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        )
+    }
+
+    /// Flat F16 KV write for batched prefill. `slot_descs`/`row_slot` are
+    /// both-or-neither — same contract as `kv_cache_write_bf16_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_f16_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_f16_batched: slot_descs and row_slot are both-or-neither. \
+             Passing only slot_descs silently pins every row to slot 0, writing every \
+             sequence's KV into slot 0's slab."
+        );
+        self.bind_thread()?;
+        // Descriptor launches run the paged module (see ensure_kv_slot_kernel).
+        let func = self.ensure_kv_slot_kernel(
+            "kv_cache_write_f16_batched",
+            "kv_cache_write_f16_batched_paged",
+            kernels::KV_CACHE_WRITE_F16_SRC,
+            slot_descs.is_some(),
+        )?;
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
+        ];
+        let grid = (n_kv_heads * head_dim).div_ceil(64) as u32;
+        let desc_raw = desc_ptr;
+        let rs_raw = rs_ptr;
+        self.launch_maybe_blob(
+            func,
             [grid, batch_size as u32, 1],
             [64, 1, 1],
             0,
@@ -2422,6 +2816,13 @@ impl Gpu {
         )
     }
 
+    /// Multi-slot variant of
+    /// [`Self::attention_flash_bf16_batched_masked_windowed`] — the bf16
+    /// tile kernel is descriptor-aware (it is one of the two kernels the
+    /// original SP1 descriptor port landed on), so this only threads the
+    /// arguments through the shared launcher.
+    #[allow(clippy::too_many_arguments)]
+
     /// Sliding-window flash attention over flat BF16 KV — tile + reduce, the
     /// decode sibling of `attention_flash_bf16_batched_masked_windowed`.
     ///
@@ -2446,6 +2847,18 @@ impl Gpu {
         window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // The bf16 tile kernel maps head-dim elements in fixed 128-element
+        // halves (Q load, phase A and phase D all index `half * 128 + ...`);
+        // a head_dim that is not a positive multiple of 128 would read past
+        // q/k and trample the NEXT tile's partials header — silent attention
+        // corruption, so fail loudly instead. (Inherited contract from the
+        // q8 tile kernel; maple is head_dim 128 today.)
+        assert!(
+            head_dim > 0 && head_dim % 128 == 0,
+            "attention_flash_bf16_windowed: the bf16 tile kernel requires \
+             head_dim to be a positive multiple of 128 (got {head_dim}); \
+             pick a KV tier whose kernels match this head_dim"
+        );
         // Same tile-size policy as the Q8 path, so a partials buffer sized
         // from max_tiles stays correct whichever tier the caller picked.
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
@@ -2465,6 +2878,260 @@ impl Gpu {
         {
             const KERNEL: &str = "attention_flash_bf16_tile";
             self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_BF16_TILE_SRC, KERNEL)?;
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let nh = n_heads as i32;
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let ms = max_seq as i32;
+            let sc = scale;
+            let ts = tile_size as i32;
+            let wn = window;
+            let grid = [n_heads as u32, launch_tiles as u32, 1];
+            let shared = ((tile_size + head_dim) * 4) as u32;
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &wn as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob_position_grid(
+                KERNEL,
+                grid,
+                [32, 1, 1],
+                shared,
+                &mut params,
+                1,
+                1,
+                tile_size as u32,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(wn);
+                    b
+                },
+            )?;
+        }
+
+        // ── Reduce kernel (shared with Q8; reads seq_len from pos_buf) ──
+        {
+            const KERNEL: &str = "attention_flash_q8_0_reduce";
+            self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr();
+            let ts = tile_size as i32;
+            let mt = max_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                KERNEL,
+                [n_heads as u32, 1, 1],
+                [256, 1, 1],
+                (max_tiles * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Batched sliding-window flash attention over flat F16 (IEEE fp16) KV.
+    /// Same shared dispatcher and batched reduce as the bf16 path — only the
+    /// tile kernel differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_f16_batched_masked_windowed(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_f16_tile_batched",
+            kernels::ATTENTION_FLASH_F16_TILE_BATCHED_SRC,
+            "attention_flash_f16_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            // Consumed-but-unused by the f16 tile (there is no separate V
+            // tier); V_MODE_Q8 keeps the kernarg blob shape identical.
+            V_MODE_Q8,
+            window,
+            /*force_wmma_grid=*/ false,
+            None,
+            None,
+        )
+    }
+
+    /// Multi-slot variant of
+    /// [`Self::attention_flash_f16_batched_masked_windowed`] — the f16 tile
+    /// kernel is descriptor-aware (cloned from the bf16 descriptor port), so
+    /// this only threads the arguments through the shared launcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_f16_batched_masked_windowed_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        window: i32,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_f16_tile_batched",
+            kernels::ATTENTION_FLASH_F16_TILE_BATCHED_SRC,
+            "attention_flash_f16_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            window,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
+    /// Sliding-window flash attention over flat F16 KV — tile + reduce, the
+    /// decode sibling of `attention_flash_f16_batched_masked_windowed`.
+    /// Shares `attention_flash_q8_0_reduce` unchanged (f32 partials only).
+    /// `window <= 0` means full causal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_f16_windowed(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Same fixed-128-element-half contract as the bf16 tile: a head_dim
+        // that is not a positive multiple of 128 would read past q/k and
+        // trample the NEXT tile's partials header — fail loudly.
+        assert!(
+            head_dim > 0 && head_dim % 128 == 0,
+            "attention_flash_f16_windowed: the f16 tile kernel requires \
+             head_dim to be a positive multiple of 128 (got {head_dim}); \
+             pick a KV tier whose kernels match this head_dim"
+        );
+        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
+        let max_tiles = max_seq.div_ceil(tile_size);
+        let actual_tiles = seq_len_hint.div_ceil(tile_size);
+        let launch_tiles = replay_stable_tile_count(
+            actual_tiles,
+            max_tiles,
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        );
+
+        // ── Tile kernel ──
+        {
+            const KERNEL: &str = "attention_flash_f16_tile";
+            self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_F16_TILE_SRC, KERNEL)?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let q_ptr = q.buf.as_ptr();
             let k_ptr = k_cache.buf.as_ptr();
@@ -2737,18 +3404,12 @@ impl Gpu {
         // compile happens in a cache dir with no -I to kernels/src. Strip the
         // directive and prepend the header body instead (same pattern as
         // ensure_givens4_kernel's turbo_common/givens_common handling).
-        if !self.functions.contains_key("attention_q8_0_kv_batched") {
-            let attn_q8_batched_src = {
-                let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                    .replace("#include \"kv_slot_desc.h\"", "");
-                format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-            };
-            self.ensure_kernel(
-                "attention_q8_0_kv_batched",
-                &attn_q8_batched_src,
-                "attention_q8_0_kv_batched",
-            )?;
-        }
+        let func = self.ensure_kv_slot_kernel(
+            "attention_q8_0_kv_batched",
+            "attention_q8_0_kv_batched_paged",
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            slot_descs.is_some(),
+        )?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -2807,7 +3468,7 @@ impl Gpu {
         let desc_raw = desc_ptr; // alias for move into closure
         let rs_raw = rs_ptr; // alias for move into closure
         let result = self.launch_maybe_blob(
-            "attention_q8_0_kv_batched",
+            func,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -3607,15 +4268,29 @@ impl Gpu {
         // compile happens in a cache dir with no -I to kernels/src. Strip the
         // directive and prepend the header body instead (same pattern as
         // ensure_givens4_kernel's turbo_common/givens_common handling).
-        if !self.functions.contains_key("attention_q8_0_flash_prefill") {
-            let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
+        // Descriptor launches (the slot engine) compile the paged module, the
+        // kernel renamed to `attention_q8_0_flash_prefill_paged`; the default
+        // module's source and code object are unchanged from before paging.
+        let func = if multi_slot {
+            "attention_q8_0_flash_prefill_paged"
+        } else {
+            "attention_q8_0_flash_prefill"
+        };
+        if !self.functions.contains_key(func) {
             let src = format!(
-                "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}\n{}",
-                kernels::KV_SLOT_DESC_H,
-                stripped
+                "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}",
+                if multi_slot {
+                    kernels::kv_slot_desc_paged_source(
+                        kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC,
+                        "attention_q8_0_flash_prefill",
+                        func,
+                    )
+                } else {
+                    kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC, false)
+                }
             );
-            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill")?;
+            let module = if multi_slot { format!("{module}_paged") } else { module };
+            self.ensure_kernel(&module, &src, func)?;
         }
 
         let bph = head_dim / 32;
@@ -3676,12 +4351,20 @@ impl Gpu {
         // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
         // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer =
-            crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_flash_prefill", bytes);
-        let result = self.launch_maybe_blob(
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
             "attention_q8_0_flash_prefill",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            func,
             [grid_x, n_heads as u32, 1],
             [NTHREADS as u32, 1, 1],
             lds as u32,
@@ -3711,6 +4394,31 @@ impl Gpu {
         result
     }
 
+    /// Largest `max_ctx_len` (max(positions)+1) the gfx11 FA2 prefill
+    /// ingresses and launchers accept on this GPU.
+    ///
+    /// Exact gfx1100 and gfx1151 take the model's 262144 positions. The FA2
+    /// bodies (`attention_q8_0_fa2_gqa.gfx11.hip`, `.gfx1151.hip`, and the
+    /// fwht3-K build of the former) never read the context: they walk KT32
+    /// tiles up to `max(positions)+1`, K/V row offsets are 64-bit, LDS is a
+    /// fixed 32 KiB and the grid is `(ceil(batch/16 or 8), 4)`. The former
+    /// 32768 ceiling sent every longer prefill segment to the query-tiled
+    /// `_wmma_slots` kernel. Other gfx11 atoms keep 32768 until measured.
+    pub fn fa2_gfx11_max_ctx(&self) -> usize {
+        if matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            262_144
+        } else {
+            32_768
+        }
+    }
+
+    /// Context admission shared by every gfx11 FA2 prefill ingress (dispatch
+    /// Q8/fwht3 arms, the wide Q8 route, the qwen35 whole-chunk and F2 pair
+    /// envelopes): `64..=`[`Self::fa2_gfx11_max_ctx`].
+    pub fn fa2_gfx11_ctx_admitted(&self, max_ctx_len: usize) -> bool {
+        (64..=self.fa2_gfx11_max_ctx()).contains(&max_ctx_len)
+    }
+
     /// Batch sizes the gfx11 FA2 prefill ingress accepts on this GPU.
     ///
     /// F2 N1024 pair envelope: exactly 1024 is admitted on exact gfx1151
@@ -3724,6 +4432,66 @@ impl Gpu {
         } else {
             (64..=512).contains(&batch_size)
         }
+    }
+
+    /// Whether the default gfx1201 Q8 FA2 prefill arm of
+    /// [`Self::attention_q8_0_flash_prefill_wmma`] takes this call (exact
+    /// arch/shape gates). Dispatch asks the same question before it routes
+    /// long-context prefill here, so the two never drift.
+    ///
+    /// Context is bounded by the model's 262144 positions
+    /// ([`GFX12_Q8_FA2_MAX_CTX`]), not by the body: it walks KT64 tiles up to
+    /// `max(positions) + 1` with 64-bit K/V row offsets and never reads
+    /// `max_ctx_len`. The former 32768 ceiling sent every longer prefill to
+    /// the tiled partials+reduce kernel (R9700 H2 at 65K: 299.3 s vs 56.8 s).
+    ///
+    /// hipGraph capture: a captured call takes FA2 whenever the launcher can
+    /// run without allocating ([`Self::gfx12_q8_fa2_capture_ready`]), at every
+    /// context, so a warmed capture replays the eager call's bytes. A cold
+    /// capture keeps the incumbent (query16 at or below 32K, the tiled
+    /// partials+reduce kernel above). The launcher was never capture-unsafe:
+    /// Q is pre-converted into Gpu-owned scratch and never mutated (F4b), and
+    /// both launches go through `launch_maybe_blob` with owned kernarg blobs.
+    /// The old eager-only gate dates from the research opt-in, before F4b.
+    pub fn gfx12_q8_fa2_prefill_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        max_ctx_len: usize,
+    ) -> bool {
+        self.flags.gfx12_fa2_prefill
+            && self.arch == "gfx1201"
+            && !self.replay.is_recording()
+            && (!self.graphs.capture_mode || self.gfx12_q8_fa2_capture_ready(batch_size))
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+            && (64..=512).contains(&batch_size)
+            // At or below 32K a batch that is not a whole number of 16-row
+            // tiles keeps dispatch's query16 kernel (unchanged envelope).
+            // Above it the only alternative is the tiled kernel, which runs
+            // such a chunk tail as one 16-row launch after another, each
+            // scanning the whole context (2.5 s of a 49K H2 prefill); the
+            // body guards partial 8-row query tiles, so FA2 takes it.
+            && (batch_size % 16 == 0 || max_ctx_len > GFX12_QUERY16_MAX_CTX)
+            && (64..=GFX12_Q8_FA2_MAX_CTX).contains(&max_ctx_len)
+    }
+
+    /// Whether [`Self::attention_q8_0_fa2_gqa_gfx1201`] can run inside a
+    /// hipGraph capture: its module is already loaded (no JIT) and its f16 Q
+    /// scratch already holds `batch_size` H24/D256 rows (no growth, which
+    /// would synchronize, free and malloc mid-capture). A cold capture keeps
+    /// the incumbent route instead of failing the capture.
+    fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
+        self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
+            && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
+            && !crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                batch_size * 24 * 256 * 2,
+            )
     }
 
     /// True when a Composable-Kernel FA library is loaded in this process.
@@ -3773,35 +4541,48 @@ impl Gpu {
             && head_dim == 256
             && (64..=8192).contains(&batch_size)
             && (batch_size <= 512 || batch_size % 512 == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
-        // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
-        // eager gates; everything else falls through to the byte-identical
-        // incumbent path below. Never inside `_wmma_slots` (its all-or-none
-        // slot ABI is unchanged) and never under replay/graph capture.
+        // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape gates
+        // (`gfx12_q8_fa2_prefill_admitted`); everything else falls through to
+        // the byte-identical incumbent path below. Never inside `_wmma_slots`
+        // (its all-or-none slot ABI is unchanged) and never under replay
+        // recording; under graph capture once warmed.
         // Opt out with `HIPFIRE_GFX12_FA2_PREFILL=0`.
-        if self.flags.gfx12_fa2_prefill
-            && self.arch == "gfx1201"
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-            && n_heads == 24
-            && n_kv_heads == 4
-            && head_dim == 256
-            && (64..=512).contains(&batch_size)
-            && batch_size % 16 == 0
-            && (64..=32768).contains(&max_ctx_len)
-        {
+        if self.gfx12_q8_fa2_prefill_admitted(
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            max_ctx_len,
+        ) {
             // q8 cache always runs the f16 FA2 body: stage-b route-Q
             // arithmetic does not exist (B4 pending), so there is nothing to
             // select here.
             return self.attention_q8_0_fa2_gqa_gfx1201(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
         // Default-on: gfx11 (RDNA3) GQA-fused FA2 prefill. Exact
@@ -3822,16 +4603,36 @@ impl Gpu {
             && n_kv_heads == 4
             && head_dim == 256
             && self.fa2_gfx11_batch_admitted(batch_size)
-            && (64..=32768).contains(&max_ctx_len)
+            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
-            batch_size, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -3947,20 +4748,30 @@ impl Gpu {
         // attention_q8_0_flash_prefill_slots and ensure_givens4_kernel). The
         // module name varies by variant but the loaded function name does
         // not, so gate on that — mirrors the scalar port's guard.
-        if !self
-            .functions
-            .contains_key("attention_q8_0_flash_prefill_wmma")
-        {
-            let stripped = kernel_src.replace("#include \"kv_slot_desc.h\"", "");
+        // Descriptor launches compile the paged module (see the scalar port).
+        let func = if multi_slot {
+            "attention_q8_0_flash_prefill_wmma_paged"
+        } else {
+            "attention_q8_0_flash_prefill_wmma"
+        };
+        if !self.functions.contains_key(func) {
             let src = format!(
-                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}\n{}",
+                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
                 split_q as u32,
                 fixed_hd,
                 prefetch_v as u32,
-                kernels::KV_SLOT_DESC_H,
-                stripped
+                if multi_slot {
+                    kernels::kv_slot_desc_paged_source(
+                        kernel_src,
+                        "attention_q8_0_flash_prefill_wmma",
+                        func,
+                    )
+                } else {
+                    kernels::kv_slot_desc_source(kernel_src, false)
+                }
             );
-            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+            let module = if multi_slot { format!("{module}_paged") } else { module };
+            self.ensure_kernel(&module, &src, func)?;
         }
         const M_TILE: usize = 16;
         const N_TILE: usize = 16;
@@ -4030,7 +4841,11 @@ impl Gpu {
         // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
         // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -4039,7 +4854,7 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "attention_q8_0_flash_prefill_wmma",
+            func,
             [grid_x, n_heads as u32, 1],
             [32, 1, 1],
             lds as u32,
@@ -4124,11 +4939,11 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > GFX12_Q8_FA2_MAX_CTX {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= max_ctx_len <= {GFX12_Q8_FA2_MAX_CTX}, got {max_ctx_len}"
                 ),
             ));
         }
@@ -4172,7 +4987,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -4201,14 +5018,13 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            symbol,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
         // the body against the scratch. Both via launch_maybe_blob so graph
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
@@ -4353,7 +5169,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -4382,14 +5200,13 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
         // the body against the scratch. Both via launch_maybe_blob so graph
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
@@ -4521,8 +5338,7 @@ impl Gpu {
         // Stage-b scratch: e4m3 codes + f32 sq + route-Q scale plane
         // (n_heads/head_dim validated H24/D256 above), Gpu-owned,
         // grows-never-shrinks. Direct launch: one split.
-        let (need_fp8_bytes, sq_off, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, true);
+        let (need_fp8_bytes, sq_off, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, true);
         // Same pre-growth invalidation contract as the f16 FA2 scratch:
         // the body reads this scratch from the captured graph's kernargs.
         if crate::scratch::scratch_will_grow(
@@ -4564,26 +5380,19 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // Stage-b pre-convert f32 Q -> e4m3 codes + f32 sq on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid. The blob ABI
         // below is the frozen contract (codes reuse the old f32 Q slot:
         // same offset 0, same size).
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
+        self.launch_fa2_q_preconvert_fp8(PRECONVERT, q.buf.as_ptr(), q8_ptr, sq_ptr, batch_size)?;
         // Stage-b arms use exactly 32768 B dynamic LDS (fp8 planes); keyed
         // off the arm, not the flag — the f16 arms above keep 65536.
         let result = self.launch_maybe_blob(
@@ -4702,8 +5511,7 @@ impl Gpu {
         // Stage-b scratch: e4m3 codes + f32 sq, no scale plane (route N
         // reads scales from the native row header), Gpu-owned,
         // grows-never-shrinks. Direct launch: one split.
-        let (need_fp8_bytes, sq_off, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        let (need_fp8_bytes, sq_off, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         // Same pre-growth invalidation contract as the f16 FA2 scratch.
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
@@ -4744,24 +5552,17 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // Stage-b pre-convert f32 Q -> e4m3 codes + f32 sq on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid.
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
+        self.launch_fa2_q_preconvert_fp8(PRECONVERT, q.buf.as_ptr(), q8_ptr, sq_ptr, batch_size)?;
         // Stage-b arms use exactly 32768 B dynamic LDS (fp8 planes); the
         // Q0 arm keeps 65536.
         let result = self.launch_maybe_blob(
@@ -4872,8 +5673,7 @@ impl Gpu {
         if !self.functions.contains_key(SYMBOL) {
             self.ensure_kernel(SYMBOL, src, SYMBOL)?;
         }
-        let (need_fp8_bytes, _, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        let (need_fp8_bytes, _, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
             self.scratch.fa2_fp8_q_scratch.is_some(),
@@ -4913,14 +5713,13 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // Packet arms use exactly 49408 B dynamic LDS (paired planes +
         // transpose scratch + shared scale headers); block 256.
         let result = self.launch_maybe_blob(
@@ -5037,10 +5836,11 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if q.dtype != crate::DType::Raw
-            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
-        {
-            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        if q.dtype != crate::DType::Raw || q.buf.size() < batch_size * n_heads * (head_dim + 4) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Q8 resident attention requires Raw codes and scales",
+            ));
         }
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
@@ -5135,9 +5935,7 @@ impl Gpu {
         if max_ctx_len == 0 || max_ctx_len > 262_144 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{symbol} requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"
-                ),
+                &format!("{symbol} requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"),
             ));
         }
         let need_qo = batch_size * n_heads * head_dim;
@@ -5216,7 +6014,11 @@ impl Gpu {
             params.insert(1, &mut q_scales as *mut _ as *mut c_void);
         }
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
         let result = self.launch_maybe_blob(
@@ -5276,8 +6078,8 @@ impl Gpu {
         n_splits: usize,
     ) -> HipResult<()> {
         self.stageb_split_impl(
-            q, k_cache, v_cache, out, positions, partials, n_heads,
-            n_kv_heads, head_dim, batch_size, n_splits, false,
+            q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, n_splits, false,
         )
     }
     /// Benchmark/oracle-only split-KV packet path (S partitions + stable
@@ -5302,8 +6104,8 @@ impl Gpu {
         n_splits: usize,
     ) -> HipResult<()> {
         self.stageb_split_impl(
-            q, k_cache, v_cache, out, positions, partials, n_heads,
-            n_kv_heads, head_dim, batch_size, n_splits, true,
+            q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, n_splits, true,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -5323,11 +6125,18 @@ impl Gpu {
         packet: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tag = if packet { "packet_split" } else { "stageb_split" };
+        let tag = if packet {
+            "packet_split"
+        } else {
+            "stageb_split"
+        };
         if self.arch != "gfx1201" {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires gfx1201, got {}", self.arch),
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires gfx1201, got {}",
+                    self.arch
+                ),
             ));
         }
         if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
@@ -5394,8 +6203,7 @@ impl Gpu {
             self.ensure_kernel(merge, src, merge)?;
         }
         // Stage-b scratch: e4m3 codes + f32 sq (same contract as direct).
-        let (need_fp8_bytes, sq_off, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        let (need_fp8_bytes, sq_off, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
             self.scratch.fa2_fp8_q_scratch.is_some(),
@@ -5438,13 +6246,7 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut ns as *mut _ as *mut c_void,
         ];
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
+        self.launch_fa2_q_preconvert_fp8(PRECONVERT, q.buf.as_ptr(), q8_ptr, sq_ptr, batch_size)?;
         self.launch_maybe_blob(
             partial,
             [grid_x, 4, n_splits as u32],
@@ -5483,16 +6285,23 @@ impl Gpu {
         ];
         let n_rec = batch_size * n_heads;
         let merge_grid_x = n_rec.div_ceil(8) as u32;
-        self.launch_maybe_blob(merge, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(pp_ptr);
-            b.push_ptr(o_ptr);
-            b.push_i32(mbs);
-            b.push_i32(mnh);
-            b.push_i32(mhd);
-            b.push_i32(mns);
-            b
-        })
+        self.launch_maybe_blob(
+            merge,
+            [merge_grid_x, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut mparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(mbs);
+                b.push_i32(mnh);
+                b.push_i32(mhd);
+                b.push_i32(mns);
+                b
+            },
+        )
     }
 
     /// Stage-b on-device Q pre-convert shared by the FA2 stage-b launchers.
@@ -5659,7 +6468,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -5688,14 +6499,13 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            symbol,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
         // F4b: pre-convert (rotation fused) f32 Q -> f16 scratch on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid. The body blob ABI
@@ -5867,11 +6677,12 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
                 ),
             ));
         }
@@ -5995,7 +6806,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(if q16_tile { 16 } else { 8 }) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -6024,7 +6837,11 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(&self.hip, "attention", module, bytes);
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
@@ -6130,11 +6947,12 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
                 ),
             ));
         }
@@ -6189,7 +7007,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -6218,7 +7038,11 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -6358,7 +7182,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -6436,16 +7262,23 @@ impl Gpu {
         ];
         let n_rec = batch_size * n_heads;
         let merge_grid_x = n_rec.div_ceil(8) as u32;
-        self.launch_maybe_blob(merge, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(pp_ptr);
-            b.push_ptr(o_ptr);
-            b.push_i32(mbs);
-            b.push_i32(mnh);
-            b.push_i32(mhd);
-            b.push_i32(mns);
-            b
-        })
+        self.launch_maybe_blob(
+            merge,
+            [merge_grid_x, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut mparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(mbs);
+                b.push_i32(mnh);
+                b.push_i32(mhd);
+                b.push_i32(mns);
+                b
+            },
+        )
     }
 
     /// Benchmark-only direct call to the preserved incumbent Q8 WMMA flash
@@ -6467,8 +7300,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
-            batch_size, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -6907,6 +7752,441 @@ impl Gpu {
         })
     }
 
+    /// VerifyAttn: run a batched flash tile + reduce of `batch_size <= 32`
+    /// query rows through the GQA-shared split-K twin pair
+    /// ([`VerifyGqaKernels`]). `Ok(false)` = not admitted; the caller runs its
+    /// unchanged reference launch. Output and `partials` are byte-identical to
+    /// `attention_flash_{q8_0,fp8_e4m3}_tile_batched` +
+    /// `attention_flash_asym_reduce_batched` with the same arguments, so the
+    /// callers intercept unconditionally (DFlash / MTP / ngram verify, short
+    /// prefill tails). Admission: exact table arch, `kernel.verify_attn`,
+    /// head_dim 256, GQA group 6, tile 128, non-tree full causal legacy-slot
+    /// KV, not recording a Redline tape, partials fit one row. The grid is
+    /// `[ceil(rows/8) * n_kv_heads, splits]` with the tile range derived from
+    /// `positions` on the device, so it is graph-capture-stable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_verify_gqa(
+        &mut self,
+        kv: VerifyKv,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_cols: usize,
+    ) -> HipResult<bool> {
+        if tree_bias.is_some() || block_cols != 0 {
+            return Ok(false);
+        }
+        self.launch_verify_gqa(
+            VerifyGqaRef::Tile(kv),
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+        )
+    }
+
+    /// VerifyAttn twin of the multi-row Q8 tile + reduce
+    /// ([`Self::attention_flash_q8_0_rows_masked`] with `rows_per_block` rows
+    /// per block): byte-identical partials and output on arches with a
+    /// `rows_q8` table entry, same admission as
+    /// [`Self::try_attention_verify_gqa`]. `Ok(false)` = not admitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_verify_gqa_rows(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        rows_per_block: usize,
+    ) -> HipResult<bool> {
+        if !matches!(rows_per_block, 4 | 8) {
+            return Ok(false);
+        }
+        self.launch_verify_gqa(
+            VerifyGqaRef::Rows(rows_per_block),
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_verify_gqa(
+        &mut self,
+        reference: VerifyGqaRef,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.flags.verify_attn || self.replay.is_recording() {
+            return Ok(false);
+        }
+        let Some(set) = verify_gqa_kernels(self) else {
+            return Ok(false);
+        };
+        let (tile_func, group_rows) = match reference {
+            VerifyGqaRef::Tile(VerifyKv::Q8) => (set.tile_q8, None),
+            VerifyGqaRef::Tile(VerifyKv::Fp8) => (set.tile_fp8, None),
+            VerifyGqaRef::Rows(rows) => (set.rows_q8, Some(rows as i32)),
+        };
+        let Some(tile_func) = tile_func else {
+            return Ok(false);
+        };
+        let tile_size = self.attn_tile_size();
+        if head_dim != 256
+            || n_kv_heads == 0
+            || n_heads != 6 * n_kv_heads
+            || tile_size != 128
+            || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
+            || max_ctx_len == 0
+        {
+            return Ok(false);
+        }
+        let max_tiles = max_ctx_len.div_ceil(tile_size);
+        let stride = 2 + head_dim;
+        let partials_bytes_per_row = n_heads * max_tiles * stride * 4;
+        let partials_capacity = partials.numel() * 4;
+        if partials_capacity < partials_bytes_per_row {
+            return Ok(false);
+        }
+        // Same sub-batching as `launch_asym_flash_batched` and the multi-row
+        // launcher, so chunk-local partial rows land where the reference
+        // writes them.
+        let sub_batch = (partials_capacity / partials_bytes_per_row).min(batch_size);
+
+        self.ensure_kernel(set.module, set.src, tile_func)?;
+        self.ensure_kernel(set.module, set.src, set.reduce)?;
+
+        let q_dim = n_heads * head_dim;
+        // The multi-row reference carries scores in log2 space.
+        let scale = match reference {
+            VerifyGqaRef::Tile(_) => 1.0f32 / (head_dim as f32).sqrt(),
+            VerifyGqaRef::Rows(_) => std::f32::consts::LOG2_E / (head_dim as f32).sqrt(),
+        };
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+            let row_groups = chunk.div_ceil(VERIFY_GQA_ROWS);
+            let splits = verify_gqa_splits(set.split_target, max_tiles, chunk, n_kv_heads);
+            {
+                let q_ptr =
+                    unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let k_ptr = k_cache.buf.as_ptr();
+                let v_ptr = v_cache.buf.as_ptr();
+                let p_ptr = partials.buf.as_ptr();
+                let pos_ptr = positions.buf.as_ptr();
+                let nr = chunk as i32;
+                let nkv = n_kv_heads as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let sc = scale;
+                let gr = group_rows.unwrap_or(0);
+                let mut params: Vec<*mut c_void> = vec![
+                    &q_ptr as *const _ as *mut c_void,
+                    &k_ptr as *const _ as *mut c_void,
+                    &v_ptr as *const _ as *mut c_void,
+                    &p_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nr as *const _ as *mut c_void,
+                    &nkv as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &sc as *const _ as *mut c_void,
+                ];
+                if group_rows.is_some() {
+                    params.push(&gr as *const _ as *mut c_void);
+                }
+                self.launch_maybe_blob(
+                    tile_func,
+                    [(row_groups * n_kv_heads) as u32, splits as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(q_ptr);
+                        b.push_ptr(k_ptr);
+                        b.push_ptr(v_ptr);
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nr);
+                        b.push_i32(nkv);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b.push_f32(sc);
+                        if group_rows.is_some() {
+                            b.push_i32(gr);
+                        }
+                        b
+                    },
+                )?;
+            }
+            {
+                let p_ptr = partials.buf.as_ptr();
+                let o_ptr =
+                    unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let pos_ptr = positions.buf.as_ptr();
+                let nh = n_heads as i32;
+                let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    set.reduce,
+                    [n_heads as u32, chunk as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr);
+                        b.push_ptr(o_ptr);
+                        b.push_ptr(pos_ptr);
+                        b.push_i32(nh);
+                        b.push_i32(mt);
+                        b.push_i32(bo);
+                        b
+                    },
+                )?;
+            }
+            offset += chunk;
+        }
+        Ok(true)
+    }
+
+    /// VerifyAttn on gfx1151: run a `batch_size <= 32` legacy single-slot
+    /// WMMA flash prefill ([`Self::attention_q8_0_flash_prefill_wmma_slots`]
+    /// with no slot descriptors) through the context-parallel twin
+    /// ([`VerifyWmmaKernels`]). `Ok(false)` = not admitted; the caller runs
+    /// the unchanged reference. Output is byte-identical to the reference, so
+    /// the dispatch arm intercepts unconditionally (DFlash / MTP / n-gram
+    /// verify, short prefill tails). `scratch` (the model's flash partials)
+    /// holds the f16 S tiles: `ceil(rows/16) * n_kv_heads * 6 *
+    /// ceil(max_ctx_len/16)` tiles of 512 B. Both grids depend on the context
+    /// only through `max_ctx_len` (the physical cap under graph capture); the
+    /// live key range comes from `positions` on the device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_verify_wmma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        scratch: &GpuTensor,
+    ) -> HipResult<bool> {
+        self.attention_verify_wmma_with(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            scratch,
+            VerifyWmmaGeometry::default(),
+        )
+    }
+
+    /// [`Self::try_attention_verify_wmma`] with an explicit launch geometry
+    /// (oracle and bench sweeps). Same admission and bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_verify_wmma_with(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        scratch: &GpuTensor,
+        geom: VerifyWmmaGeometry,
+    ) -> HipResult<bool> {
+        if !self.flags.verify_attn || self.replay.is_recording() {
+            return Ok(false);
+        }
+        let Some(set) = verify_wmma_kernels(self) else {
+            return Ok(false);
+        };
+        // The reference module must be the default gfx11 hd256 WMMA body:
+        // split-Q changes its arithmetic, and the dynamic-head_dim build is
+        // not the one this twin was proven against.
+        let dev = |name: &str| hipfire_config::developer_var(name).ok();
+        if dev("HIPFIRE_FLASH_PREFILL_SPLITQ").as_deref() == Some("1")
+            || dev("HIPFIRE_FLASH_PREFILL_FIXED_HD").as_deref() == Some("0")
+        {
+            return Ok(false);
+        }
+        if head_dim != 256
+            || n_kv_heads == 0
+            || n_heads != 6 * n_kv_heads
+            || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
+            || max_ctx_len == 0
+        {
+            return Ok(false);
+        }
+        let row_groups = batch_size.div_ceil(VERIFY_WMMA_ROWS);
+        let t_stride = max_ctx_len.div_ceil(VERIFY_WMMA_KEYS);
+        let tile_bytes = VERIFY_WMMA_ROWS * VERIFY_WMMA_KEYS * 2;
+        let need = row_groups
+            .checked_mul(n_kv_heads * VERIFY_WMMA_FRAGS)
+            .and_then(|n| n.checked_mul(t_stride))
+            .and_then(|n| n.checked_mul(tile_bytes));
+        if need.is_none_or(|n| n > scratch.buf.size()) || t_stride > i32::MAX as usize {
+            return Ok(false);
+        }
+        // Fragments of row group 0 (the largest) set the block size.
+        let rows0 = batch_size.min(VERIFY_WMMA_ROWS);
+        let pack = if geom.packed { rows0 } else { VERIFY_WMMA_ROWS };
+        let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
+        // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
+        let qk_block = (32 * nf.max(4)) as u32;
+        let qk_splits = geom.qk_waves.div_ceil(row_groups * n_kv_heads * nf).clamp(1, t_stride);
+        let pv = geom.pv.unwrap_or(if nf >= 4 { VerifyWmmaPv::Chunk2Whole2 } else { VerifyWmmaPv::Chunk1Split4 });
+        let pv_chunks = pv.chunks();
+        // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
+        let pv_block = (32 * nf.max(pv_chunks)) as u32;
+        let pv_func = set.pv[pv as usize];
+
+        self.ensure_kernel(set.module, set.src, set.qk)?;
+        self.ensure_kernel(set.module, set.src, pv_func)?;
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let s_ptr = scratch.buf.as_ptr();
+        let nr = batch_size as i32;
+        let nkv = n_kv_heads as i32;
+        let ts = t_stride as i32;
+        let pk = i32::from(geom.packed);
+        let grid_x = (row_groups * n_kv_heads) as u32;
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &s_ptr as *const _ as *mut c_void,
+                &nr as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &pk as *const _ as *mut c_void,
+                &scale as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                set.qk,
+                [grid_x, qk_splits as u32, 1],
+                [qk_block, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(s_ptr);
+                    b.push_i32(nr);
+                    b.push_i32(nkv);
+                    b.push_i32(ts);
+                    b.push_i32(pk);
+                    b.push_f32(scale);
+                    b
+                },
+            )?;
+        }
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &v_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &s_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nr as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &pk as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                pv_func,
+                [grid_x, (16 / pv_chunks) as u32, 1],
+                [pv_block, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(s_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nr);
+                    b.push_i32(nkv);
+                    b.push_i32(ts);
+                    b.push_i32(pk);
+                    b
+                },
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the
@@ -6937,6 +8217,24 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.try_attention_verify_gqa(
+            VerifyKv::Q8,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_cols,
+        )? {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_q8_0_tile_batched",
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
@@ -7003,6 +8301,24 @@ impl Gpu {
             fp8_e4m3_row_bytes(n_kv_heads, head_dim),
             "attention_flash_fp8_e4m3_tile_batched",
         )?;
+        if self.try_attention_verify_gqa(
+            VerifyKv::Fp8,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_cols,
+        )? {
+            return Ok(());
+        }
         self.launch_asym_flash_batched(
             "attention_flash_fp8_e4m3_tile_batched",
             kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC,
@@ -7033,6 +8349,8 @@ impl Gpu {
     }
 
     /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope, caller must fall back.
+    /// On arches with a VerifyAttn `rows_q8` twin (gfx1100) an admitted shape
+    /// runs the byte-identical twin instead ([`Self::try_attention_verify_gqa_rows`]).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_q8_0_rows_masked(
         &mut self,
@@ -7051,7 +8369,7 @@ impl Gpu {
         if self.replay.is_recording() {
             return Ok(false);
         }
-        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) {
+        if !q8_multirow_arch_supported(self.arch_caps.arch()) {
             return Ok(false);
         }
         let dpt = head_dim / 32;
@@ -7063,6 +8381,22 @@ impl Gpu {
             return Ok(false);
         }
         self.bind_thread()?;
+        if self.try_attention_verify_gqa_rows(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials,
+            rows,
+        )? {
+            return Ok(true);
+        }
         let tile_size = self.attn_tile_size();
         let max_tiles = max_ctx_len.div_ceil(tile_size);
         let stride = 2 + head_dim;
@@ -8162,6 +9496,36 @@ impl Gpu {
         result
     }
 
+    /// Load the givens4/turbo-family kernel `func_name` for a descriptor-aware
+    /// launch. Descriptor-less launches keep [`Self::ensure_givens4_kernel`]'s
+    /// default module (source and code object unchanged); launches with real
+    /// slot descriptors compile the same body against `kv_slot_desc_paged.h`
+    /// with the kernel renamed to its `*_paged` symbol. Returns the function
+    /// to launch.
+    pub(crate) fn ensure_givens4_kv_slot_kernel(
+        &mut self,
+        name: &str,
+        body_src: &str,
+        func_name: &'static str,
+        paged: bool,
+    ) -> HipResult<&'static str> {
+        if !paged {
+            self.ensure_givens4_kernel(name, body_src, func_name)?;
+            return Ok(func_name);
+        }
+        let paged_func = kv_slot_paged_symbol(func_name).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("{func_name} has no paged (multi-slot descriptor) variant"),
+            )
+        })?;
+        if !self.functions.contains_key(paged_func) {
+            let full_src = kernels::kv_slot_givens4_paged_source(body_src, func_name, paged_func);
+            self.ensure_kernel(paged_func, &full_src, paged_func)?;
+        }
+        Ok(paged_func)
+    }
+
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
     pub(crate) fn ensure_givens4_kernel(
         &mut self,
@@ -8201,7 +9565,9 @@ impl Gpu {
                 stripped
             )
         };
-        let obj_path = self.compiler.compile_for_symbol(name, &full_src, func_name)?;
+        let obj_path = self
+            .compiler
+            .compile_for_symbol(name, &full_src, func_name)?;
         let obj_path_str = obj_path.to_str().unwrap().to_string();
         if !self.modules.contains_key(name) {
             let module = crate::scratch::module_load_or_recompile(
@@ -8624,11 +9990,40 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_fwht3_vec_batched_slots(
+            dst, src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, None, None,
+        )
+    }
+
+    /// Multi-slot variant of [`Self::kv_cache_write_fwht3_vec_batched`] —
+    /// same descriptor contract as `kv_cache_write_asym3_batched_slots`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fwht3_vec_batched_slots(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_fwht3_vec_batched_slots: slot_descs and row_slot \
+             are both-or-neither"
+        );
         self.bind_thread()?;
-        self.ensure_givens4_kernel(
+        let paged = slot_descs.is_some();
+        let func = self.ensure_givens4_kv_slot_kernel(
             "kv_cache_write_asym_k_fwht3_batched",
             kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC,
             "kv_cache_write_asym_k_fwht3_batched",
+            paged,
         )?;
         let mut kdp = dst.buf.as_ptr();
         let mut ksp = src.buf.as_ptr();
@@ -8638,6 +10033,14 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut kdp as *mut _ as *mut c_void,
             &mut ksp as *mut _ as *mut c_void,
@@ -8648,9 +10051,15 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
+        if paged {
+            params.push(&mut desc_ptr as *mut _ as *mut c_void);
+            params.push(&mut rs_ptr as *mut _ as *mut c_void);
+        }
         let shared_mem = ((head_dim + 32) * 4) as u32;
+        let desc_raw = desc_ptr;
+        let rs_raw = rs_ptr;
         self.launch_maybe_blob(
-            "kv_cache_write_asym_k_fwht3_batched",
+            func,
             [n_kv_heads as u32, batch_size as u32, 1],
             [32, 1, 1],
             shared_mem,
@@ -8665,6 +10074,10 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
+                if paged {
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                }
                 b
             },
         )
@@ -9156,8 +10569,22 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        // Multi-slot addressing (see `kv_cache_write_asym3_batched_slots`):
+        // when both `Some`, `row_slot[row]` selects the `KvSlotDesc` whose
+        // `legacy_k_base`/block table translates that row's destination.
+        // Both `None` = legacy single-arena mode, byte-identical to the
+        // pre-port kernel. Both-or-neither, like every other desc pair.
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
-        self.ensure_givens4_kernel(kernel_key, src_const, func_name)?;
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "launch_asym_k_batched: slot_descs and row_slot are both-or-neither"
+        );
+        let paged = slot_descs.is_some();
+        let func_name =
+            self.ensure_givens4_kv_slot_kernel(kernel_key, src_const, func_name, paged)?;
         let mut kdp = k_dst.buf.as_ptr();
         let mut ksp = k_src.buf.as_ptr();
         let mut pp = positions.buf.as_ptr();
@@ -9166,6 +10593,14 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut kdp as *mut _ as *mut c_void,
             &mut ksp as *mut _ as *mut c_void,
@@ -9176,7 +10611,13 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
+        if paged {
+            params.push(&mut desc_ptr as *mut _ as *mut c_void);
+            params.push(&mut rs_ptr as *mut _ as *mut c_void);
+        }
         let shared_mem = ((head_dim + 32) * 4) as u32;
+        let desc_raw = desc_ptr;
+        let rs_raw = rs_ptr;
         self.launch_maybe_blob(
             func_name,
             [n_kv_heads as u32, batch_size as u32, 1],
@@ -9193,6 +10634,10 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
+                if paged {
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                }
                 b
             },
         )
@@ -9230,8 +10675,10 @@ impl Gpu {
         v_mode_bits: i32,
         // Sliding-window span for the tile kernel: a query at position p attends
         // only to keys in [p-window+1, p]. <= 0 = full causal (legacy behavior).
-        // Pushed as a trailing scalar kernarg; only the q8 tile kernel reads it
-        // (asym/lloyd tile kernels declare fewer args and ignore the extra).
+        // Pushed as a trailing scalar kernarg. NOTE: only the q8 and bf16 tile
+        // kernels READ it — the asym/fwht tile kernels declare the arg but
+        // ignore it, so a caller with a real window must route only to
+        // window-aware kernels (the slots ladder passes 0 for every tier).
         window: i32,
         // When true, use the WMMA grid shape `[n_heads, ceil(chunk/BLOCK_M),
         // max_tiles]` and omit the `v_mode_bits` kernarg, even if the inline
@@ -9254,12 +10701,11 @@ impl Gpu {
         // `desc` off `slot_descs`, so that combination would silently pin
         // every row to slot 0's descriptor while still running the
         // descriptor addressing path. Pushed unconditionally as the last two
-        // non-WMMA kernargs below for every caller of this launcher; only
-        // the q8 and asym3 tile kernels declare trailing parameters for them
-        // today (see the assertion below for the WMMA exclusion) — every
-        // other tile kernel routed through here (fwht/lloyd/asym2/asym4)
-        // simply has fewer declared params and ignores the extra trailing
-        // kernarg bytes, the same way they already ignore `window`.
+        // non-WMMA kernargs below for every caller of this launcher; every
+        // descriptor-aware tile kernel (q8 + asym{2,3,4} + fwht{2,3,4})
+        // declares the trailing pair — any kernel that does not simply
+        // ignores the extra trailing kernarg bytes, the same way the
+        // non-windowed tiers ignore `window`.
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
@@ -9277,9 +10723,32 @@ impl Gpu {
             "tree_bias combined with multi-slot descriptors has no defined \
              contract and no coverage: tree-verify batches are single-slot \
              (block_start/block_cols index one shared linearized tree), and \
-             row_slot-per-row addressing for a tree-verify batch has not \
-             been designed. Tree-verify + multi-slot is deliberately out of \
+             row_slot-per-row addressing for a tree-verify batch has not been \
+             designed. Tree-verify + multi-slot is deliberately out of \
              SP1 scope."
+        );
+        // The batched tile kernels hold per-lane register accumulators sized
+        // for head_dim <= 512 (float mq[16] at 32 dims per lane) and compute
+        // `dpt = head_dim / 32`, which silently truncates non-multiples of 32
+        // (dims past the truncation would never be accumulated). That bound
+        // describes the q8/bf16 tile kernels ONLY; the rotated tiers are
+        // narrower (see `batched_tile_head_dim_envelope`), so the envelope
+        // check below is the authority and this one stays as the shared
+        // multiple-of-32 floor.
+        assert!(
+            head_dim > 0 && head_dim % 32 == 0 && head_dim <= 512,
+            "launch_asym_flash_batched ({tile_func_name}): batched tile \
+             kernels require head_dim to be a positive multiple of 32 and \
+             <= 512 (got {head_dim})"
+        );
+        let (hd_min, hd_max) = batched_tile_head_dim_envelope(tile_func_name);
+        assert!(
+            head_dim >= hd_min && head_dim <= hd_max,
+            "launch_asym_flash_batched ({tile_func_name}): head_dim {head_dim} \
+             is outside this kernel's envelope [{hd_min}, {hd_max}]. Routing a \
+             larger head through it writes past its per-lane register arrays \
+             (or early-returns, leaving the reduce to fold stale partials) — \
+             both are silent-wrong-attention classes, so refuse here instead."
         );
         // gfx1151 is the dev box; gfx1201 is the target. Never bake a tuned
         // constant into a `const` — see spec §11. Resolution lives in
@@ -9325,6 +10794,7 @@ impl Gpu {
             && wmma_fa_kernel.is_some()
             && (head_dim == 128 || head_dim == 256)
             && tree_bias.is_none()
+            && slot_descs.is_none()
             && v_mode_bits == V_MODE_Q8
             && tile_func_name == "attention_flash_asym4_tile_batched"
             && batch_size >= wmma_fa_min_batch()
@@ -9362,7 +10832,14 @@ impl Gpu {
             (tile_key, tile_src, tile_func_name)
         };
 
-        self.ensure_givens4_kernel(eff_tile_key, eff_tile_src, eff_tile_func)?;
+        // Descriptor launches never take the WMMA grid (asserted above), so
+        // eff_tile_* is the scalar tile here and has a paged variant.
+        let eff_tile_func = self.ensure_givens4_kv_slot_kernel(
+            eff_tile_key,
+            eff_tile_src,
+            eff_tile_func,
+            slot_descs.is_some(),
+        )?;
         if v_mode_bits != V_MODE_Q8 {
             self.ensure_givens4_kernel(
                 "attention_flash_lloyd_reduce_batched",
@@ -9606,10 +11083,60 @@ impl Gpu {
             n_kv_heads,
             head_dim,
             batch_size,
+            None,
+            None,
         )?;
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
+    /// Multi-slot variant of [`Self::kv_cache_write_asym4_batched`] — the K
+    /// write and the Q8_0 V write both resolve their destination through the
+    /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
+    /// since the rotated-K tiers have distinct K/V strides). Lloyd-V is not
+    /// wired for the multi-slot path and errors loudly. Both `None` =
+    /// byte-identical to the plain variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_asym4_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        t1: &GpuTensor,
+        t2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_asym4_batched_slots: slot_descs and row_slot are both-or-neither"
+        );
+        self.bind_thread()?;
+        self.launch_asym_k_batched(
+            "kv_cache_write_asym_k_givens4_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC,
+            "kv_cache_write_asym_k_givens4_batched",
+            k_dst,
+            k_src,
+            positions,
+            t1,
+            t2,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            slot_descs,
+            row_slot,
+        )?;
+        self.kv_cache_write_q8_0_batched_slots(
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            /*use_v_base=*/ true,
+        )
+    }
     /// Batched K+V write for fwht4 (K FWHT-rotated 4-bit + V Q8_0).
     /// Same launch geometry as asym4_batched; only the kernel name + sign-vector
     /// param semantics differ.
@@ -9640,6 +11167,8 @@ impl Gpu {
             n_kv_heads,
             head_dim,
             batch_size,
+            None,
+            None,
         )?;
         self.kv_write_v_by_mode_batched(
             v_dst,
@@ -9654,6 +11183,54 @@ impl Gpu {
         )
     }
 
+    /// Multi-slot variant of [`Self::kv_cache_write_fwht4_batched`] — the K
+    /// write and the Q8_0 V write both resolve their destination through the
+    /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
+    /// since the rotated-K tiers have distinct K/V strides). Lloyd-V is not
+    /// wired for the multi-slot path and errors loudly. Both `None` =
+    /// byte-identical to the plain variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fwht4_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        t1: &GpuTensor,
+        t2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_fwht4_batched_slots: slot_descs and row_slot are both-or-neither"
+        );
+        self.bind_thread()?;
+        self.launch_asym_k_batched(
+            "kv_cache_write_asym_k_fwht4_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC,
+            "kv_cache_write_asym_k_fwht4_batched",
+            k_dst,
+            k_src,
+            positions,
+            t1,
+            t2,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            slot_descs,
+            row_slot,
+        )?;
+        self.kv_cache_write_q8_0_batched_slots(
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            /*use_v_base=*/ true,
+        )
+    }
     /// Batched K+V write for asym2 (K 2-bit rotated + V Q8_0).
     pub fn kv_cache_write_asym2_batched(
         &mut self,
@@ -9681,10 +11258,60 @@ impl Gpu {
             n_kv_heads,
             head_dim,
             batch_size,
+            None,
+            None,
         )?;
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
+    /// Multi-slot variant of [`Self::kv_cache_write_asym2_batched`] — the K
+    /// write and the Q8_0 V write both resolve their destination through the
+    /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
+    /// since the rotated-K tiers have distinct K/V strides). Lloyd-V is not
+    /// wired for the multi-slot path and errors loudly. Both `None` =
+    /// byte-identical to the plain variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_asym2_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        t1: &GpuTensor,
+        t2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_asym2_batched_slots: slot_descs and row_slot are both-or-neither"
+        );
+        self.bind_thread()?;
+        self.launch_asym_k_batched(
+            "kv_cache_write_asym_k_givens2_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC,
+            "kv_cache_write_asym_k_givens2_batched",
+            k_dst,
+            k_src,
+            positions,
+            t1,
+            t2,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            slot_descs,
+            row_slot,
+        )?;
+        self.kv_cache_write_q8_0_batched_slots(
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            /*use_v_base=*/ true,
+        )
+    }
     /// Batched K+V write for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
     pub fn kv_cache_write_fwht2_batched(
         &mut self,
@@ -9713,6 +11340,8 @@ impl Gpu {
             n_kv_heads,
             head_dim,
             batch_size,
+            None,
+            None,
         )?;
         self.kv_write_v_by_mode_batched(
             v_dst,
@@ -9727,6 +11356,320 @@ impl Gpu {
         )
     }
 
+    /// Multi-slot variant of [`Self::kv_cache_write_fwht2_batched`] — the K
+    /// write and the Q8_0 V write both resolve their destination through the
+    /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
+    /// since the rotated-K tiers have distinct K/V strides). Lloyd-V is not
+    /// wired for the multi-slot path and errors loudly. Both `None` =
+    /// byte-identical to the plain variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fwht2_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        t1: &GpuTensor,
+        t2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_fwht2_batched_slots: slot_descs and row_slot are both-or-neither"
+        );
+        self.bind_thread()?;
+        self.launch_asym_k_batched(
+            "kv_cache_write_asym_k_fwht2_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC,
+            "kv_cache_write_asym_k_fwht2_batched",
+            k_dst,
+            k_src,
+            positions,
+            t1,
+            t2,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            slot_descs,
+            row_slot,
+        )?;
+        self.kv_cache_write_q8_0_batched_slots(
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            /*use_v_base=*/ true,
+        )
+    }
+
+    /// Multi-slot variants (one per rotated-K tier). Same descriptor contract
+    /// as `attention_flash_asym3_batched_masked_slots`: `row_slot[row]`
+    /// (GLOBAL row) selects the `KvSlotDesc` translating that row's KV
+    /// addresses; the per-row causal bound stays `positions[row]`. The
+    /// ported tile kernels (asym4/fwht4/asym2/fwht2/fwht3) are byte-identical
+    /// to their pre-port behaviour when both descriptor args are `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym4_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_asym4_tile_batched",
+            kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC,
+            "attention_flash_asym4_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht4_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fwht4_tile_batched",
+            kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC,
+            "attention_flash_fwht4_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            signs1,
+            signs2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym2_batched_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_asym2_tile_batched",
+            kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC,
+            "attention_flash_asym2_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            None,
+            0,
+            0,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht2_batched_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fwht2_tile_batched",
+            kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC,
+            "attention_flash_fwht2_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            signs1,
+            signs2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            None,
+            0,
+            0,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fwht3_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        v_mode_bits: i32,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fwht3_tile_batched",
+            kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
+            "attention_flash_fwht3_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            signs1,
+            signs2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
     /// Batched flash attention for asym4 (K 4-bit rotated + V Q8_0).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym4_batched(
@@ -10142,8 +12085,64 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_asym3_batched_slots(
+            k_dst, v_dst, k_src, v_src, positions, cos_theta, sin_theta, n_kv_heads, head_dim,
+            batch_size, None, None,
+        )
+    }
+
+    /// Multi-slot variant of [`Self::kv_cache_write_asym3_batched`]: both the
+    /// K write and the Q8_0 V write resolve their destination through the
+    /// descriptor selected by `row_slot[row]`. The V write runs with
+    /// `use_v_base = true` — asym3's K and V per-position strides differ, so
+    /// a legacy-mode descriptor's `legacy_v_base` is the only correct V slab
+    /// offset. Both `None` = byte-identical to the plain variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_asym3_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_asym3_batched_slots: slot_descs and row_slot are \
+             both-or-neither. Passing only slot_descs silently pins every row \
+             to slot 0, writing every sequence's KV into slot 0's slab."
+        );
         self.bind_thread()?;
         if head_dim == 512 {
+            // Fail-closed: the hd512 batched K-write kernel
+            // (`kv_cache_write_asym_k_givens3_hd512_batched`) does NOT declare
+            // `slot_descs`/`row_slot` parameters and writes through a raw
+            // `pos * stride` offset — always slab 0. The V write below also
+            // goes through the non-slots `kv_cache_write_q8_0_batched` (null
+            // descriptors), so V lands in slab 0 too. Launching this path with
+            // descriptors would silently route every slot's K and V into
+            // slot 0's slab. Until the hd512 K-write kernel is ported to
+            // descriptor addressing (and the V write routed through
+            // `kv_cache_write_q8_0_batched_slots`), refuse multi-slot hd512
+            // rather than corrupt silently.
+            if slot_descs.is_some() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "kv_cache_write_asym3_batched_slots: head_dim=512 multi-slot \
+                     (descriptor/paged) KV writes are not supported — the hd512 \
+                     K-write kernel lacks descriptor addressing and would \
+                     silently route every slot's K and V into slab 0. Use \
+                     single-arena mode (null slot_descs/row_slot) instead.",
+                ));
+            }
             self.launch_asym_k_batched(
                 "kv_cache_write_asym_k_givens3_hd512_batched",
                 kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC,
@@ -10156,16 +12155,20 @@ impl Gpu {
                 n_kv_heads,
                 head_dim,
                 batch_size,
+                slot_descs,
+                row_slot,
             )?;
             return self.kv_cache_write_q8_0_batched(
                 v_dst, v_src, positions, n_kv_heads, head_dim, batch_size,
             );
         }
         // K: batched 3-bit rotated write.
-        self.ensure_givens4_kernel(
+        let paged = slot_descs.is_some();
+        let func = self.ensure_givens4_kv_slot_kernel(
             "kv_cache_write_asym_k_givens3_batched",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
             "kv_cache_write_asym_k_givens3_batched",
+            paged,
         )?;
         {
             let mut kdp = k_dst.buf.as_ptr();
@@ -10176,6 +12179,14 @@ impl Gpu {
             let mut nkv = n_kv_heads as i32;
             let mut hd = head_dim as i32;
             let mut bs = batch_size as i32;
+            let mut desc_ptr: *mut c_void = match slot_descs {
+                Some(t) => t.buf.as_ptr(),
+                None => std::ptr::null_mut(),
+            };
+            let mut rs_ptr: *mut c_void = match row_slot {
+                Some(t) => t.buf.as_ptr(),
+                None => std::ptr::null_mut(),
+            };
             let mut params: Vec<*mut c_void> = vec![
                 &mut kdp as *mut _ as *mut c_void,
                 &mut ksp as *mut _ as *mut c_void,
@@ -10186,9 +12197,15 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
                 &mut bs as *mut _ as *mut c_void,
             ];
+            if paged {
+                params.push(&mut desc_ptr as *mut _ as *mut c_void);
+                params.push(&mut rs_ptr as *mut _ as *mut c_void);
+            }
             let shared_mem = ((head_dim + 32) * 4) as u32;
+            let desc_raw = desc_ptr;
+            let rs_raw = rs_ptr;
             self.launch_maybe_blob(
-                "kv_cache_write_asym_k_givens3_batched",
+                func,
                 [n_kv_heads as u32, batch_size as u32, 1],
                 [32, 1, 1],
                 shared_mem,
@@ -10203,12 +12220,57 @@ impl Gpu {
                     b.push_i32(nkv);
                     b.push_i32(hd);
                     b.push_i32(bs);
+                    if paged {
+                        b.push_ptr(desc_raw);
+                        b.push_ptr(rs_raw);
+                    }
                     b
                 },
             )?;
         }
-        // V: batched Q8_0 write.
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        // V: batched Q8_0 write through the V base.
+        self.kv_cache_write_q8_0_batched_slots(
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            /*use_v_base=*/ true,
+        )
+    }
+
+    /// Multi-slot variant of [`Self::kv_cache_write_fwht3_batched`] for the
+    /// static Q8_0-V ladder (the only V tier the multi-slot path wires):
+    /// K through the descriptor-aware FWHT3 writer, V through the Q8_0
+    /// batched writer resolving `legacy_v_base`. Lloyd-V errors loudly here —
+    /// route it through the plain variant on the sequential path instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fwht3_batched_slots(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_fwht3_batched_slots: slot_descs and row_slot are \
+             both-or-neither"
+        );
+        self.bind_thread()?;
+        self.kv_cache_write_fwht3_vec_batched_slots(
+            k_dst, k_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, slot_descs,
+            row_slot,
+        )?;
+        self.kv_cache_write_q8_0_batched_slots(
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
+            /*use_v_base=*/ true,
+        )
     }
 
     /// Batched K+V write for fwht3 (K FWHT-rotated 3-bit + V Q8_0).
@@ -10372,16 +12434,16 @@ impl Gpu {
         if head_dim == 512 {
             // Fail-closed: HD512's descriptor translation requires that the
             // KvSlotDesc fields can actually represent the layout. The only
-            // field that can overflow is `cap: i32` (and `seq_len: i32`) —
-            // `k_base`/`v_base` are u64 and wide enough for any arena this
-            // GPU can allocate. If max_seq does not fit in i32, the device-side
-            // `KvSlotDesc.cap` would truncate and silently corrupt slab
-            // bounds; we must not silently fall back to the legacy path.
+            // narrow field is `seq_len: i32` — `legacy_k_base`/`legacy_v_base`
+            // are u64 and wide enough for any arena this GPU can allocate. If
+            // max_seq does not fit in i32, the device-side `KvSlotDesc.seq_len`
+            // would truncate and silently corrupt slab bounds; we must not
+            // silently fall back to the legacy path.
             if slot_descs.is_some() && max_seq > i32::MAX as usize {
                 return Err(hip_bridge::HipError::new(
                     0,
                     &format!(
-                        "hd512 batched: max_seq {max_seq} exceeds KvSlotDesc.cap i32 range; \
+                        "hd512 batched: max_seq {max_seq} exceeds KvSlotDesc.seq_len i32 range; \
                          cannot represent HD512 layout via descriptors — fail closed rather than \
                          silently ignoring descriptors"
                     ),
@@ -12887,6 +14949,139 @@ impl Gpu {
             )
         }
     }
+
+    /// Q-tiled flash-style ViT self-attention: same packed-QKV contract as
+    /// [`Gpu::vit_attention_f32`], but QB=16 queries per block share each
+    /// K/V tile pulled through LDS (online softmax, no full-row score
+    /// buffer), cutting the DRAM re-read traffic by ~16×. This is the
+    /// production path for the vision tower — the naive kernel measured
+    /// 1.02 s/layer at N=4624 on gfx1101 (25.5 s per 68x68-grid image);
+    /// this variant should land two orders under it. Requires
+    /// head_dim % 16 == 0 and head_dim <= 128.
+    pub fn vit_attention_qtiled_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Shapes outside the Q-tiled contract (per-lane accumulators are
+        // sized for head_dim <= 128 in 16-lane multiples of 16) fall back
+        // to the naive kernel instead of asserting: an assert here runs on
+        // the engine-owning thread, where a panic is a serve hang. The
+        // naive kernel is slower but correct for any tower shape.
+        if head_dim % 16 != 0 || head_dim > 128 {
+            eprintln!(
+                "vit_attention_qtiled_f32: head_dim={head_dim} is outside the \
+                 Q-tiled contract (multiple of 16, <= 128); falling back to \
+                 vit_attention_f32"
+            );
+            return self.vit_attention_f32(qkv, out, n, hidden, num_heads, head_dim);
+        }
+        self.ensure_kernel(
+            "vit_attention_qtiled_f32",
+            kernels::VIT_ATTENTION_QTILED_SRC,
+            "vit_attention_qtiled_f32",
+        )?;
+        let func = &self.functions["vit_attention_qtiled_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = qkv.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Layout must mirror the kernel's smem carve-up (QB=16, K_TILE=64):
+        // k_tile + q_tile + s_tile + ws_max + ws_sum + m_l + out_run. (V is
+        // deliberately NOT staged in LDS — each (j, d) element is read by
+        // exactly one lane, so there is no intra-block reuse to pay for.)
+        const QB: usize = 16;
+        const K_TILE: usize = 64;
+        let shared_mem =
+            ((K_TILE * head_dim + 2 * QB * head_dim + QB * K_TILE + 2 * QB * 16 + QB * 2) * 4)
+                as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [num_heads as u32, (n as u32).div_ceil(QB as u32), 1],
+                [256, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Multi-slot variant of
+    /// [`Self::attention_flash_bf16_batched_masked_windowed`] — the bf16
+    /// tile kernel is descriptor-aware (it is one of the two kernels the
+    /// original SP1 descriptor port landed on), so this only threads the
+    /// arguments through the shared launcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_bf16_batched_masked_windowed_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        window: i32,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_bf16_tile_batched",
+            kernels::ATTENTION_FLASH_BF16_TILE_BATCHED_SRC,
+            "attention_flash_bf16_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            window,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
+        )
+    }
+
 
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
@@ -16819,8 +19014,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "hc_streams_init_from_embed_batched",
-            kernels::HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC,
+            "qwen4_hc_streams_init_from_embed_batched",
+            kernels::QWEN4_HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC,
             "hc_streams_init_from_embed_batched_bf16",
         )?;
         let ep = embed.buf.as_ptr();
@@ -20254,16 +22449,42 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
 }
 
 
+/// `*_paged` symbol of a descriptor-aware kernel launched through the
+/// givens4/turbo assembler, or `None` when the kernel has no paged variant.
+fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
+    Some(match func {
+        "attention_flash_q8_0_tile_batched" => "attention_flash_q8_0_tile_batched_paged",
+        "attention_flash_bf16_tile_batched" => "attention_flash_bf16_tile_batched_paged",
+        "attention_flash_f16_tile_batched" => "attention_flash_f16_tile_batched_paged",
+        "attention_flash_asym2_tile_batched" => "attention_flash_asym2_tile_batched_paged",
+        "attention_flash_asym3_tile_batched" => "attention_flash_asym3_tile_batched_paged",
+        "attention_flash_asym3_tile_hd512_batched" => {
+            "attention_flash_asym3_tile_hd512_batched_paged"
+        }
+        "attention_flash_asym4_tile_batched" => "attention_flash_asym4_tile_batched_paged",
+        "attention_flash_fwht2_tile_batched" => "attention_flash_fwht2_tile_batched_paged",
+        "attention_flash_fwht3_tile_batched" => "attention_flash_fwht3_tile_batched_paged",
+        "attention_flash_fwht4_tile_batched" => "attention_flash_fwht4_tile_batched_paged",
+        "kv_cache_write_asym_k_fwht2_batched" => "kv_cache_write_asym_k_fwht2_batched_paged",
+        "kv_cache_write_asym_k_fwht3_batched" => "kv_cache_write_asym_k_fwht3_batched_paged",
+        "kv_cache_write_asym_k_fwht4_batched" => "kv_cache_write_asym_k_fwht4_batched_paged",
+        "kv_cache_write_asym_k_givens2_batched" => "kv_cache_write_asym_k_givens2_batched_paged",
+        "kv_cache_write_asym_k_givens3_batched" => "kv_cache_write_asym_k_givens3_batched_paged",
+        "kv_cache_write_asym_k_givens4_batched" => "kv_cache_write_asym_k_givens4_batched_paged",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
         flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
-        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, replay_stable_tile_count,
+        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
+        replay_stable_tile_count,
     };
     use crate::DType;
     use std::ffi::c_void;
-
 
     /// C0: FA2 gfx11 blob must match the pointer-array ABI (q,k,v,out,positions,
     /// 4×i32, f32). The old capture-only path omitted `out`, shifting every
@@ -20282,22 +22503,18 @@ mod tests {
         let bs = 512i32;
         let scale = 1.0f32 / 16.0;
 
-        let blob = pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
-            q, k, v, out, pos, nh, nkv, hd, bs, scale,
-        );
+        let blob =
+            pack_attention_q8_0_fa2_gqa_gfx11_kernarg(q, k, v, out, pos, nh, nkv, hd, bs, scale);
         let bytes = blob.as_bytes();
         // Five 8-byte pointers + five 4-byte scalars = 60 argument bytes.
         assert_eq!(bytes.len(), 60, "kernarg payload size");
 
-        let read_usize = |off: usize| -> usize {
-            usize::from_ne_bytes(bytes[off..off + 8].try_into().unwrap())
-        };
-        let read_i32 = |off: usize| -> i32 {
-            i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap())
-        };
-        let read_f32 = |off: usize| -> f32 {
-            f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap())
-        };
+        let read_usize =
+            |off: usize| -> usize { usize::from_ne_bytes(bytes[off..off + 8].try_into().unwrap()) };
+        let read_i32 =
+            |off: usize| -> i32 { i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap()) };
+        let read_f32 =
+            |off: usize| -> f32 { f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap()) };
 
         assert_eq!(read_usize(0), q as usize, "q @0");
         assert_eq!(read_usize(8), k as usize, "k @8");
@@ -20319,6 +22536,16 @@ mod tests {
             bytes[24..32] != bytes[32..40],
             "out slot must not be the positions pointer (old bug)"
         );
+    }
+
+    #[test]
+    fn q8_multirow_arch_support_is_an_exact_candidate_allowlist() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(q8_multirow_arch_supported(arch), "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1150", "gfx1152", "gfx1200", "gfx942"] {
+            assert!(!q8_multirow_arch_supported(arch), "arch={arch}");
+        }
     }
 
     /// The suffix table is the mapping from tensor dtypes to a kernel symbol.
@@ -20497,5 +22724,141 @@ mod tests {
         assert_eq!(replay_stable_tile_count(2, 64, false, false), 2);
         assert_eq!(replay_stable_tile_count(2, 64, true, false), 64);
         assert_eq!(replay_stable_tile_count(2, 64, false, true), 64);
+    }
+}
+
+/// ABI-pin tests for the multi-slot descriptor ports. The slot engine's
+/// tier dispatch (`hipfire-arch-qwen35::forward_slots`) launches these
+/// kernels with trailing `slot_descs`/`row_slot` pointers; a kernel that
+/// silently lost those parameters would read the extra kernarg bytes as
+/// garbage (or, worse, run legacy addressing against slot 0's slab). The
+/// JIT compiles from these exact embedded sources, so pinning the sources
+/// pins the contract the launchers push against — on every host, with or
+/// without a GPU present.
+#[cfg(test)]
+mod kv_slot_desc_port_tests {
+    use crate::kernels;
+
+    /// Every tile-batched attention kernel the slots engine can route a
+    /// non-q8 tier through MUST declare the trailing slot-addressing
+    /// parameters (same order as the shared launcher's push:
+    /// `v_mode, window, slot_descs, row_slot`) and MUST resolve its KV
+    /// reads through `kv_offset_for_k`/`kv_offset_for_v` — never a raw
+    /// `pos * stride` product, which cannot express a block table.
+    #[test]
+    fn rotated_tile_kernels_declare_descriptor_addressing() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "attention_flash_asym4_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_fwht4_tile_batched",
+                kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_asym2_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_fwht2_tile_batched",
+                kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_fwht3_tile_batched",
+                kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
+            ),
+        ];
+        for (name, src) in cases {
+            assert!(
+                src.contains("const KvSlotDesc* __restrict__ slot_descs"),
+                "{name} lost its slot_descs parameter — the slots engine's \
+                 descriptor addressing would silently degrade to slot 0"
+            );
+            assert!(
+                src.contains("const int* __restrict__ row_slot"),
+                "{name} lost its row_slot parameter"
+            );
+            assert!(
+                src.contains("kv_offset_for_k(desc"),
+                "{name} stopped routing K reads through kv_offset_for_k — \
+                 paged block tables would be silently ignored"
+            );
+            assert!(
+                src.contains("kv_offset_for_v(desc"),
+                "{name} stopped routing V reads through kv_offset_for_v"
+            );
+            // The causal bound must come from positions[], never desc.seq_len
+            // (the MTP stale-row contract; see kv_slot_desc.h).
+            assert!(
+                src.contains("positions[global_bid]"),
+                "{name} lost the positions[]-bounded causal sweep"
+            );
+        }
+    }
+
+    /// The batched K-writers for the rotated tiers translate their
+    /// DESTINATION through the descriptor: same trailing-parameter
+    /// contract as the Q8 batched writer.
+    #[test]
+    fn rotated_k_write_kernels_declare_descriptor_addressing() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "kv_cache_write_asym_k_givens2_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC,
+            ),
+            (
+                "kv_cache_write_asym_k_givens3_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
+            ),
+            (
+                "kv_cache_write_asym_k_givens4_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC,
+            ),
+            (
+                "kv_cache_write_asym_k_fwht2_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC,
+            ),
+            (
+                "kv_cache_write_asym_k_fwht3_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC,
+            ),
+            (
+                "kv_cache_write_asym_k_fwht4_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC,
+            ),
+        ];
+        for (name, src) in cases {
+            assert!(
+                src.contains("const KvSlotDesc* __restrict__ slot_descs"),
+                "{name} lost its slot_descs parameter"
+            );
+            assert!(
+                src.contains("const int* __restrict__ row_slot"),
+                "{name} lost its row_slot parameter"
+            );
+            assert!(
+                src.contains("kv_offset_for_k(desc"),
+                "{name} writes through a raw flat offset — paged and \
+                 multi-slab addressing would be silently ignored"
+            );
+        }
+    }
+
+    /// The Q8_0 batched writer must keep its `use_v_base` trailing flag:
+    /// the rotated tiers' V arenas have their own legacy slab offsets, and
+    /// the composite `_slots` writers rely on the V path resolving
+    /// `legacy_v_base` rather than the shared K base.
+    #[test]
+    fn q8_batched_writer_keeps_use_v_base_flag() {
+        let src = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC;
+        assert!(
+            src.contains("int use_v_base"),
+            "kv_cache_write_q8_0_batched lost the use_v_base flag"
+        );
+        assert!(
+            src.contains("kv_offset_for_v(desc"),
+            "kv_cache_write_q8_0_batched lost the V-base translation arm"
+        );
     }
 }

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — retired coherence-gate battery; historical reproduction only (docs/VALIDATION.md)
+echo "warning: coherence-gate-deepseek4-recall.sh is deprecated and will be removed in 0.5.0; retired coherence-gate battery, not acceptance evidence (docs/VALIDATION.md)" >&2
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Nick Woolmer

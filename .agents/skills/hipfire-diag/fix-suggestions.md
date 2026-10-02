@@ -30,9 +30,11 @@ Examples only — match the user’s OS docs and ROCm version:
 # sudo reboot
 ```
 
-WSL2: host must expose KFD; typical prep is `amdgpu-install --usecase=wsl`
-then the Linux user-space stack. Containers need `/dev/kfd` and render
-nodes passed through.
+WSL2 has no `/dev/kfd` by design: ROCm 7.2.1 reaches the GPU through AMD's
+ROCDXG library and `/dev/dxg` (Adrenalin 26.2.2 for WSL2, `librocdxg`,
+`HSA_ENABLE_DXG_DETECTION=1`; see the WSL2 section of GETTING_STARTED). A
+missing `/dev/kfd` there is expected; check `rocminfo` instead. Containers on
+native Linux need `/dev/kfd` and render nodes passed through.
 
 Product onboarding: [docs/GETTING_STARTED.md](../../../docs/GETTING_STARTED.md).
 

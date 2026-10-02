@@ -3,7 +3,7 @@
 //! S4-f16-residual-inputs: post-attention/down producers that emit the frozen
 //! FP16 sidecars consumed by [`Gpu::gemm_mq4g256v2_residual_wmma_f16`].
 //!
-//! Three Gpu launch families (plain + AWQ each), all exact-gfx1100,
+//! Three Gpu launch families (plain + AWQ each), exact gfx1100 and gfx1201,
 //! batched `[N x K]` row-major, `launch_maybe_blob` + `KernargBlob` only:
 //!
 //! * `gated_norm_rotate_mq_f16_batched` — LA post-GDN: gated RMSNorm + FWHT
@@ -39,11 +39,11 @@ use crate::gemm::ResidualVerifyTier;
 use crate::kernels;
 use hip_bridge::HipResult;
 
-const GATED_NORM_F16_SRC: &str =
+pub(crate) const GATED_NORM_F16_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate_f16.gfx1100.hip");
-const SIGMOID_MUL_F16_SRC: &str =
+pub(crate) const SIGMOID_MUL_F16_SRC: &str =
     include_str!("../../../kernels/src/sigmoid_mul_mq_rotate_f16.gfx1100.hip");
-const FUSED_SILU_F16_SRC: &str =
+pub(crate) const FUSED_SILU_F16_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_f16.gfx1100.hip");
 
 fn check_f16_out(out: &GpuTensor, what: &str) -> HipResult<()> {
@@ -71,7 +71,7 @@ impl Gpu {
     ///
     /// `x`, `z`: `[N x K]` F32 (`K = n_heads*head_dim`); `weight`:
     /// `[head_dim]` F32 norm weight; `out`: `[N x K]` F16 sidecar.
-    /// Requires `head_dim == 128`, `K % 256 == 0`, exact gfx1100.
+    /// Requires `head_dim == 128`, `K % 256 == 0`, exact gfx1100 or gfx1201.
     /// After: `out == convert(old gated_norm+rotate F32)` byte-for-byte.
     pub fn gated_norm_rotate_mq_f16_batched(
         &mut self,
@@ -100,10 +100,10 @@ impl Gpu {
                 "gated_norm_rotate_mq_f16_batched: K % 256 == 0 and N >= 1 required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gated_norm_rotate_mq_f16_batched: exact gfx1100 required",
+                "gated_norm_rotate_mq_f16_batched: exact gfx1100 or gfx1201 required",
             ));
         }
         self.bind_thread()?;
@@ -198,10 +198,10 @@ impl Gpu {
                 "gated_norm_rotate_mq_awq_f16_batched: K % 256 == 0, N >= 1, awq len >= K required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gated_norm_rotate_mq_awq_f16_batched: exact gfx1100 required",
+                "gated_norm_rotate_mq_awq_f16_batched: exact gfx1100 or gfx1201 required",
             ));
         }
         self.bind_thread()?;
@@ -269,7 +269,7 @@ impl Gpu {
 
     /// FA post-attention producer: `sigmoid(gate)*attn` + FWHT + direct F16
     /// store. `attn`, `gate`: `[N x K]` F32; `out`: `[N x K]` F16 sidecar.
-    /// Requires `K % 256 == 0`, exact gfx1100. Does not mutate `attn`.
+    /// Requires `K % 256 == 0`, exact gfx1100 or gfx1201. Does not mutate `attn`.
     pub fn sigmoid_mul_rotate_mq_f16_batched(
         &mut self,
         attn: &GpuTensor,
@@ -287,10 +287,10 @@ impl Gpu {
                 "sigmoid_mul_rotate_mq_f16_batched: K % 256 == 0 and N >= 1 required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "sigmoid_mul_rotate_mq_f16_batched: exact gfx1100 required",
+                "sigmoid_mul_rotate_mq_f16_batched: exact gfx1100 or gfx1201 required",
             ));
         }
         self.bind_thread()?;
@@ -359,10 +359,10 @@ impl Gpu {
                 "sigmoid_mul_rotate_mq_awq_f16_batched: K % 256 == 0, N >= 1, awq len >= K required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "sigmoid_mul_rotate_mq_awq_f16_batched: exact gfx1100 required",
+                "sigmoid_mul_rotate_mq_awq_f16_batched: exact gfx1100 or gfx1201 required",
             ));
         }
         self.bind_thread()?;
@@ -417,7 +417,7 @@ impl Gpu {
 
     /// FFN down producer: `silu(gate)*up` + FWHT + direct F16 store.
     /// `gate`, `up`: `[N x K]` F32; `out`: `[N x K]` F16 sidecar.
-    /// Requires `K % 256 == 0`, exact gfx1100.
+    /// Requires `K % 256 == 0`, exact gfx1100 or gfx1201.
     pub fn fused_silu_mul_rotate_mq_f16_batched(
         &mut self,
         gate: &GpuTensor,
@@ -435,10 +435,10 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_f16_batched: K % 256 == 0 and N >= 1 required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "fused_silu_mul_rotate_mq_f16_batched: exact gfx1100 required",
+                "fused_silu_mul_rotate_mq_f16_batched: exact gfx1100 or gfx1201 required",
             ));
         }
         self.bind_thread()?;
@@ -507,10 +507,10 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_awq_f16_batched: K % 256 == 0, N >= 1, awq len >= K required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "fused_silu_mul_rotate_mq_awq_f16_batched: exact gfx1100 required",
+                "fused_silu_mul_rotate_mq_awq_f16_batched: exact gfx1100 or gfx1201 required",
             ));
         }
         self.bind_thread()?;
@@ -570,8 +570,9 @@ impl Gpu {
     /// (DType::F16, e.g. an S4 sidecar) is wired straight in, bypassing
     /// `ensure_fp16_x` and its `convert_f32_to_f16` launch. Tier selection
     /// mirrors that function: default-on ldsstage on exact gfx1100, split-K
-    /// table, base fallback (`residual_ksplit_off` forces base). Any shape
-    /// outside the routed verify domain (non-gfx1100, `batch_size > 16`,
+    /// table, base fallback (`residual_ksplit_off` forces base); exact gfx1201
+    /// mirrors `gemm_hfq4g256_residual_wmma_gfx12_mq4v2`'s N<=16 pick. Any shape
+    /// outside the routed verify domain (other arches, `batch_size > 16`,
     /// `K % 256 != 0`) returns Err so the caller keeps the old path.
     pub fn gemm_mq4g256v2_residual_wmma_f16(
         &mut self,
@@ -586,10 +587,10 @@ impl Gpu {
         if m == 0 || batch_size == 0 {
             return Ok(());
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemm_mq4g256v2_residual_wmma_f16: exact gfx1100 required",
+                "gemm_mq4g256v2_residual_wmma_f16: exact gfx1100 or gfx1201 required",
             ));
         }
         if batch_size > 16 {
@@ -605,6 +606,42 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
+        // Exact gfx1201: the same modules, symbols, grids and blocks the F32
+        // entry `gemm_hfq4g256_residual_wmma_gfx12_mq4v2` selects for N<=16
+        // (ldsstage when `hfq4g256_ldsstage_wmma` and K%512==0, else the gfx12
+        // base), fed the S4 F16 sidecar instead of `ensure_fp16_x`.
+        if self.arch_caps.is_gfx1201() {
+            return if self.flags.hfq4g256_ldsstage_wmma
+                && k % 512 == 0
+                && batch_size <= crate::gemm::LDSSTAGE_MAX_BATCH
+            {
+                self.gemm_residual_f16_one(
+                    a_raw,
+                    x_f16,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                    "gemm_hfq4g256_residual_wmma_gfx12_ldsstage_mq4v2",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
+                    "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage",
+                    [256, 1, 1],
+                )
+            } else {
+                self.gemm_residual_f16_one(
+                    a_raw,
+                    x_f16,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                    "gemm_hfq4g256_residual_wmma_gfx12_mq4v2",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
+                    "gemm_mq4g256v2_residual_wmma_gfx12",
+                    [32, 1, 1],
+                )
+            };
+        }
         // Shared verify-tier pick (same helper as the F32 entry): the kill
         // switch dominates both optimized tiers and restores base.
         match Self::residual_verify_tier(

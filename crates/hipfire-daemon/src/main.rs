@@ -22,7 +22,7 @@
 
 use base64::Engine;
 use hipfire_config::developer_var;
-use hipfire_config::devices::{Claim, DeviceSelection, GpuDevice, ObservedDevice};
+use hipfire_config::devices::{Claim, DeviceSelection, ObservedDevice};
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
@@ -51,7 +51,7 @@ use hipfire_generate::ar::{
     deepseek4_spec_requested_from_policy, emit_qwen_ar_done, emit_qwen_ar_open_think_terminal,
     generate, llama_prefill_sample_seed, llama_qwen3_batched_prefill_eligible,
     model_retry_reset_eligible, qwen_ar_apply_cache_action, qwen_ar_cache_action,
-    qwen_ar_done_value, qwen_ar_drain_pending_into_router, qwen_ar_eos_filter_config,
+    qwen_ar_done_value, qwen_ar_drain_pending_into_router,
     qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
     qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
     qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
@@ -82,8 +82,12 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod gpu_lock;
+use gpu_lock::GpuLocks;
 mod request_guards;
 mod slots;
+mod vision_ladder;
+use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
 
 #[cfg(test)]
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -386,157 +390,9 @@ fn gpu_block_attractor_token(
             .memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
     }
 }
-#[cfg(unix)]
-fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    if !path.is_absolute() {
-        return Err(format!("GPU lock directory must be absolute: {}", path.display()));
-    }
-    if !path.exists() {
-        std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
-            .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
-    }
-    if !path.is_dir() {
-        return Err(format!("GPU lock path is not a directory: {}", path.display()));
-    }
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
-    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(format!("GPU lock directory is not writable: {}", path.display()));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn gpu_lock_dir() -> Result<std::path::PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("HIPFIRE_LOCK_DIR") {
-        let dir = std::path::PathBuf::from(override_dir);
-        prepare_gpu_lock_dir(&dir)?;
-        return Ok(dir);
-    }
-    let primary = Path::new("/run/lock/hipfire");
-    if prepare_gpu_lock_dir(primary).is_ok() {
-        return Ok(primary.to_path_buf());
-    }
-    let fallback = Path::new("/tmp/hipfire-locks");
-    prepare_gpu_lock_dir(fallback)?;
-    Ok(fallback.to_path_buf())
-}
-
-/// Machine-wide GPU reservations held until process exit. Lock files are
-/// keyed by [`GpuDevice::lock_identity`]: `gpu-GPU-<uuid>.lock`, or
-/// `gpu-pci-<bdf>.lock` for cards without a UUID. The per-HOME PID file is
-/// advisory discovery for uninstall tooling, not a mutex: two daemons using
-/// different cards in one HOME must both run.
-#[cfg(unix)]
-struct GpuLocks {
-    dir: std::path::PathBuf,
-    held: Vec<(String, std::fs::File)>,
-}
-
-#[cfg(unix)]
-impl GpuLocks {
-    fn open() -> Result<Self, String> {
-        let dir = gpu_lock_dir()?;
-        eprintln!("[gpu-lock] directory={}", dir.display());
-        Ok(Self { dir, held: Vec::new() })
-    }
-
-    /// Non-blocking reservation; a busy card reports its holder so arch
-    /// selectors can move on to the next card. Never waits, so the claim
-    /// order cannot deadlock against another daemon.
-    fn try_claim(&mut self, device: &GpuDevice) -> Result<Claim, String> {
-        use std::io::{Read, Seek, Write};
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        use std::os::unix::io::AsRawFd;
-
-        let identity = device.lock_identity();
-        if self.held.iter().any(|(held, _)| *held == identity) {
-            return Ok(Claim::Claimed);
-        }
-        let path = self.dir.join(device.lock_file_name());
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
-        let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                let mut holder = String::new();
-                let _ = file.read_to_string(&mut holder);
-                return Ok(Claim::Busy(format!(
-                    "already reserved by holder PID {}",
-                    holder.split_whitespace().next().unwrap_or("<unknown>")
-                )));
-            }
-            return Err(format!("flock {}: {error}", path.display()));
-        }
-        // The lock file stays on disk forever; never unlink an active inode.
-        // Loosen files created under a restrictive umask for other HOME/users.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
-        file.set_len(0).map_err(|e| e.to_string())?;
-        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
-        file.flush().map_err(|e| e.to_string())?;
-        eprintln!("[gpu-lock] reserved {}", path.display());
-        self.held.push((identity, file));
-        Ok(Claim::Claimed)
-    }
-
-    /// Reserve every card in `devices`, sorted by identity; any busy card
-    /// fails the whole set (held descriptors close on process exit).
-    fn claim_all(&mut self, devices: &[GpuDevice]) -> Result<(), String> {
-        let mut sorted = devices.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|device| device.lock_identity());
-        for device in sorted {
-            if let Claim::Busy(holder) = self.try_claim(device)? {
-                return Err(format!(
-                    "GPU {} (PCI {}) {holder}",
-                    device.lock_identity(),
-                    device.bdf
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn write_pid_file(&self) -> Result<(), String> {
-        if self.held.is_empty() {
-            return Err("no visible GPUs to reserve".into());
-        }
-        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
-        identities.sort_unstable();
-        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
-        let hipfire_dir = Path::new(&home).join(".hipfire");
-        std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
-        let pid_path = hipfire_dir.join(format!("daemon-{}.pid", identities.join("_")));
-        std::fs::write(&pid_path, format!("{}\n", std::process::id()))
-            .map_err(|e| format!("write {}: {e}", pid_path.display()))
-    }
-}
-
-#[cfg(not(unix))]
-struct GpuLocks;
-
-#[cfg(not(unix))]
-impl GpuLocks {
-    fn open() -> Result<Self, String> {
-        Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
-    }
-    fn try_claim(&mut self, _: &GpuDevice) -> Result<Claim, String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-    fn claim_all(&mut self, _: &[GpuDevice]) -> Result<(), String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-    fn write_pid_file(&self) -> Result<(), String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-}
-
-/// Query what HIP exposes: one entry per logical device.
-fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
+/// Query what HIP exposes: one entry per logical device. The UUID is read
+/// only where identity comes from HIP rather than the KFD topology.
+fn observe_hip_devices(with_uuid: bool) -> Result<Vec<ObservedDevice>, String> {
     let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
     let count = hip.device_count().map_err(|e| e.to_string())?;
     if count < 1 {
@@ -548,6 +404,9 @@ fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
                 logical: id as usize,
                 arch: hip.get_arch(id).map_err(|e| e.to_string())?,
                 pci_bus_id: hip.device_pci_bus_id(id).map_err(|e| e.to_string())?,
+                uuid: with_uuid
+                    .then(|| hip.device_uuid(id).map_err(|e| e.to_string()))
+                    .transpose()?,
             })
         })
         .collect()
@@ -559,9 +418,14 @@ fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
 /// `hardware.devices` already reserved its cards while resolving; here each
 /// logical device must be exactly the resolved card (arch and PCI bus ID).
 /// Without it (raw inherited filters or none), the HIP-visible cards are
-/// identified by PCI address in the KFD topology and reserved all-or-nothing.
+/// identified — by PCI address in the KFD topology on native Linux, from HIP
+/// UUID and PCI address on WSL2/ROCDXG and native Windows — and reserved
+/// all-or-nothing.
 fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
-    let observed = observe_hip_devices()?;
+    use hipfire_config::devices::{DeviceRoot, IdentitySource};
+    let root = DeviceRoot::system();
+    let source = root.identity_source();
+    let observed = observe_hip_devices(source == IdentitySource::Hip)?;
     if let Some(active) = hipfire_config::devices::active_devices() {
         active.verify_visible(&observed)?;
         for (seen, device) in observed.iter().zip(&active.devices) {
@@ -576,32 +440,15 @@ fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
             );
         }
     } else {
-        let topology = hipfire_config::devices::enumerate_gpus(Path::new(
-            hipfire_config::devices::KFD_TOPOLOGY_NODES,
-        ))
-        .map_err(|e| e.to_string())?;
-        let devices = observed
-            .iter()
-            .map(|seen| {
-                let bdf = hipfire_config::devices::PciBdf::parse(&seen.pci_bus_id);
-                topology
-                    .iter()
-                    .find(|device| Some(device.bdf) == bdf)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "HIP logical device {} (PCI {}) is not in the KFD topology\n{}",
-                            seen.logical,
-                            seen.pci_bus_id,
-                            hipfire_config::devices::device_table(&topology)
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let devices = hipfire_config::devices::identify_observed(&root, &observed)?;
         locks.claim_all(&devices)?;
+        let source = match source {
+            IdentitySource::Kfd => "",
+            IdentitySource::Hip => " (identity from HIP: no KFD topology)",
+        };
         for (seen, device) in observed.iter().zip(&devices) {
             eprintln!(
-                "[devices] logical {}: HIP {} {} = index {} {}",
+                "[devices] logical {}: HIP {} {} = index {} {}{source}",
                 seen.logical,
                 seen.arch,
                 seen.pci_bus_id,
@@ -649,6 +496,39 @@ fn write_typed_error(
         retryable,
         rolled_back,
     );
+}
+
+/// The request's wire `seed`, or `None` after refusing an out-of-domain one
+/// (negative, fractional, non-numeric) with a typed `validation` error — a
+/// client fault, never an `internal` one.
+fn client_seed_or_refuse(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    seed: Option<&serde_json::Value>,
+) -> Option<Option<u64>> {
+    match parse_wire_seed(seed) {
+        Ok(seed) => Some(seed),
+        Err(reason) => {
+            write_typed_error(stdout, id, &reason, "validation", false, false);
+            None
+        }
+    }
+}
+
+/// Refuse an image sent to a model with no vision encoder: the client asked
+/// for a capability this load lacks (`unsupported`), not a server fault.
+fn refuse_image_without_vision(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    vision_gated_off: Option<&str>,
+) {
+    let message = match vision_gated_off {
+        Some(sidecar) => format!(
+            "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+        ),
+        None => "model has no vision encoder".to_owned(),
+    };
+    write_typed_error(stdout, id, &message, "unsupported", false, false);
 }
 
 /// Resident KV backend metadata for `loaded` ACK and `diag`.
@@ -753,21 +633,6 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 /// occupies `model` — that path tears down after successful new load.
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
-}
-
-/// Daemon-side `vision_mode` gate for the tower sidecar path.
-///
-/// `off` (the default) is a hard override that drops even an explicit
-/// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
-/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
-/// ladder result through untouched. Pure string plumbing — no arch or
-/// tensor knowledge; admission still validates the surviving path.
-fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Option<String> {
-    if vision_mode == "off" {
-        None
-    } else {
-        raw_vision
-    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -880,10 +745,20 @@ fn install_process_config(
 /// Read the first protocol message before GPU initialization. Native clients
 /// send `configure`; older/direct clients may send `load`, in which case the
 /// daemon resolves local TOML plus compatibility env itself and preserves the
-/// load as the first regular command.
+/// load as the first regular command. Also returns the model the client
+/// starts the daemon for, if it names one: `configure`'s optional `model`, or
+/// the startup `load`'s.
 fn receive_startup_config(
     stdout: &mut impl Write,
-) -> Result<Option<(hipfire_config::ProcessConfig, Option<DaemonMsg>, bool)>, String> {
+) -> Result<
+    Option<(
+        hipfire_config::ProcessConfig,
+        Option<DaemonMsg>,
+        bool,
+        Option<std::path::PathBuf>,
+    )>,
+    String,
+> {
     let stdin = std::io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::new();
@@ -914,6 +789,10 @@ fn receive_startup_config(
                 continue;
             }
         };
+        let model = msg
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(std::path::PathBuf::from);
         if msg.get("type").and_then(|value| value.as_str()) == Some("configure") {
             let config = serde_json::from_value::<hipfire_config::ProcessConfig>(
                 msg.get("config")
@@ -922,8 +801,9 @@ fn receive_startup_config(
             )
             .map_err(|error| format!("invalid process configuration: {error}"))?;
             config.validate().map_err(|error| error.to_string())?;
-            return Ok(Some((config, None, true)));
+            return Ok(Some((config, None, true, model)));
         }
+        let model = model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
         let config =
             hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
         let pending = match announce_generate_terminal(&msg) {
@@ -944,7 +824,7 @@ fn receive_startup_config(
             }
             None => DaemonMsg::Regular(msg),
         };
-        return Ok(Some((config, Some(pending), false)));
+        return Ok(Some((config, Some(pending), false, model)));
     }
 }
 
@@ -1051,7 +931,7 @@ fn main() {
     // context is created.
 
     let mut stdout = std::io::stdout();
-    let Some((process_config, pending_message, acknowledge_config)) =
+    let Some((process_config, pending_message, acknowledge_config, startup_model)) =
         receive_startup_config(&mut stdout).unwrap_or_else(|error| {
             eprintln!("FATAL: failed to resolve startup configuration: {error}");
             std::process::exit(1);
@@ -1068,10 +948,27 @@ fn main() {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
+    // The model the client starts this daemon for decides the host-memory
+    // switches the HIP runtime reads once, when it first loads just below.
+    if let Some(model) = &startup_model {
+        hipfire_loader::prepare_host_memory_for(model);
+    }
     reserve_and_verify_gpus(&mut gpu_locks).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
+    // Uncertified driver models (WSL2/ROCDXG, native Windows) refuse an
+    // explicit Redline backend outright; the per-load default falls back to
+    // the HIP graph instead (load handler).
+    if let Some(refusal) = hipfire_config::devices::redline_platform_refusal() {
+        let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(backend.as_str(), "redline" | "shadow") {
+            eprintln!("FATAL: replay.backend={backend} refused: {refusal}");
+            std::process::exit(1);
+        }
+    }
     if acknowledge_config {
         writeln!(
             stdout,
@@ -1472,37 +1369,38 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    // Effective KV selection for the slot engine. The capability
-                    // gate above already refused anything but q8/legacy;
-                    // these ride into EngineConfig so Rig::build fails closed.
-                    let slot_kv_mode = msg
-                        .get("params")
-                        .and_then(|p| p.get("kv_mode"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("q8");
-                    let slot_kv_backend = msg
-                        .get("params")
-                        .and_then(|p| p.get("kv_backend"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("legacy");
+                    let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    // Vision tower: the SAME ladder the ordinary arm applies
+                    // (`vision_mode=off` is a hard override). The slot engine
+                    // discovers the `.vl` sibling itself, so it has to be told
+                    // the mode — otherwise the documented text-only default
+                    // still pays the tower's ~1 GB on this route.
+                    let (slot_vision_mode, slot_vision, _) = resolve_vision_ladder(&msg);
                     match slots::SlotBackend::load(
                         path,
                         n_slots,
                         cap_tokens,
                         prefill_chunk,
-                        slot_kv_mode,
-                        slot_kv_backend,
+                        slot_params.mtp_k,
+                        &slot_params.kv_mode_raw,
+                        &slot_params.kv_backend,
+                        slot_params.dflash_draft,
+                        slot_params.dflash_required,
+                        &slot_vision_mode,
+                        slot_vision,
+                        slot_params.max_batch_tokens,
                     ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();
                             let layers = backend.layers();
                             let vocab = backend.vocab();
+                            let vl = backend.is_vl();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
                             resident_kv = Some(ResidentKvDiag {
-                                mode: Some("q8".to_owned()),
+                                mode: Some(slot_params.kv_mode_resolved.to_owned()),
                                 ..slot_kv_diag.clone()
                             });
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
@@ -1512,7 +1410,7 @@ fn main() {
                                 "dim": dim,
                                 "layers": layers,
                                 "vocab": vocab,
-                                "vl": false,
+                                "vl": vl,
                                 "reasoning_contract": "qwen_jinja",
                                 "reasoning_effort_native": false,
                                 "reasoning_efforts": [],
@@ -1525,7 +1423,7 @@ fn main() {
                                 "kv_backend_reason": slot_kv_diag.reason,
                                 "kv_backend_legacy": slot_kv_diag.legacy,
                                 "kv_backend_warning": slot_kv_diag.warning,
-                                "kv_mode": "q8",
+                                "kv_mode": slot_params.kv_mode_resolved,
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1659,32 +1557,11 @@ fn main() {
                 // sidecar is skipped, so a default load never pays the +~1 GB
                 // tower VRAM. CLI-side gating is the primary path; this guard
                 // makes the flag durable for non-hipfire-CLI clients.
-                let vision_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("vision_mode"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("off");
-                let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
-                let raw_vision: Option<String> = match env_vision.as_deref() {
-                    Some("") => None,
-                    Some(p) => Some(p.to_string()),
-                    None => msg
-                        .get("params")
-                        .and_then(|p| p.get("vision"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                };
-                vision_gated_off = None;
-                if vision_mode == "off" {
-                    if let Some(v) = raw_vision.as_deref() {
-                        eprintln!(
-                            "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
-                        );
-                        vision_gated_off = Some(v.to_string());
-                    }
-                }
-                let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
+                //
+                // One implementation for both load arms: `resolve_vision_ladder`
+                // (next to `apply_vision_mode_gate`).
+                let (vision_mode, vision_path, gated_off) = resolve_vision_ladder(&msg);
+                vision_gated_off = gated_off;
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
@@ -1752,6 +1629,21 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
+                // One warning line when the load names a deprecated KV format
+                // (kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do).
+                if let Some(warning) = [
+                    Some(kv_mode_override.as_deref().unwrap_or(
+                        hipfire_runtime::config::get().kv_mode.as_str(),
+                    )),
+                    kv_k_override.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(hipfire_runtime::kv_mode::deprecated_kv_name_warning)
+                {
+                    eprintln!("[hipfire-daemon] {warning}");
+                }
 
                 // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the
                 // HIPFIRE_KV_ADAPTIVE env. off|conservative|balanced|aggressive|
@@ -1779,6 +1671,16 @@ fn main() {
                     .map(|value| value as usize)
                     .unwrap_or(hipfire_runtime::config::get().mtp_k);
                 let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
+
+                // DFlash adaptive verify-block (opt-in, default off): clamp(ceil(τ̂)+2,
+                // 2, full) over the trailing 8 verify cycles, full below 2k ctx.
+                // Mutually exclusive with the retained-PM4 route (fixed B=16 shape);
+                // HIPFIRE_DFLASH_ADAPTIVE_B=0 forces fixed.
+                let adaptive_b = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_adaptive_b"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -1821,41 +1723,20 @@ fn main() {
                         .get("params")
                         .and_then(|p| p.get("dspark_mode"))
                         .and_then(|v| v.as_str())
-                        .and_then(|s| match s {
-                            "on" => Some(true),
-                            "off" => Some(false),
-                            _ => None, // "auto" → loader default
-                        }),
+                        .and_then(hipfire_config::parse_tri_state),
                     dspark_conf_threshold: msg
                         .get("params")
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
                     // DFlash mirrors mtp: on = fail closed on a missing/unloadable draft.
-                    dflash: match dflash_mode {
-                        "on" => Some(true),
-                        "off" => Some(false),
-                        _ => None, // "auto" → loader default
-                    },
-                    mtp: match mtp_mode.as_str() {
-                        "on" => Some(true),
-                        "off" => Some(false),
-                        _ => None, // "auto" → loader default
-                    },
+                    dflash: hipfire_config::parse_tri_state(dflash_mode),
+                    mtp: hipfire_config::parse_tri_state(&mtp_mode),
                     mtp_k: Some(mtp_k),
+                    dflash_adaptive_b: Some(adaptive_b),
                 };
 
-                // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
-                // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
-                // Accepted here; the generate loop will honor it in the
-                // 0.1.7-stable release where we port the demo's outer τ-window
-                // trip-wire (below 2.5 → shrink block to 8).
-                let _adaptive_b = msg
-                    .get("params")
-                    .and_then(|p| p.get("dflash_adaptive_b"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
                 // 0.1.7: TriAttention / CASK eviction protocol fields. When
                 // `cask_sidecar` is set, `load_model` sizes the KV cache to a
                 // *physical_cap* (budget+beta+safety, clamped to max_seq) instead
@@ -1900,6 +1781,13 @@ fn main() {
                     .and_then(|p| p.get("cask_fold_m"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(2) as usize;
+                // CASK/TriAttention eviction is deprecated (removal in 0.5.0):
+                // it still loads, but every opt-in gets exactly one warning line.
+                if cask_sidecar.is_some() || cask_enabled {
+                    eprintln!(
+                        "[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported (cask_sidecar/cask set at load)"
+                    );
+                }
                 // Known-broken combo guard: CASK m-folding + DFlash spec decode
                 // degenerates into single-token loops after the first eviction
                 // (the m-folded synthetic K/V rows are off the draft's trained
@@ -1944,6 +1832,7 @@ fn main() {
                     gpu.mmq_screen.threshold = v as f32;
                 }
 
+                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
                 // ── PFlash load-time params (Phase 4.0 #93) ──────────────
                 //
                 // Parse compression knobs per PRD §5.3.2. None of these
@@ -2031,6 +1920,13 @@ fn main() {
                     } else {
                         None
                     };
+                // PFlash is deprecated (removal in 0.5.0): it still loads, but
+                // every opt-in (prefill_compression != off) gets one warning line.
+                if pflash_mode_str != "off" {
+                    eprintln!(
+                        "[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression={pflash_mode_str} set at load)"
+                    );
+                }
 
                 // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
                 // single-GPU (no behavior change). pp > 1 routes through
@@ -2171,7 +2067,8 @@ fn main() {
                 };
                 let admission = match hipfire_loader::admission::admit_source_with_options(
                     path, tp, pp, backend_request, draft_path.as_deref(),
-                    gpu.arch.as_str(), vision_path.as_deref(), head_path.as_deref(), max_seq,
+                    gpu.arch.as_str(), vision_path.as_deref(), &vision_mode,
+                    head_path.as_deref(), max_seq,
                     hipfire_loader::admission::KvBackendHints {
                         kv_mode: kv_mode_override.as_deref(),
                         kv_k: kv_k_override.as_deref(),
@@ -2296,7 +2193,6 @@ fn main() {
                         mtp_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_k_override.as_deref(),
-                        kv_v_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
@@ -2342,7 +2238,10 @@ fn main() {
                             pp,
                             tp,
                             drafter.is_some(),
-                        );
+                        ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
+                            eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
+                            false
+                        });
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \
@@ -2366,7 +2265,7 @@ fn main() {
                         } else {
                             Default::default()
                         });
-                        let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                        let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // Apply MTP config from load-message params.
@@ -2842,11 +2741,32 @@ fn main() {
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
                 // Spawn a bounded request worker so the main loop continues accepting independent generates.
                 if let Some(slot) = slot_backend.clone() {
+                    // Bound thread creation BEFORE spawning (spec §5.3:
+                    // "a guard acquired inside an already spawned thread
+                    // does not bound thread creation"). The worker's own
+                    // acquire_guard remains the hard atomic bound; this
+                    // pre-check keeps an arrival burst from spawning a
+                    // thread per rejected request.
+                    if slot.active_count() >= 32 {
+                        hipfire_engine::emit::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            "too many concurrent slot requests (bounded worker limit hit)",
+                            // Overload, not validation: slot saturation is a
+                            // transient capacity condition → 429 + Retry-After.
+                            "overload",
+                            true,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        batch_clear_terminal(id, gen_attempt_id);
+                        continue;
+                    }
                     let msg_clone = msg.clone();
                     let id_owned = id.to_string();
                     let slot_clone = slot.clone();
                     let admission = admission;
-                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // Bounded: the backend's active counter bounds concurrency;
                     // engine itself is the only GPU worker, so workers serialize on engine submit.
                     std::thread::spawn(move || {
                         // Each worker uses its own stdout handle; every event is one serde JSON line.
@@ -3069,48 +2989,29 @@ fn main() {
                     continue;
                 };
 
-                // Sampling defaults differ by arch: qwen35 family was tuned
-                // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
-                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
-                // for local deployment, and lower values consistently fall
-                // into block-level attractors on this quantized instruct
-                // model. Pick arch-shaped defaults so a vanilla
-                // `/v1/chat/completions` POST (no sampling fields) works on
-                // both. Explicit per-request values still override either.
-                // Hardcoded arch ladder — the LAST-RESORT fallback for the
-                // sampling defaults. The author-recommended values baked into
-                // the .hfq `generation_config` (m.rec_temperature/m.rec_top_p,
-                // populated at load time via HfqFile::recommended_sampling) take
-                // precedence over this ladder; an explicit per-request field
-                // (set below via `msg.get(...)`) overrides both. The CLI's
-                // curated registry `recommended_settings` reach this handler as
-                // explicit request fields (CLI explicit-send guard), so they sit
-                // above the .hfq layer on that path.
+                // Sampling defaults (shared with the batch and multi-slot
+                // routes via `resolve_temp_top_p`): explicit request field >
+                // the .hfq-baked author recommendation (m.rec_temperature /
+                // m.rec_top_p, from HfqFile::recommended_sampling) > the
+                // carrier's arch ladder (qwen35 `temp=0.3, top_p=0.8`;
+                // DeepSeek V4 Flash `1.0/1.0`). The CLI's curated registry
+                // `recommended_settings` reach this handler as explicit
+                // request fields (CLI explicit-send guard).
                 let defaults = hipfire_loader::carrier_for(m.arch_id)
                     .map(|c| c.sampling_defaults())
                     .unwrap_or_default();
-                let (arch_default_temp, arch_default_top_p) = (defaults.temp, defaults.top_p);
-                // Layer the .hfq-baked author recommendation OVER the arch
-                // ladder. Per-knob: a model that bakes only `temperature` still
-                // gets the arch-ladder `top_p`.
-                let default_temp = m
-                    .rec_temperature
-                    .map(|x| x as f64)
-                    .unwrap_or(arch_default_temp);
-                let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
-                let temp = msg
-                    .get("temperature")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(default_temp) as f32;
+                let (temp, top_p) = hipfire_engine::scheduler::resolve_temp_top_p(
+                    &msg,
+                    m.arch_id,
+                    m.rec_temperature,
+                    m.rec_top_p,
+                );
                 let max_tokens = msg
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
+                    .map(|v| v as usize)
+                    .unwrap_or(hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS);
                 let _fit = request_guards::fit_max_tokens(&msg);
-                let top_p = msg
-                    .get("top_p")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(default_top_p) as f32;
                 // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
                 // default = lossless/distribution-preserving. >0 is deliberately lossy
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a
@@ -3313,16 +3214,7 @@ fn main() {
                     batch_scope.rebind_for(gen_attempt_id);
                 }
                 if has_image && !has_vl {
-                    match vision_gated_off.as_deref() {
-                        Some(sidecar) => write_error(
-                            &mut stdout,
-                            id,
-                            &format!(
-                                "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
-                            ),
-                        ),
-                        None => write_error(&mut stdout, id, "model has no vision encoder"),
-                    }
+                    refuse_image_without_vision(&mut stdout, id, vision_gated_off.as_deref());
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
                     // CLI rejects images in non-last turns, but a raw
@@ -3439,13 +3331,16 @@ fn main() {
                     }
                     let source = if let Some(b64) = image_base64 {
                         if b64.len() > MAX_BASE64_ENCODED_LEN {
-                            write_error(
+                            write_typed_error(
                                 &mut stdout,
                                 id,
                                 &format!(
                                     "image payload exceeds maximum encoded size ({} bytes)",
                                     MAX_BASE64_ENCODED_LEN,
                                 ),
+                                "validation",
+                                false,
+                                false,
                             );
                             continue;
                         }
@@ -3468,12 +3363,9 @@ fn main() {
                     // wire `seed` wins, else attempt key + counter entropy.
                     // Out-of-domain seeds (negative, fractional, non-numeric)
                     // are rejected — never silently treated as unseeded.
-                    let client_seed = match parse_wire_seed(msg.get("seed")) {
-                        Ok(s) => s,
-                        Err(reason) => {
-                            write_error(&mut stdout, id, &reason);
-                            continue;
-                        }
+                    let Some(client_seed) = client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                    else {
+                        continue;
                     };
                     let vl_request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
@@ -3693,17 +3585,11 @@ fn main() {
                             // Explicit wire `seed` must reach the lane RNG on
                             // the batched route too; out-of-domain values are
                             // rejected loudly, never silently unseeded.
-                            let client_seed = match parse_wire_seed(msg.get("seed")) {
-                                Ok(s) => s,
-                                Err(reason) => {
-                                    write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal_at_generation(
-                                        id,
-                                        gen_attempt_id,
-                                        admission,
-                                    );
-                                    continue;
-                                }
+                            let Some(client_seed) =
+                                client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                            else {
+                                batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
+                                continue;
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
@@ -3855,17 +3741,11 @@ fn main() {
                             // Explicit wire `seed` must reach the lane RNG on
                             // the batched route too; out-of-domain values are
                             // rejected loudly, never silently unseeded.
-                            let client_seed = match parse_wire_seed(msg.get("seed")) {
-                                Ok(s) => s,
-                                Err(reason) => {
-                                    write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal_at_generation(
-                                        id,
-                                        gen_attempt_id,
-                                        admission,
-                                    );
-                                    continue;
-                                }
+                            let Some(client_seed) =
+                                client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                            else {
+                                batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
+                                continue;
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
@@ -4038,12 +3918,9 @@ fn main() {
                     // streams. Out-of-domain seeds (negative, fractional,
                     // non-numeric) are rejected — never silently treated as
                     // unseeded.
-                    let client_seed = match parse_wire_seed(msg.get("seed")) {
-                        Ok(s) => s,
-                        Err(reason) => {
-                            write_error(&mut stdout, id, &reason);
-                            continue;
-                        }
+                    let Some(client_seed) = client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                    else {
+                        continue;
                     };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
@@ -5142,8 +5019,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_generate_terminal, apply_vision_mode_gate, emit_batch_admission_error,
-        require_wire_attempt_id, TERMINAL_TEST_LOCK,
+        announce_generate_terminal, apply_vision_mode_gate, client_seed_or_refuse,
+        emit_batch_admission_error, refuse_image_without_vision, require_wire_attempt_id,
+        TERMINAL_TEST_LOCK,
     };
     use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
@@ -5172,6 +5050,71 @@ mod tests {
             );
             assert_eq!(apply_vision_mode_gate(mode, None), None);
         }
+    }
+
+    fn error_events(output: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Client faults in the generate arm carry a client class (HTTP 400 at
+    /// the gateway), never `internal` (HTTP 500).
+    #[test]
+    fn generate_client_faults_are_typed_not_internal() {
+        let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One live generate attempt per refusal, as the generate arm has.
+        let announce = |id: &str| {
+            clear_terminal_control();
+            batch_clear_all_terminals();
+            set_active_attempt_id(7);
+            announce_generate_terminal(
+                &serde_json::json!({"type": "generate", "id": id, "attempt_id": 7}),
+            );
+        };
+        for seed in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("abc"),
+        ] {
+            announce("req-seed");
+            let _scope = BatchAttemptScope::enter_for("req-seed", 7);
+            let mut output = Vec::new();
+            assert_eq!(client_seed_or_refuse(&mut output, "req-seed", Some(&seed)), None);
+            let events = error_events(&output);
+            assert_eq!(events.len(), 1, "{seed}");
+            assert_eq!(events[0]["type"], "error");
+            assert_eq!(events[0]["id"], "req-seed");
+            assert_eq!(events[0]["attempt_id"], 7);
+            assert_eq!(events[0]["class"], "validation", "{seed}");
+        }
+        announce("req-seed");
+        let mut output = Vec::new();
+        assert_eq!(
+            client_seed_or_refuse(&mut output, "req-seed", Some(&serde_json::json!(42))),
+            Some(Some(42))
+        );
+        assert_eq!(client_seed_or_refuse(&mut output, "req-seed", None), Some(None));
+        assert!(output.is_empty(), "a valid or absent seed emits nothing");
+
+        for gated in [None, Some("/models/x-vision.hfq")] {
+            announce("req-img");
+            let _scope = BatchAttemptScope::enter_for("req-img", 7);
+            let mut output = Vec::new();
+            refuse_image_without_vision(&mut output, "req-img", gated);
+            let events = error_events(&output);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["class"], "unsupported");
+            assert!(events[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("model has no vision encoder"));
+        }
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
     }
 
     #[test]

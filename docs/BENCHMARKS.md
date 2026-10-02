@@ -26,9 +26,11 @@ do not carry that full identity manifest, so this page is **historical** only
    still not a product default or route certificate. Any product-default or
    admission claim **additionally** requires an explicit row in
    [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record — fail closed otherwise).
-2. Many older rows used the then-default `asym3` KV mode. Current clean configs
-   resolve `kv_cache=auto` through the model registry and otherwise fall back to
-   `q8`. Do not compare asym3 rows to q8 rows as one A/B.
+2. Many older rows used the then-default `asym3` KV mode, now legacy. Current
+   clean configs resolve `kv_cache=auto` through the model registry and
+   otherwise to the architecture default (Qwen native `fp8` on eligible exact
+   gfx1201, `q8` elsewhere). Do not compare asym3 rows to q8 or fp8 rows as
+   one A/B.
 3. Speed floors used by tooling live in `tests/speed-baselines/<arch>.txt` and
    are exercised by [`scripts/speed-gate.sh`](../scripts/speed-gate.sh) when that
    path’s policy applies. Those files are **not** reproduced here.

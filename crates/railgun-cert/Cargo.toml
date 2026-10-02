@@ -1,0 +1,23 @@
+[package]
+name = "railgun-cert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline railgun certifier: peacemaker A1/A3/A4 kernarg facts as a receipt `railgun` section, with the radiowave `.actual_access` differential (railgun design §1.5, G8)"
+publish = false
+
+# Offline only: no runtime crate may depend on this one (checked by
+# peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
+[dependencies]
+peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-lift = { path = "../peacemaker-lift" }
+radiowave = { path = "../radiowave" }
+railgun-corpus = { path = "../railgun-corpus" }
+rmpv = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+smallvec = "1"

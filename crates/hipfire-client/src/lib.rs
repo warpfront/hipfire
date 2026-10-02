@@ -61,6 +61,8 @@ pub mod error_class {
     pub const INTERNAL: &str = "internal";
     pub const ADAPTIVE_POISON: &str = "adaptive_poison";
     pub const DETERMINISTIC_MISMATCH: &str = "deterministic_mismatch";
+    /// Multi-slot engine capacity refusal (queue full, budget exhausted).
+    pub const OVERLOAD: &str = "overload";
 }
 
 #[derive(Debug, Error)]
@@ -545,17 +547,25 @@ impl Engine {
     /// environment map is reserved for non-hipfire bootstrap state inherited
     /// by external launchers. The daemon itself resolves `hardware.devices`,
     /// reserving the chosen cards in the same step, and lowers it to ROCr/HIP
-    /// visibility; resolving here could not hold those reservations.
+    /// visibility; resolving here could not hold those reservations. `model`
+    /// names the model the daemon is started for, which settles runtime
+    /// switches only readable before its GPU runtime loads (host memory for
+    /// a Qwen4 model on a discrete GPU).
     pub fn spawn_configured(
         daemon: impl AsRef<Path>,
         environment: &BTreeMap<String, String>,
         config: &hipfire_config::ProcessConfig,
+        model: Option<&Path>,
     ) -> Result<Self> {
         let engine = Self::spawn(daemon, environment)?;
-        let response = engine.request(&serde_json::json!({
+        let mut configure = serde_json::json!({
             "type": "configure",
             "config": config,
-        }))?;
+        });
+        if let Some(model) = model {
+            configure["model"] = serde_json::json!(model);
+        }
+        let response = engine.request(&configure)?;
         expect_type(&response, "configured")?;
         Ok(engine)
     }
@@ -752,12 +762,93 @@ impl Engine {
         self.generate_common(request, Some(cancelled), &mut event)
     }
 
-    fn generate_common(
+    /// Submit a generate request without blocking on its lifecycle.
+    ///
+    /// Registers a per-`(id, attempt_id)` channel with the reader-routing map
+    /// (the same registration [`Engine::generate`] performs), sends the request,
+    /// and returns the receiver. The caller drains lifecycle events
+    /// (`gen_start`, `token`, `reasoning`, `commit_ready`, `done`, `error`)
+    /// from the receiver and performs the commit handshake via
+    /// [`Engine::commit_attempt`] when `commit_ready` arrives.
+    ///
+    /// When the caller has finished draining (after `done` or `error`), it
+    /// MUST call [`Engine::release_attempt`] to remove the pending entry;
+    /// otherwise the entry leaks until the engine is dropped.
+    ///
+    /// To cancel an in-flight stream, call [`Engine::cancel_attempt`] and then
+    /// drain `aborted`/`done` from the returned receiver.
+    ///
+    /// **Interleaving constraint:** `generate`/`generate_cancellable` and
+    /// streaming submissions share the same `(id, attempt_id)` pending map.
+    /// An attempt may not be interleaved on the same id — a second submission
+    /// for a live key returns [`ClientError::Protocol`] with a
+    /// `duplicate live generate` message. Use a distinct `attempt_id` for a
+    /// new turn on the same conversation id.
+    pub fn submit_streaming(
         &self,
         request: &Value,
-        cancelled: Option<&AtomicBool>,
-        event: &mut dyn FnMut(&Value) -> Result<()>,
-    ) -> Result<Value> {
+    ) -> Result<(String, u64, mpsc::Receiver<Value>)> {
+        let (request_id, attempt_id, rx) = self.register_pending_channel(request)?;
+        if let Err(err) = self.send(request) {
+            self.inner
+                .dispatch
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&(request_id.clone(), attempt_id));
+            return Err(err);
+        }
+        Ok((request_id, attempt_id, rx))
+    }
+
+    /// Send a `commit` for a streaming attempt.
+    ///
+    /// Called after `commit_ready` is received on the stream's receiver. The
+    /// daemon responds with the final `done` on the same receiver.
+    pub fn commit_attempt(&self, id: &str, attempt_id: u64) -> Result<()> {
+        self.send(&serde_json::json!({
+            "type": "commit",
+            "id": id,
+            "attempt_id": attempt_id,
+        }))
+    }
+
+    /// Send an `abort` for a streaming attempt without blocking.
+    ///
+    /// Draining the resulting `aborted`/`done` events remains the caller's
+    /// job via the receiver returned by [`Engine::submit_streaming`]. After
+    /// draining, call [`Engine::release_attempt`] to clean up the pending
+    /// entry.
+    pub fn cancel_attempt(&self, id: &str, attempt_id: u64) -> Result<()> {
+        self.send(&serde_json::json!({
+            "type": "abort",
+            "id": id,
+            "attempt_id": attempt_id,
+        }))
+    }
+
+    /// Remove a streaming attempt's pending channel entry.
+    ///
+    /// Must be called after the caller has finished draining the receiver
+    /// returned by [`Engine::submit_streaming`] (terminal `done` or `error`,
+    /// or `done` after [`Engine::cancel_attempt`]). Failing to call this leaks
+    /// the entry until the engine is dropped.
+    pub fn release_attempt(&self, id: &str, attempt_id: u64) {
+        self.inner
+            .dispatch
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(id.to_owned(), attempt_id));
+    }
+
+    /// Extract `(request_id, attempt_id)` from a generate request, create a
+    /// channel, and register it with the reader-routing pending map. Shared
+    /// by [`Engine::generate_common`] and [`Engine::submit_streaming`].
+    fn register_pending_channel(
+        &self,
+        request: &Value,
+    ) -> Result<(String, u64, mpsc::Receiver<Value>)> {
         let request_id = request
             .get("id")
             .and_then(Value::as_str)
@@ -766,9 +857,6 @@ impl Engine {
             .to_owned();
         let attempt_id = require_attempt_id(request.get("attempt_id"))
             .map_err(|reason| ClientError::Protocol(format!("generate request {reason}")))?;
-        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err(ClientError::Cancelled);
-        }
         let (tx, rx) = mpsc::channel();
         {
             let mut map = self.inner.dispatch.pending.lock().unwrap();
@@ -782,6 +870,19 @@ impl Engine {
             }
             map.insert(key, tx);
         }
+        Ok((request_id, attempt_id, rx))
+    }
+
+    fn generate_common(
+        &self,
+        request: &Value,
+        cancelled: Option<&AtomicBool>,
+        event: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(ClientError::Cancelled);
+        }
+        let (request_id, attempt_id, rx) = self.register_pending_channel(request)?;
         *self.inner.active_attempt_id.lock().unwrap() = Some(attempt_id);
         if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             self.inner
@@ -2378,7 +2479,7 @@ done
         const MAX_ATTEMPTS: usize = 8;
         let mut last = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match Engine::spawn_configured(daemon, &BTreeMap::new(), config) {
+            match Engine::spawn_configured(daemon, &BTreeMap::new(), config, None) {
                 Ok(engine) => return engine,
                 Err(ClientError::Spawn { source, path })
                     if source.raw_os_error() == Some(ETXTBSY) =>
@@ -3787,5 +3888,64 @@ done
             .spawn()
             .expect("true");
         child.stdout.take().expect("stdout")
+    }
+
+    /// `register_pending_channel` is the shared seam between `generate_common`
+    /// and `submit_streaming`. A duplicate live key must be rejected without
+    /// disturbing the original entry, and `release_attempt` must clean up so a
+    /// subsequent registration on the same key succeeds.
+    #[test]
+    fn streaming_registration_rejects_duplicate_and_release_allows_reuse() {
+        let engine = dummy_engine();
+        let req = serde_json::json!({
+            "type": "generate",
+            "id": "stream-test-1",
+            "attempt_id": 1,
+            "prompt": "hello",
+        });
+        // First registration succeeds.
+        let (id, attempt_id, _rx) = engine
+            .register_pending_channel(&req)
+            .expect("first registration");
+        assert_eq!(id, "stream-test-1");
+        assert_eq!(attempt_id, 1);
+        // Duplicate key is rejected; the original entry is left intact.
+        let err = engine
+            .register_pending_channel(&req)
+            .expect_err("duplicate rejected");
+        assert!(err.to_string().contains("duplicate live generate"), "{err}");
+        // Release the entry.
+        engine.release_attempt(&id, attempt_id);
+        // Re-registration on the same key now succeeds.
+        let (_, _, _) = engine
+            .register_pending_channel(&req)
+            .expect("re-registration after release");
+        engine.release_attempt("stream-test-1", 1);
+    }
+
+    /// `submit_streaming` requires a non-empty id and a numeric attempt_id,
+    /// matching `generate`'s validation.
+    #[test]
+    fn streaming_rejects_missing_id_and_attempt() {
+        let engine = dummy_engine();
+        let no_id = serde_json::json!({
+            "type": "generate",
+            "attempt_id": 1,
+            "prompt": "hello",
+        });
+        let err = engine
+            .register_pending_channel(&no_id)
+            .expect_err("missing id rejected");
+        assert!(err.to_string().contains("missing id"), "{err}");
+
+        let no_attempt = serde_json::json!({
+            "type": "generate",
+            "id": "x",
+            "prompt": "hello",
+        });
+        let err = engine
+            .register_pending_channel(&no_attempt)
+            .expect_err("missing attempt_id rejected");
+        assert!(err.to_string().contains("attempt_id"), "{err}");
     }
 }

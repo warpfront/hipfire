@@ -8,14 +8,15 @@
 //! - page/chunk boundary growth preserves prior bytes
 //! - grow-past-reserve fails without invalidating the mapped allocation
 //! - owner teardown releases the arena (is_released)
-//! - unload/recreate works after release
+//! - unload/recreate works after release, and the recreated arena never gets
+//!   the released arena's VA back (it is retired, not freed)
 //! - a deterministic map failure leaves a clean arena that can still grow/release
 //!
 //! Device selection (parent GPU-2 route):
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p hip-bridge --example vmm_arena_smoke
 //! Optional knobs: HIPFIRE_VMM_ACCESS_DEVICE, HIPFIRE_VMM_FIRST_BYTES, HIPFIRE_VMM_SECOND_BYTES
 
-use hip_bridge::{HipRuntime, VmmArena};
+use hip_bridge::{retired_va_bytes, HipRuntime, VmmArena};
 
 const DEFAULT_CHUNK_BYTES: usize = 2 << 20;
 
@@ -119,7 +120,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- owner teardown releases allocation ---
+    let released = (
+        arena.base_address(),
+        arena.base_address() + arena.reserved_bytes(),
+    );
+    let retired_before = retired_va_bytes();
     arena.release(&hip)?;
+    assert_eq!(
+        retired_va_bytes(),
+        retired_before + (released.1 - released.0)
+    );
     assert!(arena.is_released());
     assert_eq!(arena.mapped_bytes(), 0);
     assert_eq!(arena.reserved_bytes(), 0);
@@ -127,6 +137,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- unload / recreate ---
     let mut arena2 = VmmArena::reserve(&hip, device, first_bytes)?;
+    let (lo, hi) = (
+        arena2.base_address(),
+        arena2.base_address() + arena2.reserved_bytes(),
+    );
+    assert!(
+        hi <= released.0 || lo >= released.1,
+        "re-reserved VA 0x{lo:x}..0x{hi:x} overlaps released 0x{:x}..0x{:x}",
+        released.0,
+        released.1
+    );
     arena2.map_next(&hip, first_bytes, &access)?;
     let buf2 = arena2.buffer(first_bytes)?;
     let p2 = pattern(first_bytes, 5, 9);

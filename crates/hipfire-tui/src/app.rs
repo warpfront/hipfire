@@ -1172,19 +1172,32 @@ impl App {
     fn persist_setting(&mut self, key: &str, raw: &str) -> (bool, String) {
         match writer::write_value(&self.paths.config, key, raw) {
             Ok(value) => {
+                // A cleared value arrives as `Null`: the writer dropped the key
+                // from the file. `Value::Null`'s own `to_string()` is the string
+                // "null", which would land in `values` and render as "null on
+                // GPU" — the row's label reads "" as unset, so store that instead.
+                let cleared = matches!(value, serde_json::Value::Null);
                 let as_str = match &value {
                     serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
                     other => other.to_string(),
                 };
                 if key == "default_model" {
                     self.config.default_model = as_str.clone();
                 }
                 self.config.values.insert(key.to_string(), as_str.clone());
-                // The key is now explicitly on disk -> an override, so a
-                // following Delete/Backspace can reset it this session (without
-                // it, is_override() stays false until the next full reload and
-                // reset wrongly reports "already at its default").
-                self.config.overrides.insert(key.to_string());
+                // An override marker means "this key is explicitly on disk", so
+                // it has to follow the write: a key that was just cleared is back
+                // to its default and must not keep claiming to be changed.
+                // Setting it (rather than leaving it alone) is what lets a
+                // following Delete/Backspace reset the key this session —
+                // without it, is_override() stays false until the next full
+                // reload and reset wrongly reports "already at its default".
+                if cleared {
+                    self.config.overrides.remove(key);
+                } else {
+                    self.config.overrides.insert(key.to_string());
+                }
                 self.config.loaded_from_disk = true;
                 // Honest pflash state: turning compression on without a drafter is
                 // a no-op until a prefill_drafter (.hfq) is set.
@@ -1521,7 +1534,11 @@ impl App {
                     ChatEvent::Done => {
                         // Normalize empty reasoning to None so serialization omits it.
                         if let Some(last) = self.chat.messages.last_mut() {
-                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                            if last
+                                .reasoning_content
+                                .as_deref()
+                                .is_some_and(|s| s.is_empty())
+                            {
                                 last.reasoning_content = None;
                             }
                         }
@@ -1536,7 +1553,11 @@ impl App {
                     ChatEvent::Error(err) => {
                         // Normalize empty reasoning as with Done.
                         if let Some(last) = self.chat.messages.last_mut() {
-                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                            if last
+                                .reasoning_content
+                                .as_deref()
+                                .is_some_and(|s| s.is_empty())
+                            {
                                 last.reasoning_content = None;
                             }
                         }
@@ -2171,6 +2192,251 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The reported bug: the offload row appeared in the easy list but Enter did
+    /// nothing and no value could be typed, because it had no `EDITABLE_FIELDS`
+    /// spec. Drive the real key path end to end.
+    #[test]
+    fn easy_offload_row_accepts_a_typed_value() {
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        let idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("gpu_layer_budget")))
+            .expect("offload row is in the easy list");
+        app.settings_selected = idx;
+
+        // Enter must open an edit buffer for this row, not refuse it.
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_some(),
+            "Enter on the offload row must start an edit; it was refusing before"
+        );
+
+        // Typed digits must reach the buffer.
+        for c in ['3', '2'] {
+            app.handle_settings_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.settings_edit.as_ref().map(|e| e.buffer.as_str()),
+            Some("32"),
+            "typed characters must reach the edit buffer"
+        );
+
+        // Enter commits.
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(app.settings_edit.is_none(), "a valid value must commit");
+        assert_eq!(
+            app.config
+                .values
+                .get("gpu_layer_budget")
+                .map(String::as_str),
+            Some("32"),
+            "the committed value must land in the in-memory config"
+        );
+        let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(
+            on_disk.contains("gpu_layer_budget") && on_disk.contains("32"),
+            "the value must be persisted to config.toml, got: {on_disk}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_the_offload_row_returns_it_to_unset() {
+        // The clear spelling the writer documents is `null`. It must leave the
+        // row rendering as unset and the key off disk — not "null on GPU" with a
+        // override marker claiming a value that is not there, and not a buffer
+        // that seeds the next edit with the literal `null`.
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        let idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("gpu_layer_budget")))
+            .expect("offload row is in the easy list");
+        app.settings_selected = idx;
+        app.handle_settings_key(key(KeyCode::Enter));
+        for c in ['3', '2'] {
+            app.handle_settings_key(key(KeyCode::Char(c)));
+        }
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.easy_rows()[idx].1,
+            "32 on GPU",
+            "a set budget renders its count"
+        );
+        assert!(
+            app.config.easy_override_state()[idx],
+            "a written key is an override"
+        );
+
+        // Clear it the direct way: erase the seeded value and commit the empty
+        // buffer, which IS the unset spelling.
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.settings_edit.as_ref().map(|e| e.buffer.as_str()),
+            Some("32"),
+            "the editor seeds from the current value so it can be corrected in place"
+        );
+        for _ in 0..2 {
+            app.handle_settings_key(key(KeyCode::Backspace));
+        }
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_none(),
+            "an emptied buffer must clear and close, not error"
+        );
+        assert_eq!(
+            app.config
+                .values
+                .get("gpu_layer_budget")
+                .map(String::as_str),
+            Some(""),
+            "a cleared value is the unset spelling, not the string \"null\""
+        );
+        assert_eq!(
+            app.config.easy_rows()[idx].1,
+            "all on GPU",
+            "a cleared row must render as unset"
+        );
+        assert!(
+            !app.config.easy_override_state()[idx],
+            "a cleared key is back to its default and must not show a change marker"
+        );
+        let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(
+            !on_disk.contains("gpu_layer_budget"),
+            "the cleared key must be off disk, got: {on_disk}"
+        );
+
+        // The documented `null` spelling clears too, and leaves the same state.
+        app.handle_settings_key(key(KeyCode::Enter));
+        for c in ['n', 'u', 'l', 'l'] {
+            app.handle_settings_key(key(KeyCode::Char(c)));
+        }
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_none(),
+            "the documented clear spelling must commit"
+        );
+        assert_eq!(
+            app.config.easy_rows()[idx].1,
+            "all on GPU",
+            "the null spelling clears to the same unset state"
+        );
+
+        // The next edit seeds from the unset state, so a typed value is the value.
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.settings_edit.as_ref().map(|e| e.buffer.as_str()),
+            Some(""),
+            "the editor must seed from the unset state, not from \"null\""
+        );
+        for c in ['8'] {
+            app.handle_settings_key(key(KeyCode::Char(c)));
+        }
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.easy_rows()[idx].1,
+            "8 on GPU",
+            "typing after a clear must set the value, not append to a stale one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enter on a row the user never typed into (it opened empty because the
+    /// value is unset) must not be an error: the empty buffer IS the unset
+    /// spelling, so committing it clears — and clearing an already-unset key is a
+    /// no-op that closes the editor.
+    #[test]
+    fn enter_on_an_unset_row_commits_a_noop_instead_of_erroring() {
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        let idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("gpu_layer_budget")))
+            .expect("offload row is in the easy list");
+        app.settings_selected = idx;
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.settings_edit.as_ref().map(|e| e.buffer.as_str()),
+            Some(""),
+            "an unset row opens an empty buffer"
+        );
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.settings_edit.is_none(),
+            "an untouched unset row must close on Enter, not stay in an error state"
+        );
+        assert!(
+            !matches!(app.toast.as_ref().map(|t| t.level), Some(ToastLevel::Error)),
+            "nothing was changed, so nothing should be reported as invalid"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn easy_offload_exec_row_cycles_and_commits_every_schema_value() {
+        // The new row is the enum half of the offload decision: it must be in the
+        // easy list, resolve to a spec, cycle through the schema's own values, and
+        // persist by Enter.
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        let idx = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("offload_exec")))
+            .expect("offload_exec row is in the easy list");
+        app.settings_selected = idx;
+        assert!(
+            crate::hipfire::writer::field_spec("offload_exec").is_some(),
+            "the row must be inline-editable"
+        );
+
+        // Right stages a preview (no write), Enter commits it.
+        assert_eq!(app.config.easy_rows()[idx].1, "over PCIe");
+        app.handle_settings_key(key(KeyCode::Right));
+        assert_eq!(
+            app.settings_pending.as_ref().map(|p| p.value.as_str()),
+            Some("cpu"),
+            "cycling must move to the schema's next value"
+        );
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.values.get("offload_exec").map(String::as_str),
+            Some("cpu")
+        );
+        assert_eq!(app.config.easy_rows()[idx].1, "on CPU");
+        assert!(
+            app.config.easy_override_state()[idx],
+            "a written key is an override"
+        );
+        let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(
+            on_disk.contains("offload_exec") && on_disk.contains("cpu"),
+            "the value must be persisted, got: {on_disk}"
+        );
+
+        // Cycling past the end wraps to the other value and back.
+        app.handle_settings_key(key(KeyCode::Right));
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.values.get("offload_exec").map(String::as_str),
+            Some("pcie")
+        );
+        assert_eq!(app.config.easy_rows()[idx].1, "over PCIe");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn failed_save_keeps_edit_buffer() {
         // F4: a rejected value (out of range) on Enter must KEEP settings_edit
@@ -2491,7 +2757,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
-            reasoning_content: None, // empty slot, no deltas streamed
+                reasoning_content: None, // empty slot, no deltas streamed
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2635,7 +2901,10 @@ mod tests {
             Some("think step"),
             "reasoning deltas accumulated separately"
         );
-        assert_eq!(last.content, "answer", "content deltas accumulated separately");
+        assert_eq!(
+            last.content, "answer",
+            "content deltas accumulated separately"
+        );
         // Serialized request keeps them as distinct keys for prefix-cache.
         let v = serde_json::to_value(&*app.chat.messages).unwrap();
         let asst = &v[1];
@@ -2683,7 +2952,13 @@ mod tests {
         tx.send(ChatEvent::Content("hi".into())).unwrap();
         tx.send(ChatEvent::Done).unwrap();
         app.drain_chat_events();
-        assert!(app.chat.messages.last().unwrap().reasoning_content.is_none());
+        assert!(app
+            .chat
+            .messages
+            .last()
+            .unwrap()
+            .reasoning_content
+            .is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

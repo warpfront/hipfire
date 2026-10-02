@@ -1,10 +1,14 @@
 ﻿﻿# hipfire installer for Windows — detects GPU, builds binaries + indexed kernels.
 # Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
+# A -Tag (or a tag-named -Ref) installs that release's prebuilt kernel pack when it
+# verifies against the checkout; otherwise, or with -CompileKernels, hipcc compiles them.
 param(
     [string]$Ref,
     [string]$Branch,
     [string]$Tag,
-    [string]$Commit
+    [string]$Commit,
+    [switch]$CompileKernels,
+    [string]$KernelPackUrl
 )
 
 $ErrorActionPreference = "Stop"
@@ -469,34 +473,67 @@ if (Test-Path $LegacyWrapper) { Remove-Item $LegacyWrapper -Force }
 Write-Host "  Native CLI: $BinDir\hipfire.exe ✓" -ForegroundColor Green
 
 # ─── Indexed kernel package ──────────────────────────────
-# The daemon resolves the active GPU architecture and builds the exact Rust
-# registry using the same pack_to implementation as hipfire-kernel-pack.
-# Never seed unindexed .hsaco files from an unrelated source checkout.
+# A release tag's prebuilt pack is used when `hipfire kernel-pack install`
+# verifies its SHA-256, manifest, ROCm range and every index against this
+# checkout. Otherwise the daemon resolves the active GPU architecture and
+# builds the exact Rust registry using the same pack_to implementation as
+# hipfire-kernel-pack. Never seed unindexed .hsaco files from an unrelated
+# source checkout.
 $DaemonExe = "$BinDir\daemon.exe"
+$AdmittedArches = @("gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942")
 if (Test-Path $DaemonExe) {
-    Write-Host ""
-    Write-Host "Packaging indexed GPU kernels from the exact-source registry..." -ForegroundColor Cyan
-    $hipccAvailable = $false
-    if ($env:HIPFIRE_HIPCC -and (Test-Path $env:HIPFIRE_HIPCC)) { $hipccAvailable = $true }
-    elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.bat"))) { $hipccAvailable = $true }
-    elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.exe"))) { $hipccAvailable = $true }
-    elseif (Get-Command hipcc -ErrorAction SilentlyContinue) { $hipccAvailable = $true }
-    elseif (Test-Path "C:\Program Files\AMD\ROCm") {
-        $rocmHipcc = Get-ChildItem "C:\Program Files\AMD\ROCm" -Recurse -Filter "hipcc.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($rocmHipcc) { $hipccAvailable = $true }
-    }
-
-    if (-not $hipccAvailable) {
-        throw "hipcc is required to build indexed kernel packages. Install the AMD HIP SDK and re-run this installer; unindexed .hsaco files cannot load compiler-free."
-    }
-    if ($GpuArch -in @("gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942")) {
-        & $DaemonExe --precompile
-        if ($LASTEXITCODE -ne 0) {
-            throw "Indexed kernel packaging failed (exit $LASTEXITCODE). No compiler-free install was produced."
+    $PackInstalled = $false
+    if ($InstallRefKind -eq "tag" -and -not $CompileKernels -and $GpuArch -in $AdmittedArches) {
+        Write-Host ""
+        Write-Host "Installing prebuilt kernel pack $InstallRef for $GpuArch..." -ForegroundColor Cyan
+        $PackArgs = @(
+            "kernel-pack", "install",
+            "--tag", $InstallRef,
+            "--arch", $GpuArch,
+            "--source", $RepoDir,
+            "--dest", "$BinDir\kernels\compiled\$GpuArch"
+        )
+        if ($KernelPackUrl) { $PackArgs += @("--url", $KernelPackUrl) }
+        # Native stderr must not become a terminating error (see Invoke-Git).
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & "$BinDir\hipfire.exe" @PackArgs
+            $PackInstalled = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $prev
         }
-        Write-Host "  Indexed kernel package complete ✓" -ForegroundColor Green
-    } else {
-        Write-Warning "No indexed kernel registry for $GpuArch; this GPU requires hipcc JIT. Compiler-free operation is unavailable."
+        if ($PackInstalled) {
+            Write-Host "  Kernel pack verified and installed ✓" -ForegroundColor Green
+        } else {
+            Write-Warning "Kernel pack not used (reason above); compiling kernels locally."
+        }
+    }
+    if (-not $PackInstalled) {
+        Write-Host ""
+        Write-Host "Packaging indexed GPU kernels from the exact-source registry..." -ForegroundColor Cyan
+        $hipccAvailable = $false
+        if ($env:HIPFIRE_HIPCC -and (Test-Path $env:HIPFIRE_HIPCC)) { $hipccAvailable = $true }
+        elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.bat"))) { $hipccAvailable = $true }
+        elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.exe"))) { $hipccAvailable = $true }
+        elseif (Get-Command hipcc -ErrorAction SilentlyContinue) { $hipccAvailable = $true }
+        elseif (Test-Path "C:\Program Files\AMD\ROCm") {
+            $rocmHipcc = Get-ChildItem "C:\Program Files\AMD\ROCm" -Recurse -Filter "hipcc.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($rocmHipcc) { $hipccAvailable = $true }
+        }
+
+        if (-not $hipccAvailable) {
+            throw "hipcc is required to build indexed kernel packages. Install the AMD HIP SDK and re-run this installer; unindexed .hsaco files cannot load compiler-free."
+        }
+        if ($GpuArch -in $AdmittedArches) {
+            & $DaemonExe --precompile
+            if ($LASTEXITCODE -ne 0) {
+                throw "Indexed kernel packaging failed (exit $LASTEXITCODE). No compiler-free install was produced."
+            }
+            Write-Host "  Indexed kernel package complete ✓" -ForegroundColor Green
+        } else {
+            Write-Warning "No indexed kernel registry for $GpuArch; this GPU requires hipcc JIT. Compiler-free operation is unavailable."
+        }
     }
 }
 

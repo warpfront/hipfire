@@ -21,17 +21,17 @@ use std::ffi::c_void;
 use crate::dispatch::{Gpu, GpuTensor};
 use hip_bridge::HipResult;
 
-const FA_PREP_BATCHED_SRC: &str =
+pub(crate) const FA_PREP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip");
 /// gfx1151 twin: the same source under its own symbol, so either arch's
 /// kernel can change without touching the other's object.
-const FA_PREP_BATCHED_GFX1151_SRC: &str = concat!(
+pub(crate) const FA_PREP_BATCHED_GFX1151_SRC: &str = concat!(
     "#define QWEN35_FA_PREP_BATCHED_KERNEL qwen35_fa_prep_batched_gfx1151\n",
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip")
 );
-const KV_PAIR_BATCHED_SRC: &str =
+pub(crate) const KV_PAIR_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_pair_batched.gfx1100.hip");
-const FA_PREP_BATCHED_GFX1201_SRC: &str =
+pub(crate) const FA_PREP_BATCHED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip");
 
 /// Output of the gfx1201 fused FA prep for the Q rows.

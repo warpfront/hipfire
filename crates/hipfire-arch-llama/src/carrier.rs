@@ -685,7 +685,6 @@ fn resolve_llama_family_kv_mode(
     }
 }
 
-
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
     if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Legacy {
         return Err("llama: no VMM KV owner; admit legacy before carrier load".into());
@@ -757,26 +756,24 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 }
             };
             let dims = llama_kv_dims(&config, ctx.max_seq, None);
-            let kv = match <KvCache as KvCacheExt>::from_mode(
-                kv_mode,
-                KvTarget::Single(ctx.gpu),
-                &dims,
-            ) {
-                Ok(kv) => kv,
-                Err(error) => {
-                    scratch.free_gpu(ctx.gpu);
-                    let rollback = if let Some(transaction) = weight_store.take() {
-                        transaction.rollback(ctx.gpu)
-                    } else {
-                        Ok(())
-                    };
-                    weights.free_gpu(ctx.gpu);
-                    return Err(with_weight_rollback_error(
-                        format!("llama: <KvCache as KvCacheExt>::from_mode failed: {error}"),
-                        rollback,
-                    ));
-                }
-            };
+            let kv =
+                match <KvCache as KvCacheExt>::from_mode(kv_mode, KvTarget::Single(ctx.gpu), &dims)
+                {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        scratch.free_gpu(ctx.gpu);
+                        let rollback = if let Some(transaction) = weight_store.take() {
+                            transaction.rollback(ctx.gpu)
+                        } else {
+                            Ok(())
+                        };
+                        weights.free_gpu(ctx.gpu);
+                        return Err(with_weight_rollback_error(
+                            format!("llama: <KvCache as KvCacheExt>::from_mode failed: {error}"),
+                            rollback,
+                        ));
+                    }
+                };
             (
                 config,
                 weights,
@@ -802,8 +799,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
             let dims = llama_kv_dims(&config, ctx.max_seq, Some(ctx.max_seq));
             let kv =
-                match <KvCache as KvCacheExt>::from_mode(mode, KvTarget::Single(ctx.gpu), &dims)
-                {
+                match <KvCache as KvCacheExt>::from_mode(mode, KvTarget::Single(ctx.gpu), &dims) {
                     Ok(kv) => kv,
                     Err(error) => {
                         weights.free_gpu(ctx.gpu);
@@ -1232,6 +1228,7 @@ mod tests {
             qwen_default_q8: true,
             vision_path: None,
             mtp_path: None,
+            vision_mode: "auto".to_string(),
             cask,
             pp: 1,
             spec: SpecLoadCfg::default(),

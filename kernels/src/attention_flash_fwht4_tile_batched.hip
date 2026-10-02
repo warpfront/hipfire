@@ -14,6 +14,9 @@
 // Per-thread writes 2 halves × 4 dims per half.
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
+#ifdef HIPFIRE_KV_SLOT_PAGED
+#include "kv_slot_desc_paged.h"
+#endif
 
 // Tree-attention mode contract matches attention_flash_asym4_tile_batched:
 // tree_bias != nullptr → seq_len extends to (block_start + block_cols)
@@ -38,7 +41,16 @@ __global__ void attention_flash_fwht4_tile_batched(
     int batch_offset,
     int block_start,
     int block_cols,
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    int v_mode,                                // 8 = Q8_0 V (only mode for fwht4; lloyd4 is Task 6)
+    int /*window*/,                            // consumed-but-unused: keeps this
+                                               // positionally aligned with
+                                               // slot_descs/row_slot below
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [total_batch] or nullptr = legacy
+#else
     int v_mode                                 // 8 = Q8_0 V (only mode for fwht4; lloyd4 is Task 6)
+#endif
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -56,6 +68,18 @@ __global__ void attention_flash_fwht4_tile_batched(
     // Eager (non-capture) value is identical, so this is a no-op off-graph.
     const int eff_block_start = tree_mode ? positions[0] : block_start;
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
+#ifdef HIPFIRE_KV_SLOT_PAGED
+
+    // Multi-slot descriptor synthesis — same contract as
+    // attention_flash_asym3_tile_batched.hip: row_slot[global_bid] picks the
+    // slot, `desc` supplies ONLY the K/V base addresses (kv_offset_for_*),
+    // and the row's causal bound stays `positions[global_bid] + 1`, never
+    // desc.seq_len.
+    const int slot = (row_slot != nullptr) ? row_slot[global_bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+#endif
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
@@ -97,7 +121,11 @@ __global__ void attention_flash_fwht4_tile_batched(
     // Phase A: Q·K (4-bit K)
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+#ifdef HIPFIRE_KV_SLOT_PAGED
+        const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+#else
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+#endif
         float cnorm = *(const float*)kb;
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
@@ -151,7 +179,11 @@ __global__ void attention_flash_fwht4_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
+#ifdef HIPFIRE_KV_SLOT_PAGED
+            const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+#else
             const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+#endif
             for (int half = 0; half < n_halves; half++) {
                 const int d_base = half * 128 + tid * 4;
                 const int v_bi       = d_base / 32;
@@ -183,7 +215,11 @@ __global__ void attention_flash_fwht4_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
+#ifdef HIPFIRE_KV_SLOT_PAGED
+            const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_bytes_per_pos) + v_head_off;
+#else
             const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
+#endif
             float cnorm = *(const float*)vb;
             const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
             unsigned int packed = (unsigned int)base[0];

@@ -2076,7 +2076,7 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            let grouped = matches!(route, Some(MoeRouteCapability::Qt44Qt53Grouped));
+            let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
             // The grouped top-10 router rounds each logit it reads itself.
             if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
@@ -2166,6 +2166,23 @@ pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<
     call.validate_for_gpu(gpu)?;
     call.note_retained_route_identity(gpu)?;
     moe_program::execute(gpu, call)
+}
+
+/// [`execute_sealed`] for a call that directly follows `Step::Clear(clear)`
+/// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the zero fill is either taken over by
+/// the combine or launched here, first.  With the HC write `hc` (whose gates
+/// are ready; `HIPFIRE_QWEN4_HC_FUSE` >= 3) offered to the shared down, returns
+/// whether that stage carried the write; see
+/// [`moe_program::execute_after_clear`].
+pub(crate) fn execute_sealed_after_clear(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+    clear: &super::layer_ops::ClearOp<'_>,
+    hc: Option<&super::layer_ops::HyperWriteOp<'_>>,
+) -> Result<bool, DispatchError> {
+    call.validate_for_gpu(gpu)?;
+    call.note_retained_route_identity(gpu)?;
+    moe_program::execute_after_clear(gpu, call, clear, hc)
 }
 
 impl SealedMoeCall<'_> {
@@ -6493,6 +6510,7 @@ mod tests {
             x_rot_batch: &s.x_rot_batch,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_stage_ptrs: None,
             routed_experts: routed,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,

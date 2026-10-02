@@ -294,6 +294,45 @@ fn audit_kernel(symbol:&str, insns:&[Insn], metadata:&radiowave::KernelReport, i
         private_segment_fixed_size:metadata.private_segment_fixed_size,vgpr_spill_count:metadata.vgpr_spill_count,
         sgpr_spill_count:metadata.sgpr_spill_count,loops,hot_loop,findings}
 }
+/// Finding kind: some CFG path (loop back-edges included) reaches a workgroup
+/// barrier (`s_barrier`, `s_barrier_signal`, `s_barrier_wait`) with a DS store
+/// or atomic whose LGKMcnt (gfx11) / DScnt (gfx12) has not been drained. A
+/// barrier carries no memory wait of its own, so a wave on the other CU of a
+/// WGP can read LDS before that store lands (the pre-`1ba84942a` VerifyAttn
+/// race). The facts are peacemaker-ir's, not a second analysis: the code
+/// object is lifted byte-exactly, `passes::waits` replays every counter to a
+/// CFG fixpoint, and `passes::barriers` reports such a barrier as
+/// `barrier-ds-pending`. No ROCm toolchain is involved.
+pub const LDS_BARRIER_FINDING: &str = "lds_store_unwaited_at_barrier";
+#[derive(Debug, Serialize)]
+pub struct LdsBarrierSite { pub kernel: String, pub pc: u64, pub detail: String }
+#[derive(Debug, Default, Serialize)]
+pub struct LdsBarrierScan { pub arch: String, pub kernels: usize, pub barrier_kernels: usize, pub barriers: usize, pub sites: Vec<LdsBarrierSite> }
+/// Run the `lds_store_unwaited_at_barrier` check over every kernel of a HIP
+/// offload bundle or device ELF. A module the lifter rejects is an error, never
+/// a clean result.
+pub fn lds_barrier_scan(object:&[u8])->Result<LdsBarrierScan,String> {
+    use peacemaker_ir::{cfg::BarrierKind, effects::Control, inst::Frontend, passes::barriers};
+    let lifted=peacemaker_lift::lift_object(object,peacemaker_lift::Options{frontend:Frontend::Hipcc}).map_err(|e|format!("lift rejected: {e}"))?;
+    let arch=lifted.program.target.arch;
+    let mut scan=LdsBarrierScan{arch:format!("{arch:?}").to_lowercase(),..Default::default()};
+    for kernel in &lifted.program.kernels {
+        scan.kernels+=1;
+        let body=&kernel.body;
+        let barriers=body.layout.iter().filter_map(|id|body.insts.get(*id))
+            .filter(|i|matches!(i.effects.control,Control::Barrier(BarrierKind::Full|BarrierKind::Signal(_)))).count();
+        if barriers==0 {continue}
+        scan.barrier_kernels+=1;scan.barriers+=barriers;
+        let facts=barriers::analyze(body,arch).map_err(|e|format!("{}: {e}",kernel.symbol.0))?;
+        for obligation in facts.obligations.iter().filter(|o|o.rule_id=="barrier-ds-pending") {
+            for id in &obligation.insts {
+                let pc=body.insts.get(*id).and_then(|i|i.prov.pc).ok_or_else(|| format!("{}: lifted barrier without a pc",kernel.symbol.0))?;
+                scan.sites.push(LdsBarrierSite{kernel:kernel.symbol.0.clone(),pc:pc.into(),detail:obligation.text.clone()});
+            }
+        }
+    }
+    Ok(scan)
+}
 fn run_command(command:&mut Command)->Result<(),String>{let output=command.output().map_err(|e|format!("{command:?}: {e}"))?;
     if !output.status.success(){return Err(format!("{command:?}: {}",String::from_utf8_lossy(&output.stderr)))}Ok(())}
 fn render_markdown(report:&AuditReport)->String {
@@ -364,11 +403,22 @@ pub fn run(options:Options)->Result<AuditReport,String> {
                 }
             }
             let symbols=parse_disassembly(&disassembly);
+            let lds=lds_barrier_scan(&fs::read(&object).map_err(|e|format!("{}: {e}",object.display()))?);
             let default_intent=KernelIntent::default();
             let mut kernels=Vec::new();
             for meta in &inspected.kernels {let Some(insns)=symbols.get(&meta.name) else {return Err(format!("kernel {} absent from disassembly",meta.name))};
                 let expected=intent.kernels.get(&meta.name).or_else(||intent.kernels.get("*")).unwrap_or(&default_intent);
-                kernels.push(audit_kernel(&meta.name,insns,meta,expected,arch,contract_off));
+                let mut kernel=audit_kernel(&meta.name,insns,meta,expected,arch,contract_off);
+                match &lds {
+                    Ok(scan)=>for site in scan.sites.iter().filter(|s|s.kernel==meta.name) {
+                        let i=insns.iter().find(|i|i.pc==site.pc).ok_or_else(||format!("{}: lifted barrier pc {:#x} absent from disassembly",meta.name,site.pc))?;
+                        kernel.findings.push(finding(LDS_BARRIER_FINDING,site.detail.clone(),i,i));
+                    },
+                    Err(error)=>if let (Some(first),Some(last))=(insns.iter().find(|i|i.mnemonic.starts_with("s_barrier")),insns.last()) {
+                        kernel.findings.push(finding("lds_barrier_unchecked",format!("{LDS_BARRIER_FINDING} not evaluated: {error}"),first,last));
+                    },
+                }
+                kernels.push(kernel);
             }
             if kernels.is_empty(){return Err(format!("no kernels in {}",object.display()))}
             results.push(ProfileReport{profile,object:object.display().to_string(),disassembly:isa_path.display().to_string(),kernels});
@@ -398,5 +448,21 @@ pub fn run(options:Options)->Result<AuditReport,String> {
         assert!(findings.iter().any(|f|f.kind=="contraction" && f.detail.contains("v_dual_fmac")));
         assert!(!findings.iter().any(|f|f.kind=="loop_invariant_rematerialization"
             && f.evidence.start_pc=="0x100"));
+    }
+    /// The pre-`1ba84942a` VerifyAttn object must flag exactly the loop-head
+    /// barrier of `.LBB0_36`; its fix and the gfx1201 KT48 kernel (DS stores
+    /// and split barriers) must lift and be clean.
+    #[test] fn lds_store_unwaited_at_barrier_flags_only_the_verify_attn_race() {
+        let pre=lds_barrier_scan(include_bytes!("../tests/fixtures/lds_barrier/verify_attn_gfx1151.pre-1ba84942a.co")).unwrap();
+        assert_eq!(pre.arch,"gfx1151");
+        let sites:Vec<_>=pre.sites.iter().map(|s|(s.kernel.as_str(),s.pc)).collect();
+        assert_eq!(sites,[("attention_verify_wmma_qk_gfx1151",0x40f4)]);
+        let fixed=lds_barrier_scan(include_bytes!("../tests/fixtures/lds_barrier/verify_attn_gfx1151.1ba84942a.co")).unwrap();
+        assert_eq!((fixed.barrier_kernels,fixed.barriers),(pre.barrier_kernels,pre.barriers));
+        assert!(fixed.sites.is_empty(),"{:?}",fixed.sites);
+        let kt48=lds_barrier_scan(include_bytes!("../../peacemaker-lift/tests/fixtures/kt48/hipcc.co")).unwrap();
+        assert_eq!(kt48.arch,"gfx1201");
+        assert!(kt48.barriers>0);
+        assert!(kt48.sites.is_empty(),"{:?}",kt48.sites);
     }
 }

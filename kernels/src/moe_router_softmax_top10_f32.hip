@@ -44,7 +44,9 @@ __device__ __forceinline__ int router_wave_min(int v) {
     v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x162, 0xf, 0xf, false));
     v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x164, 0xf, 0xf, false));
     v = min(v, __builtin_amdgcn_update_dpp(0, v, 0x168, 0xf, 0xf, false));
-    v = min(v, __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false));
+    // The cast keeps min() in int: with permlanex16's unsigned result it
+    // resolves through double (four F64 ops per call).
+    v = min(v, (int)__builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false));
 #else
     for (int offset = 16; offset > 0; offset >>= 1) v = min(v, __shfl_xor(v, offset, 32));
 #endif
@@ -140,7 +142,7 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
     // expert-index order, followed by selected-probability renormalization.
     // The 512 exponentials are computed in parallel into LDS; one serial pass
     // then sums them in expert order, keeping routed-output numerics.
-    __shared__ float exps[512];
+    __shared__ __align__(16) float exps[512];
     __syncthreads();
     {
         const float max_logit = selected_values[0];
@@ -152,8 +154,16 @@ extern "C" __global__ void moe_router_softmax_top10_f32(
         const size_t output_base = (size_t)token * 10;
         const float max_logit = selected_values[0];
         float denom = 0.0f;
-        for (int expert = 0; expert < 512; ++expert)
-            denom += exps[expert];
+        // Still one left-to-right sum; 16-byte reads batched ahead of the
+        // adds so the chain waits on add latency, not 512 LDS round trips.
+#pragma unroll 16
+        for (int expert = 0; expert < 512; expert += 4) {
+            const float4 e = *(const float4*)(exps + expert);
+            denom += e.x;
+            denom += e.y;
+            denom += e.z;
+            denom += e.w;
+        }
         if (!(denom > 0.0f) || !isfinite(denom)) return;
 
         const float inv_denom = 1.0f / denom;

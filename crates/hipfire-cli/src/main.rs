@@ -21,7 +21,9 @@ use hipfire_config::{
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
+    Sidecar,
 };
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
 use saddle_core::kv::KvBackend;
@@ -48,6 +50,7 @@ use std::{
 
 mod bench_concurrency;
 mod serve;
+mod kernel_pack;
 mod setup;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
@@ -122,9 +125,12 @@ pub(crate) enum Commands {
     Update(UpdateArgs),
     /// Install or repair this machine's hipfire runtime.
     Setup(SetupArgs),
+    /// Install a prebuilt release kernel pack (no device compiler needed).
+    KernelPack(KernelPackArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
-    /// Generate a TriAttention calibration sidecar.
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
+    /// Deprecated (CASK; removal in 0.5.0): generate a TriAttention calibration sidecar.
     SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
     Run(RunArgs),
@@ -244,6 +250,7 @@ struct SetupArgs {
     #[arg(long, short = 'y', visible_alias = "non-interactive")]
     yes: bool,
     /// Requested revision ref forwarded by scripts/install.sh for install.json.
+    /// A tag-named ref also selects that release's kernel pack.
     #[arg(
         long = "ref",
         value_name = "REF",
@@ -259,12 +266,57 @@ struct SetupArgs {
         conflicts_with_all = ["tag", "commit"]
     )]
     branch: Option<String>,
-    /// Requested tag forwarded by scripts/install.sh for install.json.
+    /// Requested tag forwarded by scripts/install.sh for install.json; also
+    /// selects that release's prebuilt kernel pack.
     #[arg(long, value_name = "TAG", hide = true, conflicts_with = "commit")]
     tag: Option<String>,
     /// Requested commit forwarded by scripts/install.sh for install.json.
     #[arg(long, value_name = "SHA", hide = true)]
     commit: Option<String>,
+    /// Compile kernels locally with hipcc even when a release kernel pack exists.
+    #[arg(long)]
+    compile_kernels: bool,
+    /// Directory or URL (https://, file://, or a path) holding the release
+    /// kernel pack assets. Default: the tag's GitHub release downloads.
+    #[arg(long, value_name = "URL")]
+    kernel_pack_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct KernelPackArgs {
+    #[command(subcommand)]
+    action: KernelPackAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum KernelPackAction {
+    /// Download, verify and install the pack for TAG and ARCH.
+    Install(KernelPackInstallArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct KernelPackInstallArgs {
+    /// Release tag whose pack to install.
+    #[arg(long)]
+    tag: String,
+    /// GPU architecture, e.g. gfx1201.
+    #[arg(long, value_name = "ARCH")]
+    arch: String,
+    /// Source checkout the installed daemon was built from; its HEAD must be
+    /// the pack's commit.
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+    /// Installed kernel directory to replace.
+    /// Default: ~/.hipfire/bin/kernels/compiled/ARCH.
+    #[arg(long, value_name = "DIR")]
+    dest: Option<PathBuf>,
+    /// Directory or URL holding the release assets. Default: the tag's GitHub release.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    /// Local ROCm version checked against the pack's supported range.
+    /// Default: the resolved ROCm root's .info/version.
+    #[arg(long, value_name = "VERSION")]
+    rocm_version: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,7 +435,8 @@ struct RunArgs {
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
     #[arg(long = "kv-k")]
-    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
+    /// and `turboN` are deprecated, removal in 0.5.0).
     kv_k: Option<String>,
     #[arg(long = "kv-v")]
     /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
@@ -539,7 +592,8 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     kv_mode: Option<String>,
     #[arg(long = "kv-k")]
-    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
+    /// and `turboN` are deprecated, removal in 0.5.0).
     kv_k: Option<String>,
     #[arg(long = "kv-v")]
     /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
@@ -589,7 +643,8 @@ struct ProfileArgs {
 
 #[derive(Args, Debug)]
 struct QuantizeArgs {
-    /// Hugging Face model ID, local safetensors directory, or GGUF file.
+    /// Hugging Face model ID or local safetensors directory (a GGUF file is
+    /// deprecated, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF).
     input: String,
     #[arg(long = "format")]
     /// Repeatable output format: mq4, mq6, q8, q8f16, hf4, or hf6.
@@ -749,6 +804,9 @@ fn run() -> Result<()> {
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
         Some(Commands::Setup(args)) => setup_command(&paths, args),
+        Some(Commands::KernelPack(args)) => match args.action {
+            KernelPackAction::Install(args) => kernel_pack::install_command(&paths, args),
+        },
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
@@ -1556,6 +1614,9 @@ struct LocalModel {
     name: String,
     path: PathBuf,
     size_bytes: u64,
+    /// File mtime as a unix timestamp, the closest thing a local artifact has
+    /// to OpenAI's required `created`. `0` when the platform cannot report one.
+    created: u64,
     registry_tag: Option<String>,
 }
 
@@ -1627,8 +1688,17 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
 }
 
 pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
-    let mut candidates = local_model_paths(paths)?;
+    let mut candidates = local_model_paths(paths, registry)?;
+    let mut catalog_tags: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     if let Ok(catalog) = load_catalog(&paths.config) {
+        for model in catalog.catalog.models.values() {
+            if let (Some(path), Some(tag)) = (&model.path, &model.registry_tag) {
+                if let Ok(canonical) = fs::canonicalize(path) {
+                    catalog_tags.insert(canonical, tag.clone());
+                }
+            }
+        }
         candidates.extend(
             catalog
                 .catalog
@@ -1651,17 +1721,31 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
             .and_then(|file| file.to_str())
             .unwrap_or_default()
             .to_owned();
-        if !is_model_file(&name) {
+        // Local listings (`hipfire list`, `hipfire diag`) keep sidecars: a
+        // pulled draft or a vision tower is a real file the operator may want
+        // to see and `hipfire rm`. The gate is `is_listable_model_file` — a
+        // model suffix OR a registry entry's own `file`, which admits both
+        // kinds. `/v1/models` narrows it further with `is_standalone_model` —
+        // see `serve::http`.
+        if !is_listable_model_file(&name, registry) {
             continue;
         }
         let registry_tag = registry
             .models
             .iter()
-            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()));
+            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()))
+            .or_else(|| catalog_tags.get(&canonical).cloned());
+        let created = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
         models.push(LocalModel {
             name,
             path: canonical,
             size_bytes: metadata.len(),
+            created,
             registry_tag,
         });
     }
@@ -1669,7 +1753,19 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
     Ok(models)
 }
 
-pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
+/// Enumerate the model files in the models dir, plus the same one level down
+/// inside subdirectories.
+///
+/// The test is [`is_listable_model_file`], not a bare suffix match: several
+/// registry tiers ship files whose suffix is absent from `MODEL_SUFFIXES`
+/// (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a suffix-only scan drops
+/// exactly those models — including the tier a client is looking for.
+///
+/// Sidecars are NOT filtered here. This scan backs `hipfire list`, `hipfire
+/// diag`, and name resolution, all of which should still see a pulled draft or
+/// a vision tower. The serve discovery surface narrows it — see
+/// [`crate::serve::http`] and [`is_standalone_model`].
+pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(&paths.models) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1682,7 +1778,7 @@ pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
             if path
                 .file_name()
                 .and_then(|file| file.to_str())
-                .is_some_and(is_model_file)
+                .is_some_and(|file| is_listable_model_file(file, registry))
             {
                 models.push(path);
             }
@@ -1699,7 +1795,7 @@ pub(crate) fn local_model_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
                 && path
                     .file_name()
                     .and_then(|file| file.to_str())
-                    .is_some_and(is_model_file)
+                    .is_some_and(|file| is_listable_model_file(file, registry))
         }));
     }
     Ok(models)
@@ -2283,7 +2379,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    let mut engine =
+        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
     engine.ping()?;
     let mut params = load_params(
         &resolved,
@@ -2392,6 +2489,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         // The retrying serve path threads a real counter instead (main.rs:4234).
         "attempt_id": 1,
     });
+    if args.max_tokens.is_none() {
+        // The configured default is only a ceiling: the daemon fits it to the
+        // context left after the prompt, as serve does for an omitted value.
+        request["max_tokens_fit"] = serde_json::Value::Bool(true);
+    }
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
     insert_optional_u64(&mut request, "top_k", top_k);
@@ -2583,7 +2685,8 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    let engine =
+        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
     let mut request = serde_json::json!({
@@ -3048,7 +3151,7 @@ pub(crate) fn find_model_path(
     // onto a different tier. An exact stem can only ever match the one file the
     // user actually spelled.
     let exact_stem = model.replace(':', "-").to_ascii_lowercase();
-    if let Ok(local) = local_model_paths(paths) {
+    if let Ok(local) = local_model_paths(paths, registry) {
         if let Some(hit) = local.iter().find(|path| {
             let name = path
                 .file_name()
@@ -3074,7 +3177,7 @@ pub(crate) fn find_model_path(
     }
     let search = model.replace(':', "-").to_ascii_lowercase();
     let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
-    let local = local_model_paths(paths).ok()?;
+    let local = local_model_paths(paths, registry).ok()?;
     // Two passes. The first matches the literal spelling and is what has always
     // run. The second retries with `-`, `.` and `_` stripped from both sides, so
     // an input and an on-disk file that differ only in separators still meet:
@@ -3107,7 +3210,6 @@ pub(crate) fn find_model_path(
     });
     candidates.into_iter().next()
 }
-
 
 /// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
 /// `contiguous` spelling returns the migration error naming `legacy`.
@@ -3223,6 +3325,7 @@ pub(crate) fn load_params(
         .map_err(|err| anyhow!("{err}"))?
         .as_str()
         .to_owned();
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -3299,6 +3402,7 @@ pub(crate) fn load_params(
         "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
         "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
         "prefill_threshold": config_u64(resolved, "speculation.prefill.threshold")?,
         "prefill_keep_ratio": config_f64(resolved, "speculation.prefill.keep_ratio")?,
@@ -3336,10 +3440,7 @@ pub(crate) fn load_params(
     if let Some(kv_v) = authored_kv_axis(resolved, "memory.kv_v")? {
         params["kv_v"] = serde_json::json!(kv_v);
     }
-    let max_seq_source = &resolved
-        .get("memory.max_seq")
-        .expect("schema field")
-        .source;
+    let max_seq_source = &resolved.get("memory.max_seq").expect("schema field").source;
     if matches!(
         max_seq_source,
         ConfigSource::GlobalUser { .. }
@@ -3733,7 +3834,7 @@ pub(crate) fn apply_http_reasoning_request(
     if body.get("enable_thinking").is_some() {
         if let Some(value) = body.get("enable_thinking") {
             if !value.is_boolean() && !value.is_null() {
-                bail!("enable_thinking must be a boolean");
+                serve::bail_invalid!("enable_thinking must be a boolean");
             }
         }
     }
@@ -3746,7 +3847,7 @@ pub(crate) fn apply_http_reasoning_request(
     {
         if let Some(value) = body.pointer("/chat_template_kwargs/enable_thinking") {
             if !value.is_boolean() && !value.is_null() {
-                bail!("chat_template_kwargs.enable_thinking must be a boolean");
+                serve::bail_invalid!("chat_template_kwargs.enable_thinking must be a boolean");
             }
         }
     }
@@ -3759,7 +3860,7 @@ pub(crate) fn apply_http_reasoning_request(
     let mut thinking_type_str: Option<&str> = None;
     if let Some(raw) = thinking_type_raw {
         if !raw.is_string() {
-            bail!("thinking.type must be enabled or disabled");
+            serve::bail_invalid!("thinking.type must be enabled or disabled");
         } else {
             let s = raw.as_str().unwrap();
             if s == "enabled" || s == "disabled" {
@@ -3790,14 +3891,14 @@ pub(crate) fn apply_http_reasoning_request(
             .pointer("/chat_template_kwargs/reasoning_effort")
             .is_some();
     if effort_present && effort_raw.is_none() {
-        bail!("reasoning_effort must be a string");
+        serve::bail_invalid!("reasoning_effort must be a string");
     }
     let body_budget_present = body.get("thinking_budget").is_some();
     let body_budget_str = body
         .get("thinking_budget")
         .and_then(serde_json::Value::as_str);
     if body_budget_present && body_budget_str.is_none() {
-        bail!("thinking_budget must be a string preset");
+        serve::bail_invalid!("thinking_budget must be a string preset");
     }
     let body_top_max_present = body.get("max_think_tokens").is_some();
     let body_nested_max_present = body.pointer("/reasoning/max_tokens").is_some();
@@ -3806,14 +3907,14 @@ pub(crate) fn apply_http_reasoning_request(
             serde_json::Value::Number(number) => {
                 if let Some(parsed) = number.as_u64() {
                     if parsed > 393_216 {
-                        bail!("{field} must be between 0 and 393216");
+                        serve::bail_invalid!("{field} must be between 0 and 393216");
                     }
                     Ok(parsed)
                 } else {
-                    bail!("{field} must be between 0 and 393216");
+                    serve::bail_invalid!("{field} must be between 0 and 393216");
                 }
             }
-            _ => bail!("{field} must be between 0 and 393216"),
+            _ => serve::bail_invalid!("{field} must be between 0 and 393216"),
         }
     };
     let top_max_opt = if body_top_max_present {
@@ -4788,7 +4889,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None)?;
+    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
     let prompt = resolve_bench_prompt(&args)?;
     let prompt_md5 = bench_prompt_md5(&prompt);
     let prompt_chars = prompt.chars().count() as u64;
@@ -4954,13 +5055,18 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     // weights and KV arenas, so leaving this scope is what actually frees the
     // first model before the daemon loads the second.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
-        let registry = load_registry(&paths.registry).registry;
-        let model_path = find_model_path(paths, &registry, &args.model)
-            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut slot_args = args.clone();
+        slot_args.concurrency = None;
         // 2048-token slots, not the serve default of 8192: the sweep's prompts
         // are one short turn and --max-tokens is small, so a larger arena buys
         // nothing and multiplies per-slot KV by four.
-        match SlotDriver::start(&model_path, max_k, 2048) {
+        let (engine, loaded, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        let slot_capable = loaded
+            .get("experimental_multi_slot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match SlotDriver::start(engine, max_k, slot_capable) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
                 let r = sweep_backend(
@@ -4988,7 +5094,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None)?;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         let mut d = SequentialDriver::start(engine, max_k)?;
         eprintln!("  noslots backend up (sequential daemon path)");
         let r = sweep_backend(
@@ -5096,16 +5202,57 @@ fn open_bench_engine_batched(
     serde_json::Value,
     serde_json::Value,
 )> {
-    std::env::set_var("HIPFIRE_BENCH_CONTINUOUS_BATCH", batch_size.to_string());
-    let r = open_bench_engine(paths, args, None);
-    std::env::remove_var("HIPFIRE_BENCH_CONTINUOUS_BATCH");
-    r
+    open_bench_engine(
+        paths,
+        args,
+        None,
+        &BenchLoadOpts {
+            continuous_batch: Some(batch_size),
+            ..Default::default()
+        },
+    )
+}
+
+/// Spawn a daemon and load the model with `experimental_multi_slot=true` so
+/// the slot backend owns the GPU. The slot count and per-slot context cap are
+/// fixed per load, which is why the sweep holds them at max.
+fn open_bench_engine_slots(
+    paths: &Paths,
+    args: &BenchArgs,
+    slots: usize,
+    ctx: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    open_bench_engine(
+        paths,
+        args,
+        None,
+        &BenchLoadOpts {
+            multi_slot: Some((slots, ctx)),
+            ..Default::default()
+        },
+    )
+}
+
+/// Optional load-time knobs for `open_bench_engine`, threaded explicitly
+/// rather than via `std::env::set_var` — `hipfire_config::developer_var`
+/// reads the OnceLock process-config snapshot, not the ambient environment,
+/// so a set_var inside the process is invisible once the snapshot is taken.
+#[derive(Default)]
+struct BenchLoadOpts {
+    multi_slot: Option<(usize, usize)>,
+    continuous_batch: Option<usize>,
 }
 
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
     rdna2_variant: Option<u8>,
+    load_opts: &BenchLoadOpts,
 ) -> Result<(
     Engine,
     serde_json::Value,
@@ -5147,7 +5294,7 @@ fn open_bench_engine(
             .values
             .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
     }
-    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config)?;
+    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config, Some(&path))?;
     engine.ping()?;
     let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let longest_prefill = args.pp.iter().copied().max().unwrap_or(0) as u64;
@@ -5207,13 +5354,16 @@ fn open_bench_engine(
             }
         }
     }
-    if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
-        if let Ok(n) = n.parse::<u64>() {
-            params["continuous_batch_size"] = serde_json::json!(n);
-        }
+    if let Some(n) = load_opts.continuous_batch {
+        params["continuous_batch_size"] = serde_json::json!(n as u64);
     }
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
+    }
+    if let Some((slots, ctx)) = load_opts.multi_slot {
+        params["experimental_multi_slot"] = serde_json::json!(true);
+        params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
+        params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
@@ -5331,8 +5481,9 @@ fn bench_ttft(
             }
             Ok(())
         })?;
-        let elapsed =
-            first.ok_or_else(|| anyhow!("no streamed token observed; cannot measure client-side TTFT"))?;
+        let elapsed = first.ok_or_else(|| {
+            anyhow!("no streamed token observed; cannot measure client-side TTFT")
+        })?;
         ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
         if prompt_tokens.is_none() {
             prompt_tokens = bench_prompt_tokens_from_done(&done);
@@ -5512,7 +5663,7 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant))?;
+        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
             .and_then(serde_json::Value::as_str)
@@ -5583,14 +5734,15 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
+        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
     } else {
         let (_, resolved) = resolved_global(paths, true)?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
         let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
-        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+        let mut engine =
+            Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)?;
         engine.ping()?;
         engine
     };
@@ -6550,6 +6702,8 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             .extension()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("gguf"));
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
+    // (the one-line warning is printed by hipfire-quantize itself)
     if args.formats.is_empty() {
         args.formats
             .push(if is_gguf { "hf4".into() } else { "mq4".into() });
@@ -6688,7 +6842,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     Ok(())
 }
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
+    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }
@@ -6809,7 +6965,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         let (_, resolved) = resolved_global(paths, true).ok()?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).ok()?;
         let mut engine =
-            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config).ok()?;
+            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config, None).ok()?;
         engine.ping().ok()?;
         engine.request(&serde_json::json!({ "type": "diag" })).ok()
     });
@@ -7193,6 +7349,108 @@ fn is_model_file(name: &str) -> bool {
     MODEL_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
 }
 
+/// Every file the registry names as a *sidecar* of some entry — `dflash`,
+/// `vision`, `triattn`, `mtp`, `dspark`, the FLUX components, and the
+/// alternative `heads` carriers.
+///
+/// These share the model suffixes (`.hfq`), so a suffix test alone cannot
+/// tell them apart from a trunk. A sidecar is not a loadable model on its
+/// own: `qwen3.8-27b-vision.hfq` carries only tower tensors and embeds
+/// `"tokenizer": "{}"`, so loading it as a trunk fails with
+/// `tokenizer metadata field missing or wrong type: model`.
+fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
+    registry
+        .models
+        .values()
+        .flat_map(|entry| {
+            [
+                entry.triattn.as_ref(),
+                entry.mtp.as_ref(),
+                entry.dspark.as_ref(),
+                entry.t5.as_ref(),
+                entry.clip.as_ref(),
+                entry.qwen3.as_ref(),
+                entry.vae.as_ref(),
+                entry.dflash.as_ref(),
+                entry.vision.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|sidecar: &Sidecar| sidecar.file.as_str())
+            .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
+        })
+        .collect()
+}
+
+/// True when `name` is a model file worth showing in a local listing.
+///
+/// A model suffix OR being some registry entry's own `file`. The second term
+/// is load-bearing: several registry tiers ship files whose suffix is absent
+/// from `MODEL_SUFFIXES` (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a
+/// suffix-only test hides exactly those models.
+pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
+    is_model_file(name) || registry.models.values().any(|entry| entry.file == name)
+}
+
+/// True when `name` can actually serve a completion, as opposed to merely
+/// being a model-shaped file on disk.
+///
+/// This is the `/v1/models` discovery predicate and it is stricter than
+/// [`is_listable_model_file`] on purpose. A file the registry names in ANY
+/// sidecar slot is not a serve target, even when some entry also lists it as
+/// its own `file` — that overlap is exactly the DFlash drafts
+/// (`qwen38-27b-dflash-mq3.hfq` and friends), pullable by tag but arch
+/// 20/22/23 artifacts that `docs/architecture-ids.md` classes as "not primary
+/// `load_model` trunk targets". The vision tower (`qwen3.8-27b-vision.hfq`) is
+/// sidecar-only and embeds `"tokenizer": "{}"`, so selecting it loads all 64
+/// layers and then fails with `tokenizer metadata field missing or wrong
+/// type: model`.
+///
+/// Advertising either in `/v1/models` hands an OpenAI-compatible client an id
+/// that cannot answer. Both stay pullable and resolvable by tag, and both
+/// still appear in `hipfire list` — only the serve surface drops them.
+///
+/// A file the registry does not name at all (a locally quantized trunk, or a
+/// locally produced draft such as `qwen3-8b-dflash.hfq`) is classified by its
+/// own container header: `/v1/models` must not advertise it unless
+/// [`HfqFile::probe_arch_id`] reports a [`SERVE_TRUNK_ARCH_IDS`] id. The
+/// registry cannot answer for it — the catalog only knows the files it ships.
+pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1) -> bool {
+    if registry_sidecar_files(registry).contains(name) {
+        return false;
+    }
+    if !is_listable_model_file(name, registry) {
+        return false;
+    }
+    if registry.models.values().any(|entry| entry.file == name) {
+        return true;
+    }
+    HfqFile::probe_arch_id(path).is_ok_and(|arch_id| SERVE_TRUNK_ARCH_IDS.contains(&arch_id))
+}
+
+/// HFQ arch ids a `hipfire serve` completion can be answered from — the
+/// "Primary model ids" column of `docs/architecture-ids.md`, minus the
+/// image-generation component trunks.
+///
+/// The polarity is deliberate. This predicate exists to keep `/v1/models` to
+/// its contract ("every advertised id can answer a completion"), and it only
+/// ever judges files the registry does not vouch for (registry entries short
+/// out above). An allowlist is the fail-closed direction: an arch id that is
+/// not listed here — a sidecar the table gains later (a new drafter id, a new
+/// FLUX component) or a container that is not a model at all — is not
+/// advertised, whereas a denylist would silently re-open the reported bug the
+/// day a new draft arch ships. The cost is that a brand-new *primary* arch id
+/// is hidden from local discovery until this table is updated, which the same
+/// commit has to do anyway: assigning an arch id means editing
+/// `docs/architecture-ids.md` and the loader's carrier registry.
+///
+/// `40`/`45` (FLUX MMDiT trunks) are absent on purpose: they are image
+/// generation components, served through `hipfire img` / `/v1/images/*`, not
+/// completion trunks a `/v1/models` pick can generate text from. `8`
+/// (dots.ocr) and `11` (LFM2.5 / LFM2.5-VL) are present: both answer text
+/// completions.
+pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
 fn source_label(source: &ConfigSource) -> String {
     match source {
         ConfigSource::BuiltIn => "built-in".into(),
@@ -7355,15 +7613,29 @@ mod tests {
         ServeMeta {
             current_model: Some("model.hfq".to_owned()),
             loading_model: Some("model.hfq".to_owned()),
-            instance_token: "test".to_owned(),
-            requests_served: 0,
-            retries_attempted: 0,
-            retries_succeeded: 0,
-            recent_tok_s: None,
-            started: Instant::now(),
             last_activity: Instant::now() - Duration::from_secs(600),
-            engine_state: crate::serve::EngineState::Up,
+            ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// A minimal real HFQ container carrying `arch_id`, so the discovery
+    /// predicate's header probe runs against the format it will meet on disk
+    /// rather than a stub.
+    fn write_hfq_fixture(path: &Path, arch_id: u32) {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+        write_hfqm_package_mem(
+            path,
+            arch_id,
+            "{}",
+            &[HfqMemTensor {
+                name: "model.embed_tokens.weight".to_owned(),
+                quant_type: 1,
+                shape: vec![4, 4],
+                group_size: 0,
+                data: vec![0u8; 32],
+            }],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7375,6 +7647,166 @@ mod tests {
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
+    }
+
+    /// `/v1/models` is the discovery surface an OpenAI-compatible client reads
+    /// to choose a model. It must offer only files that load as a trunk.
+    ///
+    /// Two ways the old suffix-only scan got that wrong, both observed against
+    /// a real `~/.hipfire/models`:
+    ///   - it ADVERTISED `qwen3.8-27b-vision.hfq` and `qwen38-27b-dflash-mq3.hfq`,
+    ///     which are sidecars; selecting either fails at load with
+    ///     `tokenizer metadata field missing or wrong type: model`.
+    ///   - it DROPPED `qwen3.8-27b.mq3-xt`, whose `-xt` suffix is not in
+    ///     `MODEL_SUFFIXES`, so the tier the user actually wanted was invisible.
+    #[test]
+    fn standalone_model_classification_separates_sidecars_from_tiers() {
+        let registry = hipfire_registry::bundled().unwrap();
+        // Registry-vouched files are judged by the catalog, never by the file:
+        // these paths deliberately do not exist.
+        let classified = |name: &str| {
+            is_standalone_model(
+                &PathBuf::from("/nonexistent/models").join(name),
+                name,
+                &registry,
+            )
+        };
+
+        // The tier whose suffix is missing from MODEL_SUFFIXES: listable AND
+        // servable. This is the model the operator actually wants.
+        assert!(!is_model_file("qwen3.8-27b.mq3-xt"));
+        assert!(is_listable_model_file("qwen3.8-27b.mq3-xt", &registry));
+        assert!(classified("qwen3.8-27b.mq3-xt"));
+
+        // A sidecar-only file: listable (it is really on disk) but NOT
+        // servable. It embeds `"tokenizer": "{}"`.
+        assert!(is_listable_model_file("qwen3.8-27b-vision.hfq", &registry));
+        assert!(!classified("qwen3.8-27b-vision.hfq"));
+
+        // The overlap case: the DFlash draft is BOTH its own registry entry's
+        // `file` (the documented `hipfire pull qwen3.8:27b-draft-mq3` target)
+        // AND a `dflash` sidecar of three other entries. Arch 20 is not a serve
+        // trunk, so it must not be advertised — while staying pullable.
+        assert!(registry
+            .models
+            .values()
+            .any(|entry| entry.file == "qwen38-27b-dflash-mq3.hfq"));
+        assert!(is_listable_model_file(
+            "qwen38-27b-dflash-mq3.hfq",
+            &registry
+        ));
+        assert!(!classified("qwen38-27b-dflash-mq3.hfq"));
+
+        assert!(!is_listable_model_file("README.md", &registry));
+        assert!(!classified("README.md"));
+    }
+
+    /// A file the registry does not name at all — what `hipfire quantize`
+    /// leaves in the models dir — is classified by its own container header.
+    ///
+    /// This is the class the registry-sidecar filter cannot see: on a real
+    /// box, `/v1/models` advertised `qwen3-8b-dflash.hfq`, and selecting it
+    /// failed with `no carrier for HFQ arch_id=20`.
+    #[test]
+    fn unregistered_files_are_classified_by_their_container_arch_id() {
+        let registry = hipfire_registry::bundled().unwrap();
+        let paths = test_paths("unregistered-arch");
+        fs::create_dir_all(&paths.models).unwrap();
+        let classify = |file: &str| {
+            let path = paths.models.join(file);
+            is_standalone_model(&path, file, &registry)
+        };
+
+        // A locally quantized trunk of a primary arch: advertised.
+        write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
+        assert!(classify("local-trunk.mq4"));
+
+        // Locally produced sidecars: never advertised, whatever the registry
+        // knows. 20 = DFlash draft, 23 = Muse Glimmer drafter.
+        write_hfq_fixture(&paths.models.join("qwen3-8b-dflash.hfq"), 20);
+        write_hfq_fixture(&paths.models.join("glimmer-assistant.hfq"), 23);
+        assert!(!classify("qwen3-8b-dflash.hfq"));
+        assert!(!classify("glimmer-assistant.hfq"));
+
+        // Not a container at all (or truncated): fail closed rather than
+        // advertise an id that cannot be classified.
+        fs::write(paths.models.join("garbage.hfq"), b"not an HFQ container").unwrap();
+        fs::write(paths.models.join("short.hfq"), b"HFQM\x01\x00\x00\x00").unwrap();
+        assert!(!classify("garbage.hfq"));
+        assert!(!classify("short.hfq"));
+
+        // A FLUX component trunk is a container with a carrier, but it cannot
+        // answer a completion: `/v1/models` is the completion surface.
+        write_hfq_fixture(&paths.models.join("flux-transformer.hfq"), 40);
+        assert!(!classify("flux-transformer.hfq"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The two surfaces deliberately disagree, and that is the point:
+    /// `hipfire list` shows what is on disk; `/v1/models` shows what can serve.
+    #[test]
+    fn local_listing_keeps_sidecars_that_serve_discovery_drops() {
+        let paths = test_paths("listing-sidecars");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq3-xt",
+            "qwen3.8-27b-vision.hfq",
+            "qwen38-27b-dflash-mq3.hfq",
+            "qwen3.6-27b.mq4",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        // Unregistered artifacts, so the header probe decides: a local trunk
+        // stays advertised, a local draft does not.
+        write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
+        write_hfq_fixture(&paths.models.join("qwen3-8b-dflash.hfq"), 20);
+        let registry = hipfire_registry::bundled().unwrap();
+
+        let models = list_local_models(&paths, &registry).unwrap();
+        let listed: Vec<String> = models.iter().map(|model| model.name.clone()).collect();
+        // Local listing: everything on disk is visible and rm-able.
+        for file in [
+            "qwen3.8-27b.mq3-xt",
+            "qwen3.8-27b-vision.hfq",
+            "qwen38-27b-dflash-mq3.hfq",
+            "qwen3.6-27b.mq4",
+            "local-trunk.mq4",
+            "qwen3-8b-dflash.hfq",
+        ] {
+            assert!(
+                listed.contains(&file.to_owned()),
+                "{file} missing: {listed:?}"
+            );
+        }
+
+        // Serve discovery: the XT tier survives, sidecars do not.
+        let served: Vec<String> = models
+            .iter()
+            .filter(|model| is_standalone_model(&model.path, &model.name, &registry))
+            .map(|model| model.name.clone())
+            .collect();
+        assert!(
+            served.contains(&"qwen3.8-27b.mq3-xt".to_owned()),
+            "{served:?}"
+        );
+        assert!(served.contains(&"qwen3.6-27b.mq4".to_owned()), "{served:?}");
+        assert!(
+            served.contains(&"local-trunk.mq4".to_owned()),
+            "a local trunk must stay advertised: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen3.8-27b-vision.hfq".to_owned()),
+            "tower sidecar must not be offered as a model: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen38-27b-dflash-mq3.hfq".to_owned()),
+            "DFlash draft must not be offered as a model: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen3-8b-dflash.hfq".to_owned()),
+            "an unregistered DFlash draft must not be offered as a model: {served:?}"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     /// The Ornith artifacts shipped briefly as `ornith1.5-*` before being
@@ -7651,7 +8083,6 @@ mod tests {
         );
     }
 
-
     #[test]
     pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
         let paths = test_paths("registry-qwen-tag-policy");
@@ -7864,7 +8295,10 @@ mod tests {
             Some(entry),
         )
         .unwrap();
-        assert_eq!(config_string(&resolved, "memory.kv_backend").unwrap(), "vmm");
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
 
         // DeepSeek tags keep generation.max_tokens only; no max_seq/backend pin.
         for tag in [
@@ -7975,9 +8409,7 @@ mod tests {
 
         // Global user override wins over registry tag policy (registry below global).
         let mut user_layer = ConfigLayer::default();
-        user_layer
-            .set_cli("memory.kv_backend", "legacy")
-            .unwrap();
+        user_layer.set_cli("memory.kv_backend", "legacy").unwrap();
         user_layer.set_cli("memory.max_seq", "32768").unwrap();
         user_layer.set_cli("generation.max_tokens", "1024").unwrap();
         let overridden = hipfire_config::resolve(vec![
@@ -8064,9 +8496,7 @@ mod tests {
 
         // Precedence: flag > model config > global config.
         let mut global_layer = ConfigLayer::default();
-        global_layer
-            .set_cli("memory.kv_backend", "legacy")
-            .unwrap();
+        global_layer.set_cli("memory.kv_backend", "legacy").unwrap();
         let mut model_layer = ConfigLayer::default();
         model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
         let model_over_global = hipfire_config::resolve(vec![
@@ -8468,11 +8898,13 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().fold(String::with_capacity(64), |mut out, byte| {
-            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-            out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
-            out
-        })
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+                out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+                out
+            })
     }
 
     /// A manifest-v1 `.xdna.zip` binding the given payloads, written to the
@@ -8835,7 +9267,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(params.get("xdna").is_none(), "flag-off must not project xdna");
+        assert!(
+            params.get("xdna").is_none(),
+            "flag-off must not project xdna"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -11160,7 +11595,7 @@ mod tests {
             let mut engine = None;
             let mut last = None;
             for attempt in 0..8 {
-                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config) {
+                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
                     Ok(e) => {
                         engine = Some(e);
                         break;
@@ -11186,6 +11621,22 @@ mod tests {
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                capabilities: crate::serve::route_capabilities(
+                    false,
+                    4,
+                    8192,
+                    1024,
+                    false,
+                    0,
+                    false,
+                    4096,
+                    1,
+                    64,
+                    268435456,
+                    30000,
+                    None,
+                    64 << 20,
+                ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {
                     engine,
@@ -11222,25 +11673,16 @@ mod tests {
                         allow_paths: false,
                         operator_model: None,
                     },
+                    max_batch_tokens: 4096,
                 }),
-                meta: Mutex::new(ServeMeta {
-                    current_model: None,
-                    loading_model: None,
-                    instance_token: serve_instance_token(),
-                    requests_served: 0,
-                    retries_attempted: 0,
-                    retries_succeeded: 0,
-                    recent_tok_s: None,
-                    started: Instant::now(),
-                    last_activity: Instant::now(),
-                    engine_state: crate::serve::EngineState::Up,
-                }),
+                meta: Mutex::new(ServeMeta::new(serve_instance_token())),
                 max_request_bytes: 8 * 1024 * 1024,
                 admission: Arc::new(Admission::new(4, Duration::from_secs(5))),
                 idle_timeout: Duration::from_secs(0),
                 retry_enabled,
                 retry_backoff,
                 backoff_hook: Mutex::new(None),
+                stream_stall_timeout: None,
             });
 
             let std_listener =
@@ -11485,14 +11927,18 @@ mod tests {
         let h = Task11HttpHarness::spawn("switch-fail");
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
-        assert_eq!(serve_health(h.port()).1["model"], serde_json::json!(h.model()));
+        let health = serve_health(h.port()).1;
+        assert_eq!(health["model"], serde_json::json!(h.model()));
+        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
 
         fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
         let mut bad = h.base_body("t11-stop-text", false);
         bad["model"] = serde_json::json!("t20-load-fail.hfq");
         let (status, _, text) = post_status(h.port(), &bad);
         assert_ne!(status, 200, "{text}");
-        assert!(serve_health(h.port()).1["model"].is_null());
+        let health = serve_health(h.port()).1;
+        assert!(health["model"].is_null());
+        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
 
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
@@ -11552,6 +11998,82 @@ mod tests {
         // The supervisor reloaded the model; the request did not load again.
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
         assert_eq!(loads, 2);
+    }
+
+    /// A failed pre-warm leaves single-slot serve up to load on the next
+    /// request, but fails multi-slot serve closed: `/health` goes 503
+    /// `unhealthy` (never 200 `ok` with every request failing), the daemon is
+    /// stopped, and the load error comes back for serve to exit on.
+    #[cfg(unix)]
+    #[test]
+    fn serve_prewarm_failure_fails_closed_only_on_multi_slot() {
+        let single = Task11HttpHarness::spawn("prewarm-fail-single");
+        fs::write(single.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        {
+            let mut runtime = single.shared.runtime.lock().unwrap();
+            crate::serve::prewarm(&mut runtime, &single.shared.meta, "t20-load-fail.hfq").unwrap();
+        }
+        let (status, health) = serve_health(single.port());
+        assert_eq!(status, 200);
+        assert_eq!(health["status"], "ok");
+        assert!(health["model"].is_null());
+        let ok = single.base_body("t11-stop-text", false);
+        assert_eq!(post_status(single.port(), &ok).0, 200);
+
+        let multi = Task11HttpHarness::spawn("prewarm-fail-multi");
+        fs::write(multi.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        let mut runtime = multi.shared.runtime.lock().unwrap();
+        runtime.multi_slot_enabled = true;
+        let error = crate::serve::prewarm(&mut runtime, &multi.shared.meta, "t20-load-fail.hfq")
+            .unwrap_err();
+        assert!(runtime.engine.exited(), "the daemon is stopped");
+        drop(runtime);
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("multi-slot pre-warm of t20-load-fail.hfq failed")
+                && message.contains("load failed: fixture"),
+            "{message}"
+        );
+        let (status, health) = serve_health(multi.port());
+        assert_eq!(status, 503);
+        assert_eq!(health["status"], "unhealthy");
+        assert!(health["model"].is_null());
+        assert!(health["loading_model"].is_null());
+    }
+
+    /// The reload after a daemon respawn follows the same rule: single-slot
+    /// serve comes back up without the model, multi-slot serve fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn serve_reload_failure_after_respawn_fails_closed_only_on_multi_slot() {
+        for multi_slot in [false, true] {
+            let h = Task11HttpHarness::spawn(&format!("reload-fail-{multi_slot}"));
+            fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+            {
+                let mut runtime = h.shared.runtime.lock().unwrap();
+                runtime.multi_slot_enabled = multi_slot;
+                runtime.resident_model = Some("t20-load-fail.hfq".to_owned());
+                runtime.engine.terminate();
+            }
+            let supervised = crate::serve::supervise_engine(&h.shared);
+            let (status, health) = serve_health(h.port());
+            assert!(health["model"].is_null());
+            if multi_slot {
+                let message = format!("{:#}", supervised.unwrap_err());
+                assert!(
+                    message.contains(
+                        "multi-slot reload of t20-load-fail.hfq after the daemon restart failed"
+                    ),
+                    "{message}"
+                );
+                assert_eq!(status, 503);
+                assert_eq!(health["status"], "unhealthy");
+            } else {
+                supervised.unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(health["status"], "ok");
+            }
+        }
     }
 
     /// DeepSeek V4 (legacy contract) stages tool calls only on the terminal;

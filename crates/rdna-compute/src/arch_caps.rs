@@ -400,6 +400,18 @@ impl ArchCaps {
     pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
         self.has_wmma_w32 || self.has_wmma_w32_gfx12
     }
+    /// DFlash S2 hidden-ring commit/scatter launch fusion: pure copies with no
+    /// WMMA or arch builtins, measured byte-identical on exact gfx1100 and
+    /// exact gfx1201. Other arches keep the per-row copy loops.
+    pub fn supports_dflash_hidden_scatter_fusion(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash S4 exact-F16 residual producers feeding the direct-F16 residual
+    /// WMMA consumer (gfx11 tiers on gfx1100, the gfx12 base/ldsstage kernels
+    /// on gfx1201). Exact gfx1100 and exact gfx1201 only.
+    pub fn supports_dflash_f16_residual_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -583,6 +595,20 @@ mod tests {
         assert!(!caps.has_wmma_w32());
         assert!(!caps.is_rdna3());
         assert!(caps.supports_ds4_f16_compressor_cache());
+    }
+
+    #[test]
+    fn dflash_s2_s4_fusions_cover_exact_gfx1100_and_gfx1201_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            let caps = make_caps(arch);
+            assert!(caps.supports_dflash_hidden_scatter_fusion(), "{arch}");
+            assert!(caps.supports_dflash_f16_residual_fusions(), "{arch}");
+        }
+        for arch in ["gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942"] {
+            let caps = make_caps(arch);
+            assert!(!caps.supports_dflash_hidden_scatter_fusion(), "{arch}");
+            assert!(!caps.supports_dflash_f16_residual_fusions(), "{arch}");
+        }
     }
 
     #[test]

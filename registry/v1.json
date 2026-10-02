@@ -1017,9 +1017,11 @@
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq4-xts",
       "size_gb": 14.99,
+      "size_bytes": 14987185152,
+      "sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 XT, symmetric (H2: per-group AWQ alpha + three GPTQ scale-refit rounds). Runs the int4-activation (A4) prefill on gfx1201/gfx1100/gfx1151. gfx1201 KLD (24 chunks, fp8 KV) A4 WT2 0.0696 / code24 0.0521; native-fp8 WT2 0.0419 / code24 0.0299. Canonical dense fixture (AGENTS.md §5).",
+      "desc": "Qwen3.8 27B MQ4V2 XT, symmetric (H2: per-group AWQ alpha + three GPTQ scale-refit rounds). Runs the int4-activation (A4) prefill on gfx1201/gfx1100/gfx1151. gfx1201 KLD (24 chunks, fp8 KV) A4 WT2 0.0696 / code24 0.0521; native-fp8 WT2 0.0419 / code24 0.0299. Canonical dense fixture (AGENTS.md \u00a75).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1055,8 +1057,6 @@
         "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
         "size_bytes": 927611840
       },
-      "sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
-      "size_bytes": 14987185152,
       "arch_id": 5,
       "quant": "mq4"
     },

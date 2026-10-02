@@ -504,6 +504,24 @@ impl SourceReaderImpl for HfqRangeReader {
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
     }
+
+    fn advise_willneed(&self, offset: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            if let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) {
+                // A hint only: the result does not affect correctness.
+                unsafe {
+                    libc::posix_fadvise(
+                        self.file.as_raw_fd(),
+                        offset,
+                        len,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Author-recommended sampling defaults baked into a .hfq's
@@ -580,6 +598,36 @@ impl HfqFile {
     }
     pub fn mq4v2_symmetric(&self) -> bool {
         self.mq4v2_symmetric
+    }
+
+
+    /// Header-only sibling of [`Self::open`]: read the 32-byte container
+    /// header and return its `arch_id` — no mmap, no metadata JSON parse, no
+    /// tensor index.
+    ///
+    /// [`Self::open`] is the load path: it walks the metadata and
+    /// materialises every tensor entry, which is far too much work for a
+    /// discovery scan. Serve's `/v1/models` uses this to classify an on-disk
+    /// file the registry does not vouch for — a trunk versus a sidecar
+    /// artifact (the DFlash drafts and friends carry arch ids 20/21/22/23;
+    /// see `docs/architecture-ids.md` § Sidecar / reserved ids). `Err` for
+    /// anything that is not a container, or is shorter than one, so a caller
+    /// can read "cannot tell" as "not a trunk".
+    ///
+    /// The layout is the one [`Self::open_at_offset`] parses: `HFQM` magic,
+    /// `u32` version, `u32` arch id, `u32` tensor count, then the metadata and
+    /// data offsets — little-endian, relative to the container start.
+    pub fn probe_arch_id(path: &Path) -> std::io::Result<u32> {
+        let mut file = File::open(path)?;
+        let mut header = [0u8; 32];
+        file.read_exact(&mut header)?;
+        if &header[..4] != b"HFQM" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HfqFile: not an HFQ container: {}", path.display()),
+            ));
+        }
+        Ok(u32::from_le_bytes(header[8..12].try_into().unwrap()))
     }
 
     /// `open` with the REAP plan injected instead of taken from process config.
@@ -1375,10 +1423,23 @@ impl HfqFile {
         // back to tensor_data_vec()/tensor_data_pread() on None. Do NOT
         // assert-fail debug builds on that expected path.
         let mmap = self.mmap.as_ref()?;
-        Some((
-            info,
-            &mmap[info.data_offset..info.data_offset + info.data_size],
-        ))
+        // A file truncated in its data region (intact header+index — exactly
+        // what a partial copy leaves) must not panic on the slice below.
+        // The index loop validated every header field, but the data region's
+        // END is only known here. Surface it as None so callers treat the
+        // tensor as missing instead of crashing the loader.
+        let end = info.data_offset.checked_add(info.data_size)?;
+        if end > mmap.len() {
+            eprintln!(
+                "HfqFile: tensor {name:?} data region [{}, {}) overruns the \
+                 {}-byte file — truncated or corrupt HFQ container",
+                info.data_offset,
+                info.data_offset + info.data_size,
+                mmap.len()
+            );
+            return None;
+        }
+        Some((info, &mmap[info.data_offset..end]))
     }
 
     /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
@@ -1410,6 +1471,7 @@ impl HfqFile {
             let mut buf = self.pread_buf.borrow_mut();
             buf.resize(info.data_size, 0);
             let mut total_read = 0usize;
+            let mut read_err: Option<std::io::Error> = None;
             while total_read < info.data_size {
                 let n = unsafe {
                     libc::pread(
@@ -1419,7 +1481,16 @@ impl HfqFile {
                         (info.data_offset + total_read) as libc::off_t,
                     )
                 };
-                if n <= 0 {
+                if n == 0 {
+                    // EOF: the file is shorter than the index claims. Without
+                    // this check the tail of the zero-initialized buffer would
+                    // be served as tensor data — silent weight corruption for
+                    // a truncated copy. Drop the partial buffer and report
+                    // the tensor as missing.
+                    break;
+                }
+                if n < 0 {
+                    read_err = Some(std::io::Error::last_os_error());
                     break;
                 }
                 total_read += n as usize;
@@ -1429,6 +1500,17 @@ impl HfqFile {
             // the caller refuses — never hand back a zero-filled tail as if
             // it were weights.
             if total_read < info.data_size {
+                eprintln!(
+                    "HfqFile: tensor {name:?} short read ({total_read} of {} \
+                     bytes at offset {}) — truncated or corrupt HFQ container{}",
+                    info.data_size,
+                    info.data_offset,
+                    read_err
+                        .as_ref()
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default()
+                );
+                buf.clear();
                 return None;
             }
             // Evict these pages from cache — works because pread doesn't hold a
@@ -1594,6 +1676,34 @@ impl HfqFile {
     /// `tensor_data_vec`.
     pub fn tensors(&self) -> &[HfqTensorInfo] {
         &self.tensors
+    }
+
+    /// SHA-256 of architecture, metadata JSON, ordered tensor manifest, and
+    /// file length (spec §4.1 C1). Path, inode and mtime are excluded so a
+    /// byte-identical copy at another path is the same content. Computed
+    /// once at load for cache-domain identity.
+    pub fn content_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.arch_id.to_le_bytes());
+        h.update((self.metadata_json.len() as u64).to_le_bytes());
+        h.update(self.metadata_json.as_bytes());
+        h.update((self.tensors.len() as u64).to_le_bytes());
+        for t in &self.tensors {
+            h.update((t.name.len() as u64).to_le_bytes());
+            h.update(t.name.as_bytes());
+            h.update([t.quant_type]);
+            h.update((t.shape.len() as u64).to_le_bytes());
+            for d in &t.shape {
+                h.update(d.to_le_bytes());
+            }
+            h.update(t.group_size.to_le_bytes());
+            h.update((t.data_offset as u64).to_le_bytes());
+            h.update((t.data_size as u64).to_le_bytes());
+        }
+        let len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        h.update(len.to_le_bytes());
+        h.finalize().to_vec()
     }
 
     /// Compute the exact immutable source identity for this opened HFQ file.
@@ -2436,6 +2546,9 @@ impl WeightSource for LlamaHfqSource<'_> {
             candidates: flat_name_candidates,
             read_proj: load_weight_tensor,
             layer: i,
+            // Generic llama-family reader is always fully resident — no offload support.
+            host_local: false,
+            read_proj_host: None,
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
     }
@@ -3926,6 +4039,42 @@ mod metadata_overlay_tests {
             std::fs::read(&path).expect("read unchanged fixture"),
             before
         );
+    }
+}
+
+// ─── Header-only arch-id probe ─────────────────────────────────────────────
+
+/// `HfqFile::probe_arch_id` backs serve's `/v1/models` discovery filter, which
+/// classifies files the registry does not vouch for by their container arch id.
+#[cfg(test)]
+mod probe_tests {
+    use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
+
+    #[test]
+    fn probe_reads_the_arch_id_of_a_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let trunk = dir.path().join("trunk.hfq");
+        write_min_hfq(&trunk, 5, &[("A", 3, &[2, 4], &[1u8; 8])]);
+        assert_eq!(HfqFile::probe_arch_id(&trunk).unwrap(), 5);
+
+        // The sidecar class the discovery filter exists for: a DFlash draft.
+        let draft = dir.path().join("draft.hfq");
+        write_min_hfq(&draft, 20, &[("A", 3, &[2, 4], &[1u8; 8])]);
+        assert_eq!(HfqFile::probe_arch_id(&draft).unwrap(), 20);
+    }
+
+    #[test]
+    fn probe_fails_closed_on_a_non_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_hfq = dir.path().join("README.md");
+        std::fs::write(&not_hfq, b"# not a model\n").unwrap();
+        assert!(HfqFile::probe_arch_id(&not_hfq).is_err());
+        // Shorter than the 32-byte header: `Err`, not a panic.
+        let truncated = dir.path().join("truncated.hfq");
+        std::fs::write(&truncated, b"HFQM\x01\x00\x00\x00").unwrap();
+        assert!(HfqFile::probe_arch_id(&truncated).is_err());
+        assert!(HfqFile::probe_arch_id(&dir.path().join("absent.hfq")).is_err());
     }
 }
 

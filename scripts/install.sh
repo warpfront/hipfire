@@ -5,7 +5,8 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 
 # Thin bootstrap: obtain source, build hipfire-cli, hand off to `hipfire setup`
-# for exact-registry indexed kernel packaging beside the installed daemon.
+# for exact-registry indexed kernels beside the installed daemon: the tag's
+# prebuilt release kernel pack when it verifies, local hipcc compilation otherwise.
 # Usage: curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
 # Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch beta
 set -euo pipefail
@@ -178,9 +179,12 @@ Usage: install.sh [options]
 
 Options:
   --branch NAME              Install from branch NAME
-  --ref REF                  Install from git ref REF
-  --tag TAG                  Install from tag TAG
+  --ref REF                  Install from git ref REF (a tag also selects its kernel pack)
+  --tag TAG                  Install from tag TAG and its prebuilt kernel pack
   --commit SHA               Install from commit SHA
+  --compile-kernels          Compile kernels locally with hipcc even when a kernel pack exists
+  --kernel-pack-url URL      Directory or URL (https://, file://, path) holding the kernel pack
+                             assets (default: the tag's GitHub release; forwarded to setup)
   --rocm-root PATH           ROCm installation root (forwarded to setup)
   --hipcc PATH               ROCm device compiler (hipcc) when in different prefix (forwarded to setup)
   --strict-rocm              Disable cross-root compiler fallback (forwarded to setup)
@@ -253,11 +257,11 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2
             ;;
-        --rocm-root|--gpu-arch|--hipcc)
+        --rocm-root|--gpu-arch|--hipcc|--kernel-pack-url)
             [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
             shift 2
             ;;
-        --strict-rocm)
+        --strict-rocm|--compile-kernels)
             shift
             ;;
         --yes|-y|--non-interactive)

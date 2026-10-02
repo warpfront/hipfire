@@ -558,6 +558,64 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     }
 
     #[test]
+    fn tool_call_cut_by_length_cap_is_length_done_not_error() {
+        // Budget spent inside a tool call: AR ends finish=length with no call
+        // and no cache (`qwen_ar_finish_route`). The spec paths (DFlash, MTP)
+        // must end the same way instead of failing closed with
+        // "malformed tool protocol".
+        let body = "Saving it.<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.py\",\"content\":\"def";
+        let (stream, fin, _raw) = drive_qwen_emit(body, AssistantPrefix::Plain);
+        assert_eq!(fin.finish_reason, "truncated_tool_call");
+        assert_eq!(fin.tool_calls, 0);
+        let visible: String = stream
+            .iter()
+            .chain(fin.events.iter())
+            .filter_map(|e| match e {
+                ClientEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(visible, "Saving it.");
+        assert!(!fin.events.iter().any(|e| matches!(e, ClientEvent::ToolCalls(_))));
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, &visible, false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "length");
+                assert!(!*release_tool_calls);
+                assert!(!*store_cache);
+                assert!(wire_tool_calls.is_empty());
+            }
+            other => panic!("expected length Done, got {other:?}"),
+        }
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
+        // The model ending its turn inside the call still fails closed.
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, &visible, false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
+                message,
+                class,
+                retryable,
+                ..
+            } => {
+                assert_eq!(message, "malformed tool protocol");
+                assert_eq!(*class, "validation");
+                assert!(!*retryable);
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // A call that went malformed mid-stream fails closed even at the cap:
+        // AR errors on the spot there, before any length terminal.
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&summary_malformed(), true, false, "", false);
+        assert!(matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }));
+    }
+
+    #[test]
     fn producer_decoded_eot_beats_length_without_token_rescan() {
         // Real emitter decoded_eot at budget boundary → stop, not length.
         let tok = test_tokenizer();

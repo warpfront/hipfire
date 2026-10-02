@@ -90,6 +90,11 @@ pub struct LoadCtx<'a> {
     /// trunk. Read by `Qwen35Carrier` only, after the bundled trailer probe.
     /// `None` = look beside the canonical trunk (`<trunk>.with_extension("mtp")`).
     pub mtp_path: Option<PathBuf>,
+    /// Resolved `vision.mode` (`off`/`auto`/`on`). Gates `<stem>.vl` sibling
+    /// discovery in the carrier — `vision_path` alone cannot distinguish
+    /// "off" (never probe) from "auto with no explicit sidecar" (probe).
+    /// `off` suppresses discovery; `auto`/`on` allow it.
+    pub vision_mode: String,
     pub kv_mode_override: Option<&'a str>,
     /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
     pub kv_k_override: Option<&'a str>,
@@ -178,8 +183,15 @@ pub struct SpecLoadCfg {
     /// `Some(false)` = `off` (skip), `None` = `auto` (load when present,
     /// log-and-AR fallback otherwise).
     pub dflash: Option<bool>,
+    /// DFlash adaptive verify-block (`dflash_adaptive_b`, default false).
+    /// `None` = loader default (off: fixed block). Env `HIPFIRE_DFLASH_ADAPTIVE_B=0`
+    /// forces the fixed full block at build, mirroring
+    /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`. Mutually exclusive with the
+    /// retained-PM4 verify route (which needs the fixed B=16 shape).
+    pub dflash_adaptive_b: Option<bool>,
 }
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 /// CASK/TriAttention params forwarded by the CLI at load time.
 #[derive(Default)]
 pub struct CaskConfig {

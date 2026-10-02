@@ -31,7 +31,7 @@ use rdna_compute::tensor_ops::{
     indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
     indexed_attention_pool_rope, indexed_attention_select, Bf16Roundtrip, GatedDeltaStep,
     HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
-    IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect,
+    IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -1380,6 +1380,7 @@ fn run_gdn_sequence(
                     value_heads,
                     key_dim,
                     value_dim,
+                    position: token,
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -2546,6 +2547,7 @@ fn run_qsa(
                 head_dim,
                 selected_len: capacity,
                 full_capacity: tokens,
+                format: QsaKvFormat::F32,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2790,8 +2792,15 @@ fn run_moe_operator(
     let weights_gpu = gpu
         .zeros(&[tokens * top_k], DType::F32)
         .map_err(|error| error.to_string())?;
-    gpu.moe_router_softmax_top10_f32(&logits_gpu, &selected_gpu, &weights_gpu, tokens, true, false)
-        .map_err(|error| error.to_string())?;
+    gpu.moe_router_softmax_top10_f32(
+        &logits_gpu,
+        &selected_gpu,
+        &weights_gpu,
+        tokens,
+        true,
+        false,
+    )
+    .map_err(|error| error.to_string())?;
     let selected_experts = download_i32(gpu, &selected_gpu, tokens * top_k)?;
     let routing_weights = gpu
         .download_f32(&weights_gpu)
@@ -3426,6 +3435,7 @@ fn run_mtp(
                 head_dim: 4,
                 selected_len: capacity,
                 full_capacity: tokens,
+                format: QsaKvFormat::F32,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3874,6 +3884,7 @@ fn run_quality_candidate(
         &mut gpu,
         2048,
         metadata,
+        hipfire_arch_qwen4::Qwen4StateFormat::F32,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));

@@ -173,6 +173,7 @@ pub enum ShardPolicy {
 ///
 /// This is deliberately independent from [`ShardPolicy`] and
 /// [`PlacementHint`]. `Resident` weights are fulfilled into a device tensor;
+/// `HostMapped` weights into pinned host RAM the device reads over PCIe;
 /// `ExternalRows` weights remain in a source-backed row store and are only
 /// described in the fulfillment census.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -180,6 +181,10 @@ pub enum WeightResidency {
     /// Materialize the logical tensor on its planned device(s).
     #[default]
     Resident,
+    /// Materialize the logical tensor in pinned, device-mapped host RAM. The
+    /// handle is an ordinary tensor whose kernels read it over PCIe
+    /// (zero-copy); it costs no device memory.
+    HostMapped,
     /// Keep source rows external to the device weight store.
     ///
     /// `row_bytes` describes one physical source row. `valid_rows` is the

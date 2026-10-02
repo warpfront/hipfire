@@ -53,6 +53,42 @@ Playbook fix 9.
 
 ---
 
+### Loader wedge → degraded GPU/driver state (AMD RDNA)
+
+| Field | Value |
+|---|---|
+| **Status** | Current — driver-level; **single-box observation 2026-09-27**, gfx1100 (Navi31 / RX 7900 XTX); pattern is machine-independent, numbers are not |
+| **Scope** | AMD RDNA serve loads (seen loading `qwen3.8:27b-mq4-xt`, mq4 weights + q8 KV) |
+
+**Symptom:** Loads never complete and every restart reproduces it. The daemon
+spins in `R` state while `serve.log` freezes mid-layer; two threads park in
+`kfd_wait_on_events` (a GPU completion that never arrives); VRAM stays held
+(11–15 GB) and `/health` may still answer. Observed freeze positions varied
+(62/64, 54, 49, 41, 33, 10 …).
+
+**Workaround (privileged — approval + owner inspection; playbook fix 11):**
+
+Machine-agnostic — DRM node indexes and service-unit names are
+host-specific, so resolve them on the box in question:
+
+```bash
+# Identify the AMD GPU first — do NOT assume a card index
+for c in /sys/class/drm/card*/device; do
+  echo "$(basename "$(dirname "$c")"): vendor=$(cat "$c/vendor")"
+done   # AMD = 0x1002
+
+# Stop the daemon's supervision, reset that GPU, start again
+systemctl --user stop hipfire.service      # or the unit in use
+echo 1 | sudo tee /sys/class/drm/<card-of-amd>/device/reset
+systemctl --user start hipfire.service
+```
+
+Restarting serve does **not** clear this; a full reset (or a reboot) does.
+If wedges repeat across sessions, escalate with the full triage bundle
+rather than making resets a routine.
+
+---
+
 ## Unknown / needs ref-pinned verification
 
 ### Qwen 3.5 0.8B + hipGraph capture panic

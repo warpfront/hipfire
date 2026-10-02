@@ -1,4 +1,5 @@
-use super::{ActScale, Builder, Spec, ds_load, op, v};
+use super::{ActScale, Builder, Spec, ds_load};
+use crate::kernels::common::{op, v};
 use crate::ledger::Counter;
 
 /// Row-scale ratio staging for one row group (8 ratios, rows 8i..8i+7):

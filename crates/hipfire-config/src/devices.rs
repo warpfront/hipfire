@@ -26,8 +26,8 @@
 use crate::{ConfigError, ProcessConfig, Result};
 use std::{
     fmt, fs,
-    path::Path,
-    sync::OnceLock,
+    path::{Path, PathBuf},
+    sync::{LazyLock, OnceLock},
 };
 
 pub const HIP_VISIBLE_DEVICES: &str = "HIP_VISIBLE_DEVICES";
@@ -36,6 +36,124 @@ pub const ROCR_VISIBLE_DEVICES: &str = "ROCR_VISIBLE_DEVICES";
 pub const HSA_OVERRIDE_GFX_VERSION: &str = "HSA_OVERRIDE_GFX_VERSION";
 /// KFD topology root. Its GPU nodes, in node order, are ROCr's agent order.
 pub const KFD_TOPOLOGY_NODES: &str = "/sys/class/kfd/kfd/topology/nodes";
+
+/// Filesystem root probed for the GPU driver model: `/` in production, a
+/// fake tree in tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceRoot(PathBuf);
+
+/// Where physical GPU identity comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentitySource {
+    /// amdgpu KFD topology in sysfs (native Linux).
+    Kfd,
+    /// HIP device properties (UUID, PCI bus ID, arch): WSL2/ROCDXG and native
+    /// Windows, which have no KFD topology.
+    Hip,
+}
+
+impl DeviceRoot {
+    pub fn system() -> Self {
+        Self(PathBuf::from("/"))
+    }
+
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self(root.into())
+    }
+
+    pub fn kfd_topology(&self) -> PathBuf {
+        self.0.join(KFD_TOPOLOGY_NODES.trim_start_matches('/'))
+    }
+
+    /// WSL2 with AMD's ROCDXG: the Windows driver owns the GPU and ROCm talks
+    /// to it through `/dev/dxg`; there is no `/dev/kfd`.
+    pub fn is_wsl_dxg(&self) -> bool {
+        self.0.join("dev/dxg").exists() && !self.0.join("dev/kfd").exists()
+    }
+
+    pub fn identity_source(&self) -> IdentitySource {
+        if cfg!(windows) || self.is_wsl_dxg() {
+            IdentitySource::Hip
+        } else {
+            IdentitySource::Kfd
+        }
+    }
+}
+
+/// Driver models on which Redline PM4 and VMM KV growth are not certified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UncertifiedPlatform {
+    /// Windows HIP SDK: no ROCr, VMM growth observed to alias segments.
+    NativeWindows,
+    /// WSL2/ROCDXG: ROCr over WDDM; PM4 passthrough and VMM growth unproven.
+    WslDxg,
+}
+
+impl UncertifiedPlatform {
+    pub fn detect_at(root: &DeviceRoot) -> Option<Self> {
+        if cfg!(windows) {
+            Some(Self::NativeWindows)
+        } else if root.is_wsl_dxg() {
+            Some(Self::WslDxg)
+        } else {
+            None
+        }
+    }
+
+    /// This host, probed once.
+    pub fn detect() -> Option<Self> {
+        static PLATFORM: LazyLock<Option<UncertifiedPlatform>> =
+            LazyLock::new(|| UncertifiedPlatform::detect_at(&DeviceRoot::system()));
+        *PLATFORM
+    }
+}
+
+/// Process knob that admits Redline under WSL/ROCDXG; unsafe until certified.
+pub const UNSAFE_WSL_REDLINE: &str = "HIPFIRE_UNSAFE_WSL_REDLINE";
+/// Process knob that admits VMM KV under WSL/ROCDXG; unsafe until certified.
+pub const UNSAFE_WSL_VMM_KV: &str = "HIPFIRE_UNSAFE_WSL_VMM_KV";
+
+/// Why Redline PM4 (retained default or explicit backend) is refused on
+/// `platform`, or `None` when it may run. Native Windows has no ROCr, so no
+/// knob lifts it there.
+pub fn redline_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: bool) -> Option<String> {
+    match platform? {
+        UncertifiedPlatform::NativeWindows => Some(
+            "Redline PM4 needs ROCr (libhsa-runtime64), which the Windows HIP SDK does not ship".into(),
+        ),
+        UncertifiedPlatform::WslDxg if unsafe_override => None,
+        UncertifiedPlatform::WslDxg => Some(format!(
+            "Redline PM4 is not certified under WSL/ROCDXG (/dev/dxg without /dev/kfd); set {UNSAFE_WSL_REDLINE}=1 (replay.unsafe_wsl_redline) to override, unsafe until certified"
+        )),
+    }
+}
+
+/// Why the VMM KV backend is refused on `platform`, or `None` when allowed.
+pub fn vmm_kv_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: bool) -> Option<String> {
+    match platform? {
+        UncertifiedPlatform::NativeWindows => {
+            Some("Windows VMM mapping/graph semantics are not certified".into())
+        }
+        UncertifiedPlatform::WslDxg if unsafe_override => None,
+        UncertifiedPlatform::WslDxg => Some(format!(
+            "VMM KV growth is not certified under WSL/ROCDXG (WDDM may alias earlier KV segments); set {UNSAFE_WSL_VMM_KV}=1 (memory.unsafe_wsl_vmm_kv) to override, unsafe until certified"
+        )),
+    }
+}
+
+fn process_flag(name: &str) -> bool {
+    crate::process_value(name).as_deref() == Some("1")
+}
+
+/// [`redline_refusal`] for this host and process configuration.
+pub fn redline_platform_refusal() -> Option<String> {
+    redline_refusal(UncertifiedPlatform::detect(), process_flag(UNSAFE_WSL_REDLINE))
+}
+
+/// [`vmm_kv_refusal`] for this host and process configuration.
+pub fn vmm_kv_platform_refusal() -> Option<String> {
+    vmm_kv_refusal(UncertifiedPlatform::detect(), process_flag(UNSAFE_WSL_VMM_KV))
+}
 
 const KEY: &str = "hardware.devices";
 
@@ -120,15 +238,23 @@ pub struct GpuDevice {
     pub node: u32,
     /// `gfxNNNN` from the node's `gfx_target_version`.
     pub arch: String,
-    /// KFD `unique_id`; `None` when the card reports none (0).
-    pub unique_id: Option<u64>,
+    /// KFD `unique_id`, or the HIP UUID on HIP-identified hosts; `None` when
+    /// the card reports none (0).
+    pub unique_id: Option<u128>,
     pub bdf: PciBdf,
 }
 
 impl GpuDevice {
-    /// ROCr's UUID spelling, `GPU-` plus 16 lowercase hex digits.
+    /// ROCr's UUID spelling, `GPU-` plus 16 lowercase hex digits; a full
+    /// 128-bit HIP UUID keeps all 32.
     pub fn uuid(&self) -> Option<String> {
-        self.unique_id.map(|id| format!("GPU-{id:016x}"))
+        self.unique_id.map(|id| {
+            if id > u128::from(u64::MAX) {
+                format!("GPU-{id:032x}")
+            } else {
+                format!("GPU-{id:016x}")
+            }
+        })
     }
 
     /// Selector for `ROCR_VISIBLE_DEVICES`: the UUID when the card has one,
@@ -211,7 +337,7 @@ pub fn enumerate_gpus(nodes_dir: &Path) -> Result<Vec<GpuDevice>> {
             rocr_index: devices.len(),
             node,
             arch: gfx_name(version),
-            unique_id: property("unique_id").filter(|&id| id != 0),
+            unique_id: property("unique_id").filter(|&id| id != 0).map(u128::from),
             bdf: PciBdf::from_kfd(domain as u32, location_id as u32),
         });
     }
@@ -220,6 +346,92 @@ pub fn enumerate_gpus(nodes_dir: &Path) -> Result<Vec<GpuDevice>> {
         device.index = index;
     }
     Ok(devices)
+}
+
+/// Parse HIP's `GPU-<hex>` UUID spelling: ROCr's 16 ASCII hex digits, or the
+/// raw 16 UUID bytes as 32 hex digits. All zeros means no UUID.
+fn parse_hip_uuid(value: &str) -> Option<u128> {
+    let value = value.trim();
+    let hex = value.strip_prefix("GPU-").or_else(|| value.strip_prefix("gpu-"))?;
+    if hex.is_empty() || hex.len() > 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u128::from_str_radix(hex, 16).ok().filter(|&id| id != 0)
+}
+
+/// Identify HIP's logical devices from HIP properties alone, for hosts with
+/// no KFD topology. The result is in logical order; `index` is the PCI BDF
+/// position and `rocr_index`/`node` carry the HIP ordinal. Two devices with
+/// one lock identity fail closed: a single lock must never cover two cards.
+pub fn devices_from_hip(observed: &[ObservedDevice]) -> std::result::Result<Vec<GpuDevice>, String> {
+    let mut devices = observed
+        .iter()
+        .map(|seen| {
+            let bdf = PciBdf::parse(&seen.pci_bus_id).ok_or_else(|| {
+                format!(
+                    "HIP logical device {} reports an unparsable PCI bus ID {:?}",
+                    seen.logical, seen.pci_bus_id
+                )
+            })?;
+            Ok(GpuDevice {
+                index: 0,
+                rocr_index: seen.logical,
+                node: seen.logical as u32,
+                arch: seen.arch.clone(),
+                unique_id: seen.uuid.as_deref().and_then(parse_hip_uuid),
+                bdf,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    let mut order = (0..devices.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&position| devices[position].bdf);
+    for (index, position) in order.into_iter().enumerate() {
+        devices[position].index = index;
+    }
+    for (position, device) in devices.iter().enumerate() {
+        if devices[..position]
+            .iter()
+            .any(|other| other.lock_identity() == device.lock_identity())
+        {
+            return Err(format!(
+                "HIP logical devices share the lock identity {}; refusing an ambiguous reservation\n{}",
+                device.lock_identity(),
+                device_table(&devices)
+            ));
+        }
+    }
+    Ok(devices)
+}
+
+/// Physical identity of every HIP logical device, in logical order: KFD
+/// topology nodes matched by PCI address on native Linux, HIP properties on
+/// WSL2/ROCDXG and native Windows (see [`DeviceRoot::identity_source`]).
+pub fn identify_observed(
+    root: &DeviceRoot,
+    observed: &[ObservedDevice],
+) -> std::result::Result<Vec<GpuDevice>, String> {
+    if root.identity_source() == IdentitySource::Hip {
+        return devices_from_hip(observed);
+    }
+    let topology = enumerate_gpus(&root.kfd_topology()).map_err(|e| e.to_string())?;
+    observed
+        .iter()
+        .map(|seen| {
+            let bdf = PciBdf::parse(&seen.pci_bus_id);
+            topology
+                .iter()
+                .find(|device| Some(device.bdf) == bdf)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "HIP logical device {} (PCI {}) is not in the KFD topology\n{}",
+                        seen.logical,
+                        seen.pci_bus_id,
+                        device_table(&topology)
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Human-readable device table carried by every resolution error.
@@ -272,7 +484,7 @@ impl DeviceSelector {
         match self {
             Self::Index(index) => device.index == *index,
             Self::Arch(arch) => device.arch == *arch,
-            Self::Uuid(id) => device.unique_id == Some(*id),
+            Self::Uuid(id) => device.unique_id == Some(u128::from(*id)),
             Self::Bdf { bdf, has_domain } => {
                 (!has_domain || device.bdf.domain == bdf.domain)
                     && (device.bdf.bus, device.bdf.device, device.bdf.function)
@@ -538,6 +750,9 @@ pub fn apply_device_visibility(
     config: &ProcessConfig,
     claim: &mut ClaimFn<'_>,
 ) -> Result<DeviceSelection> {
+    if let Some(selection) = hip_identity_visibility(&DeviceRoot::system(), config)? {
+        return Ok(selection);
+    }
     let hip = unicode_environment(HIP_VISIBLE_DEVICES)?;
     let rocr = unicode_environment(ROCR_VISIBLE_DEVICES)?;
     let selection = synchronized_device_visibility(
@@ -566,11 +781,66 @@ pub fn apply_device_visibility(
     Ok(selection)
 }
 
+/// Visibility policy on hosts without a KFD topology. `hardware.devices`
+/// resolves through KFD and fails closed there. Native Windows has no ROCr,
+/// so HIP applies an inherited `HIP_VISIBLE_DEVICES` itself and nothing is
+/// rewritten; WSL2 has ROCr and keeps the Linux filter normalization (`None`).
+fn hip_identity_visibility(
+    root: &DeviceRoot,
+    config: &ProcessConfig,
+) -> Result<Option<DeviceSelection>> {
+    if root.identity_source() != IdentitySource::Hip {
+        return Ok(None);
+    }
+    if config.legacy_value("HIPFIRE_DEVICES").is_some() {
+        return Err(ConfigError::InvalidValue {
+            key: KEY.into(),
+            message: "hardware.devices resolves cards through the KFD topology, which WSL2/ROCDXG and native Windows do not have; select cards with HIP_VISIBLE_DEVICES instead".into(),
+        });
+    }
+    Ok(cfg!(windows).then_some(DeviceSelection::Unfiltered))
+}
+
 static ACTIVE_DEVICES: OnceLock<ActiveDevices> = OnceLock::new();
 
 /// The cards `hardware.devices` resolved to in this process, if any.
 pub fn active_devices() -> Option<&'static ActiveDevices> {
     ACTIVE_DEVICES.get()
+}
+
+/// The cards this process may use, read from the KFD topology before any GPU
+/// runtime loads: the cards `hardware.devices` resolved to, else the GPUs
+/// that ROCr's filter (`ROCR_VISIBLE_DEVICES`, as [`apply_device_visibility`]
+/// left it) keeps. `None` when that cannot be told: no readable KFD topology
+/// (WSL2/ROCDXG, native Windows) or a filter entry that names no GPU.
+pub fn startup_devices() -> Option<Vec<GpuDevice>> {
+    if let Some(active) = active_devices() {
+        return Some(active.devices.clone());
+    }
+    let devices = enumerate_gpus(Path::new(KFD_TOPOLOGY_NODES)).ok()?;
+    let filter = std::env::var(ROCR_VISIBLE_DEVICES).ok();
+    rocr_visible(&devices, filter.as_deref())
+}
+
+/// The `devices` ROCr exposes under `filter`, a comma-separated list of ROCr
+/// agent ordinals and `GPU-<hex>` UUIDs; every device without one.
+fn rocr_visible(devices: &[GpuDevice], filter: Option<&str>) -> Option<Vec<GpuDevice>> {
+    let Some(filter) = filter else {
+        return Some(devices.to_vec());
+    };
+    filter
+        .split(',')
+        .map(|token| {
+            let token = token.trim();
+            devices
+                .iter()
+                .find(|device| match token.parse::<usize>() {
+                    Ok(ordinal) => device.rocr_index == ordinal,
+                    Err(_) => device.uuid().is_some_and(|uuid| uuid.eq_ignore_ascii_case(token)),
+                })
+                .cloned()
+        })
+        .collect()
 }
 
 /// What HIP reported for one logical device.
@@ -581,6 +851,9 @@ pub struct ObservedDevice {
     pub arch: String,
     /// `hipDeviceGetPCIBusId`.
     pub pci_bus_id: String,
+    /// `hipDeviceGetUuid` (`GPU-<hex>`); read only where identity comes from
+    /// HIP ([`IdentitySource::Hip`]).
+    pub uuid: Option<String>,
 }
 
 /// Resolved cards in logical order plus the arch HIP must report for them.
@@ -984,7 +1257,123 @@ mod tests {
             logical,
             arch: arch.into(),
             pci_bus_id: pci.into(),
+            uuid: None,
         }
+    }
+
+    #[cfg(not(windows))]
+    fn seen_uuid(logical: usize, pci: &str, uuid: &str) -> ObservedDevice {
+        ObservedDevice {
+            uuid: Some(uuid.into()),
+            ..seen(logical, "gfx1201", pci)
+        }
+    }
+
+    /// Fake `/`: `dev/<node>` files plus, optionally, a KFD topology with one
+    /// gfx1201 node at 03:00.0.
+    #[cfg(not(windows))]
+    fn device_root(nodes: &[&str], kfd_topology: bool) -> Topology {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-devroot-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("dev")).unwrap();
+        for node in nodes {
+            fs::write(root.join("dev").join(node), "").unwrap();
+        }
+        if kfd_topology {
+            let node = DeviceRoot::at(&root).kfd_topology().join("1");
+            fs::create_dir_all(&node).unwrap();
+            fs::write(
+                node.join("properties"),
+                "simd_count 128\ngfx_target_version 120001\nlocation_id 768\ndomain 0\nunique_id 4660\n",
+            )
+            .unwrap();
+        }
+        Topology(root)
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wsl_dxg_root_identifies_devices_from_hip() {
+        let wsl = device_root(&["dxg"], false);
+        let root = DeviceRoot::at(&wsl.0);
+        assert!(root.is_wsl_dxg());
+        assert_eq!(root.identity_source(), IdentitySource::Hip);
+        assert_eq!(UncertifiedPlatform::detect_at(&root), Some(UncertifiedPlatform::WslDxg));
+
+        let devices = identify_observed(
+            &root,
+            &[
+                seen_uuid(0, "0000:13:00.0", "GPU-9eb7aeda51c88ffd"),
+                seen_uuid(1, "0000:03:00.0", "GPU-00112233445566778899aabbccddeeff"),
+                seen_uuid(2, "0000:0a:00.0", "GPU-00000000000000000000000000000000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            devices
+                .iter()
+                .map(|device| (device.index, device.lock_file_name()))
+                .collect::<Vec<_>>(),
+            [
+                (2, "gpu-GPU-9eb7aeda51c88ffd.lock".into()),
+                (0, "gpu-GPU-00112233445566778899aabbccddeeff.lock".into()),
+                (1, "gpu-pci-0000:0a:00.0.lock".into()),
+            ],
+            "logical order kept; ROCr-style UUIDs lock under the KFD name; no UUID locks by PCI"
+        );
+
+        let error = identify_observed(
+            &root,
+            &[seen(0, "gfx1201", "0000:00:00.0"), seen(1, "gfx1201", "0000:00:00.0")],
+        )
+        .unwrap_err();
+        assert!(error.contains("share the lock identity pci-0000:00:00.0"), "{error}");
+        let error = identify_observed(&root, &[seen(0, "gfx1201", "dxg")]).unwrap_err();
+        assert!(error.contains("unparsable PCI bus ID"), "{error}");
+
+        let error = message(hip_identity_visibility(&root, &process_with_devices("0")).unwrap_err());
+        assert!(error.contains("select cards with HIP_VISIBLE_DEVICES"), "{error}");
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert_eq!(hip_identity_visibility(&root, &defaults).unwrap(), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn kfd_hosts_keep_topology_identity() {
+        for nodes in [&["kfd"][..], &["kfd", "dxg"][..]] {
+            let host = device_root(nodes, true);
+            let root = DeviceRoot::at(&host.0);
+            assert_eq!(root.identity_source(), IdentitySource::Kfd, "{nodes:?}");
+            assert_eq!(UncertifiedPlatform::detect_at(&root), None, "{nodes:?}");
+            let devices =
+                identify_observed(&root, &[seen_uuid(0, "0000:03:00.0", "GPU-ffffffffffffffff")])
+                    .unwrap();
+            assert_eq!(devices[0].lock_file_name(), "gpu-GPU-0000000000001234.lock");
+            assert!(identify_observed(&root, &[seen(0, "gfx1201", "0000:04:00.0")])
+                .unwrap_err()
+                .contains("not in the KFD topology"));
+        }
+        let missing = device_root(&[], false);
+        assert!(identify_observed(&DeviceRoot::at(&missing.0), &[seen(0, "gfx1201", "0000:03:00.0")])
+            .is_err());
+    }
+
+    #[test]
+    fn uncertified_platform_gates_need_the_unsafe_knob_on_wsl_only() {
+        use UncertifiedPlatform::{NativeWindows, WslDxg};
+        for refusal in [redline_refusal, vmm_kv_refusal] {
+            assert_eq!(refusal(None, false), None);
+            assert_eq!(refusal(Some(WslDxg), true), None);
+            assert!(refusal(Some(NativeWindows), true).is_some());
+        }
+        let redline = redline_refusal(Some(WslDxg), false).unwrap();
+        assert!(redline.contains("WSL/ROCDXG") && redline.contains("HIPFIRE_UNSAFE_WSL_REDLINE=1"), "{redline}");
+        let vmm = vmm_kv_refusal(Some(WslDxg), false).unwrap();
+        assert!(vmm.contains("WSL/ROCDXG") && vmm.contains("HIPFIRE_UNSAFE_WSL_VMM_KV=1"), "{vmm}");
     }
 
     #[test]
@@ -1021,5 +1410,30 @@ mod tests {
         assert_eq!(gfx_name(110501), "gfx1151");
         assert_eq!(override_arch("9.0.10").as_deref(), Some("gfx90a"));
         assert_eq!(override_arch("11.0"), None);
+    }
+
+    #[test]
+    fn rocr_filter_keeps_the_cards_it_names() {
+        let topology = hipx();
+        let devices = enumerate_gpus(&topology.0).unwrap();
+        let archs = |filter: Option<&str>| {
+            rocr_visible(&devices, filter)
+                .map(|kept| kept.into_iter().map(|device| device.arch).collect::<Vec<_>>())
+        };
+        // Unfiltered: every GPU in BDF order, the APU included.
+        assert_eq!(
+            archs(None).unwrap(),
+            ["gfx1100", "gfx1030", "gfx1010", "gfx1151"]
+        );
+        // ROCr ordinals follow KFD node order; UUIDs match in any case.
+        assert_eq!(archs(Some("1")).unwrap(), ["gfx1151"]);
+        assert_eq!(
+            archs(Some("GPU-C7FF6B154D0128BC, 0")).unwrap(),
+            ["gfx1030", "gfx1100"]
+        );
+        // An entry naming no GPU (or an empty filter) cannot be told.
+        assert_eq!(archs(Some("GPU-0000000000000001")), None);
+        assert_eq!(archs(Some("7")), None);
+        assert_eq!(archs(Some("")), None);
     }
 }

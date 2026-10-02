@@ -19,8 +19,6 @@
 // (256×256 is trivial — no external dependency needed; this keeps the quantize
 // crate free of `faer`, unlike the orphan `gptq.rs` module).
 
-#![allow(dead_code)] // wired conditionally from main.rs
-
 use crate::e8;
 
 /// Damping factor: H'_b += LAMBDA * mean(diag(H'_b)) * I. Essential for the
@@ -757,9 +755,6 @@ mod tests {
     }
 
     // RTN E8 reference for n=4 (convenience wrapper kept for existing tests).
-    fn rtn_row_codewords(row_rot: &[f32]) -> (Vec<u32>, Vec<f32>) {
-        rtn_row_codewords_n(row_rot, 4, e8::QUANT_STEP)
-    }
 
     // GPTQ-E8 single-tensor wrapper (generic on n), returning codewords + rotated recon.
     fn gptq_codewords_n(

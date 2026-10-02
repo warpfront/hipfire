@@ -25,7 +25,8 @@ pub use batch::{
 };
 pub use config::{
     apply_reap_plan, config_from_hfq, config_from_metadata_json, config_from_safetensors,
-    dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout,
+    dense_tp_rank_layouts, local_dense_tp_config, offload_residency_report,
+    offload_topology_refusal, validate_dense_tp, DenseTpRankLayout,
     DflashFusionCtx, LayerType, MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility,
     Qwen35BatchLoadConfig, Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt,
     Qwen35EpReduce, Qwen35EpTopology, TreeVerifyCtx,

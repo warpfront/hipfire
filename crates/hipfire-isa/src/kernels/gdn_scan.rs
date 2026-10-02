@@ -21,10 +21,10 @@
 //! block 512.
 use crate::{Arch, Builder, Emitted, KernelSpec, KernargLayout, RegPlan};
 use crate::insn::{Instruction, MemoryClass, Sop};
-use crate::kernels::iu4_gemm::lit;
+use crate::kernels::common::{lit, op, s, sop, sr, v, vr};
 use crate::ledger::Counter;
 use crate::lds::Transition;
-use crate::reg::{Kind, Live, RegRef};
+use crate::reg::{Live, RegRef};
 
 pub const SYMBOL: &str = "gdn_chunk_scan";
 /// score[64][68] u16 + state[2][64][132] u16 + d[2][64][68] u16 + ctrl[4][64] f32.
@@ -55,13 +55,6 @@ const L_D: usize = 2;
 const L_CTRL: usize = 3;
 
 type R = Result<(), String>;
-fn v(n: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len: 1 } }
-fn vr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::V, base: n, len } }
-fn s(n: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len: 1 } }
-fn sr(n: u8, len: u8) -> RegRef { RegRef { kind: Kind::S, base: n, len } }
-fn op(b: &mut Builder, text: impl Into<String>, defs: &[RegRef], uses: &[RegRef]) -> R {
-    b.push(Instruction::new(text, defs.to_vec(), uses.to_vec()))
-}
 fn rs(base: u8, len: u8) -> String { if len == 1 { format!("v{base}") } else { format!("v[{base}:{}]", base + len - 1) } }
 fn off(imm: u32) -> String { if imm == 0 { String::new() } else { format!(" offset:{imm}") } }
 /// global_load_b{32,64,128} with a uniform SGPR base and a 32-bit lane offset.
@@ -231,14 +224,11 @@ fn plan() -> Result<RegPlan, String> {
 fn declare_lds(b: &mut Builder) -> R {
     for (id, (name, base, len)) in [("score", SCORE, STATE - SCORE), ("state", STATE, DB - STATE), ("d", DB, CTRL - DB),
         ("ctrl", CTRL, GROUP_BYTES - CTRL)].into_iter().enumerate() {
-        if b.lds.add(name, base, len)? != id { return Err("LDS slot order".into()) }
+        if b.lds_slot(name, base, len)? != id { return Err("LDS slot order".into()) }
     }
     Ok(())
 }
 
-fn sop(b: &mut Builder, text: impl Into<String>, defs: &[u8], uses: &[u8]) -> R {
-    op(b, text, &defs.iter().map(|&n| s(n)).collect::<Vec<_>>(), &uses.iter().map(|&n| s(n)).collect::<Vec<_>>())
-}
 /// base64 = base + (lo32 of `off`), zero-extended.
 fn sadd64(b: &mut Builder, dst: u8, base: u8, off: u8) -> R {
     sop(b, format!("s_mov_b32 s{}, 0", S64A + 1), &[S64A + 1], &[])?;
@@ -857,7 +847,7 @@ fn epilogue(b: &mut Builder) -> R {
     }}
     b.wait_all()?;
     b.label(END)?;
-    b.push(Sop::End.encode(Arch::Gfx1201)?)
+    b.control(Sop::End.encode(Arch::Gfx1201)?)
 }
 
 pub fn emit(arch: Arch) -> Result<Emitted, String> {

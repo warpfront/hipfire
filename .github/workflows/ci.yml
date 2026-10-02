@@ -28,8 +28,8 @@ on:
     # Gating direct pushes catches the dead-gate / missing-arm / broken-test
     # class (e.g. the 3 stale prerotated tests, gfx12 dead-gate) at push time
     # via the GPU-free `cargo test --lib --workspace` dispatch coverage gate,
-    # not just on PRs.
-    branches: [master, 'integration/**']
+    # not just on PRs. beta = pre-release line, also pushed to directly.
+    branches: [master, beta, 'integration/**']
 
 # Supersede in-flight runs when a PR gets new pushes.
 concurrency:
@@ -59,9 +59,15 @@ jobs:
         run: cargo build --release --locked -p hipfire-daemon
 
   test:
-    name: unit tests (lib, no GPU)
+    name: unit + integration tests (no GPU)
     runs-on: ubuntu-latest
+    env:
+      # Belt and braces on a GPU-less runner: no test may see a device.
+      ROCR_VISIBLE_DEVICES: "-1"
+      HIP_VISIBLE_DEVICES: "-1"
     steps:
+      - name: Private hipfire lock dir
+        run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -77,6 +83,16 @@ jobs:
         # (crates/hipfire-cli/src/serve/fake_daemon.py, stdlib python3) and
         # need no GPU. hipfire-client is a lib crate and runs above.
         run: cargo test --locked -p hipfire-cli
+      - name: Run GPU-free integration and bin tests
+        # `--lib` skips crates/*/tests/*.rs and bin-only unit tests. These
+        # crates' integration tests are GPU-free (GPU ones are #[ignore]).
+        run: >-
+          cargo test --locked --tests
+          -p hipfire-engine -p hipfire-generate -p hipfire-isa -p peacemaker-lift
+          -p redline-dispatch -p hipfire-arch-qwen35-vl -p hipfire-detect
+          -p hipfire-daemon -p saddle-quant -p hipfire-tui
+      - name: Run serve fault-injection tests
+        run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 
   gates:
     name: gates (ratchets, layering, registers)
@@ -102,6 +118,10 @@ jobs:
         run: bash scripts/leanup-ratchets.sh
       - name: Crate maps match the tree
         run: python3 scripts/check-crate-maps.py --check
+      - name: Scratch growers invalidate captured graphs first
+        run: python3 scripts/check-scratch-growth.py
+      - name: Released CHANGELOG sections match their tags
+        run: python3 scripts/check-changelog.py
       - name: No committed expectation was loosened
         # PR-only: on a push there is no proposed base to compare against.
         if: github.event_name == 'pull_request'

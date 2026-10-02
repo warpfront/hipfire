@@ -76,11 +76,15 @@ impl HipError {
     ) -> Self {
         let detail = get_string
             .and_then(|f| {
+                // SAFETY: `f` is hipGetErrorString from a loaded HipRuntime; it
+                // returns a static NUL-terminated message or null for unknown codes.
                 let ptr = unsafe { f(code) };
                 if ptr.is_null() {
                     None
                 } else {
                     Some(
+                        // SAFETY: non-null pointer from hipGetErrorString points at a
+                        // static C string valid for the process lifetime.
                         unsafe { CStr::from_ptr(ptr) }
                             .to_string_lossy()
                             .into_owned(),

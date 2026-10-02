@@ -6,7 +6,7 @@
 // A low-bit copy of the LM head ranks the vocabulary; its top 8 are then
 // scored exactly against the head's own rows, so the result is the head's
 // argmax whenever that token ranks in the approximate top 8. Prepended to the
-// sources of the per-format re-score kernels (gemv_q8_0.hip, and
+// sources of the per-format re-score kernels (qwen4_gemv_q8_0.hip, and
 // gemv_mq6g256v2.hip under HIPFIRE_TOPK8_RESCORE).
 
 #include <hip/hip_runtime.h>

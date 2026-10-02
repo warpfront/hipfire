@@ -122,7 +122,8 @@ fn front_first(
         dst += bytes;
     }
     let copied = copied.and_then(|_| gpu.hip.device_synchronize());
-    let freed = gpu.free_tensor(head);
+    // Back to the device: nothing else reuses a pooled vocab-sized copy.
+    let freed = gpu.release_tensor_immediate(head);
     if let Err(error) = copied.and(freed) {
         let _ = gpu.free_tensor(out);
         return Err(error);
@@ -130,30 +131,69 @@ fn front_first(
     Ok(out)
 }
 
+/// What [`DraftHead::new`] builds for a `head_dtype` head: the ranking-copy
+/// format, whether the copy's top 8 are re-scored, and the layout front.
+fn plan(
+    head_dtype: DType,
+    layout: DraftHeadLayout,
+    policy: DraftHeadPolicy,
+) -> (Option<DType>, bool, usize) {
+    // Only a bigger head is worth a smaller copy.
+    let copy_format = policy.copy.filter(|&format| {
+        matches!(
+            head_dtype,
+            DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2
+        ) && format != head_dtype
+    });
+    // The re-score kernel reads Q8_0 or MQ6G256V2 rows at K = 2560.
+    let rescore = policy.rescore
+        && copy_format.is_some()
+        && matches!(head_dtype, DType::Q8_0 | DType::MQ6G256V2)
+        && layout.hidden == 2560;
+    let front = if rescore && layout.front < layout.special {
+        layout.front
+    } else {
+        0
+    };
+    (copy_format, rescore, front)
+}
+
 impl DraftHead {
+    /// `(resident, load scratch)` device bytes [`Self::new`] takes for a
+    /// `head_dtype` head: what the head keeps, and the most it holds on top
+    /// of that while building — the F32 requant scratch, or the unordered
+    /// copy while rows are reordered. Both go back to the device, not the
+    /// pool, before `new` returns.
+    pub fn device_bytes(
+        head_dtype: DType,
+        layout: DraftHeadLayout,
+        policy: DraftHeadPolicy,
+    ) -> Option<(usize, usize)> {
+        let (copy_format, rescore, front) = plan(head_dtype, layout, policy);
+        let mut resident = layout
+            .vocab
+            .checked_mul(std::mem::size_of::<f32>())?
+            .checked_add(8)?
+            .checked_add(layout.hidden.checked_mul(std::mem::size_of::<f32>())?)?;
+        let mut scratch = 0;
+        if let Some(format) = copy_format {
+            let (values, copy) = Gpu::requant_g256_bytes(layout.vocab, layout.hidden, format)?;
+            resident = resident.checked_add(copy)?;
+            scratch = if front == 0 { values } else { values.max(copy) };
+        }
+        if rescore {
+            resident = resident.checked_add(Gpu::TOPK8_PARTIAL_BYTES)?;
+        }
+        Some((resident, scratch))
+    }
+
     pub fn new(
         gpu: &mut Gpu,
         head: &GpuTensor,
         layout: DraftHeadLayout,
         policy: DraftHeadPolicy,
     ) -> Result<Self, DispatchError> {
-        // Only a bigger head is worth a smaller copy.
-        let copy_format = policy.copy.filter(|&format| {
-            matches!(
-                head.dtype,
-                DType::Q8_0 | DType::BF16 | DType::MQ6G256V2 | DType::MQ5G256V2
-            ) && format != head.dtype
-        });
-        // The re-score kernel reads Q8_0 or MQ6G256V2 rows at K = 2560.
-        let rescore = policy.rescore
-            && copy_format.is_some()
-            && matches!(head.dtype, DType::Q8_0 | DType::MQ6G256V2)
-            && layout.hidden == 2560;
-        let front = if rescore && layout.front < layout.special {
-            layout.front
-        } else {
-            0
-        };
+        let (copy_format, rescore, front) = plan(head.dtype, layout, policy);
         let mut owned: Vec<GpuTensor> = Vec::with_capacity(5);
         let allocated = (|| -> hip_bridge::HipResult<()> {
             if let Some(format) = copy_format {

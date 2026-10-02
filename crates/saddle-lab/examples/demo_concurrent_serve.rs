@@ -68,7 +68,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::admission::{AdmissionController, AdmitError, ModelFootprint};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::session_table::{SessionId, SessionTable};
@@ -300,6 +300,9 @@ fn main() {
                  vs n_slots={n_slots} looks wrong"
             );
         }
+        Err(e @ AdmitError::UnknownSession(_)) => {
+            panic!("open() reported {e}; only resize() can name an unknown session");
+        }
     }
     println!(
         "  (the spare pool slot stays unacquired: admission ran before pool.acquire(), so the \
@@ -326,7 +329,7 @@ fn main() {
         .map(|_| DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new"))
         .collect();
     let mut desc_staging =
-        SlotDescStaging::new(&mut gpu, pool_capacity, max_batch).expect("SlotDescStaging::new");
+        SlotDescStaging::new(&mut gpu, pool_capacity, max_batch, 0).expect("SlotDescStaging::new");
     let pbs =
         PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch::new");
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens)
@@ -338,12 +341,25 @@ fn main() {
         .zeros(&[pool_capacity], DType::F32)
         .expect("alloc out_tokens");
 
+    // q8 slot KV tier: the example exercises the scheduling loop, not a KV
+    // tier, so no rotation tables are needed.
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+    let repeat_windows: Vec<rdna_compute::GpuTensor> = (0..pool_capacity)
+        .map(|_| gpu.zeros(&[2048usize], DType::F32))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("repeat windows");
+
     let mut sample_params: Vec<SlotSampleParams> = (0..pool_capacity)
         .map(|_| SlotSampleParams {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
             seed: 0,
+            repeat_window: 0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
         })
         .collect();
 
@@ -359,10 +375,20 @@ fn main() {
                 .unwrap_or_default(),
             next_pos: 0,
             decoding: false,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         })
         .collect();
 
-    let mut scheduler = Scheduler { chunk_size };
+    let mut scheduler = Scheduler {
+        chunk_size,
+        vl_sequential: false,
+        prefill_cursor: 0,
+    };
     let mut n_generated = vec![0usize; pool_capacity];
     // Every slot holding an admitted session starts NOT finished; the
     // spare (unacquired) slot starts finished so it never runs.
@@ -371,7 +397,7 @@ fn main() {
 
     println!("\n--- generating (each line: one step, one token per still-active session) ---");
     for step in 0..n_steps {
-        let batch = scheduler.next_batch(&mut work);
+        let batch = scheduler.next_batch(&mut work, chunk_size.max(1), 1);
         if batch.is_empty() {
             break;
         }
@@ -386,6 +412,7 @@ fn main() {
             &k_arenas,
             &v_arenas,
             &mut desc_staging,
+            &kv_tier,
             &pbs,
             &scratch,
             &logits_out,
@@ -396,6 +423,7 @@ fn main() {
         gpu.sample_per_slot(
             &logits_out,
             &mut sample_params,
+            &repeat_windows,
             pool_capacity,
             config.vocab_size,
             &out_tokens,
