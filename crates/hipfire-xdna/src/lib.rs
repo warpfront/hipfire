@@ -595,6 +595,9 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        // `mut_from_ref` is intentional: the BO mapping is shared with the
+        // device and aliasing discipline is the caller's contract (crate docs).
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.
@@ -1232,6 +1235,7 @@ mod imp_stub {
         pub fn as_slice(&self) -> &[u8] {
             &[]
         }
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: zero-length, aligned, never dereferenced for I/O.
             unsafe { &mut *std::ptr::slice_from_raw_parts_mut(std::ptr::NonNull::dangling().as_ptr(), 0) }
