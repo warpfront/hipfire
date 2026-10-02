@@ -576,15 +576,17 @@ const fn entry(name: &'static str, gate_up: &'static str, down: &'static str, gu
     Entry { name, gate_up, down, gu_block, pm }
 }
 
-const ENTRIES_GFX1151: [Entry; 4] = [
+const ENTRIES_GFX1151: [Entry; 5] = [
     entry("pm_nt1", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151", "qwen4_moe_down_iu4_sym_pm_gfx1151", 64, true),
     entry("pm_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", 128, true),
+    entry("pm_nt4x4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4x4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", 256, true),
     entry("hip_nt1", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151", "qwen4_moe_down_iu4_sym_gfx1151", 64, false),
     entry("hip_nt4", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4", "qwen4_moe_down_iu4_sym_gfx1151_nt4", 128, false),
 ];
-const ENTRIES_GFX1201: [Entry; 3] = [
+const ENTRIES_GFX1201: [Entry; 4] = [
     entry("pm_nt1", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201", "qwen4_moe_down_iu4_sym_pm_gfx1201", 64, true),
     entry("pm_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", 128, true),
+    entry("pm_nt4x4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4x4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", 256, true),
     entry("pm_nt8", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8", 128, true),
 ];
 const HIP_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
@@ -638,7 +640,9 @@ fn entry_gemm(gpu: &mut Gpu, c: &Case, e: Entry, down: bool, y: &GpuTensor) -> R
     for v in [m, k, div, c.pmax, src_rows] {
         a.push_i32(v as i32);
     }
-    launch(gpu, f, [(m / 64) as u32, (c.pmax / 16) as u32, 1], block, &mut a)
+    // The super-run gate/up (block 256) covers 16 output columns per CTA.
+    let gx = if !down && block == 256 { m / 32 } else { m / 64 };
+    launch(gpu, f, [gx as u32, (c.pmax / 16) as u32, 1], block, &mut a)
 }
 
 /// Every anchor's GEMMs over the current grouping and gate sidecar (its own
@@ -1528,7 +1532,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // charges every arm alike.
             let mut arms: Vec<(&str, Stage, Option<Entry>)> =
                 vec![("incumbent", inc_stage, None), ("candidate", cand_stage, None)];
-            for &e in anchors.iter().filter(|e| e.gu_block == 128) {
+            for &e in anchors.iter().filter(|e| e.gu_block >= 128) {
                 arms.push((e.name, anchor_stage, Some(e)));
             }
             for _ in 0..2 {

@@ -1,11 +1,12 @@
 //! Qwen4 symmetric IU4 MoE builder family (gfx1151 + gfx1201).
 use hipfire_isa::Arch;
-use hipfire_isa::kernels::qwen4_moe_sym::{self, Kind, Spec, tile_widths};
+use hipfire_isa::kernels::qwen4_moe_sym::{self, Kind, Spec, module_specs};
 
 const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
 
+/// Exactly the module's entries, so certification covers every symbol.
 fn specs(arch: Arch) -> impl Iterator<Item = Spec> {
-    tile_widths(arch).iter().flat_map(move |&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt }))
+    module_specs(arch).into_iter()
 }
 
 #[test]
@@ -21,9 +22,11 @@ fn entries_are_deterministic_and_target_only_their_arches() {
             assert_eq!(a.s_text.contains("ds_store") || a.s_text.contains("ds_load"), handoff, "{spec:?}");
         }
     }
-    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Down, nt: 1 }).is_err());
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Down, nt: 1, runs: 1 }).is_err());
     // gfx11 NT8 does not fit the VGPR file.
-    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::GateUp, nt: 8 }).is_err());
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::GateUp, nt: 8, runs: 1 }).is_err());
+    // Super-runs are NT4 gate/up only.
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::Down, nt: 4, runs: 4 }).is_err());
 }
 
 /// The runtime embeds one certified module per arch: it must be exactly
@@ -91,7 +94,7 @@ mod toolchain {
                 let symbol = spec.symbol();
                 let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
                 assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
-                let tag = if spec.nt == 1 { spec.kind.tag().to_string() } else { format!("{}_nt{}", spec.kind.tag(), spec.nt) };
+                let tag = format!("{}{}", spec.kind.tag(), spec.suffix());
                 let path = format!("{}/kernels/qwen4_moe_sym.{}.{tag}.contract.json", env!("CARGO_MANIFEST_DIR"), arch.name());
                 let contract = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))).unwrap();
                 certify(&toolchain, &build, &s, arch.name(), &dir.join(format!("{tag}.manifest.json")), Some(&contract), "test", "test")

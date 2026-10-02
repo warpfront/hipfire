@@ -45024,11 +45024,13 @@ const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
 const QWEN4_MOE_SYM_CHECK_GFX1201_MODULE: &str = "qwen4_moe_sym_check_gfx1201";
 const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = ["qwen4_moe_iu4_sym_pm_gfx1151", "qwen4_moe_iu4_sym_pm_gfx1201"];
 /// Expert-run entries `[arch][host_mapped]` (block 128, several 16-slot tiles
-/// per weight stream): NT4 on VRAM-resident experts; on gfx1201 NT8 when the
-/// layer's experts are host-mapped (twice the reuse per PCIe weight stream).
-/// Every entry is bitwise the module's 16-slot entries, the ORACLE's anchor.
+/// per weight stream): NT4 on VRAM-resident experts; on gfx1151 the gate/up
+/// super-run NT4x4 (block 256, four runs of one expert per weight stream,
+/// grid.x = M/32); on gfx1201 NT8 when the layer's experts are host-mapped
+/// (twice the reuse per PCIe weight stream). Every entry is bitwise the
+/// module's 16-slot entries, the ORACLE's anchor.
 const QWEN4_MOE_SYM_PM_GATE_UP: [[&str; 2]; 2] = [
-    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4"],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4x4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4x4"],
     ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8"],
 ];
 const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
@@ -45594,6 +45596,9 @@ impl Gpu {
             .qwen4_moe_sym_gemm_symbols(host_mapped)
             .map(|[gate_up, dn]| if down { dn } else { gate_up })
             .unwrap_or(what);
+        // The super-run gate/up (`_nt4x4`): one 16-column row pair per CTA
+        // (grid.x = M/32), eight waves (four runs x gate/up).
+        let (grid, block) = if func.ends_with("x4") { ([grid[0] * 2, grid[1], grid[2]], 256) } else { (grid, block) };
         let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
             dims.map(|value| i32::try_from(value).ok())
         else {

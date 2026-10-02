@@ -81,16 +81,26 @@ impl std::str::FromStr for Kind {
     }
 }
 
-/// One entry: arch, GEMM kind and expert-run tile width `nt` (16-slot tiles
-/// per weight stream). `nt == 1` is the frozen 16-slot entry, the byte anchor
-/// of every wider tile.
+/// One entry: arch, GEMM kind, expert-run tile width `nt` (16-slot tiles
+/// per weight stream) and `runs`, the expert runs one CTA folds over one
+/// weight stream. `nt == 1` is the frozen 16-slot entry, the byte anchor
+/// of every wider tile; `runs == 4` is the NT4 gate/up super-run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Spec { pub arch: Arch, pub kind: Kind, pub nt: u8 }
+pub struct Spec { pub arch: Arch, pub kind: Kind, pub nt: u8, pub runs: u8 }
 
 /// Tile widths built per arch: the anchor and the shipped expert-run tiles
 /// (gfx1151 NT4; gfx1201 NT4 for VRAM-resident, NT8 for host-mapped experts).
 pub fn tile_widths(arch: Arch) -> &'static [u8] {
     match arch { Arch::Gfx1201 => &[1, 4, 8], _ => &[1, 4] }
+}
+
+/// Every entry of one arch's module: both kinds at each tile width, then
+/// the NT4 gate/up super-run (4 runs per CTA).
+pub fn module_specs(arch: Arch) -> Vec<Spec> {
+    let mut v: Vec<Spec> = tile_widths(arch).iter()
+        .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt, runs: 1 })).collect();
+    v.push(Spec { arch, kind: Kind::GateUp, nt: 4, runs: 4 });
+    v
 }
 
 impl Spec {
@@ -99,7 +109,11 @@ impl Spec {
             Kind::GateUp => format!("qwen4_moe_gate_up_silu_iu4_sym_pm_{}", self.arch.name()),
             Kind::Down => format!("qwen4_moe_down_iu4_sym_pm_{}", self.arch.name()),
         };
-        if self.nt == 1 { base } else { format!("{base}_nt{}", self.nt) }
+        format!("{base}{}", self.suffix())
+    }
+    /// Symbol suffix past the arch, also the contract tag past the kind.
+    pub fn suffix(self) -> String {
+        match (self.nt, self.runs) { (1, _) => String::new(), (nt, 1) => format!("_nt{nt}"), (nt, r) => format!("_nt{nt}x{r}") }
     }
     pub fn module(arch: Arch) -> String { format!("qwen4_moe_iu4_sym_pm_{}", arch.name()) }
     pub fn validate(self) -> Result<(), String> {
@@ -107,14 +121,23 @@ impl Spec {
         // gfx11 operands are twice gfx12's per lane: NT8 exceeds the VGPR file.
         let max_nt = if self.arch.gfx12() { 8 } else { 4 };
         if !matches!(self.nt, 1 | 2 | 4 | 8) || self.nt > max_nt { return Err(format!("qwen4_moe_sym: tile width {} (1, 2, 4{})", self.nt, if max_nt == 8 { " or 8" } else { "" })) }
+        // A super-run CTA is (run) x (gate, up) over one row pair; its run
+        // block (nt * runs tiles) must fit the 32-lane count of the walk.
+        if self.runs != 1 && !(self.runs == 4 && self.kind == Kind::GateUp && self.nt == 4) { return Err(format!("qwen4_moe_sym: {} runs per CTA (NT4 gate/up only)", self.runs)) }
         Ok(())
     }
     /// Waves per CTA: the 16-slot gate/up pairs gate and up rows in one wave
-    /// (2 waves); every expert-run gate/up and every down uses 4.
-    pub fn waves(self) -> u32 { if self.kind == Kind::GateUp && self.nt == 1 { 2 } else { 4 } }
+    /// (2 waves); every expert-run gate/up and every down uses 4; the
+    /// super-run gate/up 8 (run x (gate, up)).
+    pub fn waves(self) -> u32 { if self.kind == Kind::GateUp && self.nt == 1 { 2 } else if self.runs > 1 { 8 } else { 4 } }
     pub fn threads(self) -> u32 { self.waves() * 32 }
-    /// LDS bytes: the expert-run gate/up hands RNE(gate) rows to the up waves.
-    pub fn lds_bytes(self) -> u32 { if self.kind == Kind::GateUp && self.nt > 1 { u32::from(self.nt) * NT_GATE_BYTES } else { 0 } }
+    /// Output columns of one CTA (`blockIdx.x` stride of the row base).
+    pub fn cta_rows(self) -> u32 { if self.runs > 1 { 16 } else { self.kind.cta_rows() } }
+    /// LDS bytes: the expert-run gate/up hands RNE(gate) rows to the up
+    /// waves, 1 KiB per gate wave per tile.
+    pub fn lds_bytes(self) -> u32 { if self.kind == Kind::GateUp && self.nt > 1 { u32::from(self.nt) * self.gate_tile_bytes() } else { 0 } }
+    /// LDS stride of one tile in the gate/up handoff.
+    fn gate_tile_bytes(self) -> u32 { self.waves() / 2 * NT_GATE_BYTES / 2 }
     pub fn kernargs(self) -> KernargLayout {
         KernargLayout::new(KERNARG_BYTES).pointer("expert_weight_ptrs", 0).pointer("expert_tile_ids", 8)
             .pointer("sorted_slot_index", 16).pointer("Xq", 24).pointer("Y_grouped", 32)
@@ -535,9 +558,7 @@ fn body<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
 /// Every entry of one architecture (both kinds at every [`tile_widths`]
 /// width) as one code object.
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = tile_widths(arch).iter()
-        .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt }))
-        .map(emit).collect::<Result<Vec<_>, _>>()?;
+    let emitted = module_specs(arch).into_iter().map(emit).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
     Ok((emitted, text, proof))
 }
@@ -608,7 +629,7 @@ mod nt {
         fn nt(&self) -> u8 { self.spec.nt }
         fn aw(&self) -> u8 { self.spec.aw() }
         fn gate_up(&self) -> bool { self.spec.kind == Kind::GateUp }
-        fn label(&self, name: &str) -> String { format!(".Lq4s_{}_nt{}_{name}", self.spec.kind.tag(), self.nt()) }
+        fn label(&self, name: &str) -> String { format!(".Lq4s_{}{}_{name}", self.spec.kind.tag(), self.spec.suffix()) }
         fn sum(&self, j: u8) -> u8 { SUM0 + 8 * j }
         fn sums_end(&self) -> u8 { SUM0 + 8 * self.nt() }
         /// Weight nibbles of set `p` (epoch parity).
@@ -715,9 +736,10 @@ mod nt {
         let kind = g.spec.kind;
         let nt = g.nt();
         // The LDS address comes first: certification derives it from the
-        // work-item id in the entry block. (32*(w&1) + lane) * 32 bytes.
+        // work-item id in the entry block. (32*(w & (gate waves - 1)) + lane)
+        // * 32 bytes: gate wave w and up wave w + gate waves share it.
         if g.gate_up() {
-            op(b, format!("v_and_b32_e32 v{LDSA}, 63, v0"), &[v(LDSA)], &[v(0)])?;
+            op(b, format!("v_and_b32_e32 v{LDSA}, {}, v0", lit(g.spec.waves() * 16 - 1)), &[v(LDSA)], &[v(0)])?;
             op(b, format!("v_lshlrev_b32_e32 v{LDSA}, 5, v{LDSA}"), &[v(LDSA)], &[v(LDSA)])?;
         }
         smem(b, 8, 8, 0, 0)?;
@@ -781,13 +803,15 @@ mod nt {
         let b = wg.isa();
         sop(b, format!("s_ctz_i32_b32 s{POS}, s{MASKA}"), &[POS], &[MASKA])?;
         sop(b, format!("{} s{POS}, s{POS}, s{BACK}", s_add_i32(a)), &[POS], &[POS, BACK])?;
-        // Not a leader: another CTA folds this tile.
-        sop(b, format!("s_and_b32 s{POS}, s{POS}, {}", nt - 1), &[POS], &[POS])?;
+        // Not a leader: another CTA folds this tile (a super-run CTA leads a
+        // block of `runs` consecutive NT runs).
+        let blk = nt * g.spec.runs;
+        sop(b, format!("s_and_b32 s{POS}, s{POS}, {}", blk - 1), &[POS], &[POS])?;
         let follower = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_lg_u32 s{POS}, 0"), vec![], vec![s(POS)]))?;
         wg.exit_if(follower, end)?;
         let b = wg.isa();
-        // cnt: the first lane l < nt whose tile tile+l is past the end or of
-        // another expert (lanes >= nt always stop).
+        // cnt: the first lane l < blk whose tile tile+l is past the end or of
+        // another expert (lanes >= blk always stop).
         op(b, format!("v_add_nc_u32_e32 v5, s{WGY}, v2"), &[v(5)], &[s(WGY), v(2)])?;
         op(b, "v_lshlrev_b32_e32 v6, 2, v5", &[v(6)], &[v(5)])?;
         bload(b, 1, 7, 6, SRD_S, 0)?;
@@ -795,9 +819,21 @@ mod nt {
         op(b, format!("v_cmp_ne_u32_e64 s{MASKA}, s23, v7"), &[s(MASKA)], &[s(23), v(7)])?;
         op(b, format!("v_cmp_le_u32_e64 s{}, s5, v5", MASKT[0]), &[s(MASKT[0])], &[s(5), v(5)])?;
         or_mask(b, MASKA, MASKT[0])?;
-        op(b, format!("v_cmp_le_u32_e64 s{}, {nt}, v2", MASKT[0]), &[s(MASKT[0])], &[v(2)])?;
+        op(b, format!("v_cmp_le_u32_e64 s{}, {blk}, v2", MASKT[0]), &[s(MASKT[0])], &[v(2)])?;
         or_mask(b, MASKA, MASKT[0])?;
         sop(b, format!("s_ctz_i32_b32 s{CNT}, s{MASKA}"), &[CNT], &[MASKA])?;
+        if g.spec.runs > 1 {
+            // Wave (run r = w & (runs-1)) folds tiles tile+nt*r ..: its
+            // count is clamp(cnt - nt*r, 0, nt); a run with none folds dead
+            // slots, stores nothing and still meets the handoff barrier.
+            sop(b, format!("s_and_b32 s4, s{WAVE}, {}", g.spec.runs - 1), &[4], &[WAVE])?;
+            sop(b, format!("s_mul_i32 s4, s4, {nt}"), &[4], &[4])?;
+            sop(b, format!("{} s{CNT}, s{CNT}, s4", sub_i32(a)), &[CNT], &[CNT, 4])?;
+            sop(b, format!("s_max_i32 s{CNT}, s{CNT}, 0"), &[CNT], &[CNT])?;
+            sop(b, format!("s_min_u32 s{CNT}, s{CNT}, {nt}"), &[CNT], &[CNT])?;
+            sop(b, format!("{} s{WGY}, s{WGY}, s4", s_add_i32(a)), &[WGY], &[WGY, 4])?;
+            sop(b, format!("s_lshl_b32 s{TILE16}, s{WGY}, 4"), &[TILE16], &[WGY])?;
+        }
         // row_bytes = (K/256)*136 (QT44) or (K/128)*68 (QT53).
         let k = 19;
         match kind {
@@ -807,9 +843,13 @@ mod nt {
         sop(b, format!("s_lshr_b32 s{TRIPS}, s{k}, 7"), &[TRIPS], &[k])?;
         sop(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(a)), &[TRIPS], &[TRIPS])?;
         sop(b, format!("s_lshr_b32 s{TRIPS}, s{TRIPS}, 1"), &[TRIPS], &[TRIPS])?;
-        // Output column base: gate/up 32x + 16*(w&1), down 64x + 16w. The
-        // weight rows of an up wave are M/2 further.
+        // Output column base: gate/up 32x + 16*(w&1) (super-run 16x), down
+        // 64x + 16w. The weight rows of an up wave are M/2 further.
         match kind {
+            Kind::GateUp if g.spec.runs > 1 => {
+                sop(b, format!("s_lshl_b32 s{RBASE}, s{WGX}, 4"), &[RBASE], &[WGX])?;
+                sop(b, "s_mov_b32 s4, 0", &[4], &[])?;
+            }
             Kind::GateUp => {
                 sop(b, format!("s_lshl_b32 s{RBASE}, s{WGX}, 5"), &[RBASE], &[WGX])?;
                 sop(b, format!("s_and_b32 s4, s{WAVE}, 1"), &[4], &[WAVE])?;
@@ -834,7 +874,7 @@ mod nt {
         op(b, "v_add_nc_u32_e32 v8, v8, v9", &[v(8)], &[v(8), v(9)])?;
         op(b, format!("v_lshlrev_b32_e32 v{YOFF}, 1, v8"), &[v(YOFF)], &[v(8)])?;
         if kind == Kind::GateUp {
-            sop(b, format!("s_lshr_b32 s4, s{WAVE}, 1"), &[4], &[WAVE])?;
+            sop(b, format!("s_lshr_b32 s4, s{WAVE}, {}", if g.spec.runs > 1 { 2 } else { 1 }), &[4], &[WAVE])?;
             sop(b, "s_mul_i32 s4, s4, s5", &[4], &[4, 5])?;
             sop(b, format!("{} s{RBASE}, s{RBASE}, s4", s_add_i32(a)), &[RBASE], &[RBASE, 4])?;
         }
@@ -1044,11 +1084,12 @@ mod nt {
             op(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[s(PSEL)], &[])?;
         }
         for j in 0..g.nt() {
-            if j > 0 {
+            // A super-run wave's run may hold no tile at all (cnt 0).
+            if j > 0 || g.spec.runs > 1 {
                 let live = w.scmp(Instruction::new(format!("s_cmp_gt_u32 s{CNT}, {j}"), vec![], vec![s(CNT)]))?;
                 w.exit_unless(live, end)?;
-                add64(w.isa(), SRD_Y, SRD_Y, YSTEP)?;
             }
+            if j > 0 { add64(w.isa(), SRD_Y, SRD_Y, YSTEP)?; }
             let r = vals(w, j)?;
             store_rows(w.isa(), g, r, g.live(j))?;
         }
@@ -1067,13 +1108,13 @@ mod nt {
         // Gate waves publish the rounded gate rows and leave; up waves meet
         // them at their own barrier, read the publication and store the
         // tiles (wave scope, up to the kernel exit).
-        let up = wg.scmp(Instruction::new(format!("s_cmp_ge_u32 s{WAVE}, 2"), vec![], vec![s(WAVE)]))?;
+        let up = wg.scmp(Instruction::new(format!("s_cmp_ge_u32 s{WAVE}, {}", g.spec.waves() / 2), vec![], vec![s(WAVE)]))?;
         let gv = g.gval();
         wg.handoff(up, &g.label("up"), end, gate, |w, gate| {
             let mut out = w.begin_write(gate);
             for j in 0..g.nt() {
                 for h in 0..2u8 {
-                    let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
+                    let off = u32::from(j) * g.spec.gate_tile_bytes() + 16 * u32::from(h);
                     let d = crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.sum(j) + 4 * h, len: 4 };
                     let text = format!("ds_store_b128 v{LDSA}, {d}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
                     out = w.ds_store(out, Instruction::new(text, vec![], vec![v(LDSA), d]).memory(MemoryClass::DsStore))?;
@@ -1082,7 +1123,7 @@ mod nt {
             Ok(out)
         }, |w, gate, end| store_tiles(w, g, end, |w, j| {
             for h in 0..2u8 {
-                let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
+                let off = u32::from(j) * g.spec.gate_tile_bytes() + 16 * u32::from(h);
                 let d = crate::reg::RegRef { kind: crate::reg::Kind::V, base: gv + 4 * h, len: 4 };
                 let text = format!("ds_load_b128 {d}, v{LDSA}{}", if off == 0 { String::new() } else { format!(" offset:{off}") });
                 w.ds_load(&gate, Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad))?;
@@ -1095,7 +1136,7 @@ mod nt {
     pub(super) fn emit(spec: Spec) -> Result<Emitted, String> {
         let g = G { spec };
         let kspec = KernelSpec {
-            kernel_id: "qwen4_moe_sym".into(), variant: format!("{}_nt{}", spec.kind.tag(), spec.nt), arch: spec.arch, symbol: spec.symbol(),
+            kernel_id: "qwen4_moe_sym".into(), variant: format!("{}{}", spec.kind.tag(), spec.suffix()), arch: spec.arch, symbol: spec.symbol(),
             kernargs: spec.kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
             workgroup_size: spec.threads() as u16, group_segment_fixed_size: spec.lds_bytes(), wave32: true, cu_mode: false,
         };

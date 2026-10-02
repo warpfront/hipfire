@@ -45,12 +45,13 @@ fn iu4_v2b(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 /// `--epi all` emits every entry of the arch as one module; `gate_up`/`down`
-/// one 16-slot entry, `gate_up_ntN`/`down_ntN` one expert-run entry.
+/// one 16-slot entry, `gate_up_ntN`/`down_ntN` one expert-run entry,
+/// `gate_up_nt4x4` the super-run gate/up.
 fn qwen4_moe_sym(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
- use hipfire_isa::kernels::qwen4_moe_sym::{self,Spec};
+ use hipfire_isa::kernels::qwen4_moe_sym;
  if epi=="all"{let (_,text,proof)=qwen4_moe_sym::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
- let (kind,nt)=match epi.rsplit_once("_nt"){Some((k,n))=>(k,n.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?),None=>(epi,1)};
- let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt})?;
+ let spec=qwen4_moe_sym::module_specs(arch).into_iter().find(|s|format!("{}{}",s.kind.tag(),s.suffix())==epi).ok_or_else(||format!("--epi {epi}: no such qwen4_moe_sym entry on {}",arch.name()))?;
+ let e=qwen4_moe_sym::emit(spec)?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
