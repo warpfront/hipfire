@@ -752,6 +752,17 @@ mod nt {
         sop(b, "s_lshl_b32 s4, s23, 3", &[4], &[23])?;
         add64(b, 6, 8, 4)?;
         smem(b, WPTR, 2, 6, 0)?;
+        let probe = kind == Kind::Down && std::env::var("HIPFIRE_Q4S_PROBE_NOWALK").as_deref() == Ok("1");
+        if probe {
+            // TIMING PROBE ONLY (wrong numbers): leader = tile % nt == 0, cnt = min(nt, tiles left).
+            sop(b, format!("s_and_b32 s{POS}, s{WGY}, {}", nt - 1), &[POS], &[WGY])?;
+            let follower = wg.scmp_wg_uniform(Instruction::new(format!("s_cmp_lg_u32 s{POS}, 0"), vec![], vec![s(POS)]))?;
+            wg.exit_if(follower, end)?;
+            let b = wg.isa();
+            sop(b, "s_lshr_b32 s5, s21, 4", &[5], &[21])?;
+            sop(b, format!("{} s{CNT}, s5, s{WGY}", sub_i32(a)), &[CNT], &[5, WGY])?;
+            sop(b, format!("s_min_u32 s{CNT}, s{CNT}, {nt}"), &[CNT], &[CNT])?;
+        } else {
         // Tile ids through a descriptor of m_total/16 records: an id read at
         // or past the end (or before the start) reads 0, so both bounds are
         // tested explicitly.
@@ -798,6 +809,8 @@ mod nt {
         op(b, format!("v_cmp_le_u32_e64 s{}, {nt}, v2", MASKT[0]), &[s(MASKT[0])], &[v(2)])?;
         or_mask(b, MASKA, MASKT[0])?;
         sop(b, format!("s_ctz_i32_b32 s{CNT}, s{MASKA}"), &[CNT], &[MASKA])?;
+        }
+        let b = wg.isa();
         // row_bytes = (K/256)*136 (QT44) or (K/128)*68 (QT53).
         let k = 19;
         match kind {
