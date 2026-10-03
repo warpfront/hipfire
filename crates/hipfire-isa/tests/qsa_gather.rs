@@ -1,4 +1,5 @@
 //! QSA gathered F16 WMMA builder family (gfx1151 + gfx1201).
+mod common;
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::qsa_gather::{self, Kind, Spec};
 
@@ -22,6 +23,7 @@ fn entries_are_deterministic_and_target_only_their_arches() {
 /// what the builder emits today.
 #[test]
 fn committed_bundles_equal_fresh_emission() {
+    if common::no_llvm() { return }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     for arch in ARCHES {
         let module = Spec::module(arch);

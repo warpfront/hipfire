@@ -92,3 +92,28 @@ pub(crate) fn refuse_ep_request(
     let _ = stdout.flush();
     true
 }
+
+/// Suffix for an admitted-load failure. Single-device/pp loads are
+/// unload-first, so after admission the prior model is already retired and a
+/// construction or staging failure leaves `model=None`; say so explicitly.
+/// A deferred tp>1 load keeps its prior model and gets no suffix.
+pub(crate) fn no_model_loaded_suffix(model_present: bool) -> &'static str {
+    if model_present {
+        ""
+    } else {
+        "; no model loaded (the prior model was unloaded before this load)"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::no_model_loaded_suffix;
+
+    #[test]
+    fn admitted_load_failure_names_missing_model_only_when_unload_first() {
+        // Unload-first (single-device/pp, incl. Qwen4): prior already retired.
+        assert!(no_model_loaded_suffix(false).contains("no model loaded"));
+        // Deferred tp>1: prior model survives a failed load.
+        assert_eq!(no_model_loaded_suffix(true), "");
+    }
+}

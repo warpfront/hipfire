@@ -1107,6 +1107,15 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_MAX_REQUEST_BYTES"),
         "Maximum request-body bytes."
     ),
+    process_bool_field!(
+        "serve.ui",
+        "serve_ui",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_UI",
+        "Serve the embedded chat UI at /ui on the serve listener; default off."
+    ),
     field!(
         "serve.max_queue",
         "serve_max_queue",

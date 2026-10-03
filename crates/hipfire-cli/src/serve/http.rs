@@ -58,7 +58,7 @@ where
     UnsyncBoxBody::new(body)
 }
 
-fn boxed_full(bytes: Vec<u8>) -> BoxBody {
+pub(crate) fn boxed_full(bytes: Vec<u8>) -> BoxBody {
     boxed(Full::new(bytes.into()).map_err(|never: Infallible| match never {}))
 }
 
@@ -656,10 +656,22 @@ fn model_entry(
             } else {
                 vec!["text"]
             };
-            entry["architecture"] = serde_json::json!({
+            // Same facts /health publishes from `meta.loaded`, so a client
+            // discovering models the OpenAI way doesn't also need a bespoke
+            // /health probe to learn the effort rungs. `reasoning_contract`
+            // is skipped while empty (load window: ack not yet in).
+            let mut architecture = serde_json::json!({
                 "input_modalities": input_modalities,
                 "output_modalities": ["text"],
             });
+            if !loaded.reasoning_contract.is_empty() {
+                architecture["reasoning_contract"] =
+                    serde_json::json!(loaded.reasoning_contract);
+                architecture["reasoning_effort_native"] =
+                    serde_json::json!(loaded.reasoning_effort_native);
+                architecture["reasoning_efforts"] = serde_json::json!(loaded.reasoning_efforts);
+            }
+            entry["architecture"] = architecture;
         }
     }
     entry
@@ -678,6 +690,13 @@ async fn handle_request(
         .unwrap_or(req.uri().path())
         .to_owned();
     let method = req.method().clone();
+    // Opt-in embedded chat UI (`serve.ui` / `--ui`). A GET on a UI path
+    // resolves embedded assets; anything else falls through to 404.
+    if shared.ui_enabled && method == Method::GET {
+        if let Some(resp) = crate::serve::ui::ui_asset(&path) {
+            return resp;
+        }
+    }
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
@@ -687,7 +706,8 @@ async fn handle_request(
             // (prewarm at startup and request-time loads alike), so reading
             // through it would block this endpoint — the one every readiness
             // probe polls — for the duration and report serve as down
-            // (`docs/SERVE.md` § "Detached readiness").
+            // (`docs/SERVE.md` § "Detached readiness"). Reasoning capability
+            // therefore publishes through `meta.loaded` too.
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             // 503 while the daemon is dead or being respawned, so probes and
             // service managers see that requests cannot be served.
@@ -707,6 +727,12 @@ async fn handle_request(
                 // and not the trained window. `null` while no model is resident
                 // (`n_ctx == 0`), so a client cannot read 0 as "zero context".
                 "n_ctx": (meta.n_ctx > 0).then_some(meta.n_ctx),
+                // Reasoning capability is live state, published on
+                // `meta.loaded` at the load ack (see `ensure_model`) so this
+                // endpoint never touches the runtime lock.
+                "reasoning_contract": meta.loaded.reasoning_contract,
+                "reasoning_effort_native": meta.loaded.reasoning_effort_native,
+                "reasoning_efforts": meta.loaded.reasoning_efforts,
             });
             let status = if state == crate::serve::EngineState::Up {
                 200
@@ -2194,6 +2220,9 @@ mod tests {
             vision: false,
             n_embd: 2048,
             n_vocab: 248320,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
         };
         let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
         assert_eq!(resident["created"], serde_json::json!(1790385975u64));
@@ -2223,6 +2252,9 @@ mod tests {
             vision: true,
             n_embd: 5120,
             n_vocab: 248320,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
         };
         let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
         assert_eq!(
@@ -2240,5 +2272,33 @@ mod tests {
         assert!(entry.get("created").is_none());
         assert!(entry.get("meta").is_none());
         assert!(entry.get("architecture").is_none());
+    }
+
+    #[test]
+    fn model_entry_publishes_reasoning_facts_for_resident_model() {
+        // The same facts /health serves from meta.loaded, on the model
+        // discovery surface, and skipped while the contract is unknown
+        // (load window / non-reasoning default-empty).
+        let loaded = LoadedInfo {
+            reasoning_contract: "qwen_jinja".into(),
+            reasoning_effort_native: false,
+            reasoning_efforts: vec!["low".into(), "high".into()],
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        let entry = model_entry("qwen3.5:4b", None, Some((&loaded, 8192)));
+        assert_eq!(entry["architecture"]["reasoning_contract"], "qwen_jinja");
+        assert_eq!(entry["architecture"]["reasoning_effort_native"], false);
+        assert_eq!(
+            entry["architecture"]["reasoning_efforts"],
+            serde_json::json!(["low", "high"])
+        );
+        // Empty contract (ack not in): no reasoning keys at all.
+        let unknown = LoadedInfo {
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        let bare = model_entry("qwen3.5:4b", None, Some((&unknown, 8192)));
+        assert!(bare["architecture"].get("reasoning_contract").is_none());
     }
 }

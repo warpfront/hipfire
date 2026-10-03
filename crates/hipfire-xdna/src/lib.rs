@@ -595,6 +595,9 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        // `Bo` is a cloneable handle to one shared mapping, so `&mut self`
+        // would not prevent aliasing; exclusivity is the documented contract.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.

@@ -3534,13 +3534,8 @@ mod mq2_lloyd_anchored_tests {
             .map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0)
             .collect();
         let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
-        for blk in out.chunks_exact(72) {
-            for &b in &blk[8..] {
-                for j in 0..4 {
-                    assert!(((b >> (j * 2)) & 0x3) <= 3);
-                }
-            }
-        }
+        // 2-bit indices are in range by construction; pin the block geometry.
+        assert_eq!(out.len(), 2 * 72);
         // Canonical hyphen and underscore aliases resolve to Mq2LloydAnchored,
         // remaining distinct from the affine MQ2V2 path.
         assert_eq!(

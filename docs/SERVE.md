@@ -128,8 +128,23 @@ Implemented paths (anything else → `404`):
 | `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
 | `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
+| `GET` | `/ui`, `/ui/*` | Embedded chat UI (opt-in; see below) |
 
 There is **no** `/v1/completions` route in the current CLI serve.
+
+### Embedded chat UI (`--ui` / `serve.ui` / `HIPFIRE_SERVE_UI`)
+
+Off by default. `hipfire serve --ui` (or `--open`, which implies `--ui`
+and launches the browser) serves a dependency-free chat frontend at
+`/ui` on the same listener; `serve.ui = true` or `HIPFIRE_SERVE_UI=1`
+enable it for any serve start, including detached ones. `GET /`
+redirects to `/ui` only while the UI is enabled.
+
+The UI talks to the same `/v1/chat/completions` gateway as any other
+client and keeps chat history in the browser's IndexedDB — serve stores
+nothing on its behalf. Like every serve endpoint it is **unauthenticated**:
+binding a non-loopback host with the UI enabled prints a warning, since
+that makes the gateway reachable from any browser on the network.
 
 For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
 Agent / Pi custom-provider configuration, see

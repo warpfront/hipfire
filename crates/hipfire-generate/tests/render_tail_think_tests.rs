@@ -49,6 +49,38 @@ use hipfire_generate::common::*;
         ));
     }
 
+    /// The assistant framing is read back from the rendered suffix, not from
+    /// the tokenizer's token inventory. A thinking-on Qwen3-family render ends
+    /// in a bare `assistant\n` — the model opens `<think>` itself — so the
+    /// framing is `Plain`, never `ClosedThink`.
+    ///
+    /// Regression: the multi-slot route derived `ClosedThink` whenever the
+    /// tokenizer registered `<think>`, then failed every thinking-on request
+    /// closed with "reasoning prefix mismatch: expected OpenThink got
+    /// ClosedThink".
+    #[test]
+    fn rendered_framing_is_read_from_the_suffix() {
+        assert!(matches!(
+            render_assistant_prefix("<|im_start|>assistant\n"),
+            AssistantPrefix::Plain
+        ));
+        assert!(matches!(
+            render_assistant_prefix("<|im_start|>assistant\n<think>\n"),
+            AssistantPrefix::OpenThink
+        ));
+        assert!(matches!(
+            render_assistant_prefix("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            AssistantPrefix::ClosedThink
+        ));
+        // Tail-only: a literal closer in user content must not reclassify.
+        assert!(matches!(
+            render_assistant_prefix(
+                "<|im_start|>user\nan answer </think><|im_end|>\n<|im_start|>assistant\n"
+            ),
+            AssistantPrefix::Plain
+        ));
+    }
+
     #[test]
     fn assistant_cache_fingerprint_matches_client_visible_content() {
         let raw = "hidden reasoning</think>\n\nvisible answer<|im_end|>";

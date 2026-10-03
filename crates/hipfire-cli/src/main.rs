@@ -734,6 +734,12 @@ pub(crate) struct ServeArgs {
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
     continuous_batch_size: Option<u64>,
+    /// Serve the embedded chat UI at /ui on the serve listener.
+    #[arg(long)]
+    ui: bool,
+    /// Open the chat UI in the default browser once serving (implies --ui).
+    #[arg(long)]
+    open: bool,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -2905,6 +2911,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             tp: None,
             continuous_batch_size: None,
             foreground_child: false,
+            ui: false,
+            open: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
     }
@@ -11631,6 +11639,7 @@ mod tests {
                     30000,
                     None,
                     64 << 20,
+                    false,
                 ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {
@@ -11645,6 +11654,7 @@ mod tests {
                     continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
+                    needs_session_reset: false,
                     kv_override: None,
                     kv_k_override: None,
                     kv_v_override: None,
@@ -11678,6 +11688,7 @@ mod tests {
                 retry_backoff,
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
+                ui_enabled: false,
             });
 
             let std_listener =

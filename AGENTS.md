@@ -789,6 +789,7 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. Unset/`auto`/`-1`/unparseable = fully resident (never forces offload). Sibling of `HIPFIRE_OFFLOAD_EXEC`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md). | unset (fully resident) |
 | `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default) or `cpu`. Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1. | `pcie` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
+| `HIPFIRE_SERVE_UI` | Serve the embedded chat UI at `/ui` on the serve listener (same as `hipfire serve --ui`; `--open` also launches the browser). Unauthenticated — warn-level on non-loopback binds. Chat history lives in the browser's IndexedDB; nothing is stored server-side. | OFF |
 
 | `hipfire bench` flag | Purpose |
 |---|---|

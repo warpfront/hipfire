@@ -48,6 +48,31 @@ pub fn render_tail_opens_think(rendered: &str) -> bool {
     rendered.trim_end().ends_with("<think>")
 }
 
+/// The assistant framing a rendered prompt's generation suffix ends in.
+///
+/// Companion to [`render_tail_opens_think`], and tail-only for the same
+/// reason. The Jinja render owns the generation suffix, so the framing used
+/// for continuation and for the engine's reasoning state must be read back
+/// from the rendered bytes — not assumed from the request's
+/// `assistant_prefix`, and not from the tokenizer's token inventory. A
+/// tokenizer that registers `<think>` does not imply the prompt frames a
+/// think block: the standard Qwen3-family template emits no opener when
+/// thinking is enabled and lets the model generate `<think>` itself, while
+/// `enable_thinking=false` emits a closed `<think>\n\n</think>\n\n` block.
+pub fn render_assistant_prefix(
+    rendered: &str,
+) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+    use hipfire_runtime::prompt_frame::AssistantPrefix;
+    let tail = rendered.trim_end();
+    if tail.ends_with("</think>") {
+        AssistantPrefix::ClosedThink
+    } else if tail.ends_with("<think>") {
+        AssistantPrefix::OpenThink
+    } else {
+        AssistantPrefix::Plain
+    }
+}
+
 /// Reduce the authoritative rendered-prompt state to the signal consumed by
 /// speculative emitters. Jinja owns the generation suffix, so the request's
 /// `assistant_prefix` is not authoritative once rendering succeeds.
