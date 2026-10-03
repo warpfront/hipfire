@@ -193,6 +193,52 @@
 - **PM text front end and LDS bound check for the fused A4 epilogue:** `parse_line` reads `ds_swizzle_b32 … offset:swizzle(SWAP,n)` (`0x1F | n << 10`, pinned against `llvm-mc`), and `pm_check::lds_bounds` evaluates `v_xor_b32_e32` in the entry block.
 
 ### Internal & CI
+- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
+  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
+  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
+  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
+  run the same program with `rows > 1`. The Gemma 4 super-op path and its
+  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
+  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
+    byte-identical, logits included; EAGLE tau is unchanged.
+  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
+    kernels. Greedy text stays coherent and can diverge late.
+  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
+    through the same program (`lowered::forward_prefill_batch`, 64-row
+    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
+    collector, so any architecture on these steps calibrates without
+    per-architecture taps. Gemma calibration and KLD numbers move: the tools
+    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed; dense
+    Gemma 4 always loads on the eager stack, MoE on the lowered one.
+  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM,PROJ}` developer
+    switches are removed; the fused routes are always on. The debug switches
+    `HIPFIRE_GEMMA4_{BASELINE_ATTN,ATTN_VERIFY,GEMM_VERIFY}` and
+    `HIPFIRE_MOE_{BYPASS,BUCKETED}` are removed with their hand-written paths.
+  - The 26B-A4B lowered stack loads MQ4G256V2 weights and runs MQ4G256V2 and
+    MQ6G256 routed experts on the indexed kernels, which is what the current
+    quantizer emits for it. A MoE checkpoint whose expert formats have no
+    indexed kernel pair now refuses to load instead of running a host-side
+    expert loop, and so does one whose HFQ4-G128 expert `down_proj` (K = 704)
+    was packed across rows by a quantizer before `b4846285e`; both produced
+    garbage. Requantize such files.
+
+- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
+  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
+  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
+  steps now uses the same step program as plain decode, so the qwen35
+  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
+  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
+  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
+  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
+    token 3).
+  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
+    late.
+  - Qwen3.8-27B vision answers are byte-identical.
+
+- PARO A3B checkpoints (z-lab Qwen3.5-35B-A3B-PARO, shisa Qwen3.6-35B-A3B-PARO)
+  load again: expert-group validation no longer requires one shape across a
+  layer's PARO rotation sidecars.
 - Registry: the parked `qwen3.8:27b-mq4l*` tags are dropped (never published); `registry/pending/` is removed.
 - The experimental MW16 GEMM route (`kernel.mw16` / `HIPFIRE_MW16`, default off) is removed together with its call-site predicates and tests; the live F16 mw16 kernels stay. Kernel packs are unchanged.
 - **Perf: Qwen AR (and the generic AR and secondary AR loops) and the DFlash/MTP spec emitter append each token's bytes to one buffer instead of re-decoding the whole generated history every token.** The think-budget scans read that buffer too. `Tokenizer::decode_token_bytes_into` is the per-token decode; `decode_bytes` is built on it.

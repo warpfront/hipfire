@@ -21,21 +21,11 @@ use rdna_compute::Gpu;
 
 // ─── Helpers moved verbatim from carriers.rs ─────────────────────────────
 
-/// Route selection shared by the carrier load path and source admission.
-pub fn gemma4_use_lowered(
-    enable_moe_block: bool,
-    want_batched: bool,
-    has_drafter: bool,
-    is_e_series: bool,
-) -> bool {
-    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
-}
-
 /// Pure context admission for Gemma 4. Refuses the lowered route when
 /// `max_seq < 128`. Eager loads are unrestricted (no eager assert exists).
 ///
-/// Callers compute `use_lowered` via [`gemma4_use_lowered`] / source probes so
-/// the refusal string is byte-identical at admission and carrier layers.
+/// Callers compute `use_lowered` via [`gemma4_source_uses_lowered`] so the
+/// refusal string is byte-identical at admission and carrier layers.
 pub fn gemma4_context_admission(max_seq: usize, use_lowered: bool) -> Result<(), String> {
     if use_lowered && max_seq < 128 {
         return Err(format!(
@@ -45,29 +35,10 @@ pub fn gemma4_context_admission(max_seq: usize, use_lowered: bool) -> Result<(),
     Ok(())
 }
 
-/// Mirror carrier route selection from an already-open HFQ source + env gates.
-/// `has_drafter` is the EAGLE `params.drafter` presence (not DFlash draft).
-pub fn gemma4_source_uses_lowered(hfq: &hipfire_runtime::hfq::HfqFile, has_drafter: bool) -> bool {
-    let lowered_cfg = lowered::config_from_hfq(hfq);
-    let want_batched = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
-    let Some(lcfg) = &lowered_cfg else {
-        return false;
-    };
-    let lowered_is_moe = lcfg.enable_moe_block;
-    let is_e_series = if lowered_is_moe {
-        false
-    } else {
-        match Gemma4Config::from_hfq(hfq) {
-            Ok(cfg) => cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0,
-            Err(_) => false,
-        }
-    };
-    gemma4_use_lowered(
-        lcfg.enable_moe_block,
-        want_batched,
-        has_drafter,
-        is_e_series,
-    )
+/// MoE checkpoints run on the lowered stack; every other Gemma 4 load is
+/// eager.
+pub fn gemma4_source_uses_lowered(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    lowered::config_from_hfq(hfq).is_some_and(|cfg| cfg.enable_moe_block)
 }
 
 fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
@@ -116,6 +87,27 @@ fn append_cleanup_context(op_err: String, cleanup: Result<(), String>) -> String
         Ok(()) => op_err,
         Err(c) => format!("{op_err}; cleanup also failed: {c}"),
     }
+}
+
+/// Refuse MoE checkpoints whose expert formats have no indexed device kernel
+/// pair (the routed-expert step is capture-safe and never falls back to a
+/// host loop).
+fn unsupported_expert_formats(weights: &lowered::Gemma4Weights) -> Option<String> {
+    weights.layers.iter().find_map(|layer| {
+        let moe = match layer {
+            lowered::LayerWeights::Sliding(l) => l.moe.as_ref(),
+            lowered::LayerWeights::Full(l) => l.moe.as_ref(),
+        }?;
+        let expert = moe.experts.first()?;
+        let (gate_up, down) = (expert.gate_up_proj.gpu_dtype, expert.down_proj.gpu_dtype);
+        (!hipfire_dispatch::pipeline::sandwich::RoutedExperts::supports(gate_up, down)).then(|| {
+            format!(
+                "gemma4 MoE: expert formats gate_up={gate_up:?} down={down:?} have no indexed \
+                 kernel; requantize experts to MQ4G256(V2)/MQ6G256/HFQ4G256/HFQ6G256/Q8_0 gate_up with \
+                 Q8_0/HFQ4G128 down"
+            )
+        })
+    })
 }
 
 fn free_lowered_weights(weights: lowered::Gemma4Weights, gpu: &mut Gpu) {
@@ -172,9 +164,9 @@ fn resolve_lowered_full_kv_mode(
 /// Build the Gemma 4 GPU bundle from an HFQ source.
 ///
 /// `ModelSource::Dir` returns the same error string the carrier previously
-/// emitted inline. HFQ path is verbatim: lowered/eager selection,
-/// `want_batched` env gate, E-series validation, weight/state/KV allocation,
-/// and the preserved `eprintln!` diagnostics for the chosen path.
+/// emitted inline. HFQ path: lowered (MoE) / eager selection, E-series
+/// validation, weight/state/KV allocation, and the `eprintln!` diagnostics
+/// for the chosen path.
 pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4Bundle, String> {
     if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Legacy {
         return Err("gemma4: sliding/full KV owners require legacy backend".into());
@@ -186,17 +178,11 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         }
     };
 
-    // ── Lowered vs eager selection (MoE or batched prefill opt-in) ──
-    // Arch-13 MoE (26B-A4B `enable_moe_block`) must go through `lowered`, which
-    // carries the parallel-MoE branch. We also route DENSE models through
-    // `lowered` when the operator opts into batched/WMMA prefill — that path
-    // lives only in `lowered::forward_prefill_batch`. E2B/E4B stay on eager
-    // because lowered does not implement PLE, KV sharing, or E2B's double-wide
-    // shared-layer FFN. EAGLE spec-decode (`params.drafter`) requires the eager
-    // `Gemma4State`, so a drafter request always wins and keeps the eager path
-    // (batched prefill opt-in is ignored when a drafter is present).
+    // ── Lowered vs eager selection ──
+    // Arch-13 MoE (26B-A4B `enable_moe_block`) runs on `lowered`, which
+    // carries the parallel-MoE weights; dense and E-series (PLE, KV sharing,
+    // double-wide FFN) and EAGLE targets run on the eager stack.
     let lowered_cfg = lowered::config_from_hfq(&hfq);
-    let want_batched = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
     let lowered_is_moe = lowered_cfg
         .as_ref()
         .is_some_and(|lcfg| lcfg.enable_moe_block);
@@ -212,16 +198,7 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         eager_config.as_ref().unwrap().e_series_variant()?;
     }
     gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
-    let use_lowered = if let Some(lcfg) = &lowered_cfg {
-        gemma4_use_lowered(
-            lcfg.enable_moe_block,
-            want_batched,
-            ctx.gemma4_drafter_path.is_some(),
-            is_e_series,
-        )
-    } else {
-        false
-    };
+    let use_lowered = lowered_is_moe;
     // Refuse before any device allocation so direct-carrier callers match
     // source-admission refusal (prior model / pool state stay untouched).
     gemma4_context_admission(ctx.max_seq, use_lowered)?;
@@ -253,6 +230,10 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         // On any later error free every completed earlier owner in reverse.
         let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
+        if let Some(e) = unsupported_expert_formats(&weights) {
+            free_lowered_weights(weights, ctx.gpu);
+            return Err(e);
+        }
         let scratch = match lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, ctx.max_seq) {
             Ok(v) => v,
             Err(e) => {
@@ -313,8 +294,7 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
             }
         };
         eprintln!(
-            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {full_kv_label} KV; kv_cache={mode_raw})",
-            lcfg.enable_moe_block, want_batched,
+            "  gemma4 lowered path: moe (sliding q8-ring + full {full_kv_label} KV; kv_cache={mode_raw})"
         );
         return Ok(Gemma4Bundle::Lowered(Gemma4LoweredBundle {
             config: lcfg,
@@ -357,7 +337,11 @@ mod tests {
     fn lowered_full_kv_mode_follows_kv_cache() {
         use hipfire_runtime::kv_mode::KvMode;
         for raw in ["", "auto", "q8"] {
-            assert_eq!(resolve_lowered_full_kv_mode(raw), Ok((KvMode::Q8, None)), "{raw:?}");
+            assert_eq!(
+                resolve_lowered_full_kv_mode(raw),
+                Ok((KvMode::Q8, None)),
+                "{raw:?}"
+            );
         }
         assert_eq!(
             resolve_lowered_full_kv_mode("legacy-asym3"),
@@ -400,11 +384,6 @@ mod tests {
         assert_eq!(s_small, 4_210_688);
         assert_eq!(s_large, 16_842_752);
         assert_eq!(s_large, 4 * s_small);
-        let pb_small = lowered::gemma4_pb_flash_partials_len(max_seq_small, n_heads, full_hd);
-        let pb_large = lowered::gemma4_pb_flash_partials_len(max_seq_large, n_heads, full_hd);
-        assert_eq!(pb_small, 128 * s_small);
-        assert_eq!(pb_large, 128 * s_large);
-        assert_eq!(pb_large, 2_155_872_256);
     }
 
     #[test]
@@ -421,10 +400,6 @@ mod tests {
             assert_eq!(
                 lowered::gemma4_flash_partials_len(max_seq, n_heads, hd),
                 expected
-            );
-            assert_eq!(
-                lowered::gemma4_pb_flash_partials_len(max_seq, n_heads, hd),
-                lowered::GEMMA4_MAX_PREFILL_BATCH * expected
             );
         }
     }
@@ -444,19 +419,5 @@ mod tests {
         assert!(gemma4_context_admission(64, false).is_ok());
         assert!(gemma4_context_admission(127, false).is_ok());
         assert!(gemma4_context_admission(128, false).is_ok());
-    }
-
-    #[test]
-    fn use_lowered_route_matrix() {
-        // MoE always lowered.
-        assert!(gemma4_use_lowered(true, false, false, false));
-        assert!(gemma4_use_lowered(true, true, true, true));
-        // Dense batched opt-in, no drafter, not E-series.
-        assert!(gemma4_use_lowered(false, true, false, false));
-        // Drafter or E-series keep eager even with batched opt-in.
-        assert!(!gemma4_use_lowered(false, true, true, false));
-        assert!(!gemma4_use_lowered(false, true, false, true));
-        // No batched / no MoE → eager.
-        assert!(!gemma4_use_lowered(false, false, false, false));
     }
 }

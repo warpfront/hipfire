@@ -39,17 +39,16 @@
 //! forward at a FIXED position. `use_ordered_embeddings`/centroid masking is
 //! disabled (the shipped head ties lm_head directly).
 //!
-//! REUSE: this introduces NO new kernels. The pre/post projections and lm_head
-//! are plain `weight_gemv`; attention is the existing `attention_q8_0_kv_swa`
-//! (sliding) / `attention_q8_0_kv` (full) called WITHOUT the kv-write step
-//! (drafter does not own the cache); norms/rope/gelu/rmsnorm are the same
-//! helpers `crate::forward` uses for the target. The target's `decode_step`,
-//! `forward_batch`, weights and state are READ-ONLY here and byte-unchanged.
+//! A draft step is one declarative step list: `Gemv(pre_projection)`, one
+//! query-only `[SandwichAttention, SandwichMlp, Scale?]` block per layer over
+//! the target's last cache slot of the matching type (`crate::program`, the
+//! same ops the target runs), the final norm, the tied `lm_head` and
+//! `post_projection`. The target's weights and state are READ-ONLY here.
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{Gemma4State, Gemma4Weights};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
-use hipfire_runtime::llama::{f16_to_f32, weight_gemv, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub const DRAFTER_ARCH_ID: u32 = 22;
@@ -648,6 +647,8 @@ pub struct Gemma4DrafterScratch {
     pub x: GpuTensor,          // [hidden] = 1024 residual stream
     pub residual: GpuTensor,   // [hidden]
     pub tmp: GpuTensor,        // [hidden] norm / o_proj scratch
+    /// FWHT rotation scratch for MagnumQuant projections, `[max_q_dim]`.
+    pub x_rot: GpuTensor,
     pub q: GpuTensor,          // [max_q_dim]
     pub attn_out: GpuTensor,   // [max_q_dim]
     pub gate_ffn: GpuTensor,   // [hidden_dim]
@@ -659,6 +660,8 @@ pub struct Gemma4DrafterScratch {
     pub logits: GpuTensor,     // [vocab]
     /// device i32 query position scalar (constant across a round).
     pub pos_buf: hip_bridge::DeviceBuffer,
+    /// Host copy of the query position staged in `pos_buf`.
+    pub query_pos: usize,
 }
 
 impl Gemma4DrafterScratch {
@@ -677,6 +680,7 @@ impl Gemma4DrafterScratch {
             x: alloc(gpu, cfg.hidden, "x")?,
             residual: alloc(gpu, cfg.hidden, "residual")?,
             tmp: alloc(gpu, cfg.hidden, "tmp")?,
+            x_rot: alloc(gpu, cfg.max_q_dim().max(cfg.hidden), "x_rot")?,
             q: alloc(gpu, cfg.max_q_dim(), "q")?,
             attn_out: alloc(gpu, cfg.max_q_dim(), "attn_out")?,
             gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
@@ -687,6 +691,7 @@ impl Gemma4DrafterScratch {
             post_proj: alloc(gpu, cfg.backbone_hidden, "post_proj")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
             pos_buf,
+            query_pos: 0,
         })
     }
 
@@ -699,6 +704,7 @@ impl Gemma4DrafterScratch {
         let _ = gpu.free_tensor(self.x);
         let _ = gpu.free_tensor(self.residual);
         let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.x_rot);
         let _ = gpu.free_tensor(self.q);
         let _ = gpu.free_tensor(self.attn_out);
         let _ = gpu.free_tensor(self.gate_ffn);
@@ -759,6 +765,7 @@ pub fn drafter_step(
         let pos_bytes = unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
         gpu.memcpy_htod_auto(&ds.pos_buf, pos_bytes)
             .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
+        ds.query_pos = query_pos;
     }
 
     // ── (a) concat = [ target_embed(prev)·√bb  ‖  hidden_backbone ] (7680) ──
@@ -817,6 +824,7 @@ pub fn drafter_step_from_concat(
         let pos_bytes = unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
         gpu.memcpy_htod_auto(&ds.pos_buf, pos_bytes)
             .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
+        ds.query_pos = query_pos;
     }
     if concat.len() != dcfg.pre_proj_in() {
         return Err(format!(
@@ -841,48 +849,109 @@ fn drafter_step_from_concat_inner(
     target_state: &Gemma4State,
     target_cfg: &Gemma4Config,
 ) -> Result<DrafterStepOut, String> {
-    let eps = dcfg.norm_eps;
+    use crate::program::{Geometry, LayerKv, LayerRefs, LayerScratch, ProgramBinding, Resident};
+    use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 
-    // ── (b) x = pre_projection · concat  (7680 → 1024, no bias) ──
-    weight_gemv(gpu, &dw.pre_projection, &ds.concat, &ds.x)
-        .map_err(|e| format!("gemma4-drafter: pre_projection: {e}"))?;
+    // Each block attends the target's LAST cache slot of its type.
+    let last_slot = |n: usize, kind: &str| {
+        n.checked_sub(1)
+            .ok_or_else(|| format!("gemma4-drafter: target has no {kind} layers to share KV from"))
+    };
+    let sliding_slot = last_slot(target_cfg.n_sliding_layers(), "sliding")?;
+    let full_slot = last_slot(target_cfg.n_full_layers(), "full")?;
+    let pos = ds.query_pos;
+    let binding = ProgramBinding {
+        geo: Geometry::drafter(dcfg),
+        resident: Resident {
+            kv_sliding: &target_state.kv_sliding,
+            kv_full: &target_state.kv_full,
+            pos_buf: &ds.pos_buf,
+            v_norm_ones: &target_state.v_norm_ones,
+            flash_partials: &target_state.q8_flash_partials,
+        },
+        rows: 1,
+        position: pos,
+        positions: None,
+        scratch: LayerScratch {
+            x: &ds.x,
+            residual: &ds.residual,
+            normed: &ds.tmp,
+            attn_rot: &ds.x_rot,
+            mlp_rot: &ds.x_rot,
+            q: &ds.q,
+            k: &ds.q,
+            v: &ds.q,
+            attn_out: &ds.attn_out,
+            gate: &ds.gate_ffn,
+            up: &ds.up_ffn,
+            act: &ds.ffn_hidden,
+            mlp_out: &ds.ffn_out,
+            ple: None,
+            moe: None,
+        },
+    };
 
-    // ── (c) drafter layers ──
-    for layer_idx in 0..dcfg.n_layers {
-        drafter_layer(
-            gpu,
-            dcfg,
-            target_cfg,
-            &dw.layers[layer_idx],
-            target_state,
-            ds,
-            dcfg.layer_types[layer_idx],
+    // pre_projection → blocks → final norm → tied lm_head (no softcap) and
+    // post_projection, one step list.
+    let pre = dw.pre_projection.dispatch_ref();
+    let lm_head = dw.lm_head.dispatch_ref();
+    let post = dw.post_projection.dispatch_ref();
+    let mut steps = Vec::with_capacity(3 * dcfg.n_layers + 4);
+    steps.push(Step::Gemv {
+        w: &pre,
+        input: GemvInput::Raw(&ds.concat),
+        out: &ds.x,
+    });
+    for (layer_idx, layer) in dw.layers.iter().enumerate() {
+        let layer_type = dcfg.layer_types[layer_idx];
+        let slot = match layer_type {
+            LayerType::Sliding => sliding_slot,
+            LayerType::Full => full_slot,
+        };
+        binding.layer(
+            layer_idx,
+            LayerRefs::drafter(layer, layer_type, dcfg.hidden_dim),
+            LayerKv {
+                slot,
+                writes: false,
+            },
+            &mut steps,
         )?;
     }
+    steps.push(Step::RmsnormAutomatic {
+        x: &ds.x,
+        norm_weight: &dw.final_norm,
+        x_plain: &ds.normed,
+        out: &ds.normed,
+        awq_scale: None,
+        k: dcfg.hidden,
+        eps: dcfg.norm_eps,
+        rotation: hipfire_dispatch::types::RotationPlan::None,
+    });
+    steps.push(Step::Gemv {
+        w: &lm_head,
+        input: GemvInput::Raw(&ds.normed),
+        out: &ds.logits,
+    });
+    steps.push(Step::Gemv {
+        w: &post,
+        input: GemvInput::Raw(&ds.normed),
+        out: &ds.post_proj,
+    });
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    execute_steps(gpu, &ctx, &steps).map_err(|e| format!("gemma4-drafter: {e}"))?;
+    drop(steps);
 
-    // ── (d) n = model.norm(x)  (1024) ──
-    gpu.rmsnorm_f32(&ds.x, &dw.final_norm, &ds.normed, eps)
-        .map_err(|e| format!("gemma4-drafter: final rmsnorm: {e:?}"))?;
-
-    // ── (e) logits = n · embed_tokens.T  (tied, full vocab, NO softcap) → argmax ──
-    weight_gemv(gpu, &dw.lm_head, &ds.normed, &ds.logits)
-        .map_err(|e| format!("gemma4-drafter: lm_head: {e}"))?;
-    // (final_logit_softcapping is null on the drafter — do NOT apply.)
     let logits = gpu
         .download_f32(&ds.logits)
         .map_err(|e| format!("gemma4-drafter: download logits: {e:?}"))?;
     let argmax = argmax_f32(&logits);
-
-    // ── (f) post_proj = post_projection · n  (1024 → 3840) ──
-    weight_gemv(gpu, &dw.post_projection, &ds.normed, &ds.post_proj)
-        .map_err(|e| format!("gemma4-drafter: post_projection: {e}"))?;
     let post_proj_hidden = gpu
         .download_f32(&ds.post_proj)
         .map_err(|e| format!("gemma4-drafter: download post_proj: {e:?}"))?;
     let normed_hidden = gpu
         .download_f32(&ds.normed)
         .map_err(|e| format!("gemma4-drafter: download normed: {e:?}"))?;
-
     let _ = dw.embd_q8;
     Ok(DrafterStepOut {
         argmax,
@@ -890,190 +959,6 @@ fn drafter_step_from_concat_inner(
         normed_hidden,
         logits,
     })
-}
-
-/// One drafter layer: sandwich-norm block over `ds.x`, KV-shared attention
-/// against the target's last-of-type slot. Mirrors the target's
-/// sliding/full `*_layer_decode` attention half + the shared FFN tail, but
-/// with NO k/v projection and NO cache write.
-#[allow(clippy::too_many_arguments)]
-fn drafter_layer(
-    gpu: &mut Gpu,
-    dcfg: &Gemma4DrafterConfig,
-    target_cfg: &Gemma4Config,
-    lw: &DrafterLayerWeights,
-    target_state: &Gemma4State,
-    ds: &mut Gemma4DrafterScratch,
-    lt: LayerType,
-) -> Result<(), String> {
-    let hidden = dcfg.hidden;
-    let eps = dcfg.norm_eps;
-    let hidden_bytes = hidden * 4;
-    let n_heads = dcfg.n_heads;
-
-    let (head_dim, n_kv, window, rope) = match lt {
-        LayerType::Sliding => (
-            dcfg.sliding_head_dim,
-            dcfg.sliding_n_kv_heads,
-            dcfg.sliding_window,
-            RopeFlavour::Full(dcfg.sliding_rope_theta),
-        ),
-        LayerType::Full => {
-            let n_rot_pairs = match dcfg.full_rope_type {
-                RopeType::Proportional => {
-                    ((dcfg.full_head_dim as f32) * dcfg.full_partial_rotary_factor * 0.5) as usize
-                }
-                RopeType::Default => dcfg.full_head_dim / 2,
-            };
-            (
-                dcfg.full_head_dim,
-                dcfg.full_n_kv_heads,
-                0usize,
-                RopeFlavour::PartialHalved(dcfg.full_rope_theta, n_rot_pairs),
-            )
-        }
-    };
-
-    // The shared KV slot in the TARGET state: the LAST slot of the matching
-    // per-type cache (the target's last sliding / last full layer).
-    let (kv_cache, kv_slot) = match lt {
-        LayerType::Sliding => {
-            let slot = target_cfg
-                .n_sliding_layers()
-                .checked_sub(1)
-                .ok_or("gemma4-drafter: target has no sliding layers to share KV from")?;
-            (&target_state.kv_sliding, slot)
-        }
-        LayerType::Full => {
-            let slot = target_cfg
-                .n_full_layers()
-                .checked_sub(1)
-                .ok_or("gemma4-drafter: target has no full layers to share KV from")?;
-            (&target_state.kv_full, slot)
-        }
-    };
-
-    // residual = x
-    gpu.memcpy_dtod_auto(&ds.residual.buf, &ds.x.buf, hidden_bytes)
-        .map_err(|e| format!("gemma4-drafter: save residual: {e:?}"))?;
-
-    // n1 = input_layernorm(x) → tmp
-    gpu.rmsnorm_f32(&ds.x, &lw.input_layernorm, &ds.tmp, eps)
-        .map_err(|e| format!("gemma4-drafter: input rmsnorm: {e:?}"))?;
-
-    // q = q_proj(n1)
-    weight_gemv(gpu, &lw.q_proj, &ds.tmp, &ds.q)
-        .map_err(|e| format!("gemma4-drafter: q_proj: {e}"))?;
-    // per-head q_norm over head_dim
-    gpu.rmsnorm_batched(&ds.q, &lw.q_norm, &ds.q, n_heads, head_dim, eps)
-        .map_err(|e| format!("gemma4-drafter: q_norm: {e:?}"))?;
-    // q ·= √head_dim (cancels the kernel's 1/√head_dim → effective scale 1.0).
-    gpu.scale_f32(&ds.q, (head_dim as f32).sqrt())
-        .map_err(|e| format!("gemma4-drafter: q scale: {e:?}"))?;
-
-    // RoPE the drafter Q ONLY (n_heads_k = 0 ⇒ the kernel skips K untouched).
-    match rope {
-        RopeFlavour::Full(theta) => {
-            gpu.rope_f32(&ds.q, &ds.q, &ds.pos_buf, n_heads, 0, head_dim, theta)
-                .map_err(|e| format!("gemma4-drafter: rope: {e:?}"))?;
-        }
-        RopeFlavour::PartialHalved(theta, n_rot_pairs) => {
-            gpu.rope_partial_halved_f32(
-                &ds.q,
-                &ds.q,
-                &ds.pos_buf,
-                n_heads,
-                0,
-                head_dim,
-                n_rot_pairs,
-                theta,
-            )
-            .map_err(|e| format!("gemma4-drafter: rope partial: {e:?}"))?;
-        }
-    }
-
-    // Attention over the target's shared K/V (NO write). pos_buf = query_pos so
-    // the kernel reads seq_len = query_pos+1 from pos_buf[0]+1.
-    let max_seq = target_state.max_seq;
-    let phys_cap = kv_cache.physical_cap;
-    let k_cache = &kv_cache.k_gpu[kv_slot];
-    let v_cache = &kv_cache.v_gpu[kv_slot];
-    if window > 0 {
-        gpu.attention_q8_0_kv_swa(
-            &ds.q,
-            k_cache,
-            v_cache,
-            &ds.attn_out,
-            &ds.pos_buf,
-            max_seq,
-            n_heads,
-            n_kv,
-            head_dim,
-            phys_cap,
-            window,
-        )
-        .map_err(|e| format!("gemma4-drafter: attention swa: {e:?}"))?;
-    } else {
-        gpu.attention_q8_0_kv(
-            &ds.q,
-            k_cache,
-            v_cache,
-            &ds.attn_out,
-            &ds.pos_buf,
-            max_seq,
-            n_heads,
-            n_kv,
-            head_dim,
-            phys_cap,
-        )
-        .map_err(|e| format!("gemma4-drafter: attention full: {e:?}"))?;
-    }
-
-    // o_proj(attn_out) → tmp; post_attention_layernorm; x = residual + tmp.
-    weight_gemv(gpu, &lw.o_proj, &ds.attn_out, &ds.tmp)
-        .map_err(|e| format!("gemma4-drafter: o_proj: {e}"))?;
-    gpu.rmsnorm_f32(&ds.tmp, &lw.post_attention_layernorm, &ds.tmp, eps)
-        .map_err(|e| format!("gemma4-drafter: post_attn rmsnorm: {e:?}"))?;
-    gpu.memcpy_dtod_auto(&ds.x.buf, &ds.residual.buf, hidden_bytes)
-        .map_err(|e| format!("gemma4-drafter: reset x: {e:?}"))?;
-    gpu.add_inplace_f32(&ds.x, &ds.tmp)
-        .map_err(|e| format!("gemma4-drafter: attn residual add: {e:?}"))?;
-
-    // residual = x; FFN: GeGLU(gelu_tanh) → down_proj; post_ffn norm; x += ffn.
-    gpu.memcpy_dtod_auto(&ds.residual.buf, &ds.x.buf, hidden_bytes)
-        .map_err(|e| format!("gemma4-drafter: save ffn residual: {e:?}"))?;
-    gpu.rmsnorm_f32(&ds.x, &lw.pre_feedforward_layernorm, &ds.tmp, eps)
-        .map_err(|e| format!("gemma4-drafter: pre_ffn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &lw.gate_proj, &ds.tmp, &ds.gate_ffn)
-        .map_err(|e| format!("gemma4-drafter: gate_proj: {e}"))?;
-    weight_gemv(gpu, &lw.up_proj, &ds.tmp, &ds.up_ffn)
-        .map_err(|e| format!("gemma4-drafter: up_proj: {e}"))?;
-    gpu.gelu_tanh_f32(&ds.gate_ffn, &ds.ffn_hidden, dcfg.hidden_dim)
-        .map_err(|e| format!("gemma4-drafter: gelu_tanh: {e:?}"))?;
-    gpu.mul_f32(&ds.ffn_hidden, &ds.up_ffn, &ds.ffn_hidden)
-        .map_err(|e| format!("gemma4-drafter: geglu mul: {e:?}"))?;
-    weight_gemv(gpu, &lw.down_proj, &ds.ffn_hidden, &ds.ffn_out)
-        .map_err(|e| format!("gemma4-drafter: down_proj: {e}"))?;
-    gpu.rmsnorm_f32(&ds.ffn_out, &lw.post_feedforward_layernorm, &ds.tmp, eps)
-        .map_err(|e| format!("gemma4-drafter: post_ffn rmsnorm: {e:?}"))?;
-    gpu.memcpy_dtod_auto(&ds.x.buf, &ds.residual.buf, hidden_bytes)
-        .map_err(|e| format!("gemma4-drafter: reset x (ffn): {e:?}"))?;
-    gpu.add_inplace_f32(&ds.x, &ds.tmp)
-        .map_err(|e| format!("gemma4-drafter: ffn residual add: {e:?}"))?;
-
-    // learned per-layer scalar.
-    if lw.layer_scalar_host != 1.0 {
-        gpu.scale_f32(&ds.x, lw.layer_scalar_host)
-            .map_err(|e| format!("gemma4-drafter: layer_scalar: {e:?}"))?;
-    }
-    Ok(())
-}
-
-enum RopeFlavour {
-    /// Full rotate-half over the whole head_dim (sliding). θ.
-    Full(f32),
-    /// Partial proportional rotate-half (full layer). (θ, n_rot_pairs).
-    PartialHalved(f32, usize),
 }
 
 fn argmax_f32(v: &[f32]) -> u32 {

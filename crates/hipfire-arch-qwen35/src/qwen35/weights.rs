@@ -2412,14 +2412,7 @@ pub(crate) fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
 
 // ─── State ──────────────────────────────────────────────────────────────
 
-/// Persistent state for DeltaNet layers across tokens.
-/// State quantization mode for DeltaNet S matrix.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum StateQuant {
-    FP32,
-    Q8,
-    Q4,
-}
+pub use hipfire_dispatch::ops::delta_net::StateQuant;
 
 pub struct DeltaNetState {
     /// S matrix storage — FP32 or Q8 depending on quant mode
@@ -2986,6 +2979,28 @@ mod tests {
                     err.message
                 );
             }
+        }
+    }
+}
+
+impl DeltaNetLayerWeights {
+    pub(crate) fn dense_ffn(&self) -> super::prefill::DenseFfnWeights<'_> {
+        super::prefill::DenseFfnWeights {
+            norm: &self.ffn_norm,
+            gate: &self.w_gate,
+            up: &self.w_up,
+            down: &self.w_down,
+        }
+    }
+}
+
+impl FullAttnLayerWeights {
+    pub(crate) fn dense_ffn(&self) -> super::prefill::DenseFfnWeights<'_> {
+        super::prefill::DenseFfnWeights {
+            norm: &self.ffn_norm,
+            gate: &self.w_gate,
+            up: &self.w_up,
+            down: &self.w_down,
         }
     }
 }

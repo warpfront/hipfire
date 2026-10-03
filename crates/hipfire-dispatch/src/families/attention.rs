@@ -179,7 +179,9 @@ impl AttentionFamily {
                 && (64..=262_144).contains(&io.max_ctx_len)
                 && io.tree_bias.is_none())
         {
-            return Err(DispatchError::Hip("Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into()));
+            return Err(DispatchError::Hip(
+                "Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into(),
+            ));
         }
         dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
             DispatchError::Hip(format!(
@@ -187,6 +189,31 @@ impl AttentionFamily {
                 plan.write_key, plan.attend_key, io.pos, io.physical_cap
             ))
         })?;
+        let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
+        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io).map_err(|error| {
+            DispatchError::Hip(format!("attention {:?}: {error}", plan.attend_key))
+        })
+    }
+
+    /// Attend against an already-populated cache without writing the current
+    /// row: KV-shared layers and draft heads read another layer's cache.
+    pub fn run_attend_only(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        plan: &crate::families::kv_tier::KvTierPlan,
+        io: &AttnParams,
+    ) -> Result<(), DispatchError> {
+        let shape = ShapeInfo {
+            batch_size: plan.batch_size,
+            head_dim: io.head_dim,
+            m: if plan.batch_size > 1 {
+                io.max_ctx_len
+            } else {
+                io.pos + 1
+            },
+            is_tree: io.tree_bias.is_some(),
+        };
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
         dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io).map_err(|error| {
             DispatchError::Hip(format!("attention {:?}: {error}", plan.attend_key))
@@ -1376,23 +1403,24 @@ fn dispatch_attend(
                     ));
                 }
                 match (io.output_gate, io.output_awq_scale) {
-                    (Some(gate), Some(scale)) => hip!(gpu.attention_flash_asym3_gated_mq_rotate_awq(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.pos_buf,
-                        ct,
-                        st,
-                        seq_len,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.physical_cap,
-                        fp,
-                        gate,
-                        scale,
-                    )),
+                    (Some(gate), Some(scale)) => hip!(gpu
+                        .attention_flash_asym3_gated_mq_rotate_awq(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.pos_buf,
+                            ct,
+                            st,
+                            seq_len,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                            fp,
+                            gate,
+                            scale,
+                        )),
                     (Some(gate), None) => hip!(gpu.attention_flash_asym3(
                         io.q,
                         io.k_cache,
@@ -2122,7 +2150,8 @@ fn dispatch_attend(
                     && !gpu.flash_attn_ck_loaded()
                     && !matches!(
                         hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                            .ok().as_deref(),
+                            .ok()
+                            .as_deref(),
                         Some("scalar") | Some("batched")
                     )
                     && ctx.workload == crate::context::DispatchWorkload::Standard
@@ -2138,7 +2167,8 @@ fn dispatch_attend(
                     && (64..=8192).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
-                    && io.max_ctx_len
+                    && io
+                        .max_ctx_len
                         .checked_mul(4 * (256 / 32) * 34)
                         .is_some_and(|bytes| {
                             io.k_cache.buf.size() >= bytes && io.v_cache.buf.size() >= bytes
@@ -2528,12 +2558,11 @@ fn dispatch_attend(
                 // q8: LDS holds occupancy), flash-tile-batched above it.
                 // tree_bias passes through to whichever backend runs; noslots
                 // (null descriptors inside the launchers), like the writer.
-                let crossover: usize =
-                    if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-                        4096
-                    } else {
-                        8192
-                    };
+                let crossover: usize = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                    4096
+                } else {
+                    8192
+                };
                 if io.max_ctx_len <= crossover {
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_fp8_e4m3_kv_batched(

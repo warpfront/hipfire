@@ -39,7 +39,7 @@
 //! Multi-arch dispatch (Tier-1): mirrors `calib_sweep.rs` arch detection
 //!   llama 0|1, qwen35 5|6, gemma4 13, glimmer 14, lfm2 11.
 //!   Per-arch chunking mirrors calib_sweep:
-//!     gemma4 sub-chunks to 128 (scratch.max_prefill_batch) and needs q8 KV
+//!     gemma4 uses forward_prefill_batch (step program, 64-row chunks) with q8 KV
 //!     glimmer chunks 192 (glimmer_prefill_chunk_size / prefill_with_capture)
 //!     lfm2 uses forward_decode_batch_lfm with explicit positions, q8 KV
 //!     qwen35 uses forward_prefill_batch with q8 KV at seq_len+16
@@ -96,7 +96,8 @@ fn main() {
                 let v = argv[i + 1].clone();
                 if !matches!(
                     v.as_str(),
-                    "q8" | "fp8" | "bf16"
+                    "q8" | "fp8"
+                        | "bf16"
                         | "asym2"
                         | "asym3"
                         | "asym4"
@@ -489,7 +490,7 @@ fn main() {
                     kv_max,
                 )
                 .unwrap()
-            },
+            }
             "bf16" => {
                 // Quality control: unscaled bf16 K/V (stride D*2 per head,
                 // no scales). Same exact admission as fp8 (gfx1201, dense
@@ -532,7 +533,7 @@ fn main() {
                     kv_max,
                 )
                 .unwrap()
-            },
+            }
             "asym4" => KvCache::new_gpu_asym4(
                 &mut gpu,
                 config.n_layers,
@@ -606,8 +607,11 @@ fn main() {
 
         let hidden_buf = if args.scoring_mode == "prefill" {
             Some(
-                gpu.alloc_tensor(&[scored_per_chunk + usize::from(pad_scoring_tail), config.dim], DType::F32)
-                    .expect("alloc hidden_buf"),
+                gpu.alloc_tensor(
+                    &[scored_per_chunk + usize::from(pad_scoring_tail), config.dim],
+                    DType::F32,
+                )
+                .expect("alloc hidden_buf"),
             )
         } else {
             None
@@ -947,13 +951,12 @@ fn main() {
             p99_kld_per_seq.push(p99);
             mean_nll_per_seq.push(mean_nll);
         }
+    } else if is_gemma {
         // ----- gemma4 13 — WIRED -----
         // Quant dtypes admitted: MQ4G256 / MG4G256 (campaign mq4, quant_type 13/30 alias),
         // HFQ4G256, HFQ4G128, HFQ6G256, HFQ2/3, Q4K, MQ8G256, MQ6G256, MQ3G256, MQ2G256,
         // plus F32/BF16 teachers (BF16 kept as BF16 when HIPFIRE_CALIB_BF16=1 else widened to F32).
-        // See lowered.rs:load_gemma4_weight match (lines 696-736).
-        // KV must be q8 (KvCache::new_gpu_q8): F32 cache fails with "no implementation for KvWriteF32".
-        // Prefill sub-chunks to scratch.max_prefill_batch (128) — mirrors calib_sweep gemma arm.
+        // See lowered.rs:load_gemma4_weight. Batched prefill needs a Q8 KV cache.
         use hipfire_arch_gemma4::lowered as gemma4;
         if args.model.is_dir() {
             eprintln!("eval_hipfire: gemma4 dir not yet wired — use HFQ for arch 13");
@@ -1012,28 +1015,18 @@ fn main() {
             let mut chunk_nll_count: usize = 0;
 
             if args.scoring_mode == "prefill" {
-                // Prefill prefix with batched forward chunked to 128 (max_prefill_batch), then per-token for scored window.
-                // This mirrors calib_sweep run_gemma_batched: while offset<chunk.len() { sub = chunk[offset..min(offset+128)]; forward_prefill_batch(..., sub, pos) }
-                let max_b = scratch.max_prefill_batch; // 128
-                let mut offset = 0usize;
-                let mut pos = 0usize;
-                while offset < scoring_start {
-                    let end = (offset + max_b).min(scoring_start);
-                    let sub = &chunk_tokens[offset..end];
-                    gemma4::forward_prefill_batch(
-                        &mut gpu,
-                        &weights,
-                        &cfg,
-                        sub,
-                        pos,
-                        &mut kv_sliding,
-                        &mut kv_full,
-                        &scratch,
-                    )
-                    .expect("gemma prefill prefix");
-                    pos += sub.len();
-                    offset = end;
-                }
+                // Batched prefill of the prefix, then per-token for the scored window.
+                gemma4::forward_prefill_batch(
+                    &mut gpu,
+                    &weights,
+                    &cfg,
+                    &chunk_tokens[..scoring_start],
+                    0,
+                    &mut kv_sliding,
+                    &mut kv_full,
+                    &scratch,
+                )
+                .expect("gemma prefill prefix");
                 for pos in scoring_start..(n_ctx - 1) {
                     gemma4::forward_scratch(
                         &mut gpu,

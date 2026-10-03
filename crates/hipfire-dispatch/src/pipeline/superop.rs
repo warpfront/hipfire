@@ -26,7 +26,7 @@
 //!
 //! ## Coverage (the whole served fleet, one substrate)
 //! - `Proj` / `ResidualGemv` / `Moe`     → qwen35, MiniMax(reuse), cohere2moe(reuse)
-//! - `Attend` (flavor-carrying)          → all; Gemma SWA/qk-norm/softcap/k_eq_v live here as flavors
+//! - `Attend`                            → all
 //! - `Recurrent`                         → qwen35 DeltaNet linear-attention state
 //! - `Conv`                              → LFM2 depthwise causal short-conv mixer (+ conv state)
 //! - `Escape(EscapeKind)`                → irregular/stateful: deepseek4 compressor/indexer/SWA, etc.
@@ -62,54 +62,10 @@ pub enum ScratchSlot {
     Cache(u32),
 }
 
-/// FFN/gate-up activation flavor. SiLU for qwen-family; GeLU-tanh (GeGLU) for
-/// Gemma (`gelu_tanh(gate)·up`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActFlavor {
-    SiluMul,
-    GeluTanhMul,
-}
-
-/// RoPE flavor carried by an `Attend` super-op (resolved from config at load).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RopeFlavor {
-    None,
-    /// Standard rotate-half (most archs). `theta` = rope base.
-    HalfRotate {
-        theta: f32,
-    },
-    /// Interleaved full-dim RoPE (e.g. cohere2moe).
-    Interleaved {
-        theta: f32,
-    },
-}
-
-/// Attention-block flavor — everything that distinguishes one arch's attention
-/// from another, resolved at load so the per-token `Attend` is branch-free.
-/// Gemma exercises the full surface (SWA window, per-head qk-norm, q·√hd scaling,
-/// the k_eq_v weightless-V-RMSNorm prelude, logit softcap).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AttnFlavor {
-    /// Sliding-window size; 0 = full (global) attention. Gemma alternates
-    /// Sliding(1024)/Full per layer.
-    pub window: u32,
-    /// Per-head q_norm/k_norm over head_dim (Gemma, qwen35).
-    pub qk_norm: bool,
-    /// q *= sqrt(head_dim) (Gemma query scaling).
-    pub q_scale_sqrt_hd: bool,
-    /// V = copy of K before k_norm + weightless RMSNorm on V (Gemma full layers).
-    pub k_eq_v: bool,
-    /// Attention-logit softcap value; 0.0 = none (Gemma-2 style).
-    pub logit_softcap: f32,
-    pub rope: RopeFlavor,
-}
-
 /// Per-super-op flavor payload (None for ops with no flavor axis, e.g. Proj).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OpFlavor {
     None,
-    Attn(AttnFlavor),
-    Act(ActFlavor),
 }
 
 /// Irregular/stateful ops that don't map onto a single fused kernel. Each is a
@@ -123,8 +79,6 @@ pub enum EscapeKind {
     Deepseek4IndexerTopK,
     /// deepseek4 sparse SWA over the gathered top-K KV.
     Deepseek4SwaTopK,
-    /// Gemma final logit softcap (output stage).
-    GemmaLogitSoftcap,
 }
 
 /// One coarse super-op. For `Proj`/`ResidualGemv`/`Moe` the `key` is the
@@ -146,7 +100,7 @@ pub enum SuperOpKind {
     /// projection cluster did NOT fuse — mirrors execute_steps' unfused
     /// per-step launch_op path (rmsnorm, then individual Proj gemvs).
     Norm,
-    /// Attention block (flavor in `OpFlavor::Attn`).
+    /// Attention block.
     Attend,
     /// MoE FFN block (routes to MoeFamily / run_moe_decode).
     Moe,
@@ -249,9 +203,9 @@ fn lower_walk(
 /// the frozen `KernelKey`s match `execute_steps` byte-for-byte — no fusion drift.
 ///
 /// TODO(arch-migration, Step 3+): populate `WeightSlot`/`ScratchSlot` bindings
-/// and `AttnFlavor`/`ActFlavor` from the arch's weight/scratch tables + config.
-/// This step freezes the FUSION STRUCTURE + kernel keys; the per-arch migration
-/// supplies the operand slots + flavor data (and the executor binds them).
+/// from the arch's weight/scratch tables. This step freezes the FUSION
+/// STRUCTURE + kernel keys; the per-arch migration supplies the operand slots
+/// (and the executor binds them).
 pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
     lower_walk(
         steps.len(),

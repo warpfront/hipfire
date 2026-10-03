@@ -34,10 +34,11 @@ pub mod drafter;
 pub mod forward;
 pub mod gemma4;
 pub mod lowered;
+mod program;
 pub mod speculative;
 pub use carrier::{
-    gemma4_context_admission, gemma4_source_uses_lowered, gemma4_use_lowered, load_gemma4_bundle,
-    Gemma4Bundle, Gemma4EagerBundle, Gemma4LoweredBundle,
+    gemma4_context_admission, gemma4_source_uses_lowered, load_gemma4_bundle, Gemma4Bundle,
+    Gemma4EagerBundle, Gemma4LoweredBundle,
 };
 
 pub use arch::{Gemma4, ARCH_ID};

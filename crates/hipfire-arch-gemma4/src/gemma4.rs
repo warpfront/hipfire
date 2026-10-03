@@ -800,24 +800,12 @@ fn build_kv_slot_map(cfg: &Gemma4Config) -> Result<Vec<usize>, String> {
 }
 
 fn q8_flash_partials_len(gpu: &Gpu, cfg: &Gemma4Config, max_seq: usize) -> usize {
-    [
-        (cfg.sliding_n_kv_heads, cfg.sliding_head_dim),
-        (cfg.full_n_kv_heads, cfg.full_head_dim),
-    ]
-    .into_iter()
-    .map(|(n_kv_heads, head_dim)| {
-        let tile = rdna_compute::attention::q8_flash_tile_size(
-            &gpu.arch,
-            cfg.n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq,
-        );
-        let max_tiles = max_seq.div_ceil(tile);
-        GEMMA4_FORWARD_BATCH_MAX * cfg.n_heads * max_tiles * (2 + head_dim)
-    })
-    .max()
-    .unwrap_or(0)
+    crate::program::q8_flash_partials_len(
+        gpu,
+        &crate::program::Geometry::eager(cfg),
+        max_seq,
+        GEMMA4_FORWARD_BATCH_MAX,
+    )
 }
 
 impl Gemma4State {

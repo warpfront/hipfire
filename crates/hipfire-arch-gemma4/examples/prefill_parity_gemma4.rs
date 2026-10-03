@@ -5,17 +5,14 @@
 //! Batched-vs-per-token prefill parity harness for the gemma4 lowered path.
 //!
 //! Runs the SAME prompt through (A) per-token `forward_scratch` and
-//! (B) `forward_prefill_batch` with fresh KV each, compares prefill logits
+//! (B) `forward_prefill_batch` over all but the last token plus one
+//! `forward_scratch`, with fresh KV each; compares the prompt's last logits
 //! (max-abs diff, argmax) and an N-token greedy continuation (per-token decode
-//! from both prefill states). Uses Q8 KV for both attention tiers, matching
-//! the daemon's explicit `--kv-mode q8` route.
+//! from both prefill states). Uses unwindowed Q8 KV for both attention tiers,
+//! the layout batched prefill writes.
 //!
 //! Usage:
 //!   prefill_parity_gemma4 --model <hfq> [--prompt <text>] [--decode N]
-//!
-//! Env: HIPFIRE_GEMMA4_DUMP=1 + HIPFIRE_BATCHED_PREFILL / HIPFIRE_WMMA_PREFILL
-//! affect only the lowered internals (run_prefill_gemm WMMA arm); this harness
-//! calls forward_prefill_batch unconditionally for run B.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -76,11 +73,7 @@ fn main() {
     let scratch = lowered::Gemma4Scratch::new(&mut gpu, &cfg, max_seq).expect("scratch");
     lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim).expect("scratch consts");
 
-    eprintln!(
-        "prompt tokens = {} (chunk={})",
-        ids.len(),
-        scratch.max_prefill_batch
-    );
+    eprintln!("prompt tokens = {}", ids.len());
 
     let fnv = |bytes: &[u8]| -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -103,13 +96,12 @@ fn main() {
     };
 
     let mut run = |label: &str, batched: bool| -> (Vec<f32>, Vec<u32>) {
-        let mut kv_sliding = KvCache::new_gpu_q8_capped(
+        let mut kv_sliding = KvCache::new_gpu_q8(
             &mut gpu,
             cfg.n_layers,
             cfg.sliding_n_kv_heads,
             cfg.sliding_head_dim,
             max_seq,
-            cfg.sliding_window,
         )
         .expect("kv sliding");
         let mut kv_full = KvCache::new_gpu_q8(
@@ -122,27 +114,29 @@ fn main() {
         .expect("kv full");
         let t0 = std::time::Instant::now();
         if batched {
-            let chunk = std::env::var("HIPFIRE_PREFILL_CHUNK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(scratch.max_prefill_batch)
-                .max(1);
-            let mut off = 0usize;
-            while off < ids.len() {
-                let end = (off + chunk).min(ids.len());
-                lowered::forward_prefill_batch(
-                    &mut gpu,
-                    &weights,
-                    &cfg,
-                    &ids[off..end],
-                    off,
-                    &mut kv_sliding,
-                    &mut kv_full,
-                    &scratch,
-                )
-                .expect("batched prefill");
-                off = end;
-            }
+            let last = ids.len() - 1;
+            lowered::forward_prefill_batch(
+                &mut gpu,
+                &weights,
+                &cfg,
+                &ids[..last],
+                0,
+                &mut kv_sliding,
+                &mut kv_full,
+                &scratch,
+            )
+            .expect("batched prefill");
+            lowered::forward_scratch(
+                &mut gpu,
+                &weights,
+                &cfg,
+                ids[last],
+                last,
+                &mut kv_sliding,
+                &mut kv_full,
+                &scratch,
+            )
+            .expect("last prompt token");
         } else {
             for (p, &t) in ids.iter().enumerate() {
                 lowered::forward_scratch(
