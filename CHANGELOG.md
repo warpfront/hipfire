@@ -92,6 +92,22 @@
   `HIPFIRE_QWEN4_HC_ROW_FOLD` row kernel writes its F16 row at the HC read's
   padded `f16_row_pitch`.
 - **gfx1151: fix garbage output on Qwen3.5-family prompts that prefill through the GDN chunk scan with a partial last chunk.** The `gdn_chunk_scan_gfx1151` twin let clang sink its final output WMMAs into the `tok < rows` store branch. WMMA then ran with the tail lanes masked off, so the valid rows of a partial 16-row block read undefined operands (off by ~5e3, or NaN). Full 64-row chunks were unaffected. A 291-token prompt on qwen3.8-27b decoded `MENTS` under AR and MTP alike; `HIPFIRE_GFX1151_GDN_SCAN=0` was the workaround. An empty `asm volatile` pin now keeps the WMMAs at full EXEC, and the twin is again byte-identical to `gdn_chunk_scan` for every tail length. Regression test: `crates/rdna-compute/tests/gdn_chunk_scan_tail.rs` (ignored; GPU).
+- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
+  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
+  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
+  steps now uses the same step program as plain decode, so the qwen35
+  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
+  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
+  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
+  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
+    token 3).
+  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
+    late.
+  - Qwen3.8-27B vision answers are byte-identical.
+
+- PARO A3B checkpoints (z-lab Qwen3.5-35B-A3B-PARO, shisa Qwen3.6-35B-A3B-PARO)
+  load again: expert-group validation no longer requires one shape across a
+  layer's PARO rotation sidecars.
 
 ## v0.4.1 — unreleased (target 2026-10-06)
 

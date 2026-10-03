@@ -61,13 +61,10 @@
 
 use crate::qwen35::Qwen35Weights;
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
-use hipfire_dispatch::pipeline::{run_uniform_moe_down_expanded, run_uniform_moe_gate_up};
+use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::llama::{
-    self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
-};
+use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::{Path, PathBuf};
 
@@ -108,7 +105,49 @@ pub struct Qwen35MtpHeadConfig {
     pub tie_word_embeddings: bool,
 }
 
+/// Layer prefix the MTP MoE layer loads under through the trunk MoE loader
+/// (see `qwen35::load::mtp_sidecar_tensor_name`).
+pub(crate) const MTP_MOE_PREFIX: &str = "mtp_head";
+
 impl Qwen35MtpHeadConfig {
+    /// Trunk MoE-layer config for the MTP layer's routed FFN: one
+    /// full-attention layer with this head's MoE geometry and no REAP map.
+    fn moe_config(&self) -> crate::qwen35::Qwen35Config {
+        crate::qwen35::Qwen35Config {
+            dim: self.n_embd,
+            n_layers: 1,
+            vocab_size: self.vocab_size,
+            norm_eps: self.rms_norm_eps,
+            eos_token: 0,
+            n_heads: self.n_head,
+            n_kv_heads: self.n_head_kv,
+            head_dim: self.head_dim,
+            rope_theta: self.rope_theta,
+            partial_rotary_factor: self.n_rot as f32 / self.head_dim as f32,
+            is_vl_text: false,
+            mrope_interleaved: false,
+            mrope_section: [0; 3],
+            linear_num_key_heads: 0,
+            linear_num_value_heads: 0,
+            linear_key_head_dim: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_dim: 0,
+            hidden_dim: 0,
+            layer_types: vec![crate::qwen35::LayerType::FullAttention],
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            moe_intermediate_size: self.moe_intermediate_size,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size,
+            has_shared_expert: true,
+            norm_topk_prob: self.norm_topk_prob,
+            paged_experts: false,
+            vram_budget_bytes: u64::MAX,
+            reap_keep: None,
+            // The MTP layer is always device-resident.
+            i_gpu_start: 0,
+        }
+    }
+
     /// Parse from a `.mtp` file's metadata JSON. Defaults match the Task 8
     /// extractor's canonical layout.
     fn from_metadata(meta: &serde_json::Value, max_seq: usize) -> Self {
@@ -200,29 +239,14 @@ pub struct Qwen35MtpDenseFfnWeights {
     pub down: WeightTensor, // [n_embd, n_ff]
 }
 
-pub struct Qwen35MtpMoeExpertWeights {
-    pub gate_up: WeightTensor, // [2 * moe_intermediate, n_embd]
-    pub down: WeightTensor,    // [n_embd, moe_intermediate]
-}
-
-pub struct Qwen35MtpMoeSharedExpertWeights {
-    pub gate: WeightTensor, // [shared_expert_intermediate, n_embd]
-    pub up: WeightTensor,   // [shared_expert_intermediate, n_embd]
-    pub down: WeightTensor, // [n_embd, shared_expert_intermediate]
-}
-
-pub struct Qwen35MtpMoeFfnWeights {
-    pub router: WeightTensor, // [num_experts, n_embd]
-    pub shared_expert: Qwen35MtpMoeSharedExpertWeights,
-    pub shared_expert_gate: WeightTensor, // [1, n_embd]
-    pub experts: Vec<Qwen35MtpMoeExpertWeights>,
-    pub expert_gate_up_ptrs: GpuTensor,
-    pub expert_down_ptrs: GpuTensor,
-}
-
 pub enum Qwen35MtpFfnWeights {
     Dense(Qwen35MtpDenseFfnWeights),
-    Moe(Qwen35MtpMoeFfnWeights),
+    /// Routed experts bound like a trunk MoE layer; `config` carries the
+    /// MTP layer's MoE geometry for the shared decode recipe.
+    Moe {
+        ffn: crate::qwen35::MoeFfnWeights,
+        config: crate::qwen35::Qwen35Config,
+    },
 }
 
 /// All 15 GPU-resident MTP head tensors (+2 optional FastMTP-style
@@ -284,18 +308,10 @@ impl Qwen35MtpHeadWeights {
                 let _ = gpu.free_tensor(ffn.up.buf);
                 let _ = gpu.free_tensor(ffn.down.buf);
             }
-            Qwen35MtpFfnWeights::Moe(ffn) => {
-                let _ = gpu.free_tensor(ffn.router.buf);
-                let _ = gpu.free_tensor(ffn.shared_expert_gate.buf);
-                let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
-                let _ = gpu.free_tensor(ffn.shared_expert.up.buf);
-                let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
-                let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
-                let _ = gpu.free_tensor(ffn.expert_down_ptrs);
-                for expert in ffn.experts {
-                    let _ = gpu.free_tensor(expert.gate_up.buf);
-                    let _ = gpu.free_tensor(expert.down.buf);
-                }
+            Qwen35MtpFfnWeights::Moe { ffn, .. } => {
+                crate::qwen35::weights::free_moe_ffn_with(ffn, &mut |tensor| {
+                    let _ = gpu.free_tensor(tensor);
+                });
             }
         }
         if let Some(lm_d) = self.lm_head_draft {
@@ -319,7 +335,7 @@ pub struct Qwen35MtpHeadScratch {
     pub h_norm: GpuTensor,   // [n_embd]
     pub concat: GpuTensor,   // [2 * n_embd]
     pub cur: GpuTensor,      // [n_embd] — primary residual stream
-    pub residual: GpuTensor, // [n_embd] — saved for inpSA
+    pub residual: GpuTensor, // [n_embd] — rotated normed-projection input
     pub tmp: GpuTensor,      // [n_embd] — RMSNorm output scratch
 
     // Attention sub-block
@@ -329,13 +345,11 @@ pub struct Qwen35MtpHeadScratch {
     pub k: GpuTensor,        // [head_dim * n_head_kv]
     pub v: GpuTensor,        // [head_dim * n_head_kv]
     pub attn_out: GpuTensor, // [head_dim * n_head]
-    pub o: GpuTensor,        // [n_embd]
 
     // FFN sub-block
     pub gate_ffn: GpuTensor,   // [n_ff]
     pub up: GpuTensor,         // [n_ff]
     pub ffn_hidden: GpuTensor, // [n_ff]
-    pub ffn_out: GpuTensor,    // [n_embd]
 
     // MoE FFN scratch, allocated only for ffn_kind=moe.
     pub moe_router_logits: Option<GpuTensor>, // [num_experts]
@@ -377,6 +391,30 @@ pub struct Qwen35MtpHeadScratch {
 }
 
 impl Qwen35MtpHeadScratch {
+    /// View of the MoE scratch in the trunk decode recipe's layout. Panics
+    /// if the head was built without MoE scratch.
+    fn moe_refs(&self) -> crate::qwen35::forward::MoeScratchRef<'_> {
+        fn moe(t: &Option<GpuTensor>) -> &GpuTensor {
+            t.as_ref().expect("MoE MTP scratch not allocated")
+        }
+        crate::qwen35::forward::MoeScratchRef {
+            router_logits: moe(&self.moe_router_logits),
+            scalar_buf: moe(&self.moe_scalar_buf),
+            x_rot_local: moe(&self.moe_x_rot),
+            gate_up_buf: moe(&self.moe_gate_up_buf),
+            gate_buf: moe(&self.moe_gate_buf),
+            up_buf: moe(&self.moe_up_buf),
+            ffn_hidden: moe(&self.moe_ffn_hidden),
+            ffn_out: moe(&self.moe_ffn_out),
+            gate_batch: moe(&self.moe_gate_batch),
+            up_batch: moe(&self.moe_up_batch),
+            rot_batch: moe(&self.moe_rot_batch),
+            topk_indices: moe(&self.moe_topk_indices),
+            topk_weights: moe(&self.moe_topk_weights),
+            down_expanded: moe(&self.moe_down_expanded),
+        }
+    }
+
     pub fn new(gpu: &mut Gpu, config: &Qwen35MtpHeadConfig) -> HipResult<Self> {
         let dim = config.n_embd;
         let q_dim = config.head_dim * config.n_head;
@@ -399,11 +437,9 @@ impl Qwen35MtpHeadScratch {
             k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
             v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
             attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            o: gpu.alloc_tensor(&[dim], DType::F32)?,
             gate_ffn: gpu.alloc_tensor(&[config.n_ff], DType::F32)?,
             up: gpu.alloc_tensor(&[config.n_ff], DType::F32)?,
             ffn_hidden: gpu.alloc_tensor(&[config.n_ff], DType::F32)?,
-            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             moe_router_logits: if alloc_moe {
                 Some(gpu.alloc_tensor(&[config.num_experts], DType::F32)?)
             } else {
@@ -544,11 +580,9 @@ impl Qwen35MtpHeadScratch {
         let _ = gpu.free_tensor(self.k);
         let _ = gpu.free_tensor(self.v);
         let _ = gpu.free_tensor(self.attn_out);
-        let _ = gpu.free_tensor(self.o);
         let _ = gpu.free_tensor(self.gate_ffn);
         let _ = gpu.free_tensor(self.up);
         let _ = gpu.free_tensor(self.ffn_hidden);
-        let _ = gpu.free_tensor(self.ffn_out);
         if let Some(t) = self.moe_router_logits {
             let _ = gpu.free_tensor(t);
         }
@@ -969,7 +1003,11 @@ pub fn load_mtp_head_at_offset(
                 "MoE MTP runtime currently supports top_k=8, got {}",
                 config.num_experts_per_tok
             );
-            Qwen35MtpFfnWeights::Moe(load_mtp_moe_ffn(&hfq, gpu, &config)?)
+            let moe_config = config.moe_config();
+            Qwen35MtpFfnWeights::Moe {
+                ffn: crate::qwen35::load::load_moe_ffn(&hfq, gpu, MTP_MOE_PREFIX, &moe_config, 0)?,
+                config: moe_config,
+            }
         }
     };
 
@@ -1117,60 +1155,6 @@ fn load_weight_raw(
         .unwrap_or_else(|| panic!(".mtp tensor '{name}' missing"));
     sanity_check_2d_shape(name, info, m, k);
     weight_tensor_from_raw(gpu, info.quant_type, &data, m, k, name)
-}
-
-fn load_mtp_moe_ffn(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    config: &Qwen35MtpHeadConfig,
-) -> HipResult<Qwen35MtpMoeFfnWeights> {
-    let n_exp = config.num_experts;
-    let dim = config.n_embd;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    assert!(n_exp > 0, "MoE MTP config has num_experts=0");
-    assert!(mi > 0, "MoE MTP config has moe_intermediate_size=0");
-    assert!(
-        smi > 0,
-        "MoE MTP config has shared_expert_intermediate_size=0"
-    );
-
-    let router = load_weight_raw(hfq, gpu, "moe_router", n_exp, dim)?;
-    let shared_expert_gate = load_weight_raw(hfq, gpu, "moe_shared_expert_gate", 1, dim)?;
-    let shared_expert = Qwen35MtpMoeSharedExpertWeights {
-        gate: load_weight_raw(hfq, gpu, "moe_shared_gate", smi, dim)?,
-        up: load_weight_raw(hfq, gpu, "moe_shared_up", smi, dim)?,
-        down: load_weight_raw(hfq, gpu, "moe_shared_down", dim, smi)?,
-    };
-
-    let mut experts = Vec::with_capacity(n_exp);
-    for x in 0..n_exp {
-        let gate_up = load_weight_raw(hfq, gpu, &format!("moe_experts.{x}.gate_up"), 2 * mi, dim)?;
-        let down = load_weight_raw(hfq, gpu, &format!("moe_experts.{x}.down"), dim, mi)?;
-        experts.push(Qwen35MtpMoeExpertWeights { gate_up, down });
-    }
-
-    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    for e in &experts {
-        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
-        dn_ptrs.push(e.down.buf.buf.as_ptr() as u64);
-    }
-    let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
-    gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
-
-    Ok(Qwen35MtpMoeFfnWeights {
-        router,
-        shared_expert,
-        shared_expert_gate,
-        experts,
-        expert_gate_up_ptrs,
-        expert_down_ptrs,
-    })
 }
 
 /// Cross-check the on-disk shape against the caller's expected (m, k).
@@ -1447,8 +1431,7 @@ pub fn mtp_head_forward(
     );
 
     // Run the block (NextN concat + eh_proj + attn + FFN). Writes
-    // `scratch.t_mtp_out` and leaves `scratch.ffn_out` holding the same
-    // hidden (alias for the LM-head path).
+    // `scratch.t_mtp_out`.
     mtp_head_forward_block_only(
         gpu,
         head,
@@ -1706,290 +1689,119 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     )?;
     weight_gemv(gpu, &w.eh_proj, &scratch.concat, &scratch.cur)?;
 
-    // Save inpSA for the attention residual (cur is about to be norm'd
-    // out-of-place into scratch.tmp).
-    gpu.memcpy_dtod_at_auto(&scratch.residual.buf, 0, &scratch.cur.buf, 0, dim_bytes)?;
-
-    // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
-    gpu.rmsnorm_f32(&scratch.cur, &w.attn_norm, &scratch.tmp, cfg.rms_norm_eps)?;
-
-    // Qwen3.5 gated-Q: wq emits 2 * head_dim * n_head, deinterleaved into
-    // Q (head-major first half) and gate (second half) per-head. Mirror
-    // qwen35.rs:2402-2414.
-    weight_gemv(gpu, &w.wq, &scratch.tmp, &scratch.q_full)?;
-    gpu.deinterleave_f32(
-        &scratch.q_full,
-        &scratch.q,
-        &scratch.gate,
-        cfg.n_head,
-        cfg.head_dim,
-    )?;
-    gpu.rmsnorm_batched(
-        &scratch.q,
-        &w.attn_q_norm,
-        &scratch.q,
-        cfg.n_head,
-        cfg.head_dim,
-        cfg.rms_norm_eps,
-    )?;
-
-    weight_gemv(gpu, &w.wk, &scratch.tmp, &scratch.k)?;
-    weight_gemv(gpu, &w.wv, &scratch.tmp, &scratch.v)?;
-    gpu.rmsnorm_batched(
-        &scratch.k,
-        &w.attn_k_norm,
-        &scratch.k,
-        cfg.n_head_kv,
-        cfg.head_dim,
-        cfg.rms_norm_eps,
-    )?;
-
-    // ── 5. RoPE (partial-interleaved, mirrors trunk's full-attn layer) ───
-    gpu.rope_partial_interleaved_f32(
-        &scratch.q,
-        &scratch.k,
-        pos_buf,
-        cfg.n_head,
-        cfg.n_head_kv,
-        cfg.head_dim,
-        cfg.n_rot,
-        cfg.rope_theta,
-    )?;
-
-    // ── 6+7. KV cache write + attention (dispatch on kv.kv_mode) ─────────
-    //
-    // Mirrors trunk's per-token decode dispatch at qwen35.rs:6062-6138.
-    // - Q8: 2-call kv_cache_write_q8_0 + attention_q8_0_kv (no flash partials)
-    // - Asym3: kv_cache_write_asym3_fused + attention_flash_asym3 (Givens cos/sin)
-    // - Fwht4: kv_cache_write_fwht4_fused + attention_flash_fwht4 (FWHT signs
-    //   stored in kv_cache.givens_cos/givens_sin slots — field-name reuse
-    //   per Phase 1 fwht4 commit `c64c0e3f`).
-    // KV write + attention via the shared KV-usage abstraction. kv.inner is
-    // built per kv_mode (new_gpu_q8/asym3/fwht4), so kv.inner.tier_inputs()
-    // produces the tier kv.kv_mode dispatches on — byte-identical kernels
-    // (incl. the Givens cos/sin + v_mode_bits sub-plan). The dispatch arm
-    // computes seq_len = pos+1, so pos = seq_len_hint-1 reproduces the hand
-    // seq_len_hint exactly (the write position flows via pos_buf).
-    // `tier_inputs()` reports flash_mode 0, which would pin the Q8 tier to the
-    // non-flash AttnQ8_0Kv at any context (10 ms per draft step at 33k against
-    // 0.3 ms on the flash tile), so the head takes the trunk's flash policy.
-    // flash_partials is always Some and sized with the same tile the launch
-    // picks (see `Qwen35MtpHeadScratch::new`).
-    let dispatch_pos = seq_len_hint - 1;
+    // ── 4-9. Gated full attention (shared decode op), residual in place ──
+    // The KV slot and attention shape come from `seq_len_hint - 1`; the RoPE
+    // position flows via `pos_buf`. `tier_inputs()` reports flash_mode 0,
+    // which would pin the Q8 tier to the non-flash AttnQ8_0Kv at any context
+    // (10 ms per draft step at 33k against 0.3 ms on the flash tile), so the
+    // head takes the trunk's flash policy. flash_partials is sized with the
+    // same tile the launch picks (see `Qwen35MtpHeadScratch::new`).
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
-        hipfire_dispatch::families::kv_tier::KvTierInputs {
-            pos: dispatch_pos,
-            flash_mode: hipfire_runtime::llama::attention_flash_mode(&gpu.arch),
-            ..kv.inner.tier_inputs()
-        },
-    )
-    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-    let io = hipfire_dispatch::families::attention::AttnParams {
-        q: &scratch.q,
-        k: &scratch.k,
-        v: &scratch.v,
-        k_cache: &kv.inner.k_gpu[0],
-        v_cache: &kv.inner.v_gpu[0],
-        k_scales: None,
-        v_scales: None,
-        pos_buf,
-        pos: dispatch_pos,
-        positions: None,
+    let dims = hipfire_dispatch::pipeline::hybrid::HybridDims {
+        dim: n_embd,
+        n_layers: 1,
         n_heads: cfg.n_head,
         n_kv_heads: cfg.n_head_kv,
         head_dim: cfg.head_dim,
-        physical_cap: kv.inner.physical_cap,
-        batch_size: 1,
-        max_ctx_len: 0,
-        flash_partials: Some(&scratch.flash_partials),
-        givens_cos: kv.inner.givens_cos.as_ref(),
-        givens_sin: kv.inner.givens_sin.as_ref(),
-        tree_bias: None,
-        block_start: 0,
-        block_cols: 0,
-        output_gate: None,
-        output_awq_scale: None,
-        output: &scratch.attn_out,
+        n_rot: cfg.n_rot,
+        rope_theta: cfg.rope_theta,
+        norm_eps: cfg.rms_norm_eps,
+        linear_key_heads: 0,
+        linear_value_heads: 0,
+        linear_key_dim: 0,
+        linear_value_dim: 0,
+        conv_kernel: 0,
+        num_experts: 0,
+    };
+    let attention = hipfire_dispatch::pipeline::hybrid::GatedAttentionOp {
+        dims,
+        rows: 1,
+        position: seq_len_hint - 1,
+        x: &scratch.cur,
+        prerotated_input: false,
+        attn_norm: &w.attn_norm,
+        wq: w.wq.dispatch_ref(),
+        wk: w.wk.dispatch_ref(),
+        wv: w.wv.dispatch_ref(),
+        q_norm: &w.attn_q_norm,
+        k_norm: &w.attn_k_norm,
+        wo: w.wo.dispatch_ref(),
+        kv: hipfire_dispatch::pipeline::hybrid::AttentionKv {
+            tier: hipfire_dispatch::families::kv_tier::KvTierInputs {
+                flash_mode: hipfire_runtime::llama::attention_flash_mode(&gpu.arch),
+                ..kv.inner.tier_inputs()
+            },
+            k_cache: &kv.inner.k_gpu[0],
+            v_cache: &kv.inner.v_gpu[0],
+            physical_cap: kv.inner.physical_cap,
+            givens_cos: kv.inner.givens_cos.as_ref(),
+            givens_sin: kv.inner.givens_sin.as_ref(),
+            compact_offset: 0,
+        },
+        pos_buf,
+        plain: &scratch.tmp,
+        x_rot: &scratch.residual,
+        q_gate: &scratch.q_full,
+        q: &scratch.q,
+        gate: &scratch.gate,
+        k: &scratch.k,
+        v: &scratch.v,
+        flash_partials: &scratch.flash_partials,
+        attn_out: &scratch.attn_out,
+        tap: None,
+        mrope: None,
+    };
+    // ── 10. POST-attn norm + FFN (dense SwiGLU or routed MoE), residual in
+    // place on `cur`. `attn_post_norm` is the pre-FFN norm.
+    let moe_refs;
+    let ffn_step = match &w.ffn {
+        Qwen35MtpFfnWeights::Dense(ffn) => {
+            Step::SwigluFfn(hipfire_dispatch::pipeline::hybrid::SwigluFfnOp {
+                rows: 1,
+                eps: cfg.rms_norm_eps,
+                x: &scratch.cur,
+                norm: &w.attn_post_norm,
+                w_gate: ffn.gate.dispatch_ref(),
+                w_up: ffn.up.dispatch_ref(),
+                w_down: ffn.down.dispatch_ref(),
+                plain: &scratch.tmp,
+                x_rot: &scratch.residual,
+                gate: &scratch.gate_ffn,
+                up: &scratch.up,
+                hidden: &scratch.ffn_hidden,
+                batch: None,
+            })
+        }
+        Qwen35MtpFfnWeights::Moe { ffn, config } => {
+            moe_refs = scratch.moe_refs();
+            let params = crate::qwen35::forward::moe_decode_params(
+                ffn,
+                &scratch.cur,
+                &w.attn_post_norm,
+                &scratch.tmp,
+                config,
+                &moe_refs,
+            );
+            Step::Moe(
+                hipfire_dispatch::pipeline::sealed_moe::seal_decode(
+                    ffn.bound_experts()?,
+                    &ctx,
+                    params,
+                )
+                .map_err(HipError::from)?,
+            )
+        }
     };
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+        &[Step::GatedAttention(attention), ffn_step],
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
-    // ── 8. Apply gate (sigmoid(gate) * attn_out, in-place on attn_out) ───
-    gpu.sigmoid_mul_f32(&scratch.attn_out, &scratch.gate)?;
-
-    // ── 9. Output projection + residual ──────────────────────────────────
-    weight_gemv(gpu, &w.wo, &scratch.attn_out, &scratch.o)?;
-    gpu.add_inplace_f32(&scratch.o, &scratch.residual)?;
-    // scratch.o now holds (attn_out @ wo + inpSA); this is the FFN residual base.
-
-    // ── 10. POST-attn norm + SwiGLU FFN + residual ───────────────────────
-    //
-    // Note attn_post_norm runs BEFORE the FFN and the residual is taken
-    // from the pre-norm activation, mirroring the standard Qwen3.5 layer
-    // (post-attention-layernorm in HF lingo = pre-FFN norm here, with the
-    // "attn_post_norm" name reflecting its source position in the .mtp
-    // metadata file).
-    gpu.rmsnorm_f32(
-        &scratch.o,
-        &w.attn_post_norm,
-        &scratch.tmp,
-        cfg.rms_norm_eps,
-    )?;
-    match &w.ffn {
-        Qwen35MtpFfnWeights::Dense(ffn) => {
-            weight_gemv(gpu, &ffn.gate, &scratch.tmp, &scratch.gate_ffn)?;
-            weight_gemv(gpu, &ffn.up, &scratch.tmp, &scratch.up)?;
-            gpu.silu_mul_f32(&scratch.gate_ffn, &scratch.up, &scratch.ffn_hidden)?;
-            weight_gemv(gpu, &ffn.down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-            gpu.add_inplace_f32(&scratch.ffn_out, &scratch.o)?;
-        }
-        Qwen35MtpFfnWeights::Moe(ffn) => {
-            gpu.memcpy_dtod_at_auto(&scratch.ffn_out.buf, 0, &scratch.o.buf, 0, dim_bytes)?;
-            mtp_moe_ffn_decode(gpu, ffn, &scratch.tmp, &scratch.ffn_out, cfg, scratch)?;
-        }
-    }
-    // scratch.ffn_out now holds the post-FFN, pre-LM-head-norm hidden.
-
-    // Snapshot for callers that want to chain into n+2 prediction OR feed
-    // into the batched `mtp_head_apply_lm_head_batched` end-of-chain reduce.
-    gpu.memcpy_dtod_at_auto(
-        &scratch.t_mtp_out.buf,
-        0,
-        &scratch.ffn_out.buf,
-        0,
-        dim_bytes,
-    )?;
-
-    Ok(())
-}
-
-fn mtp_moe_ffn_decode(
-    gpu: &mut Gpu,
-    ffn: &Qwen35MtpMoeFfnWeights,
-    x_norm: &GpuTensor,
-    x_residual: &GpuTensor,
-    cfg: &Qwen35MtpHeadConfig,
-    scratch: &Qwen35MtpHeadScratch,
-) -> HipResult<()> {
-    let dim = cfg.n_embd;
-    let mi = cfg.moe_intermediate_size;
-    let smi = cfg.shared_expert_intermediate_size;
-    let k_top = cfg.num_experts_per_tok;
-    assert_eq!(k_top, 8, "MoE MTP decode currently expects top_k=8");
-    assert_eq!(ffn.experts.len(), cfg.num_experts);
-
-    let router_logits = scratch
-        .moe_router_logits
-        .as_ref()
-        .expect("MoE MTP scratch not allocated");
-    let scalar_buf = scratch.moe_scalar_buf.as_ref().expect("MoE MTP scratch");
-    let x_rot = scratch.moe_x_rot.as_ref().expect("MoE MTP scratch");
-    let gate_buf = scratch.moe_gate_buf.as_ref().expect("MoE MTP scratch");
-    let up_buf = scratch.moe_up_buf.as_ref().expect("MoE MTP scratch");
-    let ffn_hidden = scratch.moe_ffn_hidden.as_ref().expect("MoE MTP scratch");
-    let ffn_out = scratch.moe_ffn_out.as_ref().expect("MoE MTP scratch");
-    let gate_batch = scratch.moe_gate_batch.as_ref().expect("MoE MTP scratch");
-    let up_batch = scratch.moe_up_batch.as_ref().expect("MoE MTP scratch");
-    let rot_batch = scratch.moe_rot_batch.as_ref().expect("MoE MTP scratch");
-    let topk_indices = scratch.moe_topk_indices.as_ref().expect("MoE MTP scratch");
-    let topk_weights = scratch.moe_topk_weights.as_ref().expect("MoE MTP scratch");
-    let down_expanded = scratch.moe_down_expanded.as_ref().expect("MoE MTP scratch");
-
-    weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
-    gpu.softmax_f32(router_logits)?;
-    gpu.moe_topk_renorm_k8(
-        router_logits,
-        topk_indices,
-        topk_weights,
-        cfg.num_experts,
-        cfg.norm_topk_prob,
-    )?;
-
-    weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
-    let shared_gate = gate_buf.sub_offset(0, smi);
-    let shared_up = up_buf.sub_offset(0, smi);
-    weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-    weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
-    if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
-        gpu.ensure_mq_signs()?;
-        let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-            dtype: DType::F32,
-        };
-        fused_silu_mul_rotate_mq_for(
-            gpu,
-            &ffn.shared_expert.down,
-            &shared_gate,
-            &shared_up,
-            &x_rot_alias,
-            smi,
-        )?;
-        gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-            &ffn.shared_expert.down.buf,
-            &x_rot_alias,
-            x_residual,
-            scalar_buf,
-            ffn.shared_expert.down.m,
-            ffn.shared_expert.down.k,
-        )?;
-    } else {
-        gpu.sigmoid_f32(scalar_buf)?;
-        let shared_hid = ffn_hidden.sub_offset(0, smi);
-        gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
-        weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, ffn_out)?;
-        gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
-    }
-
-    let e0 = ffn.experts.first().expect("MoE MTP has no routed experts");
-    let gate_dtype = e0.gate_up.gpu_dtype;
-    let down_dtype = e0.down.gpu_dtype;
-    assert!(
-        ffn.experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == gate_dtype),
-        "MoE MTP routed gate_up experts must have one uniform dtype"
-    );
-    assert!(
-        ffn.experts.iter().all(|e| e.down.gpu_dtype == down_dtype),
-        "MoE MTP routed down experts must have one uniform dtype"
-    );
-    rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
-    run_uniform_moe_gate_up(
-        gpu,
-        gate_dtype,
-        &ffn.expert_gate_up_ptrs,
-        topk_indices,
-        x_rot,
-        gate_batch,
-        up_batch,
-        2 * mi,
-        e0.gate_up.k,
-        k_top,
-    )
-    .map_err(|error| HipError::new(0, &error.to_string()))?;
-    fused_silu_mul_rotate_mq_batched_for(
-        gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
-    )?;
-    run_uniform_moe_down_expanded(
-        gpu,
-        down_dtype,
-        &ffn.expert_down_ptrs,
-        topk_indices,
-        rot_batch,
-        down_expanded,
-        e0.down.m,
-        e0.down.k,
-        k_top,
-        1,
-    )
-    .map_err(|error| HipError::new(0, &error.to_string()))?;
-    gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, x_residual, e0.down.m, k_top, 1)?;
+    // Snapshot the post-FFN, pre-LM-head-norm hidden for callers that chain
+    // into n+2 prediction OR feed the batched end-of-chain LM head.
+    gpu.memcpy_dtod_at_auto(&scratch.t_mtp_out.buf, 0, &scratch.cur.buf, 0, dim_bytes)?;
 
     Ok(())
 }
@@ -2757,7 +2569,7 @@ pub fn mtp_head_forward_block_batched(
             )?;
             gpu.add_inplace_f32(&ffn_out_view, &o_view)?;
         }
-        Qwen35MtpFfnWeights::Moe(_) => {
+        Qwen35MtpFfnWeights::Moe { .. } => {
             panic!("batched MTP head forward does not support MoE FFN yet; use serial MTP");
         }
     }

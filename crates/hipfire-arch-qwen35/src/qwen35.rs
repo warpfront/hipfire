@@ -16,6 +16,7 @@ pub mod load;
 #[cfg(feature = "moe-oracle")]
 pub mod oracle;
 pub mod prefill;
+pub(crate) mod program;
 pub mod weights;
 
 pub use batch::{

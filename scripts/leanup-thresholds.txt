@@ -120,4 +120,6 @@ bypass_slack                == 0
 # recorded on the hipfire-arch-qwen35 ledger row, now carried by the SCS fold.
 # Banked 305 -> 296 with fold/flash-next: #755's sealed MoE prefill moved into
 # dispatch (qwen35 -5, cohere2moe -6), plus hipfire-arch-qwen4's 2 recorded rows.
-bypass_total                <= 296
+# Banked 296 -> 206 with PR #795: Qwen3.5 layer bodies run as declarative
+# hipfire_dispatch Steps (qwen35 -90).
+bypass_total                <= 206

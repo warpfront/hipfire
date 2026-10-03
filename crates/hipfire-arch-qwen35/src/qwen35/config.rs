@@ -5,6 +5,7 @@
 //! Qwen3.5 config parsing (`Qwen35Config`), layer typing, EP batch attestation
 //! types, and the tree-verify / mrope context structs.
 
+pub use hipfire_dispatch::pipeline::batched_attention::TreeVerifyCtx;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_config::memory::GpuLayerBudget;
@@ -103,18 +104,6 @@ pub struct MaskEmbedOverride<'a> {
 pub enum DflashFusionCtx {
     Off,
     ChainVerify,
-}
-
-#[derive(Clone, Copy)]
-pub struct TreeVerifyCtx<'a> {
-    pub positions: &'a [i32],
-    pub attn_bias: &'a GpuTensor,
-    /// `[N]` i32 — for each linearized slot, the slot index of its parent
-    /// in the same linearization (or -1 for the root / seed). Produced by
-    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
-    /// use tree-aware kernels that read parent state from the per-layer
-    /// s_tape scratch in `PrefillBatchScratch`.
-    pub parent_indices: Option<&'a GpuTensor>,
 }
 
 #[derive(Debug, Clone)]

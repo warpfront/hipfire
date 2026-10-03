@@ -87,6 +87,7 @@
 // KV write and the attend call, both single launches via the `_slots`
 // entry points — RoPE is slot-agnostic per SP2 Task 2 and needs no split).
 
+use hipfire_dispatch::families::fused_qkv::{fused_qkv_key_for, fused_qkvza_key_for};
 use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
     moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
@@ -476,42 +477,6 @@ enum AttnProjDtype {
 // and returns noise. That cost two full KLD measurement cycles (WT2 12.137559
 // against a 0.043776 baseline, bit-identical across both runs) before it was
 // found. Select on the container; never hardcode.
-
-pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
-    match dt {
-        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
-        // read them at the 136 B HFQ4 stride and return noise at full speed.
-        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
-        DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
-        DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
-        DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
-        DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
-        DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
-        DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
-        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
-        DType::MQ4G256V2Lloyd => panic!(
-            "fused_qkvza_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
-        ),
-        _ => KernelKey::FusedQkvzaHfq4G256,
-    }
-}
-
-pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
-    match dt {
-        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
-        DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
-        DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
-        DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
-        DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
-        DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
-        DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
-        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
-        DType::MQ4G256V2Lloyd => panic!(
-            "fused_qkv_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
-        ),
-        _ => KernelKey::FusedQkvHfq4G256,
-    }
-}
 
 /// Q8_0-or-rotated-MQ weight-dtype gate for a `DeltaNetMoeLayerWeights`,
 /// uniform across all five attention projections (wqkv/wz/w_beta/w_alpha/wo)
