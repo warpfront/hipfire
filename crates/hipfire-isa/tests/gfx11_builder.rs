@@ -1,6 +1,8 @@
 //! gfx11 builder target: counter waits, LDS barrier drain, VOPD pairing, the
 //! V2C-equivalent SET/ADD/gate-up kernels (gfx1100), the V2B module
 //! (gfx1151), and byte identity of the committed builder products.
+mod common;
+use common::no_llvm;
 use hipfire_isa::{Arch, Builder, KernelSpec, KernargLayout, RegPlan};
 use hipfire_isa::insn::{Instruction, MemoryClass};
 use hipfire_isa::kernels::{iu4_gemm, iu4_v2b, iu4_v2c, fp8_gemm};
@@ -131,6 +133,7 @@ fn v2c_gate_up_trip_is_the_paired_set_fold_plus_up_scales() {
 }
 
 fn assemble(text: &str, arch: &str) {
+    if no_llvm() { return }
     let mut child = Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
@@ -207,6 +210,7 @@ fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
 /// `.text` of the committed bundles.
 #[test]
 fn committed_gfx1201_bundles_equal_fresh_emission() {
+    if no_llvm() { return }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let token = iu4_gemm::emit_module(iu4_gemm::Fold::K128, iu4_gemm::Tile::T128x128x8, iu4_gemm::Cacc::One, iu4_gemm::ALayout::Token, Arch::Gfx1201).unwrap().1;
     let slab = iu4_gemm::emit_module(iu4_gemm::Fold::K128, iu4_gemm::Tile::T128x128x8, iu4_gemm::Cacc::One, iu4_gemm::ALayout::Slab, Arch::Gfx1201).unwrap().1;
@@ -261,6 +265,7 @@ fn v2b_module_assembles_for_gfx1151_with_zero_diagnostics() { assemble(&iu4_v2b:
 /// the builder emits today.
 #[test]
 fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
+    if no_llvm() { return }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2b::MODULE)).unwrap();
     let text = iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1;
@@ -271,6 +276,7 @@ fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
 /// the builder emits today.
 #[test]
 fn committed_gfx1100_v2c_bundle_equals_fresh_emission() {
+    if no_llvm() { return }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2c::MODULE)).unwrap();
     let text = iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1;

@@ -2,6 +2,7 @@
 //! `IsaShapeContract` of every product point, the 192-VGPR occupancy
 //! ceiling, deterministic emission, the loop wait-ledger fix point, the
 //! imported SiLU region, and assembly of every emitted module.
+mod common;
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::iu4_gemm::{self, ALayout, Cacc, Epi, Fold, Spec, Tile, region::{self, Region}};
 use serde_json::Value;
@@ -89,6 +90,7 @@ fn emission_is_deterministic_and_loop_ledger_reaches_fixed_point() {
 
 #[test]
 fn every_module_assembles_with_zero_diagnostics() {
+    if common::no_llvm() { return }
     for (tile, act, _) in POINTS {
         let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
         assemble(&text).unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));

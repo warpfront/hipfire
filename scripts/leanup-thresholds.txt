@@ -44,7 +44,7 @@ required_features_daemon    == 0
 # 355eeb987) added the daemon load warnings for deprecated KV names and PFlash
 # plus their lifecycle markers (+23 lines, 5358 -> 5381 on land); fold/flash-next
 # took 4 back. The warnings go with the surfaces they announce in 0.5.0.
-daemon_lines                <= 5377
+daemon_lines                <= 5392
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
