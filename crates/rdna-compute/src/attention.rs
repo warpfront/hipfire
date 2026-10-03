@@ -6745,14 +6745,17 @@ impl Gpu {
         // launcher (F1-oracle-proven bit-exact vs two N512 halves); the F2
         // pair path launches the merged 1024-row FA2 through production
         // ingress, which admits exactly-1024 on gfx1151 only.
+        let narrow_max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+            1024
+        } else {
+            512
+        };
         let max_fa2_batch: usize = if self.flags.gfx11_q8_fa2_wide
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
         {
             8192
-        } else if self.arch.as_str() == "gfx1151" {
-            1024
         } else {
-            512
+            narrow_max_fa2_batch
         };
         if batch_size == 0 || batch_size > max_fa2_batch {
             return Err(hip_bridge::HipError::new(
@@ -6869,8 +6872,10 @@ impl Gpu {
         let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
             hip_bridge::HipError::new(0, "attention_q8_0_fa2_gqa_gfx11 Q16 size overflow")
         })?;
-        if self.flags.gfx11_q8_fa2_wide
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+        // Only wide-only batches must find their scratch pre-grown; the
+        // narrow envelope grew it on demand under recording before wide
+        // existed, and still does with wide off.
+        if batch_size > narrow_max_fa2_batch
             && (self.graphs.capture_mode || self.replay.is_recording())
             && crate::scratch::scratch_will_grow(
                 self.scratch.fa2_q16_scratch_bytes,
