@@ -29,7 +29,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_engine::redline::{
     redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
-    redline_capture_json, redline_hash, RedlineRegionHash,
+    redline_capture_json, redline_hash, G0Arm, RedlineRegionHash,
 };
 use hipfire_loader::spec_build::Qwen35SlotGuard;
 use hipfire_loader::LoadedModel;
@@ -240,7 +240,7 @@ pub fn redline_qwen_snapshot(
         .chain(bundle.kv_cache.k_scales.iter())
         .chain(bundle.kv_cache.v_scales.iter())
     {
-        redline_append_buffer(gpu, &mut kv, &tensor.buf)?;
+        redline_append_mapped(gpu, &mut kv, tensor)?;
     }
     let mut recurrent = Vec::new();
     for tensor in bundle
@@ -259,6 +259,31 @@ pub fn redline_qwen_snapshot(
         recurrent,
         gdn_frame: rdna_compute::norm::gdn_requant_frame_checkpoint(),
     })
+}
+
+/// Byte length of a tensor's mapped prefix for whole-surface dumps: the VMM
+/// mapped prefix (the reserve beyond it is unbacked VA), clamped to the
+/// tensor's logical size because the mapping is granule-rounded and covers
+/// past the logical end once growth reaches `physical_cap`. Non-VMM tensors
+/// are whole, matching `KvCache::clear_gpu`'s byte range.
+fn redline_mapped_len(gpu: &rdna_compute::Gpu, tensor: &rdna_compute::GpuTensor) -> usize {
+    gpu.vmm_mapped_bytes(tensor)
+        .map_or(tensor.buf.size(), |mapped| mapped.min(tensor.buf.size()))
+}
+
+/// Append a tensor's device bytes, limited to its mapped prefix
+/// ([`redline_mapped_len`]).
+fn redline_append_mapped(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    tensor: &rdna_compute::GpuTensor,
+) -> Result<(), String> {
+    let bytes = redline_mapped_len(gpu, tensor);
+    let start = output.len();
+    output.resize(start + bytes, 0);
+    gpu.hip
+        .memcpy_dtoh(&mut output[start..], &tensor.buf)
+        .map_err(|error| error.to_string())
 }
 
 fn redline_gemma4_snapshot(
@@ -390,6 +415,7 @@ fn redline_reset_gemma4(
             .memset(buffer, 0, buffer.size())
             .map_err(|error| error.to_string())?;
     }
+    gpu.invalidate_graph_state();
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -799,6 +825,20 @@ pub fn redline_reset_qwen(
             .memset(&tensor.buf, 0, tensor.buf.size())
             .map_err(|error| error.to_string())?;
     }
+    redline_fill_qwen_scratch(gpu, bundle, 0)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+/// Fill every per-forward Qwen scratch surface (model scratch plus the shared
+/// GPU MQ/GEMV scratch) with one byte. Zero is the shadow reset; a non-zero
+/// byte is a poison for read-before-write detection.
+fn redline_fill_qwen_scratch(
+    gpu: &rdna_compute::Gpu,
+    bundle: &Qwen35Bundle,
+    value: u8,
+) -> Result<(), String> {
     let scratch = &bundle.scratch;
     let buffers: &[&hip_bridge::DeviceBuffer] = &[
         &scratch.x.buf,
@@ -833,12 +873,7 @@ pub fn redline_reset_qwen(
         &scratch.x_rot.buf,
         &scratch.flash_partials.buf,
     ];
-    for buffer in buffers {
-        gpu.hip
-            .memset(buffer, 0, buffer.size())
-            .map_err(|error| error.to_string())?;
-    }
-    for buffer in [
+    let shared = [
         gpu.scratch.mq_x_rot.as_ref().map(|tensor| &tensor.buf),
         gpu.scratch.mq_x_rot_fp8.as_ref(),
         gpu.scratch.mq_x_q8.as_ref(),
@@ -847,17 +882,13 @@ pub fn redline_reset_qwen(
         gpu.scratch.fp8_x_scratch.as_ref(),
         gpu.scratch.q8_1_mmq_x_scratch.as_ref(),
         gpu.scratch.ksplit_det_partials.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ];
+    for buffer in buffers.iter().copied().chain(shared.into_iter().flatten()) {
         gpu.hip
-            .memset(buffer, 0, buffer.size())
+            .memset(buffer, i32::from(value), buffer.size())
             .map_err(|error| error.to_string())?;
     }
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 pub fn redline_prime_qwen(
@@ -866,11 +897,20 @@ pub fn redline_prime_qwen(
     context: usize,
 ) -> Result<(), String> {
     let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    redline_prime_qwen_tokens(gpu, bundle, &synthetic)
+}
+
+/// Prefill `tokens` from position 0 into a reset Qwen state (shadow prime).
+fn redline_prime_qwen_tokens(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut Qwen35Bundle,
+    tokens: &[u32],
+) -> Result<(), String> {
     qwen35::forward_prefill_batch(
         gpu,
         &bundle.weights,
         &bundle.config,
-        &synthetic,
+        tokens,
         0,
         &mut bundle.kv_cache,
         &mut bundle.dn_state,
@@ -1169,6 +1209,12 @@ pub fn redline_bench_decode_deepseek4(
     if capture && product_route {
         return Err("redline_capture and redline_product_route are mutually exclusive".to_string());
     }
+    let g0 = G0Arm::from_request(msg)?;
+    if g0.is_some() && (capture || product_route || iterations != 1) {
+        return Err(
+            "g0 requires iterations == 1 and excludes redline_capture/redline_product_route".to_string(),
+        );
+    }
     if context == 0 || iterations == 0 {
         return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
     }
@@ -1191,10 +1237,11 @@ pub fn redline_bench_decode_deepseek4(
         .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
     loaded.seq_pos = context;
 
-    if capture || (product_route && gpu.replay.prepared_route_identity().is_some()) {
+    if capture || g0.is_some() || (product_route && gpu.replay.prepared_route_identity().is_some()) {
         // Manual capture and prepared product routes are already warm paths.
         // The first product warmup must still materialize lazy allocations and
         // record the route; later requests replay from their first timed token.
+        // Both G0 arms run the same warm body so only the recording differs.
         bundle.state.ar_forward_warmed_up = true;
     }
     if capture {
@@ -1202,21 +1249,29 @@ pub fn redline_bench_decode_deepseek4(
             .begin_capture()
             .map_err(|reason| format!("redline decode capture refused: {reason}"))?;
     }
+    let g0_before = g0.map(|arm| arm.begin(gpu)).transpose()?;
 
     if product_route {
         gpu.replay.begin_replay_observation_window();
     }
     let replay_before = gpu.replay.replay_observation();
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| error.to_string())?;
+    let settled = gpu.hip.device_synchronize().map_err(|error| error.to_string());
     let started = Instant::now();
-    redline_run_deepseek4_decode(gpu, bundle, context, iterations)
-        .map_err(|error| format!("bench_decode forward failed: {error}"))?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| error.to_string())?;
+    let run = settled
+        .and_then(|()| {
+            redline_run_deepseek4_decode(gpu, bundle, context, iterations)
+                .map_err(|error| format!("bench_decode forward failed: {error}"))
+        })
+        .and_then(|()| gpu.hip.device_synchronize().map_err(|error| error.to_string()));
     let elapsed = started.elapsed().as_secs_f64();
+    // A G0 arm is always closed, so a failed forward cannot leave the
+    // controller observing (or recording) every later launch.
+    let g0_result = match (g0, g0_before) {
+        (Some(arm), Some(before)) => Some(arm.finish(gpu, before)),
+        _ => None,
+    };
+    run?;
+    let g0_result = g0_result.transpose()?;
     let replay_after = gpu.replay.replay_observation();
     let capture_summary = if capture {
         Some(
@@ -1242,6 +1297,9 @@ pub fn redline_bench_decode_deepseek4(
     });
     if let Some(summary) = capture_summary {
         response["redline_capture"] = redline_capture_json(gpu, summary, capture_detail);
+    }
+    if let Some(value) = g0_result {
+        response["g0"] = value;
     }
     if product_route {
         let prepared = gpu.replay.prepared_route_identity().map(|identity| {
@@ -4020,6 +4078,112 @@ fn redline_shadow_qwen4(
     }))
 }
 
+/// Railgun G0 (recording invariance, design §5 G0) for the DFlash cycle:
+/// one served acceptance window (`Speculator::step` = draft + verify +
+/// commit) from a synthetic primed prompt, run as one G0 arm. The prompt
+/// prefill and both resets stay outside the arm. Refuses the retained-PM4
+/// verify route (it swaps controllers mid-window) and a verify HipGraph (its
+/// launches would not reach the funnels); the harness runs with
+/// `HIPFIRE_VERIFY_GRAPH=0` and compares the arms with
+/// `scripts/redline_daemon_harness.py --g0 --dflash-cycle`.
+pub fn railgun_g0_dflash_cycle(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    arm: G0Arm,
+    context: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1 || loaded.ep.is_some() || (loaded.arch_id != 5 && loaded.arch_id != 6) {
+        return Err("railgun_g0_dflash_cycle requires a single-GPU Qwen3.5/3.8-family target".into());
+    }
+    if hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4").as_deref() == Ok("1") {
+        return Err("railgun_g0_dflash_cycle refuses HIPFIRE_DFLASH_VERIFY_PM4=1 (retained verify swaps controllers)".into());
+    }
+    if hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").as_deref() != Ok("0") {
+        return Err("railgun_g0_dflash_cycle requires HIPFIRE_VERIFY_GRAPH=0 (graph launches bypass the funnels)".into());
+    }
+    if context == 0 || context.saturating_add(4 * DFLASH_VERIFY_PM4_BLOCK) > loaded.physical_cap {
+        return Err(format!(
+            "railgun_g0_dflash_cycle context {context} must be non-zero and leave a window below physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+    let spec = loaded
+        .speculator
+        .as_mut()
+        .filter(|s| s.name() == "dflash")
+        .ok_or("railgun_g0_dflash_cycle requires a loaded DFlash sidecar")?;
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let slot = guard.model_slot()?;
+    spec.reset(gpu)?;
+    redline_reset_qwen_slot(gpu, slot)?;
+    let prompt: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
+    let first = match spec.prefill(gpu, slot, &prompt, &prompt, 0, false, None, &|| false)? {
+        hipfire_runtime::spec::PrefillOutcome::Ready { first_token } => first_token,
+        hipfire_runtime::spec::PrefillOutcome::Aborted => {
+            return Err("railgun_g0_dflash_cycle prefill aborted".into())
+        }
+    };
+    gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+    // The spec window is not a plain-AR forward; make the record arm's
+    // recorder live for it (the observe arm ignores eligibility).
+    gpu.replay.set_forward_eligible(true);
+    let before = arm.begin(gpu)?;
+    let step = spec.step(gpu, slot, context, first, &[first], None, 0.0, usize::MAX);
+    let settled = gpu.hip.device_synchronize().map_err(|e| e.to_string());
+    let result = arm.finish(gpu, before);
+    let step = step?;
+    settled?;
+    let mut value = result?;
+    spec.reset(gpu)?;
+    redline_reset_qwen_slot(gpu, slot)?;
+    drop(guard);
+    loaded.seq_pos = 0;
+    loaded.conversation_tokens.clear();
+    value["type"] = serde_json::json!("railgun_g0_dflash_cycle");
+    value["context_tokens"] = serde_json::json!(context);
+    value["window"] = serde_json::json!({
+        "seed": first,
+        "emit": step.emit.to_vec(),
+        "next_seed": step.next_seed,
+        "proposed": step.proposed,
+        "accepted": step.accepted,
+    });
+    Ok(value)
+}
+
+/// `"railgun_g0_dflash_cycle"` daemon message handler.
+pub fn handle_railgun_g0_dflash_cycle(
+    msg: &serde_json::Value,
+    model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+) {
+    let context = msg
+        .get("context_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(128) as usize;
+    let response = G0Arm::from_request(msg)
+        .and_then(|arm| arm.ok_or_else(|| "railgun_g0_dflash_cycle requires g0".to_string()))
+        .and_then(|arm| {
+            model
+                .as_mut()
+                .ok_or_else(|| "railgun_g0_dflash_cycle requires a loaded model".to_string())
+                .and_then(|loaded| railgun_g0_dflash_cycle(gpu, loaded, arm, context))
+        });
+    match response {
+        Ok(response) => {
+            let _ = writeln!(stdout, "{response}");
+        }
+        Err(reason) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "error", "message": reason})
+            );
+        }
+    }
+    let _ = stdout.flush();
+}
 /// `"redline_shadow_aql" | "redline_shadow_pm4"` daemon message handler.
 fn redline_shadow_gemma4(
     gpu: &mut rdna_compute::Gpu,
@@ -4656,9 +4820,15 @@ pub fn handle_redline_dispatch_profile(
             let started = Instant::now();
             // SAFETY: the loaded model owns every captured pointer.
             let profile = unsafe { gpu.replay.replay_pm4_dispatch_profile(context) }?;
-            if profile.spans_nanoseconds.len() != launch_count {
+            // gfx12 stamps after each dispatch (one span per launch); the
+            // gfx10/gfx11 tape also stamps after each compute-idle packet, so
+            // spans alternate kernel issue-to-idle and boundary idle-to-issue.
+            if profile.spans_nanoseconds.len() != launch_count
+                && profile.spans_nanoseconds.len() != 2 * launch_count
+            {
                 return Err(format!(
-                    "dispatch span length mismatch: expected {launch_count}, got {}",
+                    "dispatch span length mismatch: expected {launch_count} or {}, got {}",
+                    2 * launch_count,
                     profile.spans_nanoseconds.len()
                 ));
             }
@@ -5374,6 +5544,560 @@ pub fn handle_redline_prefix_shadow(
         })
     );
     let _ = stdout.flush();
+}
+
+/// Word-wise FNV-1a-style fingerprint for per-step localization. Each word
+/// step is a bijection of the running state, so a single differing 8-byte
+/// word can never collide. Final state surfaces are dumped whole and
+/// compared byte for byte; this hash only locates the first divergent step.
+fn redline_trace_hash(bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        hash ^= u64::from_le_bytes(word.try_into().expect("8-byte chunk"));
+        hash = hash.wrapping_mul(PRIME);
+    }
+    for byte in words.remainder() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash ^ bytes.len() as u64
+}
+
+fn redline_trace_dn_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {
+    bundle
+        .dn_state
+        .s_matrices
+        .iter()
+        .chain(bundle.dn_state.s_scales.iter())
+        .chain(bundle.dn_state.conv_states.iter())
+        .chain(bundle.dn_state.s_ef_residual.iter())
+        .collect()
+}
+
+fn redline_trace_kv_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {
+    bundle
+        .kv_cache
+        .k_gpu
+        .iter()
+        .chain(bundle.kv_cache.v_gpu.iter())
+        .chain(bundle.kv_cache.k_scales.iter())
+        .chain(bundle.kv_cache.v_scales.iter())
+        .collect()
+}
+
+fn redline_trace_dn_bytes(
+    gpu: &rdna_compute::Gpu,
+    bundle: &Qwen35Bundle,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    output.clear();
+    for tensor in redline_trace_dn_planes(bundle) {
+        redline_append_buffer(gpu, output, &tensor.buf)?;
+    }
+    Ok(())
+}
+
+fn redline_trace_kv_bytes(gpu: &rdna_compute::Gpu, bundle: &Qwen35Bundle) -> Result<Vec<u8>, String> {
+    let mut kv = Vec::new();
+    for tensor in redline_trace_kv_planes(bundle) {
+        redline_append_mapped(gpu, &mut kv, tensor)?;
+    }
+    Ok(kv)
+}
+
+/// Upload a whole-surface dump written by `redline_trace_kv_bytes` /
+/// `redline_trace_dn_bytes`. Each plane takes exactly its mapped (KV) or full
+/// (DeltaNet) size; the dump must be consumed exactly.
+fn redline_trace_upload(
+    gpu: &rdna_compute::Gpu,
+    planes: &[&rdna_compute::GpuTensor],
+    mapped: bool,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let mut offset = 0;
+    for tensor in planes {
+        let size = if mapped { redline_mapped_len(gpu, tensor) } else { tensor.buf.size() };
+        let chunk = bytes
+            .get(offset..offset + size)
+            .ok_or_else(|| format!("state dump short: plane needs {size} B at {offset}"))?;
+        gpu.hip
+            .memcpy_htod(&tensor.buf, chunk)
+            .map_err(|error| error.to_string())?;
+        offset += size;
+    }
+    if offset != bytes.len() {
+        return Err(format!("state dump has {} B, planes took {offset} B", bytes.len()));
+    }
+    Ok(())
+}
+
+/// Hash KV rows `[first, end)` of every real (non-placeholder) K and V plane.
+fn redline_trace_kv_rows_hash(
+    gpu: &rdna_compute::Gpu,
+    bundle: &Qwen35Bundle,
+    row_bytes: usize,
+    first: usize,
+    end: usize,
+) -> Result<u64, String> {
+    let mut rows = vec![0u8; (end - first) * row_bytes];
+    let mut mix = 0xcbf2_9ce4_8422_2325_u64;
+    for tensor in bundle
+        .kv_cache
+        .k_gpu
+        .iter()
+        .chain(bundle.kv_cache.v_gpu.iter())
+    {
+        // 1-element placeholders stand in for non-KV (DeltaNet) layers.
+        if tensor.buf.size() < end * row_bytes {
+            continue;
+        }
+        gpu.hip
+            .memcpy_dtoh_at(&mut rows, &tensor.buf, first * row_bytes)
+            .map_err(|error| error.to_string())?;
+        mix ^= redline_trace_hash(&rows);
+        mix = mix.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(mix)
+}
+
+/// `"redline_greedy_trace"` daemon message handler.
+///
+/// Product-route parity trace for Qwen3.5 plain AR decode. Unlike the shadow
+/// oracle, every step calls the ordinary `forward_scratch` entry point, so
+/// the process's configured route (HIP AR graph, or the automatic retained
+/// lifecycle: one recorded HIP warmup, then PM4 replay) is exactly what
+/// serving executes. Each sequence resets state, fills scratch and the mapped
+/// KV arena with its poison byte (0 = plain reset), primes `context_tokens`
+/// (the shadow's synthetic prefill, or the head of `prompt_tokens_file`), or
+/// with `load_primed` uploads another run's saved primed KV + DeltaNet state
+/// + GDN frame (`save_primed`) so two routes start from identical bytes even
+/// when their prefill paths differ. It then decodes `steps` tokens: `greedy`
+/// feeds the host argmax of the previous logits; `fixed` replays one position
+/// from a restored DeltaNet state and GDN frame. Per step it writes the whole
+/// logits and final-hidden (`x`, normed `tmp`) buffers and fingerprints the
+/// DeltaNet state and the written KV rows; after the last step it writes the
+/// whole mapped KV arena and DeltaNet state. `probe_refusal` then submits one
+/// more forward at `context_tokens + steps` and reports whether it was
+/// refused, with the HIP launches, retained replays and state change it
+/// caused (railgun G1 refusal point). Routes are compared offline across
+/// processes.
+pub fn handle_redline_greedy_trace(
+    msg: &serde_json::Value,
+    model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+) {
+    match redline_greedy_trace(msg, model, gpu) {
+        Ok(response) => {
+            let _ = writeln!(stdout, "{response}");
+        }
+        Err(reason) => {
+            emit_uncorrelated_error(
+                stdout,
+                None,
+                &format!("redline greedy trace failed: {reason}"),
+                "internal",
+                false,
+                false,
+            );
+        }
+    }
+    let _ = stdout.flush();
+}
+
+fn redline_greedy_trace(
+    msg: &serde_json::Value,
+    model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<serde_json::Value, String> {
+    use std::io::Write as _;
+    let io = |error: std::io::Error| error.to_string();
+    let hip = |error: hip_bridge::HipError| error.to_string();
+    let number = |name: &str| msg.get(name).and_then(|value| value.as_u64());
+    let flag = |name: &str| msg.get(name).and_then(|value| value.as_bool());
+    let context = number("context_tokens").unwrap_or(512) as usize;
+    let steps = number("steps").unwrap_or(256) as usize;
+    // `prompt_tokens_file`: raw little-endian u32 token ids. The prime uses
+    // the first `context_tokens`, and the first decoded input defaults to the
+    // file's next token; otherwise the shadow's synthetic prime and 101.
+    let prompt = match msg.get("prompt_tokens_file").and_then(|value| value.as_str()) {
+        None => None,
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+            let tokens = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("4-byte chunk")))
+                .collect::<Vec<u32>>();
+            if tokens.len() < context {
+                return Err(format!("{path}: {} tokens < context {context}", tokens.len()));
+            }
+            Some(tokens)
+        }
+    };
+    let first_token = number("first_token")
+        .map(|token| token as u32)
+        .or_else(|| prompt.as_ref().and_then(|tokens| tokens.get(context).copied()))
+        .unwrap_or(101);
+    let fixed = match msg.get("mode").and_then(|value| value.as_str()) {
+        None | Some("greedy") => false,
+        Some("fixed") => true,
+        Some(other) => return Err(format!("unknown mode {other:?} (greedy|fixed)")),
+    };
+    let poisons = match msg.get("poisons") {
+        None => vec![0u8],
+        Some(value) => value
+            .as_array()
+            .ok_or("poisons must be an array of bytes")?
+            .iter()
+            .map(|byte| {
+                byte.as_u64()
+                    .and_then(|byte| u8::try_from(byte).ok())
+                    .ok_or_else(|| "poison bytes must be 0..=255".to_string())
+            })
+            .collect::<Result<Vec<u8>, String>>()?,
+    };
+    let dump_steps = flag("dump_steps").unwrap_or(true);
+    let dump_final = flag("dump_final").unwrap_or(true);
+    let save_primed = flag("save_primed").unwrap_or(false);
+    // `probe_refusal` (railgun G1): after the last greedy step, submit one
+    // more forward at `context + steps`, the first position outside the
+    // loaded length domain when that equals `physical_cap` (AR: `max_seq`).
+    // It must be refused with no launch and no state change, never clamped.
+    let probe_refusal = flag("probe_refusal").unwrap_or(false);
+    if probe_refusal && fixed {
+        return Err("probe_refusal requires greedy mode".into());
+    }
+    let load_primed = msg
+        .get("load_primed")
+        .and_then(|value| value.as_str())
+        .map(std::path::PathBuf::from);
+    let out_dir = std::path::PathBuf::from(
+        msg.get("out_dir")
+            .and_then(|value| value.as_str())
+            .ok_or("out_dir is required")?,
+    );
+    if context == 0 || steps == 0 || poisons.is_empty() {
+        return Err("context_tokens, steps and poisons must be non-empty".into());
+    }
+    let loaded = model.as_mut().ok_or("no model loaded")?;
+    if loaded.pp != 1 || loaded.ep.is_some() {
+        return Err("requires a single-GPU model".into());
+    }
+    let bundle = loaded
+        .state
+        .as_mut()
+        .and_then(|state| (state.as_mut() as &mut dyn Any).downcast_mut::<Qwen35Bundle>())
+        .ok_or("requires a loaded Qwen3.5 model")?;
+    let end_pos = if fixed { context + 1 } else { context + steps };
+    if end_pos > bundle.kv_cache.physical_cap {
+        return Err(format!(
+            "positions up to {end_pos} exceed KV physical_cap {}",
+            bundle.kv_cache.physical_cap
+        ));
+    }
+    let row_bytes = redline_kv_token_stride(
+        bundle.kv_cache.n_kv_heads,
+        bundle.kv_cache.head_dim,
+        bundle.kv_cache.quant_fp8,
+        bundle.kv_cache.quant_bf16,
+    )?;
+    let vocab = bundle.config.vocab_size;
+    std::fs::create_dir_all(&out_dir).map_err(io)?;
+    let frame_initial = rdna_compute::norm::gdn_requant_frame_checkpoint();
+    let mut dn = Vec::new();
+    let mut sequences = Vec::with_capacity(poisons.len());
+    for (sequence, &poison) in poisons.iter().enumerate() {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_initial);
+        redline_reset_qwen(gpu, bundle)?;
+        if poison != 0 {
+            redline_fill_qwen_scratch(gpu, bundle, poison)?;
+            for tensor in redline_trace_kv_planes(bundle) {
+                let bytes = redline_mapped_len(gpu, tensor);
+                gpu.hip
+                    .memset(&tensor.buf, i32::from(poison), bytes)
+                    .map_err(hip)?;
+            }
+            gpu.hip.device_synchronize().map_err(hip)?;
+        }
+        let dir = out_dir.join(format!("seq{sequence}"));
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        // `load_primed` replaces the prefill with another process's primed
+        // KV + DeltaNet state + GDN frame, so two routes decode from the same
+        // bytes even when their prefill paths differ.
+        let primed_from = match &load_primed {
+            None => {
+                match &prompt {
+                    Some(tokens) => redline_prime_qwen_tokens(gpu, bundle, &tokens[..context])?,
+                    None => redline_prime_qwen(gpu, bundle, context)?,
+                }
+                None
+            }
+            Some(source) => {
+                let source = source.join(format!("seq{sequence}"));
+                let meta: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(source.join("primed.json")).map_err(io)?,
+                )
+                .map_err(|error| error.to_string())?;
+                if meta["context_tokens"].as_u64() != Some(context as u64)
+                    || meta["poison"].as_u64() != Some(u64::from(poison))
+                {
+                    return Err(format!("primed state {meta} does not match ctx {context} poison {poison}"));
+                }
+                bundle
+                    .kv_cache
+                    .ensure_mapped_capacity(gpu, context)
+                    .map_err(hip)?;
+                let kv = std::fs::read(source.join("primed_kv.bin")).map_err(io)?;
+                redline_trace_upload(gpu, &redline_trace_kv_planes(bundle), true, &kv)?;
+                let recurrent = std::fs::read(source.join("primed_recurrent.bin")).map_err(io)?;
+                redline_trace_upload(gpu, &redline_trace_dn_planes(bundle), false, &recurrent)?;
+                gpu.hip.device_synchronize().map_err(hip)?;
+                let frame = meta["gdn_frame"]
+                    .as_u64()
+                    .and_then(|frame| u32::try_from(frame).ok())
+                    .ok_or("primed.json gdn_frame missing")?;
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame);
+                Some(source.display().to_string())
+            }
+        };
+        if save_primed {
+            let kv = redline_trace_kv_bytes(gpu, bundle)?;
+            redline_trace_dn_bytes(gpu, bundle, &mut dn)?;
+            std::fs::write(dir.join("primed_kv.bin"), &kv).map_err(io)?;
+            std::fs::write(dir.join("primed_recurrent.bin"), &dn).map_err(io)?;
+            let meta = serde_json::json!({
+                "context_tokens": context,
+                "poison": poison,
+                "gdn_frame": rdna_compute::norm::gdn_requant_frame_checkpoint(),
+                "kv_bytes": kv.len(),
+                "recurrent_bytes": dn.len(),
+            });
+            std::fs::write(dir.join("primed.json"), meta.to_string()).map_err(io)?;
+        }
+        let create = |name: &str| {
+            std::fs::File::create(dir.join(name))
+                .map(std::io::BufWriter::new)
+                .map_err(io)
+        };
+        let mut logits_file = create("logits.bin")?;
+        let mut hidden_file = create("hidden.bin")?;
+        let mut steps_file = create("steps.jsonl")?;
+        let dn_backup = if fixed {
+            redline_trace_dn_bytes(gpu, bundle, &mut dn)?;
+            Some(dn.clone())
+        } else {
+            None
+        };
+        let frame_primed = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        let mut token = first_token;
+        let mut tokens = Vec::with_capacity(steps);
+        let mut replayed_total = 0u64;
+        let mut graph_ready_steps = 0usize;
+        for step in 0..steps {
+            let pos = if fixed { context } else { context + step };
+            if let Some(backup) = &dn_backup {
+                redline_trace_upload(gpu, &redline_trace_dn_planes(bundle), false, backup)?;
+                gpu.hip.device_synchronize().map_err(hip)?;
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_primed);
+            }
+            let frame_before = rdna_compute::norm::gdn_requant_frame_checkpoint();
+            let observed_before = gpu.replay.replay_observation().count;
+            let started = Instant::now();
+            qwen35::forward_scratch(
+                gpu,
+                &bundle.weights,
+                &bundle.config,
+                token,
+                pos,
+                &mut bundle.kv_cache,
+                &mut bundle.dn_state,
+                &bundle.scratch,
+            )
+            .map_err(|error| format!("step {step} pos {pos}: {error}"))?;
+            gpu.hip.device_synchronize().map_err(hip)?;
+            let step_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+            let replayed = gpu
+                .replay
+                .replay_observation()
+                .count
+                .saturating_sub(observed_before);
+            replayed_total += replayed;
+            let graph_ready =
+                gpu.graphs.graph_exec.is_some() && gpu.graphs.ar_forward_replay_enabled;
+            graph_ready_steps += usize::from(graph_ready);
+            let mut logits = Vec::new();
+            redline_append_buffer(gpu, &mut logits, &bundle.scratch.logits.buf)?;
+            let mut hidden = Vec::new();
+            redline_append_buffer(gpu, &mut hidden, &bundle.scratch.x.buf)?;
+            let x_bytes = hidden.len();
+            redline_append_buffer(gpu, &mut hidden, &bundle.scratch.tmp.buf)?;
+            if logits.len() < vocab * 4 {
+                return Err(format!("logits buffer {} < vocab {vocab} f32", logits.len()));
+            }
+            let mut best: Option<(usize, f32)> = None;
+            let mut nonfinite = 0usize;
+            for (index, value) in logits[..vocab * 4].chunks_exact(4).enumerate() {
+                let value = f32::from_le_bytes(value.try_into().expect("4-byte chunk"));
+                if !value.is_finite() {
+                    nonfinite += 1;
+                } else if best.map_or(true, |(_, top)| value > top) {
+                    best = Some((index, value));
+                }
+            }
+            let (argmax, top) = best.ok_or_else(|| format!("step {step}: no finite logit"))?;
+            redline_trace_dn_bytes(gpu, bundle, &mut dn)?;
+            let record = serde_json::json!({
+                "step": step,
+                "pos": pos,
+                "token": token,
+                "argmax": argmax,
+                "top_logit_bits": format!("{:08x}", top.to_bits()),
+                "nonfinite_logits": nonfinite,
+                "logits_hash": format!("{:016x}", redline_trace_hash(&logits)),
+                "x_hash": format!("{:016x}", redline_trace_hash(&hidden[..x_bytes])),
+                "tmp_hash": format!("{:016x}", redline_trace_hash(&hidden[x_bytes..])),
+                "dn_hash": format!("{:016x}", redline_trace_hash(&dn)),
+                "kv_row_hash": format!(
+                    "{:016x}",
+                    redline_trace_kv_rows_hash(gpu, bundle, row_bytes, pos, pos + 1)?
+                ),
+                "gdn_frame_before": frame_before,
+                "gdn_frame_after": rdna_compute::norm::gdn_requant_frame_checkpoint(),
+                "retained_replays": replayed,
+                "graph_ready": graph_ready,
+                "step_us": step_us,
+            });
+            writeln!(steps_file, "{record}").map_err(io)?;
+            if dump_steps {
+                logits_file.write_all(&logits).map_err(io)?;
+                hidden_file.write_all(&hidden).map_err(io)?;
+            }
+            tokens.push(token);
+            if !fixed {
+                token = argmax as u32;
+            }
+        }
+        for file in [&mut logits_file, &mut hidden_file, &mut steps_file] {
+            file.flush().map_err(io)?;
+        }
+        let kv = redline_trace_kv_bytes(gpu, bundle)?;
+        redline_trace_dn_bytes(gpu, bundle, &mut dn)?;
+        if dump_final {
+            std::fs::write(dir.join("kv.bin"), &kv).map_err(io)?;
+            std::fs::write(dir.join("recurrent.bin"), &dn).map_err(io)?;
+        }
+        let refusal = if probe_refusal {
+            let pos = context + steps;
+            let counters = hipfire_engine::redline::G0HipCounters::now();
+            let observed_before = gpu.replay.replay_observation().count;
+            let frame_before = rdna_compute::norm::gdn_requant_frame_checkpoint();
+            let result = qwen35::forward_scratch(
+                gpu,
+                &bundle.weights,
+                &bundle.config,
+                token,
+                pos,
+                &mut bundle.kv_cache,
+                &mut bundle.dn_state,
+                &bundle.scratch,
+            );
+            gpu.hip.device_synchronize().map_err(hip)?;
+            let after = hipfire_engine::redline::G0HipCounters::now();
+            let replayed = gpu
+                .replay
+                .replay_observation()
+                .count
+                .saturating_sub(observed_before);
+            let kv_after = redline_trace_kv_bytes(gpu, bundle)?;
+            let mut dn_after = Vec::new();
+            redline_trace_dn_bytes(gpu, bundle, &mut dn_after)?;
+            Some(serde_json::json!({
+                "pos": pos,
+                "token": token,
+                "physical_cap": bundle.kv_cache.physical_cap,
+                "refused": result.is_err(),
+                "error": result.err().map(|error| error.to_string()),
+                "hip_launches": after.launch_kernel.saturating_sub(counters.launch_kernel),
+                "hip_memcpy_htod": after.memcpy_htod.saturating_sub(counters.memcpy_htod),
+                "hip_memcpy_dtod": after.memcpy_dtod.saturating_sub(counters.memcpy_dtod),
+                "hip_memset": after.memset.saturating_sub(counters.memset),
+                "retained_replays": replayed,
+                "kv_mapped_unchanged": kv_after == kv,
+                "recurrent_unchanged": dn_after == dn,
+                "gdn_frame_before": frame_before,
+                "gdn_frame_after": rdna_compute::norm::gdn_requant_frame_checkpoint(),
+                "route_state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+            }))
+        } else {
+            None
+        };
+        sequences.push(serde_json::json!({
+            "sequence": sequence,
+            "poison": poison,
+            "dir": dir.display().to_string(),
+            "primed_from": primed_from,
+            "tokens": tokens,
+            "retained_replays": replayed_total,
+            "graph_ready_steps": graph_ready_steps,
+            "kv_mapped_bytes": kv.len(),
+            "kv_mapped_hash": format!("{:016x}", redline_trace_hash(&kv)),
+            "kv_active_hash": format!(
+                "{:016x}",
+                redline_trace_kv_rows_hash(gpu, bundle, row_bytes, 0, end_pos)?
+            ),
+            "recurrent_bytes": dn.len(),
+            "recurrent_hash": format!("{:016x}", redline_trace_hash(&dn)),
+            "gdn_frame_end": rdna_compute::norm::gdn_requant_frame_checkpoint(),
+            "refusal": refusal,
+        }));
+    }
+    let capture = gpu.replay.capture_summary();
+    let observation = gpu.replay.replay_observation();
+    let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+        serde_json::json!({
+            "dispatches": identity.dispatch_count,
+            "packets": identity.packet_count,
+            "queue_id": identity.queue_id,
+            "command_dwords": identity.command_dwords,
+            "queues": identity.queue_count,
+            "phases": identity.phase_count,
+        })
+    });
+    Ok(serde_json::json!({
+        "type": "redline_greedy_trace",
+        "mode": if fixed { "fixed" } else { "greedy" },
+        "context_tokens": context,
+        "steps": steps,
+        "first_token": first_token,
+        "prompt_tokens_file": msg.get("prompt_tokens_file"),
+        "vocab": vocab,
+        "kv_row_bytes": row_bytes,
+        "kv_physical_cap": bundle.kv_cache.physical_cap,
+        "kv_fp8": bundle.kv_cache.quant_fp8,
+        "route": {
+            "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+            "transport": gpu.replay.transport_name(),
+            "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+            "fallback_reason": gpu.replay.fallback_reason(),
+            "prepared": prepared,
+            "sequence": {
+                "launches": capture.launch_count,
+                "unique_kernels": capture.unique_kernel_count,
+                "hash": format!("{:016x}", capture.sequence_hash),
+            },
+            "observed": {
+                "count": observation.count,
+                "first_position": observation.first_position,
+                "last_position": observation.last_position,
+                "failed": observation.failed,
+            },
+            "hip_graph_exec": gpu.graphs.graph_exec.is_some(),
+            "hip_graph_replay_enabled": gpu.graphs.ar_forward_replay_enabled,
+        },
+        "sequences": sequences,
+    }))
 }
 
 #[cfg(test)]

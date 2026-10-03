@@ -13,7 +13,8 @@ railgun-corpus = { path = "../railgun-corpus" }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 
-# GPU examples (`examples/g4_probe.rs`, `--features g4-probe`).
+# GPU examples (`examples/mc_g2.rs`, `--features mc-g2`; `examples/g4_probe.rs`,
+# `--features g4-probe`; `examples/boundary_bench.rs`, `--features boundary-bench`).
 [dev-dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
@@ -23,9 +24,21 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [features]
+# `examples/mc_g2.rs`: the MC G2 gate on a GPU (copies-only program).
+mc-g2 = []
 # `examples/g4_probe.rs`: the G4 cache-visibility silicon probe (design §5 G4).
 g4-probe = []
+# `examples/boundary_bench.rs`: the gfx11 PM4 boundary-cost microbenchmark.
+boundary-bench = []
 
 [[example]]
 name = "g4_probe"
 required-features = ["g4-probe"]
+
+[[example]]
+name = "mc_g2"
+required-features = ["mc-g2"]
+
+[[example]]
+name = "boundary_bench"
+required-features = ["boundary-bench"]

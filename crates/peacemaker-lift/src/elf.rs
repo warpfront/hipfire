@@ -671,8 +671,8 @@ pub(crate) mod fixtures {
     /// SHA-256 f876e2ce520ba8d97358b34c903a48dafc5cff2e4cc552d7ffc775361cbcb6bc.
     pub fn kt48_co() -> Vec<u8> { load("tests/fixtures/kt48/hipcc.co", 42_208) }
 
-    /// The F2 builder bundle, SHA-256 6a2dbe591a58680abbeef680be82a986dc0aee0beb2f46ef7cc74f4b3bfb9111.
-    pub fn f2_hxaco() -> Vec<u8> { load("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", 362_048) }
+    /// The F2 builder bundle, SHA-256 1efb0b8b16b510407446dae8dc4ec137955de27d818b424daeb84383c8191fa7.
+    pub fn f2_hxaco() -> Vec<u8> { load("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", 361_976) }
 }
 
 #[cfg(test)]

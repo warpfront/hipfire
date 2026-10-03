@@ -18,8 +18,8 @@ extern "C" __global__ void moe_down_combine_k8_batched_vec4(
     int M, int K_TOP
 ) {
     (void)K_TOP;
-    const int bid = blockIdx.y;
-    const int col = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    const int bid = blockIdx.x;
+    const int col = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
     if (col >= M) return;
 
     const long long token_base = (long long)bid * 8 * M;

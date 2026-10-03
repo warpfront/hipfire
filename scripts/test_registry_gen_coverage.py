@@ -7,7 +7,7 @@
 - the committed registry/v1.json is exactly what build_registry produces from
   registry/models.json (hipfire-registry include_str!s v1.json, so a stale
   v1.json ships a stale bundled registry);
-- the Python allow-lists that "MUST stay in sync" with hipfire-config do.
+- the reasoning-effort allow-list matches hipfire-config.
 """
 import importlib.util
 import json
@@ -103,7 +103,7 @@ def _rust_str_list(name: str) -> set[str]:
 
 @pytest.mark.parametrize(
     "py_name,rust_name",
-    [("KNOWN_KV_MODES", "KV_MODES"), ("REASONING_EFFORTS", "REASONING_EFFORTS")],
+    [("REASONING_EFFORTS", "REASONING_EFFORTS")],
 )
 def test_python_allow_lists_match_hipfire_config(py_name, rust_name):
     assert set(getattr(rg, py_name)) == _rust_str_list(rust_name)

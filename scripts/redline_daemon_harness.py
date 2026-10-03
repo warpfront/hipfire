@@ -10,6 +10,14 @@ separately, and asks the daemon to delimit/fingerprint exactly one HIP launch
 sequence for each phase. The optional DSpark / DFlash2 verify oracles
 additionally lower one isolated fixed-B verify body and compare ordinary HIP,
 captured HIP, and retained PM4 state without installing that route into serving.
+
+`--g0` runs the railgun recording-invariance gate (design §5 G0) instead: the
+same forward is run once eagerly with every launch observed (`is_recording()`
+false) and once under a replay recording, and the two launch sequences are
+compared kernel by kernel (geometry, LDS, exact kernarg bytes). Every
+difference must be attributed to a `byte_exact` decision of the
+`railgun-cert recording-inventory json` inventory, and no launch may bypass
+the recorder funnels in either arm.
 """
 
 import argparse
@@ -27,7 +35,9 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 class Daemon:
-    def __init__(self, binary: Path, log_path: Path, timeout_s: float, kv_mode: str):
+    def __init__(
+        self, binary: Path, log_path: Path, timeout_s: float, kv_mode: str, extra_env=None
+    ):
         self.timeout_s = timeout_s
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
@@ -40,6 +50,7 @@ class Daemon:
             HIPFIRE_AR_GRAPH="0",
             HIPFIRE_GRAPH="0",
         )
+        env.update(extra_env or {})
         self.proc = subprocess.Popen(
             [str(binary)],
             cwd=REPO,
@@ -414,6 +425,179 @@ def qwen4_recipe_failures(model):
     return failures
 
 
+def g0_rows(arm):
+    return arm.get("sequence") or []
+
+
+def g0_decisions_by_kernel(inventory):
+    by_kernel = {}
+    for decision in inventory.get("decisions") or []:
+        for kernel in decision.get("kernels") or []:
+            by_kernel.setdefault(kernel, []).append(decision)
+    return by_kernel
+
+
+# A same-kernel geometry/argument difference can only come from a decision
+# that changes launch shape; an inserted/removed/replaced kernel only from one
+# that changes kernel selection.
+G0_EFFECTS = {"shape": {"launch_shape"}, "sequence": {"kernel_selection"}}
+
+
+def g0_attribute(kernel, kind, by_kernel):
+    """Decisions that may cause a `kind` difference in `kernel` (exact symbol
+    or `prefix*` inventory rows)."""
+    found = list(by_kernel.get(kernel, []))
+    for pattern, decisions in by_kernel.items():
+        if pattern.endswith("*") and kernel.startswith(pattern[:-1]):
+            found.extend(decisions)
+    return [d for d in found if d.get("effect") in G0_EFFECTS[kind]]
+
+
+def g0_pre_program_launches(inventory, program):
+    """Declared pre-program launches of `program` (inventory
+    `pre_program_launches`): host-input launches issued outside the recorder
+    funnels before the program in every lowering. Empty without a program."""
+    if program is None:
+        return []
+    return [
+        launch for launch in inventory.get("pre_program_launches") or []
+        if program in (launch.get("programs") or [])
+    ]
+
+
+def g0_compare(observe, record, inventory, program=None):
+    """Compare one G0 observe arm with one record arm. Returns a verdict dict.
+
+    A difference passes only when every kernel involved is attributed to an
+    inventory decision and all attributed decisions are `byte_exact`; the
+    byte-exactness itself is then G2 arm 3's to confirm on silicon. An arm's
+    HIP launches outside the recorder funnels pass only when they equal the
+    `per_forward` sum of `program`'s declared pre-program launches.
+    """
+    import difflib
+
+    by_kernel = g0_decisions_by_kernel(inventory)
+    declared = g0_pre_program_launches(inventory, program)
+    allowed = sum(int(launch["per_forward"]) for launch in declared)
+    failures = []
+    outside = {}
+    for arm in (observe, record):
+        hip = arm.get("hip") or {}
+        extra = int(hip.get("launch_kernel", -1)) - int(arm.get("launches", -2))
+        outside[arm.get("arm")] = extra
+        if extra != allowed:
+            failures.append(
+                f"{arm.get('arm')}: {hip.get('launch_kernel')} HIP launches but "
+                f"{arm.get('launches')} reached the recorder funnels; {allowed} declared "
+                f"pre-program launch(es) for {program} (a launch bypassed them)"
+            )
+    for counter in ("memcpy_dtod", "memcpy_htod", "memset"):
+        a = (observe.get("hip") or {}).get(counter)
+        b = (record.get("hip") or {}).get(counter)
+        if a != b:
+            failures.append(f"{counter}: observe={a} record={b}")
+
+    obs, rec = g0_rows(observe), g0_rows(record)
+    matcher = difflib.SequenceMatcher(
+        a=[r["kernel"] for r in obs], b=[r["kernel"] for r in rec], autojunk=False
+    )
+    differences = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                fields = [
+                    f for f in ("grid", "block", "shared_mem", "kernarg_hex") if obs[i][f] != rec[j][f]
+                ]
+                if fields:
+                    differences.append(
+                        {"kind": "shape", "observe_index": i, "record_index": j,
+                         "kernels": [obs[i]["kernel"]], "fields": fields,
+                         "observe": {f: obs[i][f] for f in fields},
+                         "record": {f: rec[j][f] for f in fields}}
+                    )
+        else:
+            differences.append(
+                {"kind": "sequence", "op": tag, "observe": [i1, i2], "record": [j1, j2],
+                 "kernels": sorted({r["kernel"] for r in obs[i1:i2]} | {r["kernel"] for r in rec[j1:j2]})}
+            )
+    for diff in differences:
+        decisions = {}
+        for kernel in diff["kernels"]:
+            for decision in g0_attribute(kernel, diff["kind"], by_kernel):
+                decisions[decision["id"]] = decision["verdict"]
+        diff["decisions"] = decisions
+        unattributed = [k for k in diff["kernels"] if not g0_attribute(k, diff["kind"], by_kernel)]
+        if unattributed:
+            failures.append(f"unattributed {diff['kind']} difference in {unattributed}")
+        elif any(v != "byte_exact" for v in decisions.values()):
+            failures.append(
+                f"{diff['kind']} difference in {diff['kernels']} attributed to non-byte-exact "
+                f"decision(s) {sorted(k for k, v in decisions.items() if v != 'byte_exact')}"
+            )
+    identical = not differences
+    return {
+        "observe_launches": len(obs),
+        "record_launches": len(rec),
+        "identical": identical,
+        "differences": differences,
+        "program": program,
+        "pre_program_launches": {
+            "declared": [
+                {"id": launch["id"], "kernel": launch["kernel"], "per_forward": launch["per_forward"],
+                 "site": launch["site"]}
+                for launch in declared
+            ],
+            "outside_funnels": outside,
+        },
+        "failures": failures,
+        "pass": not failures,
+    }
+
+
+def run_g0(daemon, args, report):
+    inventory = json.loads(Path(args.inventory).read_text())
+    if inventory.get("schema") != "railgun-recording-inventory":
+        sys.exit(f"{args.inventory} is not a railgun-cert recording inventory")
+    if args.g0_program is not None and args.g0_program not in (inventory.get("programs") or {}):
+        sys.exit(f"--g0-program {args.g0_program} is not an inventory program")
+    report["g0"] = {"inventory": str(args.inventory), "program": args.g0_program, "contexts": {}}
+    ok = True
+    for context in args.g0_contexts:
+        if args.dflash_cycle:
+            def arm(name):
+                return daemon.request(
+                    {"type": "railgun_g0_dflash_cycle", "context_tokens": context, "g0": name}
+                )
+        else:
+            def arm(name):
+                return daemon.request(
+                    {"type": "bench_decode", "context_tokens": context, "iterations": 1, "g0": name}
+                )["g0"]
+        # First touch materialises lazy kernels/scratch; never compared.
+        arm("observe")
+        observe = arm("observe")
+        record = arm("record")
+        verdict = g0_compare(observe, record, inventory, args.g0_program)
+        if args.dflash_cycle and observe.get("window") != record.get("window"):
+            verdict["failures"].append(
+                f"acceptance windows differ: observe={observe.get('window')} record={record.get('window')}"
+            )
+            verdict["pass"] = False
+        report["g0"]["contexts"][str(context)] = {
+            "observe": observe, "record": record, "verdict": verdict,
+        }
+        ok = ok and verdict["pass"]
+        print(
+            f"g0 context={context}: observe={verdict['observe_launches']} "
+            f"record={verdict['record_launches']} identical={verdict['identical']} "
+            f"differences={len(verdict['differences'])} pass={verdict['pass']}",
+            flush=True,
+        )
+        for line in verdict["failures"]:
+            print(f"  FAIL {line}", flush=True)
+    report["pass"] = ok
+    return ok
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -432,7 +616,7 @@ def main():
     parser.add_argument("--decode-context", type=int, default=128)
     parser.add_argument(
         "--kv-mode",
-        choices=("q8", "fwht2", "fwht3", "fwht4", "bf16"),
+        choices=("q8", "fp8", "fwht2", "fwht3", "fwht4", "bf16"),
         help=(
             "KV layout used by capture, shadow replay, and the HIP oracle "
             "(default: q8; bf16 with --qwen4, whose KV is BF16 only)"
@@ -536,6 +720,38 @@ def main():
         help="draft sidecar path (required by --dspark-verify-shadow / --dflash-verify-shadow)",
     )
     parser.add_argument(
+        "--g0",
+        action="store_true",
+        help=(
+            "railgun G0 recording-invariance gate: compare an observed eager "
+            "forward with a recorded one at every --g0-contexts value"
+        ),
+    )
+    parser.add_argument(
+        "--g0-contexts",
+        type=int,
+        nargs="+",
+        default=[128, 2048, 4097, 8193],
+        help="positions for --g0 (default spans the 2048/4096/8192 host thresholds)",
+    )
+    parser.add_argument(
+        "--dflash-cycle",
+        action="store_true",
+        help="with --g0: one DFlash acceptance window (draft+verify+commit) instead of plain-AR decode",
+    )
+    parser.add_argument(
+        "--inventory",
+        help="railgun-cert recording-inventory json output (required by --g0)",
+    )
+    parser.add_argument(
+        "--g0-program",
+        help=(
+            "inventory program under test (e.g. h2_gfx1201); its declared pre-program "
+            "launches are the only HIP launches allowed outside the recorder funnels. "
+            "Omitted: none are allowed"
+        ),
+    )
+    parser.add_argument(
         "--verify-batch",
         type=int,
         default=3,
@@ -560,6 +776,14 @@ def main():
         sys.exit("--dflash-verify-shadow requires an existing --draft sidecar")
     if args.dspark_verify_shadow and args.dflash_verify_shadow:
         sys.exit("choose one of --dspark-verify-shadow or --dflash-verify-shadow")
+    if args.g0 and (args.dspark_verify_shadow or args.dflash_verify_shadow):
+        sys.exit("--g0 is its own mode; use --g0 --dflash-cycle for the DFlash cycle")
+    if args.g0 and not args.inventory:
+        sys.exit("--g0 requires --inventory (railgun-cert recording-inventory json > FILE)")
+    if args.dflash_cycle and not args.g0:
+        sys.exit("--dflash-cycle is a --g0 option")
+    if args.dflash_cycle and (draft is None or not draft.is_file()):
+        sys.exit("--g0 --dflash-cycle requires an existing --draft sidecar")
     if args.dspark_verify_shadow:
         discovered_draft = model.with_name(f"{model.stem}-dspark{model.suffix}").resolve()
         if draft != discovered_draft:
@@ -586,12 +810,15 @@ def main():
         "prefill": {},
         "decode": {},
     }
-    daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode)
+    # G0 DFlash: the verify HipGraph's launches never reach the recorder
+    # funnels, so both arms run the direct verify body.
+    extra_env = {"HIPFIRE_VERIFY_GRAPH": "0"} if args.dflash_cycle else None
+    daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode, extra_env)
     try:
         load_params = {
             "max_seq": args.max_seq,
             "kv_mode": args.kv_mode,
-            "dflash_mode": "on" if args.dflash_verify_shadow else "off",
+            "dflash_mode": "on" if (args.dflash_verify_shadow or args.dflash_cycle) else "off",
             "dspark_mode": "on" if args.dspark_verify_shadow else "off",
             "mtp_mode": "off",
             "ngram_draft": False,
@@ -603,7 +830,7 @@ def main():
         load_body = {
             **load_params,
             **({"state_quant": args.state_quant} if args.state_quant else {}),
-            **({"draft": str(draft)} if args.dflash_verify_shadow else {}),
+            **({"draft": str(draft)} if (args.dflash_verify_shadow or args.dflash_cycle) else {}),
         }
         loaded = daemon.request(
             {
@@ -621,6 +848,15 @@ def main():
             flush=True,
         )
 
+        if args.g0:
+            run_g0(daemon, args, report)
+            output = Path(args.out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n")
+            print(f"report={output} pass={report['pass']}", flush=True)
+            if not report["pass"]:
+                raise SystemExit("g0 failed; see the report")
+            return
         if args.dflash_verify_shadow:
             shadow = daemon.request(
                 {

@@ -243,6 +243,7 @@ fn lfm_dense_is_dense_and_route_is_lfm_ar() {
     assert!(!moe.is_dense());
     // Route selection is pure and state-independent.
     let base = hipfire_generate::ar::GenerationRouteInputs {
+        dense_tp: false,
         arch_id: 11,
         ep: false,
         pp: 1,

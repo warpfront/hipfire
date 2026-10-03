@@ -4,12 +4,13 @@
 //! `Ledger` plus EXEC/VCC/SCC/M0 capabilities; it reconciles pending counters
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
-pub mod author; pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco; pub mod profile;
-pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod iu4_v2b; pub mod fp8_gemm; pub mod gdn_scan; pub mod qwen4_moe_sym; }
+pub mod author; pub mod arch; pub mod reg; pub mod plan; pub mod ledger; pub mod hazard; pub mod vopd; pub mod lds; pub mod insn; pub mod emit; pub mod aco; pub mod profile; pub mod native;
+pub mod kernels { pub mod common; pub mod iu4_fold; pub mod bf16; pub mod iu4_k1; pub mod iu4_gemm; pub mod iu4_v2c; pub mod iu4_v2b; pub mod fp8_gemm; pub mod gdn_scan; pub mod qwen4_moe_sym; pub mod gemm_uk; #[path = "qsa_gather.rip.rs"] pub mod qsa_gather; }
 #[cfg(feature="toolchain")] pub mod toolchain;
 #[cfg(feature="toolchain")] pub mod ledger_replay;
 #[cfg(feature="toolchain")] pub mod audit;
 #[cfg(feature="toolchain")] pub mod pm_check;
+#[cfg(feature="toolchain")] pub mod cost_lint;
 pub use arch::Arch;
 pub use reg::{RegPlan,V,S};
 pub use plan::{KernelSpec,KernargLayout,Emitted,BuilderProof,IsaShape,MemoryScope};

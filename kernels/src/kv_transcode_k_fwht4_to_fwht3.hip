@@ -41,7 +41,9 @@
 // scratch; do NOT alias). dst stride (fwht3, 100B@256) < src stride (fwht4,
 // 132B@256).
 //
-// Grid: [n_kv_heads, n_positions]. Block: [32]. LDS: (head_dim + 32) * 4 bytes
+// Grid: [n_kv_heads * n_positions, 1, 1] (y folded into x: HIP grid.y caps at
+// 65535, full context reaches 262144). blockIdx.x = pos * n_kv_heads + h.
+// Block: [32]. LDS: (head_dim + 32) * 4 bytes
 // (head_dim floats hold the normal-space K between the inverse and forward
 // passes; the +32 tail is the norm-reduce scratch).
 #include <hip/hip_runtime.h>
@@ -54,9 +56,10 @@ extern "C" __global__ void kv_transcode_k_fwht4_to_fwht3(
     const float* __restrict__ signs2,
     int n_kv_heads, int head_dim, int n_positions
 ) {
-    const int h = blockIdx.x;
-    if (h >= n_kv_heads) return;
-    const int pos = blockIdx.y;
+    if (n_kv_heads <= 0) return;
+    const unsigned int fold = blockIdx.x;
+    const int h = (int)(fold % (unsigned int)n_kv_heads);
+    const int pos = (int)(fold / (unsigned int)n_kv_heads);
     if (pos >= n_positions) return;
     const int tid = threadIdx.x;
 

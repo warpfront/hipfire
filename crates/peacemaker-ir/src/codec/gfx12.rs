@@ -46,6 +46,9 @@ fn select(code: u32, width: u8, scalar_dest: bool, literal: Option<u32>) -> Resu
         126 => Operand::Special(Special::ExecLo), 127 => Operand::Special(Special::ExecHi),
         128..=192 => Operand::Inline(InlineConst::Integer((code - 128) as i8)),
         193..=208 => Operand::Inline(InlineConst::Integer((192 - code as i32) as i8)),
+        // Aperture sources (RDNA3/RDNA4 SSRC encodings).
+        235 => Operand::Special(Special::SrcSharedBase), 236 => Operand::Special(Special::SrcSharedLimit),
+        237 => Operand::Special(Special::SrcPrivateBase), 238 => Operand::Special(Special::SrcPrivateLimit),
         240..=247 => Operand::Inline(InlineConst::FloatBits(match code {
             240 => 0x3f000000, 241 => 0xbf000000, 242 => 0x3f800000, 243 => 0xbf800000,
             244 => 0x40000000, 245 => 0xc0000000, 246 => 0x40800000, _ => 0xc0800000,
@@ -65,6 +68,8 @@ fn selector(operand: &Operand, width: u8) -> Result<u32, DecodeError> {
             Special::VccLo | Special::Vcc => 106, Special::VccHi => 107,
             Special::Ttmp(n) => u32::from(*n) + 108, Special::M0 => 125, Special::Null => 124,
             Special::ExecLo | Special::Exec => 126, Special::ExecHi => 127,
+            Special::SrcSharedBase => 235, Special::SrcSharedLimit => 236,
+            Special::SrcPrivateBase => 237, Special::SrcPrivateLimit => 238,
             _ => return Err(reject(format!("unencodable special register {s:?}"))),
         }),
         Operand::Inline(InlineConst::Integer(n)) if (0..=64).contains(n) => Ok((*n as u32) + 128),
@@ -137,7 +142,9 @@ fn operand(arch: Arch, name: &str, bits: u16, code: u32, literal: Option<u32>, r
     if bits == 16 {
         if let Operand::Reg(r) = &src {
             if r.kind == Kind::V {
-                return Ok(Operand::Half(*r, if field_value(arch, "OPSEL", row, words) & 1 != 0 { Half::Hi } else { Half::Lo }));
+                // OPSEL bit n selects the half of source n (SRC0 bit 0, SRC1 bit 1, SRC2 bit 2).
+                let bit = match name { "SRC1" => 2, "SRC2" => 4, _ => 1 };
+                return Ok(Operand::Half(*r, if field_value(arch, "OPSEL", row, words) & bit != 0 { Half::Hi } else { Half::Lo }));
             }
         }
     }
@@ -183,7 +190,7 @@ fn width(arch: Arch, row: &OpRow, words: &[u32]) -> Result<usize, DecodeError> {
             row.slots(false).any(|(name, _)| {
                 let source = name.starts_with("SRC") || name.starts_with("SSRC");
                 source && forms::field_for(arch, row.form, name).is_some_and(|f| value(Some(f), words) == 255)
-            }) || row.grammar.contains("literal@last") && matches!(row.name, "s_fmamk_f32" | "v_fmaak_f32" | "v_fmamk_f32" | "v_dual_fmaak_f32" | "v_dual_fmamk_f32")
+            }) || row.grammar.contains("literal@last") && matches!(row.name, "s_fmaak_f32" | "s_fmamk_f32" | "v_fmaak_f32" | "v_fmamk_f32" | "v_dual_fmaak_f32" | "v_dual_fmamk_f32")
                 || row.form == Form::Vopd && (
                     forms::field_for(arch, row.form, "SRCY0").is_some_and(|f| value(Some(f),words)==255)
                     || isa::table(arch).iter().any(|y| y.form==Form::Vopd && y.op.id==((words[0]>>17)&31) as u16
@@ -404,8 +411,12 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
                     2 => operands.push(Operand::Scope(CacheScope::Dev)),
                     _ => operands.push(Operand::Scope(CacheScope::Sys)),
                 }
-            } else if row.name=="global_inv" && field_value(arch, "SCOPE", row, words)==1 {
-                operands.push(Operand::Scope(CacheScope::Se));
+            } else if row.name=="global_inv" {
+                match field_value(arch, "SCOPE", row, words) {
+                    0 => {}, 1 => operands.push(Operand::Scope(CacheScope::Se)),
+                    2 => operands.push(Operand::Scope(CacheScope::Dev)),
+                    _ => operands.push(Operand::Scope(CacheScope::Sys)),
+                }
             }
         }
         let field = forms::field_for(arch, row.form, "IOFFSET").expect("VMEM IOFFSET");
@@ -576,8 +587,8 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
                     encode_field(arch, "SCOPE", row, &mut words, match scope { CacheScope::Cu=>0,CacheScope::Se=>1,CacheScope::Dev=>2,CacheScope::Sys=>3 })?,
                 Operand::CacheTh(th) if row.form==Form::Vmem(crate::inst::VmemForm::Buffer) =>
                     encode_field(arch, "TH", row, &mut words, u32::from(*th))?,
-                Operand::Scope(CacheScope::Se) if row.name=="global_inv" =>
-                    encode_field(arch, "SCOPE", row, &mut words, 1)?,
+                Operand::Scope(scope) if row.name=="global_inv" =>
+                    encode_field(arch, "SCOPE", row, &mut words, match scope { CacheScope::Cu=>0,CacheScope::Se=>1,CacheScope::Dev=>2,CacheScope::Sys=>3 })?,
                 _ => return Err(reject("invalid VMEM modifier operand")),
             }
         }
@@ -687,6 +698,119 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// One pinned word per row added for the gfx1201/gfx11 JIT caches at
+    /// fe77c0837 (`llvm-mc --disassemble`, AMD LLVM 23.0.0git, in the comment).
+    /// Each must decode to the LLVM mnemonic and re-encode byte-exact; gfx11
+    /// rows also hold on gfx1151, which inherits the gfx1100 table.
+    const JIT_CACHE_ROWS: &[(Arch, &str, &[u32])] = &[
+        (Arch::Gfx1201, "ds_add_rtn_u32", &[0xd880_0000, 0x0100_0701]), // ds_add_rtn_u32 v1, v1, v7
+        (Arch::Gfx1201, "ds_add_u32", &[0xd800_0000, 0x0000_0407]), // ds_add_u32 v7, v4
+        (Arch::Gfx1201, "ds_load_2addr_b64", &[0xd9dc_0100, 0x0000_0037]), // ds_load_2addr_b64 v[0:3], v55 offset1:1
+        (Arch::Gfx1201, "ds_load_b96", &[0xdbf8_0512, 0x2200_0025]), // ds_load_b96 v[34:36], v37 offset:1298
+        (Arch::Gfx1201, "ds_load_u16_d16_hi", &[0xda9c_0088, 0x0800_002a]), // ds_load_u16_d16_hi v8, v42 offset:136
+        (Arch::Gfx1201, "ds_or_b32", &[0xd828_0000, 0x0000_0100]), // ds_or_b32 v0, v1
+        (Arch::Gfx1201, "flat_load_b128", &[0xec05_c07c, 0x0000_0001, 0x0000_1003]), // flat_load_b128 v[1:4], v[3:4] offset:16
+        (Arch::Gfx1201, "flat_load_b32", &[0xec05_007c, 0x0000_0001, 0x0000_0006]), // flat_load_b32 v1, v[6:7]
+        (Arch::Gfx1201, "flat_load_b64", &[0xec05_407c, 0x0000_0020, 0x0000_0009]), // flat_load_b64 v[32:33], v[9:10]
+        (Arch::Gfx1201, "flat_load_d16_b16", &[0xec08_007c, 0x0000_0001, 0x0000_0407]), // flat_load_d16_b16 v1, v[7:8] offset:4
+        (Arch::Gfx1201, "flat_load_d16_hi_b16", &[0xec08_c07c, 0x0000_0001, 0x0000_0407]), // flat_load_d16_hi_b16 v1, v[7:8] offset:4
+        (Arch::Gfx1201, "flat_store_b128", &[0xec07_407c, 0x0100_0000, 0x0000_1018]), // flat_store_b128 v[24:25], v[2:5] offset:16
+        (Arch::Gfx1201, "flat_store_b32", &[0xec06_807c, 0x0100_0000, 0x0000_0000]), // flat_store_b32 v[0:1], v2
+        (Arch::Gfx1201, "global_atomic_add_u32", &[0xee0d_4004, 0x0198_0002, 0x0000_0002]), // global_atomic_add_u32 v2, v2, v3, s[4:5] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+        (Arch::Gfx1201, "global_load_d16_hi_b16", &[0xee08_c07c, 0x0000_0000, 0x0000_0006]), // global_load_d16_hi_b16 v0, v[6:7], off
+        (Arch::Gfx1201, "s_bcnt1_i32_b32", &[0xbe80_1805]), // s_bcnt1_i32_b32 s0, s5
+        (Arch::Gfx1201, "s_bfe_i32", &[0x9380_ff75, 0x0001_001d]), // s_bfe_i32 s0, ttmp9, 0x1001d
+        (Arch::Gfx1201, "s_bitcmp0_b32", &[0xbf0c_8018]), // s_bitcmp0_b32 s24, 0
+        (Arch::Gfx1201, "s_cmp_nge_f32", &[0xbf49_8000]), // s_cmp_nge_f32 s0, 0
+        (Arch::Gfx1201, "s_cvt_f32_f16", &[0xbe90_6903]), // s_cvt_f32_f16 s16, s3
+        (Arch::Gfx1201, "s_cvt_hi_f32_f16", &[0xbe80_6a00]), // s_cvt_hi_f32_f16 s0, s0
+        (Arch::Gfx1201, "s_fmaak_f32", &[0xa283_0503, 0x3586_37bd]), // s_fmaak_f32 s3, s3, s5, 0x358637bd
+        (Arch::Gfx1201, "s_load_u16", &[0xf401_6b4f, 0xf800_0000]), // s_load_u16 s45, s[30:31], 0x0
+        (Arch::Gfx1201, "s_pack_lh_b32_b16", &[0x9980_2780]), // s_pack_lh_b32_b16 s0, 0, s39
+        (Arch::Gfx1201, "v_add_nc_u32_dpp", &[0x4a00_0afa, 0xff09_6205]), // v_add_nc_u32_dpp v0, v5, v5 row_xmask:2 row_mask:0xf bank_mask:0xf bound_ctrl:1
+        (Arch::Gfx1201, "v_cmp_eq_u64_e32", &[0x7cb4_0e80]), // v_cmp_eq_u64_e32 vcc_lo, 0, v[7:8]
+        (Arch::Gfx1201, "v_cmp_eq_u64_e64", &[0xd45a_0000, 0x0202_3480]), // v_cmp_eq_u64_e64 s0, 0, v[26:27]
+        (Arch::Gfx1201, "v_cmp_lt_i64_e32", &[0x7ca2_104a]), // v_cmp_lt_i64_e32 vcc_lo, s[74:75], v[8:9]
+        (Arch::Gfx1201, "v_cmp_ne_u64_e64", &[0xd45d_0001, 0x0202_1280]), // v_cmp_ne_u64_e64 s1, 0, v[9:10]
+        (Arch::Gfx1201, "v_cmp_neq_f16_e64", &[0xd40d_0000, 0x0202_1680]), // v_cmp_neq_f16_e64 s0, 0, v11.l
+        (Arch::Gfx1201, "v_cmp_nge_f32_e64", &[0xd419_0000, 0x0202_32ff, 0x7b80_0000]), // v_cmp_nge_f32_e64 s0, 0x7b800000, v25
+        (Arch::Gfx1201, "v_cmp_nle_f32_e32", &[0x7c38_32ff, 0x2680_0000]), // v_cmp_nle_f32_e32 vcc_lo, 0x26800000, v25
+        (Arch::Gfx1201, "v_cmp_nle_f32_e64", &[0xd41c_0002, 0x0202_22ff, 0x0d80_0000]), // v_cmp_nle_f32_e64 s2, 0xd800000, v17
+        (Arch::Gfx1201, "v_cmpx_eq_f32_e32", &[0x7d24_0d04]), // v_cmpx_eq_f32_e32 v4, v6
+        (Arch::Gfx1201, "v_cmpx_eq_u16_e32", &[0x7d74_1281]), // v_cmpx_eq_u16_e32 1, v9.l
+        (Arch::Gfx1201, "v_cmpx_eq_u32_e64", &[0xd4ca_007e, 0x0202_1204]), // v_cmpx_eq_u32_e64 s4, v9
+        (Arch::Gfx1201, "v_cmpx_gt_i64_e64", &[0xd4d4_007e, 0x0202_0610]), // v_cmpx_gt_i64_e64 s[16:17], v[3:4]
+        (Arch::Gfx1201, "v_cmpx_le_f32_e32", &[0x7d26_0880]), // v_cmpx_le_f32_e32 0, v4
+        (Arch::Gfx1201, "v_cmpx_lt_u32_e32", &[0x7d92_0087]), // v_cmpx_lt_u32_e32 7, v0
+        (Arch::Gfx1201, "v_cmpx_ne_u16_e32", &[0x7d7a_0280]), // v_cmpx_ne_u16_e32 0, v1.l
+        (Arch::Gfx1201, "v_cmpx_ngt_f32_e32", &[0x7d36_0104]), // v_cmpx_ngt_f32_e32 v4, v0
+        (Arch::Gfx1201, "v_cmpx_nlg_f32_e32", &[0x7d34_02ff, 0xff80_0000]), // v_cmpx_nlg_f32_e32 0xff800000, v1
+        (Arch::Gfx1201, "v_cvt_f32_ubyte1_e32", &[0x7e4c_251d]), // v_cvt_f32_ubyte1_e32 v38, v29
+        (Arch::Gfx1201, "v_cvt_f32_ubyte2_e32", &[0x7e4e_271d]), // v_cvt_f32_ubyte2_e32 v39, v29
+        (Arch::Gfx1201, "v_cvt_f32_ubyte3_e32", &[0x7e14_290a]), // v_cvt_f32_ubyte3_e32 v10, v10
+        (Arch::Gfx1201, "v_cvt_f64_i32_e32", &[0x7e08_0904]), // v_cvt_f64_i32_e32 v[4:5], v4
+        (Arch::Gfx1201, "v_cvt_f64_u32_e32", &[0x7e08_2d05]), // v_cvt_f64_u32_e32 v[4:5], v5
+        (Arch::Gfx1201, "v_cvt_i32_f64_e32", &[0x7e08_0704]), // v_cvt_i32_f64_e32 v4, v[4:5]
+        (Arch::Gfx1201, "v_dual_min_num_f32", &[0xcad4_0f06, 0x0606_0f08]), // v_dual_min_num_f32 v6, v6, v7 :: v_dual_max_num_f32 v7, v8, v7
+        (Arch::Gfx1201, "v_fmac_f16_e64", &[0xd536_4080, 0x0202_ff80]), // v_fmac_f16_e64 v128.h, v128.l, v127.l op_sel:[0,0,0,1]
+        (Arch::Gfx1201, "v_lshlrev_b16", &[0xd738_0000, 0x0202_0088]), // v_lshlrev_b16 v0.l, 8, v0.l
+        (Arch::Gfx1201, "v_maximumminimum_f32", &[0xd66d_001c, 0x03fc_1122, 0x4300_0000]), // v_maximumminimum_f32 v28, v34, s8, 0x43000000
+        (Arch::Gfx1201, "v_maxmin_num_f32", &[0xd669_0001, 0x03fc_0b01, 0x42fe_0000]), // v_maxmin_num_f32 v1, v1, s5, 0x42fe0000
+        (Arch::Gfx1201, "v_min3_i32", &[0xd61a_0001, 0x0404_1208]), // v_min3_i32 v1, s8, s9, v1
+        (Arch::Gfx1201, "v_min3_num_f32", &[0xd629_0006, 0x0432_1706]), // v_min3_num_f32 v6, v6, v11, v12
+        (Arch::Gfx1201, "v_min_i32_dpp", &[0x2208_08fa, 0xff09_6104]), // v_min_i32_dpp v4, v4, v4 row_xmask:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+        (Arch::Gfx1201, "v_min_num_f32_e32", &[0x2a10_0905]), // v_min_num_f32_e32 v8, v5, v4
+        (Arch::Gfx1201, "v_min_num_f64_e32", &[0x1a08_0908]), // v_min_num_f64_e32 v[4:5], v[8:9], v[4:5]
+        (Arch::Gfx1201, "v_minimum3_f32", &[0xd62d_024a, 0x0532_754b]), // v_minimum3_f32 v74, v75, |v58|, v76
+        (Arch::Gfx1201, "v_minimum_f32", &[0xd765_024a, 0x0202_814a]), // v_minimum_f32 v74, v74, |v64|
+        (Arch::Gfx1201, "v_or_b16", &[0xd763_0003, 0x0202_0706]), // v_or_b16 v3.l, v6.l, v3.l
+        (Arch::Gfx1201, "v_or_b32_dpp", &[0x3802_02fa, 0xff09_0101]), // v_or_b32_dpp v1, v1, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+        (Arch::Gfx1201, "v_xad_u32", &[0xd645_0005, 0x0005_8300]), // v_xad_u32 v5, v0, -1, s1
+        (Arch::Gfx1100, "scratch_load_d16_b16", &[0xdc81_0000, 0x04fc_0002]), // scratch_load_d16_b16 v4, v2, off
+        (Arch::Gfx1100, "v_cmpx_eq_f32_e32", &[0x7d24_84ff, 0xff80_0000]), // v_cmpx_eq_f32_e32 0xff800000, v66
+        (Arch::Gfx1100, "v_cvt_f16_u16_e64", &[0xd5d0_0095, 0x0201_0195]), // v_cvt_f16_u16_e64 v149.l, v149.l
+        (Arch::Gfx1100, "v_fmac_f16_e64", &[0xd536_4086, 0x0202_d586]), // v_fmac_f16_e64 v134.h, v134.l, v106.l op_sel:[0,0,0,1]
+        (Arch::Gfx1100, "v_min3_i32", &[0xd61a_0001, 0x0404_0a04]), // v_min3_i32 v1, s4, s5, v1
+        (Arch::Gfx1201, "global_load_b32", &[0xee05_007c, 0x0008_000d, 0x0000_1c0d]), // global_load_b32 v13, v[13:14], off offset:28 scope:SCOPE_DEV
+        (Arch::Gfx1201, "global_inv", &[0xee0a_c07c, 0x0008_0000, 0x0000_0000]), // global_inv scope:SCOPE_DEV
+        (Arch::Gfx1201, "s_mov_b64", &[0xbe82_01eb]), // s_mov_b64 s[2:3], src_shared_base
+    ];
+
+    #[test]
+    fn jit_cache_rows_decode_to_llvm_mnemonic_and_reencode_exactly() {
+        let mut failures = Vec::new();
+        for &(arch, name, words) in JIT_CACHE_ROWS {
+            let arches: &[Arch] = if arch == Arch::Gfx1100 { &[Arch::Gfx1100, Arch::Gfx1151] } else { &[arch] };
+            for &arch in arches {
+                let result = decode_for(arch, words).and_then(|(inst, len)| {
+                    if len != words.len() { return Err(reject(format!("width {len} != {}", words.len()))); }
+                    // FLAT/GLOBAL/BUFFER and e32/DPP share opcode ids; the form disambiguates.
+                    let decoded = isa::lookup(arch, inst.op, inst.form).map_or("?", |row| row.name);
+                    if decoded != name { return Err(reject(format!("decoded as {decoded}"))); }
+                    let bytes = encode_for(arch, &inst)?;
+                    if &bytes[..] != words { return Err(reject(format!("re-encoded {bytes:08x?}"))); }
+                    Ok(())
+                });
+                if let Err(error) = result { failures.push(format!("{arch:?} {name}: {error}")); }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn flat_aperture_and_scoped_invalidate_are_typed() {
+        let (flat, _) = decode(&[0xec05_007c, 0x0000_0001, 0x0000_0006]).unwrap();
+        let counters = &flat.effects.mem.as_ref().expect("flat load is a memory op").counters;
+        assert!(counters.contains(Counter::Load) && counters.contains(Counter::Ds));
+        let (mov, _) = decode(&[0xbe82_01eb]).unwrap();
+        assert_eq!(mov.operands.last(), Some(&Operand::Special(Special::SrcSharedBase)));
+        let (inv, _) = decode(&[0xee0a_c07c, 0x0008_0000, 0x0000_0000]).unwrap();
+        assert_eq!(inv.operands.last(), Some(&Operand::Scope(CacheScope::Dev)));
+        let (atomic, _) = decode(&[0xee0d_4004, 0x0198_0002, 0x0000_0002]).unwrap();
+        assert!(atomic.effects.mem.as_ref().unwrap().counters.contains(Counter::Load));
+        assert_eq!(atomic.mods.cpol.th & 1, 1);
     }
 
     #[test]

@@ -116,6 +116,9 @@ KNOWN_KV_MODES = {
     "turbo2",
     # Qwen4 (Flash-Next) QSA fp8 K/V; exact-gfx1201 sites only.
     "fp8",
+    # Gemma4 lowered full-tier opt-out back to Givens asym3 (on Qwen it names
+    # the same legacy K as `--kv-k legacy-asym3`); mirrors hipfire-config.
+    "legacy-asym3",
 }
 KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
 

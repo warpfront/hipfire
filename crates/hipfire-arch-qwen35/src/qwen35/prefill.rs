@@ -647,7 +647,6 @@ fn native_mq4_widened_flags_admitted(
         && flags.mmq_min_batch.is_none()
         && !screen
         && !flags.qkvza_split_tail
-        && !flags.mw16
         && flags.wo_wmma_variant.is_none()
 }
 
@@ -8201,7 +8200,6 @@ mod tests {
         let mut f = make(); f.mmq_override = Some(false); variants.push(f);
         let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
         let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
-        let mut f = make(); f.mw16 = true; variants.push(f);
         let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
         // Packed FFN shares the budgeted MMQ slot and keeps native tails.
         let mut packed = make();

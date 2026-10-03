@@ -797,6 +797,9 @@ pub fn execute_validated_steps<'a>(
     // The hyper write at this index takes its gates from its paired read
     // (`HIPFIRE_QWEN4_HC_FUSE` >= 1, see `paired_hyper_write`).
     let mut pregated: Option<usize> = None;
+    // The hyper read at this index had its norm + paired-write gates produced
+    // by the preceding MoE call's HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`).
+    let mut prenormed: Option<usize> = None;
     let hc_level = if cpu_exec::cpu_exec_enabled() {
         0
     } else {
@@ -811,8 +814,8 @@ pub fn execute_validated_steps<'a>(
         if hc_fuse {
             use crate::pipeline::layer_ops::{
                 execute_gated_delta_net_hc, execute_hyper_read_paired,
-                execute_hyper_write_pregated, execute_indexed_attention_hc,
-                hyper_read_pairs_write,
+                execute_hyper_read_prenormed, execute_hyper_write_pregated,
+                execute_indexed_attention_hc, hyper_read_pairs_write,
             };
             match &steps[i] {
                 Step::HyperWrite(write) if pregated == Some(i) => {
@@ -824,7 +827,11 @@ pub fn execute_validated_steps<'a>(
                 Step::HyperRead(read) => {
                     if let Some((j, write)) = paired_hyper_write(steps, i + 1, read) {
                         if hyper_read_pairs_write(gpu, read, write) {
-                            if execute_hyper_read_paired(gpu, read, write)? {
+                            if prenormed == Some(i) {
+                                prenormed = None;
+                                execute_hyper_read_prenormed(gpu, read, write)?;
+                                pregated = Some(j);
+                            } else if execute_hyper_read_paired(gpu, read, write)? {
                                 pregated = Some(j);
                             }
                             gpu.scratch.prerotated = None;
@@ -878,14 +885,39 @@ pub fn execute_validated_steps<'a>(
                     }
                     _ => None,
                 };
+                // Row fold lookahead: the HyperRead of the same streams right
+                // after the write, with its own paired write (the same pairing
+                // the read itself will take), on the F16 WMMA read route.
+                let next = match (write, steps.get(i + 3)) {
+                    (Some(write), Some(Step::HyperRead(read)))
+                        if gpu.flags.qwen4_hc_row_fold_enabled()
+                            && read.input.buf.as_ptr() == write.output.buf.as_ptr()
+                            && read.rows == write.rows =>
+                    {
+                        paired_hyper_write(steps, i + 4, read).filter(|(_, next_write)| {
+                            crate::pipeline::layer_ops::hyper_read_prenorm_applies(
+                                gpu, read, next_write,
+                            )
+                        })
+                        .map(|(j, next_write)| (j, read, next_write))
+                    }
+                    _ => None,
+                };
                 gpu.scratch.prerotated = None;
-                let folded = crate::pipeline::sealed_moe::execute_sealed_after_clear(
-                    gpu, call, clear, write,
+                let done = crate::pipeline::sealed_moe::execute_sealed_after_clear(
+                    gpu,
+                    call,
+                    clear,
+                    write,
+                    next.map(|(_, read, next_write)| (read, next_write)),
                 )?;
-                if folded {
+                if done.folded {
                     pregated = None;
                 }
-                i += 2 + usize::from(folded);
+                if done.row_folded {
+                    prenormed = Some(i + 3);
+                }
+                i += 2 + usize::from(done.folded);
                 continue;
             }
         }

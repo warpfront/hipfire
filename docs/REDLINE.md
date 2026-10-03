@@ -465,6 +465,120 @@ Section 7 ledger. The diagnostic commands above still do **not** emit that full
 ledger; use the product bench (or the Golden wrapper around it) for certification
 evidence.
 
+### Recording-invariance diagnostic (railgun G0)
+
+A tape records the kernels chosen while `is_recording()` is true; an ordinary
+forward runs the eager branch of every recording-dependent predicate. The
+inventory of those predicates is `railgun-cert recording-inventory
+markdown|json` (`crates/railgun-cert/src/recording.rs`); its source scan fails
+`cargo test -p railgun-cert` when a new `is_recording()`/`capture_mode`-style
+check has no inventory row. The G0 gate runs one forward both ways in the same
+process and compares the launch sequences:
+
+- `bench_decode` with `"g0": "observe" | "record"` (`iterations == 1`):
+  `observe` brackets the token with `ReplayController::begin_g0_observation`
+  (every funnel launch is copied, `is_recording()` stays false), `record`
+  with a manual capture. The response's `g0` object carries the sequence
+  (kernel, grid, block, shared memory, exact kernarg bytes) and the HIP
+  launch/copy counter deltas, so a launch that bypasses the funnels is
+  visible in either arm. DeepSeek4 supports the same field.
+- `railgun_g0_dflash_cycle` with `g0` and `context_tokens`: one served DFlash
+  acceptance window (`Speculator::step`: draft + verify + commit) after a
+  synthetic prefill. Requires `HIPFIRE_VERIFY_GRAPH=0` and refuses
+  `HIPFIRE_DFLASH_VERIFY_PM4=1`.
+
+```bash
+cargo run --release -p railgun-cert -- recording-inventory json > .redline-work/g0/inventory.json
+HIPFIRE_REPLAY_BACKEND=shadow HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
+python3 scripts/redline_daemon_harness.py --model "$MODEL" --max-seq 16384 \
+  --g0 --g0-program h2_gfx1201 --inventory .redline-work/g0/inventory.json \
+  --out .redline-work/g0/decode.json
+```
+
+Add `--dflash-cycle --draft "$DRAFT"` for the DFlash cycle. A difference passes
+only when every kernel involved is attributed to a `byte_exact` inventory
+decision of the matching effect; G0 is diagnostic evidence, and G2 arm 3
+remains the byte-exactness proof. Both `bench_decode` arms prime from GDN
+requant frame 0, so the `gated_delta_net_*` frame word is the same forward's.
+
+HIP launches outside the recorder funnels (HIP launch counter minus funnel
+launches) fail the arm unless they equal the program's declared pre-program
+launches (`--g0-program`; inventory `pre_program_launches`): host-input
+launches that run before the program in every lowering. The only one declared
+is the Qwen3.5 token embedding (`embedding_q8`, `Gpu::embedding_lookup_q8`,
+one per forward) for `h2_gfx1201`. Without `--g0-program` none are allowed.
+
+### railgun shadow diff (M1, G7 diagnostic)
+
+`HIPFIRE_RAILGUN_SHADOW=<corpus dir>` (a `railgun-jit-corpus` build,
+`<out>/v1/<host key>`) makes every recorded launch also feed railgun
+(`crates/rdna-compute/src/replay/railgun_shadow.rs`): the SHA-256 of the object
+the launch ran is looked up in the corpus, the receipt's A1/A3/A4 facts type
+its arguments, A1 pointer arguments are bound to their live allocations, and
+launch sites declare their dynamic words (`Gpu::launch_maybe_blob_declared`;
+the GDN requant frame). When the gfx12 single-IB tape is prepared, railgun
+authors its program (`crates/railgun/src/kernel.rs`), derives edges and
+boundaries from its gfx12 cache table (`plan.rs`; the writer-side system
+acquire is the derived `WarPreWriter` rule, not a name table), lowers it
+through the same command builder, kernarg pool and loaded kernels, and diffs
+it against the prepared tape (`shadow.rs`): IB dwords with kernarg addresses
+canonicalised, kernarg images, pointer bindings, word and grid patch lists,
+per-boundary wait and acquire rung, and the post-dispatch NOP pacing. Every
+difference is classified `benign_relocation`, `pacing_mismatch`,
+`railgun_stronger` or `railgun_weaker`; G7 fails on any weaker one because no
+G4 receipt exists, and on any pacing mismatch. Nothing railgun builds is
+submitted and the route is unchanged.
+
+Pacing is a per-arch lowering parameter (`railgun::plan::ArchLowering`), not a
+kernel property: on exact gfx1201 railgun's lowering emits the same 64-body-dword
+`NOP` after every `DISPATCH_DIRECT` as the Redline tape (`PostDispatchNop(64)`),
+and an explicit `HIPFIRE_GFX1201_PM4_PACING` (`off`, `nop:N`) applies to both
+planners. Other arches lower unpaced.
+
+- `HIPFIRE_RAILGUN_SHADOW_OUT=<dir>`: one JSON report per prepare
+  (`railgun-shadow-<pid>-<n>.json`); the `[railgun] shadow G7 …` stderr line
+  summarises it.
+- `HIPFIRE_RAILGUN_INVENTORY=<file>`: `railgun-cert recording-inventory json`
+  output; the matched route's recording-dependent decisions go into the
+  report's certificate.
+- Artifact hashes match the corpus only when the runtime loads the corpus
+  pack (install `pack/<arch>` as `kernels/compiled/<arch>`); locally
+  JIT-compiled objects are loud `receipt_missing` nodes lowered `HipDirect`.
+  Redline reads Radiowave argument effects from `*.radiowave.json` sidecars,
+  which only the JIT path writes; without them it falls back to its name
+  tables.
+
+### railgun G4 probe, backend and check mode (M2)
+
+- **G4 silicon probe** (`crates/railgun/examples/g4_probe.rs` + `.hip`, feature
+  `g4-probe`): per cache-visibility row (`raw_vmem`, `raw_smem`, `war`, `waw`,
+  `war_pre_writer`, `pre_writer_after_barrier`), adversarial producer→consumer
+  kernels inside one retained PM4 IB, swept over the barrier rungs from none to
+  the system acquire, ≥2²⁰ trials per rung split over four footprints (≤L0,
+  ≤L1, ≤L2, >L2) and two write layouts, placement recorded from `HW_ID1`. Any
+  stale observation disqualifies a rung; `receipt.<arch>.<row>.json` and
+  `cache-table.<arch>.json` name the weakest rung never observed stale.
+- `HIPFIRE_RAILGUN_CACHE_TABLE=<cache-table.<arch>.json>` attaches those
+  receipts to the cache-table rows whose own rung the probe ran clean.
+- `HIPFIRE_RAILGUN_BACKEND=railgun` makes the gfx12 single-IB tape execute
+  railgun's lowering (over Redline's kernarg buffers, admitted only when every
+  railgun kernarg image equals them); a refusal fails the prepare closed.
+- `HIPFIRE_RAILGUN_CHECK=off|sample(N)|always` runs the prepared PM4 lowering
+  and its HIP twin (the same nodes through `hipModuleLaunchKernel`, same
+  kernarg bytes) from the same snapshot and byte-compares every live `State`
+  allocation of the allocator registry (`hip_bridge::registry`), poisoning the
+  route on any difference. The snapshot and the restore are each fenced with
+  `hipDeviceSynchronize`: `hipMemcpy` device→device returns before the copy
+  lands, and the PM4 queue is outside HIP's stream order (unfenced, the PM4
+  run raced the pre-image copies). `always` digests the immutable `Weights`
+  allocations before and after the first checked step of each prepared
+  program, not per step. `HIPFIRE_RAILGUN_DIGEST=1` writes per-step state
+  digests for the cross-process third arm; `HIPFIRE_RAILGUN_CHECK_OUT` is the
+  JSON-lines log. Negative controls (`HIPFIRE_RAILGUN_NEGATIVE_CONTROL`):
+  `flip_byte` XORs one byte of one surface into the PM4 arm's result (the
+  step must come back unequal on exactly that byte); `drop_boundaries` lowers
+  the tape without its mid-segment boundaries.
+
 ### Steady-state dispatch profiler (attribution-only diagnostic)
 
 `python3 -m tools.redline.dispatch_profile` is a **named manual diagnostic** for

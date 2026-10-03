@@ -22,6 +22,7 @@
 
 pub mod backend;
 pub mod lds;
+pub mod runtime;
 pub mod scope;
 pub mod target;
 pub mod trace;

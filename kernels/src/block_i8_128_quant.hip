@@ -80,9 +80,11 @@ __device__ __forceinline__ void quantize_block_i8_128_wave(
     }
 }
 
-// Standalone quantizer: same (X, Y, K, N) grid contract as
-// quantize_int4_mmq_ds128 (block (256,1,1), each thread 4 floats, grid
-// [(K+1023)/1024, N]); one wave32 covers exactly one 128-K group.
+// Standalone quantizer: same (X, Y, K, N) contract as
+// quantize_int4_mmq_ds128 (block (256,1,1), each thread 4 floats). Folded
+// 1-D launch, grid [((K+1023)/1024) * N, 1, 1]: token = blockIdx.x /
+// blocks_per_row, so N is not bound by gridDim.y; one wave32 covers exactly
+// one 128-K group.
 // Layout [K/128 x N]: Y[kb * N + token]. K % 128 == 0.
 #ifndef HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE
 extern "C" __global__ void quantize_int8_mmq_ds128(
@@ -91,8 +93,10 @@ extern "C" __global__ void quantize_int8_mmq_ds128(
     int K,
     int N
 ) {
-    const int token = blockIdx.y;
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per_row = (K + (int)blockDim.x * 4 - 1) / ((int)blockDim.x * 4);
+    if (per_row <= 0) return;
+    const int token = (int)(blockIdx.x / (unsigned)per_row);
+    const int t = (int)(blockIdx.x % (unsigned)per_row) * blockDim.x + threadIdx.x;
     const int i0 = t * 4;
     if (token >= N || i0 >= K) return;
     const int lane = threadIdx.x & 31;

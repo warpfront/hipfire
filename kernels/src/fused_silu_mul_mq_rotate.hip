@@ -36,15 +36,19 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     float* __restrict__ x_rot,
     int K
 ) {
-    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (group >= groups_total) return;
+    if (groups_total <= 0) return;
 
-    // Batch row: grid.y is the batch dim. For decode grid=[groups_total, 1, 1]
-    // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
-    // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
-    const long long batch_off = (long long)blockIdx.y * K;
+    // Batch row: grid.x folds (token, group) as x = token * groups_total +
+    // group (group fastest, the order the former [groups_total, N] grid
+    // dispatched in), keeping the row count out of grid.y, which HIP bounds
+    // at 65535. Decode grid=[groups_total, 1, 1] is token 0 (byte-identical
+    // to pre-batching). gate, up, and x_rot are [N × K] row-major.
+    const unsigned bx = blockIdx.x;
+    const int token = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)token * (unsigned)groups_total);
+    const long long batch_off = (long long)token * K;
     const float* gate_b  = gate  + batch_off;
     const float* up_b    = up    + batch_off;
           float* x_rot_b = x_rot + batch_off;
@@ -112,15 +116,19 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     int K
 #endif
 ) {
-    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (group >= groups_total) return;
+    if (groups_total <= 0) return;
 
-    // Batch row: grid.y is the batch dim. For decode grid=[groups_total, 1, 1]
-    // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
-    // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
-    const long long batch_off = (long long)blockIdx.y * K;
+    // Batch row: grid.x folds (token, group) as x = token * groups_total +
+    // group (group fastest, the order the former [groups_total, N] grid
+    // dispatched in), keeping the row count out of grid.y, which HIP bounds
+    // at 65535. Decode grid=[groups_total, 1, 1] is token 0 (byte-identical
+    // to pre-batching). gate, up, and x_rot are [N × K] row-major.
+    const unsigned bx = blockIdx.x;
+    const int token = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)token * (unsigned)groups_total);
+    const long long batch_off = (long long)token * K;
     const float* gate_b  = gate  + batch_off;
     const float* up_b    = up    + batch_off;
 #ifdef HIPFIRE_IU4_SIDECAR
@@ -212,7 +220,7 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     }
     emit_iu4_sidecar_from_producer8(
         f0, f1, f2, f3, f4, f5, f6, f7,
-        x_i4, group, (int)blockIdx.y, N, tid);
+        x_i4, group, token, N, tid);
 #else
     x_rot_b[base]     = f0;
     x_rot_b[base + 1] = f1;

@@ -140,6 +140,9 @@ pub(super) struct MoeStepState<'a> {
     /// stage), and whether it did.
     hc_write: RefCell<Option<super::qt44_qt53_prefill::HcSharedDown>>,
     hc_folded: Cell<bool>,
+    /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the shared down ran the whole tail as the
+    /// HC row fold, including the next HC read's norm.
+    hc_row_folded: Cell<bool>,
 }
 
 impl<'a> MoeStepState<'a> {
@@ -195,6 +198,7 @@ impl<'a> MoeStepState<'a> {
             initial_zero: Cell::new(false),
             hc_write: RefCell::new(None),
             hc_folded: Cell::new(false),
+            hc_row_folded: Cell::new(false),
         }
     }
 
@@ -789,8 +793,10 @@ impl<'a> SealedMoeOp<'a> {
             // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
             // shared down's GEMM epilogue when this call admits it.
             if let Some(hc) = self.state.hc_write.take() {
+                let row_fold = hc.row_fold.is_some();
                 if super::qt44_qt53_prefill::shared_down_hc(gpu, params, &hc)? {
                     self.state.hc_folded.set(true);
+                    self.state.hc_row_folded.set(row_fold);
                     return Ok(());
                 }
             }
@@ -944,6 +950,23 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+            // The row fold combines inside its own kernel; only the rank order
+            // is owed here, and the absorbed target fill is not (the shared
+            // down's rows overwrite the target).
+            if self
+                .state
+                .hc_write
+                .borrow()
+                .as_ref()
+                .is_some_and(|hc| hc.row_fold.is_some())
+            {
+                self.state.initial_zero.set(false);
+                return super::qt44_qt53_prefill::combine_order_only(
+                    gpu,
+                    params,
+                    selection.path2_m_total,
+                );
+            }
             return super::qt44_qt53_prefill::combine(
                 gpu,
                 params,
@@ -1212,12 +1235,22 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
 /// down stage, which folds it into its GEMM epilogue when it fits.  Returns
 /// whether it did; the caller then skips the write.  When the stage declines
 /// (or never runs), nothing was launched for it and the write runs unfused.
+///
+/// `HIPFIRE_QWEN4_HC_ROW_FOLD`: with `next` (the HC read right after `hc` and
+/// that read's paired write, both already admitted by the step interpreter),
+/// the shared down runs the whole tail as one row kernel when
+/// [`super::qt44_qt53_prefill::row_fold_applies`]; the result then reports
+/// `row_folded` and the read's norm + its write's gates are already done.
 pub(super) fn execute_after_clear(
     gpu: &mut Gpu,
     call: &SealedMoeCall<'_>,
     clear: &super::layer_ops::ClearOp<'_>,
     hc: Option<&super::layer_ops::HyperWriteOp<'_>>,
-) -> Result<bool, DispatchError> {
+    next: Option<(
+        &super::layer_ops::HyperReadOp<'_>,
+        &super::layer_ops::HyperWriteOp<'_>,
+    )>,
+) -> Result<AfterClear, DispatchError> {
     let state = MoeStepState::new(call);
     let absorbed = state.absorbs_clear(gpu, clear);
     if !absorbed {
@@ -1225,7 +1258,24 @@ pub(super) fn execute_after_clear(
     }
     state.initial_zero.set(absorbed);
     if let Some(write) = hc {
-        *state.hc_write.borrow_mut() = super::qt44_qt53_prefill::HcSharedDown::offer(write);
+        let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
+        if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
+            if let Ok((params, selection)) = state.prefill_parts() {
+                if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+                    && super::qt44_qt53_prefill::row_fold_applies(
+                        gpu,
+                        params,
+                        selection.resolution.use_path2,
+                        offered,
+                    )
+                {
+                    offered.row_fold = Some(super::qt44_qt53_prefill::HcRowFoldNext::offer(
+                        read, next_write,
+                    ));
+                }
+            }
+        }
+        *state.hc_write.borrow_mut() = offered;
     }
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
@@ -1237,7 +1287,18 @@ pub(super) fn execute_after_clear(
             "sealed moe: the absorbed target clear was not consumed by the combine".into(),
         ));
     }
-    Ok(state.hc_folded.get())
+    Ok(AfterClear {
+        folded: state.hc_folded.get(),
+        row_folded: state.hc_row_folded.get(),
+    })
+}
+
+/// What [`execute_after_clear`] did beyond the call itself.
+pub(super) struct AfterClear {
+    /// The shared down carried the call's HC write.
+    pub folded: bool,
+    /// ... and the next HC read's norm + its write's gates (the HC row fold).
+    pub row_folded: bool,
 }
 
 /// Execute only the canonical slot-order combine for a validated EP call.

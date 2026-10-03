@@ -281,7 +281,7 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
     let body = &kern.body;
     let fail = |what: &str, e: &dyn fmt::Display| EditError::Analysis(format!("{what}: {e}"));
     passes::windows::check_windows(body).map_err(|e| fail("windows", &e))?;
-    let replay = passes::waits::replay(body, arch).map_err(|e| fail("waits", &e))?;
+    let replay = passes::waits::replay(body, arch, kern.wave).map_err(|e| fail("waits", &e))?;
     let hazards = passes::hazards::analyze(body, arch, kern.wave).map_err(|e| fail("hazards", &e))?;
     let lds = passes::lds::analyze(body, arch).map_err(|e| fail("lds", &e))?;
     let barriers = passes::barriers::analyze(body, arch).map_err(|e| fail("barriers", &e))?;
@@ -1505,7 +1505,7 @@ impl Tx {
             }
         }
         check_window_integrity(body, lo, hi, true)?;
-        let replay = passes::waits::replay(body, self.arch).map_err(|e| EditError::Analysis(e.to_string()))?;
+        let replay = passes::waits::replay(body, self.arch, self.wave()).map_err(|e| EditError::Analysis(e.to_string()))?;
         let range: HashSet<InstId> = flow.ids[lo..=hi].iter().copied().collect();
         let issuer: HashMap<_, _> = replay.events.iter().map(|e| (e.id, e.inst)).collect();
         for fact in replay.facts.iter().filter(|f| range.contains(&f.wait)) {
@@ -1908,7 +1908,7 @@ impl Tx {
 
     /// Issuing instructions of the events `wait` retires in the whole-CFG replay.
     fn wait_retires(&self, wait: InstId) -> Result<BTreeSet<InstId>, EditError> {
-        let replay = passes::waits::replay(self.body(), self.arch).map_err(|e| EditError::Analysis(e.to_string()))?;
+        let replay = passes::waits::replay(self.body(), self.arch, self.wave()).map_err(|e| EditError::Analysis(e.to_string()))?;
         let issuer: HashMap<_, _> = replay.events.iter().map(|e| (e.id, e.inst)).collect();
         Ok(replay.facts.iter().filter(|f| f.wait == wait).flat_map(|f| f.satisfies.iter().map(|e| issuer[e])).collect())
     }

@@ -13,7 +13,9 @@
 //! `mq_rotate_x_128_v2` plus the shared quantizer. The GEMMs are the certified
 //! builder (PM) expert-run entries the launchers select for the residency
 //! (gfx1201 host-mapped: NT8, else NT4), or the gfx1151 hipcc NT4 under
-//! `HIPFIRE_QWEN4_MOE_SYM_PM=0`. Every other entry of the arch (PM NT1/NT4/NT8,
+//! `HIPFIRE_QWEN4_MOE_SYM_PM=0`. On gfx1151 PM the down GEMM follows
+//! `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1|2|4, row repeat; reported as `down_rr`).
+//! Every other entry of the arch (PM NT1/NT4/NT8, down rr2/rr4 `pm_nt4_dr*`,
 //! gfx1151 hipcc NT1/NT4) is an anchor: it runs on the same grouping and
 //! sidecars and every byte of both output buffers (poison included) must
 //! agree with the candidate's. The incumbent
@@ -562,7 +564,9 @@ fn cand_all(gpu: &mut Gpu, c: &Case) -> Res<()> {
 /// expert-run tile width and, on gfx1151, the hipcc entries (the production
 /// module `kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC`). NT1 gate/up runs block
 /// 64; every NT>1 entry and every down runs block 128; the grid is
-/// ceil(M/64) x P/16 for all. Every entry must produce the same bytes.
+/// ceil(M/64) x P/16 for all, except a down with row repeat `down_rr` > 1
+/// (gfx1151 PM `_nt4r2`/`_nt4r4`), whose grid.x is M / (64 * down_rr).
+/// Every entry must produce the same bytes.
 #[derive(Clone, Copy)]
 struct Entry {
     name: &'static str,
@@ -570,17 +574,24 @@ struct Entry {
     down: &'static str,
     gu_block: u32,
     pm: bool,
+    down_rr: usize,
 }
 
 const fn entry(name: &'static str, gate_up: &'static str, down: &'static str, gu_block: u32, pm: bool) -> Entry {
-    Entry { name, gate_up, down, gu_block, pm }
+    Entry { name, gate_up, down, gu_block, pm, down_rr: 1 }
 }
 
-const ENTRIES_GFX1151: [Entry; 4] = [
+const fn entry_rr(name: &'static str, gate_up: &'static str, down: &'static str, down_rr: usize) -> Entry {
+    Entry { name, gate_up, down, gu_block: 128, pm: true, down_rr }
+}
+
+const ENTRIES_GFX1151: [Entry; 6] = [
     entry("pm_nt1", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151", "qwen4_moe_down_iu4_sym_pm_gfx1151", 64, true),
     entry("pm_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", 128, true),
     entry("hip_nt1", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151", "qwen4_moe_down_iu4_sym_gfx1151", 64, false),
     entry("hip_nt4", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4", "qwen4_moe_down_iu4_sym_gfx1151_nt4", 128, false),
+    entry_rr("pm_nt4_dr2", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r2", 2),
+    entry_rr("pm_nt4_dr4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4", 4),
 ];
 const ENTRIES_GFX1201: [Entry; 3] = [
     entry("pm_nt1", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201", "qwen4_moe_down_iu4_sym_pm_gfx1201", 64, true),
@@ -608,13 +619,20 @@ fn load_entries(gpu: &mut Gpu) -> Res<()> {
     Ok(())
 }
 
-/// The candidate (the entry the launchers select for this residency) and
-/// its anchors: every other entry of the arch.
+/// The candidate (the entry the launchers select for this residency, down
+/// row repeat included) and its anchors: every other entry of the arch.
 fn cand_and_anchors(gpu: &Gpu, host: bool) -> Res<(Entry, Vec<Entry>)> {
-    let [gu, _] = gpu.qwen4_moe_sym_gemm_symbols(host).ok_or("no sym GEMM symbols on this arch")?;
+    let [gu, dn] = gpu.qwen4_moe_sym_gemm_symbols(host).ok_or("no sym GEMM symbols on this arch")?;
+    let rr = gpu.qwen4_moe_sym_down_rr()?;
     let all = entries(gpu);
-    let cand = *all.iter().find(|e| e.gate_up == gu).ok_or("route GEMM is not an ORACLE entry")?;
-    Ok((cand, all.iter().copied().filter(|e| e.gate_up != gu).collect()))
+    let cand = *all
+        .iter()
+        .find(|e| e.gate_up == gu && e.down == dn)
+        .ok_or("route GEMM is not an ORACLE entry")?;
+    if cand.down_rr != rr {
+        return Err(format!("route down row repeat {rr} != ORACLE entry {} row repeat {}", cand.name, cand.down_rr).into());
+    }
+    Ok((cand, all.iter().copied().filter(|e| e.name != cand.name).collect()))
 }
 
 fn diff(a: &[u8], b: &[u8]) -> usize {
@@ -624,13 +642,16 @@ fn diff(a: &[u8], b: &[u8]) -> usize {
 /// Entry `e`'s GEMM `down` (else gate/up) from the current grouping and
 /// production sidecar into `y` ([`load_entries`] first).
 fn entry_gemm(gpu: &mut Gpu, c: &Case, e: Entry, down: bool, y: &GpuTensor) -> Res<()> {
-    let (f, ptrs, xq, m, k, div, src_rows, block) = if down {
+    let (f, ptrs, xq, m, k, div, src_rows, block, rr) = if down {
         let xq = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no down sidecar")?.as_ptr();
-        (e.down, &c.dn_ptrs, xq, DN_M, MI, 1, c.l, 128)
+        (e.down, &c.dn_ptrs, xq, DN_M, MI, 1, c.l, 128, e.down_rr)
     } else {
         let xq = gpu.scratch.int4_mmq_x_scratch.as_ref().ok_or("no gate sidecar")?.as_ptr();
-        (e.gate_up, &c.gu_ptrs, xq, GU_M, HID, TOPK, c.t, e.gu_block)
+        (e.gate_up, &c.gu_ptrs, xq, GU_M, HID, TOPK, c.t, e.gu_block, 1)
     };
+    if m % (64 * rr) != 0 {
+        return Err(format!("{f}: m {m} is not a multiple of 64 * {rr}").into());
+    }
     let mut a = KernargBlob::new();
     for ptr in [p(ptrs), p(&c.tiles), p(&c.sorted), xq as *const _, p(y)] {
         a.push_ptr(ptr);
@@ -638,7 +659,7 @@ fn entry_gemm(gpu: &mut Gpu, c: &Case, e: Entry, down: bool, y: &GpuTensor) -> R
     for v in [m, k, div, c.pmax, src_rows] {
         a.push_i32(v as i32);
     }
-    launch(gpu, f, [(m / 64) as u32, (c.pmax / 16) as u32, 1], block, &mut a)
+    launch(gpu, f, [(m / (64 * rr)) as u32, (c.pmax / 16) as u32, 1], block, &mut a)
 }
 
 /// Every anchor's GEMMs over the current grouping and gate sidecar (its own
@@ -1035,9 +1056,9 @@ fn x_onehot_sweep(
     let run = |gpu: &mut Gpu, e: Entry| -> Res<(Vec<u8>, Vec<u8>)> {
         gpu.hip.memset(&ygu.buf, 0x7B, n * MI * 2)?;
         gpu.hip.memset(&ydn.buf, 0x7B, n * DN_M * 2)?;
-        for (func, ptrs, xq, y, m, k, block) in [
-            (e.gate_up, &gu_ptrs, &xgt, &ygu, GU_M, HID, e.gu_block),
-            (e.down, &dn_ptrs, &xdt, &ydn, DN_M, MI, 128u32),
+        for (func, ptrs, xq, y, m, k, block, rr) in [
+            (e.gate_up, &gu_ptrs, &xgt, &ygu, GU_M, HID, e.gu_block, 1),
+            (e.down, &dn_ptrs, &xdt, &ydn, DN_M, MI, 128u32, e.down_rr),
         ] {
             let mut a = KernargBlob::new();
             a.push_ptr(p(ptrs));
@@ -1048,7 +1069,10 @@ fn x_onehot_sweep(
             for v in [m, k, 1, n, n] {
                 a.push_i32(v as i32);
             }
-            launch(gpu, func, [(m / 64) as u32, (n / 16) as u32, 1], block, &mut a)?;
+            if m % (64 * rr) != 0 {
+                return Err(format!("{func}: m {m} is not a multiple of 64 * {rr}").into());
+            }
+            launch(gpu, func, [(m / (64 * rr)) as u32, (n / 16) as u32, 1], block, &mut a)?;
         }
         gpu.hip.device_synchronize()?;
         Ok((download(gpu, &ygu.buf, n * MI * 2)?, download(gpu, &ydn.buf, n * DN_M * 2)?))
@@ -1119,6 +1143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cand, anchors) = cand_and_anchors(&gpu, host)?;
     out.insert("gemm_symbols".into(), format!("[{},{}]", q(cand.gate_up), q(cand.down)));
     out.insert("candidate_entry".into(), q(cand.name));
+    out.insert("down_rr".into(), cand.down_rr.to_string());
     out.insert("residency".into(), q(&residency));
     let names: Vec<String> = anchors.iter().map(|e| q(e.name)).collect();
     out.insert("anchors".into(), format!("[{}]", names.join(",")));

@@ -34,7 +34,7 @@ pub mod batched_deltanet;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod draft_head;
-pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy};
+pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
 pub(crate) mod steps;
 pub use layer_ops::{

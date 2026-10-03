@@ -46,7 +46,9 @@
 // 132B@256), so even an in-place ascending pass would be safe, but we do not
 // rely on it.
 //
-// Grid: [n_kv_heads, n_positions]. Block: [32]. LDS: (head_dim + 32) * 4 bytes
+// Grid: [n_kv_heads * n_positions, 1, 1] (y folded into x: HIP grid.y caps at
+// 65535, full context reaches 262144). blockIdx.x = pos * n_kv_heads + h.
+// Block: [32]. LDS: (head_dim + 32) * 4 bytes
 // (only the +32 scratch tail is used; sized to match the K-write template).
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
@@ -56,9 +58,10 @@ extern "C" __global__ void kv_transcode_k_fwht4_to_fwht2(
     const unsigned char* __restrict__ src,  // fwht4 layout (132 B/head/pos @256)
     int n_kv_heads, int head_dim, int n_positions
 ) {
-    const int h = blockIdx.x;
-    if (h >= n_kv_heads) return;
-    const int pos = blockIdx.y;
+    if (n_kv_heads <= 0) return;
+    const unsigned int fold = blockIdx.x;
+    const int h = (int)(fold % (unsigned int)n_kv_heads);
+    const int pos = (int)(fold / (unsigned int)n_kv_heads);
     if (pos >= n_positions) return;
     const int tid = threadIdx.x;
 

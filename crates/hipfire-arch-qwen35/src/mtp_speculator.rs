@@ -18,7 +18,7 @@ use crate::mtp_spec::{
     prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary, sample_from_logits,
     spec_step_mtp_compressed_serial_with_k,
     spec_step_mtp_compressed_serial_with_takeover_candidates, MtpPromptRoute, MtpSamplingConfig,
-    MtpSpecState,
+    MtpSpecResult, MtpSpecState,
 };
 use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
 use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
@@ -56,6 +56,12 @@ fn ngram_mod_env_config() -> Option<NgramModConfig> {
 pub struct Qwen35MtpDrafter {
     head: Qwen35MtpHead,
     state: Option<MtpSpecState>,
+    /// Rank-0 drafter state + per-rank verify scratch when the target is a
+    /// dense-TP mesh; `state` stays unused on that path.
+    tp: Option<crate::mtp_dense_tp::MtpTpRuntime>,
+    /// A mesh reset cannot run from the daemon's `Gpu`, so it defers to the
+    /// next prefill, which owns rank 0.
+    tp_reset_pending: bool,
     max_n: usize,
     ctx_capacity: usize,
     request: SpecRequestConfig,
@@ -101,6 +107,8 @@ impl Qwen35MtpDrafter {
         Self {
             head,
             state: None,
+            tp: None,
+            tp_reset_pending: false,
             max_n: max_n.clamp(1, 8),
             ctx_capacity,
             request: SpecRequestConfig::default(),
@@ -125,6 +133,45 @@ impl Qwen35MtpDrafter {
     /// the drafter without re-implementing the prefill/step/repair paths.
     pub fn mtp_live_state(&self) -> Option<&MtpSpecState> {
         self.state.as_ref()
+    }
+
+    fn tp_target(
+        target: &mut dyn SpecTarget,
+    ) -> Option<&mut crate::mtp_dense_tp::Qwen35DenseTpTarget> {
+        target
+            .as_any_mut()
+            .downcast_mut::<crate::mtp_dense_tp::Qwen35DenseTpTarget>()
+    }
+
+    /// The head, the mesh target and its lazily built rank-0 runtime; `what`
+    /// names the caller in the error when `target` is not a dense-TP mesh.
+    fn tp_runtime<'a>(
+        &'a mut self,
+        target: &'a mut dyn SpecTarget,
+        what: &str,
+    ) -> Result<
+        (
+            &'a Qwen35MtpHead,
+            &'a mut crate::mtp_dense_tp::Qwen35DenseTpTarget,
+            &'a mut crate::mtp_dense_tp::MtpTpRuntime,
+        ),
+        String,
+    > {
+        let tp = Self::tp_target(target)
+            .ok_or_else(|| format!("dense TP {what} without a TP target"))?;
+        let Self {
+            head,
+            tp: runtime,
+            max_n,
+            request,
+            ..
+        } = self;
+        if runtime.is_none() {
+            let mut rt = crate::mtp_dense_tp::MtpTpRuntime::new(tp, head, *max_n, MtpKvMode::Q8)?;
+            Self::apply_request(&mut rt.state, *request);
+            *runtime = Some(rt);
+        }
+        Ok((head, tp, runtime.as_mut().expect("built above")))
     }
 
     /// Downcast the generic target to a qwen35 `ModelSlot` (same as DflashSpeculator).
@@ -235,6 +282,87 @@ impl Qwen35MtpDrafter {
         Ok(())
     }
 
+    fn seed_ngram_context(&mut self, prompt_tokens: &[u32], first_token: u32) {
+        // Seed request-local n-gram history exactly once. Prefix realignment
+        // calls prefill again inside the same request; preserving this context
+        // keeps counters and already-emitted history intact.
+        if self.ngram_active && self.ngram_context.is_empty() {
+            self.ngram_context.extend_from_slice(prompt_tokens);
+            self.ngram_context.push(first_token);
+            if let Some(pool) = self.ngram_pool.as_mut() {
+                let n_match = pool.config().n_match;
+                pool.insert_range(&self.ngram_context, n_match);
+            }
+            self.ngram_indexed_until = self.ngram_context.len();
+            self.ngram_emitted_len = 1;
+        }
+    }
+
+    fn tp_prefill(
+        &mut self,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+    ) -> Result<u32, String> {
+        let reset_pending = std::mem::take(&mut self.tp_reset_pending);
+        let (head, tp, rt) = self.tp_runtime(target, "prefill")?;
+        if !cache_hit || reset_pending {
+            let dev0 = &mut tp.gpus.devices[0];
+            dev0.bind_thread().map_err(|e| e.to_string())?;
+            rt.state
+                .reset(dev0)
+                .map_err(|e| format!("dense TP MTP state reset: {e}"))?;
+        }
+        crate::mtp_dense_tp::prefill_trunk_and_mtp_cache_dense_tp(
+            tp,
+            head,
+            rt,
+            fill_tokens,
+            start_pos,
+        )?;
+        let logits = tp.last_logits()?;
+        let state = &mut rt.state;
+        let first_token = if state.sampling.is_greedy() {
+            logits
+                .iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i as u32, v)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0
+        } else {
+            sample_from_logits(&logits, &state.sampling, &mut state.rng).0
+        };
+        Ok(first_token)
+    }
+
+    fn tp_prefill_tokens(
+        &mut self,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(), String> {
+        let (head, tp, rt) = self.tp_runtime(target, "advance")?;
+        crate::mtp_dense_tp::prefill_trunk_and_mtp_cache_dense_tp(tp, head, rt, tokens, start_pos)
+    }
+
+    fn tp_step(
+        &mut self,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        eos: u32,
+        k: usize,
+    ) -> Result<MtpSpecResult, String> {
+        let (head, tp, rt) = self.tp_runtime(target, "step")?;
+        crate::mtp_dense_tp::spec_step_mtp_dense_tp(tp, head, rt, position, seed, eos, k)
+    }
+
     fn clear_checkpoints(&mut self, gpu: &mut Gpu) {
         for (_, snapshot) in self.checkpoints.drain(..) {
             snapshot.free_gpu(gpu);
@@ -262,6 +390,14 @@ impl MtpDrafter for Qwen35MtpDrafter {
         // preserves target + MTP cache for honest LCP suffix prefill.
         if !cache_hit {
             target.reset_recurrent(gpu)?;
+        }
+        if Self::tp_target(target).is_some() {
+            let first_token = self.tp_prefill(target, fill_tokens, start_pos, cache_hit)?;
+            if abort() {
+                return Err("aborted".into());
+            }
+            self.seed_ngram_context(prompt_tokens, first_token);
+            return Ok(first_token);
         }
         let slot = Self::slot(target)?;
         self.ensure_state(gpu, slot)?;
@@ -333,19 +469,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             sample_from_logits(&logits, &state.sampling, &mut state.rng).0
         };
 
-        // Seed request-local n-gram history exactly once. Prefix realignment
-        // calls prefill again inside the same request; preserving this context
-        // keeps counters and already-emitted history intact.
-        if self.ngram_active && self.ngram_context.is_empty() {
-            self.ngram_context.extend_from_slice(prompt_tokens);
-            self.ngram_context.push(first_token);
-            if let Some(pool) = self.ngram_pool.as_mut() {
-                let n_match = pool.config().n_match;
-                pool.insert_range(&self.ngram_context, n_match);
-            }
-            self.ngram_indexed_until = self.ngram_context.len();
-            self.ngram_emitted_len = 1;
-        }
+        self.seed_ngram_context(prompt_tokens, first_token);
         Ok(first_token)
     }
 
@@ -385,6 +509,18 @@ impl MtpDrafter for Qwen35MtpDrafter {
         let modifier = self.ngram_active;
         let native_k = k.min(self.max_n);
 
+        if Self::tp_target(target).is_some() {
+            // The mesh has no takeover verify, so an n-gram-mod hit is not
+            // used there: the window drafts natively.
+            let r = self.tp_step(target, position, seed, eos, native_k)?;
+            self.last_window = Some((position, seed));
+            self.stats.mtp_windows += 1;
+            return Ok(MtpWindow {
+                committed: r.committed,
+                accepted: r.accept_count,
+                drafts_generated: r.drafts_generated,
+            });
+        }
         let slot = Self::slot(target)?;
         let r = {
             let state = self
@@ -457,6 +593,11 @@ impl MtpDrafter for Qwen35MtpDrafter {
         if abort() {
             return Ok(true);
         }
+        if Self::tp_target(target).is_some() {
+            self.tp_prefill_tokens(target, tokens, start_pos)
+                .map_err(|e| format!("qwen35 MTP forced advance (dense TP): {e}"))?;
+            return Ok(true);
+        }
         let slot = Self::slot(target)?;
         self.ensure_state(gpu, slot)?;
         let state = self.state.as_mut().expect("ensure_state set it");
@@ -486,6 +627,22 @@ impl MtpDrafter for Qwen35MtpDrafter {
             ));
         }
 
+        if Self::tp_target(target).is_some() {
+            let replay = terminal_prefix_replay(window_seed, consumed);
+            {
+                let tp = Self::tp_target(target).expect("checked above");
+                let Some(rt) = self.tp.as_ref() else {
+                    return Ok(false);
+                };
+                rt.restore_last_window(tp)?;
+            }
+            if replay.is_empty() {
+                return Ok(true);
+            }
+            self.tp_prefill_tokens(target, &replay, window_start)
+                .map_err(|e| format!("qwen35 MTP terminal repair replay (dense TP): {e}"))?;
+            return Ok(true);
+        }
         let slot = Self::slot(target)?;
         let Some(state) = self.state.as_mut() else {
             return Ok(false);
@@ -507,6 +664,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.last_window = None;
+        self.tp_reset_pending = self.tp.is_some();
         self.reset_ngram_request();
         self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
@@ -519,6 +677,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn mtp_reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.last_window = None;
+        self.tp_reset_pending = self.tp.is_some();
         self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
             state
@@ -568,11 +727,38 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
         let mut this = *self;
+        if this.tp.is_some() {
+            // The per-rank verify scratch is unreachable from one `Gpu`; a
+            // mesh drafter must go through `mtp_free_multi`, so say so loudly
+            // instead of dropping those buffers on the floor.
+            debug_assert!(
+                false,
+                "qwen35 MTP drafter with a dense-TP runtime freed via mtp_free"
+            );
+            eprintln!(
+                "[mtp] BUG: dense-TP drafter freed via mtp_free; per-rank verify scratch leaked"
+            );
+        }
         this.clear_checkpoints(gpu);
         if let Some(state) = this.state {
             state.free_gpu(gpu);
         }
         this.head.free_gpu(gpu);
+    }
+
+    fn mtp_free_multi(self: Box<Self>, gpus: &mut hipfire_runtime::multi_gpu::Gpus) {
+        let mut this = *self;
+        if let Some(tp) = this.tp.take() {
+            tp.free_on_ranks(gpus);
+        }
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            this.clear_checkpoints(dev);
+            if let Some(state) = this.state {
+                state.free_gpu(dev);
+            }
+            this.head.free_gpu(dev);
+        }
     }
 
     fn k(&self) -> usize {
@@ -606,6 +792,9 @@ impl MtpDrafter for Qwen35MtpDrafter {
         self.request = cfg;
         if let Some(state) = self.state.as_mut() {
             Self::apply_request(state, cfg);
+        }
+        if let Some(rt) = self.tp.as_mut() {
+            Self::apply_request(&mut rt.state, cfg);
         }
         self.reset_ngram_request();
         self.ngram_active = false;

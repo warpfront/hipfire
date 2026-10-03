@@ -437,11 +437,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("attention_q8_0_fa2_gqa_gfx1151", kernels::ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC, ["attention_fa2_q_preconvert_gfx1151", "attention_q8_0_fa2_gqa_gfx1151"]);
         add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]);
         add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
-        add!("fused_rmsnorm_mq_rotate_awq_i4", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC, ["fused_rmsnorm_mq_rotate_awq_i4"]);
-        add!("fused_rmsnorm_mq_rotate_awq_i4_fold", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_fold"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_GFX1151_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151"]);
+        add!("fused_rmsnorm_mq_rotate_awq_i4_fold_b8", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_fold_b8"]);
         // Qwen4 chunked-GDN inline-Q8 recurrence (opt-in `HIPFIRE_QWEN4_GDN_Q8_INLINE`, exact gfx1151; tensor_ops.rs gated_delta_step_gate_wmma_arms).
         add!("gated_delta_chunk_q8_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_Q8_WMMA_SRC, ["gated_delta_chunk_gate_q8_wmma"]);
-        add!("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC, ["gated_norm_mq_rotate_awq_i4_gfx11"]);
+        add!("gated_norm_mq_rotate_awq_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC, ["gated_norm_mq_rotate_awq_i4_gfx1151_v2"]);
         add!("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC, ["gdn_chunk_scan_gfx1151"]);
         add!("gemm_mq4g256v2_residual_iu4_v2b_gfx11", kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC, ["gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11"]);
         add!("gemm_mq4g256v2_residual_mmq_iu4", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "quantize_int4_mmq_ds128"]);
@@ -683,11 +683,20 @@ mod tests {
         // digests above are re-pinned to the current source.
         // The five KV-write modules gained paged-only code behind
         // `#ifdef HIPFIRE_KV_SLOT_PAGED` (fold/scs); their preprocessed source
-        // and gfx1100/gfx1151/gfx1201 `.text` are unchanged.
-        const REPINNED_SINCE_P0: [&str; 10] = [
+        // and gfx1100/gfx1151/gfx1201 `.text` are unchanged. The four
+        // grid.y row-fold modules (qk-L2 norm, sigmoid-alpha gate, SiLU-mul
+        // rotate, AWQ rotate) moved their row axis onto grid.x for the
+        // gfx1201 65536-workgroup limit. The two RMSNorm/FWHT modules' source
+        // gained the fold's batched Phase-1a behind `HIPFIRE_RMSNORM_FOLD` +
+        // `HIPFIRE_RMSNORM_P1A_BATCHED` (gfx1151 `_fold_b8`); their
+        // preprocessed source is unchanged on gfx1100/gfx1151/gfx1201.
+        const REPINNED_SINCE_P0: [&str; 14] = [
             "conv1d_silu_split_qknorm_b256",
+            "fused_qk_l2_norm_scale",
             "fused_rmsnorm_mq_rotate",
             "fused_rmsnorm_mq_rotate_awq",
+            "fused_sigmoid_alpha_gate",
+            "fused_silu_mul_mq_rotate",
             "fused_silu_mul_mq_rotate_awq",
             "gated_delta_net_q8_fast",
             "kv_cache_write_asym_k_givens3_batched",
@@ -695,6 +704,7 @@ mod tests {
             "kv_cache_write_q8_0_batched",
             "kv_cache_write_q8_0_independent",
             "kv_cache_write_q8_0_independent_masked",
+            "rotate_x_mq_awq",
         ];
         const FLAGS_ADDED_SINCE_P0: [&str; 1] = ["-fuse-cuid=none"];
         let mut repins_seen = HashSet::new();

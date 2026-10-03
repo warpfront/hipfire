@@ -520,10 +520,12 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // which warn and fall back for anything they cannot allocate. `bf16` is
 // maple's default plus the Qwen quality-control arm; `fp8` is admitted at
 // the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
+// `legacy-asym3` is the Gemma4 lowered full-tier opt-out back to Givens asym3
+// (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
     "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8",
+    "turbo", "turbo4", "turbo3", "turbo2", "fp8", "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -3012,15 +3014,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_DETERMINISTIC",
         "Select deterministic kernel variants where available."
-    ),
-    process_bool_field!(
-        "kernel.mw16",
-        "mw16",
-        Kernel,
-        false,
-        true,
-        "HIPFIRE_MW16",
-        "Enable the MW16 kernel experiment."
     ),
     process_bool_field!(
         "kernel.q8_batched_legacy",
@@ -5862,7 +5855,7 @@ mod tests {
     #[test]
     fn process_config_is_sparse_versioned_and_revalidated() {
         let mut global = ConfigLayer::default();
-        global.set_cli("kernel.mw16", "true").unwrap();
+        global.set_cli("kernel.deterministic", "true").unwrap();
         global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         global
             .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
@@ -5879,7 +5872,7 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(), Some("1"));
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")

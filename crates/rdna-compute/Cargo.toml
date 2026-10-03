@@ -16,6 +16,8 @@ hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
+railgun = { path = "../railgun" }
+railgun-corpus = { path = "../railgun-corpus" }
 libloading = { workspace = true, optional = true }
 rayon = "1"
 serde = { workspace = true, features = ["derive"] }
@@ -44,6 +46,10 @@ redline-rocr = { path = "../redline-rocr" }
 # ---------------------------------------------------------------------------
 [[example]]
 name = "qwen4_moe_sym"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_trunk_iu4"
 required-features = ["lab"]
 
 [[example]]
@@ -856,4 +862,8 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_qsa_indexed"
+required-features = ["lab"]
+
+[[example]]
+name = "qsa_pm_check"
 required-features = ["lab"]

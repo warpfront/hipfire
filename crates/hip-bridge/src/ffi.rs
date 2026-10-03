@@ -10,7 +10,7 @@ use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -443,6 +443,8 @@ pub struct HipRuntime {
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
+    /// `hipMemcpyDtoD(dst, src, bytes)` (driver-style device pointers).
+    fn_memcpy_dtod: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32>,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
     fn_memset_d32_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
@@ -511,6 +513,7 @@ pub struct HipRuntime {
     // Graph capture & replay
     fn_stream_begin_capture: unsafe extern "C" fn(HipStream, c_uint) -> u32,
     fn_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
+    fn_stream_is_capturing: unsafe extern "C" fn(HipStream, *mut c_uint) -> u32,
     fn_graph_instantiate:
         unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32,
     fn_graph_launch: unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
@@ -524,6 +527,12 @@ pub struct HipRuntime {
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
+    /// `gridDim.y`/`gridDim.z` ceiling (`u32::MAX` = unguarded, the default).
+    /// Per-runtime, not per-device or per-thread: it is set once by the owner
+    /// of a runtime bound to a single device (`Gpu::init_with_device`) via
+    /// `set_launch_grid_limit_for_arch`. A standalone `HipRuntime` that nobody
+    /// configures is unguarded.
+    launch_grid_yz_limit: AtomicU32,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -824,6 +833,12 @@ impl HipRuntime {
                     ) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_dtod: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemcpyDtoD",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_memset: unsafe { load_fn!(
                     lib,
                     "hipMemset",
@@ -1038,6 +1053,12 @@ impl HipRuntime {
                     unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_is_capturing: unsafe { load_fn!(
+                    lib,
+                    "hipStreamIsCapturing",
+                    unsafe extern "C" fn(HipStream, *mut c_uint) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_graph_instantiate: unsafe { load_fn!(
                     lib,
                     "hipGraphInstantiate",
@@ -1104,6 +1125,7 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
                 ) },
                 _lib: lib,
+                launch_grid_yz_limit: AtomicU32::new(u32::MAX),
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -1343,6 +1365,7 @@ impl HipRuntime {
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Malloc);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1368,6 +1391,7 @@ impl HipRuntime {
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
         self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Signal);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1387,7 +1411,9 @@ impl HipRuntime {
         // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
         // caller must ensure GPU work on it is quiesced (documented on free).
         let code = unsafe { (self.fn_free)(buf.ptr) };
-        self.check(code, "hipFree")
+        self.check(code, "hipFree")?;
+        crate::registry::forget(buf.ptr as usize);
+        Ok(())
     }
 
     /// Allocate host-pinned memory the GPU can read directly over PCIe.
@@ -1518,7 +1544,9 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, 0, handle, 0) };
-        self.check(code, "hipMemMap")
+        self.check(code, "hipMemMap")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::VmmChunk);
+        Ok(())
     }
 
     /// # Safety
@@ -1528,7 +1556,9 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size) };
-        self.check(code, "hipMemUnmap")
+        self.check(code, "hipMemUnmap")?;
+        crate::registry::forget(ptr as usize);
+        Ok(())
     }
 
     /// # Safety
@@ -1817,6 +1847,29 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2D")
     }
 
+    /// `hipMemcpyDtoD(dst, src, size)` on raw device addresses.
+    ///
+    /// # Safety
+    /// `[src, src+size)` and `[dst, dst+size)` must lie in live device
+    /// allocations and must not overlap.
+    pub unsafe fn memcpy_dtod_raw(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+    ) -> HipResult<()> {
+        let f = self.fn_memcpy_dtod.ok_or_else(|| {
+            HipError::new(0, "hipMemcpyDtoD is not exported by the loaded HIP runtime")
+        })?;
+        let t = std::time::Instant::now();
+        // SAFETY: the caller guarantees both ranges lie in live, disjoint
+        // device allocations; Rust does not deref device pointers.
+        let code = unsafe { f(dst, src as *mut c_void, size) };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
+        self.check(code, "hipMemcpyDtoD")
+    }
+
     #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
         assert!(size <= buf.size);
@@ -1988,6 +2041,30 @@ impl HipRuntime {
         Ok(Function(func))
     }
 
+    /// Install the `gridDim.y`/`gridDim.z` ceiling for the architecture this
+    /// runtime launches on ([`crate::launch_grid::grid_yz_limit_for_arch`]).
+    /// Architectures without a recorded ceiling clear the guard.
+    pub fn set_launch_grid_limit_for_arch(&self, arch: &str) {
+        let limit = crate::launch_grid::grid_yz_limit_for_arch(arch).unwrap_or(u32::MAX);
+        self.launch_grid_yz_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The installed `gridDim.y`/`gridDim.z` ceiling, if any.
+    pub fn launch_grid_yz_limit(&self) -> Option<u32> {
+        match self.launch_grid_yz_limit.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            limit => Some(limit),
+        }
+    }
+
+    /// Fail-closed geometry check shared by the raw launch entry points and
+    /// the dispatch record/capture funnels. Never clamps; see
+    /// [`crate::launch_grid::check_launch_grid`].
+    #[inline]
+    pub fn validate_launch_grid(&self, grid: [u32; 3]) -> HipResult<()> {
+        crate::launch_grid::check_launch_grid(grid, self.launch_grid_yz_limit())
+    }
+
     /// Launch a kernel on the GPU.
     ///
     /// # Safety
@@ -2001,6 +2078,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
@@ -2056,6 +2134,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
@@ -2387,6 +2466,18 @@ impl HipRuntime {
         let code = unsafe { (self.fn_stream_end_capture)(stream.0, &mut graph) };
         self.check(code, "hipStreamEndCapture")?;
         Ok(Graph(graph))
+    }
+
+    /// Whether `stream` is inside a `hipStreamBeginCapture` window. An
+    /// invalidated capture still counts: work issued to it is not executed.
+    pub fn stream_is_capturing(&self, stream: &Stream) -> HipResult<bool> {
+        let mut status: c_uint = 0;
+        // SAFETY: `stream` is a live opaque HIP handle owned by the wrapper;
+        // `status` is a stack out-param.
+        let code = unsafe { (self.fn_stream_is_capturing)(stream.0, &mut status) };
+        self.check(code, "hipStreamIsCapturing")?;
+        // hipStreamCaptureStatusNone = 0; Active = 1, Invalidated = 2.
+        Ok(status != 0)
     }
 
     /// Instantiate an executable graph from a captured graph.

@@ -179,8 +179,7 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// native MTP speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
 /// `gather_bytes` when the gathered QSA prefill attention reserves its
 /// context-sized scratch at load
-/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). G2's
-/// opt-in full-layer staging adds two expert layers' worth of device bytes.
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`).
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     max_seq: usize,
@@ -209,18 +208,12 @@ pub fn auto_vram_reserve(
             .ok_or_else(overflow)?;
     let forward =
         crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows).ok_or_else(overflow)?;
-    let stage_bytes = if rdna_compute::gemm::qwen4_expert_stage_requested() {
-        rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES
-    } else {
-        0
-    };
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(forward))
         .and_then(|bytes| bytes.checked_sub(measured))
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(gather_bytes.unwrap_or(0)))
-        .and_then(|bytes| bytes.checked_add(stage_bytes))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
 }
 
@@ -518,14 +511,12 @@ mod tests {
         let reserve = |chunk| {
             auto_vram_reserve(&config, AUTO_VRAM_RESERVE_MAX_SEQ, chunk, F32, None, None).unwrap()
         };
-        // G2's opt-in staging reserves two expert layers' worth more.
-        let staged = if rdna_compute::gemm::qwen4_expert_stage_requested() { 2 } else { 0 };
         // Verify-sized spec logits free 1472 logit rows of the measured
         // 1536-row layout: one layer past the measured N = 16 fits.
         let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
         assert_eq!(
             auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, measured_chunk),
-            17 - staged
+            17
         );
         // gfx1201's 4096-row chunk spends that and one layer more on
         // forward scratch.
@@ -533,7 +524,7 @@ mod tests {
         assert!(reserve > measured_chunk);
         assert_eq!(
             auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve),
-            15 - staged
+            15
         );
         // A card that holds everything keeps every layer resident.
         assert_eq!(

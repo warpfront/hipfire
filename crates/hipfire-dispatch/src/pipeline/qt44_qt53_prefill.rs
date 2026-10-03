@@ -361,6 +361,32 @@ pub(crate) struct HcSharedDown {
     pub rows: usize,
     pub hidden: usize,
     pub state_bf16: bool,
+    /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the next HC read's operands, when the whole
+    /// MoE tail runs as one row kernel (see [`row_fold_applies`]).
+    pub row_fold: Option<HcRowFoldNext>,
+}
+
+/// The HC read that follows the HC write of a row-folded MoE call, and that
+/// read's paired write: the row kernel computes the read's norm (its F16 row)
+/// and that write's gate logits.
+pub(crate) struct HcRowFoldNext {
+    pub norm_weight: GpuTensor,
+    pub gate_weight: GpuTensor,
+    pub next_gates: GpuTensor,
+}
+
+impl HcRowFoldNext {
+    /// What the row kernel needs of `read` and its paired `write`.
+    pub(crate) fn offer(
+        read: &super::layer_ops::HyperReadOp<'_>,
+        write: &super::layer_ops::HyperWriteOp<'_>,
+    ) -> Self {
+        Self {
+            norm_weight: f32_view(read.norm_weight, 0, read.norm_weight.numel()),
+            gate_weight: f32_view(write.block_inject.buf, 0, write.block_inject.buf.numel()),
+            next_gates: f32_view(write.gates, 0, read.rows * write.branches),
+        }
+    }
 }
 
 impl HcSharedDown {
@@ -382,6 +408,7 @@ impl HcSharedDown {
                 rows: write.rows,
                 hidden: write.hidden,
                 state_bf16: write.state_bf16,
+                row_fold: None,
             })
     }
 }
@@ -403,27 +430,17 @@ pub(crate) fn shared_down_hc(
     };
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
-    if gpu.flags.qwen4_hc_fuse_level() < 3
-        || down.dtype != DType::BF16
-        || down.rotation.is_some()
-        || down.awq_scale.is_some()
-        || !p.recipe.bf16_round_trip()
-        || !p.recipe.shared_after_combine()
-        || down.m != p.down_m
-        || down.k != shared.intermediate
-        || hc.rows != p.batch_size
-        || hc.hidden != p.down_m
-        || hc.mixed != target.buf.as_ptr()
-        || target.numel() < p.batch_size * p.down_m
-        || shared.scalar.numel() < p.batch_size
-        || !gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(
-            down.buf,
-            down.m,
-            down.k,
-            p.batch_size,
-        )
-    {
+    if !hc_shared_down_admits(gpu, p, hc) {
+        if hc.row_fold.is_some() {
+            return Err(DispatchError::Hip(
+                "qt44 shared down: the HC row fold was planned but its route no longer applies".into(),
+            ));
+        }
         return Ok(false);
+    }
+    if let Some(next) = &hc.row_fold {
+        shared_down_row_fold(gpu, p, hc, next)?;
+        return Ok(true);
     }
     hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
         down.buf,
@@ -441,12 +458,126 @@ pub(crate) fn shared_down_hc(
     Ok(true)
 }
 
-/// Whether path 2 takes the opt-in symmetric IU4 arm (fn-moe-sym): the layer's
+/// Whether the shared down of this call can carry `hc` (the conditions of
+/// [`shared_down_hc`]).
+fn hc_shared_down_admits(gpu: &Gpu, p: &MoePrefillParams<'_>, hc: &HcSharedDown) -> bool {
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return false;
+    };
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    gpu.flags.qwen4_hc_fuse_level() >= 3
+        && down.dtype == DType::BF16
+        && down.rotation.is_none()
+        && down.awq_scale.is_none()
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && down.m == p.down_m
+        && down.k == shared.intermediate
+        && hc.rows == p.batch_size
+        && hc.hidden == p.down_m
+        && hc.mixed == target.buf.as_ptr()
+        && target.numel() >= p.batch_size * p.down_m
+        && shared.scalar.numel() >= p.batch_size
+        && gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(down.buf, down.m, down.k, p.batch_size)
+}
+
+/// Whether this call's whole tail (combine, shared fold, `hc`'s HC write, the
+/// next read's norm) can run as the HC row fold
+/// (`HIPFIRE_QWEN4_HC_ROW_FOLD`): the zero-initialized BF16-row combine of
+/// path 2 into the routed target (which, nothing reading it, then holds the
+/// BF16 shared-down rows), the HC-write shared down, BF16 streams.
+pub(crate) fn row_fold_applies(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    hc: &HcSharedDown,
+) -> bool {
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    gpu.flags.qwen4_hc_row_fold_enabled()
+        && hc.state_bf16
+        && combine_initial_zero_applies(gpu, p, use_path2)
+        && hc_shared_down_admits(gpu, p, hc)
+        && gpu.hc_row_fold_applies(hc.hidden)
+        && p.k_top == 10
+        && p.down_expanded.buf.size() >= p.batch_size * 10 * 8
+        && target.buf.size() >= p.batch_size * p.down_m * 2
+}
+
+/// The row-folded combine stage: only the rank order (the row kernel reads the
+/// grouped rows itself).
+pub(crate) fn combine_order_only(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
+    hip(gpu.moe_combine_order_top10(
+        p.inverse_perm,
+        p.topk_indices,
+        p.topk_weights,
+        p.down_expanded,
+        grouped_rows,
+        p.batch_size,
+    ))
+}
+
+/// The row-folded shared down: the shared-down GEMM stores its BF16 rows into
+/// the (otherwise unwritten) routed target, then one row kernel per token
+/// combines the ten expert rows, folds the shared row, writes the HC streams
+/// and runs the next read's norm + gate projection.  Bitwise
+/// [`combine`] (`initial_zero`) + [`shared_down_hc`] + the next read's
+/// `hyper_norm_gate` (F16 read output at `f16_row_pitch`).
+fn shared_down_row_fold(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    hc: &HcSharedDown,
+    next: &HcRowFoldNext,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .prelude
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    // The next read's F16 row lives in the shared F16 scratch, which the
+    // shared-down GEMM's own F16 input also uses (it is dead by the time the
+    // row kernel writes): size it first so nothing reallocates under the GEMM.
+    let ld16 = gpu.f16_row_pitch(4 * hc.hidden);
+    let x16 = hip(gpu.qwen4_f16_x_scratch(hc.rows * ld16))?;
+    hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(
+        down.buf,
+        shared.rotated,
+        down.m,
+        down.k,
+        p.batch_size,
+        target,
+    ))?;
+    hip(gpu.hc_row_fold_norm_gate(&rdna_compute::hc_row_fold::HcRowFold {
+        grouped_down: p.y_down_grouped,
+        order: p.down_expanded,
+        shared_bf16: target,
+        selector: shared.scalar,
+        streams: &hc.streams,
+        gates: &hc.gates,
+        norm_weight: &next.norm_weight,
+        gate_weight: &next.gate_weight,
+        next_gates: &next.next_gates,
+        normalized_f16: &x16,
+        ld16,
+        rows: hc.rows,
+        hidden: hc.hidden,
+    }))
+}
+
+/// Whether path 2 takes the symmetric IU4 arm (fn-moe-sym): the layer's
 /// experts were verified symmetric at load (the policy says so), the recipe
 /// keeps the BF16 boundaries the kernels implement, the activation is F32,
-/// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`, gfx1151 or gfx1201, >= 512
-/// rows, C2 producers). It replaces scatter, gate/up, unscatter/rotation and
-/// down; the combine reads its BF16 rows like the F16 WMMA arm's.
+/// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for
+/// gfx1151, `=1` on gfx1201; >= 512 rows, C2 producers). It replaces scatter,
+/// gate/up, unscatter/rotation and down; the combine reads its BF16 rows like
+/// the F16 WMMA arm's.
 fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     use_path2
         && p

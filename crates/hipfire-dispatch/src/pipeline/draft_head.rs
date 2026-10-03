@@ -58,6 +58,22 @@ pub struct DraftHeadLayout {
     pub full_hold: u32,
 }
 
+/// See [`DraftHead::request_state`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DraftHeadRequestState {
+    pub full_steps: u32,
+    pub margin: f32,
+}
+
+impl Default for DraftHeadRequestState {
+    fn default() -> Self {
+        Self {
+            full_steps: 0,
+            margin: f32::INFINITY,
+        }
+    }
+}
+
 pub struct DraftHead {
     /// Lower-bit ranking copy, rows in the layout order (`None` = rank the
     /// source head).
@@ -240,6 +256,25 @@ impl DraftHead {
         if (self.front..self.special).contains(&(token as usize)) {
             self.full_steps = self.full_hold;
         }
+    }
+
+    /// Request-local draft policy: the full-vocabulary hold left and the
+    /// last draft's margin. Ranking weights and scratch are not included.
+    pub fn request_state(&self) -> DraftHeadRequestState {
+        DraftHeadRequestState {
+            full_steps: self.full_steps,
+            margin: self.margin,
+        }
+    }
+
+    pub fn set_request_state(&mut self, state: DraftHeadRequestState) {
+        self.full_steps = state.full_steps;
+        self.margin = state.margin;
+    }
+
+    /// The policy a freshly built head starts from.
+    pub fn reset_request_state(&mut self) {
+        self.set_request_state(DraftHeadRequestState::default());
     }
 
     /// Rank `hidden` (`[hidden]` F32) and return the draft token id.

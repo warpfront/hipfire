@@ -1,11 +1,11 @@
 //! Qwen4 symmetric IU4 MoE builder family (gfx1151 + gfx1201).
 use hipfire_isa::Arch;
-use hipfire_isa::kernels::qwen4_moe_sym::{self, Kind, Spec, tile_widths};
+use hipfire_isa::kernels::qwen4_moe_sym::{self, Kind, Spec};
 
 const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
 
 fn specs(arch: Arch) -> impl Iterator<Item = Spec> {
-    tile_widths(arch).iter().flat_map(move |&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt }))
+    qwen4_moe_sym::module_specs(arch).into_iter()
 }
 
 #[test]
@@ -21,9 +21,25 @@ fn entries_are_deterministic_and_target_only_their_arches() {
             assert_eq!(a.s_text.contains("ds_store") || a.s_text.contains("ds_load"), handoff, "{spec:?}");
         }
     }
-    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Down, nt: 1 }).is_err());
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Down, nt: 1, rr: 1 }).is_err());
     // gfx11 NT8 does not fit the VGPR file.
-    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::GateUp, nt: 8 }).is_err());
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::GateUp, nt: 8, rr: 1 }).is_err());
+}
+
+/// Row repeats exist only as 2 or 4 blocks of the gfx1151 down NT4 entry.
+#[test]
+fn row_repeat_shapes_are_validated() {
+    let spec = |arch, kind, nt, rr| Spec { arch, kind, nt, rr };
+    for rr in [0, 3, 8] { assert!(qwen4_moe_sym::emit(spec(Arch::Gfx1151, Kind::Down, 4, rr)).is_err(), "rr {rr}"); }
+    for bad in [
+        spec(Arch::Gfx1151, Kind::GateUp, 4, 2),
+        spec(Arch::Gfx1151, Kind::Down, 1, 2),
+        spec(Arch::Gfx1151, Kind::Down, 2, 2),
+        spec(Arch::Gfx1201, Kind::Down, 4, 2),
+        spec(Arch::Gfx1201, Kind::Down, 8, 4),
+    ] {
+        assert!(qwen4_moe_sym::emit(bad).is_err(), "{bad:?}");
+    }
 }
 
 /// The runtime embeds one certified module per arch: it must be exactly
@@ -72,7 +88,7 @@ fn text_section(bytes: &[u8]) -> Vec<u8> {
 #[cfg(feature = "toolchain")]
 mod toolchain {
     use super::*;
-    use hipfire_isa::{ledger_replay, pm_check, toolchain::{assemble_link_bundle, certify, Toolchain}};
+    use hipfire_isa::{ledger_replay, pm_check, toolchain::{build, certify, Toolchain}};
 
     /// Every symbol of both modules certifies: parse-back, independent wait
     /// replay, its committed shape contract, and M7's lift identity plus
@@ -86,13 +102,13 @@ mod toolchain {
             std::fs::create_dir_all(&dir).unwrap();
             let s = dir.join("module.s");
             std::fs::write(&s, &text).unwrap();
-            let toolchain = Toolchain::default();
-            let build = assemble_link_bundle(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
+            let toolchain = Toolchain::oracle();
+            let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
             for spec in specs(arch) {
                 let symbol = spec.symbol();
                 let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
                 assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
-                let tag = if spec.nt == 1 { spec.kind.tag().to_string() } else { format!("{}_nt{}", spec.kind.tag(), spec.nt) };
+                let tag = spec.variant();
                 let path = format!("{}/kernels/qwen4_moe_sym.{}.{tag}.contract.json", env!("CARGO_MANIFEST_DIR"), arch.name());
                 let contract = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))).unwrap();
                 certify(&toolchain, &build, &s, arch.name(), &dir.join(format!("{tag}.manifest.json")), Some(&contract), "test", "test")

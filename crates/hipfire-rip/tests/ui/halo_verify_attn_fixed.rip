@@ -1,0 +1,27 @@
+region KTile;
+// Standalone RIP safety fixture, assembled only if the sealed driver accepts it.
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let kspec = KernelSpec {
+        kernel_id: "rip_negative".into(), variant: "negative".into(),
+        arch: spec.arch, symbol: "rip_negative".into(),
+        kernargs: KernargLayout::new(0), user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false, workgroup_size: 32,
+        group_segment_fixed_size: 32768, wave32: true, cu_mode: false,
+    };
+    let mut p = RegPlan::new(256, 104)?;
+    for i in 0..4 { p.v::<8>("vectors", 8 * i, Live::Whole)?; }
+    p.s::<8>("scalars", 0, Live::Whole)?;
+    let mut b = Builder::new(kspec, p);
+    let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    let k0 = wg.lds::<KTile>("K0", 0, 8704)?;
+    let k1 = wg.lds::<KTile>("K1", 8704, 8704)?;
+    let (ring, st) = wg.ds_store(Ring::new(k0, k1), Instruction::new("ds_store_b128 v1, v[2:5]", vec![], vec![v(1), vr(2,4)]).memory(MemoryClass::DsStore))?;
+    // Legal control for the race's publication: drain, publish, then read.
+    // Physical buffer alternation is not needed to exercise this transition.
+    let drained = wg.wait(st)?;
+    let (ring,) = wg.barrier((prime(ring, drained),))?;
+    wg.ds_load_cur(&ring, Instruction::new("ds_load_b128 v[8:11], v6", vec![vr(8,4)], vec![v(6)]).memory(MemoryClass::DsLoad))?;
+    let end = wg.exit(".Lend")?;
+    wg.end(end)?;
+    b.finish()
+}

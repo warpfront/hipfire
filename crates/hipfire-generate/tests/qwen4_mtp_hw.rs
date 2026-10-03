@@ -2,19 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Qwen4 (Flash-Next) prompt-cache and MTP hardware tests.
+//! Qwen4 (Flash-Next) native MTP hardware test: seeded sampled MTP emits
+//! seeded AR's exact text.
 //!
-//! Every test is `#[ignore]`d: they need a real HIP GPU, the Flash-Next
-//! model (`HIPFIRE_QWEN4_CACHE_MODEL`, default
+//! `#[ignore]`d: it needs a real HIP GPU, the Flash-Next model
+//! (`HIPFIRE_QWEN4_CACHE_MODEL`, default
 //! `~/.hipfire/models/qwen3.8-flash-next.mq4.hfq`) and a release daemon
 //! (`HIPFIRE_DAEMON_BIN`, default `target/release/daemon`).
-//!
-//! One interactive daemon session runs a five-turn conversation where every
-//! turn's `messages` purely extend the previous turn, then asserts the
-//! `cached_tokens` pattern on each `done`: a pure extension reuses the prefix,
-//! except an MTP turn right after an AR turn (the AR decode does not feed the
-//! MTP head, so that hit is demoted to a cold miss).  A third test checks that
-//! seeded sampled MTP emits seeded AR's exact text.
 
 #![allow(clippy::all)]
 
@@ -28,14 +22,6 @@ static HW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn lock() -> std::sync::MutexGuard<'static, ()> {
     HW_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-const USERS: [&str; 5] = [
-    "Name one prime number and nothing else.",
-    "Now name a larger one.",
-    "Add those two numbers.",
-    "Is the sum even? Answer yes or no.",
-    "Say thanks in one word.",
-];
 
 fn model_path() -> Option<PathBuf> {
     let path = match std::env::var("HIPFIRE_QWEN4_CACHE_MODEL") {
@@ -230,91 +216,6 @@ fn turn(
             _ => {}
         }
     }
-}
-
-/// Run the five-turn greedy conversation; `penalties[i]` is turn `i`'s
-/// repeat penalty (1.0 → native MTP when loaded; anything else → AR, which
-/// applies it). Returns per-turn (`cached_tokens`, `mtp` marker).
-fn conversation(extra_env: &[(&str, &str)], mtp: bool, penalties: [f64; 5]) -> Vec<(u64, bool)> {
-    let Some(model) = model_path() else {
-        return Vec::new();
-    };
-    let model = model.to_string_lossy().into_owned();
-    let mut s = Session::spawn(extra_env);
-    load(&mut s, &model, mtp, "load");
-    let mut messages: Vec<Value> = Vec::new();
-    let mut out = Vec::new();
-    for (i, (user, penalty)) in USERS.iter().zip(penalties).enumerate() {
-        messages.push(serde_json::json!({ "role": "user", "content": user }));
-        let context = format!("turn {}", i + 1);
-        let (done, text) = turn(
-            &mut s,
-            &format!("q4c-{i}"),
-            i as u64 + 1,
-            &messages,
-            &serde_json::json!({ "temperature": 0.0, "repeat_penalty": penalty, "seed": 12345 }),
-            &context,
-        );
-        let cached = done
-            .get("cached_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let is_mtp = done.get("mtp").and_then(|v| v.as_bool()) == Some(true);
-        eprintln!("{context}: RP={penalty} cached={cached} mtp={is_mtp} text={text:?}");
-        assert!(
-            !text.trim().is_empty(),
-            "{context}: empty text; done={done}"
-        );
-        messages.push(serde_json::json!({ "role": "assistant", "content": text }));
-        out.push((cached, is_mtp));
-    }
-    s.close("unload");
-    out
-}
-
-#[test]
-#[ignore = "requires real HIP GPU + HIPFIRE_QWEN4_CACHE_MODEL (qwen3.8-flash-next) + release daemon"]
-fn qwen4_mtp_ar_prompt_cache_alternation() {
-    let _g = lock();
-    let turns = conversation(&[], true, [1.0, 1.0, 1.1, 1.0, 1.0]);
-    if turns.is_empty() {
-        return;
-    }
-    let cached: Vec<u64> = turns.iter().map(|t| t.0).collect();
-    let mtp: Vec<bool> = turns.iter().map(|t| t.1).collect();
-    assert_eq!(
-        mtp,
-        [true, true, false, true, true],
-        "route per turn (cached={cached:?})"
-    );
-    assert_eq!(cached[0], 0, "turn 1 is cold: {cached:?}");
-    assert!(cached[1] > 0, "MTP→MTP hits: {cached:?}");
-    assert!(cached[2] > 0, "MTP→AR hits: {cached:?}");
-    assert_eq!(cached[3], 0, "AR→MTP demotes to a miss: {cached:?}");
-    assert!(
-        cached[4] > 0,
-        "MTP→MTP hits after a cold MTP turn: {cached:?}"
-    );
-}
-
-#[test]
-#[ignore = "requires real HIP GPU + HIPFIRE_QWEN4_CACHE_MODEL (qwen3.8-flash-next) + release daemon"]
-fn qwen4_ar_prompt_cache_reuses_prefix() {
-    let _g = lock();
-    let turns = conversation(&[], false, [1.0; 5]);
-    if turns.is_empty() {
-        return;
-    }
-    let cached: Vec<u64> = turns.iter().map(|t| t.0).collect();
-    assert_eq!(cached[0], 0, "turn 1 is cold: {cached:?}");
-    assert!(
-        cached[1..].iter().all(|&c| c > 0),
-        "AR turns 2-5 hit: {cached:?}"
-    );
-
-    let disabled = conversation(&[("HIPFIRE_QWEN_PROMPT_CACHE", "0")], false, [1.0; 5]);
-    let cached: Vec<u64> = disabled.iter().map(|t| t.0).collect();
-    assert!(cached.iter().all(|&c| c == 0), "cache disabled: {cached:?}");
 }
 
 /// Seeded sampled MTP must emit seeded AR's exact tokens on both verify

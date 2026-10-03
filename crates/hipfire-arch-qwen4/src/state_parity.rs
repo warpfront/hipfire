@@ -15,6 +15,7 @@ use crate::gpu_forward::{
     Qwen4ProfilePhase, Qwen4ProfileStats,
 };
 use crate::mtp_gpu::{MtpGpuState, MtpStateParityMetadata};
+use crate::mtp_spec::validate_native_mtp_prefill_request;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::external_rows::RowCacheStats;
@@ -137,6 +138,7 @@ fn run_inner(
             "injected_replay_failure",
             Some("injected replay error"),
         )?,
+        cache_suffix_refusal(),
     ];
     let pass = cases.iter().all(is_pass) && scenarios.iter().all(is_pass);
     Ok(json!({
@@ -1052,6 +1054,19 @@ fn rollback_failure(
         "target_rollback": target_compare.1,
         "mtp_rollback": mtp_compare.1,
     }))
+}
+
+fn cache_suffix_refusal() -> Value {
+    let refusal = validate_native_mtp_prefill_request(&[1, 2, 3], &[1, 2, 3], 0, true)
+        .expect_err("cache-hit suffix must be refused");
+    json!({
+        "case": "cache_suffix_refusal",
+        "status": "pass",
+        "refusal": refusal,
+        "cache_hit": true,
+        "prompt_len": 3,
+        "fill_len": 3,
+    })
 }
 
 /// JSON report returned by the state parity orchestration entrypoint.
@@ -2143,7 +2158,7 @@ mod tests {
         let scenarios = field(&report, "scenarios")
             .as_array()
             .expect("scenarios array");
-        assert_eq!(scenarios.len(), 5);
+        assert_eq!(scenarios.len(), 6);
         let mut scenario_names = BTreeSet::new();
         for scenario in scenarios {
             assert_pass(scenario);
@@ -2162,6 +2177,7 @@ mod tests {
                 "forced_terminal_seed",
                 "cancellation",
                 "injected_replay_failure",
+                "cache_suffix_refusal",
             ]
             .into_iter()
             .map(str::to_string)
@@ -2250,5 +2266,15 @@ mod tests {
             field(injected, "replay_error").as_str(),
             Some("injected replay error")
         );
+
+        let cache = scenarios
+            .iter()
+            .find(|scenario| field(scenario, "case").as_str() == Some("cache_suffix_refusal"))
+            .expect("cache suffix refusal scenario");
+        assert_eq!(field(cache, "cache_hit").as_bool(), Some(true));
+        assert!(field(cache, "refusal")
+            .as_str()
+            .unwrap()
+            .contains("cache-hit suffix"));
     }
 }

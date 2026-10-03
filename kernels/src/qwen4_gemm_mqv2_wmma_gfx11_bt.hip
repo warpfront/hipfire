@@ -124,6 +124,51 @@ __device__ __forceinline__ half16_t decode6_tile_split(unsigned long long code,
     return __builtin_bit_cast(half16_t, both);
 }
 
+// Packed-pair variant of decode6_tile_split: two codes per VALU op.  The
+// codes ride in the mantissas of 1024 + q (0x6400 | q, exact for q < 64);
+// v_pk_add_f16 of -1024 (0xe400) recovers q exactly, and v_pk_fma_f16
+// computes sc * q + zp in one rounding (RNE), the same fused expression as
+// the scalar path's v_fma_f16 with the same operand order (sc, q, zp).
+// Explicit asm pins the fusion and operand order against reordering or
+// contraction.  `sc2`/`zp2` carry the raw half bits replicated in both halves.
+__device__ __forceinline__ unsigned int pk_add_f16_bt(unsigned int a, unsigned int b) {
+    unsigned int r;
+    asm("v_pk_add_f16 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+__device__ __forceinline__ unsigned int pk_fma_f16_bt(unsigned int a, unsigned int b,
+                                                      unsigned int c) {
+    unsigned int r;
+    asm("v_pk_fma_f16 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    return r;
+}
+__device__ __forceinline__ half16_t decode6_tile_split_pk(unsigned long long code,
+                                                          unsigned int sc2,
+                                                          unsigned int zp2,
+                                                          int lane_half) {
+    uint4_bt_t m;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const unsigned int q0 = (unsigned int)(code >> (12 * k)) & 63u;
+        const unsigned int q1 = (unsigned int)(code >> (12 * k + 6)) & 63u;
+        const unsigned int q2bits = 0x64006400u | q0 | (q1 << 16);
+        const unsigned int q2 = pk_add_f16_bt(q2bits, 0xe400e400u);
+        m[k] = pk_fma_f16_bt(sc2, q2, zp2);
+    }
+    uint4_bt_t o;
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+        o[k] = (unsigned int)__builtin_amdgcn_permlanex16(
+            (int)m[k], (int)m[k], 0x76543210u, 0xfedcba98u, false, false);
+    uint8_bt_t both;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        both[k] = lane_half ? o[k] : m[k];
+        both[k + 4] = lane_half ? m[k] : o[k];
+    }
+    return __builtin_bit_cast(half16_t, both);
+}
+
 // ---------------------------------------------------------------------------
 // QKVZA overwrite BT4 — four projection regions (QKV/Z/beta/alpha)
 // Grid: [ceil((qkv_m+z_m+beta_m+alpha_m)/16), ceil(N/(16*BV))]. Block: [32].
@@ -708,7 +753,7 @@ static __device__ __forceinline__ void hcw_apply8(const uint4 mq, int t, int c0,
 // halves apart (>= K; see Gpu::f16_row_pitch).
 // ---------------------------------------------------------------------------
 template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false, int PREFETCH = 1,
-          bool HC = false>
+          bool HC = false, bool DQ = false>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
@@ -724,7 +769,17 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     constexpr int NT = 32 * RW;
     constexpr int VPT = CK / 8;         // 16 B vectors per token per chunk
     constexpr int VECS = TOK * VPT / NT;
-    __shared__ __attribute__((aligned(16))) _Float16 xs[TOK * STRIDE];
+    // HC parking reuses xs for TOK x (16 * RW) BF16 channel halfs.  RW <= 4 parks at
+    // the staging STRIDE (72 for RW4: the incumbent layout, unchanged).  RW8 needs 128
+    // halfs per token, and the unpadded 16 * RW stride (no padding) is what keeps the
+    // BV16/RW8 tile at exactly TOK * 128 * 2 B = 64 KB, the LDS limit.  Every HC
+    // store and the stage-2 read use PARK_STRIDE, so the chain (WMMA -> permlanex16
+    // swap -> hcw_pack8 -> LDS -> hcw_apply8) is the incumbent's, only re-addressed.
+    constexpr int PARK_STRIDE = (RW <= 4) ? STRIDE : 16 * RW;
+    constexpr int STAGE_HALFS = TOK * STRIDE;
+    constexpr int PARK_HALFS = HC ? TOK * PARK_STRIDE : 0;
+    constexpr int LDS_HALFS = STAGE_HALFS > PARK_HALFS ? STAGE_HALFS : PARK_HALFS;
+    __shared__ __attribute__((aligned(16))) _Float16 xs[LDS_HALFS];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -748,10 +803,10 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // Slot i covers token i * (NT / VPT) + tid / VPT, so its LDS offset is
     // lds0 plus a compile-time constant.  Named scalars, not an array: the
     // array stays in scratch because SROA runs before the loops unroll.
-    static_assert(VECS == 4 || VECS == 6 || VECS == 8 || VECS == 12);
+    static_assert(VECS == 4 || VECS == 6 || VECS == 8 || VECS == 12 || VECS == 16);
     static_assert(PREFETCH == 1 || PREFETCH == 2);
-    static_assert(TOK * STRIDE * sizeof(_Float16) <= 32768);
-#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7) F(8) F(9) F(10) F(11)
+    static_assert(LDS_HALFS * sizeof(_Float16) <= 65536);
+#define XL_FOR8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7) F(8) F(9) F(10) F(11) F(12) F(13) F(14) F(15)
 #define XL_OFF(I) \
     const int xo##I = ((batch_start + I * (NT / VPT) + tid / VPT < N) \
         ? (batch_start + I * (NT / VPT) + tid / VPT) : 0) * ldx + (tid % VPT) * 8;
@@ -765,8 +820,8 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
     // The barriers order LDS only: __syncthreads would also wait for the
     // in-flight next-chunk X and payload loads (WGP-mode workgroup fence).
 #define XL_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
-    uint4 st0, st1, st2, st3, st4, st5, st6, st7, st8, st9, st10, st11;
-    uint4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nx8, nx9, nx10, nx11;
+    uint4 st0, st1, st2, st3, st4, st5, st6, st7, st8, st9, st10, st11, st12, st13, st14, st15;
+    uint4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nx8, nx9, nx10, nx11, nx12, nx13, nx14, nx15;
     {
         const int cn = 0;
         XL_FOR8(XL_LOAD)
@@ -789,6 +844,14 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
         const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
         const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
+        // DQ: raw half bits replicated into both 16-bit halves (v_perm_b32).
+        unsigned int sc2_0 = 0, zp2_0 = 0, sc2_1 = 0, zp2_1 = 0;
+        if constexpr (DQ) {
+            sc2_0 = __builtin_amdgcn_perm(hA, hA, 0x01000100u);
+            zp2_0 = __builtin_amdgcn_perm(hA, hA, 0x03020302u);
+            sc2_1 = __builtin_amdgcn_perm(hB, hB, 0x01000100u);
+            zp2_1 = __builtin_amdgcn_perm(hB, hB, 0x03020302u);
+        }
 #pragma unroll
         for (int cq = 0; cq < 4; cq++) {
             const int c = g * 4 + cq;
@@ -823,8 +886,15 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                 const unsigned int lo = lane_half
                     ? __builtin_amdgcn_alignbit(d[3 * j + 2], d[3 * j + 1], 16) : d[3 * j];
                 const unsigned int hi = lane_half ? (d[3 * j + 2] >> 16) : (d[3 * j + 1] & 0xFFFFu);
-                half16_t a_reg = decode6_tile_split(
-                    ((unsigned long long)hi << 32) | lo, sc_h, zp_h, lane_half);
+                half16_t a_reg;
+                if constexpr (DQ) {
+                    a_reg = decode6_tile_split_pk(((unsigned long long)hi << 32) | lo,
+                                                  (kt < 8) ? sc2_0 : sc2_1,
+                                                  (kt < 8) ? zp2_0 : zp2_1, lane_half);
+                } else {
+                    a_reg = decode6_tile_split(
+                        ((unsigned long long)hi << 32) | lo, sc_h, zp_h, lane_half);
+                }
 #pragma unroll
                 for (int b = 0; b < BV; b++) {
                     half16_t b_reg = *(const half16_t*)(xs + (b * 16 + ml) * STRIDE + j * 16);
@@ -860,10 +930,10 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         if (HC) {
             // M % 8 == 0 (caller): no partial row run.  Park the BF16 bits of
             // 0.0f + acc in LDS (xs: the staging buffer is dead after the last
-            // chunk's closing barrier); `Y`, when non-null, is the unfused
-            // kernel's own F32 output (debug/capture mirror).
+            // chunk's closing barrier) at row stride PARK_STRIDE; `Y`, when
+            // non-null, is the unfused kernel's own F32 output (debug/capture mirror).
             if (Y) hcw_mirror8(r, out_col, row0, M, Y);
-            *(uint4*)(xs + (b * 16 + ml) * STRIDE + 16 * (tid >> 5) + 8 * lane_half) = hcw_pack8(r);
+            *(uint4*)(xs + (b * 16 + ml) * PARK_STRIDE + 16 * (tid >> 5) + 8 * lane_half) = hcw_pack8(r);
             continue;
         }
         if (OUT_BF16) {
@@ -910,7 +980,7 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             const int t = batch_start + tl;
             const int c0 = (row_block < 0 ? (int)blockIdx.x : row_block) * RW * 16 + c8 * 8;
             if (t >= N || c0 >= M) continue;
-            hcw_apply8(*(const uint4*)(xs + tl * STRIDE + c8 * 8), t, c0, M, hc_streams, hc_gates,
+            hcw_apply8(*(const uint4*)(xs + tl * PARK_STRIDE + c8 * 8), t, c0, M, hc_streams, hc_gates,
                        hc_bf16);
         }
     }
@@ -996,7 +1066,59 @@ U3_TILE(12, 4, 1)
 U3_TILE(12, 4, 2)
 U3_TILE(12, 8, 1)
 U3_TILE(12, 8, 2)
+// BV16 U3 tiles (TOK = 256 tokens; VECS = 16 for RW4, 8 for RW8).
+U3_TILE(16, 4, 1)
+U3_TILE(16, 4, 2)
+U3_TILE(16, 8, 1)
+U3_TILE(16, 8, 2)
 #undef U3_TILE
+
+// Tile-twin multi-region and HC-fused entries, generated separately from U3_TILE
+// (packed X: row pitch K)
+// so the incumbent U3 wrappers and the *_bt8_x4_{regions,hcw} entries stay byte-
+// identical.  `_regions`: the incumbent three-region ABI with r_i = ceil(M_i / (16*RW))
+// row blocks per region (RW 16-row tiles per block) and the same dispatch /
+// local_rb pattern.  `_hcw`: the incumbent HC ABI (M % 8 == 0), body
+// resid_bt_xlds<6, BV, RW, true, false, PF, true>.
+#define U3_TWIN_TILE(BV, RW, PF) \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_regions( \
+    const char* A0, const char* A1, const char* A2, const _Float16* X, \
+    float* Y0, float* Y1, float* Y2, int M0, int M1, int M2, int K, int N) { \
+    if (N <= 0 || K <= 0) return; \
+    const int r0 = (M0 + 16 * RW - 1) / (16 * RW); \
+    const int r1 = (M1 + 16 * RW - 1) / (16 * RW); \
+    const int rb = blockIdx.x; \
+    const char* A; \
+    float* Y; \
+    int M, local_rb; \
+    if (rb < r0) { \
+        A = A0; Y = Y0; M = M0; local_rb = rb; \
+    } else if (rb < r0 + r1) { \
+        A = A1; Y = Y1; M = M1; local_rb = rb - r0; \
+    } else { \
+        A = A2; Y = Y2; M = M2; local_rb = rb - r0 - r1; \
+    } \
+    if (M <= 0 || local_rb >= (M + 16 * RW - 1) / (16 * RW)) return; \
+    resid_bt_xlds<6, BV, RW, true, false, PF>(A, X, Y, M, K, N, K, local_rb); \
+} \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_hcw( \
+    const char* __restrict__ A, const _Float16* __restrict__ X, float* __restrict__ Y, \
+    int M, int K, int N, \
+    void* hc_streams, const float* hc_gates, int hc_bf16) { \
+    resid_bt_xlds<6, BV, RW, true, false, PF, true>(A, X, Y, M, K, N, K, -1, hc_streams, \
+                                                     hc_gates, hc_bf16); \
+}
+U3_TWIN_TILE(8, 4, 1)
+U3_TWIN_TILE(8, 4, 2)
+U3_TWIN_TILE(8, 8, 1)
+U3_TWIN_TILE(8, 8, 2)
+U3_TWIN_TILE(16, 4, 1)
+U3_TWIN_TILE(16, 4, 2)
+U3_TWIN_TILE(16, 8, 1)
+U3_TWIN_TILE(16, 8, 2)
+#undef U3_TWIN_TILE
 
 extern "C" __launch_bounds__(128, 1) __global__ void
 gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions(
@@ -1018,6 +1140,62 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions(
     }
     if (M <= 0 || local_rb >= (M + 63) / 64) return;
     resid_bt_xlds<6, 8, 4, true>(A, X, Y, M, K, N, ldx, local_rb);
+}
+
+// DQ entries: the U3 b8 tiles / regions / hcw paths with the packed-pair dequant
+// (resid_bt_xlds DQ = true).  Incumbent entries are unchanged; this block stays
+// before the final incumbent kernel (gemm_..._bt8_x4_hcw) so that kernel's code is
+// not perturbed by appended entries.
+#define U3_DQ_TILE(BV, RW, PF) \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_dq( \
+    const char* A, const _Float16* X, float* Y, int M, int K, int N) { \
+    if (M <= 0 || K <= 0 || N <= 0) return; \
+    resid_bt_xlds<6, BV, RW, true, false, PF, false, true>(A, X, Y, M, K, N, K); \
+} \
+extern "C" __launch_bounds__(32 * RW, 1) __global__ void \
+gemm_mq6g256v2_wmma_gfx11_u3_b##BV##_r##RW##_p##PF##_dq_bf16out( \
+    const char* A, const _Float16* X, float* Y, int M, int K, int N) { \
+    if (M <= 0 || K <= 0 || N <= 0) return; \
+    resid_bt_xlds<6, BV, RW, true, true, PF, false, true>(A, X, Y, M, K, N, K); \
+}
+U3_DQ_TILE(8, 4, 1)
+U3_DQ_TILE(8, 4, 2)
+U3_DQ_TILE(8, 8, 1)
+U3_DQ_TILE(8, 8, 2)
+#undef U3_DQ_TILE
+
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_regions(
+    const char* A0, const char* A1, const char* A2, const _Float16* X,
+    float* Y0, float* Y1, float* Y2, int M0, int M1, int M2, int K, int N) {
+    if (N <= 0 || K <= 0) return;
+    const int r0 = (M0 + 63) / 64;
+    const int r1 = (M1 + 63) / 64;
+    const int rb = blockIdx.x;
+    const char* A;
+    float* Y;
+    int M, local_rb;
+    if (rb < r0) {
+        A = A0; Y = Y0; M = M0; local_rb = rb;
+    } else if (rb < r0 + r1) {
+        A = A1; Y = Y1; M = M1; local_rb = rb - r0;
+    } else {
+        A = A2; Y = Y2; M = M2; local_rb = rb - r0 - r1;
+    }
+    if (M <= 0 || local_rb >= (M + 63) / 64) return;
+    resid_bt_xlds<6, 8, 4, true, false, 1, false, true>(A, X, Y, M, K, N, K, local_rb);
+}
+
+extern "C" __launch_bounds__(128, 1) __global__ void
+gemm_mq6g256v2_wmma_gfx11_u3_b8_r4_p1_dq_hcw(const char* __restrict__ A,
+                                             const _Float16* __restrict__ X,
+                                             float* __restrict__ Y,
+                                             int M, int K, int N,
+                                             void* hc_streams, const float* hc_gates, int hc_bf16) {
+    if (M <= 0 || K <= 0 || N <= 0) return;
+    resid_bt_xlds<6, 8, 4, true, false, 1, true, true>(A, X, Y, M, K, N, K, -1, hc_streams, hc_gates,
+                                                      hc_bf16);
 }
 
 // Y = W·X applied to the HC streams in place: the unfused kernel's `0.0f + acc`

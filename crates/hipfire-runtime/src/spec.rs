@@ -211,6 +211,16 @@ pub trait SpecTarget {
     /// so production rollback can attest `rolled_back:false`.
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
+    /// Discard live decode state after a terminal stop inside a speculative
+    /// window that [`Speculator::repair_terminal_prefix`] could not repair.
+    /// The caller drops its host history and never extends this state; the
+    /// next request prefills anew. Default: [`Self::reset_recurrent`]. A
+    /// target whose prompt cache is a durable checkpoint that live decode
+    /// rows never overwrite may rewind to it instead, so it survives the stop.
+    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset_recurrent(gpu)
+    }
+
     /// Whether this target's architecture reset-core is complete enough for
     /// serve-hardening retry. Default `false` (explicitly ineligible). Retry
     /// candidates override to `true` only when recurrent/EF/KV/cache/graph/
@@ -858,18 +868,19 @@ pub trait Speculator {
         Vec::new()
     }
 
-    /// Whether this speculator can continue its own state from a cached prompt
-    /// prefix of `start_pos` tokens (suffix-only prefill). `false` makes the
-    /// planner turn the hit into a cold miss.
-    fn prompt_cache_resumable(&self, start_pos: usize) -> bool {
-        let _ = start_pos;
-        true
-    }
-
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
     /// so a drafter that forgets to free is a missing-trait-method compile
     /// error rather than a silent VRAM leak.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// [`Self::free`] for a mesh unload: a dense-TP drafter owns per-rank
+    /// buffers the daemon's single `Gpu` cannot reach.
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.free(dev);
+        }
+    }
 
     /// Whether this drafter requires greedy verification (temperature 0).
     /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
@@ -1102,12 +1113,6 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
-    /// See [`Speculator::prompt_cache_resumable`].
-    fn mtp_prompt_cache_resumable(&self, start_pos: usize) -> bool {
-        let _ = start_pos;
-        true
-    }
-
     /// Restore the MTP target's recurrent state to an advertised checkpoint
     /// and discard checkpoints from the now-stale future.
     fn mtp_rewind_to(
@@ -1132,6 +1137,14 @@ pub trait MtpDrafter {
 
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// [`Self::mtp_free`] for a mesh unload.
+    fn mtp_free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.mtp_free(dev);
+        }
+    }
 
     /// Draft window size (K).
     fn k(&self) -> usize;
@@ -1329,10 +1342,6 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         self.arch.mtp_checkpoint_positions()
     }
 
-    fn prompt_cache_resumable(&self, start_pos: usize) -> bool {
-        self.arch.mtp_prompt_cache_resumable(start_pos)
-    }
-
     fn rewind_to(
         &mut self,
         gpu: &mut Gpu,
@@ -1354,6 +1363,10 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         // Move the drafter out of the box and hand it its own boxed-self free.
         Box::new(self.arch).mtp_free(gpu);
+    }
+
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        Box::new(self.arch).mtp_free_multi(gpus);
     }
 
     fn requires_greedy(&self) -> bool {

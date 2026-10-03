@@ -288,6 +288,66 @@ impl SingleQueuePm4Ib {
         )
     }
 
+    /// [`Self::create_profiled_gfx11`] with the indirect buffer allocated from
+    /// a separate (device-local) pool; timestamps and completion stay on `pool`.
+    pub fn create_profiled_legacy_with_ib_pool(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        ib_pool: &KernargPool,
+        commands: &Gfx10Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let mut timestamps = pool.allocate_executable_bytes(16)?;
+        timestamps.as_mut_bytes().fill(0);
+        let start = timestamps.address() as usize as u64;
+        let timed = commands.with_gpu_timestamps(start, start + 8);
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        Self::create_encoded(
+            device,
+            pool,
+            Some(ib_pool),
+            &timed.as_bytes(),
+            timed.len_dwords(),
+            Some(timestamps),
+            Some(frequency_hz),
+        )
+    }
+
+    /// GFX10/GFX11 attribution tape: a stamp after every dispatch and after
+    /// every compute-idle packet (see
+    /// [`Gfx10Pm4CommandBuffer::with_boundary_timestamps`]). Spans alternate
+    /// kernel issue-to-idle and boundary idle-to-next-issue.
+    pub fn create_boundary_profiled_legacy(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        commands: &Gfx10Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let slots = commands
+            .boundary_timestamp_slot_count()
+            .map_err(|dword| ReplayError::MalformedPm4IndirectBuffer { dword })?;
+        let mut timestamps = pool.allocate_executable_bytes(slots * 8)?;
+        timestamps.as_mut_bytes().fill(0);
+        let base = timestamps.address() as usize as u64;
+        let timed = commands
+            .with_boundary_timestamps(base)
+            .map_err(|dword| ReplayError::MalformedPm4IndirectBuffer { dword })?;
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        Self::create_encoded(
+            device,
+            pool,
+            None,
+            &timed.as_bytes(),
+            timed.len_dwords(),
+            Some(timestamps),
+            Some(frequency_hz),
+        )
+    }
+
     fn create_encoded(
         device: &GpuDevice,
         pool: &KernargPool,

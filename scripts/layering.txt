@@ -39,6 +39,7 @@
  2 railgun-cert
  3 hipfire-cpu
  3 rdna-compute
+ 3 hipfire-rip
  4 hipfire-dispatch
  4 saddle-core
  4 railgun-jitcorpus

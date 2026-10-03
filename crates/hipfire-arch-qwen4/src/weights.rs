@@ -195,11 +195,19 @@ fn qwen4_quant_source() -> DTypeConstraint {
 /// the tier this build happens to write would make a published rung of the
 /// other tier unloadable by the very tree that produced it.
 ///
-/// The set stays closed beyond that pair: four-bit families are a group width
-/// the trunk's decode kernels do not read, and their admission would only move
-/// the failure to the artifact boundary.
+/// A third rung is admitted for the opt-in dense IU4 trunk
+/// (`HIPFIRE_QWEN4_TRUNK_IU4`): symmetric MQ4G256V2 (qt=44), the aligned-K
+/// 256 group the trunk's GEMV (`gemv_mq4g256v2`) and the dense IU4 SET
+/// kernels read. Other four-bit families stay out: their group width is one
+/// the trunk's decode kernels do not read, and their admission would only
+/// move the failure to the artifact boundary.
 fn qwen4_trunk_matrix_source() -> DTypeConstraint {
-    DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0, DType::MQ6G256V2])
+    DTypeConstraint::source_from_sources(vec![
+        DType::BF16,
+        DType::Q8_0,
+        DType::MQ6G256V2,
+        DType::MQ4G256V2,
+    ])
 }
 
 /// True for the rank-2 trunk attention/GDN matrices — the class
@@ -410,15 +418,23 @@ impl Qwen4Manifest {
         let quant_matrix = qwen4_quant_source();
         let quant_q8 = qwen4_q8_source();
         let quant_trunk = qwen4_trunk_matrix_source();
+        // The head keeps the trunk's six/eight-bit rungs (artifacts written
+        // with its earlier Q8F16 tier keep loading) but not the IU4 trunk's
+        // four-bit one: four bits cost +0.014 KLD there.
+        let quant_head = DTypeConstraint::source_from_sources(vec![
+            DType::BF16,
+            DType::Q8_0,
+            DType::MQ6G256V2,
+        ]);
         let model = |name: &str,
                      shape: Vec<usize>,
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             let dtype = qwen4_trunk_target(name, &shape, requested_dtype, trunk_tier);
-            // The head shares the trunk's source set, so artifacts written
-            // with its earlier Q8F16 tier keep loading.
-            let source = if qwen4_trunk_matrix(name, &shape) || name == QWEN4_LM_HEAD {
+            let source = if name == QWEN4_LM_HEAD {
+                &quant_head
+            } else if qwen4_trunk_matrix(name, &shape) {
                 &quant_trunk
             } else if dtype == DType::Q8_0 {
                 &quant_q8
@@ -1473,7 +1489,11 @@ impl Qwen4Weights {
     /// Load-time precision experiments: `HIPFIRE_QWEN4_REQUANT="pat=fmt;..."`
     /// replaces every resident rank-2 weight whose name contains `pat` (first
     /// matching rule wins) with a requantized copy, `fmt` = `mq2` .. `mq6`
-    /// (MQ G256 V2) | `q8` (from BF16 only). Decode and prefill both bind it.
+    /// (MQ G256 V2) | `q8` (from BF16 only) | `qt44:DIR` (pre-encoded QT44
+    /// bytes from `DIR/<tensor name>.bin` where that file exists, e.g. an
+    /// offline GPTQ solve; it must hold exactly the `m x k` matrix). Decode
+    /// and prefill both
+    /// bind it.
     pub fn requant_from_env(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         let Ok(spec) = hipfire_config::developer_var("HIPFIRE_QWEN4_REQUANT") else {
             return Ok(());
@@ -1483,40 +1503,60 @@ impl Qwen4Weights {
             let (pattern, format) = rule
                 .split_once('=')
                 .ok_or_else(|| format!("HIPFIRE_QWEN4_REQUANT rule {rule:?} is not pat=fmt"))?;
-            let target = match format.trim() {
-                "mq2" => DType::MQ2G256V2,
-                "mq3" => DType::MQ3G256V2,
-                "mq4" => DType::MQ4G256V2,
-                "mq5" => DType::MQ5G256V2,
-                "mq6" => DType::MQ6G256V2,
-                "q8" => DType::Q8_0,
-                other => return Err(format!("HIPFIRE_QWEN4_REQUANT format {other:?}")),
+            let (target, dir) = match format.trim() {
+                "mq2" => (DType::MQ2G256V2, None),
+                "mq3" => (DType::MQ3G256V2, None),
+                "mq4" => (DType::MQ4G256V2, None),
+                "mq5" => (DType::MQ5G256V2, None),
+                "mq6" => (DType::MQ6G256V2, None),
+                "q8" => (DType::Q8_0, None),
+                other => match other.strip_prefix("qt44:") {
+                    Some(dir) => (DType::MQ4G256V2, Some(std::path::PathBuf::from(dir))),
+                    None => return Err(format!("HIPFIRE_QWEN4_REQUANT format {other:?}")),
+                },
             };
-            rules.push((pattern.trim().to_string(), target));
+            rules.push((pattern.trim().to_string(), target, dir));
         }
         let (mut count, mut before, mut after) = (0usize, 0usize, 0usize);
         for taken in &mut self.taken {
             let WeightHandle::Resident(tensor) = &taken.handle else {
                 continue;
             };
-            let Some(&(_, target)) = rules
+            let Some((_, target, dir)) = rules
                 .iter()
-                .find(|(pattern, _)| taken.key.name.contains(pattern.as_str()))
+                .find(|(pattern, _, _)| taken.key.name.contains(pattern.as_str()))
             else {
                 continue;
             };
+            let target = *target;
             let [m, k] = taken.projection.logical_shape[..] else {
                 continue;
             };
-            if tensor.dtype == target {
-                continue;
-            }
-            let copy = if target == DType::Q8_0 {
-                gpu.quantize_bf16_q8_0(tensor, m, k)
+            let copy = if let Some(dir) = dir {
+                // A matching tensor without a file keeps its payload (the
+                // MTP attention shares the trunk's names).
+                let path = dir.join(format!("{}.bin", taken.key.name));
+                if !path.exists() {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                if k % 256 != 0 || bytes.len() != m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES {
+                    return Err(format!("{}: {} bytes is not a {m}x{k} QT44 matrix", path.display(), bytes.len()));
+                }
+                let mut copy = gpu.upload_raw(&bytes, &[bytes.len()]).map_err(|error| error.to_string())?;
+                copy.dtype = DType::MQ4G256V2;
+                copy
             } else {
-                gpu.requant_g256(tensor, m, k, target)
-            }
-            .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?;
+                if tensor.dtype == target {
+                    continue;
+                }
+                if target == DType::Q8_0 {
+                    gpu.quantize_bf16_q8_0(tensor, m, k)
+                } else {
+                    gpu.requant_g256(tensor, m, k, target)
+                }
+                .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?
+            };
             count += 1;
             before += tensor.buf.size();
             after += copy.buf.size();

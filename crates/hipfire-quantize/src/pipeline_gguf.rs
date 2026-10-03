@@ -545,8 +545,19 @@ pub(crate) fn run_gguf_pipeline(
                 | GgufFormat::Mq4Lloyd
                 | GgufFormat::Mq5
                 | GgufFormat::Mq6 => {
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    if matches!(format, GgufFormat::Mq4V2 | GgufFormat::Mq4V2Lloyd)
+                        && mq6v2_promote_supported(arch_id)
+                    {
+                        // GGUF shape[0] is the innermost (K) dim and k_dim % 256 == 0 is
+                        // guaranteed by the enclosing guard; rows = numel / K.
+                        let k = k_dim as usize;
+                        let m = n_elements as usize / k;
+                        let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                    } else {
+                        let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    }
                 }
                 GgufFormat::Mq6V2 | GgufFormat::Mq5V2 | GgufFormat::Mq3V2 | GgufFormat::Mq2V2 => {
                     let m = info.shape[0] as usize;

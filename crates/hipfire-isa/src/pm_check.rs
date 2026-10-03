@@ -162,7 +162,7 @@ fn step(w: &mut Wave, name: &str, ops: &[&str]) {
 /// Byte ranges `(offset, width)` a DS instruction touches relative to its address VGPR.
 fn ds_ranges(name: &str, ops: &str) -> Option<Vec<(u32, u32)>> {
     let field = |key: &str| ops.split_whitespace().find_map(|t| t.strip_prefix(key)).and_then(parse_imm).unwrap_or(0);
-    let width = |suffix: &str| match suffix { "b32" => Some(4), "b64" => Some(8), "b96" => Some(12), "b128" => Some(16), _ => None };
+    let width = |suffix: &str| match suffix { "b16" | "b16_d16_hi" => Some(2), "b32" => Some(4), "b64" => Some(8), "b96" => Some(12), "b128" => Some(16), _ => None };
     let op = name.strip_prefix("ds_load_").or_else(|| name.strip_prefix("ds_store_"))?;
     if let Some(rest) = op.strip_prefix("2addr_stride64_") {
         let w = width(rest)?;
@@ -182,6 +182,19 @@ fn ds_ranges(name: &str, ops: &str) -> Option<Vec<(u32, u32)>> {
 /// kernel without DS memory accesses passes only with no allocation
 /// (`limit == 0`).
 pub fn lds_bounds(source: &str, symbol: &str, waves: u32, limit: u32) -> Result<u32> {
+    lds_bounds_host(source, symbol, waves, limit, &[]).map(|(end, _)| end)
+}
+
+/// [`lds_bounds`] for a kernel whose `host_bounded` VGPRs address a
+/// launch-sized dynamic LDS list (the QSA token list): each of their
+/// definitions must be `v_add_nc_u32_e32 vR, sN, vL` with `vL` a lane offset
+/// the entry block derives (at most 124 bytes), or `v_mov_b32_e32 vR, sN`,
+/// and each access through them spans at most 64 bytes past `vR`. Their
+/// scalar base is the kernel's list position, bounded by the launch
+/// contract, not by this check. Every other access is bounded as in
+/// [`lds_bounds`]. Returns the static maximum end and the number of
+/// host-bounded accesses.
+pub fn lds_bounds_host(source: &str, symbol: &str, waves: u32, limit: u32, host_bounded: &[u16]) -> Result<(u32, usize)> {
     let marker = format!("\n{symbol}:\n");
     let start = source.find(&marker).ok_or_else(|| format!("{symbol}: missing kernel label"))? + marker.len();
     let body = &source[start - 1..];
@@ -197,36 +210,59 @@ pub fn lds_bounds(source: &str, symbol: &str, waves: u32, limit: u32) -> Result<
         .ok_or("kernel has no block boundary")?;
     let mut end = 0u32;
     let mut checked = 0usize;
+    let mut hosted = 0usize;
     for wave in 0..waves {
         let mut w = Wave { v: BTreeMap::new(), s: BTreeMap::new() };
         w.v.insert(0, std::array::from_fn(|l| Some(wave * 32 + l as u32)));
         for (i, (name, ops, rest)) in lines.iter().enumerate() {
             // ds_swizzle_b32 exchanges lanes on the LDS crossbar and touches no LDS memory.
-            if name.starts_with("ds_") && *name != "ds_swizzle_b32" {
-                let addr_op = if name.starts_with("ds_store") { ops.first() } else { ops.get(1) };
-                let reg = addr_op.map(|o| o.split_whitespace().next().unwrap_or("")).and_then(|o| o.strip_prefix('v')).and_then(|n| n.parse::<u16>().ok())
-                    .ok_or_else(|| format!("{name}: unparsed LDS address in `{rest}`"))?;
-                if i > head && lines[head + 1..].iter().any(|(n2, o2, _)| n2.starts_with('v') && o2.first().and_then(|o| dst(o)) == Some(('v', reg))) {
-                    return Err(format!("LDS address v{reg} is redefined inside the K loop"));
-                }
-                let addr = w.v.get(&reg).copied().unwrap_or([None; 32]);
-                for (lane, value) in addr.iter().enumerate() {
-                    let base = value.ok_or_else(|| format!("{name} {rest}: lane {lane} of wave {wave} has an address the prologue cannot derive"))?;
-                    for (offset, width) in ds_ranges(name, rest).ok_or_else(|| format!("unsupported DS instruction {name}"))? {
-                        let e = base.checked_add(offset).and_then(|x| x.checked_add(width)).ok_or("LDS address overflow")?;
-                        if (base + offset) % width.min(8) != 0 { return Err(format!("{name} {rest}: misaligned LDS access {} in wave {wave} lane {lane}", base + offset)) }
-                        if e > limit { return Err(format!("{name} {rest}: wave {wave} lane {lane} reaches byte {e} of {limit}")) }
-                        end = end.max(e);
-                    }
-                }
-                checked += 1;
-            } else if i < head {
-                step(&mut w, name, ops);
+            if !name.starts_with("ds_") || *name == "ds_swizzle_b32" {
+                if i < head { step(&mut w, name, ops); }
+                continue;
             }
+            let addr_op = if name.starts_with("ds_store") { ops.first() } else { ops.get(1) };
+            let reg = addr_op.map(|o| o.split_whitespace().next().unwrap_or("")).and_then(|o| o.strip_prefix('v')).and_then(|n| n.parse::<u16>().ok())
+                .ok_or_else(|| format!("{name}: unparsed LDS address in `{rest}`"))?;
+            let ranges = ds_ranges(name, rest).ok_or_else(|| format!("unsupported DS instruction {name}"))?;
+            if host_bounded.contains(&reg) {
+                if i < head { return Err(format!("{name} {rest}: host-bounded access in the entry block")) }
+                if ranges.iter().any(|&(o, wd)| o + wd > 64) { return Err(format!("{name} {rest}: host-bounded access spans past 64 bytes")) }
+                if wave == 0 {
+                    for (n2, o2, r2) in &lines[..] {
+                        if !n2.starts_with('v') || o2.first().and_then(|o| dst(o)) != Some(('v', reg)) { continue }
+                        let lane_ok = |o: &str| o.strip_prefix('v').and_then(|n| n.parse::<u16>().ok())
+                            .and_then(|n| w.v.get(&n)).is_some_and(|l| l.iter().all(|x| x.is_some_and(|x| x <= 124)))
+                            && lines[head + 1..].iter().all(|(n3, o3, _)| !n3.starts_with('v') || o3.first().and_then(|o| dst(o)) != o.strip_prefix('v').and_then(|n| n.parse().ok()).map(|n| ('v', n)));
+                        let scalar = |o: &str| o.starts_with('s') && o[1..].parse::<u16>().is_ok();
+                        let ok = match (*n2, o2.as_slice()) {
+                            ("v_add_nc_u32_e32", [_, s, l]) => scalar(s) && lane_ok(l),
+                            ("v_mov_b32_e32", [_, s]) => scalar(s),
+                            _ => false,
+                        };
+                        if !ok { return Err(format!("host-bounded LDS address v{reg} defined by `{n2} {r2}`")) }
+                    }
+                    hosted += 1;
+                }
+                continue;
+            }
+            if i > head && lines[head + 1..].iter().any(|(n2, o2, _)| n2.starts_with('v') && o2.first().and_then(|o| dst(o)) == Some(('v', reg))) {
+                return Err(format!("LDS address v{reg} is redefined inside the K loop"));
+            }
+            let addr = w.v.get(&reg).copied().unwrap_or([None; 32]);
+            for (lane, value) in addr.iter().enumerate() {
+                let base = value.ok_or_else(|| format!("{name} {rest}: lane {lane} of wave {wave} has an address the prologue cannot derive"))?;
+                for &(offset, width) in &ranges {
+                    let e = base.checked_add(offset).and_then(|x| x.checked_add(width)).ok_or("LDS address overflow")?;
+                    if (base + offset) % width.min(8) != 0 { return Err(format!("{name} {rest}: misaligned LDS access {} in wave {wave} lane {lane}", base + offset)) }
+                    if e > limit { return Err(format!("{name} {rest}: wave {wave} lane {lane} reaches byte {e} of {limit}")) }
+                    end = end.max(e);
+                }
+            }
+            checked += 1;
         }
     }
-    if checked == 0 && limit != 0 { return Err("no LDS access found".into()) }
-    Ok(end)
+    if checked == 0 && hosted == 0 && limit != 0 { return Err("no LDS access found".into()) }
+    Ok((end, hosted))
 }
 
 #[cfg(test)]

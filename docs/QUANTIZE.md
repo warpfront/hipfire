@@ -197,6 +197,22 @@ Full alias set and product-ladder controls. Common extras:
 **Dense-only gate:** `mq{2,3,5,6}v2` refuse MoE `arch_id`s. Use legacy
 `mq{2,3,5,6}` or `mq4`/`mq4v2`/`mq4c` for MoE, or a dense checkpoint.
 
+**K-map Promote6 follows the MQ4 container family on audited loaders.** With
+`mq4`/`mq4v2` or V2 Lloyd MQ4 on the audited loader families (Llama
+`arch_id` 0/1, Qwen3.5 dense/MoE 5/6, Qwen2 7/8), promoted attention,
+routed experts, shared experts and shared-down weights use MQ6G256V2
+(qt47). Loader families whose qt47 support is not verified (MiniMax 10,
+LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any other
+unaudited `arch_id`) keep their existing encoder routes: ordinary
+`mq4`/`mq4v2` and nonexpert V2 Lloyd Promote6 weights retain MQ6G256
+(qt15), but V2 Lloyd stacked experts remain unpromoted MQ4G256 (qt13).
+Legacy MQ4 and compact `mq4c` also keep MQ6G256 (qt15); GGUF promotions
+remain qt15. Non-256-aligned weights still fall back to Q8. This does
+not rewrite existing artifacts or alter their loader routes.
+MQ6 V2 is not a layout-only conversion: its two fp16 affine grids per
+256-weight group differ from V1's single f32 grid. Both occupy 200 bytes;
+requantization can change decoded tokens.
+
 Example — Qwen3.8 product ladder cell (base MQ4V2):
 
 ```bash

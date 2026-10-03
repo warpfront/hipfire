@@ -487,9 +487,19 @@ impl Carrier for Qwen4Carrier {
                     .ok_or("qwen4: QSA gather scratch size overflows")
                 })
                 .transpose()?;
+            // The prefix cache's checkpoint is allocated at load (before the
+            // forward), so it is charged here, before placement.
+            let prefix_bytes = if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
+                hipfire_arch_qwen4::bundle::prefix_cache_device_bytes(&config, state_format, mtp_kept)
+                    .ok_or("qwen4: prefix cache device bytes overflow")?
+            } else {
+                0
+            };
             let reserve =
                 residency::auto_vram_reserve(&config, ctx.max_seq, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
-                    .map_err(|error| format!("qwen4: {error}"))?;
+                    .map_err(|error| format!("qwen4: {error}"))?
+                    .checked_add(prefix_bytes)
+                    .ok_or("qwen4: auto expert VRAM reserve overflows")?;
             Ok((free as u64, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
         };
         let explicit =
@@ -562,16 +572,8 @@ impl Carrier for Qwen4Carrier {
                     let gather_note = gather_bytes
                         .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                         .unwrap_or_default();
-                    let stage_note = if rdna_compute::gemm::qwen4_expert_stage_requested() {
-                        format!(
-                            ", {} MiB expert DMA stages",
-                            rdna_compute::gemm::QWEN4_EXPERT_STAGE_BYTES / MIB
-                        )
-                    } else {
-                        String::new()
-                    };
                     eprintln!(
-                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}{stage_note}), {} MiB per expert layer",
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}), {} MiB per expert layer",
                         free / MIB,
                         non_expert / MIB,
                         reserve / MIB,
@@ -682,6 +684,16 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             )
         })?;
+        // The target checkpoint is allocated before the forward so the
+        // admitted chunk rung is chosen from the VRAM left after it; the
+        // second call below adds the MTP head's part.
+        if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
+            if let Err(error) = bundle.attach_prefix_cache(ctx.gpu) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: prefix cache setup failed: {detail}"));
+            }
+        }
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
@@ -702,6 +714,23 @@ impl Carrier for Qwen4Carrier {
         } else {
             None
         };
+        if hipfire_arch_qwen4::bundle::prefix_cache_requested() {
+            if let Err(error) = bundle.attach_prefix_cache(ctx.gpu) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: prefix cache setup failed: {detail}"));
+            }
+            let bytes = hipfire_arch_qwen4::bundle::prefix_cache_device_bytes(
+                &bundle.config,
+                state_format,
+                native_mtp,
+            )
+            .unwrap_or(0);
+            eprintln!(
+                "  qwen4 prefix cache: one whole-chunk checkpoint ({} KiB)",
+                bytes / 1024
+            );
+        }
         let mut model = LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,

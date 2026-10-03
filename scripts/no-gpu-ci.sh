@@ -32,6 +32,11 @@ cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
 # peacemaker audit: lds_store_unwaited_at_barrier on committed code objects (no ROCm).
 cargo test -p hipfire-isa --features toolchain --lib audit::
+# Advisory Peacemaker schedule lint: deterministic CPU-only calibration, no GPU.
+cargo test -j 8 -p hipfire-isa --features toolchain --lib cost_lint::
+# PM typed core and its runtime driver, including the trybuild compile-fail
+# race tests: their pinned rustc diagnostics catch API changes that alter them.
+cargo test -p peacemaker-author
 
 echo "== Python CPU tests =="
 # Explicit paths only: scripts/*_test.py includes torch+CUDA scripts.

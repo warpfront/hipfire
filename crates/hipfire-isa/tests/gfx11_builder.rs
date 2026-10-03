@@ -284,7 +284,7 @@ fn committed_gfx1100_v2c_bundle_equals_fresh_emission() {
 #[cfg(feature = "toolchain")]
 mod toolchain {
     use super::*;
-    use hipfire_isa::{ledger_replay, pm_check, profile, toolchain::{assemble_link_bundle, Toolchain}};
+    use hipfire_isa::{ledger_replay, pm_check, profile, toolchain::{build, Toolchain}};
 
     /// Every symbol of the product module certifies against its committed
     /// contract: parse-back, exact counts (the linker's inter-kernel
@@ -298,8 +298,8 @@ mod toolchain {
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("v2c.s");
         std::fs::write(&s, &text).unwrap();
-        let toolchain = Toolchain::default();
-        let build = assemble_link_bundle(&toolchain, &s, &dir.join("v2c.hsaco"), "gfx1100").unwrap();
+        let toolchain = Toolchain::oracle();
+        let build = build(&toolchain, &s, &dir.join("v2c.hsaco"), "gfx1100").unwrap();
         for epi in iu4_v2c::Epi::ALL {
             let symbol = iu4_v2c::Spec { arch: Arch::Gfx1100, epi }.symbol();
             assert_eq!(pm_check::lds_bounds(&text, &symbol, 8, iu4_v2c::LDS_BYTES).unwrap(), iu4_v2c::LDS_BYTES, "{epi:?}");
@@ -322,7 +322,7 @@ mod toolchain {
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("v2b.s");
         std::fs::write(&s, &text).unwrap();
-        let build = assemble_link_bundle(&Toolchain::default(), &s, &dir.join("v2b.hsaco"), "gfx1151").unwrap();
+        let build = build(&Toolchain::oracle(), &s, &dir.join("v2b.hsaco"), "gfx1151").unwrap();
         for epi in iu4_v2b::Epi::ALL {
             let symbol = iu4_v2b::Spec { arch: Arch::Gfx1151, epi }.symbol();
             assert_eq!(pm_check::lds_bounds(&text, &symbol, iu4_v2b::WAVES, iu4_v2b::LDS_BYTES).unwrap(), iu4_v2b::LDS_BYTES);

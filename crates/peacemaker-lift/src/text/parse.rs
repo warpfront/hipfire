@@ -54,7 +54,12 @@ fn bad_operand(
     }
 }
 
-/// Parse one canonical instruction line into a typed instruction.
+/// Parse an instruction line for gfx1100, gfx1151, or gfx1201.
+///
+/// Accepts canonical disassembly and PM builder syntax, including gfx11
+/// wait/cache modifiers, true16 halves, VOPD packets, and numeric branch
+/// word offsets. Labels belong to [`parse_source`]; unsupported mnemonics
+/// and operand/modifier spellings return [`ParseError`].
 pub fn parse_line(line: &str, arch: Arch) -> Result<Inst, ParseError> {
     let line = strip_comment(line).trim();
     if line.is_empty() {
@@ -63,24 +68,21 @@ pub fn parse_line(line: &str, arch: Arch) -> Result<Inst, ParseError> {
             reason: "empty instruction line".into(),
         });
     }
-    if arch != Arch::Gfx1201 {
-        return Err(ParseError::BadSource {
-            line: line.into(),
-            reason: "M1 supports gfx1201 text only".into(),
-        });
-    }
     if let Some((x, y)) = line.split_once("::") {
-        return parse_vopd(x, y);
+        return parse_vopd(x, y, arch);
     }
     let (name, rest) = split_name(line)?;
-    let row = find_row(name)?;
+    let row = find_row(name, arch)?;
     if row.form == Form::Sopp && row.name == "s_delay_alu" {
-        return parse_delay(row, rest);
+        return parse_delay(row, rest, arch);
     }
-    if row.form == Form::Sopp && row.name == "s_wait_alu" {
-        return parse_wait_alu(row, rest);
+    if row.form == Form::Sopp && matches!(row.name, "s_wait_alu" | "s_waitcnt_depctr") {
+        return parse_wait_alu(row, rest, arch);
     }
-    parse_single(row, rest)
+    if row.name == "s_waitcnt" {
+        return parse_waitcnt(row, rest, arch);
+    }
+    parse_single(row, rest, arch)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -97,8 +99,8 @@ fn split_name(line: &str) -> Result<(&str, &str), ParseError> {
     }
 }
 
-fn find_row(name: &str) -> Result<&'static OpRow, ParseError> {
-    isa::gfx12()
+fn find_row(name: &str, arch: Arch) -> Result<&'static OpRow, ParseError> {
+    isa::table(arch)
         .iter()
         .find(|row| row.name == name)
         .ok_or_else(|| ParseError::UnknownMnemonic(name.into()))
@@ -151,6 +153,7 @@ fn is_suffix_token(token: &str) -> bool {
         || token == "div:2"
         || token.starts_with("row_shl:")
         || token.starts_with("row_share:")
+        || token.starts_with("row_xmask:")
         || token.starts_with("row_mask:")
         || token.starts_with("bank_mask:")
         || token.starts_with("bound_ctrl:")
@@ -167,7 +170,15 @@ fn is_extra_token(token: &str) -> bool {
 /// extras); unknown trailing words are reported as suffixes so the caller
 /// fails them as bad modifiers rather than misparsing an operand.
 fn split_tail(segment: &str) -> (String, Vec<String>, Vec<String>) {
-    let mut words = segment.split_whitespace();
+    let mut depth = 0usize;
+    let mut words = segment.split(|ch: char| {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        ch.is_whitespace() && depth == 0
+    }).filter(|word| !word.is_empty());
     let operand = words.next().unwrap_or("").to_owned();
     let mut suffixes = Vec::new();
     let mut extras = Vec::new();
@@ -184,12 +195,13 @@ fn split_tail(segment: &str) -> (String, Vec<String>, Vec<String>) {
 }
 
 struct ParsedOperands {
+    arch: Arch,
     operands: Vec<Operand>,
     mods: Modifiers,
     literal: Option<u32>,
 }
 
-fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
+fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, ParseError> {
     let slots = grammar_slots(row);
     let segments = if rest.is_empty() { Vec::new() } else { split_operands(rest) };
     let mut operand_texts: Vec<String> = Vec::new();
@@ -214,10 +226,19 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
         }
     }
     let mut parsed = ParsedOperands {
+        arch,
         operands: Vec::new(),
         mods: Modifiers::default(),
         literal: None,
     };
+    if matches!(row.name, "v_fmamk_f32" | "v_fmaak_f32") && operand_texts.len() == 4 {
+        let index = if row.name == "v_fmamk_f32" { 2 } else { 3 };
+        let text = operand_texts.remove(index);
+        let value = text.strip_prefix("0x")
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .ok_or_else(|| bad_operand(row.name, &text, "embedded literal needs a 32-bit hex value"))?;
+        parsed.literal = Some(value);
+    }
     if row.form == Form::Vop2 && row.name == "v_cndmask_b32_e32" {
         if operand_texts.last().is_some_and(|t| t == "vcc_lo") {
             operand_texts.pop();
@@ -279,15 +300,27 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
         }
         let slot_index = i + slot_offset - text_offset;
         let (slot, bits) = slots[slot_index];
-        let operand = if matches!(row.form, Form::Vop3 | Form::Vop1Dpp | Form::Vop2Dpp) {
-            parse_vop3_operand(row, slot, bits, text, &mut parsed.mods)?
+        let operand = if matches!(row.form, Form::Vop3 | Form::Vop3p | Form::Vop1Dpp | Form::Vop2Dpp) {
+            parse_vop3_operand(row, slot, bits, text, &mut parsed.mods, arch)?
         } else {
-            parse_operand(row, slot, bits, text)?
+            parse_operand(row, slot, bits, text, arch)?
         };
         parsed.operands.push(operand);
     }
+    // Match the codec's canonical order: offset, offen, TH, scope.
+    extras.sort_by_key(|text| if text.starts_with("offset") { 0 } else if text == "offen" { 1 } else if text.starts_with("th:") { 2 } else { 3 });
     for text in &extras {
-        parsed.operands.push(parse_extra(row, text)?);
+        if parsed.arch != Arch::Gfx1201 && (text.starts_with("th:") || text.starts_with("scope:")) {
+            return Err(bad_operand(row.name, text, "th:/scope: cache policy is gfx12 syntax"));
+        }
+        let operand = parse_extra(row, text)?;
+        // Only VBUFFER carries TH as an operand; GLOBAL keeps it in the cache policy.
+        if let Operand::CacheTh(th) = operand {
+            if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global) { parsed.mods.cpol.th = th; continue }
+        }
+        if !matches!(operand, Operand::Imm(ImmField::SmemDisplacement(0) | ImmField::VmemOffset(0) | ImmField::DsOffset(0) | ImmField::DsOffset0(0) | ImmField::DsOffset1(0)) | Operand::Scope(CacheScope::Cu) | Operand::CacheTh(0)) {
+            parsed.operands.push(operand);
+        }
     }
     if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Buffer)
         && parsed.operands.iter().any(|op| matches!(op, Operand::Vmem(VmemToken::Offen)))
@@ -296,11 +329,19 @@ fn parse_single(row: &'static OpRow, rest: &str) -> Result<Inst, ParseError> {
             if let Some(Operand::Reg(addr)) = parsed.operands.get_mut(index) { addr.len = 1; }
         }
     }
+    if row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global) {
+        let scalar = slots.iter().position(|(name, _)| *name == "SADDR");
+        if scalar.is_some_and(|index| parsed.operands.get(index) != Some(&Operand::Vmem(VmemToken::Off))) {
+            if let Some(index) = slots.iter().position(|(name, _)| matches!(*name, "ADDR" | "VADDR")) {
+                if let Some(Operand::Reg(addr)) = parsed.operands.get_mut(index) { addr.len = 1; }
+            }
+        }
+    }
     parse_suffixes(row, &suffixes, &mut parsed.mods)?;
     imply_op_sel(row, &suffixes, &mut parsed.mods, &parsed.operands)?;
-    // The assembler defaults an omitted WMMA op_sel_hi to all-ones
-    // (verified: omitted text re-encodes to 7); explicit spellings win.
-    if row.name.starts_with("v_wmma_")
+    // Packed arithmetic and WMMA default high-half selects to all-ones;
+    // mixed-precision FMA defaults them to zero. Explicit spellings win.
+    if row.form == Form::Vop3p && !row.name.starts_with("v_fma_mix")
         && !suffixes.iter().any(|s| s.starts_with("op_sel_hi:["))
         && parsed.mods.op_sel_hi == 0
     {
@@ -345,6 +386,7 @@ fn parse_vop3_operand(
     bits: u16,
     text: &str,
     mods: &mut Modifiers,
+    arch: Arch,
 ) -> Result<Operand, ParseError> {
     let src: u8 = match slot {
         "SRC0" => 0,
@@ -359,23 +401,48 @@ fn parse_vop3_operand(
                     "affix on a non-source operand",
                 ));
             }
-            return parse_operand(row, slot, bits, text);
+            return parse_operand(row, slot, bits, text, arch);
         }
     };
     let (bare, neg, abs) = strip_affix(text);
     if neg {
-        mods.neg |= 1 << src;
+        if row.form == Form::Vop3p { mods.neg_lo |= 1 << src; } else { mods.neg |= 1 << src; }
     }
     if abs {
+        if row.form == Form::Vop3p { return Err(bad_operand(row.name, text, "packed sources do not support abs")); }
         mods.abs |= 1 << src;
     }
-    parse_operand(row, slot, bits, &bare)
+    parse_operand(row, slot, bits, &bare, arch)
+}
+
+fn parse_waitcnt(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, ParseError> {
+    let raw = if rest.contains('(') {
+        let mut raw = 0xfff7u16;
+        for token in rest.split_whitespace() {
+            let (name, value) = token.split_once('(').and_then(|(name, value)| value.strip_suffix(')').map(|value| (name, value)))
+                .ok_or_else(|| bad_operand(row.name, token, "expected counter(value)"))?;
+            let (shift, max) = match name {
+                "vmcnt" => (10, 63),
+                "expcnt" => (0, 7),
+                "lgkmcnt" => (4, 63),
+                _ => return Err(bad_operand(row.name, token, "unknown wait counter")),
+            };
+            let value: u16 = value.parse().map_err(|_| bad_operand(row.name, token, "bad wait count"))?;
+            if value > max { return Err(bad_operand(row.name, token, "wait count out of range")); }
+            raw = (raw & !(max << shift)) | (value << shift);
+        }
+        raw
+    } else { parse_number(rest, row.name, rest)? };
+    let mut parsed = ParsedOperands { arch, operands: vec![Operand::Imm(ImmField::Sopp(raw as i16))], mods: Modifiers::default(), literal: None };
+    parse_wait_clause(row, &mut parsed)?;
+    finish(row, parsed)
 }
 
 /// Delay-hint lines: symbolic fields or a bare number.
 fn parse_delay(
     row: &'static OpRow,
     rest: &str,
+    arch: Arch,
 ) -> Result<Inst, ParseError> {
     const IDS: [(&str, u8); 12] = [
         ("NO_DEP", 0),
@@ -443,6 +510,7 @@ fn parse_delay(
         parse_number(rest, row.name, rest)?
     };
     let mut parsed = ParsedOperands {
+        arch,
         operands: vec![Operand::Imm(ImmField::Sopp(raw as i16))],
         mods: Modifiers::default(),
         literal: None,
@@ -459,6 +527,7 @@ fn parse_delay(
 fn parse_wait_alu(
     row: &'static OpRow,
     rest: &str,
+    arch: Arch,
 ) -> Result<Inst, ParseError> {
     // (table name, shift, max)
     const FIELDS: [(&str, u8, u16); 7] = [
@@ -507,18 +576,19 @@ fn parse_wait_alu(
     finish(
         row,
         ParsedOperands {
+            arch,
             operands: vec![Operand::Imm(ImmField::Sopp(raw as i16))],
-            mods: Modifiers::default(),
+            mods: Modifiers { wait: (row.name == "s_waitcnt_depctr").then(WaitImm::default), ..Modifiers::default() },
             literal: None,
         },
     )
 }
 
-fn parse_vopd(x: &str, y: &str) -> Result<Inst, ParseError> {
+fn parse_vopd(x: &str, y: &str, arch: Arch) -> Result<Inst, ParseError> {
     let (x_name, x_rest) = split_name(x.trim())?;
     let (y_name, y_rest) = split_name(y.trim())?;
-    let x_row = find_row(x_name)?;
-    let y_row = find_row(y_name)?;
+    let x_row = find_row(x_name, arch)?;
+    let y_row = find_row(y_name, arch)?;
     if x_row.form != Form::Vopd || y_row.form != Form::Vopd {
         return Err(ParseError::BadSource {
             line: format!("{x} :: {y}"),
@@ -537,15 +607,16 @@ fn parse_vopd(x: &str, y: &str) -> Result<Inst, ParseError> {
         });
     }
     let mut parsed = ParsedOperands {
+        arch,
         operands: Vec::new(),
         mods: Modifiers::default(),
         literal: None,
     };
     for (text, (slot, bits)) in x_texts.iter().zip(x_slots.iter()) {
-        parsed.operands.push(parse_operand(x_row, slot, *bits, text)?);
+        parsed.operands.push(parse_operand(x_row, slot, *bits, text, arch)?);
     }
     for (text, (slot, bits)) in y_texts.iter().zip(y_slots.iter()) {
-        parsed.operands.push(parse_operand(y_row, slot, *bits, text)?);
+        parsed.operands.push(parse_operand(y_row, slot, *bits, text, arch)?);
     }
     // One shared literal at most (builder's VOPD rule).
     let mut literal = None;
@@ -567,7 +638,7 @@ fn parse_vopd(x: &str, y: &str) -> Result<Inst, ParseError> {
         x_operands: x_slots.len() as u8,
     };
     Inst::from_parts(
-        Arch::Gfx1201,
+        arch,
         x_row.op,
         Form::Vopd,
         fields,
@@ -587,6 +658,7 @@ fn parse_operand(
     slot: &str,
     bits: u16,
     text: &str,
+    arch: Arch,
 ) -> Result<Operand, ParseError> {
     let width = (bits / 32).max(1) as u8;
     if let Some(ttmp) = parse_ttmp(text)? {
@@ -628,9 +700,15 @@ fn parse_operand(
         ));
     }
     if let Some(special) = parse_special(text) {
+        if special == Special::Null && slot == "SOFFSET" && row.form == Form::Smem {
+            return Ok(Operand::Imm(ImmField::SmemOffset(0)));
+        }
         return Ok(Operand::Special(special));
     }
     if text == "off" {
+        if slot == "VADDR" && row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Buffer) {
+            return Ok(Operand::Reg(RegRef { kind: Kind::V, base: 0, len: width }));
+        }
         return Ok(Operand::Vmem(VmemToken::Off));
     }
     if text == "offen" {
@@ -642,8 +720,10 @@ fn parse_operand(
     if let Some(msg) = parse_sendmsg(text)? {
         return Ok(Operand::SendMsg(msg));
     }
-    if let Some(hw) = parse_hwreg(text)? {
-        return Ok(Operand::Hwreg(hw));
+    if let Some(hw) = parse_hwreg(text, arch)? {
+        if slot != "SIMM16" || row.form != Form::Sopk { return Err(bad_operand(row.name, text, "hwreg needs SOPK immediate")); }
+        let raw = u16::from(hw.id) | u16::from(hw.offset) << 6 | u16::from(hw.size - 1) << 11;
+        return Ok(Operand::Imm(ImmField::Sopk(raw as i16)));
     }
     if let Some(rest) = text.strip_prefix("0x") {
         let value = u32::from_str_radix(rest, 16)
@@ -719,11 +799,13 @@ fn decimal_operand(
 ) -> Result<Operand, ParseError> {
     if slot == "SIMM16" {
         if row.form == Form::Sopk {
-            return Err(bad_operand(
-                row.name,
-                text,
-                "SOPK immediates print hex",
-            ));
+            let raw = i16::try_from(n).map_err(|_| bad_operand(row.name, text, "SIMM16 immediate out of range"))?;
+            return Ok(Operand::Imm(ImmField::Sopk(raw)));
+        }
+        if (row.name == "s_branch" || row.name.starts_with("s_cbranch"))
+            && !(-32768..=65535).contains(&n)
+        {
+            return Err(bad_operand(row.name, text, "branch offset exceeds 16 bits"));
         }
         // Unsigned-printing rows (branches, waits, clause, barrier_wait,
         // delay/wait_alu raw) accept the wrapped value, as mc does.
@@ -893,6 +975,9 @@ fn parse_sendmsg(text: &str) -> Result<Option<Msg>, ParseError> {
     else {
         return Ok(None);
     };
+    if inner == "MSG_RTN_GET_REALTIME" {
+        return Ok(Some(Msg { id: 131, op: 0 }));
+    }
     let (id, op) = inner.split_once(',').ok_or_else(|| {
         bad_operand("s_sendmsg", text, "expected sendmsg(id, op)")
     })?;
@@ -906,28 +991,46 @@ fn parse_sendmsg(text: &str) -> Result<Option<Msg>, ParseError> {
     }))
 }
 
-fn parse_hwreg(text: &str) -> Result<Option<HwReg>, ParseError> {
+/// `hwreg(NAME[, offset, size])` with the target's symbolic register names
+/// (the ones `llvm-mc` accepts for it), or a numeric id.
+fn parse_hwreg(text: &str, arch: Arch) -> Result<Option<HwReg>, ParseError> {
     let Some(inner) = text
         .strip_prefix("hwreg(")
         .and_then(|s| s.strip_suffix(')'))
     else {
         return Ok(None);
     };
-    let mut parts = inner.split(',');
-    let mut next = |what: &str| {
-        parts.next().ok_or_else(|| bad_operand("hwreg", text, what))
+    let mut parts = inner.split(',').map(str::trim);
+    let name = parts.next().ok_or_else(|| bad_operand("hwreg", text, "missing id"))?;
+    let named = if arch == Arch::Gfx1201 {
+        match name {
+            // llvm-mc also takes the gfx11 names on gfx12.
+            "HW_REG_WAVE_HW_ID1" | "HW_REG_HW_ID1" => Some(23),
+            "HW_REG_WAVE_HW_ID2" | "HW_REG_HW_ID2" => Some(24),
+            "HW_REG_SHADER_CYCLES_LO" => Some(29),
+            "HW_REG_SHADER_CYCLES_HI" => Some(30),
+            _ => None,
+        }
+    } else {
+        match name {
+            "HW_REG_HW_ID1" => Some(23),
+            "HW_REG_HW_ID2" => Some(24),
+            "HW_REG_SHADER_CYCLES" => Some(29),
+            _ => None,
+        }
     };
-    Ok(Some(HwReg {
-        id: next("short hwreg")?.trim().parse().map_err(|_| {
-            bad_operand("hwreg", text, "bad hwreg id")
-        })?,
-        offset: next("short hwreg")?.trim().parse().map_err(|_| {
-            bad_operand("hwreg", text, "bad hwreg offset")
-        })?,
-        size: next("short hwreg")?.trim().parse().map_err(|_| {
-            bad_operand("hwreg", text, "bad hwreg size")
-        })?,
-    }))
+    let id = match named {
+        Some(id) => id,
+        None => name.parse().map_err(|_| bad_operand("hwreg", text, "unknown hardware register for this target"))?,
+    };
+    let offset = parts.next().map(|value| value.parse()).transpose()
+        .map_err(|_| bad_operand("hwreg", text, "bad offset"))?.unwrap_or(0);
+    let size = parts.next().map(|value| value.parse()).transpose()
+        .map_err(|_| bad_operand("hwreg", text, "bad size"))?.unwrap_or(32);
+    if parts.next().is_some() || id > 63 || offset > 31 || size == 0 || size > 32 || u16::from(offset) + u16::from(size) > 32 {
+        return Err(bad_operand("hwreg", text, "hardware register field out of range"));
+    }
+    Ok(Some(HwReg { id, offset, size }))
 }
 
 fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
@@ -938,17 +1041,28 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
         return Ok(Operand::Scope(scope));
     }
     if let Some(th) = text.strip_prefix("th:") {
-        let names = if row.name.starts_with("buffer_load") {
+        let global = row.form == Form::Vmem(peacemaker_ir::inst::VmemForm::Global);
+        let load = row.name.starts_with("buffer_load") || global && row.name.starts_with("global_load");
+        let store = row.name.starts_with("buffer_store") || global && row.name.starts_with("global_store");
+        let names = if load {
             ["RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", "BYPASS"]
-        } else if row.name.starts_with("buffer_store") {
+        } else if store {
             ["RT", "NT", "HT", "BYPASS", "NT_RT", "RT_NT", "NT_HT", "NT_WB"]
         } else {
-            return Err(bad_operand(row.name, text, "cache TH only modeled for VBUFFER"));
+            return Err(bad_operand(row.name, text, "cache TH only modeled for VBUFFER and GLOBAL loads/stores"));
         };
-        let prefix = if row.name.starts_with("buffer_load") { "TH_LOAD_" } else { "TH_STORE_" };
+        let prefix = if load { "TH_LOAD_" } else { "TH_STORE_" };
         let value = th.strip_prefix(prefix).and_then(|word| names.iter().position(|name| *name == word))
             .ok_or_else(|| bad_operand(row.name, text, "bad cache TH"))?;
         return Ok(Operand::CacheTh(value as u8));
+    }
+    if let Some(inner) = text.strip_prefix("offset:swizzle(BROADCAST,").and_then(|s| s.strip_suffix(')')) {
+        if row.name != "ds_swizzle_b32" { return Err(bad_operand(row.name, text, "swizzle on non-swizzle opcode")); }
+        let (group, lane) = inner.split_once(',').ok_or_else(|| bad_operand(row.name, text, "expected broadcast group and lane"))?;
+        let group: u16 = group.parse().map_err(|_| bad_operand(row.name, text, "bad broadcast group"))?;
+        let lane: u16 = lane.parse().map_err(|_| bad_operand(row.name, text, "bad broadcast lane"))?;
+        if group > 32 || !group.is_power_of_two() || lane >= group { return Err(bad_operand(row.name, text, "invalid broadcast group or lane")); }
+        return Ok(Operand::Imm(ImmField::DsOffset((32 - group) | lane << 5)));
     }
     if let Some((kind, value)) = text.split_once(':') {
         // VMEM offsets are signed 24-bit (`offset:-48` occurs in hipcc's
@@ -1006,6 +1120,12 @@ fn parse_suffixes(
     for suffix in suffixes {
         if suffix == "clamp" {
             mods.clamp = true;
+        } else if matches!(suffix.as_str(), "glc" | "slc" | "dlc") && (row.form == Form::Smem || matches!(row.form, Form::Vmem(_))) {
+            match suffix.as_str() {
+                "glc" => mods.cpol.glc = true,
+                "slc" => mods.cpol.slc = true,
+                _ => mods.cpol.dlc = true,
+            }
         } else if suffix == "mul:2" {
             mods.omod = Omod::Mul2;
         } else if suffix == "mul:4" {
@@ -1028,6 +1148,10 @@ fn parse_suffixes(
             let lane: u16 = value.parse().map_err(|_| bad_operand(row.name, suffix, "invalid DPP row-share lane"))?;
             if lane > 15 { return Err(bad_operand(row.name, suffix, "DPP row-share lane outside 0..=15")); }
             mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?.ctrl = 0x150 + lane;
+        } else if let Some(value) = suffix.strip_prefix("row_xmask:") {
+            let mask = parse_number(value, row.name, suffix)?;
+            if mask > 15 { return Err(bad_operand(row.name, suffix, "DPP xor mask exceeds four bits")); }
+            mods.dpp.as_mut().ok_or_else(|| bad_operand(row.name, suffix, "DPP control on non-DPP row"))?.ctrl = 0x160 + mask;
         } else if let Some(value) = suffix.strip_prefix("row_mask:") {
             let mask = parse_number(value, row.name, suffix)?;
             if mask > 15 { return Err(bad_operand(row.name, suffix, "DPP row mask exceeds four bits")); }
@@ -1053,8 +1177,8 @@ fn parse_suffixes(
     Ok(())
 }
 
-/// `op_sel:[a,b(,c)]`: source entries map to bits 0.., the last entry is
-/// the bit-3 destination select (mirrors the printer).
+/// VOP3 `op_sel` ends in a bit-3 destination select; packed VOP3P
+/// `op_sel` and `op_sel_hi` each contain three source selects only.
 fn parse_op_sel(
     row: &OpRow,
     suffix: &str,
@@ -1076,6 +1200,12 @@ fn parse_op_sel(
         .collect::<Result<_, _>>()?;
     if entries.iter().any(|&e| e > 1) {
         return Err(bad("entries are 0/1"));
+    }
+    if row.form == Form::Vop3p {
+        if entries.len() != 3 { return Err(bad("packed op_sel needs 3 entries")); }
+        let value = entries[0] | entries[1] << 1 | entries[2] << 2;
+        if hi { mods.op_sel_hi = value; } else { mods.op_sel = value; }
+        return Ok(());
     }
     if hi {
         if entries.len() != 3 {
@@ -1126,6 +1256,28 @@ fn parse_wait_clause(
     row: &OpRow,
     parsed: &mut ParsedOperands,
 ) -> Result<(), ParseError> {
+    if parsed.arch != Arch::Gfx1201 && row.name.starts_with("s_waitcnt") {
+        let raw = parsed.operands.iter().find_map(|operand| match operand {
+            Operand::Imm(ImmField::Sopp(n) | ImmField::Sopk(n)) => Some(*n as u16),
+            _ => None,
+        }).ok_or_else(|| bad_operand(row.name, "", "missing wait immediate"))?;
+        let mut wait = WaitImm::default();
+        if row.name == "s_waitcnt" {
+            for (counter, value, max) in [(Counter::Vm, (raw >> 10) as u8 & 63, 63), (Counter::Exp, raw as u8 & 7, 7), (Counter::Lgkm, (raw >> 4) as u8 & 63, 63)] {
+                if value != max { wait.per_counter[counter as usize] = Some(value); }
+            }
+        } else {
+            let counter = match row.name {
+                "s_waitcnt_vscnt" => Some(Counter::Vs),
+                "s_waitcnt_vmcnt" => Some(Counter::Vm),
+                "s_waitcnt_lgkmcnt" => Some(Counter::Lgkm),
+                _ => None,
+            };
+            if let Some(counter) = counter { wait.per_counter[counter as usize] = Some(raw as u8 & 63); }
+        }
+        parsed.mods.wait = Some(wait);
+        return Ok(());
+    }
     let raw = match parsed.operands.first() {
         Some(Operand::Imm(ImmField::Sopp(n) | ImmField::Sopk(n)))
             if row.form == Form::Sopp =>
@@ -1269,7 +1421,8 @@ fn push_rule(
         "op_sel_hi" => u32::from(parsed.mods.op_sel_hi),
         "global_scope" => u32::from(parsed.mods.cpol.scope) << 18,
         "dpp_fi" => 0,
-        "global_nv" | "global_sve" | "global_th" => 0,
+        "global_th" => u32::from(parsed.mods.cpol.th) << 20,
+        "global_nv" | "global_sve" => 0,
         "vbuffer_format" => 0x800000,
         "vbuffer_offen" => {
             if parsed.operands.iter().any(|op| {
@@ -1331,7 +1484,7 @@ fn finish(
     }
     let fields = derive_fields(row, &parsed)?;
     Inst::from_parts(
-        Arch::Gfx1201,
+        parsed.arch,
         row.op,
         row.form,
         fields,

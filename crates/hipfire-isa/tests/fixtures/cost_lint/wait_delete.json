@@ -1,0 +1,33 @@
+{
+  "source": "/home/kaden/qcal/release-0.4.1/pm-wait-delete/three-process-timings.json",
+  "static_source": "/home/kaden/qcal/release-0.4.1/pm-wait-delete/{before,after}/{b1,b1s,v2b,v2c,sym1151,sym1201}.co",
+  "columns": ["symbol", "sorted_process_ratios", "before_wait_depth", "after_wait_depth", "wmma_per_trip", "vmem_per_wmma"],
+  "rows": [
+    ["gemm_mq4g256v2_residual_mmq_iu4_full_set_b1",[0.998166,0.998769,0.998775],4,4,64,0.3125],
+    ["gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",[1.002215,1.004183,1.012507],4,4,64,0.3125],
+    ["gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",[0.998486,0.998921,0.999130],4,4,64,0.3125],
+    ["gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1_bf16",[0.999792,1.001473,1.005888],4,4,64,0.3125],
+    ["gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",[0.999735,1.000596,1.001754],4,4,64,0.3125],
+    ["gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",[0.997210,0.997837,0.997843],4,4,64,0.3125],
+    ["gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",[0.998318,0.998872,1.002246],4,4,64,0.3125],
+    ["gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",[0.998496,0.999351,1.001734],4,4,64,0.3125],
+    ["gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_bf16",[0.998779,1.000207,1.000846],4,4,64,0.3125],
+    ["gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",[1.000607,1.001051,1.002441],4,4,64,0.3125],
+    ["gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151",[0.999000,0.999411,0.999468],0,0,256,0.109375],
+    ["gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151",[1.000319,1.000635,1.001115],0,0,256,0.109375],
+    ["gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151",[0.999946,0.999999,1.000597],0,0,256,0.109375],
+    ["gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",[0.995289,0.998903,1.000187],8,8,128,0.203125],
+    ["gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",[0.997638,1.002329,1.006598],9,9,128,0.21875],
+    ["gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100",[1.001022,1.009690,1.036347],8,8,128,0.21875],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151",[1.000000,1.000018,1.003683],15,15,32,0.9375],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1151",[1.000961,1.000982,1.003835],10,10,16,1.25],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",[1.122429,1.123407,1.127212],20,0,64,0.78125],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4",[1.154432,1.155284,1.155443],20,0,64,0.78125],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201",[0.997966,0.997972,1.001355],15,15,16,1.875],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1201",[0.994096,0.994841,0.995577],10,10,8,2.5],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",[1.219053,1.220044,1.221168],20,0,32,1.5625],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",[1.240520,1.241395,1.241699],20,0,32,1.5625],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",[1.146297,1.148947,1.151986],40,0,64,1.40625],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",[1.228618,1.230355,1.230504],40,0,64,1.40625]
+  ]
+}

@@ -62,8 +62,12 @@ extern "C" __global__ void quantize_q8_1_mmq_ds4(
     int K,
     int N
 ) {
-    const int token = blockIdx.y;
-    const int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    // Folded 1-D launch, grid [ceil(K / (4*blockDim.x)) * N, 1, 1]: the token
+    // is blockIdx.x / blocks_per_row, so N is not bound by gridDim.y.
+    const int per_row = (K + (int)blockDim.x * 4 - 1) / ((int)blockDim.x * 4);
+    if (per_row <= 0) return;
+    const int token = (int)(blockIdx.x / (unsigned)per_row);
+    const int i0 = ((int)(blockIdx.x % (unsigned)per_row) * blockDim.x + threadIdx.x) * 4;
     if (token >= N || i0 >= K) return;
 
     const float4 xi = (i0 + 3 < K)
@@ -112,8 +116,12 @@ extern "C" __global__ void quantize_q8_1_mmq_ds4_x128(
     int K,
     int N
 ) {
-    const int token = blockIdx.y;
-    const int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    // Folded 1-D launch, grid [ceil(K / (4*blockDim.x)) * N, 1, 1] (see
+    // quantize_q8_1_mmq_ds4).
+    const int per_row = (K + (int)blockDim.x * 4 - 1) / ((int)blockDim.x * 4);
+    if (per_row <= 0) return;
+    const int token = (int)(blockIdx.x / (unsigned)per_row);
+    const int i0 = ((int)(blockIdx.x % (unsigned)per_row) * blockDim.x + threadIdx.x) * 4;
     if (token >= N || i0 >= K) return;
 
     const float4 xi = (i0 + 3 < K)

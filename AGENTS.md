@@ -651,33 +651,42 @@ against the A3B MoE DFlash perfmaxx line.
 ### Pinned Flash-Next bench fixture
 
 The canonical Flash-Next trunk is whichever local artifact byte-matches
-`qwen3.8-flash-next.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
-(registry tag `qwen3.8:flash-next`, since 2026-09-28):
+`qwen3.8-flash-next-gptq3.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tags `qwen3.8:flash-next`, `qwen3.8:flash-next-mq4` and
+`qwen3.8:flash-next-gptq3`, since 2026-10-02):
 
 - HF repo: `hipfire-models/qwen3.8-flash-next`
-- HF / local file: `qwen3.8-flash-next.mq4`
-- File size: `125288540696`
-- SHA-256: `8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`
-- MD5: `001878abd9b68218876ac0ae732e481b`
-- Recipe (r2): MQ6G256V2 trunk (240 tensors) and language head,
-  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows
-  (128 shards, external-resident, 54,400,261,120 B). Needs a build at or
-  after `cb566dab9` (qt=54 I64 metadata records).
-- Container revision 2026-09-29: the three I64 PLE metadata records were
-  re-tagged qt=52 -> qt=54 in place; payloads are byte-identical to the
-  2026-09-28 upload (sha256 `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`),
-  so measurements taken on those bytes still apply.
+- HF / local file: `qwen3.8-flash-next-gptq3.mq4`
+- File size: `125288544792`
+- SHA-256: `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`
+- MD5: `be007fc3219e9f6cdb1d4dfa8380625f`
+- Recipe: the r2 tiers (MQ6G256V2 trunk (240 tensors) and language head,
+  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows,
+  128 shards, external-resident, 54,400,261,120 B), with the routed experts
+  symmetric and GPTQ3-solved on the 262,144-token calibration corpus (no AWQ;
+  553/25,088 experts keep RTN). All 1227 non-expert tensors are byte-identical
+  to the prior pin. Needs a build at or after `cb566dab9` (qt=54 I64 metadata
+  records); validated on `fe77c0837`.
 
 Before reporting Flash-Next results, verify the candidate trunk with
 `sha256sum` and require the digest above.
 
-Historical: the prior pin was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
+Historical: from 2026-09-28 to 2026-10-02 the pin was the RTN-asymmetric
+`qwen3.8-flash-next.mq4` (still on HF under that name, tag
+`qwen3.8:flash-next-rtn-asym`; size `125288540696`, sha256
+`8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`, MD5
+`001878abd9b68218876ac0ae732e481b`; before the 2026-09-29 qt=54 re-tag, sha256
+`cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`, same
+payloads). Measurements below labelled `qwen3.8-flash-next.mq4` were taken on
+those bytes.
+
+Historical: the pin before that was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
 tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
 `c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9` after the
 same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
-before it); it differs
-only in its Q8F16 head. The caveats and measurements below were taken on that
-prior pin unless they say otherwise.
+before it); it differs from the RTN-asymmetric pin only in its Q8F16 head.
+Caveats and measurements below without a date were taken on that pin unless
+they say otherwise.
 
 Caveats that are part of the fixture, not trivia:
 

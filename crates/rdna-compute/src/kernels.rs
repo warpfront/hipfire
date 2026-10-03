@@ -1156,8 +1156,8 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC: &str = concat!(
 /// `HIPFIRE_RMSNORM_P1A_MAX8`, the gfx1201 fp8 SHORT recipe): same elements,
 /// same strictly sequential `fma(v, v, acc)` chain from +0 as the incumbent
 /// loop's contraction, same reduction tree — bit-identical rms and outputs.
-/// gfx1151 keeps the incumbent symbols; `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps
-/// them on gfx1100 too.
+/// gfx1151 runs its own `_b8_gfx1151` twins below; `HIPFIRE_RMSNORM_P1A_BATCHED=0`
+/// keeps the incumbents on both.
 pub const FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1173,6 +1173,53 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_AWQ 1\n",
     "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_b8\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// gfx1151 `_b8_gfx1151` twins of the `_b8` producers above, also emitting
+/// through the one-pass {5,7} `block_i4_128` emit (`HIPFIRE_IU4_ONEPASS`,
+/// the gfx1201 A4C2 emit: DPP reductions, rcp + Newton codes, wave-uniform
+/// divide fallback). Both changes are bit-identical to the incumbent; the
+/// sidecar bytes equal `fused_rmsnorm_mq_rotate[_awq]_i4`.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_B8_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_b8_gfx1151\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// gfx1151 `_fold_b8` twins of the ADD-epilogue fold producers: the `_b8`
+/// batched Phase-1a over x and delta pairs, each element RN(x + delta) after
+/// the drain as in the incumbent loop — bit-identical rms, x write-back and
+/// sidecar. `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps the incumbents.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_B8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_FOLD 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_fold_b8\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_FOLD 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_fold_b8\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
 /// gfx1201 slices-2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128`
@@ -1833,8 +1880,9 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC: &str = concat!(
 /// whole 256-group and issues all of its x/z/awq/weight loads before any
 /// arithmetic, instead of two waves each waiting on four serialized loads.
 /// Same per-lane fma chain, XOR tree, rsqrt and per-element expressions —
-/// bit-identical. Grid [ceil((K/256)/2), N], block 64. gfx1151 keeps the
-/// incumbents; `HIPFIRE_GFX1100_GATED_NORM_V2=0` keeps them on gfx1100 too.
+/// bit-identical. Grid [ceil((K/256)/2), N], block 64. gfx1151 runs the
+/// `_gfx1151_v2` twins below; `HIPFIRE_GFX1100_GATED_NORM_V2=0` keeps the
+/// incumbents on gfx1100.
 pub const GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1848,6 +1896,27 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx1100_v2\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx1151 `_gfx1151_v2` twins of the `_gfx1100_v2` producers above, also
+/// emitting through the one-pass {5,7} `block_i4_128` emit
+/// (`HIPFIRE_IU4_ONEPASS`). Bit-identical to `gated_norm_mq_rotate[_awq]_i4_gfx11`.
+/// Same grid and arguments as the `_gfx1100_v2` twins.
+pub const GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx1151_v2\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_ONEPASS 1\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx1151_v2\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
@@ -2882,6 +2951,10 @@ pub const MOE_TOPK_RENORM_TOP10_BATCHED_SRC: &str =
 /// source so widening the new grammar cannot change legacy dispatch.
 pub const MOE_ROUTER_SOFTMAX_TOP10_F32_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_top10_f32.hip");
+/// Wave-per-token build of the router above (`HIPFIRE_QWEN4_ROUTER_FAST`,
+/// gfx1151); byte-identical outputs.
+pub const MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_top10_f32_fast.hip");
 /// Qwen4 qt=53 (MQ4G128V2) activation transform.  This is deliberately
 /// separate from the legacy 72-byte MQ4G128 route: the source codec uses a
 /// 68-byte row stride and permits a ragged final logical group.
@@ -4125,11 +4198,27 @@ pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
 /// down GEMMs (`hipfire-isa emit --kernel qwen4_moe_sym --epi all --arch
 /// ARCH`, one contract-checked `peacemaker custom build` per symbol, M7
 /// obligation-free). Same ABI, grid and bytes as the gfx1151 hipcc entries.
-/// gfx1151 SHA-256 (see `crates/hipfire-isa/kernels/qwen4_moe_sym.*.contract.json`).
+/// SHA-256 (contracts under `crates/hipfire-isa/kernels/qwen4_moe_sym.*.contract.json`):
+/// gfx1151 ede9af50a2f786eaef14ab12cdaef9eda604adbcd65faa7f170bcd307eba60cc (was 2540a22b…),
+/// gfx1201 792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515 (was 7179393f…);
+/// each differs from its predecessor only by the `.comment` stamp
+/// (`hipfire peacemaker native-emit`).
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
+/// Certified builder module of the gathered QSA prefill attention
+/// (`hipfire-isa emit --kernel qsa_gather --arch ARCH`, M7 obligation-free):
+/// the F16 K / block-transposed V producer and the gathered F16 WMMA
+/// attention, with the ABI, grid, LDS and output bytes of
+/// `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`.
+/// Default on (`HIPFIRE_QWEN4_QSA_PM=0` keeps the hipcc kernels).
+/// SHA-256 gfx1151 3ede35160ca5885756372580b8f972287eb71abd4174f6f6f0f45873e46df632
+/// (was b7809d03…), gfx1201 9d0b83cc14bfb50118c2b77f1f925330372fcc730ca7140cc00bbf0614d32607
+/// (was deee483f…); each differs only by the `.comment` stamp
+/// (`hipfire peacemaker native-emit`).
+pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
+pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.
 pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_sym_check.gfx1201.hip");
@@ -4488,7 +4577,9 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
 /// Certified gfx1100 builder code object, SHA-256
-/// cad59b8640fb9d1519af7c9f32b9011b5eda890a954ade81efd345daebc7f434
+/// 175a5b506c54118931b5028afba049a326327e58a5724867e2baed0b9dca7efe
+/// (cad59b86 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// nothing else changed)
 /// (`hipfire-isa emit --kernel iu4_v2c --epi all`, one contract-checked
 /// `peacemaker custom build --arch gfx1100` per symbol): the V2C algorithm's
 /// SET, ADD and F1-lite gate/up SiLU entries with every fold op VOPD-paired
@@ -4586,8 +4677,9 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 8edd7565f6a442b67224cad950b3532a07386c9543b7c04c65e024a8dd4df467
-/// (875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
+/// SHA-256 f166cf72f3c49c286aacbc627beeb204b6022fbf5865db8785dc7b54bce3321d
+/// (8edd7565 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// 875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
 /// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1;
 /// the fused GDN projection pads its LDS ring rows to 528 bytes; every symbol
 /// runs its K-loop at wave priority 1 and its epilogue (the fused projection:
@@ -4599,21 +4691,25 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco");
 /// Original certified `_b1` bundle for same-binary model/performance controls.
-/// SHA-256 e57061d5d7f580e8e070baa9d741c72e0759365bc956e9ed3b4a58ad6f47940b.
+/// SHA-256 20d0ecec4b9ade3a452c091d3f0b2248addc1c0ec3ea077e42f272e57814c4f1
+/// (e57061d5 with its `.comment` replaced in place by the native-emit stamp; no other
+/// section, symbol or note byte changed, `.text` identical).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 /// Certified gfx1201 `_b1s` bundle: the `_b1` K-loop and epilogues staging
 /// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 cc0288f8162aeb1329f0e1a2d9d0fbd88650b501e5be04e77c1205b8f7a1bab3
-/// (4ffe3580 with VCC counted in gfx12 `.sgpr_count`; `.text` identical)
+/// SHA-256 5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc
+/// (cc0288f8 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// 4ffe3580 with VCC counted in gfx12 `.sgpr_count`; `.text` identical)
 /// (d5190d97 with the `_b1` QKVZAGDN guard change).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 6a2dbe591a58680abbeef680be82a986dc0aee0beb2f46ef7cc74f4b3bfb9111
-/// (c4e5c52d with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
+/// SHA-256 1efb0b8b16b510407446dae8dc4ec137955de27d818b424daeb84383c8191fa7
+/// (6a2dbe59 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// c4e5c52d with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
 /// the 1b26cd3a symbols with every Row fold's ratios batched (two
 /// `ds_load_b128` per 8-row group, loaded one group ahead through v168..v175
 /// and v[183:186]/v[188:191]) and the QKVZA+GDN ring rows padded to 1,040 B
@@ -4641,7 +4737,9 @@ pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
 /// gfx1151 only; `HIPFIRE_V2B_PM=0` opts out to hipcc,
 /// `HIPFIRE_V2B_PM_BUNDLE=<path>` loads another builder bundle (e.g. the
 /// previous one) instead.
-/// SHA-256 485d21ba678eb3b5aca8b662c08031d227c8a09ef120e364f04f0977f18d5642.
+/// SHA-256 2395edabe77a58ba6ac8bbcb4f349d49a29f3c4e744eeb7889da498905778d2b
+/// (485d21ba with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// nothing else changed).
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
@@ -7922,17 +8020,9 @@ pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
 /// lowered decode diverged from the hand decode (`HIPFIRE_FORWARD_LOWERED=0`).
 fn qwen36_27b_fa_prep_body(entry: &str) -> String {
     let body = QWEN35_FA_PREP_GFX1100_SRC
-        .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;")
-        .replace(
-            "out[tid] = x0 * cos_a - x1 * sin_a;",
-            "out[tid] = __builtin_fmaf(x0, cos_a, -(x1 * sin_a));",
-        )
-        .replace(
-            "out[tid + HALF] = x0 * sin_a + x1 * cos_a;",
-            "out[tid + HALF] = __builtin_fmaf(x0, sin_a, x1 * cos_a);",
-        );
+        .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");
     assert_eq!(body.matches("__builtin_fmaf").count(), 2);
-    format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n{body}")
+    format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n#define QWEN_FA_PREP_EXACT_ROPE 1\n{body}")
 }
 pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
     static SRC: std::sync::LazyLock<String> =

@@ -244,7 +244,7 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError>
             return Err(BarrierError::DanglingInst { id: *id });
         }
     }
-    let replay = waits::replay(body, arch)?;
+    let replay = waits::replay(body, arch, crate::inst::Wave::Wave64)?;
     let ctx = Ctx::new(body);
     let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (id, _, succs) in &ctx.blocks {

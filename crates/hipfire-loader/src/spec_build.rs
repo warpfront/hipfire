@@ -136,6 +136,89 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
     }
 }
 
+/// Moves the dense-TP mesh out of `EpState` for one spec-decode request and
+/// puts it back on drop: the `ep` twin of [`Qwen35SlotGuard`].
+pub struct Qwen35DenseTpGuard<'m> {
+    ep: &'m mut Option<crate::EpState>,
+    target: Option<hipfire_arch_qwen35::mtp_dense_tp::Qwen35DenseTpTarget>,
+}
+
+/// True when `ep` holds a dense-TP Qwen trunk (the one mesh that speculates).
+pub fn is_qwen35_dense_tp(ep: &Option<crate::EpState>) -> bool {
+    matches!(
+        ep.as_ref().map(|e| &e.inner),
+        Some(crate::EpArch::Qwen35DenseTp { .. })
+    )
+}
+
+impl<'m> Qwen35DenseTpGuard<'m> {
+    /// Take the dense-TP mesh out of `ep`. Refuses before `take()` so a
+    /// non-dense-TP state is never moved out and dropped (that would free
+    /// every rank's weights and KV).
+    pub fn take(ep: &'m mut Option<crate::EpState>) -> Result<Self, String> {
+        if !is_qwen35_dense_tp(ep) {
+            return Err("dense TP guard: model is not a dense-TP Qwen3.5 mesh".to_string());
+        }
+        let Some(crate::EpState { gpus, inner }) = ep.take() else {
+            unreachable!("checked above");
+        };
+        let crate::EpArch::Qwen35DenseTp {
+            shard,
+            configs,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+        } = inner
+        else {
+            unreachable!("variant checked before take");
+        };
+        let eos_token = configs[0].eos_token;
+        let ctx_capacity = kv_caches[0].max_seq;
+        Ok(Self {
+            ep,
+            target: Some(hipfire_arch_qwen35::mtp_dense_tp::Qwen35DenseTpTarget {
+                gpus,
+                shard,
+                weights,
+                configs,
+                kv_caches,
+                dn_states,
+                scratches,
+                eos_token,
+                ctx_capacity,
+            }),
+        })
+    }
+}
+
+impl SpecTargetGuard for Qwen35DenseTpGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        self.target
+            .as_mut()
+            .map(|t| t as &mut dyn SpecTarget)
+            .ok_or_else(|| "dense TP guard: target already returned".to_string())
+    }
+}
+
+impl Drop for Qwen35DenseTpGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.target.take() {
+            *self.ep = Some(crate::EpState {
+                gpus: t.gpus,
+                inner: crate::EpArch::Qwen35DenseTp {
+                    shard: t.shard,
+                    configs: t.configs,
+                    weights: t.weights,
+                    kv_caches: t.kv_caches,
+                    dn_states: t.dn_states,
+                    scratches: t.scratches,
+                },
+            });
+        }
+    }
+}
+
 // The spec-decode target borrow is now dispatched per-arch by each carrier's
 // `Carrier::spec_target_guard` (qwen35 → the move-out + lazy-`HfqFile`-reopen
 // [`Qwen35SlotGuard`] above; the pure-attention arms → the generic

@@ -27,7 +27,9 @@
 // writing AND the dst record is a prefix-compaction — but we use a scratch for
 // uniformity with the q8→lloyd4 path, which is NOT in-place safe.)
 //
-// Grid: [n_kv_heads, n_positions]. Block: [32]. LDS: (head_dim + 32) * 4 bytes
+// Grid: [n_kv_heads * n_positions, 1, 1] (y folded into x: HIP grid.y caps at
+// 65535, full context reaches 262144). blockIdx.x = pos * n_kv_heads + h.
+// Block: [32]. LDS: (head_dim + 32) * 4 bytes
 // (only the +32 scratch tail is used; sized to match the V-write template).
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
@@ -62,9 +64,10 @@ extern "C" __global__ void kv_transcode_v_lloyd_down(
     const unsigned char* __restrict__ src,
     int n_kv_heads, int head_dim, int n_positions, int src_bits, int dst_bits
 ) {
-    const int h = blockIdx.x;
-    if (h >= n_kv_heads) return;
-    const int pos = blockIdx.y;
+    if (n_kv_heads <= 0) return;
+    const unsigned int fold = blockIdx.x;
+    const int h = (int)(fold % (unsigned int)n_kv_heads);
+    const int pos = (int)(fold / (unsigned int)n_kv_heads);
     if (pos >= n_positions) return;
     const int tid = threadIdx.x;
 

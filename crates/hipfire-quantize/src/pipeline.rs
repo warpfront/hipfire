@@ -3442,6 +3442,7 @@ pub(crate) fn run() {
                 use_mq6g256,
                 use_mq4g256,
                 use_mq4v2,
+                use_mq4v2_lloyd,
                 use_mq4c,
                 use_mq4_mq6exp,
                 use_mq4_mq2lloydexp,
@@ -5100,6 +5101,7 @@ fn handle_moe_expert_3d(
     // reach here, `--format mq4` silently yields a qt13 model with a handful of
     // qt44 tensors bolted on. See the default `supports_g256` arm below.
     use_mq4v2: bool,
+    use_mq4v2_lloyd: bool,
     use_mq4c: bool,
     use_mq4_mq6exp: bool,
     use_mq4_mq2lloydexp: bool,
@@ -5147,7 +5149,7 @@ fn handle_moe_expert_3d(
     let name = ctx.name;
     let file_idx = ctx.file_idx;
     let _n_elements = ctx.n_elements;
-    let _arch_id = ctx.arch_id;
+    let arch_id = ctx.arch_id;
     let _is_vision = ctx.is_vision;
 
     // Guard: this handler is only valid for stacked 3D MoE expert tensors
@@ -5236,6 +5238,7 @@ fn handle_moe_expert_3d(
         // when K%256==0". That holds on the non-expert path; this arm is where
         // routed experts are decided, and it was never updated.
         || (kmap_promote && use_mq4v2)
+        || (kmap_promote && use_mq4v2_lloyd && mq6v2_promote_supported(arch_id))
         || (kmap_promote && use_mq4c)
         || (kmap_promote && use_mq4_mq2lloyd_kmap)
         || (kmap_promote && use_mq4_mq2lloyd_imatrix)
@@ -5723,8 +5726,18 @@ fn handle_moe_expert_3d(
                 let q = quantize_mq5g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ5G256, 256u32)
             } else if expert_mq6 || down_mq6 {
-                let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
-                (q, QuantType::MQ6G256, 256u32)
+                if kmap_promote
+                    && (use_mq4v2 || use_mq4v2_lloyd)
+                    && mq6v2_promote_supported(arch_id)
+                {
+                    let q = quantize_mq6g256v2(
+                        &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
+                    );
+                    (q, QuantType::MQ6G256V2, 256u32)
+                } else {
+                    let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32)
+                }
             } else if expert_hfq6 {
                 let q = quantize_hfq6g256(&f32_slice);
                 (q, QuantType::HFQ6G256, 256u32)
@@ -5984,7 +5997,7 @@ fn handle_main_quant(
     let name = ctx.name;
     let n_elements = ctx.n_elements;
     let _is_vision = ctx.is_vision;
-    let _arch_id = ctx.arch_id;
+    let arch_id = ctx.arch_id;
     let _vision_quant = flags.vision_quant.as_str();
     let _is_gemma4_family = flags.is_gemma4_family;
     let _q8_conv1d_default = flags.q8_conv1d_default;
@@ -6102,8 +6115,18 @@ fn handle_main_quant(
                 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    if (flags.use_mq4v2 || flags.use_mq4v2_lloyd)
+                        && mq6v2_promote_supported(arch_id)
+                    {
+                        let m = n_elements / k_dim;
+                        let q = quantize_mq6g256v2(
+                            &f32_data, m, k_dim, &signs1, &signs2,
+                        );
+                        (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                    } else {
+                        let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                    }
                 } else if (flags.use_hfq4g256
                     || flags.use_hfq3g256
                     || flags.use_hfq3g128
@@ -8333,6 +8356,303 @@ mod handle_main_quant_f16_fallback_tests {
         );
         assert_eq!(hfq_tensors.len(), 1);
         assert_eq!(hfq_tensors[0].quant_type, QuantType::MQ4G256);
+    }
+}
+
+/// Byte-identity guard for the routed-expert path on arch ids whose loaders
+/// were never audited for qt47 (MQ6G256V2): `--format mq4v2-lloyd` + K-map
+/// `Promote6` on a stacked-3D expert tensor MUST keep emitting the unpromoted
+/// MQ4G256 (qt13) bytes the pre-`850cb35fc` handler produced. The expected
+/// digests below were captured by running the REAL pre-change handler
+/// (`fe77c0837`, signature without the `use_mq4v2_lloyd` argument) on the same
+/// fixture, not by running this handler on itself.
+#[cfg(test)]
+mod unsupported_arch_lloyd_promote6_expert_tests {
+    use super::*;
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    use safetensors::Dtype;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    const EXPERT_NAME: &str = "model.language_model.layers.3.mlp.experts.gate_up_proj";
+
+    // Captured from the REAL fe77c0837 handler (synth fixture arch 10, and real
+    // Qwen3.5-35B-A3B expert 0 gate/up on explicit arch 10). Runs + logs:
+    // /home/kaden/qcal/release-0.4.1/backlog041/promote6/runs/qt13-unsupported-arch/
+    const SYNTH_TENSORS_SHA256: &str =
+        "edeee46a299760d12d7420de853ad76a276c0930fd1e70c5bbaa798129225918";
+    const SYNTH_ARCH10_CONTAINER_SHA256: &str =
+        "39cd6bfcc1d07d07a382e28de84f0c883495341addb5dd9d9b6ccec294e2e425";
+    const REAL_TENSORS_SHA256: &str =
+        "14c9266f8b2d3f71eceef49a9aa8d273746bfbf2a0bc9fc0fb087f8a0c9a9038";
+
+    /// Audited loader families whose runtime accepts qt47 on every role.
+    const QT47_ARCHS: [u32; 6] = [0, 1, 5, 6, 7, 8];
+    /// Everything else: MiniMax 10, LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22,
+    /// Glimmer 14/23, plus ids nobody has audited.
+    const UNAUDITED_ARCHS: [u32; 10] = [2, 3, 10, 11, 12, 13, 14, 22, 23, 99];
+
+    #[derive(Clone, Copy)]
+    enum Recipe {
+        Mq4V2Lloyd,
+        Mq4V2,
+    }
+
+    /// `developer_var` overrides would change the emitted bytes for reasons
+    /// unrelated to the arch gate.
+    fn assert_no_ambient_expert_overrides() {
+        for var in [
+            "HIPFIRE_MOE_EXPERTS_MQ6",
+            "HIPFIRE_MOE_DOWN_MQ6",
+            "HIPFIRE_MOE_EXPERTS_MQ5",
+            "HIPFIRE_MOE_DOWN_MQ5",
+            "HIPFIRE_AWQ_EXPERTS",
+        ] {
+            assert!(
+                hipfire_config::developer_var(var).is_err(),
+                "{var} is set; unset it, the expert recipe would not be the one under test"
+            );
+        }
+    }
+
+    /// Deterministic BF16 `[n_experts, m, k]` fixture, integer-derived so the
+    /// bytes do not depend on libm.
+    fn synth_bf16(n_experts: usize, m: usize, k: usize) -> Vec<u8> {
+        (0..n_experts * m * k)
+            .flat_map(|i| {
+                let v = (((i * 37 + (i / 7) * 11) % 211) as f32 - 105.0) * 0.003;
+                ((v.to_bits() >> 16) as u16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// Runs the REAL `handle_moe_expert_3d` for one stacked expert tensor with
+    /// K-map Promote6, exactly the flag set `run()` builds for `recipe`.
+    fn run_handler(
+        arch_id: u32,
+        recipe: Recipe,
+        shape: [usize; 3],
+        bf16: &[u8],
+    ) -> Vec<HfqTensor> {
+        assert_no_ambient_expert_overrides();
+        let dir = tempfile::tempdir().unwrap();
+        let st_path = dir.path().join("experts.safetensors");
+        let view = TensorView::new(Dtype::BF16, shape.to_vec(), bf16).unwrap();
+        serialize_to_file([(EXPERT_NAME, view)], None, &st_path).unwrap();
+        let st_files = vec![SafetensorsFile::open(&st_path).unwrap()];
+        let (meta, raw_data) = st_files[0].tensor_data(EXPERT_NAME).unwrap();
+        let kmap: HashMap<String, QuantLevel> =
+            HashMap::from([(EXPERT_NAME.to_string(), QuantLevel::Promote6)]);
+        let ctx = PerTensorCtx {
+            name: EXPERT_NAME,
+            file_idx: 0,
+            n_elements: shape.iter().product(),
+            arch_id,
+            is_vision: false,
+        };
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let mut quantized_params = 0u64;
+        let mut spill: Option<TensorSpill> = None;
+        let handled = handle_moe_expert_3d(
+            &ctx,
+            meta,
+            raw_data,
+            true,
+            false,
+            &kmap,
+            &std::collections::HashSet::new(),
+            &None,
+            &None,
+            false,
+            0.0,
+            &None,
+            false, // use_gptq_e8
+            false, // use_gptq_mfp3e8
+            false, // use_gptq_mfp2e8
+            false, // use_mq6g256
+            false, // use_mq4g256
+            matches!(recipe, Recipe::Mq4V2), // use_mq4v2
+            matches!(recipe, Recipe::Mq4V2Lloyd), // use_mq4v2_lloyd
+            false, // use_mq4c
+            false, // use_mq4_mq6exp
+            false, // use_mq4_mq2lloydexp
+            false, // use_mq4_mq2glexp
+            false, // use_mq4_mq2lloyd_native
+            false, // use_mq4_mq2lloyd_kmap
+            false, // use_mq4_mq2lloyd_imatrix
+            false, // use_mq4_mq3lloyd_kmap
+            false, // use_mq4_mqlloyd_tiered
+            false, // use_mq4_mqlloyd_antirez
+            false, // use_mq4_mqlloyd_antirez_gptq
+            false, // use_mq4_mq2lloyd_gptq_all
+            false, // use_mq5g256
+            false, // use_hfq6
+            false, // use_hfq4g256
+            false, // use_hfq3g256
+            false, // use_hfq3g128
+            false, // use_hfq2g256
+            false, // use_hfq2g128
+            false, // use_hfq_mixed
+            false, // use_mfp4
+            false, // use_mfp4p
+            false, // use_mfp4e8
+            false, // use_mfp4e8soa
+            false, // use_mfp3e8_gptq_fmt
+            false, // use_mfp2e8_gptq_fmt
+            false, // use_mq3g256
+            false, // use_mq2g256
+            false, // use_mq2g256_lloyd
+            false, // use_mq3g256_lloyd
+            false, // use_mq4g256_lloyd
+            false, // use_hfp4
+            false, // use_mfp4l
+            false, // routed_gl
+            &None,
+            false,
+            &None,
+            reap_overlay::ReapArch::Qwen35,
+            &st_files,
+            &HashMap::new(),
+            &mut hfq_tensors,
+            &mut quantized_params,
+            &mut spill,
+        );
+        assert!(handled, "handler must claim a stacked-3D expert tensor");
+        hfq_tensors
+    }
+
+    fn hex(digest: impl AsRef<[u8]>) -> String {
+        digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// SHA-256 over every tensor's name, qt id, shape, group size and payload.
+    fn tensors_sha256(tensors: &[HfqTensor]) -> String {
+        let mut h = Sha256::new();
+        for t in tensors {
+            h.update((t.name.len() as u32).to_le_bytes());
+            h.update(t.name.as_bytes());
+            h.update([t.quant_type as u8]);
+            for d in &t.shape {
+                h.update(d.to_le_bytes());
+            }
+            h.update(t.group_size.to_le_bytes());
+            h.update((t.data.len() as u64).to_le_bytes());
+            h.update(&t.data);
+        }
+        hex(h.finalize())
+    }
+
+    /// The complete `.hfq` container bytes `write_hfq` produces for `tensors`.
+    fn container_bytes(arch_id: u32, tensors: &[HfqTensor]) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.hfq");
+        write_hfq(&path, arch_id, "{}", tensors, None).unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    fn assert_all_qt(tensors: &[HfqTensor], expected: QuantType, what: &str) {
+        assert!(!tensors.is_empty(), "{what}: no tensors emitted");
+        for t in tensors {
+            assert_eq!(
+                t.quant_type as u8, expected as u8,
+                "{what}: {} is qt{}, expected qt{}",
+                t.name, t.quant_type as u8, expected as u8
+            );
+        }
+    }
+
+    const SYNTH_SHAPE: [usize; 3] = [2, 8, 512];
+
+    #[test]
+    fn unaudited_arch_lloyd_promote6_stacked_experts_stay_qt13_with_baseline_bytes() {
+        let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
+        for arch in UNAUDITED_ARCHS {
+            let tensors = run_handler(arch, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
+            let what = format!("arch {arch} Lloyd+Promote6");
+            assert_eq!(tensors.len(), SYNTH_SHAPE[0], "{what}: one tensor per expert");
+            assert_all_qt(&tensors, QuantType::MQ4G256, &what);
+            for (slot, t) in tensors.iter().enumerate() {
+                assert_eq!(
+                    t.name,
+                    format!("model.language_model.layers.3.mlp.experts.{slot}.gate_up_proj.weight")
+                );
+                assert_eq!(t.shape, vec![SYNTH_SHAPE[1] as u32, SYNTH_SHAPE[2] as u32]);
+                assert_eq!(t.group_size, 256);
+                // MQ4G256 = 136 bytes per 256-weight group.
+                assert_eq!(t.data.len(), SYNTH_SHAPE[1] * SYNTH_SHAPE[2] / 256 * 136);
+            }
+            assert_eq!(
+                tensors_sha256(&tensors),
+                SYNTH_TENSORS_SHA256,
+                "{what}: tensor bytes drifted from the fe77c0837 baseline"
+            );
+        }
+        let tensors = run_handler(10, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
+        let container = container_bytes(10, &tensors);
+        assert_eq!(
+            hex(Sha256::digest(&container)),
+            SYNTH_ARCH10_CONTAINER_SHA256,
+            "arch 10 container bytes drifted from the fe77c0837 baseline"
+        );
+    }
+
+    /// Sensitivity control: the same recipe on an audited arch really does
+    /// change to qt47, so the pin above cannot pass vacuously.
+    #[test]
+    fn audited_arch_lloyd_promote6_stacked_experts_emit_qt47() {
+        let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
+        for arch in QT47_ARCHS {
+            let tensors = run_handler(arch, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
+            assert_all_qt(&tensors, QuantType::MQ6G256V2, &format!("arch {arch} Lloyd+Promote6"));
+            assert_ne!(tensors_sha256(&tensors), SYNTH_TENSORS_SHA256);
+        }
+    }
+
+    /// Ordinary (non-Lloyd) MQ4-V2 Promote6 experts on unaudited arches keep
+    /// the v1 MQ6G256 (qt15) promotion their loaders understand.
+    #[test]
+    fn unaudited_arch_ordinary_mq4v2_promote6_stacked_experts_stay_qt15() {
+        let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
+        for arch in UNAUDITED_ARCHS {
+            let tensors = run_handler(arch, Recipe::Mq4V2, SYNTH_SHAPE, &bf16);
+            assert_all_qt(&tensors, QuantType::MQ6G256, &format!("arch {arch} MQ4V2+Promote6"));
+        }
+    }
+
+    /// Real BF16 expert 0 gate/up (`[1, 1024, 2048]`) of Qwen3.5-35B-A3B on an
+    /// explicit CPU-only arch-10 override. This is a guard proof for the arch
+    /// gate, not a claim that MiniMax loads or runs these bytes.
+    ///
+    ///   cargo test --release -p hipfire-quantize --bin hipfire-quantize -- \
+    ///     --ignored unaudited_arch_lloyd_promote6_real_expert0 --nocapture
+    /// Override the checkpoint dir with MQ6_REAL_A3B_DIR.
+    #[test]
+    #[ignore = "real-checkpoint: needs /mnt/nas/kaden/models/Qwen3.5-35B-A3B (or MQ6_REAL_A3B_DIR)"]
+    fn unaudited_arch_lloyd_promote6_real_expert0_gate_up_stays_qt13_with_baseline_bytes() {
+        let tensors = run_handler(10, Recipe::Mq4V2Lloyd, [1, 1024, 2048], &real_expert0_gate_up());
+        assert_eq!(tensors.len(), 1);
+        assert_all_qt(&tensors, QuantType::MQ4G256, "real expert0 gate_up arch 10");
+        assert_eq!(tensors[0].data.len(), 1024 * 2048 / 256 * 136);
+        assert_eq!(tensors_sha256(&tensors), REAL_TENSORS_SHA256);
+    }
+
+    /// First expert (1024 x 2048 BF16, ~4 MiB) of the layer-0 fused gate/up
+    /// tensor from shard 6; only that slice of the mmap is touched.
+    fn real_expert0_gate_up() -> Vec<u8> {
+        let dir = std::path::PathBuf::from(
+            std::env::var("MQ6_REAL_A3B_DIR")
+                .unwrap_or_else(|_| "/mnt/nas/kaden/models/Qwen3.5-35B-A3B".to_string()),
+        );
+        let path = dir.join("model.safetensors-00006-of-00014.safetensors");
+        let file = SafetensorsFile::open(&path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let name = "model.language_model.layers.0.mlp.experts.gate_up_proj";
+        let (meta, bytes) = file
+            .tensor_data(name)
+            .unwrap_or_else(|| panic!("{name} not in {}", path.display()));
+        assert_eq!(meta.dtype, "BF16");
+        assert_eq!(meta.shape[1..], [1024, 2048]);
+        bytes[..1024 * 2048 * 2].to_vec()
     }
 }
 

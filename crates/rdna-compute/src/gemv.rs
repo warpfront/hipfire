@@ -311,6 +311,46 @@ const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
 
+/// Largest safe extent on `gridDim.y` / `gridDim.z` (measured on gfx1201:
+/// 65536 workgroups are addressed correctly, larger module launches alias
+/// `blockIdx` modulo 65536; `gridDim.x` is unbounded). A token/row-scaled axis
+/// either rides `grid.x` or is launched in pieces of at most this many units.
+const GRID_YZ_MAX: usize = hip_bridge::GFX1201_MAX_GRID_YZ as usize;
+
+/// `(start, len)` pieces of `total` units, each `len <= GRID_YZ_MAX`, in
+/// order. A launcher that keeps a token/row axis on `grid.y`/`grid.z` runs one
+/// launch per piece with the per-row pointers advanced by `start` rows, so no
+/// row is truncated and every output is computed by the same arithmetic.
+pub(crate) fn grid_yz_chunks(total: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..total.div_ceil(GRID_YZ_MAX)).map(move |i| {
+        let start = i * GRID_YZ_MAX;
+        (start, (total - start).min(GRID_YZ_MAX))
+    })
+}
+
+/// `[groups * rows, 1, 1]`: a producer launch whose row axis used to ride
+/// `grid.y` now folds into `grid.x` as `x = row * groups + group` (group
+/// fastest, the former dispatch order). The kernels decode the pair with one
+/// division by `groups`. Errors, never truncates, if the product leaves u32.
+fn folded_rows_grid(what: &str, groups: usize, rows: usize) -> HipResult<[u32; 3]> {
+    groups
+        .checked_mul(rows)
+        .and_then(|blocks| u32::try_from(blocks).ok())
+        .map(|blocks| [blocks, 1, 1])
+        .ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("{what}: grid {groups} groups x {rows} rows exceeds u32 blocks"),
+            )
+        })
+}
+
+/// `ptr` advanced by `bytes` (chunked launches address later rows of a
+/// device buffer; the kernels only touch rows inside the original extent).
+pub(crate) fn ptr_add_bytes(ptr: *mut c_void, bytes: usize) -> *mut c_void {
+    (ptr as *mut u8).wrapping_add(bytes) as *mut c_void
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -3185,8 +3225,9 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_silu_mul_rotate_mq`. Grid.y is the batch dim — processes
-    /// N tokens' [N × K] gate/up/x_rot in a single launch.
+    /// Batched `fused_silu_mul_rotate_mq`. Grid.x folds (token, group) as
+    /// `token * K/256 + group` — processes N tokens' [N × K] gate/up/x_rot in
+    /// a single launch with no token count on the 65535-bounded grid.y.
     pub fn fused_silu_mul_rotate_mq_batched(
         &mut self,
         gate: &GpuTensor,
@@ -3228,7 +3269,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_silu_mul_mq_rotate",
-            [n_groups, batch_size as u32, 1],
+            folded_rows_grid("fused_silu_mul_mq_rotate_batched", n_groups as usize, batch_size)?,
             [32, 1, 1],
             0,
             &mut params,
@@ -3326,7 +3367,8 @@ impl Gpu {
     }
 
     /// Phase A Stage A — F2 batched AWQ variant of `fused_silu_mul_rotate_mq`.
-    /// Grid.y is the batch dim — processes [N × K] gate/up/x_rot.
+    /// Grid.x folds (token, group) as `token * K/256 + group` — processes
+    /// [N × K] gate/up/x_rot.
     pub fn fused_silu_mul_rotate_mq_awq_batched(
         &mut self,
         gate: &GpuTensor,
@@ -3371,7 +3413,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_silu_mul_mq_rotate_awq",
-            [n_groups, batch_size as u32, 1],
+            folded_rows_grid("fused_silu_mul_mq_rotate_awq_batched", n_groups as usize, batch_size)?,
             [32, 1, 1],
             0,
             &mut params,
@@ -3395,10 +3437,11 @@ impl Gpu {
     }
 
     /// gfx1100 IU4 RMSNorm producers run their `_b8` batched-Phase-1a twins
-    /// (bit-identical; see `FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC`). gfx1151 and
-    /// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keep the single-outstanding incumbents.
-    fn gfx1100_rmsnorm_p1a_b8(&self) -> bool {
-        self.arch_caps.is_gfx1100() && rmsnorm_p1a_batched()
+    /// (bit-identical; see `FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC`); gfx1151 runs
+    /// the `_b8_gfx1151` one-pass-emit twins and the `_fold_b8` folds.
+    /// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps the single-outstanding incumbents.
+    fn gfx11_rmsnorm_p1a_b8(&self) -> bool {
+        (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1151()) && rmsnorm_p1a_batched()
     }
 
     /// C2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128` sidecar.
@@ -3443,26 +3486,38 @@ impl Gpu {
             self.flush_residual_fold()?;
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match (awq.is_some(), self.gfx1100_rmsnorm_p1a_b8()) {
-            (true, false) => (
+        let b8 = self.gfx11_rmsnorm_p1a_b8();
+        let gfx1151 = self.arch_caps.is_gfx1151();
+        let (module, source, kernel) = match (awq.is_some(), b8, gfx1151) {
+            (true, false, _) => (
                 "fused_rmsnorm_mq_rotate_awq_i4",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4",
             ),
-            (false, false) => (
+            (false, false, _) => (
                 "fused_rmsnorm_mq_rotate_i4",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_SRC,
                 "fused_rmsnorm_mq_rotate_i4",
             ),
-            (true, true) => (
+            (true, true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_b8",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_b8",
             ),
-            (false, true) => (
+            (false, true, false) => (
                 "fused_rmsnorm_mq_rotate_i4_b8",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC,
                 "fused_rmsnorm_mq_rotate_i4_b8",
+            ),
+            (true, true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_GFX1151_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151",
+            ),
+            (false, true, true) => (
+                "fused_rmsnorm_mq_rotate_i4_b8_gfx1151",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_GFX1151_SRC,
+                "fused_rmsnorm_mq_rotate_i4_b8_gfx1151",
             ),
         };
         self.ensure_kernel(module, source, kernel)?;
@@ -3579,14 +3634,23 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.ensure_mq_signs()?;
-        let (source, kernel) = match awq {
-            Some(_) => (
+        let b8 = self.arch_caps.is_gfx1151() && rmsnorm_p1a_batched();
+        let (source, kernel) = match (awq.is_some(), b8) {
+            (true, false) => (
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_fold",
             ),
-            None => (
+            (false, false) => (
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_SRC,
                 "fused_rmsnorm_mq_rotate_i4_fold",
+            ),
+            (true, true) => (
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_fold_b8",
+            ),
+            (false, true) => (
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_B8_SRC,
+                "fused_rmsnorm_mq_rotate_i4_fold_b8",
             ),
         };
         self.ensure_kernel(kernel, source, kernel)?;
@@ -4427,7 +4491,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            [n_groups, batch_size as u32, 1],
+            folded_rows_grid("fused_silu_mul_mq_rotate_i4_batched", n_groups as usize, batch_size)?,
             [32, 1, 1],
             0,
             &mut params,
@@ -4543,7 +4607,7 @@ impl Gpu {
             if tokfast {
                 [batch_size as u32, n_groups, 1]
             } else {
-                [n_groups, batch_size as u32, 1]
+                folded_rows_grid("fused_silu_hin_rotate_mq_i4_batched", n_groups as usize, batch_size)?
             },
             [32, 1, 1],
             0,
@@ -4662,7 +4726,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            [n_groups, batch_size as u32, 1],
+            folded_rows_grid("fused_silu_mul_mq_rotate_i4_gfx12_batched", n_groups as usize, batch_size)?,
             [32, 1, 1],
             0,
             &mut params,
@@ -4757,7 +4821,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_silu_mul_mq_rotate_awq_indexed",
-            [n_groups, batch_size as u32, 1],
+            folded_rows_grid("fused_silu_mul_mq_rotate_awq_indexed_batched", n_groups as usize, batch_size)?,
             [32, 1, 1],
             0,
             &mut params,
@@ -5143,7 +5207,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            [grid_x as u32, batch_size as u32, 1],
+            folded_rows_grid("gated_norm_rotate_mq_i4_gfx12_batched", grid_x, batch_size)?,
             [64, 1, 1],
             0,
             &mut params,
@@ -5401,7 +5465,7 @@ impl Gpu {
     /// under the `_gfx11` entry symbols. `awq = Some` selects the AWQ twin
     /// (divide folded into the LDS staging, same expression order as the
     /// standalone gated_norm → rotate_x_mq_awq chain). `x_rot = None`
-    /// skips the f32 store. Grid [(K/256), N], block 64, only the
+    /// skips the f32 store. Grid [(K/256) * N], block 64, only the
     /// incumbent 1024-B LDS handoff (static `normalized[256]`). Gated by
     /// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
     #[allow(clippy::too_many_arguments)]
@@ -5447,25 +5511,25 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let v2 = self.arch_caps.is_gfx1100()
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true);
-        let (module, source) = match (awq.is_some(), v2) {
-            (true, false) => (
-                "gated_norm_mq_rotate_awq_i4_gfx11",
-                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC,
-            ),
-            (false, false) => (
-                "gated_norm_mq_rotate_i4_gfx11",
-                kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC,
-            ),
-            (true, true) => (
+        // gfx1100 `_gfx1100_v2` (opt-out `HIPFIRE_GFX1100_GATED_NORM_V2=0`);
+        // gfx1151 `_gfx1151_v2` (same body + one-pass emit, same launch).
+        let gfx1151 = self.arch_caps.is_gfx1151();
+        let v2 = gfx1151
+            || (self.arch_caps.is_gfx1100()
+                && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true));
+        let (module, source) = match (awq.is_some(), v2, gfx1151) {
+            (true, false, _) => ("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC),
+            (false, false, _) => ("gated_norm_mq_rotate_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC),
+            (true, true, false) => (
                 "gated_norm_mq_rotate_awq_i4_gfx1100_v2",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC,
             ),
-            (false, true) => (
-                "gated_norm_mq_rotate_i4_gfx1100_v2",
-                kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC,
+            (false, true, false) => ("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC),
+            (true, true, true) => (
+                "gated_norm_mq_rotate_awq_i4_gfx1151_v2",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC,
             ),
+            (false, true, true) => ("gated_norm_mq_rotate_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC),
         };
         let kernel = module;
         // v2: two 256-groups (one per wave) per 64-thread workgroup.
@@ -5527,7 +5591,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            [grid_x as u32, batch_size as u32, 1],
+            folded_rows_grid("gated_norm_rotate_mq_i4_gfx11_batched", grid_x, batch_size)?,
             [64, 1, 1],
             0,
             &mut params,
@@ -6550,7 +6614,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
         let result = self.launch_maybe_blob(
             KERNEL,
-            [(k / 256) as u32, batch_size as u32, 1],
+            folded_rows_grid("fused_silu_hin_rotate_mq_i8_gfx12_batched", k / 256, batch_size)?,
             [32, 1, 1],
             0,
             &mut params,
@@ -6669,7 +6733,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [(k / 256).div_ceil(2) as u32, batch_size as u32, 1],
+            folded_rows_grid("gated_norm_rotate_mq_i8_gfx12_batched", (k / 256).div_ceil(2), batch_size)?,
             [64, 1, 1],
             0,
             &mut params,
@@ -6900,34 +6964,38 @@ impl Gpu {
         )?;
         self.ensure_mq_signs_128()?;
         let out = self.qwen4_f16_x_scratch(k * batch_size)?;
-        let xp = x.buf.as_ptr();
-        let op = out.buf.as_ptr();
         let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
         let kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &s1 as *const _ as *mut c_void,
-            &s2 as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            "mq_rotate_x_128_v2_f16",
-            [k.div_ceil(128) as u32, batch_size as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp);
-                b.push_ptr(op);
-                b.push_ptr(s1);
-                b.push_ptr(s2);
-                b.push_i32(kv);
-                b
-            },
-        )?;
+        // grid.y carries the row axis, which HIP bounds at 65535: launch row
+        // pieces with the input/output pointers advanced to their first row.
+        for (start, n) in grid_yz_chunks(batch_size) {
+            let xp = ptr_add_bytes(x.buf.as_ptr(), start * k * std::mem::size_of::<f32>());
+            let op = ptr_add_bytes(out.buf.as_ptr(), start * k * 2);
+            let mut params: Vec<*mut c_void> = vec![
+                &xp as *const _ as *mut c_void,
+                &op as *const _ as *mut c_void,
+                &s1 as *const _ as *mut c_void,
+                &s2 as *const _ as *mut c_void,
+                &kv as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "mq_rotate_x_128_v2_f16",
+                [k.div_ceil(128) as u32, n as u32, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(xp);
+                    b.push_ptr(op);
+                    b.push_ptr(s1);
+                    b.push_ptr(s2);
+                    b.push_i32(kv);
+                    b
+                },
+            )?;
+        }
         Ok(out)
     }
 
@@ -6965,6 +7033,27 @@ impl Gpu {
                 "shared activation wider than the routed grid",
             ));
         }
+        let rows = batch_size + usize::from(shared.is_some());
+        if rows > GRID_YZ_MAX {
+            // The row axis (the shared tail is the last row) rides grid.y, which
+            // HIP bounds at 65535. Routed rows run in pieces without the shared
+            // pointers; the shared activation is its own one-row launch, which
+            // the kernel serves from its last-row branch.
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
+                    &gate.sub_offset(start * k, n * k),
+                    &up.sub_offset(start * k, n * k),
+                    &x_rot.sub_offset(start * k, n * k),
+                    k,
+                    n,
+                    None,
+                )?;
+            }
+            if shared.is_some() {
+                self.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(gate, up, x_rot, k, 0, shared)?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         const FUNC: &str = "mq_rotate_x_128_v2_silu_bf16";
         self.ensure_kernel("mq_rotate_x_128_v2", kernels::MQ_ROTATE_X_128_V2_SRC, FUNC)?;
@@ -6994,7 +7083,7 @@ impl Gpu {
             &sel as *const _ as *mut c_void,
             &sn as *const _ as *mut c_void,
         ];
-        let rows = batch_size + usize::from(shared.is_some());
+        // `rows` is at most GRID_YZ_MAX here (larger launches returned above).
         self.launch_maybe_blob(
             FUNC,
             [k.div_ceil(128) as u32, rows as u32, 1],
@@ -7026,6 +7115,19 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The row axis rides grid.y, which HIP bounds at 65535: launch row
+            // pieces with both row-major pointers advanced to their first row.
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.rotate_x_mq_128_v2(
+                    &x.sub_offset(start * k, n * k),
+                    &x_rot.sub_offset(start * k, n * k),
+                    k,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         const FUNC: &str = "mq_rotate_x_128_v2";
         self.ensure_kernel(FUNC, kernels::MQ_ROTATE_X_128_V2_SRC, FUNC)?;
@@ -12995,6 +13097,23 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
+                    a_raw,
+                    &x_batch.sub_offset(start * k, n * k),
+                    &y_batch.sub_offset(start * m, n * m),
+                    &c_batch.sub_offset(start, n),
+                    m,
+                    k,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g256_residual_scaled",
@@ -13064,6 +13183,23 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
+                    a_raw,
+                    &x_batch.sub_offset(start * k, n * k),
+                    &y_batch.sub_offset(start * m, n * m),
+                    &c_batch.sub_offset(start, n),
+                    m,
+                    k,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq4g128_residual_sigmoid_scaled",
@@ -13133,6 +13269,23 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
+                    a_raw,
+                    &x_batch.sub_offset(start * k, n * k),
+                    &y_batch.sub_offset(start * m, n * m),
+                    &c_batch.sub_offset(start, n),
+                    m,
+                    k,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq6g256_residual_sigmoid_scaled",
@@ -13946,6 +14099,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         debug_assert!(
             self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
@@ -14100,6 +14272,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         debug_assert!(
             self.arch_caps.has_wmma_w32() || self.arch_caps.is_rdna4(),
@@ -15119,6 +15309,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
@@ -15212,6 +15421,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &topk_weights.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &x_residual.sub_offset(start * m, n * m),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
@@ -15312,6 +15540,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         let cpol_slc = self.arch_caps.is_gfx1100()
             && hipfire_config::developer_var("HIPFIRE_MOE_DOWN_CPOL").as_deref() == Ok("slc");
@@ -15673,6 +15919,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
@@ -15856,6 +16121,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mq6g256v2_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched",
@@ -15933,6 +16217,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
@@ -16016,6 +16318,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
@@ -16691,6 +17011,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_paro_q4g128_moe_gate_up_k8_indexed_batched",
@@ -16758,6 +17097,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_paro_q4g128_moe_down_k8_indexed_batched",
@@ -16975,6 +17332,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq6g256_moe_gate_up_indexed_batched",
@@ -17051,6 +17427,26 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mixed_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    dtype_tags,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mixed_moe_gate_up_indexed_batched",
@@ -17127,6 +17523,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq5g256_moe_gate_up_k8_indexed_batched(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &x.sub_offset(start * k, n * k),
+                    &y_gate.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    &y_up.sub_offset(start * (k_top * (m / 2)), n * (k_top * (m / 2))),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq5g256_moe_gate_up_indexed_batched",
@@ -17201,6 +17616,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq6g256_moe_down_k8_indexed_batched_expanded",
@@ -17272,6 +17705,25 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_mixed_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    dtype_tags,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_mixed_moe_down_k8_indexed_batched_expanded",
@@ -17344,6 +17796,24 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size > GRID_YZ_MAX {
+            // The token axis rides grid.z/grid.y, which HIP bounds at 65535:
+            // launch row pieces with every per-token pointer advanced to its
+            // first row (same per-row arithmetic, no row dropped).
+            for (start, n) in grid_yz_chunks(batch_size) {
+                self.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
+                    expert_ptrs,
+                    &topk_indices.sub_offset(start * k_top, n * k_top),
+                    &rot_batch.sub_offset(start * (k_top * k), n * (k_top * k)),
+                    &expert_outputs.sub_offset(start * (k_top * m), n * (k_top * m)),
+                    m,
+                    k,
+                    k_top,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemv_hfq5g256_moe_down_k8_indexed_batched_expanded",

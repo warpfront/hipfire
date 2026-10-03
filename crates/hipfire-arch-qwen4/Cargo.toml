@@ -40,7 +40,3 @@ required-features = ["lab"]
 [[example]]
 name = "qwen4_rows"
 required-features = ["lab"]
-
-[[example]]
-name = "qwen4_prompt_cache"
-required-features = ["lab"]

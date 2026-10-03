@@ -9,8 +9,10 @@
 //   tile below. The WMMA GEMM writes conv outputs position-major
 //   `[n_pix][c_out]`; the decoder walks channel-major `[c_out][n_pix]`, so
 //   each GEMM conv transposes once.
-// - vae_transpose_f32: 32x32 LDS-tiled variant (padded +1 against bank
-//   conflicts), kept for A/B behind HIPFIRE_VAE_TRANSPOSE=tiled.
+// - vae_transpose_f32_banded / vae_transpose_cast_f16: 32x32 LDS-tiled
+//   variants (padded +1 against bank conflicts); the banded one is the
+//   A/B alternative behind HIPFIRE_VAE_TRANSPOSE=tiled. Their tile grid is
+//   folded into grid.x (see `vae_tile_origin`): no gridDim.y/z is used.
 // - vae_transpose_cast_f16: f32 `[m][n]` -> f16 `[n][m]`, the fused
 //   transpose+cast that prepares a channel-major activation as the
 //   position-major f16 GEMM operand (shared by the q/k/v projections of the
@@ -22,6 +24,18 @@
 #include <hip/hip_runtime.h>
 
 #define VAE_TILE 32
+
+// Tile origin of a launch whose tile grid is FOLDED into grid.x:
+// `blockIdx.x = tile_col + tile_cols * tile_row`, `tile_cols = ceil(n/32)`.
+// gfx1201 has 16-bit y/z workgroup-ID fields. Image row tiles can exceed that
+// range, so the launched tiled entries use only x, in the old x-fastest order.
+__device__ static inline void vae_tile_origin(int n, int* x0, int* y0) {
+    const unsigned tiles_x = ((unsigned)n + VAE_TILE - 1) / VAE_TILE;
+    const unsigned tx = blockIdx.x % tiles_x;
+    const unsigned ty = blockIdx.x / tiles_x;
+    *x0 = (int)(tx * VAE_TILE); // src col
+    *y0 = (int)(ty * VAE_TILE); // src row
+}
 
 extern "C" __global__ void vae_transpose_f32(
     const float* __restrict__ src,
@@ -69,8 +83,8 @@ extern "C" __global__ void vae_transpose_cast_f16(
     int n
 ) {
     __shared__ float tile[VAE_TILE][VAE_TILE + 1];
-    int x0 = blockIdx.x * VAE_TILE; // src col
-    int y0 = blockIdx.y * VAE_TILE; // src row
+    int x0, y0;
+    vae_tile_origin(n, &x0, &y0); // src col, src row
     for (int j = threadIdx.y; j < VAE_TILE && y0 + j < m; j += blockDim.y) {
         for (int i = threadIdx.x; i < VAE_TILE && x0 + i < n; i += blockDim.x) {
             tile[j][i] = src[(long)(y0 + j) * n + (x0 + i)];
@@ -131,8 +145,8 @@ extern "C" __global__ void vae_transpose_f32_banded(
     long dst_off
 ) {
     __shared__ float tile[VAE_TILE][VAE_TILE + 1];
-    int x0 = blockIdx.x * VAE_TILE; // src col
-    int y0 = blockIdx.y * VAE_TILE; // src row
+    int x0, y0;
+    vae_tile_origin(n, &x0, &y0); // src col, src row
     for (int j = threadIdx.y; j < VAE_TILE && y0 + j < m; j += blockDim.y) {
         for (int i = threadIdx.x; i < VAE_TILE && x0 + i < n; i += blockDim.x) {
             tile[j][i] = src[(long)(y0 + j) * n + (x0 + i)];

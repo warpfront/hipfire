@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1100 and gfx1201: the Qwen3.6/3.8-27B (24Q/4K) decode fusion
-//! `qwen36_27b_fa_prep_*` must produce the same bytes as the chain it
-//! replaces: `deinterleave_f32`, `rmsnorm_batched` on Q and on K, then
+//! gfx1100/gfx1151: the A3B 16Q/2K decode fusion; gfx1100/gfx1201:
+//! the Qwen3.6/3.8-27B 24Q/4K decode fusion must produce the same bytes
+//! as the chain it replaces: `deinterleave_f32`, Q/K `rmsnorm_batched`, then
 //! `rope_partial_interleaved_f32` (the half-split partial RoPE). The Qwen3.5
 //! lowered decode uses the fusion and the hand decode
 //! (`HIPFIRE_FORWARD_LOWERED=0`) uses the chain, so any difference makes the
@@ -13,7 +13,7 @@
 //! computes `fma(x0, sin, x1 * cos)`.
 //!
 //! Q, gate and K are compared bit for bit at positions from 0 to 2^20.
-//! Other arches do not admit the 24Q/4K fusion, so the test skips there.
+//! Each shape skips arches that do not admit its certified fusion.
 //!
 //! `#[ignore]`d: needs a GPU with a working HIP toolchain. Run explicitly:
 //!
@@ -24,8 +24,6 @@
 
 use rdna_compute::{Gpu, GpuTensor};
 
-const NQ: usize = 24;
-const NK: usize = 4;
 const HD: usize = 256;
 const NROT: usize = 64;
 const EPS: f32 = 1e-6;
@@ -70,6 +68,22 @@ fn qwen36_27b_fa_prep_matches_unfused_chain_bit_for_bit() {
         eprintln!("skip: {} does not admit the 24Q/4K FA prep fusion", gpu.arch);
         return;
     }
+    check_prep(&mut gpu, 24, 4);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn qwen35_16q2k_fa_prep_matches_unfused_chain_bit_for_bit() {
+    let mut gpu = Gpu::init().expect("gpu init");
+    if !(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151()) {
+        eprintln!("skip: {} is not a corrected gfx11 twin", gpu.arch);
+        return;
+    }
+    check_prep(&mut gpu, 16, 2);
+}
+
+#[allow(non_snake_case)]
+fn check_prep(mut gpu: &mut Gpu, NQ: usize, NK: usize) {
     let alloc = |gpu: &mut Gpu, n: usize| gpu.upload_f32(&vec![0.0; n], &[n]).unwrap();
     let mut seed = 0x5eed_fa27;
     let q_full = alloc(&mut gpu, NQ * 2 * HD);

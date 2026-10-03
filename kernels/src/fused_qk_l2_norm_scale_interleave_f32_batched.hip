@@ -25,7 +25,8 @@
 //                                                   n_key * ratio)
 //   k_dst      : [N × n_value_heads × head_dim] f32 (written)
 //
-// Grid: [n_key_heads, N, 1]. Block: [32] (wave32 reduction).
+// Grid: [n_key_heads * N, 1, 1] (rows folded into grid.x: b = blockIdx.x /
+// n_key_heads, key head = blockIdx.x % n_key_heads). Block: [32] (wave32).
 
 extern "C" __global__ void fused_qk_l2_norm_scale_interleave_f32_batched(
     const float* __restrict__ q_src,
@@ -38,9 +39,8 @@ extern "C" __global__ void fused_qk_l2_norm_scale_interleave_f32_batched(
     float q_scale,
     float eps
 ) {
-    const int kh = blockIdx.x;
-    if (kh >= n_key_heads) return;
-    const int b = blockIdx.y;
+    const unsigned b = blockIdx.x / (unsigned)n_key_heads;
+    const int kh = blockIdx.x - b * (unsigned)n_key_heads;
     const int tid = threadIdx.x;
 
     const long long src_batch_off = (long long)b * n_key_heads * head_dim;

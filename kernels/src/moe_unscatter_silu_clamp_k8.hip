@@ -30,7 +30,8 @@
 // Padding slots (sorted_slot_index = -1) are skipped — downstream
 // FWHT-rotate only reads valid (token, k_rank) tuples.
 //
-// Grid:  (ceil(mi/256), m_total)
+// Grid:  (m_total, ceil(mi/256))  -- slot on x (limit 2^31); the mi tile on
+//        y stays <= 65535 (grid.y/z cap at 65535 blocks on gfx1201).
 // Block: [256]
 // LDS:   0
 
@@ -43,7 +44,7 @@ extern "C" __global__ void moe_unscatter_silu_clamp_k8(
     int mi, int K_TOP, int m_total,
     float swiglu_limit
 ) {
-    const int slot = blockIdx.y;
+    const int slot = blockIdx.x;
     if (slot >= m_total) return;
     const int flat = sorted_slot_index[slot];
     if (flat < 0) return; // padding slot — downstream does not consume.
@@ -51,7 +52,7 @@ extern "C" __global__ void moe_unscatter_silu_clamp_k8(
     const int token = flat / K_TOP;
     const int krank = flat - token * K_TOP;
 
-    const int m_col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m_col = blockIdx.y * blockDim.x + threadIdx.x;
     if (m_col >= mi) return;
 
     const long long y_grp_base = (long long)slot * 2 * mi;

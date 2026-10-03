@@ -5,8 +5,10 @@
 // the AWQ scale is selected PER BATCH ROW (per routed expert) from a device
 // pointer table — each token's K_TOP experts have a different down.awq_scale.
 //
-// grid = [groups_total = K/256, K_TOP, 1]; blockIdx.y = krank (the routed-expert
-// rank). gate/up/x_rot are [K_TOP × K] row-major (the per-expert SwiGLU outputs).
+// grid = [N_ROWS * groups_total, 1, 1] with groups_total = K/256; x folds
+// (krank, group) as x = krank * groups_total + group (group fastest), so the
+// row count never rides the 65535-bounded grid.y. krank is the routed-expert
+// rank (row). gate/up/x_rot are [N_ROWS × K] row-major (the per-expert SwiGLU outputs).
 //   awq_scale = expert_down_awq_ptrs[topk_indices[krank]]   (the selected expert's [K] f32 vector)
 // Pattern matches the indexed gate_up GEMV's `expert_ptrs[topk_indices[krank]]`.
 //
@@ -26,13 +28,14 @@ __global__ void fused_silu_mul_mq_rotate_awq_indexed(
     float* __restrict__ x_rot,
     int K
 ) {
-    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (group >= groups_total) return;
+    if (groups_total <= 0) return;
+    const unsigned bx = blockIdx.x;
 
     // Per-expert select: this batch row's routed expert id → its awq_scale base.
-    const int krank = blockIdx.y;
+    const int krank = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)krank * (unsigned)groups_total);
     const int expert_id = topk_indices[krank];
     const float* __restrict__ awq_scale =
         reinterpret_cast<const float*>(expert_down_awq_ptrs[expert_id]);

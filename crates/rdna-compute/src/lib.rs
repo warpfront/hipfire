@@ -19,6 +19,7 @@ pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
+pub mod gap_timing;
 pub mod gemm;
 mod packed_mq4;
 mod gemma4_ext;
@@ -26,6 +27,7 @@ mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
 pub mod grouped_ops;
+pub mod hc_row_fold;
 pub mod kernel_pack;
 pub mod kernel_registry;
 mod kernels;
@@ -41,6 +43,7 @@ pub mod profile_rocprof;
 pub mod profiler;
 pub mod qwen35_fa_batch;
 pub mod rdna;
+pub mod railgun_check;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
@@ -51,6 +54,11 @@ pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
 pub mod vae;
+pub mod trunk_mask;
+pub use trunk_mask::{
+    qwen4_trunk_iu4_mask, Qwen4TrunkMask, TrunkFamily, TRUNK_ALL_BITS, TRUNK_GDN_BITS,
+    TRUNK_QSA_BITS,
+};
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{

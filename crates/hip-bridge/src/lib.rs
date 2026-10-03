@@ -12,7 +12,9 @@
 mod error;
 mod ffi;
 mod kernarg;
+mod launch_grid;
 mod rccl;
+pub mod registry;
 mod rocblas;
 mod rocsolver;
 mod vmm;
@@ -33,6 +35,7 @@ pub use ffi::{
     HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
 };
 pub use kernarg::KernargBlob;
+pub use launch_grid::{check_launch_grid, grid_yz_limit_for_arch, GFX1201_MAX_GRID_YZ};
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
 pub use rocsolver::{

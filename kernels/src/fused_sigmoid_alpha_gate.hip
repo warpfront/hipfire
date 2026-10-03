@@ -8,10 +8,12 @@
 // DeltaNet attention preamble on independent buffers of size n_v_heads.
 // Originally two back-to-back scalar launches; fused into one here.
 //
-// Grid: [ceil(n/256), batch, 1]. Each thread handles one head index
-// for a single batch row. For decode grid.y=1 (byte-identical to the
-// pre-batching version); for prefill grid.y=N and beta/alpha are laid
-// out as [N × n] row-major. dt_bias and a_log are shared per-head
+// Grid: [ceil(n/256) * batch, 1, 1] (rows folded into grid.x: row =
+// blockIdx.x / ceil(n/blockDim.x), block-in-row = blockIdx.x % that), so the
+// batch is not bound by the 65535 grid.y limit. Each thread handles one head
+// index for a single batch row. For decode the grid is [ceil(n/256),1,1]
+// (row 0, byte-identical to the pre-batching version); for prefill beta/alpha
+// are laid out as [N × n] row-major. dt_bias and a_log are shared per-head
 // constants and do NOT get a batch offset.
 //
 // Bit-exact with the separate kernels since all operations are
@@ -24,10 +26,12 @@ extern "C" __global__ void fused_sigmoid_alpha_gate_f32(
     const float* __restrict__ a_log,  // [n]
     int n
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned blocks_per_row = ((unsigned)n + blockDim.x - 1) / blockDim.x;
+    const unsigned row = blockIdx.x / blocks_per_row;
+    int i = (blockIdx.x - row * blocks_per_row) * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    const long long batch_off = (long long)blockIdx.y * n;
+    const long long batch_off = (long long)row * n;
     float* beta_b  = beta  + batch_off;
     float* alpha_b = alpha + batch_off;
 

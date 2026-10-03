@@ -1,0 +1,8 @@
+{
+  "symbol": "indexed_attention_kv_f16vb_fp8_pm_gfx1201",
+  "counts": {"buffer_load_u8": 2, "buffer_load_u16": 2, "buffer_store_b16": 2, "v_cvt_pk_f32_fp8_e32": 2, "v_fma_mixlo_f16": 2, "s_endpgm": 1},
+  "forbidden": ["scratch_*", "flat_*", "global_*", "v_readlane*", "v_writelane*", "s_setpc*", "s_swappc*"],
+  "vgpr_max": 16, "sgpr_max": 104,
+  "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0
+}

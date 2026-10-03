@@ -1332,4 +1332,228 @@ mod tests {
             );
         }
     }
+
+    // ── MQ6G256 (qt15) vs MQ6G256V2 (qt47): dequantized-value relation ──────────
+    //
+    // Both are 200 B / 256-weight groups with the same 6-bit packing scheme
+    // (4 codes per 3 bytes) and FWHT rotation (signs 42/1042). V1 uses one
+    // f32 (scale,min) grid; V2 uses two fp16 (scale,zero) grids. The grids
+    // and selected codes differ, so this is not a layout-only change.
+
+    fn mq6_unpack_group(payload: &[u8], q: &mut [u8; 256]) {
+        for c in 0..64 {
+            let (b0, b1, b2) = (payload[c * 3], payload[c * 3 + 1], payload[c * 3 + 2]);
+            q[c * 4] = b0 & 63;
+            q[c * 4 + 1] = (b0 >> 6) | ((b1 & 0x0f) << 2);
+            q[c * 4 + 2] = (b1 >> 4) | ((b2 & 0x03) << 4);
+            q[c * 4 + 3] = b2 >> 2;
+        }
+    }
+
+    /// MQ6G256 (qt15): [f32 scale][f32 min][192 B payload]; value = q*scale + min.
+    fn mq6_v1_dequant_rotated(blob: &[u8]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(blob.len() / MQ6V2_GROUP_BYTES * 256);
+        let mut q = [0u8; 256];
+        for g in blob.chunks_exact(MQ6V2_GROUP_BYTES) {
+            let scale = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+            let min = f32::from_le_bytes([g[4], g[5], g[6], g[7]]);
+            mq6_unpack_group(&g[8..], &mut q);
+            out.extend(q.iter().map(|&c| f32::from(c) * scale + min));
+        }
+        out
+    }
+
+    /// MQ6G256V2 (qt47): [fp16 s0][fp16 z0][fp16 s1][fp16 z1][192 B payload].
+    fn mq6_v2_dequant_rotated(blob: &[u8]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(blob.len() / MQ6V2_GROUP_BYTES * 256);
+        let mut q = [0u8; 256];
+        for g in blob.chunks_exact(MQ6V2_GROUP_BYTES) {
+            let h = |o: usize| f16_to_f32(u16::from_le_bytes([g[o], g[o + 1]]));
+            let (s0, z0, s1, z1) = (h(0), h(2), h(4), h(6));
+            mq6_unpack_group(&g[8..], &mut q);
+            for (i, &c) in q.iter().enumerate() {
+                let (s, z) = if i < 128 { (s0, z0) } else { (s1, z1) };
+                out.push(f32::from(c) * s + z);
+            }
+        }
+        out
+    }
+
+    /// Inverse of `cpu_fwht_256` (signs2 -> butterfly -> 1/16 * signs1): the
+    /// transform is orthonormal, so this recovers original-domain weights.
+    fn cpu_ifwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+        for i in 0..256 {
+            x[i] *= signs2[i];
+        }
+        let mut stride = 1;
+        while stride < 256 {
+            let mut i = 0;
+            while i < 256 {
+                for j in 0..stride {
+                    let a = x[i + j];
+                    let b = x[i + j + stride];
+                    x[i + j] = a + b;
+                    x[i + j + stride] = a - b;
+                }
+                i += stride * 2;
+            }
+            stride <<= 1;
+        }
+        for i in 0..256 {
+            x[i] *= 0.0625 * signs1[i];
+        }
+    }
+
+    /// First `rows` rows (of expert 0 for a fused 3-D expert tensor) of a BF16
+    /// tensor as f32, plus K. Panics loudly if the checkpoint is missing.
+    fn mq6_real_bf16_rows(
+        dir: &std::path::Path,
+        shard: u32,
+        name: &str,
+        rows: Option<usize>,
+    ) -> (Vec<f32>, usize) {
+        let path = dir.join(format!("model.safetensors-{shard:05}-of-00014.safetensors"));
+        let file = hipfire_quantize::safetensors_file::SafetensorsFile::open(&path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let (meta, bytes) = file
+            .tensor_data(name)
+            .unwrap_or_else(|| panic!("{name} not in {}", path.display()));
+        assert_eq!(meta.dtype, "BF16", "{name} dtype");
+        let k = *meta.shape.last().unwrap();
+        let tensor_rows = meta.shape[meta.shape.len() - 2];
+        let rows = rows.unwrap_or(tensor_rows);
+        assert!(rows <= tensor_rows, "{name}: {rows} rows > {tensor_rows}");
+        let vals = bytes[..rows * k * 2]
+            .chunks_exact(2)
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+            .collect();
+        (vals, k)
+    }
+
+    /// Real-checkpoint regression: MQ6G256 (qt15) vs MQ6G256V2 (qt47)
+    /// dequantized values on every Promote6 role of Qwen3.5-35B-A3B (BF16
+    /// original, layer 0 = linear attention + MoE, edge layer 39 = full
+    /// attention + MoE): LA qkv/z/a/b/out, FA q/k/v/o, routed gate_up/down (expert 0), shared
+    /// gate/up/down.
+    ///
+    /// Envelope asserted (rotated domain, per element, per 256-group):
+    ///   V1: |dq - ref| <= 0.5*scale*(1+1e-4) + 1e-6*amax
+    ///   V2: |dq - ref| <= 0.5*step*(1+1e-4) + 64*(step*2^-10 + 2^-24)
+    ///                     + |lo|*2^-10 + 2^-24 + 1e-6*amax   (per 128-half;
+    ///       step=(hi-lo)/63; float16::f32_to_f16 truncates, so header error
+    ///       allows a full fp16 ULP, including the 2^-24 subnormal spacing)
+    ///   |V1 - V2| <= bound1 + bound2.
+    /// Original domain (inverse-rotated vs BF16 weights): V2 mean-abs and
+    /// relative-L2 error must be <= V1's. Max-abs is reported, not assumed
+    /// monotone; neither these sampled errors nor kernel arithmetic imply
+    /// byte-identical model decode.
+    ///
+    /// Run (needs the NAS checkpoint, ~16 MB of tensor pages touched):
+    ///   cargo test --release -p hipfire-quantize --bin hipfire-quantize -- \
+    ///     --ignored mq6_v1_v2_dequant_envelope_on_real_a3b_roles --nocapture
+    /// Override the checkpoint dir with MQ6_REAL_A3B_DIR.
+    #[test]
+    #[ignore = "real-checkpoint: needs /mnt/nas/kaden/models/Qwen3.5-35B-A3B (or MQ6_REAL_A3B_DIR)"]
+    fn mq6_v1_v2_dequant_envelope_on_real_a3b_roles() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("MQ6_REAL_A3B_DIR")
+                .unwrap_or_else(|_| "/mnt/nas/kaden/models/Qwen3.5-35B-A3B".to_string()),
+        );
+        const L: &str = "model.language_model.layers.";
+        // (role, shard, tensor, rows)
+        let roles: [(&str, u32, String, Option<usize>); 14] = [
+            ("LA in_proj_qkv", 13, format!("{L}0.linear_attn.in_proj_qkv.weight"), Some(512)),
+            ("LA in_proj_z", 13, format!("{L}0.linear_attn.in_proj_z.weight"), Some(512)),
+            ("LA out_proj", 13, format!("{L}0.linear_attn.out_proj.weight"), Some(256)),
+            ("LA in_proj_a", 14, format!("{L}0.linear_attn.in_proj_a.weight"), None),
+            ("LA in_proj_b", 14, format!("{L}0.linear_attn.in_proj_b.weight"), None),
+            ("FA q_proj", 13, format!("{L}39.self_attn.q_proj.weight"), Some(512)),
+            ("FA k_proj", 14, format!("{L}39.self_attn.k_proj.weight"), None),
+            ("FA v_proj", 14, format!("{L}39.self_attn.v_proj.weight"), None),
+            ("FA o_proj", 13, format!("{L}39.self_attn.o_proj.weight"), Some(256)),
+            ("routed gate_up e0", 6, format!("{L}0.mlp.experts.gate_up_proj"), Some(1024)),
+            ("routed down e0", 12, format!("{L}0.mlp.experts.down_proj"), Some(512)),
+            ("shared gate", 14, format!("{L}0.mlp.shared_expert.gate_proj.weight"), None),
+            ("shared up", 14, format!("{L}0.mlp.shared_expert.up_proj.weight"), None),
+            ("shared down", 14, format!("{L}0.mlp.shared_expert.down_proj.weight"), None),
+        ];
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let fp16_rel = 1.0f32 / 1024.0;
+        let fp16_sub = 1.0f32 / 16_777_216.0;
+        for (role, shard, name, rows) in roles {
+            let (w, k) = mq6_real_bf16_rows(&dir, shard, &name, rows);
+            assert_eq!(k % 256, 0, "{role}: K={k} not 256-aligned");
+            let m = w.len() / k;
+            let n_groups = w.len() / 256;
+            let v1 = quantize_mq6g256(&w, &s1, &s2);
+            let v2 = quantize_mq6g256v2(&w, m, k, &s1, &s2);
+            assert_eq!(v1.len(), n_groups * MQ6V2_GROUP_BYTES, "{role}: v1 size");
+            assert_eq!(v2.len(), v1.len(), "{role}: v1/v2 container size must match");
+            let d1 = mq6_v1_dequant_rotated(&v1);
+            let d2 = mq6_v2_dequant_rotated(&v2);
+
+            let mut worst1 = 0.0f32; // max err / bound
+            let mut worst2 = 0.0f32;
+            let mut worst12 = 0.0f32;
+            let (mut sum1, mut sum2, mut sq1, mut sq2, mut sqw) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut max1, mut max2) = (0.0f32, 0.0f32);
+            for g in 0..n_groups {
+                let mut rot = [0.0f32; 256];
+                rot.copy_from_slice(&w[g * 256..(g + 1) * 256]);
+                cpu_fwht_256(&mut rot, &s1, &s2);
+                let amax = rot.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let hdr = &v1[g * MQ6V2_GROUP_BYTES..];
+                let scale1 = f32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+                let tol1 = 0.5 * scale1 * (1.0 + 1e-4) + 1e-6 * amax;
+                for h in 0..2 {
+                    let half = &rot[h * 128..(h + 1) * 128];
+                    let lo = half.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let hi = half.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let step = if hi > lo { (hi - lo) / 63.0 } else { 0.0 };
+                    let tol2 = 0.5 * step * (1.0 + 1e-4)
+                        + 64.0 * (step * fp16_rel + fp16_sub)
+                        + lo.abs() * fp16_rel
+                        + fp16_sub
+                        + 1e-6 * amax;
+                    for i in h * 128..(h + 1) * 128 {
+                        let e1 = (d1[g * 256 + i] - rot[i]).abs();
+                        let e2 = (d2[g * 256 + i] - rot[i]).abs();
+                        let e12 = (d1[g * 256 + i] - d2[g * 256 + i]).abs();
+                        assert!(e1 <= tol1, "{role} g={g} i={i}: v1 err {e1} > {tol1}");
+                        assert!(e2 <= tol2, "{role} g={g} i={i}: v2 err {e2} > {tol2}");
+                        assert!(e12 <= tol1 + tol2, "{role} g={g} i={i}: |v1-v2| {e12} > {}", tol1 + tol2);
+                        worst1 = worst1.max(e1 / tol1);
+                        worst2 = worst2.max(e2 / tol2);
+                        worst12 = worst12.max(e12 / (tol1 + tol2));
+                    }
+                }
+                let mut o1 = [0.0f32; 256];
+                let mut o2 = [0.0f32; 256];
+                o1.copy_from_slice(&d1[g * 256..(g + 1) * 256]);
+                o2.copy_from_slice(&d2[g * 256..(g + 1) * 256]);
+                cpu_ifwht_256(&mut o1, &s1, &s2);
+                cpu_ifwht_256(&mut o2, &s1, &s2);
+                for i in 0..256 {
+                    let orig = w[g * 256 + i];
+                    let (e1, e2) = ((o1[i] - orig).abs(), (o2[i] - orig).abs());
+                    max1 = max1.max(e1);
+                    max2 = max2.max(e2);
+                    sum1 += f64::from(e1);
+                    sum2 += f64::from(e2);
+                    sq1 += f64::from(e1) * f64::from(e1);
+                    sq2 += f64::from(e2) * f64::from(e2);
+                    sqw += f64::from(orig) * f64::from(orig);
+                }
+            }
+            let n = w.len() as f64;
+            let (mean1, mean2) = (sum1 / n, sum2 / n);
+            let (rel1, rel2) = ((sq1 / sqw).sqrt(), (sq2 / sqw).sqrt());
+            eprintln!(
+                "{role:<18} [{m}x{k}] rot err/bound v1={worst1:.4} v2={worst2:.4} |v1-v2|={worst12:.4} | orig max v1={max1:.3e} v2={max2:.3e} mean v1={mean1:.3e} v2={mean2:.3e} rel-L2 v1={rel1:.5} v2={rel2:.5}"
+            );
+            assert!(mean2 <= mean1, "{role}: V2 mean-abs {mean2} > V1 {mean1}");
+            assert!(rel2 <= rel1, "{role}: V2 rel-L2 {rel2} > V1 {rel1}");
+        }
+    }
 }

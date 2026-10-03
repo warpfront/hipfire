@@ -99,6 +99,77 @@ pub struct Qwen4Bundle {
     pub(crate) spec_top1: Option<GpuTensor>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
+    /// Single-session prefix cache (`attach_prefix_cache`); `None` = off.
+    prefix: Option<Qwen4PrefixCache>,
+}
+
+/// The Qwen4 prefix cache is on by default; `HIPFIRE_QWEN_PROMPT_CACHE=0|1`
+/// (the prompt-cache switch every Qwen family reads) overrides it.
+pub const QWEN4_PREFIX_CACHE_DEFAULT: bool = true;
+
+/// Whether a load should attach (and charge) the prefix cache.
+pub fn prefix_cache_requested() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN_PROMPT_CACHE", QWEN4_PREFIX_CACHE_DEFAULT)
+}
+
+/// Device bytes [`Qwen4Bundle::attach_prefix_cache`] allocates: the target
+/// state checkpoint plus, with native MTP, the head's selection, device
+/// selected length and wide hidden. Charged by the load's VRAM reserve.
+pub fn prefix_cache_device_bytes(
+    config: &Qwen4Config,
+    format: Qwen4StateFormat,
+    native_mtp: bool,
+) -> Option<u64> {
+    let target = Qwen4State::prefix_arena_bytes(config, format)?;
+    if !native_mtp {
+        return Some(target);
+    }
+    let mtp = config
+        .qsa_selected_capacity()
+        .checked_add(1)?
+        .checked_add(config.hc_count.checked_mul(config.hidden_size)?)?
+        .checked_mul(4)?;
+    target.checked_add(u64::try_from(mtp).ok()?)
+}
+
+/// Prefill schedule a prefix checkpoint was produced under. AR and native
+/// MTP prefill run different forwards (MTP captures wide hidden rows and
+/// appends every row to the head), so a checkpoint never crosses modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen4PrefixMode {
+    Ar,
+    NativeMtp,
+}
+
+/// Where a prefill starts: `start_pos == 0` is a cold reset, otherwise the
+/// durable checkpoint after exactly `start_pos` tokens is restored and
+/// `prompt[start_pos..]` is replayed. `start_pos` is the cached-token count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Qwen4PrefixPlan {
+    pub start_pos: usize,
+}
+
+/// One durable canonical-chunk checkpoint. The device bytes live in the
+/// state/MTP prefix arenas (their `active` flags are the device validity);
+/// this records which tokens they hold and under which schedule.
+///
+/// The key is only tokens, mode and admitted chunk because everything else
+/// is immutable for this owner: model artifact, device, state formats,
+/// config and placement are fixed per bundle (a reload builds a new bundle
+/// with no checkpoint), and numeric dispatch knobs come from the process
+/// config snapshot (`hipfire_config` `OnceLock`), fixed for the process. Any
+/// future mutable route knob or cross-bundle transport must join the key.
+struct Qwen4PrefixCache {
+    /// Token ids `[0, p)` of the checkpoint; reused allocation.
+    tokens: Vec<u32>,
+    mode: Qwen4PrefixMode,
+    /// Admitted prefill chunk the checkpoint's schedule ran with.
+    chunk: usize,
+    /// Set only by a client-committed request; a running request's
+    /// candidate is never planned against.
+    published: bool,
+    /// Absolute position the running prefill checkpoints at.
+    capture_at: Option<usize>,
 }
 
 impl Qwen4Bundle {
@@ -204,6 +275,7 @@ impl Qwen4Bundle {
             spec_top1: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
+            prefix: None,
         })
     }
 
@@ -1001,6 +1073,11 @@ impl Qwen4Bundle {
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.published = false;
+            cache.capture_at = None;
+            cache.tokens.clear();
+        }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
         if let Some(mtp) = self.mtp.as_mut() {
@@ -1008,6 +1085,281 @@ impl Qwen4Bundle {
                 .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Allocate the durable prefix checkpoint (target state plus, when
+    /// attached, the MTP head). Call after `attach_forward` and MTP attach;
+    /// its bytes are charged by the load reserve
+    /// (`Qwen4State::prefix_arena_bytes`).
+    /// Idempotent: call once right after assembly, before `attach_forward`
+    /// (so its free-VRAM chunk rung sees the checkpoint already allocated),
+    /// and again after MTP attach to add the head's part.
+    pub fn attach_prefix_cache(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        self.state
+            .attach_prefix_arena(gpu)
+            .map_err(BundleError::State)?;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.attach_prefix_arena(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+        }
+        if self.prefix.is_none() {
+            self.prefix = Some(Qwen4PrefixCache {
+                tokens: Vec::with_capacity(self.state.max_seq_len),
+                mode: Qwen4PrefixMode::Ar,
+                chunk: 0,
+                published: false,
+                capture_at: None,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn prefix_cache_attached(&self) -> bool {
+        self.prefix.is_some()
+    }
+
+    /// Pure plan for `prompt` (the full canonical token ids) under `mode`:
+    /// restore the published checkpoint `p` when `prompt[..p]` equals its
+    /// tokens, `p < prompt.len()`, and mode, admitted chunk and device
+    /// validity all match; otherwise cold. No GPU or state mutation.
+    pub fn plan_prefix(&self, prompt: &[u32], mode: Qwen4PrefixMode) -> Qwen4PrefixPlan {
+        let cold = Qwen4PrefixPlan::default();
+        let Some(cache) = self.prefix.as_ref() else {
+            return cold;
+        };
+        let p = cache.tokens.len();
+        if cache.published
+            && cache.mode == mode
+            && Some(cache.chunk) == self.spec_chunk_rows()
+            && p > 0
+            && p < prompt.len()
+            && self.prefix_device_valid(p, mode)
+            && prompt[..p] == cache.tokens[..]
+        {
+            Qwen4PrefixPlan { start_pos: p }
+        } else {
+            cold
+        }
+    }
+
+    /// Whether the device arenas hold the checkpoint after `p` tokens: the
+    /// target's always, the head's too for native MTP.
+    fn prefix_device_valid(&self, p: usize, mode: Qwen4PrefixMode) -> bool {
+        self.state.prefix_position() == Some(p)
+            && match mode {
+                Qwen4PrefixMode::Ar => true,
+                Qwen4PrefixMode::NativeMtp => {
+                    self.mtp.as_ref().and_then(Qwen4MtpGpu::prefix_position) == Some(p)
+                }
+            }
+    }
+
+    /// Discard live decode state the host will never extend, keeping the
+    /// checkpoint: restore it into every owner (its token record and publish
+    /// state untouched), as a hit's prefill would. Without a valid checkpoint,
+    /// or if the restore fails, reset instead. Every later prefill begins
+    /// with [`Self::begin_prefix`], so the live state is never built on.
+    pub fn rewind_to_prefix(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let mode = match self.prefix.as_ref() {
+            Some(cache)
+                if !cache.tokens.is_empty()
+                    && self.prefix_device_valid(cache.tokens.len(), cache.mode) =>
+            {
+                cache.mode
+            }
+            _ => return self.reset(gpu),
+        };
+        if let Err(error) = self.restore_prefix_owners(gpu, mode) {
+            return match self.reset(gpu) {
+                Ok(()) => Ok(()),
+                Err(reset) => Err(BundleError::Forward(format!(
+                    "{error}; reset after the failed prefix rewind also failed: {reset}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    /// Start a prefill of `prompt` under `plan` (re-validated here): a cold
+    /// plan resets every owner, a hit restores the checkpoint into target
+    /// state and, for native MTP, the head and its draft policy. Any failure
+    /// after the first device write resets before returning. The cache is
+    /// unpublished until [`Self::commit_prefix`]; the prefill checkpoints at
+    /// the last whole-chunk boundary of `prompt` past `plan.start_pos`.
+    pub fn begin_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        plan: Qwen4PrefixPlan,
+        mode: Qwen4PrefixMode,
+    ) -> Result<(), BundleError> {
+        if plan.start_pos == 0 {
+            self.reset(gpu)?;
+        } else {
+            if self.plan_prefix(prompt, mode) != plan {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 prefix plan at {} is no longer valid",
+                    plan.start_pos
+                )));
+            }
+            let restored = self.restore_prefix_owners(gpu, mode);
+            if let Err(error) = restored {
+                let reset = self.reset(gpu);
+                return Err(match reset {
+                    Ok(()) => error,
+                    Err(reset) => BundleError::Forward(format!(
+                        "{error}; reset after the failed prefix restore also failed: {reset}"
+                    )),
+                });
+            }
+        }
+        let chunk = self.spec_chunk_rows();
+        let budget = self.config.indexer_budget;
+        if let Some(cache) = self.prefix.as_mut() {
+            let chunk = chunk.ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?;
+            cache.published = false;
+            cache.mode = mode;
+            cache.chunk = chunk;
+            let boundary =
+                crate::gpu_forward::prefill_checkpoint_boundary(budget, prompt.len(), chunk);
+            cache.capture_at = (boundary > plan.start_pos).then_some(boundary);
+        }
+        Ok(())
+    }
+
+    fn restore_prefix_owners(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+    ) -> Result<(), BundleError> {
+        self.invalidate_ple_epoch()?;
+        self.state
+            .restore_prefix(gpu)
+            .map_err(BundleError::State)?;
+        if let Some(mtp) = self.mtp.as_mut() {
+            match mode {
+                Qwen4PrefixMode::NativeMtp => mtp.restore_prefix(gpu),
+                // An AR prefill leaves the head cold, as a reset would.
+                Qwen4PrefixMode::Ar => mtp.reset(gpu),
+            }
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Absolute position the running prefill must checkpoint at, if any.
+    pub fn prefix_capture_at(&self) -> Option<usize> {
+        self.prefix.as_ref().and_then(|cache| cache.capture_at)
+    }
+
+    /// Checkpoint the live state at the armed boundary. `prefix` is
+    /// `prompt[..boundary]`; target (and for native MTP, the head) must have
+    /// consumed exactly it. A failure leaves no valid checkpoint.
+    pub fn stage_prefix(&mut self, gpu: &mut Gpu, prefix: &[u32]) -> Result<(), BundleError> {
+        let (at, mode) = match self.prefix.as_ref() {
+            Some(cache) => (cache.capture_at, cache.mode),
+            None => return Ok(()),
+        };
+        let mtp_position = self.mtp.as_ref().map(Qwen4MtpGpu::position);
+        let aligned = at == Some(prefix.len())
+            && self.state.position == prefix.len()
+            && (mode == Qwen4PrefixMode::Ar || mtp_position == Some(prefix.len()));
+        let result = if aligned {
+            self.capture_prefix_owners(gpu, mode)
+        } else {
+            Err(BundleError::Forward(format!(
+                "Qwen4 prefix checkpoint at {} is not aligned (armed {at:?}, target {}, mtp {mtp_position:?})",
+                prefix.len(),
+                self.state.position
+            )))
+        };
+        let cache = self.prefix.as_mut().expect("prefix cache checked above");
+        cache.capture_at = None;
+        cache.tokens.clear();
+        match result {
+            Ok(()) => {
+                cache.tokens.extend_from_slice(prefix);
+                Ok(())
+            }
+            Err(error) => {
+                self.invalidate_prefix();
+                Err(error)
+            }
+        }
+    }
+
+    fn capture_prefix_owners(
+        &mut self,
+        gpu: &mut Gpu,
+        mode: Qwen4PrefixMode,
+    ) -> Result<(), BundleError> {
+        self.quiesce_ple()?;
+        self.state
+            .capture_prefix(gpu)
+            .map_err(BundleError::State)?;
+        match (mode, self.mtp.as_mut()) {
+            (Qwen4PrefixMode::NativeMtp, Some(mtp)) => mtp
+                .capture_prefix(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            (Qwen4PrefixMode::NativeMtp, None) => Err(BundleError::Forward(
+                "Qwen4 MTP resources are not attached".to_string(),
+            )),
+            (Qwen4PrefixMode::Ar, Some(mtp)) => {
+                mtp.invalidate_prefix();
+                Ok(())
+            }
+            (Qwen4PrefixMode::Ar, None) => Ok(()),
+        }
+    }
+
+    /// Publish the checkpoint after the client committed the request. A
+    /// request that restored `p` and crossed no new boundary republishes `p`.
+    pub fn commit_prefix(&mut self) {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.capture_at = None;
+            cache.published = !cache.tokens.is_empty();
+        }
+    }
+
+    /// Drop the checkpoint (device validity and its token record).
+    pub fn invalidate_prefix(&mut self) {
+        if let Some(cache) = self.prefix.as_mut() {
+            cache.published = false;
+            cache.capture_at = None;
+            cache.tokens.clear();
+        }
+        self.state.invalidate_prefix();
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.invalidate_prefix();
+        }
+    }
+
+    /// AR prefill of the full canonical `prompt` under `plan`, keeping only
+    /// the final logits row: begin (reset or restore), replay
+    /// `prompt[plan.start_pos..]` in the cold schedule's global chunks, and
+    /// checkpoint at the armed whole-chunk boundary.
+    pub fn prefill_final(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        plan: Qwen4PrefixPlan,
+        logits: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        self.begin_prefix(gpu, prompt, plan, Qwen4PrefixMode::Ar)?;
+        let start = plan.start_pos;
+        match self.prefix_capture_at() {
+            Some(at) => {
+                self.forward_chunk_final(gpu, &prompt[start..at], logits, None)?;
+                self.stage_prefix(gpu, &prompt[..at])?;
+                if at < prompt.len() {
+                    self.forward_chunk_final(gpu, &prompt[at..], logits, None)?;
+                }
+                Ok(())
+            }
+            None => self.forward_chunk_final(gpu, &prompt[start..], logits, None),
+        }
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {

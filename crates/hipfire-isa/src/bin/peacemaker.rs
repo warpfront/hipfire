@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use hipfire_isa::audit::{self, Options as AuditOptions};
-use hipfire_isa::toolchain::{assemble_link_bundle, certify, read_kd, IsaShapeContract, Toolchain};
+use hipfire_isa::toolchain::{build, certify, read_kd, IsaShapeContract, Toolchain};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -10,6 +10,8 @@ fn run() -> Result<(), String> {
     let Some(command) = args.next() else { return Err(usage().into()); };
     if command == "audit" { return run_audit(args); }
     if command == "profile" { return run_profile(args); }
+    if command == "lint" { return run_lint(args); }
+    if command == "native" { return run_native(args); }
     if command != "custom" || args.next().as_deref() != Some("build") {
         return Err(usage().into());
     }
@@ -56,7 +58,7 @@ fn run() -> Result<(), String> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let build = assemble_link_bundle(&toolchain, &source, &output, &arch)?;
+    let build = build(&toolchain, &source, &output, &arch)?;
     certify(&toolchain, &build, &source, &arch, &manifest, contract.as_ref(),
         &proof_digest, &builder_git_sha)?;
     if let Some(symbol) = descriptor {
@@ -68,9 +70,54 @@ fn run() -> Result<(), String> {
 
 fn usage() -> &'static str {
     "usage: peacemaker custom build --arch gfx1201 --s file.s --out file.hsaco --manifest file.json [--contract shape.json --proof proof.json] [--host-target triple]\n\
+     peacemaker native --arch=gfx1201 file.s [--co=file.co] [--bundle=file.hxaco] [--host-target=triple]   (no ROCm: the code object and bundle `custom build` emits, uncertified)\n\
      peacemaker audit --arch gfx1201 (--source file.hip | --hsaco file.hsaco) [--prepend header.hip] [--define NAME=VALUE] [--flag FLAG] [--intent intent.json] [--json report.json] [--markdown report.md] [--sweep-profiles]\n\
      peacemaker audit --lds-barrier PATH...   (CPU-only: every *.hsaco/*.co under PATH; fails on lds_store_unwaited_at_barrier or an unliftable module)\n\
-     peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)"
+     peacemaker profile --arch gfx1201|gfx1100|gfx1151 --s module.s --points points.json --out diag.hsaco   (DIAGNOSTIC build: writes diag.s, diag.map.json, diag.co)\n\
+     peacemaker lint OBJECT.co [--routes routes.json]   (CPU-only: JSON schedule report per lifted kernel/loop)"
+}
+
+/// The native build alone, spelled the way `toolchain::build` records it.
+fn run_native(args: impl Iterator<Item=String>) -> Result<(), String> {
+    let (mut arch, mut source, mut co, mut bundle) = (None, None, None, None);
+    let mut host = hipfire_isa::native::DEFAULT_HOST_TARGET.to_owned();
+    for arg in args {
+        match arg.split_once('=') {
+            Some(("--arch", v)) => arch = Some(v.parse::<hipfire_isa::Arch>()?),
+            Some(("--co", v)) => co = Some(PathBuf::from(v)),
+            Some(("--bundle", v)) => bundle = Some(PathBuf::from(v)),
+            Some(("--host-target", v)) => host = v.to_owned(),
+            _ if !arg.starts_with("--") && source.is_none() => source = Some(PathBuf::from(arg)),
+            _ => return Err(format!("unrecognized native argument {arg}\n{}", usage())),
+        }
+    }
+    let (arch, source) = (arch.ok_or("missing --arch=")?, source.ok_or("missing source .s")?);
+    let text = fs::read_to_string(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+    let elf = hipfire_isa::native::assemble(&text, arch)?;
+    if let Some(path) = &co { fs::write(path, &elf).map_err(|e| format!("{}: {e}", path.display()))? }
+    if let Some(path) = &bundle { fs::write(path, hipfire_isa::native::bundle(&elf, arch, &host)).map_err(|e| format!("{}: {e}", path.display()))? }
+    Ok(())
+}
+
+fn run_lint(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+    use hipfire_isa::cost_lint::{self, Route};
+    use std::collections::BTreeMap;
+    let path = args.next().ok_or_else(|| usage().to_owned())?;
+    let mut routes = BTreeMap::<String, Route>::new();
+    if let Some(option) = args.next() {
+        if option != "--routes" { return Err(format!("unknown lint option {option}")); }
+        let file = args.next().ok_or("missing --routes path")?;
+        routes = serde_json::from_slice(&fs::read(&file).map_err(|e| format!("{file}: {e}"))?)
+            .map_err(|e| format!("{file}: {e}"))?;
+    }
+    if args.next().is_some() { return Err(usage().into()); }
+    let object = fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+    let lifted = peacemaker_lift::lift_object(&object, peacemaker_lift::Options {
+        frontend: peacemaker_ir::inst::Frontend::Hipcc,
+    }).map_err(|e| format!("{path}: {e}"))?;
+    let report = cost_lint::analyze(&lifted.program, &routes)?;
+    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    Ok(())
 }
 
 /// DIAGNOSTIC: instrument one kernel with timestamp records, verify the
@@ -109,7 +156,7 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     let s_path = output.with_extension("s");
     fs::write(&s_path, &text).map_err(|e| e.to_string())?;
-    let build = assemble_link_bundle(&Toolchain::default(), &s_path, &output, &arch)?;
+    let build = build(&Toolchain::default(), &s_path, &output, &arch)?;
     let mut json = serde_json::to_value(&map).map_err(|e| e.to_string())?;
     json["source"] = source_path.display().to_string().into();
     json["source_sha256"] = format!("{:x}", Sha256::digest(source.as_bytes())).into();
@@ -117,7 +164,7 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     json["profiled_co_sha256"] = format!("{:x}", Sha256::digest(fs::read(&build.elf).map_err(|e| e.to_string())?)).into();
     json["wait_replay_hazards_original"] = original_replay.len().into();
     json["wait_replay_hazards_profiled"] = profiled_replay.len().into();
-    json["parse_back"] = "pass".into();
+    json["parse_back"] = if build.parse_back_checked { "pass" } else { "skipped: llvm-objdump absent" }.into();
     let map_path = output.with_extension("map.json");
     fs::write(&map_path, serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     println!("DIAGNOSTIC {} sites={} delay_fixups={} vgpr {}->{} (limit {}) sgpr {}->{} kernarg {}+{}\n{}\n{}\n{}",

@@ -649,6 +649,11 @@ static __device__ __forceinline__ float wlds_bf16_scaled_add(
 // selector [B] (NOT [M]), and the four streams of token b are updated in place
 // with the hyper write.  Alone (no other EPI bit); requires has_bias == 0, M % 8 == 0.
 #define EPI_HC_SD   64
+// EPI_BF16_STORE (128, with EPI_HC_SD): row fold producer.  The GEMM output as the
+// HC_SD stage 1 rounds it (BF16 bits of `acc + 0.0f`) is stored as-is to Y, a
+// BF16 [B, M] matrix; no fold, no streams (the HC row fold kernel owns those).
+// idea from Gufo upstream (gufo-org/gufo @1071b361, MIT): row-level MoE fold ownership.
+#define EPI_BF16_STORE 128
 
 #ifndef HCW_EPILOGUE_BLOCK
 #define HCW_EPILOGUE_BLOCK
@@ -1138,7 +1143,7 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                 for (int e = 0; e < 8; e++) {
                     const float o = v[e] + 0.0f;
                     const int row = i * 16 + 2 * e + hc_half;
-                    if (Y != nullptr && out_b < B && m_wave + row < M) {
+                    if (!(EPI & EPI_BF16_STORE) && Y != nullptr && out_b < B && m_wave + row < M) {
                         ((float*)Y)[(long long)out_b * M + m_wave + row] = o;
                     }
                     slab[ml * SLAB + row] = (unsigned short)hcw_bf16bits(o);
@@ -1152,6 +1157,11 @@ __device__ __forceinline__ void gemm_f16_wmma_lds_tile(
                 const int t = n_wave + j * 16 + tok;
                 const int c0 = m_wave + chunk * 8;
                 if (t >= B || c0 >= M) {
+                    continue;
+                }
+                if constexpr (EPI & EPI_BF16_STORE) {
+                    *(uint4*)((unsigned short*)Y + (long long)t * M + c0) =
+                        *(const uint4*)(slab + tok * SLAB + chunk * 8);
                     continue;
                 }
                 const uint4 rq = *(const uint4*)(slab + tok * SLAB + chunk * 8);
@@ -1426,6 +1436,12 @@ WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
 // kill switch's twin (HIPFIRE_FLUX_GEMM_PIPE=0).
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k32,       64,  64, 2, 4, 32, false, false)
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k32_p,     64,  64, 2, 4, 32, false, true)
+// HIPFIRE_QWEN4_HC_DOWN_TILE (shape-specific narrow long-K HC-down scheduling, idea from Gufo
+// upstream: gufo-org/gufo @1071b361, MIT): the same 320 x 10240 shape on one 160 x 64 block of
+// five 32 x 64 waves, 256 workgroups instead of 640. Each output's K order and store are the
+// 64 x 64 tile's, so the bytes are identical; measured 3.10 vs 3.66 ms at N = 8192.
+WLDS_KERNEL(gemm_wmma_lds_160_64_32_64_k64_p,   160,  64, 2, 4, 64, false, true)
+WLDS_KERNEL(gemm_wmma_lds_160_64_32_64_k64,     160,  64, 2, 4, 64, false, false)
 
 // --- Fused-epilogue instantiations ------------------------------------------
 // Only the five tiles Gpu::lds_tile_for can return (the three per-arch
@@ -1560,3 +1576,23 @@ WLDS_KERNEL_HC(gemm_wmma_lds_128_256_32_64_k64_hcsd,   128, 256, 2, 4, 64, false
 WLDS_KERNEL_HC(gemm_wmma_lds_128_256_32_64_k64_p_hcsd, 128, 256, 2, 4, 64, false, true)
 WLDS_KERNEL_HC(gemm_wmma_lds_128_128_32_64_k64_hcsd,   128, 128, 2, 4, 64, false, false)
 WLDS_KERNEL_HC(gemm_wmma_lds_128_128_32_64_k64_p_hcsd, 128, 128, 2, 4, 64, false, true)
+
+// Row fold producer: the shared-down GEMM stores BF16 bits of `acc + 0.0f` to Y.
+#define WLDS_KERNEL_BF16ST(NAME, BM, BN, WP, WQ, KS, SWAPXY, PIPE)             \
+    __launch_bounds__((BM / (16 * WP)) * (BN / (16 * WQ)) * 32, 1)             \
+    extern "C" __global__ void NAME(                                           \
+        const _Float16* __restrict__ A,                                        \
+        const _Float16* __restrict__ X,                                        \
+        void*                        Y,                                        \
+        int M, int K, int B, int lda, int ldx                                  \
+    ) {                                                                        \
+        __shared__ __align__(32) char lds_raw[WLDS_KSTAGE_BYTES(BM, BN, KS)];  \
+        _Float16* a_lds = (_Float16*)lds_raw;                                  \
+        _Float16* x_lds = a_lds + (KS / 16) * (BM) * 16;                       \
+        gemm_f16_wmma_lds_tile<BM, BN, WP, WQ, KS, SWAPXY,                     \
+                               EPI_HC_SD | EPI_BF16_STORE, false, PIPE>(       \
+            A, X, Y, nullptr, M, K, B, 0, lda, ldx, nullptr, nullptr, nullptr, \
+            a_lds, x_lds, (float*)lds_raw, nullptr, nullptr, 0, 0);            \
+    }
+
+WLDS_KERNEL_BF16ST(gemm_wmma_lds_128_256_32_64_k64_bf16st, 128, 256, 2, 4, 64, false, false)

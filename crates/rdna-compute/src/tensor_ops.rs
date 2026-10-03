@@ -44,6 +44,14 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
+/// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
+/// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
+/// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
+/// JIT source, on every gathered-route arch (gfx1151, gfx1201).  `0` keeps the
+/// hipcc kernels.  Read once.
+static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
+});
 /// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
 /// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
 /// ranks; selected indices and mirror byte-identical) for complete <= 2048
@@ -4002,6 +4010,26 @@ pub fn indexed_attention_attention_batch_exact(
 ) -> HipResult<()> {
     indexed_attention_attention_batch_impl(gpu, p, QsaAttentionRoutes::Exact)
 }
+
+/// The gathered route's launches for `p` on the hipcc kernels or, with `pm`,
+/// the builder module (`HIPFIRE_QWEN4_QSA_PM`), whatever the route flags say.
+/// Byte-equality and timing harness only (`examples/qsa_pm_check.rs`).
+#[cfg(any(test, feature = "lab"))]
+#[doc(hidden)]
+pub fn indexed_attention_gathered_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    pm: bool,
+) -> HipResult<()> {
+    let end_position = p.position_start + p.rows;
+    let max_selected = end_position
+        .min(p.capacity)
+        .min(p.budget_blocks * p.compress + p.compress - 1);
+    if pm && !qsa_gathered_pm_fits(p) {
+        return Err(HipError::new(0, "QSA PM gathered route does not cover this shape"));
+    }
+    qsa_gathered_wmma_launch(gpu, p, end_position, max_selected, pm)
+}
 fn indexed_attention_attention_batch_impl(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -4489,18 +4517,56 @@ fn qsa_gathered_wmma(
     end_position: usize,
     max_selected: usize,
 ) -> HipResult<()> {
-    let (module, src, convert, attend) = match p.format {
-        QsaKvFormat::F32 => (
+    let pm = *QWEN4_QSA_PM && qsa_gathered_pm_fits(p);
+    qsa_gathered_wmma_launch(gpu, p, end_position, max_selected, pm)
+}
+
+/// Whether the builder module covers `p`: its raw buffer offsets are 32-bit,
+/// so the F16 K/V scratch over the whole cache capacity and the query row
+/// stay below its out-of-range offset.
+fn qsa_gathered_pm_fits(p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    const PM_OOB_OFFSET: usize = 0x7fff_ff00;
+    let scratch = p.full_capacity.div_ceil(4).checked_mul(4).and_then(|t| t.checked_mul(p.n_kv_heads * 512));
+    scratch.is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        && p.n_heads.checked_mul(2048).is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        // `v_mad_u32_u24` token and stride operands.
+        && p.full_capacity < 1 << 24
+        && p.n_kv_heads * 2048 < 1 << 24
+}
+
+/// The gathered route's producer and attention launches: the hipcc kernels,
+/// or with `pm` the certified builder module (`kernels::QSA_GATHER_PM_*`).
+fn qsa_gathered_wmma_launch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+    max_selected: usize,
+    pm: bool,
+) -> HipResult<()> {
+    let (module, src, convert, attend) = match (p.format, pm) {
+        (QsaKvFormat::F32, false) => (
             "indexed_attention_gathered_wmma",
             INDEXED_ATTENTION_GATHERED_WMMA_SRC,
             "indexed_attention_kv_f16vb",
             "indexed_attention_gathered_wmma_f16",
         ),
-        QsaKvFormat::Fp8 => (
+        (QsaKvFormat::Fp8, false) => (
             "indexed_attention_gathered_wmma_gfx1201",
             INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC,
             "indexed_attention_kv_f16vb_fp8_gfx1201",
             "indexed_attention_gathered_wmma_f16_gfx1201",
+        ),
+        (QsaKvFormat::F32, true) => (
+            "qsa_gather_pm_gfx1151",
+            "",
+            "indexed_attention_kv_f16vb_pm_gfx1151",
+            "indexed_attention_gathered_wmma_f16_pm_gfx1151",
+        ),
+        (QsaKvFormat::Fp8, true) => (
+            "qsa_gather_pm_gfx1201",
+            "",
+            "indexed_attention_kv_f16vb_fp8_pm_gfx1201",
+            "indexed_attention_gathered_wmma_f16_pm_gfx1201",
         ),
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
@@ -4513,7 +4579,15 @@ fn qsa_gathered_wmma(
     let tokens = checked_i32(end_position, "QSA gathered tokens")?;
     let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
     for kernel in [convert, attend] {
-        gpu.ensure_kernel_public(module, src, kernel)?;
+        if pm {
+            let image = match p.format {
+                QsaKvFormat::F32 => crate::kernels::QSA_GATHER_PM_GFX1151,
+                QsaKvFormat::Fp8 => crate::kernels::QSA_GATHER_PM_GFX1201,
+            };
+            gpu.ensure_embedded_kernel(module, image, kernel)?;
+        } else {
+            gpu.ensure_kernel_public(module, src, kernel)?;
+        }
     }
     let mut args = KernargBlob::new();
     args.push_ptr(p.full_keys.buf.as_ptr());
@@ -8607,6 +8681,128 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): the BF16-store shared-down GEMM
+    /// plus `hc_row_fold_norm_gate` must leave the HC streams, the next read's F16
+    /// normalized row and its paired write's gate logits bytewise as the
+    /// zero-initialized combine, the `hcsd` fold + HC write GEMM and
+    /// `hyper_norm_gate` with its F16 read output do, with dead (-1) routes, tied experts and
+    /// ragged token counts.
+    #[test]
+    fn hc_row_fold_is_bytewise_combine_hcsd_norm_gate_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (m, k) = (2560usize, 640usize);
+        let wide = 4 * m;
+        let ld16 = gpu.f16_row_pitch(wide);
+        let bf16_tensor = |gpu: &mut Gpu, values: &[f32]| -> GpuTensor {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(values), &[values.len() * 2])
+                .expect("bf16 upload");
+            t.dtype = DType::BF16;
+            t.shape = vec![values.len()];
+            t
+        };
+        let weight = bf16_tensor(&mut gpu, &test_wave(1, m * k, 0.3));
+        let norm_weight = bf16_tensor(&mut gpu, &test_wave(7, wide, 0.3));
+        let gate_weight = bf16_tensor(&mut gpu, &test_wave(8, 4 * wide, 0.05));
+        let ints = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for rows in [512usize, 530, 1100] {
+            let grouped_rows = rows * 10 + 16;
+            let grouped = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(9, grouped_rows * m, 2.0)), &[grouped_rows * m * 2])
+                .expect("grouped");
+            let inverse: Vec<i32> = (0..rows * 10)
+                .map(|i| if i % 13 == 5 { -1 } else { ((i * 7919) % grouped_rows) as i32 })
+                .collect();
+            let experts: Vec<i32> = (0..rows * 10).map(|i| ((i * 37) % 64) as i32).collect();
+            let inverse = gpu.upload_raw(&ints(&inverse), &[rows * 40]).expect("inverse");
+            let experts = gpu.upload_raw(&ints(&experts), &[rows * 40]).expect("experts");
+            let route_weights: Vec<f32> =
+                test_wave(10, rows * 10, 1.0).iter().map(|v| v.abs() / 3.0).collect();
+            let route_weights = gpu.upload_f32(&route_weights, &[rows * 10]).expect("weights");
+            let order = gpu.zeros(&[rows * 20], DType::F32).expect("order");
+            let x = gpu.upload_f32(&test_wave(2, rows * k, 2.0), &[rows * k]).expect("x");
+            let selector = gpu.upload_f32(&test_wave(3, rows, 1.0), &[rows]).expect("selector");
+            let gates = gpu.upload_f32(&test_wave(4, rows * 4, 1.5), &[rows * 4]).expect("gates");
+            let mut raw = bf16_le_bytes(&test_wave(6, rows * wide, 3.0));
+            raw.resize(rows * wide * 4, 0);
+            let streams = |gpu: &mut Gpu| {
+                let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                t.dtype = DType::F32;
+                t.shape = vec![rows * wide];
+                t
+            };
+            // Reference: zero-initialized combine, hcsd, hyper_norm_gate.
+            let routed = gpu.zeros(&[rows * m], DType::F32).expect("routed");
+            gpu.moe_down_combine_grouped_top10_bf16in(
+                &grouped, &inverse, &experts, &route_weights, &routed, &order, m, grouped_rows, rows, true,
+            )
+            .expect("combine");
+            let ref_streams = streams(&mut gpu);
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+                &weight, &x, m, k, rows, &routed, &selector, &ref_streams, &gates, true, false,
+            )
+            .expect("hcsd");
+            let ref_gates = gpu.zeros(&[rows * 4], DType::F32).expect("ref gates");
+            let ref_row = gpu.zeros(&[rows * ld16], DType::F16).expect("ref row");
+            hyper_norm_gate(
+                &mut gpu,
+                &HyperNormGate {
+                    input: &ref_streams,
+                    norm_weight: &norm_weight,
+                    gate_weight: &gate_weight,
+                    gates: &ref_gates,
+                    rows,
+                    branches: 4,
+                    hidden: m,
+                    state_bf16: true,
+                    read_f16: Some((&norm_weight, &ref_row, ld16)),
+                },
+            )
+            .expect("norm gate");
+            // Row fold.
+            let new_streams = streams(&mut gpu);
+            let shared = gpu.zeros(&[rows * m], DType::F32).expect("shared");
+            let new_gates = gpu.zeros(&[rows * 4], DType::F32).expect("new gates");
+            let new_row = gpu.zeros(&[rows * ld16], DType::F16).expect("new row");
+            gpu.moe_combine_order_top10(&inverse, &experts, &route_weights, &order, grouped_rows, rows)
+                .expect("order");
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(&weight, &x, m, k, rows, &shared)
+                .expect("bf16st");
+            gpu.hc_row_fold_norm_gate(&crate::hc_row_fold::HcRowFold {
+                grouped_down: &grouped,
+                order: &order,
+                shared_bf16: &shared,
+                selector: &selector,
+                streams: &new_streams,
+                gates: &gates,
+                norm_weight: &norm_weight,
+                gate_weight: &gate_weight,
+                next_gates: &new_gates,
+                normalized_f16: &new_row,
+                ld16,
+                rows,
+                hidden: m,
+            })
+            .expect("row fold");
+            let words = |gpu: &Gpu, t: &GpuTensor| gpu.download_raw_bytes(t).expect("download");
+            for (name, want, got) in [
+                ("streams", words(&gpu, &ref_streams), words(&gpu, &new_streams)),
+                ("gate logits", words(&gpu, &ref_gates), words(&gpu, &new_gates)),
+                ("normalized f16 row", words(&gpu, &ref_row), words(&gpu, &new_row)),
+            ] {
+                assert_ne!(want.len(), 0);
+                assert!(want == got, "{name} differ: rows={rows}");
             }
         }
     }

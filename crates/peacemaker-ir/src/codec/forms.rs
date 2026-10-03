@@ -44,7 +44,8 @@ pub(super) fn layout(form: Form) -> &'static [Field] {
         Form::Sop1 => SOP1, Form::Sop2 => SOP2, Form::Sopc => SOPC, Form::Sopk => SOPK,
         Form::Sopp => SOPP, Form::Smem => SMEM, Form::Vop1 => VOP1, Form::Vop1Dpp => VOP1_DPP,
         Form::Vop2 => VOP2, Form::Vop2Dpp => VOP2_DPP, Form::Vopc => VOPC, Form::Vop3 => VOP3, Form::Vop3p => VOP3P, Form::Vopd => VOPD,
-        Form::Ds => DS, Form::Vmem(VmemForm::Global) => GLOBAL,
+        // VFLAT shares the VGLOBAL bit layout; only the segment prefix differs.
+        Form::Ds => DS, Form::Vmem(VmemForm::Global | VmemForm::Flat) => GLOBAL,
         Form::Vmem(VmemForm::Buffer) => BUFFER, Form::Vmem(VmemForm::Scratch) => SCRATCH, _ => &[],
     }
 }
@@ -64,7 +65,7 @@ pub(super) fn opcode(form: Form) -> Option<Field> {
         Form::Vop2 | Form::Vop2Dpp => f!("OP",25,6), Form::Vopc => f!("OP",17,8),
         Form::Vop3 => f!("OP",16,10), Form::Vop3p => f!("OP",16,7),
         Form::Vopd => f!("OPX",22,4), Form::Ds => f!("OP",18,8),
-        Form::Vmem(VmemForm::Global | VmemForm::Buffer | VmemForm::Scratch) => f!("OP",14,8),
+        Form::Vmem(VmemForm::Global | VmemForm::Buffer | VmemForm::Scratch | VmemForm::Flat) => f!("OP",14,8),
         _ => return None,
     })
 }
@@ -83,7 +84,8 @@ pub(super) fn prefix(form: Form) -> Option<(u32,u32)> {
         Form::Vop3p => (0xff00_0000,0xcc00_0000), Form::Vopd => (0xfc00_0000,0xc800_0000),
         Form::Ds => (0xfc00_0000,0xd800_0000), Form::Vmem(VmemForm::Global) => (0xff00_0000,0xee00_0000),
         Form::Vmem(VmemForm::Buffer) => (0xfc00_0000,0xc400_0000),
-        Form::Vmem(VmemForm::Scratch) => (0xff00_0000,0xed00_0000), _ => return None,
+        Form::Vmem(VmemForm::Scratch) => (0xff00_0000,0xed00_0000),
+        Form::Vmem(VmemForm::Flat) => (0xff00_0000,0xec00_0000), _ => return None,
     })
 }
 pub(super) fn prefix_for(arch: Arch, form: Form) -> Option<(u32,u32)> {

@@ -351,6 +351,72 @@ impl Gfx10Pm4CommandBuffer {
         timed
     }
 
+    /// Diagnostic copy with one GPU-clock stamp before the stream, one after
+    /// every `DISPATCH_DIRECT` (dispatch issued) and one after every
+    /// `EVENT_WRITE CS_PARTIAL_FLUSH` (every earlier wave drained). Consecutive
+    /// stamps therefore split each dispatch into issue-to-idle (kernel) and
+    /// idle-to-next-issue (boundary packets) spans. Stamps are written without
+    /// write confirmation so the command processor never stalls on the
+    /// host-memory write. Attribution only: the tape and its hash change.
+    /// `Err` carries the offending source dword of a malformed stream.
+    pub fn with_boundary_timestamps(&self, base_address: u64) -> Result<Self, usize> {
+        let mut timed = Self::new();
+        let mut slot = 0_u64;
+        timed.copy_gpu_timestamp_unconfirmed(base_address);
+        slot += 1;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let (next, stamp) = self.boundary_stamp_packet(cursor)?;
+            timed.dwords.extend_from_slice(&self.dwords[cursor..next]);
+            if stamp {
+                timed.copy_gpu_timestamp_unconfirmed(base_address + slot * 8);
+                slot += 1;
+            }
+            cursor = next;
+        }
+        Ok(timed)
+    }
+
+    /// Slots [`Self::with_boundary_timestamps`] writes: the baseline plus one
+    /// per dispatch and one per compute-idle packet.
+    pub fn boundary_timestamp_slot_count(&self) -> Result<usize, usize> {
+        let mut slots = 1_usize;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let (next, stamp) = self.boundary_stamp_packet(cursor)?;
+            slots += usize::from(stamp);
+            cursor = next;
+        }
+        Ok(slots)
+    }
+
+    fn boundary_stamp_packet(&self, cursor: usize) -> Result<(usize, bool), usize> {
+        let header = self.dwords[cursor];
+        if header >> 30 != 3 {
+            return Err(cursor);
+        }
+        let next = cursor + 2 + ((header >> 16) & 0x3fff) as usize;
+        if next > self.dwords.len() {
+            return Err(cursor);
+        }
+        let opcode = (header >> 8) & 0xff;
+        let stamp = opcode == PACKET3_DISPATCH_DIRECT
+            || (opcode == PACKET3_EVENT_WRITE && self.dwords[cursor + 1] == 0x407);
+        Ok((next, stamp))
+    }
+
+    fn copy_gpu_timestamp_unconfirmed(&mut self, address: u64) {
+        const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_COPY_DATA, 5, false),
+            COPY_DATA_TIMESTAMP_TO_MEMORY_64,
+            0,
+            0,
+            address as u32,
+            (address >> 32) as u32,
+        ]);
+    }
+
     fn copy_gpu_timestamp(&mut self, address: u64) {
         const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16) | (1 << 20);
         self.dwords.extend_from_slice(&[

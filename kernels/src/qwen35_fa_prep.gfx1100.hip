@@ -78,7 +78,13 @@ __global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
         const float sin_a = sinf(angle);
         const float x0 = sdata[tid];
         const float x1 = sdata[tid + HALF];
+#if defined(__gfx1100__) || defined(__gfx1151__) || defined(QWEN_FA_PREP_EXACT_ROPE)
+        // Match the unfused chain's contraction, especially the second output.
+        out[tid] = __builtin_fmaf(x0, cos_a, -(x1 * sin_a));
+        out[tid + HALF] = __builtin_fmaf(x0, sin_a, x1 * cos_a);
+#else
         out[tid] = x0 * cos_a - x1 * sin_a;
         out[tid + HALF] = x0 * sin_a + x1 * cos_a;
+        #endif
     }
 }

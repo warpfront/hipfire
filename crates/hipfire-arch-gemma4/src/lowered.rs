@@ -2240,6 +2240,28 @@ pub fn gemma4_pb_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Co
     gemma4_pb_flash_partials_len(max_seq, config.n_heads, config.full_head_dim)
 }
 
+/// Single-query flash partial length that covers every decode attend tier the
+/// lowered path can run on `arch`: the asym3 hd512 tile ([`GEMMA4_FLASH_TILE`])
+/// and the Q8 decode tile (`q8_flash_tile_size`) for the full tier at `max_seq`
+/// and the sliding ring at `min(sliding_window, max_seq)`. The Q8 tile can be
+/// smaller than 128 (tile32 on gfx1100 up to 8K), which needs more partials.
+pub fn gemma4_decode_flash_partials_len(arch: &str, config: &Gemma4Config, max_seq: usize) -> usize {
+    let q8_len = |n_kv_heads: usize, head_dim: usize, cap: usize| {
+        let tile = rdna_compute::attention::q8_flash_tile_size(
+            arch,
+            config.n_heads,
+            n_kv_heads,
+            head_dim,
+            cap,
+        );
+        config.n_heads * cap.div_ceil(tile) * (2 + head_dim)
+    };
+    let sliding_cap = config.sliding_window.min(max_seq);
+    gemma4_flash_partials_len_for_config(max_seq, config)
+        .max(q8_len(config.full_n_kv_heads, config.full_head_dim, max_seq))
+        .max(q8_len(config.sliding_n_kv_heads, config.sliding_head_dim, sliding_cap))
+}
+
 /// Per-decode scratch, sized once at model-load time against the MAX of
 /// sliding and full attention dimensions so a single buffer works across
 /// layer types. 31B target shapes: sliding Q=[32*256]=8192, full Q=[32*512]=16384
@@ -2269,9 +2291,9 @@ pub struct Gemma4Scratch {
     pub sample_buf: GpuTensor, // [2] — (token_id, new_rng_state) for GPU sampling
     pub repeat_buf: GpuTensor, // [1024] — rolling window for repeat penalty
 
-    // Flash attention tile partials. Sized for the LARGER of the two
-    // cache shapes: full-attn uses head_dim=512, max_tiles=max_seq/128.
-    // Sliding uses head_dim=256, max_tiles=sliding_window/128 (much smaller).
+    // Flash attention tile partials. Sized by `gemma4_decode_flash_partials_len`
+    // for the LARGER of the cache shapes: full-attn head_dim=512 at the asym3
+    // tile (128) or the arch's Q8 decode tile, sliding head_dim=256 over the ring.
     pub flash_partials: GpuTensor,
 
     // No-scale v_norm ones buffer (full-attn layers compute v_norm without
@@ -2479,13 +2501,12 @@ impl Gemma4Scratch {
         let i_sample_buf = alloc!(&[2], DType::F32);
         let i_repeat_buf = alloc!(&[1024], DType::F32);
 
-        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
-        // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
-        // sliding-layer dispatches use part of the buffer, full-layer dispatches
-        // use all of it. `max_seq` is the single authority shared with both KV
-        // caches — no independent `HIPFIRE_KV_SEQ` env var.
-        let flash_partials_sz =
-            gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
+        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats,
+        // covering the full tier (head_dim=512, stride 514) in either KV format
+        // and the sliding q8 ring (256, stride 258) at this arch's Q8 decode
+        // tile. `max_seq` is the single authority shared with both KV caches —
+        // no independent `HIPFIRE_KV_SEQ` env var.
+        let flash_partials_sz = gemma4_decode_flash_partials_len(&gpu.arch, config, max_seq);
         let i_flash_partials = alloc!(&[flash_partials_sz], DType::F32);
 
         // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
@@ -2799,6 +2820,38 @@ mod scratch_geometry_tests {
             gemma4_flash_partials_len(131071, 32, 512),
             gemma4_flash_partials_len(131072, 32, 512)
         );
+    }
+
+    #[test]
+    fn decode_partials_cover_q8_decode_tile() {
+        let cfg = dummy_cfg_31b();
+        // gfx1100 decodes Q8 with tile32 up to 8K: 4x the tile-128 partials.
+        assert_eq!(
+            gemma4_decode_flash_partials_len("gfx1100", &cfg, 8192),
+            32 * (8192 / 32) * 514
+        );
+        assert_eq!(
+            gemma4_decode_flash_partials_len("gfx1100", &cfg, 8192),
+            4 * gemma4_flash_partials_len_for_config(8192, &cfg)
+        );
+        // Tile128 arches keep the tile-128 geometry.
+        for arch in ["gfx1201", "gfx1151"] {
+            for max_seq in [128usize, 8192, 32768] {
+                assert_eq!(
+                    gemma4_decode_flash_partials_len(arch, &cfg, max_seq),
+                    gemma4_flash_partials_len_for_config(max_seq, &cfg)
+                );
+            }
+        }
+        // Past 8K gfx1100 is tile128 too.
+        assert_eq!(
+            gemma4_decode_flash_partials_len("gfx1100", &cfg, 32768),
+            gemma4_flash_partials_len_for_config(32768, &cfg)
+        );
+        // Small contexts: the sliding q8 ring (tile32) must fit as well.
+        let small = gemma4_decode_flash_partials_len("gfx1100", &cfg, 1000);
+        assert!(small >= 32 * 1000usize.div_ceil(32) * 258);
+        assert!(small >= 32 * 1000usize.div_ceil(32) * 514);
     }
 }
 #[cfg(test)]
@@ -4058,11 +4111,145 @@ fn apply_moe_branch_batched(
     Ok(())
 }
 
+/// Fingerprint the allocations and constants baked into the lowered AR graph.
+/// Position is deliberately absent: RoPE, KV writes and attention read pos_buf.
+fn lowered_graph_binding(
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    kv_sliding: &llama::KvCache,
+    kv_full: &llama::KvCache,
+    s: &Gemma4Scratch,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
+    macro_rules! tensors {
+        ($($t:expr),* $(,)?) => {
+            $(
+                mix($t.buf.as_ptr() as u64);
+                mix($t.numel() as u64);
+                mix($t.dtype as u64);
+            )*
+        };
+    }
+    macro_rules! projection {
+        ($w:expr) => {{
+            let w = &$w;
+            tensors!(w.buf);
+            for v in [w.m, w.k, w.row_stride, w.gpu_dtype as usize] {
+                mix(v as u64);
+            }
+            if let Some(p) = &w.paro {
+                tensors!(p.pairs, p.theta, p.channel_scales);
+                mix(p.krot as u64);
+                mix(p.group_size as u64);
+            }
+            if let Some(t) = &w.awq_scale {
+                tensors!(t);
+            }
+            for v in w.lloyd_lut_f16.iter().flatten() {
+                mix(*v as u64);
+            }
+        }};
+    }
+    tensors!(weights.embed_tokens, weights.final_norm);
+    projection!(weights.lm_head);
+    mix(weights.embd_format as u64);
+    for v in [
+        config.dim, config.n_layers, config.vocab_size, config.n_heads,
+        config.sliding_head_dim, config.sliding_n_kv_heads, config.sliding_window,
+        config.full_head_dim, config.full_n_kv_heads, config.hidden_dim,
+        config.enable_moe_block as usize, config.moe_intermediate_size,
+        config.num_experts, config.top_k_experts, config.attention_k_eq_v as usize,
+        forward_lowered_enabled() as usize,
+    ] {
+        mix(v as u64);
+    }
+    for v in [
+        config.norm_eps, config.sliding_rope_theta, config.full_rope_theta,
+        config.full_partial_rotary_factor, config.final_logit_softcapping,
+    ] {
+        mix(v.to_bits() as u64);
+    }
+    for ty in &config.layer_types {
+        mix(matches!(ty, LayerType::Full) as u64);
+    }
+    macro_rules! layer {
+        ($lw:expr) => {{
+            let lw = $lw;
+            tensors!(
+                lw.input_layernorm, lw.post_attention_layernorm,
+                lw.pre_feedforward_layernorm, lw.post_feedforward_layernorm,
+                lw.layer_scalar, lw.q_norm, lw.k_norm,
+            );
+            mix(lw.layer_scalar_host.to_bits() as u64);
+            projection!(lw.q_proj);
+            projection!(lw.k_proj);
+            projection!(lw.o_proj);
+            projection!(lw.gate_proj);
+            projection!(lw.up_proj);
+            projection!(lw.down_proj);
+            mix(lw.moe.is_some() as u64);
+            if let Some(m) = &lw.moe {
+                projection!(m.router_proj);
+                tensors!(
+                    m.router_scale, m.per_expert_scale,
+                    m.pre_feedforward_layernorm_2, m.post_feedforward_layernorm_1,
+                    m.post_feedforward_layernorm_2, m.experts_gate_up_pool,
+                    m.experts_down_pool, m.experts_gate_up_ptrs, m.experts_down_ptrs,
+                );
+                if let Some(first) = m.experts.first() {
+                    projection!(first.gate_up_proj);
+                    projection!(first.down_proj);
+                }
+            }
+        }};
+    }
+    for lw in &weights.layers {
+        match lw {
+            LayerWeights::Sliding(lw) => {
+                mix(0);
+                layer!(lw);
+                projection!(lw.v_proj);
+            }
+            LayerWeights::Full(lw) => {
+                mix(1);
+                layer!(lw);
+            }
+        }
+    }
+    for kv in [kv_sliding, kv_full] {
+        for v in [
+            kv.max_seq, kv.physical_cap, kv.compact_offset,
+            kv.quant_q8 as usize, kv.quant_asym3 as usize, kv.quant_fwht as usize,
+            kv.quant_asym4 as usize, kv.quant_asym2 as usize,
+            kv.v_mode_bits() as usize,
+        ] {
+            mix(v as u64);
+        }
+        for t in kv.k_gpu.iter().chain(&kv.v_gpu) {
+            tensors!(t);
+        }
+        for t in kv.givens_cos.iter().chain(&kv.givens_sin) {
+            tensors!(t);
+        }
+    }
+    mix(s.pos_buf.as_ptr() as u64);
+    tensors!(
+        s.x, s.residual, s.tmp, s.q, s.k, s.v, s.attn_out,
+        s.gate_ffn, s.up_ffn, s.ffn_hidden, s.ffn_out, s.logits,
+        s.flash_partials, s.v_norm_ones_full, s.moe_cur_mlp, s.moe_pre2,
+        s.moe_router_in, s.moe_router_logits, s.moe_topk_indices,
+        s.moe_topk_weights, s.moe_cur_moe, s.moe_expert_gate_up,
+        s.moe_expert_hidden, s.moe_expert_out, s.moe_pre2_rot,
+        s.moe_expert_gate_batch, s.moe_expert_up_batch, s.moe_expert_hidden_batch,
+    );
+    h.max(1)
+}
+
 /// Single-token decode. Phase 3 implementation.
 ///
-/// Precondition: `scratch.sliding_cos/sin` + `scratch.full_cos/sin` +
-/// `scratch.v_norm_ones_full` must be populated by the loader before the
-/// first forward call (one-time init).
+/// Precondition: the loader initializes `scratch.v_norm_ones_full` once before
+/// the first forward call.
 pub fn forward_scratch(
     gpu: &mut Gpu,
     weights: &Gemma4Weights,
@@ -4102,100 +4289,112 @@ pub fn forward_scratch(
     }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
-    // hipGraph capture/replay policy.
-    //   - DEFAULT-OFF for Gemma 4 (until cross-arch / long-context validation).
-    //   - Fixed 2026-05-19 (evening): the earlier diagnosis ("kv_len = pos + 1
-    //     is a scalar arg baked at capture") was wrong — attention_flash_*_window
-    //     kernels actually compute seq_len = pos_buf[0] + 1 at runtime
-    //     (`attention_flash_asym3_tile.hip:47`). The real bugs were three
-    //     elementwise kernels (`scale_f32`, `mul_f32`, `add_f32` in
-    //     `crates/rdna-compute/src/dispatch.rs`) that used direct `launch_kernel`
-    //     instead of `launch_maybe_blob`. `mul_f32` and `add_f32` additionally
-    //     ran on the default stream (`None`) instead of `stream_ref()`, so
-    //     during graph capture they were NOT recorded at all — every replay
-    //     skipped the FFN's `ffn_hidden = gelu(gate) * up` multiply, feeding
-    //     wrong tensors into down_proj → token attractor on greedy decode.
-    //     `scale_f32` was on the capture stream but using raw `kernelParams`
-    //     (stack pointers that dangle by replay under ROCm 7.x loader).
-    //     All three converted to `launch_maybe_blob` in the same commit as
-    //     this comment. HIPFIRE_GRAPH=1 now produces clean output.
-    //   - Compact offset != 0 (TriAttention eviction) still breaks capture
-    //     for the same reason as Qwen35 — bail to direct in that case.
-    static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_GRAPH")
-            .ok()
-            .as_deref()
-        {
+    // Same explicit per-model override as the hand path; HIPFIRE_GRAPH also
+    // controls this carrier. With both switches unset, capture/replay is the
+    // measured default on exact gfx1201 only; every other arch stays opt-in.
+    static GRAPH_ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        let parse = |name| match hipfire_config::developer_var(name).ok().as_deref() {
             Some("0") => Some(false),
             Some("1") => Some(true),
             _ => None,
-        }
+        };
+        parse("HIPFIRE_GEMMA4_GRAPH").or_else(|| parse("HIPFIRE_GRAPH"))
     });
-    let use_graph = graph_override.unwrap_or(false)
+    let graph_on = (*GRAPH_ENV).unwrap_or(gpu.arch == "gfx1201");
+    let eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    let use_graph = graph_on
+        && eligible
+        && !gpu.replay.is_recording()
         && kv_sliding.compact_offset == 0
-        && kv_full.compact_offset == 0;
-
-    if use_graph && gpu.graphs.graph_exec.is_some() {
-        // ── Replay path. Update pos_buf via stream_write_value32 (graph-
-        //    replay-safe, no host→device copy). The captured graph reads
-        //    pos_buf at kernel-launch time, so a fresh `pos` propagates
-        //    without recapture. ──
-        let stream = gpu.active_stream.as_ref().unwrap();
-        gpu.hip
-            .stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-        gpu.graphs
-            .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
-    } else if use_graph && gpu.graphs.graph_exec.is_none() {
-        let pos_i32 = pos as i32;
-        if !false
-        /* graph-capture-not-wired */
-        {
-            // ── Warmup: direct dispatch so any JIT kernel compiles or lazy
-            //    scratch allocations happen OUTSIDE a capture region.
-            //    Capturing on the first call hits "hipMalloc not permitted
-            //    under stream capture". Same pattern as Qwen35. ──
-            /* graph-capture-not-wired */
-            gpu.hip
-                .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
-        } else {
-            // ── First post-warmup call: capture the forward into a graph. ──
-            if gpu.active_stream.is_none() {
-                gpu.active_stream = Some(gpu.hip.stream_create()?);
-            }
-            gpu.hip
-                .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.graphs.begin_graph_capture(
-                &gpu.hip,
-                gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(),
-            )?;
-            forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
-            gpu.graphs.end_graph_capture(
-                &gpu.hip,
-                gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(),
-            )?;
-            // hipStreamCaptureModeGlobal RECORDS — kernels don't execute
-            // during capture. Replay once so THIS pos's forward actually
-            // runs (KV write, logits update).
-            gpu.graphs.graph_launch(
-                &gpu.hip,
-                gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(),
-            )?;
-            eprintln!(
-                "[gemma4 hipGraph] captured {} blobs, instantiated",
-                gpu.graphs.capture_blobs.len()
-            );
-        }
+        && kv_full.compact_offset == 0
+        // The CPU expert fallback downloads top-K inside the body. Q8 expert
+        // down uses atomicAdd, whose scheduling-dependent sum is not exact.
+        && weights.layers.iter().all(|layer| {
+            let moe = match layer {
+                LayerWeights::Sliding(lw) => &lw.moe,
+                LayerWeights::Full(lw) => &lw.moe,
+            };
+            moe.as_ref().map_or(true, |m| m.experts.first().is_some_and(|e| {
+                matches!(e.gate_up_proj.gpu_dtype,
+                    DType::MQ4G256 | DType::HFQ4G256 | DType::HFQ6G256 | DType::Q8_0)
+                    && e.down_proj.gpu_dtype == DType::HFQ4G128
+            }))
+        })
+        && hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").as_deref() != Ok("1");
+    let binding = if use_graph {
+        lowered_graph_binding(weights, config, kv_sliding, kv_full, scratch)
     } else {
-        // ── Direct path (no graph) ──
-        let pos_i32 = pos as i32;
-        gpu.hip
-            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        0
+    };
+    if use_graph && gpu.graphs.ar_forward_binding != binding {
+        gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+        gpu.graphs.ar_forward_binding = binding;
+    }
+    if use_graph && gpu.active_stream.is_none() {
+        // Embedding above may have run on the default stream. Complete it
+        // before switching streams for capture/replay.
+        gpu.hip.device_synchronize()?;
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+    if use_graph
+        && gpu.graphs.ar_forward_replay_enabled
+        && !gpu.graphs.ar_forward_kernel_dirty
+        && gpu.graphs.graph_exec.is_some()
+    {
+        gpu.hip.stream_write_value32(
+            gpu.active_stream.as_ref().unwrap(), &scratch.pos_buf, pos as u32, 0,
+        )?;
+        if let Err(e) = gpu.graphs.graph_launch(
+            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+        ) {
+            gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+            return Err(e);
+        }
+    } else if use_graph && !gpu.graphs.ar_forward_kernel_dirty {
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+        gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+        if let Err(e) = gpu.graphs.begin_graph_capture(
+            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+        ) {
+            gpu.graphs.capture_mode = false;
+            gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+            return Err(e);
+        }
+        let body = forward_scratch_inner(
+            gpu, weights, config, pos, kv_sliding, kv_full, scratch,
+        );
+        // Always close capture, including a failing body, before dropping its
+        // blobs. Captured work is never launched when either phase fails.
+        let end = gpu.graphs.end_graph_capture(
+            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+        );
+        if let Err(e) = body.and(end) {
+            gpu.graphs.capture_mode = false;
+            gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+            return Err(e);
+        }
+        gpu.graphs.ar_forward_binding = binding;
+        if let Err(e) = gpu.graphs.graph_launch(
+            &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+        ) {
+            gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+            return Err(e);
+        }
+        gpu.graphs.ar_forward_replay_enabled = true;
+        eprintln!(
+            "[gemma4 lowered hipGraph] captured {} blobs, instantiated",
+            gpu.graphs.ar_forward_blobs.len(),
+        );
+    } else {
+        if !use_graph && gpu.graphs.graph_exec.is_some() {
+            gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+        }
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
         forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+        // A successful direct call JITs the same body before capture.
+        if use_graph {
+            gpu.graphs.ar_forward_kernel_dirty = false;
+        }
     }
     Ok(())
 }
@@ -6107,7 +6306,7 @@ fn forward_prefill_batch_v2(
                 // Batched full-layer attention (hd=512): all N tokens in ONE
                 // masked flash call instead of a per-token loop. Full layers are
                 // non-ring (cache_capacity=0) and non-windowed (window_size=0);
-                // the asym3 batched-masked kernel derives each query's causal
+                // the batched-masked kernel (q8 or legacy asym3) derives each query's causal
                 // bound from pb_positions, so this reproduces the per-token
                 // result with 1 launch/layer instead of N. (Sliding layers stay
                 // per-token until the q8 batched ring kernel lands — A.2.)

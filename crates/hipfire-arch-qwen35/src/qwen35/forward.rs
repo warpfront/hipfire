@@ -1686,6 +1686,8 @@ pub fn forward_scratch(
     };
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
+    let gap_started = rdna_compute::gap_timing::begin_forward();
+    let embed_started = rdna_compute::gap_timing::now();
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => {
@@ -1702,6 +1704,7 @@ pub fn forward_scratch(
         }
         _ => panic!("unsupported embedding format"),
     }
+    rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::Embed, embed_started);
 
     let pos_i32 = pos as i32;
     if gpu.replay.should_route_aql() {
@@ -1718,11 +1721,14 @@ pub fn forward_scratch(
         };
     }
     if gpu.replay.should_route_pm4() {
+        let copy_started = rdna_compute::gap_timing::now();
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        let replay = unsafe { gpu.replay.replay_pm4(pos) };
+        rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
+        let replay = unsafe { gpu.replay_pm4_routed(pos) };
+        rdna_compute::gap_timing::end_forward(gap_started, pos, "pm4");
         return match replay {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(reason) => {
                 gpu.replay
                     .poison(format!("prepared PM4 replay failed: {reason}"));
@@ -1741,10 +1747,18 @@ pub fn forward_scratch(
         // as the buffers are the plain-AR continuation — which the spec markers
         // + verify invalidation guarantee — and this call passes the buffers
         // the graph was captured with (`ar_graph_binding`). ──
+        let copy_started = rdna_compute::gap_timing::now();
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
+        let launch_started = rdna_compute::gap_timing::now();
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+        rdna_compute::gap_timing::add_since(
+            rdna_compute::gap_timing::Slot::GraphLaunch,
+            launch_started,
+        );
+        rdna_compute::gap_timing::end_forward(gap_started, pos, "hip_graph");
         if ar_graph_trace_enabled() {
             eprintln!("[qwen-ar-graph] replay pos={pos}");
         }
@@ -4589,9 +4603,10 @@ pub fn forward_scratch_dense_tp(
 /// residual (written from that rank's own `x_batch`, which the rooted
 /// allreduce leaves bit-identical on every rank). `tape` records the
 /// rank-local DeltaNet `(q, k, v, α, β)` innovations for exact replay.
-pub(crate) struct DenseTpDflashCapture<'a> {
+pub(crate) struct DenseTpSpecCapture<'a> {
     pub hidden: &'a mut HiddenStateRingBuffer,
-    pub tape: &'a mut GdnTape,
+    /// `None` skips the DeltaNet tape when the caller will replay by tokens.
+    pub tape: Option<&'a mut GdnTape>,
 }
 
 /// Dense-TP verify/prefill with persistent caller-owned scratch and DFlash
@@ -4602,7 +4617,7 @@ pub(crate) struct DenseTpDflashCapture<'a> {
 /// copies the final `[n,H]` full residual into `rank0_final_hidden`. Runs no
 /// final LM head; the caller (rank-0 verify) owns norm + head.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
+pub(crate) fn forward_prefill_dense_tp_verify_capture(
     gpus: &mut Gpus,
     shard: &ShardConfig,
     weights: &[Qwen35Weights],
@@ -4614,8 +4629,9 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
     scratches: &[Qwen35Scratch],
     pbs: &[&PrefillBatchScratch],
     partials: &[&GpuTensor],
-    captures: &mut [DenseTpDflashCapture<'_>],
+    captures: &mut [DenseTpSpecCapture<'_>],
     rank0_final_hidden: &GpuTensor,
+    post_norm_hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     if tokens.is_empty() {
         return Ok(());
@@ -4680,6 +4696,7 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
         pbs,
         partials,
         Some(captures),
+        post_norm_hidden_out,
     )?;
     debug_assert_eq!(last_n, n);
     gpus.devices[0].bind_thread()?;
@@ -4712,7 +4729,8 @@ fn forward_prefill_dense_tp_batched(
     scratches: &[Qwen35Scratch],
     pbs_vec: &[&PrefillBatchScratch],
     partials: &[&GpuTensor],
-    mut captures: Option<&mut [DenseTpDflashCapture<'_>]>,
+    mut captures: Option<&mut [DenseTpSpecCapture<'_>]>,
+    per_token_hidden_out: Option<&GpuTensor>,
 ) -> HipResult<usize> {
     if tokens.is_empty() {
         return Ok(0);
@@ -4865,7 +4883,7 @@ fn forward_prefill_dense_tp_batched(
                                 hd,
                                 BatchSemantics::Sequential,
                                 None,
-                                captures.as_ref().map(|caps| &*caps[rank].tape),
+                                captures.as_ref().and_then(|caps| caps[rank].tape.as_deref()),
                                 0,
                                 delta_layer_idx,
                                 q8_flags[rank],
@@ -5125,6 +5143,30 @@ fn forward_prefill_dense_tp_batched(
                     }
                 }
             }
+            // Post-norm hidden for every row of this chunk: rank 0 holds the
+            // all-reduced residual, so its rows are the complete ones.
+            if process_res.is_ok() {
+                if let Some(dst) = per_token_hidden_out {
+                    let res = (|| -> HipResult<()> {
+                        gpus.devices[0].bind_thread()?;
+                        let src = pbs_vec[0].x_batch.sub_offset(0, n * dim);
+                        let dst_view = dst.sub_offset(offset * dim, n * dim);
+                        gpus.devices[0].rmsnorm_batched(
+                            &src,
+                            &weights[0].output_norm,
+                            &dst_view,
+                            n,
+                            dim,
+                            configs[0].norm_eps,
+                        )?;
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        process_res = Err(e);
+                        break;
+                    }
+                }
+            }
             offset += n;
         }
         Ok(last_chunk_n)
@@ -5146,6 +5188,26 @@ pub fn forward_prefill_dense_tp(
     kv_caches: &mut [llama::KvCache],
     dn_states: &mut [DeltaNetState],
     scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    forward_prefill_dense_tp_with_hidden(
+        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, None,
+    )
+}
+
+/// `per_token_hidden_out` takes the post-output-norm row of every prefilled
+/// token, which the MTP head needs to warm its private KV over the prompt.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_dense_tp_with_hidden(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    tokens: &[u32],
+    start_pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+    per_token_hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     if tokens.is_empty() {
         return Ok(());
@@ -5221,6 +5283,7 @@ pub fn forward_prefill_dense_tp(
         &pbs_refs,
         &partial_refs,
         None,
+        per_token_hidden_out,
     ) {
         Ok(n) => n,
         Err(e) => {

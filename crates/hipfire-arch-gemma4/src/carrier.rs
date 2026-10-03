@@ -149,6 +149,24 @@ fn free_lowered_sliding_scratch_weights(
     }
 }
 
+/// Resolve the lowered full-attention KV tier from the raw `kv_cache` value
+/// through [`GEMMA4_LOWERED_FULL_POLICY`](hipfire_runtime::kv_mode::GEMMA4_LOWERED_FULL_POLICY):
+/// `auto`/`q8` → Q8, `legacy-asym3` → the previous Givens asym3 tier.
+/// Unsupported names fall back to Q8 with the returned warning; fp8/bf16 fail
+/// closed (no Gemma4 lowered attend site admits a native tier).
+fn resolve_lowered_full_kv_mode(
+    mode_raw: &str,
+) -> Result<(hipfire_runtime::kv_mode::KvMode, Option<&'static str>), String> {
+    use hipfire_runtime::kv_mode::{self, KvMode};
+    let rr = kv_mode::resolve(mode_raw, &kv_mode::GEMMA4_LOWERED_FULL_POLICY);
+    match rr.mode {
+        KvMode::Q8 | KvMode::Asym3 => Ok((rr.mode, rr.warning)),
+        other => Err(format!(
+            "gemma4 (lowered): kv_cache={mode_raw} ({other:?}) has no full-attention KV tier; use auto, q8 or legacy-asym3"
+        )),
+    }
+}
+
 // ─── Bundle load ──────────────────────────────────────────────────────────
 
 /// Build the Gemma 4 GPU bundle from an HFQ source.
@@ -212,6 +230,23 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     // `use_lowered` selection proceeds directly to weight/scratch/KV upload.
     if use_lowered {
         let lcfg = lowered_cfg.unwrap();
+        // Pure CPU: resolve the full-attention tier before any device upload.
+        let mode_raw = ctx
+            .kv_mode_override
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+        let (full_kv_mode, full_kv_warning) = resolve_lowered_full_kv_mode(&mode_raw)?;
+        if let Some(w) = full_kv_warning {
+            eprintln!(
+                "  KV cache: {w} (site {})",
+                hipfire_runtime::kv_mode::GEMMA4_LOWERED_FULL_POLICY.site
+            );
+        }
+        let full_kv_label = match full_kv_mode {
+            hipfire_runtime::kv_mode::KvMode::Asym3 => "legacy-asym3",
+            _ => "q8",
+        };
         let (n_sliding_layers, n_full_layers) = lowered_kv_layer_counts(&lcfg.layer_types);
         let mut hfq2 = hfq;
         // Construction order: weights → scratch → constants → sliding KV → full KV.
@@ -247,26 +282,38 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
                 ));
             }
         };
-        // Full tier remains asym3 (not Q8); logical limit is max_seq.
-        let kv_full = match KvCache::new_gpu_asym3_gemma4(
-            ctx.gpu,
-            n_full_layers,
-            lcfg.full_n_kv_heads,
-            lcfg.full_head_dim,
-            ctx.max_seq,
-        ) {
+        // Full tier: q8 by default, legacy Givens asym3 on explicit opt-out.
+        // Logical limit is max_seq (no ring).
+        let kv_full_alloc = if full_kv_mode == hipfire_runtime::kv_mode::KvMode::Asym3 {
+            KvCache::new_gpu_asym3_gemma4(
+                ctx.gpu,
+                n_full_layers,
+                lcfg.full_n_kv_heads,
+                lcfg.full_head_dim,
+                ctx.max_seq,
+            )
+        } else {
+            KvCache::new_gpu_q8(
+                ctx.gpu,
+                n_full_layers,
+                lcfg.full_n_kv_heads,
+                lcfg.full_head_dim,
+                ctx.max_seq,
+            )
+        };
+        let kv_full = match kv_full_alloc {
             Ok(v) => v,
             Err(e) => {
                 let cleanup =
                     free_lowered_sliding_scratch_weights(kv_sliding, scratch, weights, ctx.gpu);
                 return Err(append_cleanup_context(
-                    format!("gemma4 (lowered) full KV alloc: {e:?}"),
+                    format!("gemma4 (lowered) full KV alloc ({full_kv_label}): {e:?}"),
                     cleanup,
                 ));
             }
         };
         eprintln!(
-            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
+            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {full_kv_label} KV; kv_cache={mode_raw})",
             lcfg.enable_moe_block, want_batched,
         );
         return Ok(Gemma4Bundle::Lowered(Gemma4LoweredBundle {
@@ -305,6 +352,25 @@ pub use load_gemma4_bundle as load_bundle;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lowered_full_kv_mode_follows_kv_cache() {
+        use hipfire_runtime::kv_mode::KvMode;
+        for raw in ["", "auto", "q8"] {
+            assert_eq!(resolve_lowered_full_kv_mode(raw), Ok((KvMode::Q8, None)), "{raw:?}");
+        }
+        assert_eq!(
+            resolve_lowered_full_kv_mode("legacy-asym3"),
+            Ok((KvMode::Asym3, None))
+        );
+        // Bare asym3 is the Qwen FWHT alias: no hd512 FWHT tier, so q8 + warning.
+        let (mode, warning) = resolve_lowered_full_kv_mode("asym3").unwrap();
+        assert_eq!(mode, KvMode::Q8);
+        assert!(warning.is_some());
+        // Native presets fail closed instead of silently becoming q8.
+        assert!(resolve_lowered_full_kv_mode("fp8").is_err());
+        assert!(resolve_lowered_full_kv_mode("bf16").is_err());
+    }
 
     #[test]
     fn lowered_kv_counts_follow_attention_layer_types() {

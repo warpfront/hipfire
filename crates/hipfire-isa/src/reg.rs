@@ -1,6 +1,17 @@
 use serde::Serialize;
 use std::fmt;
 
+/// Literal names remain allocation-free; runtime names are shared across
+/// the builder's branch and loop snapshots without copying their strings.
+#[derive(Clone, Debug)]
+pub enum RegName { Static(&'static str), Shared(std::sync::Arc<str>) }
+impl From<&'static str> for RegName { fn from(name: &'static str) -> Self { Self::Static(name) } }
+impl AsRef<str> for RegName { fn as_ref(&self) -> &str { match self { Self::Static(s) => s, Self::Shared(s) => s } } }
+impl fmt::Display for RegName { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.as_ref()) } }
+impl Serialize for RegName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> { serializer.serialize_str(self.as_ref()) }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind { V, S }
@@ -27,7 +38,7 @@ pub enum Special { VccLo, ExecLo, Null, Ttmp7, Ttmp9, M0 }
 pub enum Live { Whole, Between(String, String) }
 impl Live { pub fn contains(&self, label: &str, order: &[String]) -> bool { match self { Self::Whole => true, Self::Between(start, end) => { let at = order.iter().position(|l| l == label); let first = order.iter().position(|l| l == start); let last = order.iter().position(|l| l == end).unwrap_or(order.len()); matches!((at,first), (Some(at),Some(first)) if first <= at && at < last) } } } }
 #[derive(Clone, Debug, Serialize)]
-pub struct Range { pub name: &'static str, pub kind: Kind, pub base: u8, pub len: u8, pub live: Live }
+pub struct Range { pub name: RegName, pub kind: Kind, pub base: u8, pub len: u8, pub live: Live }
 impl Range { pub fn reg(&self) -> RegRef { RegRef { kind: self.kind, base: self.base, len: self.len } } }
 #[derive(Clone, Debug)]
 pub struct Scope { pub start: String, pub end: String }
@@ -36,7 +47,8 @@ pub struct RegPlan { pub vgpr_budget: u16, pub sgpr_budget: u16, pub ranges: Vec
 impl RegPlan {
     pub fn new(vgpr_budget: u16, sgpr_budget: u16) -> Result<Self,String> { if vgpr_budget > 256 || sgpr_budget > 104 { return Err("register budget exceeds architectural limit".into()) } Ok(Self { vgpr_budget, sgpr_budget, ranges: Vec::new(), scratch: None }) }
     pub fn scratch_pool(&mut self, base: u8, len: u8) -> Result<(),String> { if u16::from(base)+u16::from(len)>self.vgpr_budget { return Err("scratch pool exceeds VGPR budget".into()) } self.scratch=Some((base,len)); Ok(()) }
-    fn add(&mut self,name:&'static str,kind:Kind,base:u8,len:u8,live:Live)->Result<(),String> {
+    fn add(&mut self,name:impl Into<RegName>,kind:Kind,base:u8,len:u8,live:Live)->Result<(),String> {
+        let name = name.into();
         if !matches!(len,1|2|4|8) { return Err("register width must be 1, 2, 4 or 8".into()) }
         if kind==Kind::S && len>1 && base%len!=0 { return Err(format!("misaligned SGPR {base}:{len}")) }
         let budget=if kind==Kind::V { self.vgpr_budget } else { self.sgpr_budget };
@@ -44,6 +56,10 @@ impl RegPlan {
         let reg=RegRef { kind,base,len };
         for existing in &self.ranges { if reg.overlaps(existing.reg()) && (live==Live::Whole || existing.live==Live::Whole || live==existing.live) { return Err(format!("{name} overlaps {} with a shared lifetime",existing.name)) } }
         self.ranges.push(Range { name,kind,base,len,live }); Ok(())
+    }
+    /// The same checked allocator for front ends with runtime names and widths.
+    pub fn add_range(&mut self,name:&str,kind:Kind,base:u8,len:u8,live:Live)->Result<(),String> {
+        self.add(RegName::Shared(std::sync::Arc::from(name)),kind,base,len,live)
     }
     pub fn v<const N:u8>(&mut self,name:&'static str,base:u8,live:Live)->Result<V<N>,String> { self.add(name,Kind::V,base,N,live)?; Ok(V(base)) }
     pub fn s<const N:u8>(&mut self,name:&'static str,base:u8,live:Live)->Result<S<N>,String> { self.add(name,Kind::S,base,N,live)?; Ok(S(base)) }

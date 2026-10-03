@@ -11,7 +11,9 @@
 // once, so no atomics; padding rows emit nothing. The host concatenates
 // block_i4_128_quant.hip (HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE) in front
 // of this file; no quantizer copy here.
-// Grid (K/128, P, 1), block 32.
+// Grid (P * K/128, 1, 1), block 32: block x folds (p, group) as
+// x = p * (K/128) + group, keeping the row count out of the 65535-bounded
+// grid y.
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(__gfx1201__)
 #error "qwen4_moe_rotate128_i4.hip is gfx1151/gfx1201-only"
@@ -21,8 +23,10 @@ extern "C" __global__ __launch_bounds__(32) void qwen4_moe_rotate128_i4(
     const uint16_t* __restrict__ h, const int* __restrict__ sorted,
     block_i4_128* __restrict__ Xq, const float* __restrict__ signs1,
     const float* __restrict__ signs2, int K, int P, int L) {
-    const int group = blockIdx.x;
-    const int p = blockIdx.y;
+    const unsigned groups = (unsigned)K >> 7;
+    const unsigned bx = blockIdx.x;
+    const int p = (int)(bx / groups);
+    const int group = (int)(bx - (unsigned)p * groups);
     const int slot = sorted[p];
     if (slot < 0) return;
     const int tid = threadIdx.x;

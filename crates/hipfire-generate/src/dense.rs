@@ -2350,6 +2350,9 @@ pub fn generate_gemma4_lowered(
     m.conversation_tokens.clear();
     let t0 = Instant::now();
     for (pos, &token) in prompt_ids.iter().enumerate() {
+        // Mirror the hand carrier: prompt prefill is eager; only AR decode
+        // may warm up, capture and replay its single-token body.
+        gpu.graphs.ar_graph_eligible = false;
         let result = unsafe {
             gemma4::lowered::forward_scratch(
                 gpu,

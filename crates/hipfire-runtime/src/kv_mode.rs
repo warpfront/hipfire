@@ -377,14 +377,15 @@ pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Non-Qwen (llama HFQ) alias table — preserved pre-migration semantics.
-/// `asymN` stays Givens AsymN; `turbo`/`auto` → Fwht3 (unaccepted → q8 warn).
+/// `asymN` stays Givens AsymN; `auto` is the site default (q8, silent);
+/// `turbo`/`turbo3` → Fwht3 (unaccepted → q8 warn).
 fn normalize_full(raw: &str) -> Option<KvMode> {
     match raw {
-        "q8" => Some(Q8),
+        "q8" | "auto" => Some(Q8),
         // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
         "asym2" | "turbo2" => Some(Asym2),
         "asym3" => Some(Asym3),
-        "auto" | "turbo" | "turbo3" => Some(Fwht3),
+        "turbo" | "turbo3" => Some(Fwht3),
         "asym4" | "turbo4" => Some(Asym4),
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
@@ -408,6 +409,32 @@ pub const HFQ_Q8_ONLY_POLICY: KvModePolicy = KvModePolicy {
     site: "hfq-q8-only",
     normalize_alias: normalize_full,
     accepted: &[Q8],
+    default: Q8,
+};
+
+/// Gemma4 lowered full-attention tier. Names use the shared Qwen table, so
+/// bare `asym3`/`turbo3` mean FWHT (no hd512 FWHT tier here → q8 + warn) and
+/// the legacy Givens tier needs the explicit `legacy-asym3` opt-out.
+/// `fp8`/`bf16` are carried forward so the carrier fails closed on them.
+fn normalize_gemma4(raw: &str) -> Option<KvMode> {
+    match raw.trim() {
+        "" | "auto" => Some(Q8),
+        "fp8" => Some(Fp8),
+        "bf16" => Some(Bf16),
+        other => parse_qwen_k_name(other).ok(),
+    }
+}
+
+/// Gemma4 lowered carrier, full-attention tier (the sliding tier is
+/// always the q8 ring). `auto` follows the shared policy: fp8 only where the
+/// site admits Fp8, else q8. Fp8 is not admitted: every lowered Gemma4 attend
+/// site builds its tier plan with `quant_fp8: false`, and the batched full
+/// prefill uses the windowed Q8 plan, which refuses fp8. So `auto` is q8 on
+/// every arch; `legacy-asym3` restores the previous Givens asym3 tier.
+pub const GEMMA4_LOWERED_FULL_POLICY: KvModePolicy = KvModePolicy {
+    site: "gemma4-lowered-full",
+    normalize_alias: normalize_gemma4,
+    accepted: &[Q8, Asym3],
     default: Q8,
 };
 
@@ -1186,9 +1213,7 @@ mod tests {
         assert!(resolve("asym3", p).warning.is_none());
         assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
         assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
-        // auto/turbo/turbo3 → Fwht3 unaccepted → Q8 + warn (legacy non-Qwen path)
-        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
-        assert!(resolve("auto", p).warning.is_some());
+        // turbo/turbo3 → Fwht3 unaccepted → Q8 + warn (legacy non-Qwen path)
         assert_eq!(resolve("turbo", p).mode, KvMode::Q8);
         assert!(resolve("turbo", p).warning.is_some());
         assert_eq!(resolve("turbo3", p).mode, KvMode::Q8);
@@ -1208,10 +1233,45 @@ mod tests {
         assert_eq!(resolve("q8", p).mode, KvMode::Q8);
         assert_eq!(resolve("asym3", p).mode, KvMode::Q8);
         assert!(resolve("asym3", p).warning.is_some());
-        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
-        assert!(resolve("auto", p).warning.is_some());
+        assert!(resolve("fwht4", p).warning.is_some());
         assert_eq!(resolve("fwht4", p).mode, KvMode::Q8);
         assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
+    }
+
+    /// `auto` is the site default on every non-Qwen q8 site: it resolves to
+    /// q8 without the "unrecognized or unsupported" warning.
+    #[test]
+    fn non_qwen_auto_resolves_q8_without_warning() {
+        for p in [&LLAMA_HFQ_POLICY, &HFQ_Q8_ONLY_POLICY] {
+            let r = resolve("auto", p);
+            assert_eq!(r.mode, KvMode::Q8, "site {}", p.site);
+            assert!(r.warning.is_none(), "site {}: {:?}", p.site, r.warning);
+        }
+    }
+
+    #[test]
+    fn gemma4_lowered_full_policy() {
+        let p = &GEMMA4_LOWERED_FULL_POLICY;
+        for raw in ["", "auto", "q8"] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, Q8, "{raw:?}");
+            assert!(r.warning.is_none(), "{raw:?}");
+        }
+        let legacy = resolve("legacy-asym3", p);
+        assert_eq!(legacy.mode, Asym3);
+        assert!(legacy.warning.is_none());
+        // Bare asymN/turboN/fwhtN are FWHT names; no hd512 FWHT tier → q8 + warn.
+        for raw in ["asym3", "turbo3", "turbo", "fwht3", "asym4", "legacy-asym4", "garbage"] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, Q8, "{raw}");
+            assert!(r.warning.is_some(), "{raw} must warn");
+        }
+        // Native presets are carried forward so the carrier fails closed.
+        for (raw, mode) in [("fp8", Fp8), ("bf16", Bf16)] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, mode);
+            assert!(r.warning.is_some());
+        }
     }
 
     #[test]

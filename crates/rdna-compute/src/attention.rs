@@ -191,6 +191,53 @@ fn check_native_kv_capacity(
     Ok(())
 }
 
+/// Token rows per launch for kernels whose `gridDim.y`/`gridDim.z` is the batch
+/// row. HIP caps those axes at 65535 (gfx1201 rejects >= 65536) while the
+/// legacy `HIPFIRE_PREFILL_MAX_BATCH` override has no upper bound. A multiple
+/// of 16 so WMMA row tiles and 4/8-row groups stay aligned. Batches up to this
+/// size are one launch with arguments identical to the unchunked launcher.
+const ROW_LAUNCH_CHUNK: usize = 65_520;
+
+/// `(row offset, rows)` slices of a batch, each at most [`ROW_LAUNCH_CHUNK`].
+/// An empty batch yields one empty slice so the caller's launch is unchanged.
+fn row_launch_chunks(batch: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..batch.max(1))
+        .step_by(ROW_LAUNCH_CHUNK)
+        .map(move |off| (off, ROW_LAUNCH_CHUNK.min(batch - off)))
+}
+
+/// `base` advanced by `rows * row_bytes` bytes; a null pointer stays null.
+fn shift_row_ptr(base: *mut c_void, rows: usize, row_bytes: usize) -> *mut c_void {
+    if base.is_null() {
+        base
+    } else {
+        unsafe { (base as *mut u8).add(rows * row_bytes) as *mut c_void }
+    }
+}
+
+/// Launch grid for the adaptive-KV transcode kernels: one block per
+/// (position, kv_head) folded into `grid.x` as `pos * n_kv_heads + h`. HIP
+/// caps `grid.y` at 65535 blocks, so the former `[n_kv_heads, n_positions]`
+/// grid silently failed for >= 65536 positions (full context is 262144).
+fn transcode_folded_grid(
+    what: &'static str,
+    n_kv_heads: usize,
+    n_positions: usize,
+) -> HipResult<[u32; 3]> {
+    n_kv_heads
+        .checked_mul(n_positions)
+        .and_then(|blocks| u32::try_from(blocks).ok())
+        .map(|blocks| [blocks, 1, 1])
+        .ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{what}: grid n_kv_heads={n_kv_heads} x n_positions={n_positions} exceeds u32 blocks"
+                ),
+            )
+        })
+}
+
 fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
     // Qwen3.6-27B graph-on decode: three fresh-process samples per
     // arm measured +0.61% by median (+0.11/+0.45/+0.61% paired),
@@ -2050,30 +2097,39 @@ impl Gpu {
             params.push(&mut vb as *mut _ as *mut c_void);
         }
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
-        let desc_raw = desc_ptr; // alias for move into closure
-        let rs_raw = rs_ptr; // alias for move into closure
-        self.launch_maybe_blob(
-            func,
-            [total_blocks, batch_size as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b.push_ptr(desc_raw);
-                b.push_ptr(rs_raw);
-                if paged {
-                    b.push_i32(vb);
-                }
-                b
-            },
-        )
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (s_base, p_base, rs_base) = (s, p, rs_ptr);
+        for (off, len) in row_launch_chunks(batch_size) {
+            s = shift_row_ptr(s_base, off, kv_row_bytes);
+            p = shift_row_ptr(p_base, off, 4);
+            rs_ptr = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let desc_raw = desc_ptr; // alias for move into closure
+            let rs_raw = rs_ptr; // alias for move into closure
+            self.launch_maybe_blob(
+                func,
+                [total_blocks, len as u32, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(d);
+                    b.push_ptr(s);
+                    b.push_ptr(p);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(bs);
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                    if paged {
+                        b.push_i32(vb);
+                    }
+                    b
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Legacy single-sequence entry point. Preserved so existing call sites are
@@ -2124,11 +2180,11 @@ impl Gpu {
             )?;
         }
         let d = dst.buf.as_ptr();
-        let s = src.buf.as_ptr();
-        let p = positions.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
-        let bs = batch_size as i32;
+        let mut bs = batch_size as i32;
         let mut params: Vec<*mut c_void> = vec![
             &d as *const _ as *mut c_void,
             &s as *const _ as *mut c_void,
@@ -2145,23 +2201,34 @@ impl Gpu {
             "kv_cache_write_fp8_e4m3_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
-            "kv_cache_write_fp8_e4m3_batched",
-            [n_kv_heads as u32, batch_size as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b
-            },
-        );
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (s_base, p_base) = (s, p);
+        let mut result = Ok(());
+        for (off, len) in row_launch_chunks(batch_size) {
+            s = shift_row_ptr(s_base, off, kv_row_bytes);
+            p = shift_row_ptr(p_base, off, 4);
+            bs = len as i32;
+            result = self.launch_maybe_blob(
+                "kv_cache_write_fp8_e4m3_batched",
+                [n_kv_heads as u32, len as u32, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(d);
+                    b.push_ptr(s);
+                    b.push_ptr(p);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(bs);
+                    b
+                },
+            );
+            if result.is_err() {
+                break;
+            }
+        }
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -2607,27 +2674,36 @@ impl Gpu {
             &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let grid = (n_kv_heads * head_dim).div_ceil(64) as u32;
-        let desc_raw = desc_ptr;
-        let rs_raw = rs_ptr;
-        self.launch_maybe_blob(
-            func,
-            [grid, batch_size as u32, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b.push_ptr(desc_raw);
-                b.push_ptr(rs_raw);
-                b
-            },
-        )
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (s_base, p_base, rs_base) = (s, p, rs_ptr);
+        for (off, len) in row_launch_chunks(batch_size) {
+            s = shift_row_ptr(s_base, off, kv_row_bytes);
+            p = shift_row_ptr(p_base, off, 4);
+            rs_ptr = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let desc_raw = desc_ptr;
+            let rs_raw = rs_ptr;
+            self.launch_maybe_blob(
+                func,
+                [grid, len as u32, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(d);
+                    b.push_ptr(s);
+                    b.push_ptr(p);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(bs);
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                    b
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Flat F16 (IEEE fp16) KV write for single-token decode. Launched twice
@@ -2737,27 +2813,36 @@ impl Gpu {
             &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let grid = (n_kv_heads * head_dim).div_ceil(64) as u32;
-        let desc_raw = desc_ptr;
-        let rs_raw = rs_ptr;
-        self.launch_maybe_blob(
-            func,
-            [grid, batch_size as u32, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b.push_ptr(desc_raw);
-                b.push_ptr(rs_raw);
-                b
-            },
-        )
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (s_base, p_base, rs_base) = (s, p, rs_ptr);
+        for (off, len) in row_launch_chunks(batch_size) {
+            s = shift_row_ptr(s_base, off, kv_row_bytes);
+            p = shift_row_ptr(p_base, off, 4);
+            rs_ptr = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let desc_raw = desc_ptr;
+            let rs_raw = rs_ptr;
+            self.launch_maybe_blob(
+                func,
+                [grid, len as u32, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(d);
+                    b.push_ptr(s);
+                    b.push_ptr(p);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(bs);
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
+                    b
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Batched sliding-window flash attention over flat BF16 KV (maple
@@ -8411,7 +8496,8 @@ impl Gpu {
         }
         let sub_batch = (partials.numel() * 4 / partials_bytes_per_row)
             .max(1)
-            .min(batch_size);
+            .min(batch_size)
+            .min(ROW_LAUNCH_CHUNK);
         let func: &'static str = match (rows, dpt) {
             (8, 8) => "attention_flash_q8_0_rows8_d8",
             (4, 8) => "attention_flash_q8_0_rows4_d8",
@@ -10061,31 +10147,40 @@ impl Gpu {
             params.push(&mut rs_ptr as *mut _ as *mut c_void);
         }
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        let desc_raw = desc_ptr;
-        let rs_raw = rs_ptr;
-        self.launch_maybe_blob(
-            func,
-            [n_kv_heads as u32, batch_size as u32, 1],
-            [32, 1, 1],
-            shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(kdp);
-                b.push_ptr(ksp);
-                b.push_ptr(pp);
-                b.push_ptr(s1p);
-                b.push_ptr(s2p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                if paged {
-                    b.push_ptr(desc_raw);
-                    b.push_ptr(rs_raw);
-                }
-                b
-            },
-        )
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (ksp_base, pp_base, rs_base) = (ksp, pp, rs_ptr);
+        for (off, len) in row_launch_chunks(batch_size) {
+            ksp = shift_row_ptr(ksp_base, off, kv_row_bytes);
+            pp = shift_row_ptr(pp_base, off, 4);
+            rs_ptr = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let desc_raw = desc_ptr;
+            let rs_raw = rs_ptr;
+            self.launch_maybe_blob(
+                func,
+                [n_kv_heads as u32, len as u32, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(s1p);
+                    b.push_ptr(s2p);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(bs);
+                    if paged {
+                        b.push_ptr(desc_raw);
+                        b.push_ptr(rs_raw);
+                    }
+                    b
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub fn kv_cache_write_v256_2bit_vec(
@@ -10135,6 +10230,9 @@ impl Gpu {
         Ok(())
     }
 
+    /// Grid `[n_kv_heads, batch_size, 1]`. Adaptive-KV only, and every adaptive
+    /// caller chunks prefill at `PREFILL_MAX_BATCH` (256) rows, so this is not
+    /// row-chunked like the other batched KV writers (`ROW_LAUNCH_CHUNK`).
     pub fn kv_cache_write_v256_2bit_vec_batched(
         &mut self,
         dst: &GpuTensor,
@@ -10239,6 +10337,9 @@ impl Gpu {
         Ok(())
     }
 
+    /// Grid `[n_kv_heads, batch_size, 1]`. Adaptive-KV only, and every adaptive
+    /// caller chunks prefill at `PREFILL_MAX_BATCH` (256) rows, so this is not
+    /// row-chunked like the other batched KV writers (`ROW_LAUNCH_CHUNK`).
     pub fn kv_cache_write_v256_4bit_vec_batched(
         &mut self,
         dst: &GpuTensor,
@@ -10349,6 +10450,9 @@ impl Gpu {
         }
     }
 
+    // The KV transcode kernels decode `blockIdx.x = pos * n_kv_heads + h`; the
+    // old `[n_kv_heads, n_positions]` grid overflowed HIP's 65535 grid.y limit
+    // once a layer held >= 65536 positions (full context is 262144).
     pub fn transcode_v_q8_to_lloyd4(
         &mut self,
         dst: &GpuTensor,
@@ -10386,7 +10490,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_kv_heads as u32, n_positions as u32, 1],
+                transcode_folded_grid("transcode_v_q8_to_lloyd4", n_kv_heads, n_positions)?,
                 [32, 1, 1],
                 shared_mem,
                 self.stream_ref(),
@@ -10433,7 +10537,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_kv_heads as u32, n_positions as u32, 1],
+                transcode_folded_grid("transcode_v_lloyd_down", n_kv_heads, n_positions)?,
                 [32, 1, 1],
                 shared_mem,
                 self.stream_ref(),
@@ -10474,7 +10578,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_kv_heads as u32, n_positions as u32, 1],
+                transcode_folded_grid("transcode_k_fwht4_to_fwht2", n_kv_heads, n_positions)?,
                 [32, 1, 1],
                 shared_mem,
                 self.stream_ref(),
@@ -10521,7 +10625,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_kv_heads as u32, n_positions as u32, 1],
+                transcode_folded_grid("transcode_k_fwht4_to_fwht3", n_kv_heads, n_positions)?,
                 [32, 1, 1],
                 shared_mem,
                 self.stream_ref(),
@@ -10621,31 +10725,40 @@ impl Gpu {
             params.push(&mut rs_ptr as *mut _ as *mut c_void);
         }
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        let desc_raw = desc_ptr;
-        let rs_raw = rs_ptr;
-        self.launch_maybe_blob(
-            func_name,
-            [n_kv_heads as u32, batch_size as u32, 1],
-            [32, 1, 1],
-            shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(kdp);
-                b.push_ptr(ksp);
-                b.push_ptr(pp);
-                b.push_ptr(ctp);
-                b.push_ptr(stp);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                if paged {
-                    b.push_ptr(desc_raw);
-                    b.push_ptr(rs_raw);
-                }
-                b
-            },
-        )
+        let kv_row_bytes = n_kv_heads * head_dim * 4;
+        let (ksp_base, pp_base, rs_base) = (ksp, pp, rs_ptr);
+        for (off, len) in row_launch_chunks(batch_size) {
+            ksp = shift_row_ptr(ksp_base, off, kv_row_bytes);
+            pp = shift_row_ptr(pp_base, off, 4);
+            rs_ptr = shift_row_ptr(rs_base, off, 4);
+            bs = len as i32;
+            let desc_raw = desc_ptr;
+            let rs_raw = rs_ptr;
+            self.launch_maybe_blob(
+                func_name,
+                [n_kv_heads as u32, len as u32, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(bs);
+                    if paged {
+                        b.push_ptr(desc_raw);
+                        b.push_ptr(rs_raw);
+                    }
+                    b
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Shared helper: launch a batched asym flash tile + the shared asym reduce.
@@ -10776,8 +10889,9 @@ impl Gpu {
             (partials_capacity / partials_bytes_per_row)
                 .max(1)
                 .min(batch_size)
+                .min(ROW_LAUNCH_CHUNK)
         } else {
-            batch_size
+            batch_size.min(ROW_LAUNCH_CHUNK)
         };
 
         let wmma_fa_kernel = if self.arch_caps.has_wmma_w32_gfx12() {
@@ -12207,31 +12321,39 @@ impl Gpu {
                 params.push(&mut rs_ptr as *mut _ as *mut c_void);
             }
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            let desc_raw = desc_ptr;
-            let rs_raw = rs_ptr;
-            self.launch_maybe_blob(
-                func,
-                [n_kv_heads as u32, batch_size as u32, 1],
-                [32, 1, 1],
-                shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(kdp);
-                    b.push_ptr(ksp);
-                    b.push_ptr(pp);
-                    b.push_ptr(ctp);
-                    b.push_ptr(stp);
-                    b.push_i32(nkv);
-                    b.push_i32(hd);
-                    b.push_i32(bs);
-                    if paged {
-                        b.push_ptr(desc_raw);
-                        b.push_ptr(rs_raw);
-                    }
-                    b
-                },
-            )?;
+            let kv_row_bytes = n_kv_heads * head_dim * 4;
+            let (ksp_base, pp_base, rs_base) = (ksp, pp, rs_ptr);
+            for (off, len) in row_launch_chunks(batch_size) {
+                ksp = shift_row_ptr(ksp_base, off, kv_row_bytes);
+                pp = shift_row_ptr(pp_base, off, 4);
+                rs_ptr = shift_row_ptr(rs_base, off, 4);
+                bs = len as i32;
+                let desc_raw = desc_ptr;
+                let rs_raw = rs_ptr;
+                self.launch_maybe_blob(
+                    func,
+                    [n_kv_heads as u32, len as u32, 1],
+                    [32, 1, 1],
+                    shared_mem,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(kdp);
+                        b.push_ptr(ksp);
+                        b.push_ptr(pp);
+                        b.push_ptr(ctp);
+                        b.push_ptr(stp);
+                        b.push_i32(nkv);
+                        b.push_i32(hd);
+                        b.push_i32(bs);
+                        if paged {
+                            b.push_ptr(desc_raw);
+                            b.push_ptr(rs_raw);
+                        }
+                        b
+                    },
+                )?;
+            }
         }
         // V: batched Q8_0 write through the V base.
         self.kv_cache_write_q8_0_batched_slots(

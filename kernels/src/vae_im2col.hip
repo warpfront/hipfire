@@ -29,7 +29,10 @@
 
 // ─── LDS-tiled (default) ────────────────────────────────────────────────
 //
-// Grid: (ceil(w/tw), ceil(rows/th), ceil(c_in/c_tile)). Block: 1-D, at least
+// Grid: 1-D, `ceil(w/tw) * ceil(rows/th) * ceil(c_in/c_tile)` blocks, folded as
+// `blockIdx.x = ox_tile + n_ox * (row_tile + n_ry * c_tile_idx)`. gridDim.y/z
+// stay 1: gfx1201 has 16-bit y/z workgroup-ID fields, and a tall band's
+// row-tile count can exceed that range. Block: 1-D, at least
 // `(th+2)*(tw+2)` threads recommended so the staging pass is a single sweep.
 // Dynamic shared memory: `c_tile*(th+2)*(tw+2)*sizeof(_Float16)` bytes.
 //
@@ -56,9 +59,15 @@ extern "C" __global__ void vae_im2col_f16_lds(
     const int patch_elems = ph * pw;
     const long hw = (long)h * (long)w;
 
-    const int ci0 = blockIdx.z * c_tile;
-    const int ox0 = blockIdx.x * tw;
-    const int ly0 = blockIdx.y * th;          // band-local first output row
+    // Folded grid: blockIdx.x = ox_tile + n_ox * (row_tile + n_ry * c_tile_idx),
+    // the linear block order of the old (x, y, z) launch (x fastest).
+    const unsigned n_ox = ((unsigned)w + tw - 1) / tw;
+    const unsigned n_ry = ((unsigned)rows + th - 1) / th;
+    const unsigned ox_tile = blockIdx.x % n_ox;
+    const unsigned rest = blockIdx.x / n_ox;
+    const int ci0 = (int)(rest / n_ry) * c_tile;
+    const int ox0 = (int)ox_tile * tw;
+    const int ly0 = (int)(rest % n_ry) * th;  // band-local first output row
     if (ci0 >= c_in || ox0 >= w || ly0 >= rows) return;
     const int c_here = min(c_tile, c_in - ci0);
 

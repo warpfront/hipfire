@@ -19,6 +19,7 @@ use crate::weights::{Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
+    DraftHeadRequestState,
     DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
     IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
 };
@@ -567,6 +568,9 @@ pub struct MtpGpuState {
     generation: u64,
     model_id: u64,
     snapshot_arena: MtpGpuStateSnapshotArena,
+    /// Durable prefix-cache checkpoint (see `Qwen4State::capture_prefix`):
+    /// separate from the speculative arena; `active` = valid.
+    prefix_arena: Option<MtpGpuStateSnapshotArena>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -748,11 +752,13 @@ impl MtpGpuState {
             generation: 0,
             model_id,
             snapshot_arena,
+            prefix_arena: None,
         })
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
+        self.invalidate_prefix();
         for tensor in [
             &self.full_keys,
             &self.full_values,
@@ -863,6 +869,7 @@ impl MtpGpuState {
         if result.is_err() && consume {
             self.snapshot_arena.invalidate();
         }
+        self.retire_prefix_past_position();
         result
     }
 
@@ -910,6 +917,7 @@ impl MtpGpuState {
         self.pooled_len = position / compress;
         self.selected_len = self.selected_len.min(position);
         self.step_index = mark.step_index.wrapping_add(keep);
+        self.retire_prefix_past_position();
         Ok(())
     }
 
@@ -960,6 +968,106 @@ impl MtpGpuState {
         self.step_index = metadata.step_index;
     }
 
+    pub(crate) fn attach_prefix_arena(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        if self.prefix_arena.is_none() {
+            self.prefix_arena = Some(MtpGpuStateSnapshotArena::new(
+                gpu,
+                &self.selected_indices,
+                &self.selected_len_out,
+                &self.wide_hidden,
+                self.model_id,
+                self.mark(),
+            )?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prefix_position(&self) -> Option<usize> {
+        self.prefix_arena
+            .as_ref()
+            .filter(|arena| arena.active)
+            .map(|arena| arena.mark.position)
+    }
+
+    pub(crate) fn invalidate_prefix(&mut self) {
+        if let Some(arena) = self.prefix_arena.as_mut() {
+            arena.invalidate();
+        }
+    }
+
+    fn retire_prefix_past_position(&mut self) {
+        if self.prefix_position().is_some_and(|saved| self.position < saved) {
+            self.invalidate_prefix();
+        }
+    }
+
+    /// Copy the in-place-overwritten MTP owners (selection, device selected
+    /// length, own wide hidden) and the marks incl. `step_index`.
+    pub(crate) fn capture_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.invalidate_prefix();
+        let mark = self.mark();
+        validate_mtp_mark(&mark, self)?;
+        let arena = self
+            .prefix_arena
+            .as_ref()
+            .ok_or_else(|| invalid("MTP prefix arena is not attached"))?;
+        if arena.model_id != self.model_id {
+            return Err(invalid("MTP prefix arena model mismatch"));
+        }
+        arena.validate_layout(self)?;
+        for (live, saved) in [
+            (&self.selected_indices, &arena.selected_indices),
+            (&self.selected_len_out, &arena.selected_len_out),
+            (&self.wide_hidden, &arena.wide_hidden),
+        ] {
+            gpu.copy_d2d(live, saved, live.byte_size())?;
+        }
+        let arena = self
+            .prefix_arena
+            .as_mut()
+            .ok_or_else(|| invalid("MTP prefix arena is not attached"))?;
+        arena.mark = mark;
+        arena.active = true;
+        Ok(())
+    }
+
+    /// Restore the durable checkpoint. Like a reset it starts a new request
+    /// epoch and retires every speculative ticket; the caller resets on error.
+    pub(crate) fn restore_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        let arena = self
+            .prefix_arena
+            .as_ref()
+            .filter(|arena| arena.active)
+            .ok_or_else(|| invalid("MTP prefix checkpoint is not valid"))?;
+        if arena.model_id != self.model_id {
+            return Err(invalid("MTP prefix arena model mismatch"));
+        }
+        validate_mtp_mark(&arena.mark, self)?;
+        arena.validate_layout(self)?;
+        let mark = arena.mark;
+        self.snapshot_arena.invalidate();
+        self.request_epoch = self.request_epoch.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+        let arena = self
+            .prefix_arena
+            .as_ref()
+            .ok_or_else(|| invalid("MTP prefix arena is not attached"))?;
+        for (live, saved) in [
+            (&self.selected_indices, &arena.selected_indices),
+            (&self.selected_len_out, &arena.selected_len_out),
+            (&self.wide_hidden, &arena.wide_hidden),
+        ] {
+            gpu.copy_d2d(saved, live, live.byte_size())?;
+        }
+        self.full_len = mark.full_len;
+        self.raw_len = mark.raw_len;
+        self.pooled_len = mark.pooled_len;
+        self.selected_len = mark.selected_len;
+        self.position = mark.position;
+        self.step_index = mark.step_index;
+        Ok(())
+    }
+
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let Self {
             full_keys,
@@ -970,9 +1078,13 @@ impl MtpGpuState {
             selected_len_out,
             wide_hidden,
             snapshot_arena,
+            prefix_arena,
             ..
         } = self;
         let mut first = snapshot_arena.free_gpu(gpu);
+        if let Some(error) = prefix_arena.and_then(|arena| arena.free_gpu(gpu)) {
+            first.get_or_insert(error);
+        }
         for tensor in [
             full_keys,
             full_values,
@@ -1003,6 +1115,8 @@ pub struct Qwen4MtpGpu {
     /// MQ2 copy with exact re-scoring of its top 8 drafts the Q8_0 head's own
     /// argmax at a quarter of its read; plain MQ3 loses acceptance.
     pub(crate) draft: DraftHead,
+    /// Draft policy at the durable prefix checkpoint.
+    prefix_policy: DraftHeadRequestState,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -1121,6 +1235,7 @@ impl Qwen4MtpGpu {
             moe,
             max_seq,
             draft,
+            prefix_policy: DraftHeadRequestState::default(),
         })
     }
 
@@ -1170,8 +1285,39 @@ impl Qwen4MtpGpu {
         Ok(())
     }
 
+    /// A cold request also starts the draft policy fresh: the full-vocabulary
+    /// hold and margin are request-local, never inherited from the previous
+    /// request.
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.draft.reset_request_state();
         self.state.reset(gpu)
+    }
+
+    pub(crate) fn attach_prefix_arena(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.state.attach_prefix_arena(gpu)
+    }
+
+    pub(crate) fn prefix_position(&self) -> Option<usize> {
+        self.state.prefix_position()
+    }
+
+    pub(crate) fn invalidate_prefix(&mut self) {
+        self.state.invalidate_prefix();
+    }
+
+    /// Checkpoint the head state and the draft policy. Prompt appends only
+    /// `observe` (a qualifying input sets the full hold); drafts are the only
+    /// decrement, so at a prompt boundary this is the canonical prompt summary.
+    pub(crate) fn capture_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.state.capture_prefix(gpu)?;
+        self.prefix_policy = self.draft.request_state();
+        Ok(())
+    }
+
+    pub(crate) fn restore_prefix(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.state.restore_prefix(gpu)?;
+        self.draft.set_request_state(self.prefix_policy);
+        Ok(())
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)
@@ -1355,6 +1501,7 @@ impl Qwen4MtpGpu {
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode,
+                trunk_a4: 0,
             };
             let lengths = attention.next_lengths()?;
             let moe = if step == MtpStep::Append {
@@ -1592,6 +1739,7 @@ impl Qwen4MtpGpu {
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode: IndexedAttentionMode::AppendOnly,
+                trunk_a4: 0,
             };
             let lengths = attention.next_lengths()?;
             let steps = [

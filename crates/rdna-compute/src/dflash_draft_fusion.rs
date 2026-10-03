@@ -19,8 +19,8 @@ pub(crate) const COLLAPSE_SRC: &str = include_str!("../../../kernels/src/dflash_
 ///
 /// Mirrors the default variant selection in
 /// [`Gpu::gemm_hfq4g256_residual_wmma`]: `m >= 8192` runs the k2 schedule,
-/// smaller M runs deterministic ksplit. Any non-default policy (mw16,
-/// ldsstage, explicit `HIPFIRE_WO_WMMA_VARIANT`) resolves to [`Off`](DraftCollapseGemm::Off)
+/// smaller M runs deterministic ksplit. Any non-default policy (ldsstage,
+/// explicit `HIPFIRE_WO_WMMA_VARIANT`) resolves to [`Off`](DraftCollapseGemm::Off)
 /// so the caller keeps today's path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DraftCollapseGemm {
@@ -87,7 +87,7 @@ impl Gpu {
         if k % 256 != 0 {
             return DraftCollapseGemm::Off;
         }
-        if self.flags.mw16 || self.flags.hfq4g256_ldsstage_wmma {
+        if self.flags.hfq4g256_ldsstage_wmma {
             return DraftCollapseGemm::Off;
         }
         if self.flags.wo_wmma_variant.is_some() {

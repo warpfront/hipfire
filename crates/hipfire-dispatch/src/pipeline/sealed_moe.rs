@@ -2173,16 +2173,20 @@ pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<
 /// the combine or launched here, first.  With the HC write `hc` (whose gates
 /// are ready; `HIPFIRE_QWEN4_HC_FUSE` >= 3) offered to the shared down, returns
 /// whether that stage carried the write; see
-/// [`moe_program::execute_after_clear`].
+/// [`moe_program::execute_after_clear`] (`next`: the HC row fold's lookahead).
 pub(crate) fn execute_sealed_after_clear(
     gpu: &mut Gpu,
     call: &SealedMoeCall<'_>,
     clear: &super::layer_ops::ClearOp<'_>,
     hc: Option<&super::layer_ops::HyperWriteOp<'_>>,
-) -> Result<bool, DispatchError> {
+    next: Option<(
+        &super::layer_ops::HyperReadOp<'_>,
+        &super::layer_ops::HyperWriteOp<'_>,
+    )>,
+) -> Result<moe_program::AfterClear, DispatchError> {
     call.validate_for_gpu(gpu)?;
     call.note_retained_route_identity(gpu)?;
-    moe_program::execute_after_clear(gpu, call, clear, hc)
+    moe_program::execute_after_clear(gpu, call, clear, hc, next)
 }
 
 impl SealedMoeCall<'_> {

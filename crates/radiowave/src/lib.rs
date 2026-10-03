@@ -471,6 +471,9 @@ pub enum PeacemakerToolRole {
     Linker,
     Bundler,
     Aco,
+    /// hipfire-isa's native code-object writer: assembler, linker and
+    /// bundler in one, no ROCm tool.
+    Native,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

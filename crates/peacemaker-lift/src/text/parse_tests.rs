@@ -5,7 +5,7 @@
 use super::{label_block_ids, parse_line, parse_source, SourceKind};
 use crate::text::{print::canonical, support};
 use peacemaker_ir::{
-    codec::gfx12,
+    codec::{gfx11, gfx12},
     inst::{Arch, Inst},
 };
 
@@ -353,4 +353,237 @@ fn hipcc_spellings_match_codec() {
     .expect("wmma parses");
     assert_eq!(inst.mods.op_sel_hi, 7);
     gfx12::encode(&inst).expect("encodes");
+}
+
+/// `(text, gfx1100 words, gfx1151 words, gfx1201 words)` pinned from
+/// `/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc -triple=amdgcn -mcpu=<arch>
+/// -show-encoding`. An empty slice means the pinned assembler rejects the
+/// spelling for that arch, so the parser/codec pair must refuse it too.
+type Pinned = (&'static str, &'static [u32], &'static [u32], &'static [u32]);
+
+const GFX11_ARCHES: [Arch; 2] = [Arch::Gfx1100, Arch::Gfx1151];
+
+/// Encode through the architecture's own codec.
+fn encode_for_arch(arch: Arch, inst: &Inst) -> Result<Vec<u32>, String> {
+    match arch {
+        Arch::Gfx1201 => gfx12::encode(inst),
+        _ => gfx11::encode(arch, inst),
+    }
+    .map(|words| words.to_vec())
+    .map_err(|e| e.to_string())
+}
+
+fn parse_encode(text: &str, arch: Arch) -> Result<Vec<u32>, String> {
+    let inst = parse_line(text, arch).map_err(|e| e.to_string())?;
+    encode_for_arch(arch, &inst)
+}
+
+fn pinned_words(case: &Pinned, arch: Arch) -> &'static [u32] {
+    match arch {
+        Arch::Gfx1100 => case.1,
+        Arch::Gfx1151 => case.2,
+        Arch::Gfx1201 => case.3,
+        other => panic!("no pinned words for {other:?}"),
+    }
+}
+
+/// Every pinned row on each arch it assembles for must parse and re-encode
+/// to llvm-mc's exact words; rows the assembler rejects must be refused.
+fn check_pinned(table: &[Pinned], arches: &[Arch]) {
+    for case in table {
+        for &arch in arches {
+            let want = pinned_words(case, arch);
+            let got = parse_encode(case.0, arch);
+            if want.is_empty() {
+                assert!(
+                    got.is_err(),
+                    "{arch:?}: llvm-mc rejects {:?}, parser+codec produced {got:08x?}",
+                    case.0
+                );
+            } else {
+                assert_eq!(
+                    got.as_deref(),
+                    Ok(want),
+                    "{arch:?}: {:?} vs llvm-mc words {want:08x?}",
+                    case.0
+                );
+            }
+        }
+    }
+}
+
+const PINNED_WAITCNT: &[Pinned] = &[
+    ("s_waitcnt vmcnt(0) lgkmcnt(0)", &[0xbf890007], &[0xbf890007], &[]),
+    ("s_waitcnt vmcnt(1) expcnt(2) lgkmcnt(3)", &[0xbf890432], &[0xbf890432], &[]),
+    ("s_waitcnt expcnt(0)", &[0xbf89fff0], &[0xbf89fff0], &[]),
+    ("s_waitcnt vmcnt(5)", &[0xbf8917f7], &[0xbf8917f7], &[]),
+    ("s_waitcnt lgkmcnt(0)", &[0xbf89fc07], &[0xbf89fc07], &[]),
+    ("s_waitcnt 0", &[0xbf890000], &[0xbf890000], &[]),
+];
+
+/// gfx11-only true16 rows: the gfx12 table has no `v_mul_f16`, so the gfx1201
+/// column is unused (never checked).
+const PINNED_TRUE16_GFX11: &[Pinned] = &[
+    ("v_mul_f16_e32 v1.h, v2.l, v3.h", &[0x6b030702], &[0x6b030702], &[]),
+    ("v_mul_f16_e32 v1.l, v2.h, v3.l", &[0x6a020782], &[0x6a020782], &[]),
+    ("v_mul_f16_e64 v1.h, v2.h, v3.l", &[0xd5354801, 0x02020702], &[0xd5354801, 0x02020702], &[]),
+];
+
+const PINNED_TRUE16: &[Pinned] = &[
+    ("v_fma_f16 v1.l, v2.h, v3.l, v4.h", &[0xd6482801, 0x04120702], &[0xd6482801, 0x04120702], &[0xd6482801, 0x04120702]),
+    ("v_mov_b16_e32 v1.h, v2.l", &[0x7f023902], &[0x7f023902], &[0x7f023902]),
+    ("v_mov_b16_e32 v5.h, 0", &[0x7f0a3880], &[0x7f0a3880], &[0x7f0a3880]),
+    ("v_cvt_f16_f32_e32 v68.h, v61", &[0x7f88153d], &[0x7f88153d], &[0x7f88153d]),
+    ("v_cvt_f32_f16_e32 v1, v2.h", &[0x7e021782], &[0x7e021782], &[0x7e021782]),
+    ("v_cvt_f32_f16_e64 v12, v198.h", &[0xd58b080c, 0x020101c6], &[0xd58b080c, 0x020101c6], &[0xd58b080c, 0x020101c6]),
+];
+
+const PINNED_CACHE_BITS: &[Pinned] = &[
+    ("buffer_load_b32 v1, v2, s[4:7], s8 offen offset:16 glc slc dlc", &[0xe0507010, 0x08410102], &[0xe0507010, 0x08410102], &[]),
+    ("buffer_load_b32 v1, off, s[4:7], s8 offset:4 glc", &[0xe0504004, 0x08010100], &[0xe0504004, 0x08010100], &[]),
+    ("buffer_store_b32 v1, v2, s[4:7], s8 offen slc dlc", &[0xe0683000, 0x08410102], &[0xe0683000, 0x08410102], &[]),
+    ("global_load_b32 v1, v[2:3], off glc slc dlc", &[0xdc52e000, 0x017c0002], &[0xdc52e000, 0x017c0002], &[]),
+    ("global_load_b32 v1, v[2:3], off offset:-48 glc", &[0xdc525fd0, 0x017c0002], &[0xdc525fd0, 0x017c0002], &[]),
+    ("global_load_b32 v1, v2, s[4:5] slc", &[0xdc528000, 0x01040002], &[0xdc528000, 0x01040002], &[]),
+    ("global_store_b32 v[2:3], v1, off dlc", &[0xdc6a2000, 0x007c0102], &[0xdc6a2000, 0x007c0102], &[]),
+    ("s_load_b32 s1, s[2:3], 0x0 glc", &[0xf4004041, 0xf8000000], &[0xf4004041, 0xf8000000], &[]),
+    ("s_load_b32 s1, s[2:3], 0x10 glc dlc", &[0xf4006041, 0xf8000010], &[0xf4006041, 0xf8000010], &[]),
+];
+
+const PINNED_VOPD: &[Pinned] = &[
+    ("v_dual_mov_b32 v1, v2 :: v_dual_add_f32 v4, v5, v6", &[0xca080102, 0x01040d05], &[0xca080102, 0x01040d05], &[0xca080102, 0x01040d05]),
+    ("v_dual_add_f32 v104, v104, v34 :: v_dual_add_f32 v105, v105, v35", &[0xc9084568, 0x68684769], &[0xc9084568, 0x68684769], &[0xc9084568, 0x68684769]),
+    ("v_dual_fmamk_f32 v1, v2, 0x3f800000, v3 :: v_dual_mul_f32 v4, v5, v6", &[0xc8860702, 0x01040d05, 0x3f800000], &[0xc8860702, 0x01040d05, 0x3f800000], &[0xc8860702, 0x01040d05, 0x3f800000]),
+    ("v_dual_fmaak_f32 v0, v1, v2, 0x40490fdb :: v_dual_mov_b32 v3, v4", &[0xc8500501, 0x00020104, 0x40490fdb], &[0xc8500501, 0x00020104, 0x40490fdb], &[0xc8500501, 0x00020104, 0x40490fdb]),
+    ("v_dual_mul_f32 v0, v1, v2 :: v_dual_fmamk_f32 v3, v4, 0x40490fdb, v5", &[0xc8c40501, 0x00020b04, 0x40490fdb], &[0xc8c40501, 0x00020b04, 0x40490fdb], &[0xc8c40501, 0x00020b04, 0x40490fdb]),
+];
+
+const PINNED_BRANCH: &[Pinned] = &[
+    ("s_branch 5", &[0xbfa00005], &[0xbfa00005], &[0xbfa00005]),
+    ("s_branch -3", &[0xbfa0fffd], &[0xbfa0fffd], &[0xbfa0fffd]),
+    ("s_cbranch_scc1 -2", &[0xbfa2fffe], &[0xbfa2fffe], &[0xbfa2fffe]),
+    ("s_cbranch_execz 7", &[0xbfa50007], &[0xbfa50007], &[0xbfa50007]),
+    ("s_cbranch_scc0 12", &[0xbfa1000c], &[0xbfa1000c], &[0xbfa1000c]),
+    ("s_cbranch_vccz -7", &[0xbfa3fff9], &[0xbfa3fff9], &[0xbfa3fff9]),
+    ("s_cbranch_execnz 0", &[0xbfa60000], &[0xbfa60000], &[0xbfa60000]),
+    ("s_branch -32768", &[0xbfa08000], &[0xbfa08000], &[0xbfa08000]),
+    ("s_branch 32767", &[0xbfa07fff], &[0xbfa07fff], &[0xbfa07fff]),
+    ("s_branch 32768", &[0xbfa08000], &[0xbfa08000], &[0xbfa08000]),
+    ("s_branch 65535", &[0xbfa0ffff], &[0xbfa0ffff], &[0xbfa0ffff]),
+];
+
+const PINNED_EDGES: &[Pinned] = &[
+    ("v_fmamk_f32 v1, v2, 0x3f800000, v3", &[0x58020702, 0x3f800000], &[0x58020702, 0x3f800000], &[0x58020702, 0x3f800000]),
+    ("v_fmaak_f32 v1, v2, v3, 0x3f800000", &[0x5a020702, 0x3f800000], &[0x5a020702, 0x3f800000], &[0x5a020702, 0x3f800000]),
+    ("v_pk_fma_f16 v1, v2, v3, v4 op_sel:[0,1,0]", &[0xcc0e5001, 0x1c120702], &[0xcc0e5001, 0x1c120702], &[0xcc0e5001, 0x1c120702]),
+    ("v_pk_fma_f16 v1, v2, v3, v4 op_sel_hi:[1,0,1]", &[0xcc0e4001, 0x0c120702], &[0xcc0e4001, 0x0c120702], &[0xcc0e4001, 0x0c120702]),
+    ("v_pk_fma_f16 v1, v2, v3, v4 op_sel:[1,0,1] op_sel_hi:[0,1,0] neg_lo:[1,0,0] neg_hi:[0,0,1]", &[0xcc0e2c01, 0x34120702], &[0xcc0e2c01, 0x34120702], &[0xcc0e2c01, 0x34120702]),
+    ("ds_swizzle_b32 v1, v2 offset:swizzle(BROADCAST,16,8)", &[0xd8d40110, 0x01000002], &[0xd8d40110, 0x01000002], &[0xd8d40110, 0x01000002]),
+    ("ds_swizzle_b32 v1, v2 offset:swizzle(BROADCAST,2,1)", &[0xd8d4003e, 0x01000002], &[0xd8d4003e, 0x01000002], &[0xd8d4003e, 0x01000002]),
+    ("ds_swizzle_b32 v1, v2 offset:swizzle(BROADCAST,32,31)", &[0xd8d403e0, 0x01000002], &[0xd8d403e0, 0x01000002], &[0xd8d403e0, 0x01000002]),
+    ("buffer_load_b32 v1, v2, s[4:7], s8 offen offset:16", &[0xe0500010, 0x08410102], &[0xe0500010, 0x08410102], &[0xc4050008, 0x40800801, 0x00001002]),
+    ("buffer_load_b32 v1, off, s[4:7], s8 offset:16", &[0xe0500010, 0x08010100], &[0xe0500010, 0x08010100], &[0xc4050008, 0x00800801, 0x00001000]),
+];
+
+/// gfx11 `s_waitcnt` combined counters (vmcnt/expcnt/lgkmcnt in one
+/// SOPP word, unspelled counters at their maxima) and the bare numeric
+/// spelling. gfx1201 has no combined counter instruction: it is refused.
+#[test]
+fn gfx11_waitcnt_combined_counters_match_llvm_mc() {
+    check_pinned(PINNED_WAITCNT, &GFX11_ARCHES);
+    for case in PINNED_WAITCNT {
+        assert!(
+            parse_line(case.0, Arch::Gfx1201).is_err(),
+            "gfx1201 must refuse {:?}",
+            case.0
+        );
+    }
+    for bad in [
+        "s_waitcnt vmcnt(64)",
+        "s_waitcnt expcnt(8)",
+        "s_waitcnt lgkmcnt(64)",
+        "s_waitcnt bogcnt(0)",
+        "s_waitcnt vmcnt",
+    ] {
+        for arch in GFX11_ARCHES {
+            assert!(parse_line(bad, arch).is_err(), "{arch:?} must reject {bad:?}");
+        }
+    }
+}
+
+/// True16 `.l`/`.h` halves select the VOP1/VOP2 half bits and the VOP3
+/// `op_sel` bits identically on every architecture whose table has the row
+/// (`v_mul_f16` is gfx11-only).
+#[test]
+fn true16_halves_match_llvm_mc() {
+    check_pinned(PINNED_TRUE16, &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]);
+    check_pinned(PINNED_TRUE16_GFX11, &GFX11_ARCHES);
+}
+
+/// gfx11 `glc`/`slc`/`dlc` cache bits on buffer, global and SMEM; gfx1201
+/// replaced them with `th:`/`scope:`, so the legacy spellings are refused.
+#[test]
+fn gfx11_cache_bits_match_llvm_mc_and_gfx1201_refuses() {
+    check_pinned(PINNED_CACHE_BITS, &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]);
+}
+
+/// VOPD pairs, including the embedded-literal X/Y forms, encode to
+/// llvm-mc's words on all three architectures.
+#[test]
+fn vopd_pairs_match_llvm_mc_on_all_arches() {
+    check_pinned(PINNED_VOPD, &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]);
+}
+
+/// Numeric branch targets: negative, positive and the wrapped
+/// 32768..=65535 spelling llvm-mc accepts; below -32768 and above 65535 are
+/// refused on every architecture.
+#[test]
+fn numeric_branches_match_llvm_mc_and_reject_out_of_range() {
+    let arches = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+    check_pinned(PINNED_BRANCH, &arches);
+    for arch in arches {
+        for bad in ["s_branch -32769", "s_branch 65536", "s_cbranch_scc1 -32769", "s_cbranch_vccz 65536"] {
+            assert!(parse_line(bad, arch).is_err(), "{arch:?} must reject {bad:?}");
+        }
+    }
+}
+
+/// Edge spellings pinned on all three architectures: FMAMK/FMAAK embedded
+/// 32-bit literal, packed-FMA `op_sel`/`op_sel_hi`/`neg_lo`/`neg_hi` source
+/// bit mapping, `ds_swizzle_b32` BROADCAST encoding and buffer `offen` /
+/// `off` + `offset:` (gfx11 MUBUF dwords differ from gfx12 VBUFFER).
+#[test]
+fn embedded_literal_packed_swizzle_and_buffer_edges_match_llvm_mc() {
+    check_pinned(PINNED_EDGES, &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]);
+}
+
+/// gfx1201 buffer `offen offset th scope` words from llvm-mc. llvm-mc only
+/// accepts the `offen offset:N th: scope:` spelling; the parser also takes the
+/// modifiers in any order and must still emit the canonical operand order.
+#[test]
+fn gfx1201_buffer_offen_offset_th_scope_order() {
+    const WORDS: &[u32] = &[0xc4050008, 0x40940801, 0x00001002];
+    for text in [
+        "buffer_load_b32 v1, v2, s[4:7], s8 offen offset:16 th:TH_LOAD_NT scope:SCOPE_SE",
+        "buffer_load_b32 v1, v2, s[4:7], s8 offset:16 offen th:TH_LOAD_NT scope:SCOPE_SE",
+        "buffer_load_b32 v1, v2, s[4:7], s8 scope:SCOPE_SE th:TH_LOAD_NT offset:16 offen",
+        "buffer_load_b32 v1, v2, s[4:7], s8 th:TH_LOAD_NT offen scope:SCOPE_SE offset:16",
+    ] {
+        assert_eq!(parse_encode(text, Arch::Gfx1201).as_deref(), Ok(WORDS), "{text}");
+    }
+}
+
+/// The `peacemaker profile` clock/id reads and its GLOBAL `th:` record
+/// store: each target takes exactly the hwreg names and cache-policy syntax
+/// llvm-mc accepts for it (gfx12 also takes the gfx11 `HW_ID` names).
+const PINNED_PROFILE: &[Pinned] = &[
+    ("s_getreg_b32 s17, hwreg(HW_REG_HW_ID1)", &[0xb891f817], &[0xb891f817], &[0xb891f817]),
+    ("s_getreg_b32 s17, hwreg(HW_REG_WAVE_HW_ID1)", &[], &[], &[0xb891f817]),
+    ("s_getreg_b32 s3, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", &[0xb883981d], &[0xb883981d], &[]),
+    ("s_getreg_b32 s3, hwreg(HW_REG_SHADER_CYCLES_HI)", &[], &[], &[0xb883f81e]),
+    ("global_store_addtid_b32 v239, s[28:29] offset:-8 th:TH_STORE_NT", &[], &[], &[0xee0a401c, 0x77900000, 0xfffff800]),
+];
+#[test]
+fn profile_hwreg_names_and_global_th_match_llvm_mc_per_target() {
+    check_pinned(PINNED_PROFILE, &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]);
 }

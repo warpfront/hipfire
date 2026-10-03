@@ -1570,45 +1570,40 @@ impl MtpDraftOutput {
     }
 }
 
-/// Core accept-and-rollback logic shared between the single-slot path
-/// (`mtp_shared_verify_accept_rollback_inner`) and the batched slot-engine
-/// path (`mtp_batched_verify_accept_from_batch`).
+/// Accept decision of one verify window ([`mtp_verify_accept`]).
+pub(crate) struct MtpVerifyAccepted {
+    pub committed: Vec<u32>,
+    pub accept_count: usize,
+    pub hit_eos: bool,
+}
+
+/// Trunk lm_head over the verify rows, the greedy/sampled accept rule, and the
+/// `prev_hidden` capture from the last kept row. Everything in an MTP verify
+/// that runs on the drafter's device; the trunk rollback is the caller's
+/// (single slot: [`mtp_accept_and_rollback`]; dense TP: per rank in
+/// `mtp_dense_tp`).
 ///
-/// Caller responsibilities BEFORE calling this:
-/// - Populate `state.verify_hidden` with the trunk's hidden states for all
-///   `n_verify` rows (single-slot: trunk forward writes them; batched: copied
-///   from `pbs.x_batch`).
-/// - Save DN snapshot to `state.trunk_snap` (for rollback on rejection).
-/// - Assemble `verify_tokens` = `[seed, cand_1, ..., cand_K]`.
+/// `state.verify_hidden` must hold the post-norm trunk hidden of all
+/// `n_verify` rows.
 #[allow(clippy::too_many_arguments)]
-fn mtp_accept_and_rollback(
+pub(crate) fn mtp_verify_accept(
     gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    kv_cache: &mut KvCache,
-    dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    w_out: &llama::WeightTensor,
+    dim: usize,
+    vocab: usize,
     state: &mut MtpSpecState,
     n_verify: usize,
-    verify_tokens: &[u32],
     candidates: &[u32],
     drafts_generated: usize,
-    chain_truncated: bool,
     use_sampling: bool,
     sampling: MtpSamplingConfig,
     draft_probs: &[f32],
     draft_softmaxes: &[Vec<f32>],
     is_external: bool,
     use_device_token_chain: bool,
-    tape_captured: bool,
     cur_pos: usize,
     eos_token_id: u32,
-) -> HipResult<MtpSpecResult> {
-    let dim = config.dim;
-    let vocab = config.vocab_size;
-    let trunk_weights: &Qwen35Weights = weights;
-
-    let w_out = &trunk_weights.output;
+) -> HipResult<MtpVerifyAccepted> {
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
     mtp_trunk_verify_lm_head(
         gpu,
@@ -1698,6 +1693,72 @@ fn mtp_accept_and_rollback(
 
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, cur_pos, prev_hidden_row, dim)?;
+
+    Ok(MtpVerifyAccepted {
+        committed,
+        accept_count,
+        hit_eos,
+    })
+}
+
+/// Core accept-and-rollback logic shared between the single-slot path
+/// (`mtp_shared_verify_accept_rollback_inner`) and the batched slot-engine
+/// path (`mtp_batched_verify_accept_from_batch`).
+///
+/// Caller responsibilities BEFORE calling this:
+/// - Populate `state.verify_hidden` with the trunk's hidden states for all
+///   `n_verify` rows (single-slot: trunk forward writes them; batched: copied
+///   from `pbs.x_batch`).
+/// - Save DN snapshot to `state.trunk_snap` (for rollback on rejection).
+/// - Assemble `verify_tokens` = `[seed, cand_1, ..., cand_K]`.
+#[allow(clippy::too_many_arguments)]
+fn mtp_accept_and_rollback(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    kv_cache: &mut KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &mut Qwen35Scratch,
+    state: &mut MtpSpecState,
+    n_verify: usize,
+    verify_tokens: &[u32],
+    candidates: &[u32],
+    drafts_generated: usize,
+    chain_truncated: bool,
+    use_sampling: bool,
+    sampling: MtpSamplingConfig,
+    draft_probs: &[f32],
+    draft_softmaxes: &[Vec<f32>],
+    is_external: bool,
+    use_device_token_chain: bool,
+    tape_captured: bool,
+    cur_pos: usize,
+    eos_token_id: u32,
+) -> HipResult<MtpSpecResult> {
+    let trunk_weights: &Qwen35Weights = weights;
+    let MtpVerifyAccepted {
+        committed,
+        accept_count,
+        hit_eos,
+    } = mtp_verify_accept(
+        gpu,
+        &trunk_weights.output,
+        config.dim,
+        config.vocab_size,
+        state,
+        n_verify,
+        candidates,
+        drafts_generated,
+        use_sampling,
+        sampling,
+        draft_probs,
+        draft_softmaxes,
+        is_external,
+        use_device_token_chain,
+        cur_pos,
+        eos_token_id,
+    )?;
+    let advance = committed.len();
 
     // ── KV / DN rollback (or skip on full accept) ─────────────────────
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;

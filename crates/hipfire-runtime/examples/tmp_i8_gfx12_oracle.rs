@@ -246,7 +246,8 @@ fn quantize_gpu(gpu: &mut Gpu, d_x: &GpuTensor, n: usize, k: usize) -> GpuTensor
     b.push_i32(k as i32);
     b.push_i32(n as i32);
     let mut blob = b.into_vec();
-    gpu.launch_kernel_blob(QUANT, [k.div_ceil(1024) as u32, n as u32, 1], [256, 1, 1], 0, &mut blob)
+    // Folded 1-D grid: token = blockIdx.x / blocks_per_row.
+    gpu.launch_kernel_blob(QUANT, [(k.div_ceil(1024) * n) as u32, 1, 1], [256, 1, 1], 0, &mut blob)
         .expect("launch quantizer");
     out
 }

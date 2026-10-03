@@ -47,7 +47,7 @@ use hipfire_runtime::external_rows::RowFetch;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -142,14 +142,56 @@ pub(crate) fn prefill_chunk_rows(
         _ => rows,
     }
 }
+
+/// Last whole-chunk end of the cold [`prefill_chunk_rows`] schedule from
+/// position zero that fits in `len` tokens (0 if none). The schedule from any
+/// such end onward is the cold one, so a prefix checkpoint taken there and
+/// replayed from it runs the cold prefill's exact chunks.
+pub(crate) fn prefill_checkpoint_boundary(
+    indexer_budget: usize,
+    len: usize,
+    max_chunk: usize,
+) -> usize {
+    let mut end = 0usize;
+    loop {
+        let rows = prefill_chunk_rows(indexer_budget, end, max_chunk, max_chunk);
+        match end.checked_add(rows) {
+            Some(next) if rows > 0 && next <= len => end = next,
+            _ => return end,
+        }
+    }
+}
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
-/// K3 measured 56.7 GB/s: a 1,336,934,400-byte layer copy takes 23.6 ms.
-/// Smaller chunks (notably 1536 rows) expose DMA: keep the mapped path.
-/// The existing HIPFIRE_PREFILL_CHUNK_ROWS policy activates this once its
-/// branch lands; do not bypass the current 2048-row scratch cap here.
-const QWEN4_EXPERT_STAGE_MIN_ROWS: usize = 4096;
+/// Long-prefill host-expert staging (G2). `1`/`0` force it on/off; unset it
+/// is on for gfx1201 only, the card it was measured on. Placement is not
+/// touched: a staged prefill borrows the VRAM of the last two resident expert
+/// layers as its two DMA stages, and restores them from pinned host copies
+/// before the forward returns, so decode keeps today's residency.
+pub const QWEN4_EXPERT_STAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE";
+
+/// Forwards of at least this many rows stage ([`QWEN4_EXPERT_STAGE_ENV`]);
+/// smaller ones, decode and verify keep the mapped reads.
+pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS";
+
+/// A 1,336,934,400-byte layer copy takes 23.5 ms (card B, gfx1201). A
+/// 2048-row forward already hides it: pp2048 went from 1057 to 1377 tok/s,
+/// and the restore that was not hidden cost 18 ms of that chunk. Smaller
+/// forwards keep the mapped path (K3: 1536 rows expose the DMA).
+const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
+
+/// One Flash-Next layer's routed experts: 512 QT44 gate/up, 512 QT53 down.
+const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 512 * 1_740_800;
+const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 512 * 870_400;
+
+fn qwen4_expert_stage_min_rows() -> usize {
+    hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&rows| rows >= 2)
+        .unwrap_or(QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT)
+}
 
 /// Which rows of a batched Qwen4 prefill write language-model logits.
 ///
@@ -588,18 +630,9 @@ fn layer_desc<'a>(
             experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
             expert_gate_up_ptrs: &moe.expert_gate_up_ptrs,
             expert_down_ptrs: &moe.expert_down_ptrs,
-            expert_stage_ptrs: moe
-                .stage_tables
-                .as_ref()
-                .zip(stage)
-                .map(|(tables, stage)| {
-                    let parity = layer.layer % 2;
-                    MoeStageTables {
-                        gate_up: &tables[parity][0],
-                        down: &tables[parity][1],
-                        free: &stage.free[parity],
-                    }
-                }),
+            expert_stage_ptrs: stage
+                .filter(|_| moe.host_mapped())
+                .map(|stage| stage.tables(layer.layer)),
             expert_gate_up_entries: &moe.expert_gate_up_entries,
             expert_down_entries: &moe.expert_down_entries,
             layer_idx: layer.layer as u16,
@@ -659,9 +692,6 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     experts_all_gate_up_mq4: bool,
     expert_gate_up_ptrs: GpuTensor,
     expert_down_ptrs: GpuTensor,
-    /// Two static gate/up + down table pairs, one per VRAM-stage parity.
-    /// None for resident layers. These never replace the bound mapped tables.
-    stage_tables: Option<[[GpuTensor; 2]; 2]>,
     /// Host entries the two tables above were uploaded from. Kept so dispatch can
     /// prove the table contents name the live expert tensors before a retained
     /// body records them.
@@ -912,7 +942,6 @@ impl Qwen4MoeLayerRuntime {
             expert_down_ptrs,
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
-            stage_tables: None,
             symmetric: false,
         })
     }
@@ -956,13 +985,6 @@ impl Qwen4MoeLayerRuntime {
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
-        if let Some(tables) = self.stage_tables {
-            for tensor in tables.into_iter().flatten() {
-                if let Err(error) = gpu.free_tensor(tensor) {
-                    first.get_or_insert(error);
-                }
-            }
-        }
         for tensor in [self.expert_gate_up_ptrs, self.expert_down_ptrs] {
             if let Err(error) = gpu.free_tensor(tensor) {
                 if first.is_none() {
@@ -974,55 +996,143 @@ impl Qwen4MoeLayerRuntime {
     }
 }
 
-/// Routing-independent, pinned-host DMA pipeline. Every fork and join uses
-/// recorded events, including the initial fork from the capture-origin stream.
+/// What a donor layer's VRAM holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DonorState {
+    /// Its own experts, ordered for every later compute-stream launch.
+    Resident,
+    /// A host layer's experts are (or may be partly) copied over it.
+    Overwritten,
+    /// Its restore is issued on the copy stream and recorded on `ready`, but
+    /// the compute stream has not yet waited on it.
+    Restoring,
+}
+
+/// Long-prefill host-expert DMA pipeline (G2) on borrowed VRAM. The last
+/// resident expert layer of each parity is that parity's stage: once its own
+/// MoE has run, the host layers of the same parity are copied over it in
+/// turn (L+2 refill), and after the last of them its bytes are restored
+/// from a pinned host copy. Each fork and join is a recorded event, and
+/// the forward makes the compute stream wait on the restores before it
+/// returns. Any later launch on that stream (the active stream is installed
+/// once, by `ensure_capture_stream`, and never replaced) therefore sees the
+/// donor layers whole. Routing-independent: neither the copies nor the
+/// pointer tables depend on the experts a row picks.
 struct Qwen4ExpertStage {
-    buffers: Vec<GpuTensor>,
+    /// Forwards of at least this many rows stage.
+    min_rows: usize,
+    /// Donor trunk layer per parity.
+    donors: [usize; 2],
+    /// Borrowed device views of each donor's gate/up and down experts,
+    /// parity-major. Never freed here: the bundle's weights own them.
+    donor_views: Vec<GpuTensor>,
+    /// Pinned host copies of the same bytes: the restore source.
+    mirrors: Vec<GpuTensor>,
+    /// Static per-expert pointer tables into each donor's gate/up and down
+    /// VRAM, parity-major. They never replace a layer's bound mapped tables.
+    tables: Vec<GpuTensor>,
     copy_stream: hip_bridge::Stream,
     ready: Vec<hip_bridge::Event>,
     free: Vec<hip_bridge::Event>,
+    /// Sticky until the donors are back: a failed forward leaves it set,
+    /// and every later forward restores first ([`Self::restore_blocking`]).
+    state: std::cell::Cell<[DonorState; 2]>,
 }
 
 impl Qwen4ExpertStage {
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
-        moe: &mut [Qwen4MoeLayerRuntime],
+        moe: &[Qwen4MoeLayerRuntime],
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
-        if !rdna_compute::gemm::qwen4_expert_stage_requested()
-            || !moe.iter().any(RoutedExpertWeights::host_mapped)
-        {
+        if !hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_ENV, gpu.arch == "gfx1201") {
             return Ok(None);
         }
+        let Some(first_host) = moe.iter().position(RoutedExpertWeights::host_mapped) else {
+            return Ok(None);
+        };
         let config = &bundle.config;
         // G2's stage layout is the frozen Flash-Next QT44/QT53 geometry.
         // Other quantized artifacts keep their existing mapped path.
         if config.num_experts != 512
             || config.hidden_size != 2560
             || config.moe_intermediate_size != 640
-            || moe.iter().any(|layer| {
-                layer.host_mapped()
-                    && layer.experts.iter().any(|expert| {
-                        expert.gate_up.tensor.dtype != DType::MQ4G256V2
-                            || expert.down.tensor.dtype != DType::MQ4G128V2
-                    })
+            || moe[first_host.saturating_sub(2)..].iter().any(|layer| {
+                layer.experts.iter().any(|expert| {
+                    expert.gate_up.tensor.dtype != DType::MQ4G256V2
+                        || expert.down.tensor.dtype != DType::MQ4G128V2
+                })
             })
         {
             return Ok(None);
         }
+        let off = |reason: &str| {
+            eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
+            Ok(None)
+        };
+        // Resident layers are a prefix (`place_routed_experts`), so each
+        // donor's own MoE runs before every host layer of its parity.
+        if first_host < 2 || !moe[first_host..].iter().all(RoutedExpertWeights::host_mapped) {
+            return off("needs two resident expert layers ahead of every host layer");
+        }
+        let mut donors = [first_host - 2, first_host - 1];
+        donors.sort_by_key(|layer| layer % 2);
+        let layer_bytes = QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES;
+        let mirror_bytes =
+            2 * layer_bytes as u64 + 4 * crate::expert_residency::HOST_MAPPED_PAD_BYTES;
+        let admitted = crate::expert_residency::check_host_ram(
+            mirror_bytes,
+            rdna_compute::kv_slots::mem_available_bytes(),
+            crate::expert_residency::ttm_pool_estimate(),
+        )
+        .and_then(|()| {
+            crate::expert_residency::check_gtt_cap(
+                mirror_bytes,
+                crate::expert_residency::gtt_budget(),
+            )
+        });
+        if let Err(reason) = admitted {
+            return off(&format!("restore copies: {reason}"));
+        }
+        let parts = |layer: usize| {
+            let weights = &bundle.weights.layer_refs[layer].moe;
+            [
+                (&weights.experts_gate_up, QWEN4_EXPERT_STAGE_GATE_UP_BYTES, 1_740_800),
+                (&weights.experts_down, QWEN4_EXPERT_STAGE_DOWN_BYTES, 870_400),
+            ]
+        };
+        for layer in first_host..moe.len() {
+            for (source, bytes, _) in parts(layer) {
+                let owner = bundle.weights.resident(source)?;
+                // Host addresses come only from owning tensors. Borrowed
+                // expert views are never re-tagged as HostMapped (G1).
+                if gpu.host_bytes(owner).is_none_or(|host| host.len() < bytes) {
+                    return off("a host expert owner has no pinned host bytes of the stage size");
+                }
+            }
+        }
+        for layer in donors {
+            for (source, bytes, _) in parts(layer) {
+                let owner = bundle.weights.resident(source)?;
+                if owner.buf.is_host_mapped() || owner.buf.size() < bytes {
+                    return off("a donor expert owner is not device memory of the stage size");
+                }
+            }
+        }
         gpu.ensure_capture_stream()?;
         let mut stage = Self {
-            buffers: Vec::with_capacity(2),
+            min_rows: qwen4_expert_stage_min_rows(),
+            donors,
+            donor_views: Vec::with_capacity(4),
+            mirrors: Vec::with_capacity(4),
+            tables: Vec::with_capacity(4),
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
             free: Vec::with_capacity(2),
+            state: std::cell::Cell::new([DonorState::Resident; 2]),
         };
         let result = (|| {
             for _ in 0..2 {
-                stage.buffers.push(gpu.alloc_tensor(
-                    &[rdna_compute::gemm::QWEN4_EXPERT_STAGE_LAYER_BYTES],
-                    DType::Raw,
-                )?);
                 stage.ready.push(
                     gpu.hip
                         .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
@@ -1032,51 +1142,28 @@ impl Qwen4ExpertStage {
                         .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
                 );
             }
-            for (layer_idx, layer) in moe.iter_mut().enumerate() {
-                if !layer.host_mapped() {
-                    continue;
-                }
-                // Fetch host addresses only from owning tensors. Borrowed
-                // expert views must never be re-tagged as HostMapped (G1).
-                let weights = &bundle.weights.layer_refs[layer_idx].moe;
-                for source in [&weights.experts_gate_up, &weights.experts_down] {
+            for layer in donors {
+                for (source, bytes, stride) in parts(layer) {
                     let owner = bundle.weights.resident(source)?;
-                    if gpu.host_bytes(owner).is_none() {
-                        return Err(invalid("G2 host expert owner has no pinned host bytes"));
-                    }
+                    let view = owner.sub_offset(0, bytes);
+                    // The mirror reads the loaded bytes back once, at load.
+                    let mut host = vec![0u8; bytes];
+                    gpu.memcpy_dtoh_auto(&mut host, &view.buf)?;
+                    stage.mirrors.push(gpu.upload_raw_host_mapped(&host, &[bytes])?);
+                    drop(host);
+                    let base = view.buf.as_ptr() as usize;
+                    let entries = (0..config.num_experts)
+                        .flat_map(|expert| (base + expert * stride).to_ne_bytes())
+                        .collect::<Vec<_>>();
+                    stage
+                        .tables
+                        .push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                    gpu.memcpy_htod_auto(
+                        &stage.tables.last().expect("table just allocated").buf,
+                        &entries,
+                    )?;
+                    stage.donor_views.push(view);
                 }
-                let mut tables = Vec::with_capacity(4);
-                let table_result = (|| {
-                    for buffer in &stage.buffers {
-                        let base = buffer.buf.as_ptr() as usize;
-                        for (offset, bytes) in [
-                            (0, 1_740_800),
-                            (rdna_compute::gemm::QWEN4_EXPERT_STAGE_GATE_UP_BYTES, 870_400),
-                        ] {
-                            let tensor = gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?;
-                            tables.push(tensor);
-                            let entries = (0..config.num_experts)
-                                .flat_map(|expert| (base + offset + expert * bytes).to_ne_bytes())
-                                .collect::<Vec<_>>();
-                            gpu.memcpy_htod_auto(
-                                &tables.last().expect("table just allocated").buf,
-                                &entries,
-                            )?;
-                        }
-                    }
-                    Ok::<(), Qwen4GpuForwardError>(())
-                })();
-                if let Err(error) = table_result {
-                    for tensor in tables {
-                        let _ = gpu.free_tensor(tensor);
-                    }
-                    return Err(error);
-                }
-                let down1 = tables.pop().expect("four tables");
-                let gate1 = tables.pop().expect("four tables");
-                let down0 = tables.pop().expect("four tables");
-                let gate0 = tables.pop().expect("four tables");
-                layer.stage_tables = Some([[gate0, down0], [gate1, down1]]);
             }
             Ok::<(), Qwen4GpuForwardError>(())
         })();
@@ -1084,9 +1171,35 @@ impl Qwen4ExpertStage {
             let _ = stage.free_gpu(gpu);
             return Err(error);
         }
+        eprintln!(
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies)",
+            stage.min_rows,
+            moe.len(),
+            donors[0],
+            donors[1],
+            2 * layer_bytes >> 20
+        );
         Ok(Some(stage))
     }
 
+    /// The stage tables a host `layer` reads from on a staged forward.
+    fn tables(&self, layer: usize) -> MoeStageTables<'_> {
+        let parity = layer % 2;
+        MoeStageTables {
+            gate_up: &self.tables[2 * parity],
+            down: &self.tables[2 * parity + 1],
+            free: &self.free[parity],
+        }
+    }
+
+    fn set_state(&self, parity: usize, value: DonorState) {
+        let mut state = self.state.get();
+        state[parity] = value;
+        self.state.set(state);
+    }
+
+    /// Copy host `layer`'s experts over its parity's donor once the stage is
+    /// free, recording `ready`.
     fn enqueue_layer(
         &self,
         gpu: &Gpu,
@@ -1094,49 +1207,145 @@ impl Qwen4ExpertStage {
         layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
         let parity = layer % 2;
-        gpu.hip
-            .stream_wait_event(&self.copy_stream, &self.free[parity])?;
         let weights = &bundle.weights.layer_refs[layer].moe;
-        let gate_owner = bundle.weights.resident(&weights.experts_gate_up)?;
-        let down_owner = bundle.weights.resident(&weights.experts_down)?;
         let gate = gpu
-            .host_bytes(gate_owner)
+            .host_bytes(bundle.weights.resident(&weights.experts_gate_up)?)
             .ok_or_else(|| invalid("G2 gate/up pinned owner missing"))?;
         let down = gpu
-            .host_bytes(down_owner)
+            .host_bytes(bundle.weights.resident(&weights.experts_down)?)
             .ok_or_else(|| invalid("G2 down pinned owner missing"))?;
-        let gate_bytes = rdna_compute::gemm::QWEN4_EXPERT_STAGE_GATE_UP_BYTES;
-        let down_bytes = rdna_compute::gemm::QWEN4_EXPERT_STAGE_DOWN_BYTES;
-        // Raw subviews stay Borrowed; only the stage buffers above are owners.
-        let gate_dst = self.buffers[parity].sub_offset(0, gate_bytes);
-        let down_dst = self.buffers[parity].sub_offset(gate_bytes, down_bytes);
         gpu.hip
-            .memcpy_htod_async(&gate_dst.buf, &gate[..gate_bytes], &self.copy_stream)?;
+            .stream_wait_event(&self.copy_stream, &self.free[parity])?;
+        // From the first byte issued, the donor no longer holds its experts.
+        self.set_state(parity, DonorState::Overwritten);
+        self.copy_into_donor(gpu, parity, [gate, down])
+    }
+
+    /// Copy the donor's own bytes back once the last host layer of its
+    /// parity is done with the stage, recording `ready`.
+    fn enqueue_restore(&self, gpu: &Gpu, parity: usize) -> Result<(), Qwen4GpuForwardError> {
+        let [gate, down] = self.mirror_bytes(gpu, parity)?;
         gpu.hip
-            .memcpy_htod_async(&down_dst.buf, &down[..down_bytes], &self.copy_stream)?;
+            .stream_wait_event(&self.copy_stream, &self.free[parity])?;
+        self.copy_into_donor(gpu, parity, [gate, down])?;
+        self.set_state(parity, DonorState::Restoring);
+        Ok(())
+    }
+
+    fn copy_into_donor(
+        &self,
+        gpu: &Gpu,
+        parity: usize,
+        sources: [&[u8]; 2],
+    ) -> Result<(), Qwen4GpuForwardError> {
+        for (kind, (source, bytes)) in sources
+            .into_iter()
+            .zip([QWEN4_EXPERT_STAGE_GATE_UP_BYTES, QWEN4_EXPERT_STAGE_DOWN_BYTES])
+            .enumerate()
+        {
+            gpu.hip.memcpy_htod_async(
+                &self.donor_views[2 * parity + kind].buf,
+                &source[..bytes],
+                &self.copy_stream,
+            )?;
+        }
         gpu.hip
             .event_record(&self.ready[parity], Some(&self.copy_stream))?;
         Ok(())
     }
 
-    fn begin(
+    fn mirror_bytes<'a>(
+        &'a self,
+        gpu: &Gpu,
+        parity: usize,
+    ) -> Result<[&'a [u8]; 2], Qwen4GpuForwardError> {
+        let host = |kind: usize| {
+            gpu.host_bytes(&self.mirrors[2 * parity + kind])
+                .ok_or_else(|| invalid("G2 donor restore copy missing"))
+        };
+        Ok([host(0)?, host(1)?])
+    }
+
+    /// After `layer`'s MoE is issued on a staged forward: a donor frees its
+    /// stage, and a donor or host layer refills its parity for the next host
+    /// layer L+2.., or, past the last one, restores the donor.
+    fn after_moe(
         &self,
         gpu: &Gpu,
         bundle: &Qwen4Bundle,
         moe: &[Qwen4MoeLayerRuntime],
+        layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
-        for parity in 0..2 {
-            // Records belong to THIS forward/capture, not an earlier execution.
-            // This forks the secondary stream into the graph and orders stage
-            // reuse after the previous forward on the same compute stream.
-            gpu.hip
-                .event_record(&self.free[parity], gpu.active_stream.as_ref())?;
-            if let Some(layer) = (parity..moe.len())
-                .step_by(2)
-                .find(|&layer| moe[layer].stage_tables.is_some())
-            {
-                self.enqueue_layer(gpu, bundle, layer)?;
+        let parity = layer % 2;
+        let donor = self.donors[parity] == layer;
+        if !donor && !moe[layer].host_mapped() {
+            return Ok(());
+        }
+        if donor {
+            // A host layer's routed down records `free` itself.
+            let compute = gpu
+                .active_stream
+                .as_ref()
+                .ok_or_else(|| invalid("G2 compute stream missing"))?;
+            gpu.hip.event_record(&self.free[parity], Some(compute))?;
+        }
+        match (layer + 2..moe.len())
+            .step_by(2)
+            .find(|&next| moe[next].host_mapped())
+        {
+            Some(next) => self.enqueue_layer(gpu, bundle, next),
+            None if self.state.get()[parity] == DonorState::Overwritten => {
+                self.enqueue_restore(gpu, parity)
             }
+            None => Ok(()),
+        }
+    }
+
+    /// End of a staged forward: the compute stream waits on every restore,
+    /// charging what the trunk did not hide to this forward.
+    fn join(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        for parity in 0..2 {
+            if self.state.get()[parity] == DonorState::Overwritten {
+                self.enqueue_restore(gpu, parity)?;
+            }
+            if self.state.get()[parity] == DonorState::Restoring {
+                let compute = gpu
+                    .active_stream
+                    .as_ref()
+                    .ok_or_else(|| invalid("G2 compute stream missing"))?;
+                gpu.hip.stream_wait_event(compute, &self.ready[parity])?;
+                self.set_state(parity, DonorState::Resident);
+            }
+        }
+        Ok(())
+    }
+
+    /// Recovery when a staged forward did not reach [`Self::join`]: drain the
+    /// device, then copy every donor not known resident back synchronously.
+    /// The state stays set on failure, so the next forward retries before
+    /// anything reads the donors.
+    fn restore_blocking(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if self.state.get() == [DonorState::Resident; 2] {
+            return Ok(());
+        }
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            if gpu.hip.stream_is_capturing(stream)? {
+                return Err(invalid(
+                    "G2 donor expert layers need a restore, which a stream capture cannot run",
+                ));
+            }
+        }
+        gpu.hip.device_synchronize()?;
+        for parity in 0..2 {
+            if self.state.get()[parity] == DonorState::Resident {
+                continue;
+            }
+            for (kind, source) in self.mirror_bytes(gpu, parity)?.into_iter().enumerate() {
+                gpu.hip
+                    .memcpy_htod(&self.donor_views[2 * parity + kind].buf, source)?;
+            }
+            gpu.hip.device_synchronize()?;
+            self.set_state(parity, DonorState::Resident);
         }
         Ok(())
     }
@@ -1151,8 +1360,8 @@ impl Qwen4ExpertStage {
                 first.get_or_insert(error);
             }
         }
-        for buffer in self.buffers {
-            if let Err(error) = gpu.free_tensor(buffer) {
+        for tensor in self.tables.into_iter().chain(self.mirrors) {
+            if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
         }
@@ -1765,6 +1974,13 @@ pub struct Qwen4GpuForward {
     /// single-token HIP forward, for expert-cache sizing. `None` when unset.
     route_trace: Option<RouteTrace>,
     pub(crate) qsa_tap: Option<Qwen4QsaTap>,
+    /// `HIPFIRE_QWEN4_TRUNK_IU4`: per layer, the GDN Z|beta|alpha fold the
+    /// IU4 trunk's V2B SET reads (see [`prepare_trunk_iu4`]); empty when the
+    /// route is off or the trunk did not verify.
+    trunk_zba: Vec<Option<GpuTensor>>,
+    /// `HIPFIRE_QWEN4_TRUNK_IU4`: per layer, the [`TrunkFamily`] bits the
+    /// mask selected for A4 (empty when the route is off or did not arm).
+    trunk_a4: Vec<u16>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -1787,6 +2003,128 @@ struct RouteTrace {
     out: std::io::BufWriter<std::fs::File>,
 }
 
+/// Opt-in dense IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=<mask>`, see
+/// [`rdna_compute::Qwen4TrunkMask`]) over a trunk that may mix symmetric
+/// MQ4G256V2 (QT44) and other tiers (MQ6 ...) per tensor: check on the device
+/// that every MQ4G256V2 trunk projection (GDN qkv/z/a/b/out, QSA
+/// indexer/q/k/v/o) is a symmetric QT44 matrix, then fold each GDN layer's Z,
+/// beta (`in_proj_b`) and alpha (`in_proj_a`) rows plus zero rows into one
+/// `z.m + 256`-row matrix for the dense V2B Z|beta|alpha SET, for the layers
+/// where all three are MQ4 and in the mask (the rows are copied verbatim; the
+/// original tensors stay for decode). Arms `gpu.qwen4_trunk_iu4` iff at least
+/// one trunk tensor is MQ4G256V2 and in the mask (A4 projections > 0) and
+/// every MQ4 one verified. Returns the folds
+/// and the per-layer A4 mask bits (empty when not armed). A bad mask value
+/// fails the load even when the route cannot arm; nothing else runs unless
+/// the route was requested.
+fn prepare_trunk_iu4(
+    gpu: &mut Gpu,
+    bundle: &Qwen4Bundle,
+) -> Result<(Vec<Option<GpuTensor>>, Vec<u16>), Qwen4GpuForwardError> {
+    gpu.qwen4_trunk_iu4 = false;
+    let mask = rdna_compute::qwen4_trunk_iu4_mask().map_err(invalid)?;
+    mask.check_layers(bundle.weights.layer_refs.len())
+        .map_err(|error| invalid(format!("HIPFIRE_QWEN4_TRUNK_IU4: {error}")))?;
+    let mut folds = Vec::new();
+    if !gpu.qwen4_trunk_iu4_requested() {
+        return Ok((folds, Vec::new()));
+    }
+    let weights = &bundle.weights;
+    let (mut mq4, mut verified, mut a4, mut other) = (0usize, 0usize, 0usize, 0usize);
+    for (index, layer) in weights.layer_refs.iter().enumerate() {
+        let bits = mask.bits(index);
+        let matrices = match (&layer.gdn, &layer.attention) {
+            (Some(gdn), _) => {
+                let g = gdn_desc(weights, gdn)?;
+                [
+                    (TrunkFamily::GdnQkv, g.qkv),
+                    (TrunkFamily::GdnZ, g.z),
+                    (TrunkFamily::GdnA, g.in_proj_a),
+                    (TrunkFamily::GdnB, g.in_proj_b),
+                    (TrunkFamily::GdnOut, g.output),
+                ]
+            }
+            (None, Some(qsa)) => {
+                let q = qsa_desc(weights, qsa)?;
+                [
+                    (TrunkFamily::QsaIdx, q.indexer_qk),
+                    (TrunkFamily::QsaQ, q.q),
+                    (TrunkFamily::QsaK, q.k),
+                    (TrunkFamily::QsaV, q.v),
+                    (TrunkFamily::QsaO, q.output),
+                ]
+            }
+            (None, None) => return Err(invalid("trunk layer without attention weights")),
+        };
+        for (family, w) in matrices {
+            if w.dtype != DType::MQ4G256V2 {
+                other += 1;
+                continue;
+            }
+            mq4 += 1;
+            if gpu.qwen4_trunk_sym_check(w.buf, w.m, w.k)? {
+                verified += 1;
+            }
+            if bits & family.bit() != 0 {
+                a4 += 1;
+            }
+        }
+    }
+    eprintln!(
+        "  qwen4 IU4 trunk: mask={} MQ4 {verified}/{mq4} verified symmetric, A4 {a4} projections, MQ6/other {other}",
+        mask.canonical()
+    );
+    if mq4 == 0 || verified != mq4 || a4 == 0 {
+        return Ok((folds, Vec::new()));
+    }
+    let result = (|| {
+        for (index, layer) in weights.layer_refs.iter().enumerate() {
+            let Some(gdn) = &layer.gdn else {
+                folds.push(None);
+                continue;
+            };
+            let g = gdn_desc(weights, gdn)?;
+            let k = g.z.k;
+            let zba = TrunkFamily::GdnZ.bit() | TrunkFamily::GdnA.bit() | TrunkFamily::GdnB.bit();
+            if mask.bits(index) & zba != zba
+                || [g.z.dtype, g.in_proj_a.dtype, g.in_proj_b.dtype]
+                    .iter()
+                    .any(|d| *d != DType::MQ4G256V2)
+                || g.in_proj_a.k != k
+                || g.in_proj_b.k != k
+                || g.in_proj_a.m != 48
+                || g.in_proj_b.m != 48
+            {
+                folds.push(None);
+                continue;
+            }
+            let row_bytes = k / 256 * rdna_compute::MQ4V2_GROUP_BYTES;
+            let mut rows = vec![0u8; (g.z.m + 256) * row_bytes];
+            for (w, start) in [(&g.z, 0), (&g.in_proj_b, g.z.m), (&g.in_proj_a, g.z.m + 48)] {
+                let span = start * row_bytes..(start + w.m) * row_bytes;
+                gpu.hip.memcpy_dtoh(&mut rows[span], &w.buf.buf)?;
+            }
+            folds.push(Some(gpu.upload_raw(&rows, &[rows.len()])?));
+        }
+        Ok::<(), Qwen4GpuForwardError>(())
+    })();
+    if let Err(error) = result {
+        for tensor in folds.into_iter().flatten() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        return Err(error);
+    }
+    // Every MQ4V2 matrix the Qwen4 forward hands the dense IU4 GEMMs is a
+    // trunk projection verified above (routed experts take their own verified
+    // route), so the symmetric-grid contract those SET kernels read
+    // (`mq4v2_symmetric`: V2B / X5 / symfold) holds even though Qwen4
+    // artifacts record expert symmetry under their own metadata key.
+    gpu.mq4v2_symmetric = true;
+    gpu.qwen4_trunk_iu4 = true;
+    let layer_bits = (0..weights.layer_refs.len()).map(|layer| mask.bits(layer)).collect();
+    Ok((folds, layer_bits))
+}
+
 impl Qwen4GpuForward {
     pub fn new(
         gpu: &mut Gpu,
@@ -1799,6 +2137,8 @@ impl Qwen4GpuForward {
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut expert_stage = None;
+        let mut trunk_zba = Vec::new();
+        let mut trunk_a4 = Vec::new();
         let result = (|| {
             for layer in &bundle.weights.layer_refs {
                 moe.push(Qwen4MoeLayerRuntime::new(
@@ -1808,10 +2148,12 @@ impl Qwen4GpuForward {
                     &bundle.config,
                 )?);
             }
-            // Opt-in symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`): verify
-            // each layer's final expert headers once, before any capture, and
-            // size the route's scratch for the chunk cap. Nothing runs (and no
-            // new module loads) unless the route was requested.
+            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`, default on for
+            // gfx1151, `=1` on gfx1201, `=0` off): verify each layer's final
+            // expert headers once, before any capture, and size the route's
+            // scratch for the chunk cap. Layers that fail (every layer of an
+            // asymmetric artifact) keep the F16 route; nothing runs (and no new
+            // module loads) unless the route was requested.
             if gpu.qwen4_moe_sym_iu4_requested() {
                 let mut verified = 0usize;
                 for layer in &mut moe {
@@ -1831,7 +2173,8 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
-            expert_stage = Qwen4ExpertStage::new(gpu, bundle, &mut moe)?;
+            (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
+            expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
             let sources = bundle
                 .weights
                 .layer_refs
@@ -1882,7 +2225,8 @@ impl Qwen4GpuForward {
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
             }
-            for tensor in decode_q8 {
+            gpu.qwen4_trunk_iu4 = false;
+            for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
                 let _ = gpu.free_tensor(tensor);
             }
             if let Some(trace) = route_trace {
@@ -1900,10 +2244,16 @@ impl Qwen4GpuForward {
             moe,
             decode_q8,
             route_trace,
+            trunk_zba,
+            trunk_a4,
             qsa_tap: None,
         })
     }
 
+    /// Teardown only: free the forward right before the bundle weights it
+    /// ran on (`Qwen4Bundle::free_gpu`). After a failed staged forward
+    /// whose recovery also failed, two resident expert layers may still hold
+    /// another layer's bytes, and nothing here restores them.
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
         let Qwen4GpuForward {
             scratch,
@@ -1912,9 +2262,13 @@ impl Qwen4GpuForward {
             token_readback,
             decode_q8,
             route_trace,
+            trunk_zba,
             ..
         } = self;
         // Drain both streams before releasing stage tables, events or scratch.
+        // A donor a failed forward left overwritten is not restored: the
+        // bundle attaches its forward once and frees it only right before
+        // the weights (`Qwen4Bundle::free_gpu`), so nothing reads it again.
         if expert_stage.is_some() {
             gpu.hip.device_synchronize()?;
         }
@@ -1929,7 +2283,8 @@ impl Qwen4GpuForward {
                 first.get_or_insert(error);
             }
         }
-        for tensor in decode_q8 {
+        gpu.qwen4_trunk_iu4 = false;
+        for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
@@ -2288,6 +2643,11 @@ impl Qwen4GpuForward {
                 self.scratch.max_chunk
             )));
         }
+        // Before anything can read a donor a failed staged forward left
+        // overwritten (decode included).
+        if let Some(stage) = self.expert_stage.as_ref() {
+            stage.restore_blocking(gpu)?;
+        }
         let config = bundle.config.clone();
         let end_position = bundle
             .state
@@ -2418,16 +2778,31 @@ impl Qwen4GpuForward {
             ));
         }
         // Decode, small chunks and MTP's wide-hidden verify keep mapped reads.
-        // The parity observer also keeps its historical unsplit transport.
-        let expert_stage = self.expert_stage.as_ref().filter(|_| {
-            n >= QWEN4_EXPERT_STAGE_MIN_ROWS
-                && wide_hidden_capture.is_none()
-                && self.qsa_tap.is_none()
-        });
+        // The parity observer also keeps its historical unsplit transport. A
+        // stream capture keeps them too: a staged forward forks a copy stream
+        // and its failure recovery synchronizes the device.
+        let expert_stage = match self.expert_stage.as_ref() {
+            Some(stage)
+                if n >= stage.min_rows
+                    && wide_hidden_capture.is_none()
+                    && self.qsa_tap.is_none() =>
+            {
+                let capturing = match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.stream_is_capturing(stream)?,
+                    None => false,
+                };
+                (!capturing).then_some(stage)
+            }
+            _ => None,
+        };
         let ctx = DispatchCtx::new(gpu);
         let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
         let mut gdn_slot = 0usize;
         let mut qsa_slot = 0usize;
+        // `HIPFIRE_QWEN4_PLE_FUSE`: the PLE rows are staged straight as F16 for
+        // the BF16 key/value projections (decided once; the step op and the
+        // staging closure agree on it).
+        let mut ple_rows_f16 = false;
         for layer_index in 0..config.num_hidden_layers {
             let layer = &bundle.weights.layer_refs[layer_index];
             if layer_index == ple_layer_index {
@@ -2441,9 +2816,18 @@ impl Qwen4GpuForward {
                     ));
                 }
                 let ple = ple_desc(&bundle.weights, ple_weights)?;
+                ple_rows_f16 = bf16_state
+                    && gpu.flags.qwen4_ple_fuse_enabled()
+                    && dims.hc_count <= 4
+                    && config.hidden_size % 32 == 0
+                    && ple.key.k == config.hidden_size
+                    && ple.value.k == config.hidden_size
+                    && gpu.qwen4_f16_wmma_applies(ple.key.buf, ple.key.k, n)
+                    && gpu.qwen4_f16_wmma_applies(ple.value.buf, ple.value.k, n);
                 steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
                     rotation: &self.scratch.rotation,
                     state_bf16: bf16_state,
+                    rows_f16: ple_rows_f16,
                     key: ple.key,
                     value: ple.value,
                     norm_key: ple.norm_key,
@@ -2557,6 +2941,8 @@ impl Qwen4GpuForward {
                         conv_kernel: dims.linear_conv_kernel_dim,
                         input_width: dims.hidden,
                         row_capture: bundle.state.gdn_row_capture(gdn_slot - 1, n),
+                        zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
+                        trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     }));
                 }
                 LayerType::FullAttention => {
@@ -2619,6 +3005,7 @@ impl Qwen4GpuForward {
                         kv_heads: dims.num_key_value_heads,
                         head_dim: dims.head_dim,
                         input_width: dims.hidden,
+                        trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     }));
                 }
             }
@@ -2721,10 +3108,6 @@ impl Qwen4GpuForward {
                     position,
                 ));
             }
-        }
-        // Start the first two host-layer copies before embedding/layer work.
-        if let Some(stage) = expert_stage {
-            stage.begin(gpu, bundle, &self.moe)?;
         }
         // A HIP body: no retained tape records or routes this forward.
         let hip_body =
@@ -2915,13 +3298,23 @@ impl Qwen4GpuForward {
                 ple.validate_after_upload()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let apply_started = qwen4_profile_start();
-                gpu.grouped_gather_convert_bf16(
-                    &staged,
-                    &ple_rows,
-                    n,
-                    PLE_HEAD_COUNT,
-                    PLE_ROW_WIDTH,
-                )?;
+                if ple_rows_f16 {
+                    gpu.grouped_gather_convert_bf16_f16(
+                        &staged,
+                        &ple_rows,
+                        n,
+                        PLE_HEAD_COUNT,
+                        PLE_ROW_WIDTH,
+                    )?;
+                } else {
+                    gpu.grouped_gather_convert_bf16(
+                        &staged,
+                        &ple_rows,
+                        n,
+                        PLE_HEAD_COUNT,
+                        PLE_ROW_WIDTH,
+                    )?;
+                }
                 qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
                 Ok(())
             };
@@ -3076,7 +3469,7 @@ impl Qwen4GpuForward {
                         }
                         if matches!(step, Step::Moe(_)) {
                             execute(gpu, &steps[start..index])?;
-                            if self.moe[layer].stage_tables.is_some() {
+                            if self.moe[layer].host_mapped() {
                                 let compute = gpu
                                     .active_stream
                                     .as_ref()
@@ -3086,21 +3479,13 @@ impl Qwen4GpuForward {
                             execute(gpu, &steps[index..=index])?;
                             start = index + 1;
                             // Down recorded free before combine. Refill this
-                            // parity for L+2; no routing results are involved.
-                            if self.moe[layer].stage_tables.is_some() {
-                                if let Some(next) = (layer + 2..self.moe.len())
-                                    .step_by(2)
-                                    .find(|&next| self.moe[next].stage_tables.is_some())
-                                {
-                                    stage.enqueue_layer(gpu, bundle, next)?;
-                                }
-                            }
+                            // parity for L+2 or restore its donor; no routing
+                            // results are involved.
+                            stage.after_moe(gpu, bundle, &self.moe, layer)?;
                             layer += 1;
                         }
                     }
                     execute(gpu, &steps[start..])?;
-                    // Every issued copy has a ready wait on the origin stream:
-                    // the secondary stream is fully joined before capture ends.
                 } else {
                     let trace = self.route_trace.as_ref().filter(|_| n == 1);
                     match (ple_split, trace) {
@@ -3208,6 +3593,12 @@ impl Qwen4GpuForward {
                 }
             }
 
+            // The restores join the compute stream last, so the head overlaps
+            // them and anything not hidden is charged to this forward.
+            if let Some(stage) = expert_stage {
+                stage.join(gpu)?;
+            }
+
             drop(steps);
             Ok(qsa_commits)
         })();
@@ -3255,6 +3646,14 @@ impl Qwen4GpuForward {
                 Ok(())
             }
             Err(error) => {
+                // A staged forward that failed before its join may have left
+                // a donor overwritten; nothing may read it until restored.
+                let error = match self.expert_stage.as_ref().map(|stage| stage.restore_blocking(gpu)) {
+                    Some(Err(restore)) => {
+                        invalid(format!("{error}; G2 donor expert restore failed: {restore}"))
+                    }
+                    _ => error,
+                };
                 if gpu.replay.is_recording() {
                     // A capture window that failed inside the body must not keep
                     // failing every later forward.
@@ -3345,5 +3744,22 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
             gpu.replay.poison(reason.clone());
             eprintln!("[redline] falling back to HIP: {reason}");
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::prefill_checkpoint_boundary as boundary;
+
+    #[test]
+    fn boundary_is_a_cold_schedule_chunk_end() {
+        // Budget 2048, chunk 8192: the cold schedule ends at 2048, 10240, ...
+        assert_eq!(boundary(2048, 1000, 8192), 0);
+        assert_eq!(boundary(2048, 2048, 8192), 2048);
+        assert_eq!(boundary(2048, 10239, 8192), 2048);
+        assert_eq!(boundary(2048, 10240, 8192), 10240);
+        assert_eq!(boundary(2048, 30000, 8192), 2048 + 3 * 8192);
+        // No budget split: plain multiples of the chunk.
+        assert_eq!(boundary(0, 20000, 4096), 16384);
     }
 }

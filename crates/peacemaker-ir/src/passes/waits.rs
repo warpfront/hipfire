@@ -36,7 +36,7 @@ use thiserror::Error;
 
 use crate::cfg::{BlockId, Body, InstId};
 use crate::effects::{Control, MemClass};
-use crate::inst::{Arch, Inst};
+use crate::inst::{Arch, Inst, Wave};
 use crate::operand::{ImmField, Operand};
 use crate::reg::{Kind, RegRef, RegSet};
 use crate::state::ObligationKind;
@@ -177,17 +177,44 @@ fn overlaps(a: &[(Kind, u16)], b: &[(Kind, u16)]) -> bool {
     a.iter().any(|x| b.contains(x))
 }
 
-fn explicit_regs(inst: &Inst) -> Vec<RegRef> {
-    let mut out: Vec<RegRef> =
-        inst.effects.defs.iter().chain(inst.effects.uses.iter()).copied().collect();
-    for operand in &inst.operands {
-        match operand {
-            Operand::Reg(reg) => out.push(*reg),
-            Operand::Half(reg, _) => out.push(*reg),
-            _ => {}
-        }
+fn explicit_regs(inst: &Inst, arch: Arch, wave: Wave) -> Vec<RegRef> {
+    inst.operands.iter().enumerate().filter_map(|(index, _)|
+        crate::codec::gfx12::operand_register(arch, wave, inst, index)).collect()
+}
+
+/// Physical bits touched by an explicit operand. A narrow DS store reads
+/// only its data half, never a narrow address. D16 loads independently
+/// write their selected half; the preserved half is not a hardware read.
+fn operand_mask(inst: &Inst, arch: Arch, index: usize) -> u32 {
+    use crate::operand::Half;
+    match inst.operands.get(index) {
+        Some(Operand::Half(_, Half::Lo)) => return 0xffff,
+        Some(Operand::Half(_, Half::Hi)) => return 0xffff0000,
+        Some(Operand::Reg(r)) if r.kind == Kind::V && r.len == 1 => {}
+        _ => return u32::MAX,
     }
-    out
+    let name = inst.op.name(arch).unwrap_or("");
+    if index == 0 && inst.effects.mem.as_ref().is_some_and(|m| is_load(m.class))
+        && name.contains("d16") {
+        return if name.contains("d16_hi") { 0xffff0000 } else { 0xffff };
+    }
+    if index > 0 && name.starts_with("ds_store_")
+        && (name.contains("_b8") || name.contains("_b16")) {
+        return if name.contains("d16_hi") { 0xffff0000 } else { 0xffff };
+    }
+    u32::MAX
+}
+
+fn raw_overlap(body: &Body, event: &PendingEvent, consumer: &Inst, arch: Arch, wave: Wave) -> bool {
+    let producer = body.insts.get(event.inst).expect("pending instruction exists");
+    let mask = operand_mask(producer, arch, 0);
+    consumer.operands.iter().enumerate().any(|(index, _)| {
+        let Some(reg) = crate::codec::gfx12::operand_register(arch, wave, consumer, index) else { return false };
+        if mask & operand_mask(consumer, arch, index) == 0 { return false; }
+        event.defs.0.iter().any(|dst| dst.kind == reg.kind
+            && dst.base < reg.base + u16::from(reg.len)
+            && reg.base < dst.base + u16::from(dst.len))
+    })
 }
 
 /// Raw SOPP simm16 bits of an `s_wait_alu`, if present.
@@ -508,6 +535,7 @@ fn push_event(
 fn walk_block(
     body: &Body,
     arch: Arch,
+    wave: Wave,
     range: (usize, usize),
     entry: &WaitState,
     events: &mut EventTable,
@@ -577,14 +605,14 @@ fn walk_block(
             _ => {}
         }
         if let Some(recorder) = recorder.as_mut() {
-            let touch = dwords(&explicit_regs(inst));
+            let touch = dwords(&explicit_regs(inst, arch, wave));
             let war = dwords(&war_defs(inst, arch));
             let mut war_hits: Vec<PendingEvent> = Vec::new();
             let mut raw_hits: Vec<PendingEvent> = Vec::new();
             for event in &state.pending {
                 if overlaps(&regset_dwords(&event.src_locks), &war) {
                     war_hits.push(event.clone());
-                } else if overlaps(&regset_dwords(&event.defs), &touch) {
+                } else if raw_overlap(body, event, inst, arch, wave) {
                     raw_hits.push(event.clone());
                 }
             }
@@ -606,7 +634,7 @@ fn walk_block(
 
 
 /// CFG-aware wait replay with fixpoint over the block graph.
-pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
+pub fn replay(body: &Body, arch: Arch, wave: Wave) -> Result<WaitReplay, WaitError> {
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(WaitError::UnsupportedArch(arch));
     }
@@ -633,10 +661,10 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
     let mut refined = false;
     loop {
         for choices in &partitions {
-            let entries = fixpoint(body, arch, &ranges, choices, &mut events)?;
+            let entries = fixpoint(body, arch, wave, &ranges, choices, &mut events)?;
             for ((_, range), entry) in ranges.iter().zip(&entries) {
                 let Some(entry) = entry else { continue };
-                walk_block(body, arch, *range, entry, &mut events, choices, Some(&mut recorder))?;
+                walk_block(body, arch, wave, *range, entry, &mut events, choices, Some(&mut recorder))?;
             }
         }
         if refined || recorder.obligations.is_empty() { break; }
@@ -668,14 +696,14 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
 /// at their instruction positions, including partition-selected edges.
 /// Keeping straight-line transfer in one walk avoids retaining and cloning
 /// the entire pending state at each instruction during convergence.
-fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize))], choices: &HashMap<InstId, bool>, events: &mut EventTable) -> Result<Vec<Option<WaitState>>, WaitError> {
+fn fixpoint(body: &Body, arch: Arch, wave: Wave, ranges: &[(BlockId, (usize, usize))], choices: &HashMap<InstId, bool>, events: &mut EventTable) -> Result<Vec<Option<WaitState>>, WaitError> {
     let count = ranges.len();
     let index: HashMap<BlockId, usize> = ranges.iter().enumerate().map(|(p, (id, _))| (*id, p)).collect();
     let first_at: HashMap<usize, usize> = ranges.iter().enumerate().map(|(p, (_, range))| (range.0, p)).collect();
     let mut incoming: Vec<Vec<(usize, Option<usize>)>> = vec![Vec::new(); count];
     let mut succs = vec![Vec::new(); count];
     for (p, (_, range)) in ranges.iter().enumerate() {
-        let shape = walk_block(body, arch, *range, &WaitState::default(), events, choices, None)?;
+        let shape = walk_block(body, arch, wave, *range, &WaitState::default(), events, choices, None)?;
         if shape.fall.is_some() {
             if let Some(&q) = first_at.get(&range.1).filter(|&&q| q != p) {
                 incoming[q].push((p, None));
@@ -708,7 +736,7 @@ fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize))], choic
         if walks > budget { return Err(WaitError::NoFixpoint { walks }); }
         let exit = match &joined {
             None => None,
-            Some(state) => Some(walk_block(body, arch, ranges[p].1, state, events, choices, None)?),
+            Some(state) => Some(walk_block(body, arch, wave, ranges[p].1, state, events, choices, None)?),
         };
         entries[p] = joined;
         if exits[p] != exit { exits[p] = exit; work.extend(succs[p].iter().copied()); }
@@ -828,7 +856,7 @@ mod c5_tests {
     }
 
     fn ok(body: &Body) -> bool {
-        replay(body, Arch::Gfx1201).unwrap().obligations.is_empty()
+        replay(body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap().obligations.is_empty()
     }
 
     /// On gfx11 a positive lgkmcnt retires the oldest LDS access when no
@@ -852,23 +880,23 @@ mod c5_tests {
             assert_eq!(wait.mods.wait.as_ref().unwrap().per_counter[Counter::Lgkm as usize], Some(3));
             let consumer = || inst("v_add_f32_e32", vec![v(20, 1), v(1, 1), v(21, 1)]);
             let ds_only = body_of(vec![ds(1), ds(2), ds(3), ds(4), wait.clone(), consumer()]);
-            assert!(replay(&ds_only, arch).unwrap().obligations.is_empty(), "{arch:?}: oldest LDS must retire");
+            assert!(replay(&ds_only, arch, crate::inst::Wave::Wave64).unwrap().obligations.is_empty(), "{arch:?}: oldest LDS must retire");
             let ds_later = body_of(vec![ds(1), ds(2), ds(3), ds(4), wait.clone(),
                 inst("v_add_f32_e32", vec![v(20, 1), v(2, 1), v(21, 1)])]);
-            assert!(replay(&ds_later, arch).unwrap().obligations.iter()
+            assert!(replay(&ds_later, arch, crate::inst::Wave::Wave64).unwrap().obligations.iter()
                 .any(|obligation| obligation.rule_id == "wait-raw-ds-load"));
             let atomic = inst("ds_min_i32", vec![
                 v(30, 1), v(31, 1), Operand::Imm(ImmField::DsOffset(0)),
             ]);
             let atomics_in_order = body_of(vec![atomic, ds(1), ds(2), ds(3), wait.clone(),
                 inst("v_mov_b32_e32", vec![v(31, 1), v(21, 1)])]);
-            assert!(replay(&atomics_in_order, arch).unwrap().obligations.is_empty(),
+            assert!(replay(&atomics_in_order, arch, crate::inst::Wave::Wave64).unwrap().obligations.is_empty(),
                 "{arch:?}: oldest LDS atomic has retired before reusing its data source");
             let smem = inst("s_load_b32", vec![
                 s(20, 1), s(0, 2), Operand::Imm(ImmField::SmemOffset(0)),
             ]);
             let mixed = body_of(vec![ds(1), smem, ds(2), ds(3), ds(4), wait, consumer()]);
-            assert!(replay(&mixed, arch).unwrap().obligations.iter()
+            assert!(replay(&mixed, arch, crate::inst::Wave::Wave64).unwrap().obligations.iter()
                 .any(|obligation| obligation.rule_id == "wait-raw-ds-load"),
                 "{arch:?}: SMEM makes partial lgkmcnt unable to prove LDS retirement");
         }
@@ -881,7 +909,7 @@ mod c5_tests {
     fn gfx11_global_atomic_counts_on_vmcnt_only_when_returning() {
         for arch in [Arch::Gfx1100, Arch::Gfx1151] {
             let dec = |words: &[u32]| crate::codec::gfx11::decode(arch, words).unwrap().0;
-            let rules = |insts: Vec<Inst>| replay(&body_of(insts), arch).unwrap().obligations
+            let rules = |insts: Vec<Inst>| replay(&body_of(insts), arch, crate::inst::Wave::Wave64).unwrap().obligations
                 .into_iter().map(|o| o.rule_id).collect::<Vec<_>>();
             let add_rtn = || dec(&[0xdcd6_4000, 0x0204_020a]); // global_atomic_add_u32 v2, v10, v2, s[4:5] glc
             let swap = || dec(&[0xdcce_0000, 0x0000_0000]); // global_atomic_swap_b32 v0, v0, s[0:1]
@@ -1019,6 +1047,51 @@ mod c5_tests {
         assert!(ok(&drained));
     }
 
+    #[test]
+    fn scalar_compare_mask_does_not_touch_adjacent_sgpr_in_wave32() {
+        use crate::inst::Wave;
+        let load = || mi("s_load_b32", vec![s(2, 1), s(8, 2), Operand::Imm(ImmField::SmemOffset(0))]);
+        let body = body_of(vec![
+            load(),
+            mi("v_cmp_lt_u32_e64", vec![s(1, 2), v(0, 1), v(1, 1)]),
+        ]);
+        assert!(replay(&body, Arch::Gfx1201, Wave::Wave32).unwrap().obligations.is_empty());
+        let wide = replay(&body, Arch::Gfx1201, Wave::Wave64).unwrap();
+        assert_eq!(wide.obligations[0].rule_id, "wait-raw-smem-load");
+        let real_read = body_of(vec![
+            load(),
+            mi("v_cmp_lt_u32_e64", vec![s(1, 2), s(2, 1), v(1, 1)]),
+        ]);
+        let narrow = replay(&real_read, Arch::Gfx1201, Wave::Wave32).unwrap();
+        assert_eq!(narrow.obligations[0].rule_id, "wait-raw-smem-load");
+    }
+
+    #[test]
+    fn d16_pending_high_half_only_conflicts_with_a_high_or_full_read() {
+        use crate::inst::Wave;
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            let decode = |words: &[u32]| crate::codec::gfx12::decode_for(arch, words).unwrap().0;
+            let (low, high, wait) = if arch == Arch::Gfx1201 {
+                (decode(&[0xee07807c, 10, 2]), decode(&[0xee08407c, 10, 4]), decode(&[0xbfc00001]))
+            } else {
+                (decode(&[0xdc7a0000, 0x0a7c0002]), decode(&[0xdc860000, 0x0a7c0004]), decode(&[0xbf8907f7]))
+            };
+            let lo_store = decode(&[0xd8780000, 0x00000a06]);
+            let hi_store = decode(&[0xda800000, 0x00000a06]);
+            let clean = body_of(vec![low.clone(), high.clone(), wait.clone(), lo_store.clone()]);
+            assert!(replay(&clean, arch, Wave::Wave32).unwrap().obligations.is_empty(), "{arch:?}");
+            let hazard = body_of(vec![low.clone(), high.clone(), wait.clone(), hi_store]);
+            let obligations = replay(&hazard, arch, Wave::Wave32).unwrap().obligations;
+            assert!(obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == vec![crate::cfg::InstId(3)]), "{arch:?}");
+            let full_read = body_of(vec![low.clone(), high.clone(), wait, decode(&[0x7e28030a])]);
+            assert!(replay(&full_read, arch, Wave::Wave32).unwrap().obligations
+                .iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == vec![crate::cfg::InstId(3)]));
+            let missing_wait = body_of(vec![low, high, lo_store]);
+            assert!(replay(&missing_wait, arch, Wave::Wave32).unwrap().obligations
+                .iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == vec![crate::cfg::InstId(2)]));
+        }
+    }
+
     /// Linear `vm_vsrc_releases_store_sources…`, typed (VALU move stands in
     /// for the text test's `v_writelane_b32`, which has no M1 table row).
     #[test]
@@ -1137,7 +1210,7 @@ mod c5_tests {
     #[test]
     fn kt48_replay_obligations_are_ds_store_war() {
         let body = kt48_body();
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         assert_eq!(replay.obligations.len(), 124, "120 linear-common + 4 first-iteration sites");
         for obligation in &replay.obligations {
             assert_eq!(obligation.kind, ObligationKind::SrcReadTiming(MemClass::DsStore));
@@ -1172,7 +1245,7 @@ mod c5_tests {
     #[test]
     fn kt48_path_sensitive_sites() {
         let body = kt48_body();
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         let positions: Vec<usize> = replay
             .obligations
             .iter()
@@ -1191,7 +1264,7 @@ mod c5_tests {
     #[test]
     fn kt48_kmcnt_units_and_retirement() {
         let body = kt48_body();
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         let mut smem: Vec<_> =
             replay.events.iter().filter(|event| event.class == MemClass::SmemLoad).collect();
         assert_eq!(smem.len(), 6, "KT48 has six SMEM loads");
@@ -1241,7 +1314,7 @@ mod c5_tests {
             let mut mutated = body.clone();
             let inst = mutated.insts.get_mut(wait).unwrap();
             inst.mods.wait.as_mut().unwrap().per_counter[Counter::Km as usize] = Some(1);
-            let replay = replay(&mutated, Arch::Gfx1201).unwrap();
+            let replay = replay(&mutated, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
             if replay.obligations.iter().any(|obligation| {
                 matches!(obligation.kind, ObligationKind::Hazard)
                     && obligation.rule_id == "wait-raw-smem-load"
@@ -1267,7 +1340,7 @@ mod c5_tests {
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert!(body.blocks.len() > 1500);
         let consumer = body.layout[body.layout.len() - 2];
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         assert!(replay.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]),
             "{:?}", replay.obligations);
     }

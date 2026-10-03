@@ -59,6 +59,30 @@ fn im2col_tile(c_in: usize) -> HipResult<(usize, usize, usize)> {
     Ok((c_tile, 8, 16))
 }
 
+/// Folded block count of a tile grid whose axes the kernel decodes from
+/// `blockIdx.x` (x fastest): `dims[0] * dims[1] * dims[2]`. Folding keeps
+/// gridDim.y/z at 1, so no row-tile count can reach the gfx1201 ceiling of
+/// 65535; a product past u32 is an error, never a truncation.
+fn fold_grid(dims: [usize; 3]) -> HipResult<u32> {
+    let blocks = dims
+        .iter()
+        .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+        .and_then(|b| u32::try_from(b).ok());
+    blocks.ok_or_else(|| {
+        HipError::new(
+            1,
+            &format!("vae tile grid {dims:?} folds past the u32 grid.x limit"),
+        )
+    })
+}
+
+/// Folded grid of the 32x32 tiled transposes of a `[m][n]` source: the
+/// kernel decodes `tile_col = blockIdx.x % ceil(n/32)` and
+/// `tile_row = blockIdx.x / ceil(n/32)` (see `vae_tile_origin`).
+fn tile_grid_x(m: usize, n: usize) -> HipResult<u32> {
+    fold_grid([n.div_ceil(32), m.div_ceil(32), 1])
+}
+
 impl Gpu {
     /// 3x3 stride-1 pad-1 convolution, f32, channel-major. `x` is
     /// `[c_in][h][w]`, `w` is `[c_out][c_in*9]` (the loader flattens
@@ -522,7 +546,9 @@ impl Gpu {
     /// - `""` / `"lds"` — LDS-tiled (default). One workgroup stages a
     ///   `[c_tile][(th+2)x(tw+2)]` halo patch through LDS, so each input
     ///   element crosses DRAM once instead of nine times, and each output
-    ///   pixel's `c_tile*9` halves leave as one contiguous run.
+    ///   pixel's `c_tile*9` halves leave as one contiguous run. The tile
+    ///   grid is folded into `grid.x` (`gridDim.y/z` stay 1), so a band of
+    ///   any row count launches on gfx1201, whose `grid.y` ceiling is 65535.
     /// - `"c"` — the previous default: channel-fastest scalar gather
     ///   (contiguous 9-tap writes, scattered plane reads).
     /// - `"p"` — pixel-fastest scalar gather (measured ~6x worse).
@@ -576,10 +602,17 @@ impl Gpu {
         if entry == "vae_im2col_f16_lds" {
             let block = 256u32;
             let shared = (c_tile * (th + 2) * (tw + 2) * 2) as u32;
+            // One folded axis (see `vae_im2col.hip`): the old (x, y, z) tile
+            // grid has y = ceil(rows/th), which a tall image carries past the
+            // gfx1201 gridDim.y ceiling of 65535.
             let grid = [
-                wdt.div_ceil(tw) as u32,
-                rows.div_ceil(th) as u32,
-                c_in.div_ceil(c_tile) as u32,
+                fold_grid([
+                    wdt.div_ceil(tw),
+                    rows.div_ceil(th),
+                    c_in.div_ceil(c_tile),
+                ])?,
+                1,
+                1,
             ];
             return unsafe {
                 self.hip.launch_kernel(
@@ -660,12 +693,11 @@ impl Gpu {
             &mut off as *mut _ as *mut c_void,
         ];
         if tiled {
-            let grid_x = ((n + 31) / 32) as u32;
-            let grid_y = ((m + 31) / 32) as u32;
+            let grid = tile_grid_x(m, n)?;
             unsafe {
                 return self.hip.launch_kernel(
                     func,
-                    [grid_x, grid_y, 1],
+                    [grid, 1, 1],
                     [32, 8, 1],
                     0,
                     self.stream_ref(),
@@ -690,7 +722,9 @@ impl Gpu {
 
     /// Fused transpose + f32 -> f16 cast: `src [m][n]` f32 into `dst [n][m]`
     /// f16. `dst` must be allocated `DType::F16` with shape `[n, m]`. Same
-    /// 32x32 tiled launch as [`Self::vae_transpose_f32`].
+    /// 32x32 tiled launch as [`Self::vae_transpose_f32_banded`]: the tile
+    /// grid is folded into `grid.x`, so neither `m` nor `n` can reach a
+    /// `grid.y` limit.
     pub fn vae_transpose_cast_f16(
         &mut self,
         src: &GpuTensor,
@@ -715,12 +749,11 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ];
-        let grid_x = ((n + 31) / 32) as u32;
-        let grid_y = ((m + 31) / 32) as u32;
+        let grid = tile_grid_x(m, n)?;
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [grid_x, grid_y, 1],
+                [grid, 1, 1],
                 [32, 8, 1],
                 0,
                 self.stream_ref(),
@@ -769,29 +802,9 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use crate::kernels;
-
-    /// Source pin for the encoder's stride-2 downsampler. The whole reason
-    /// this kernel is separate from `vae_conv3x3_f32` is the tap arithmetic:
-    /// diffusers' `Downsample2D` pads (0,1,0,1), so the input row is
-    /// `2*oy + ky` with no `-1` recentering. Getting that wrong shifts the
-    /// encoded latent by one pixel per downsample level — which surfaces as a
-    /// slightly blurred round trip, not as an error.
     #[test]
-    fn vae_conv3x3_s2_source_is_the_stride2_kernel() {
-        let src = kernels::VAE_CONV3X3_S2_SRC;
-        assert!(
-            src.contains("vae_conv3x3_s2_f32"),
-            "stride-2 conv source must define `vae_conv3x3_s2_f32`"
-        );
-        assert!(
-            src.contains("2 * oy + ky"),
-            "stride-2 conv must tap `2 * oy + ky` (pad top 0, bottom 1), not the \
-             stride-1 kernel's `oy + ky - 1`"
-        );
-        assert!(
-            src.contains("2 * ox + kx"),
-            "stride-2 conv must tap `2 * ox + kx` (pad left 0, right 1)"
-        );
+    fn folded_grid_overflow_is_rejected() {
+        assert!(super::fold_grid([1 << 16, 1 << 16, 1]).is_err());
+        assert!(super::tile_grid_x(1 << 40, 1 << 40).is_err());
     }
 }

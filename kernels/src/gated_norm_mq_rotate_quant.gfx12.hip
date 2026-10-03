@@ -92,9 +92,16 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const int group = blockIdx.x * HIPFIRE_GATED_NORM_WAVES + wave;
-    const int batch = blockIdx.y;
+    // Grid x folds (batch, workgroup-of-groups): x = batch * row_blocks +
+    // block, row_blocks = ceil((K/256) / WAVES). Keeps the batch out of grid.y,
+    // which HIP bounds at 65535; per-group math is unchanged.
     const int groups_per_row = K / 256;
+    if (groups_per_row <= 0) return;
+    const unsigned row_blocks =
+        ((unsigned)groups_per_row + HIPFIRE_GATED_NORM_WAVES - 1u) / HIPFIRE_GATED_NORM_WAVES;
+    const unsigned bx = blockIdx.x;
+    const int batch = (int)(bx / row_blocks);
+    const int group = (int)(bx - (unsigned)batch * row_blocks) * HIPFIRE_GATED_NORM_WAVES + wave;
     if (group >= groups_per_row) return;
     if (group * 2 + 1 >= n_heads) return;
 
@@ -177,10 +184,13 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const int lane = tid & 31;
     // Two heads per 256-group at head_dim == 128.
     if (wave >= 2) return;
-    const int group = blockIdx.x;
-    const int batch = blockIdx.y;
+    // Grid x folds (batch, group): x = batch * (K/256) + group (group
+    // fastest). Keeps the batch out of grid.y, which HIP bounds at 65535.
     const int groups_per_row = K / 256;
-    if (group >= groups_per_row) return;
+    if (groups_per_row <= 0) return;
+    const unsigned bx = blockIdx.x;
+    const int batch = (int)(bx / (unsigned)groups_per_row);
+    const int group = (int)(bx - (unsigned)batch * (unsigned)groups_per_row);
     const int head = group * 2 + wave;
     if (head >= n_heads) return;
 

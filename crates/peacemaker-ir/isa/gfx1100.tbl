@@ -40,6 +40,7 @@ s_cmp_lt_i32	sopc	0x4	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lt_i32 s15, 
 s_cmp_le_i32	sopc	0x5	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_le_i32 s7, s3	BF050307	-
 s_cmp_lg_u32	sopc	0x7	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lg_u32 s4, 24	BF079804	-
 s_cmp_lt_u32	sopc	0xa	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lt_u32 s25, 2	BF0A8219	-
+s_cmp_le_u32	sopc	0xb	SSRC0:32,SSRC1:32,literal@last	-	SSRC0,SSRC1	scc:w	-	s_cmp_le_u32 s57, s4	BF0B0439	-
 s_mulk_i32	sopk	0x10	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_mulk_i32 s4, 0x6180	B8046180	-
 s_nop	sopp	0x0	SIMM16:16	-	SIMM16	-	-	s_nop 0	BF800000	-
 s_clause	sopp	0x5	SIMM16:16	-	SIMM16	-	-	s_clause 0x1	BF850001	-
@@ -378,6 +379,7 @@ s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_
 s_cmpk_lt_u32	sopk	0xd	SDST:32,SIMM16:16	-	SDST,SIMM16	scc:w	-	s_cmpk_lt_u32 s24, 0x100	B6980100	-
 flat_load_b32	flat	0x14	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b32 v33, v[1:2] offset:8	DC500008 217C0001	-
 flat_load_b64	flat	0x15	VDST:64,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b64 v[17:18], v[1:2]	DC540000 117C0001	-
+flat_load_b128	flat	0x17	VDST:128,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b128 v[33:36], v[22:23]	DC5C0000 217C0016	-
 buffer_gl1_inv	buffer	0x2c	-	-	-	-	-	buffer_gl1_inv	E0B00000 00000000	-
 s_bcnt1_i32_b32	sop1	0x18	SDST:32,SSRC0:32	SDST	SSRC0	scc:w	-	s_bcnt1_i32_b32 s3, s6	BE831806	-
 v_cmp_u_f32_e64	vop3	0x18	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_u_f32_e64 s0, v4, v3	D4180000 02020704	src2_unused:ignored:0x1ff:0x00/0x80/0x101
@@ -385,3 +387,13 @@ v_cmp_u_f32_e64	vop3	0x18	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_u_f32
 global_atomic_swap_b32	global	0x33	VDST@rtn:32,ADDR:64,VSRC:32,SADDR:64	VDST	ADDR,VSRC,SADDR	-	Vm:1@rtn,Vs:1@nortn	global_atomic_swap_b32 v13, v12, s[6:7] offset:4	DCCE0004 00060C0D	-
 global_atomic_cmpswap_b32	global	0x34	VDST@rtn:32,ADDR:64,VSRC:64,SADDR:64	VDST	ADDR,VSRC,SADDR	-	Vm:1@rtn,Vs:1@nortn	global_atomic_cmpswap_b32 v0, v2, v[0:1], s[0:1] glc	DCD24000 00000002	-
 global_atomic_add_u32	global	0x35	VDST@rtn:32,ADDR:64,VSRC:32,SADDR:64	VDST	ADDR,VSRC,SADDR	-	Vm:1@rtn,Vs:1@nortn	global_atomic_add_u32 v2, v10, v2, s[4:5] glc	DCD64000 0204020A	-
+# feat/pm-gfx12-rows (2026-10-02): gfx11 forms found in current JIT caches (mq2 kcomment, QSA gathered WMMA); sample = pinned llvm-mc --disassemble -mcpu=gfx1100.
+scratch_load_d16_b16	scratch	0x20	VDST:32,VADDR:64,SADDR:64	VDST	VADDR,SADDR,VDST	-	Vm:1	scratch_load_d16_b16 v4, v2, off	DC810000 04FC0002	-
+v_fmac_f16_e64	vop3	0x136	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1,VDST	-	-	v_fmac_f16_e64 v134.h, v134.l, v106.l	D5364086 0202D586	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_cvt_f16_u16_e64	vop3	0x1d0	VDST:16,SRC0:16	VDST	SRC0,VDST	-	-	v_cvt_f16_u16_e64 v149.l, v149.l	D5D00095 02010195	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_min3_i32	vop3	0x21a	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_min3_i32 v1, s4, s5, v1	D61A0001 04040A04	-
+v_cmpx_eq_f32_e32	vopc	0x92	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_f32_e32 0xff800000, v66	7D2484FF FF800000	-
+# feat/qsa-pm (2026-10-02): the QSA PM convert kernel's F16 store; sample = pinned llvm-mc -mcpu=gfx1151 encoding.
+buffer_store_b16	buffer	0x19	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	-	VDATA,VADDR,RSRC,SOFFSET	-	Vs:1	buffer_store_b16 v5, v6, s[40:43], 0 offen offset:8	E0640008 804A0506	-
+# pm/native-emit (2026-10-02): PM corpus s_getreg_b32 (hwreg id/offset/size packed in SIMM16); sample = pinned llvm-mc -mcpu=gfx1100 encoding.
+s_getreg_b32	sopk	0x11	SDST:32,SIMM16:16	SDST	SIMM16	-	-	s_getreg_b32 s13, hwreg(HW_REG_HW_ID1)	B88DF817	-

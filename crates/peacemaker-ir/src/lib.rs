@@ -4,6 +4,7 @@ pub mod codec;
 pub mod descriptor;
 pub mod edit;
 pub mod effects;
+pub mod emu;
 pub mod envelope;
 pub mod inst;
 pub mod isa;

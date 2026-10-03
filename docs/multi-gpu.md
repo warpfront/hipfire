@@ -276,6 +276,21 @@ string or a blanket “always refuse at load.”
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 
+Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit
+`speculation = "mtp"` (`speculation.mtp = on`, `--spec mtp`) takes the spec route.
+The loader then replicates the MTP head on rank 0 (bundled `.mq4-mtp` trailer, the
+CLI-resolved `.mtp` sidecar, or the trunk's sibling `.mtp`); the request drafts on
+rank 0 and verifies across ranks. A missing head is a load error, as `mtp=on` is
+on one GPU. `auto` (the default) and `off` keep the AR mesh loop even when a head
+sits beside the trunk, so existing `tp>1` serves are unchanged. Block-verify
+drafters (n-gram, DFlash, DSpark) stay refused on dense TP, and the n-gram-mod
+composition inside MTP (`HIPFIRE_MTP_NGRAM`) drafts natively there.
+
+Dense-TP MTP is not a byte-identical replacement for TP AR: speculative
+verification runs a multi-row trunk geometry, whereas AR advances one token at
+a time. The H2 greedy gate observed different output in some workloads, so a
+throughput improvement alone does not qualify this route for automatic use.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).

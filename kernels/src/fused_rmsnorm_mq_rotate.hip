@@ -36,13 +36,16 @@
 // rides the same float4 prefetch as x/weight. Uniform builds are textually
 // unchanged.
 //
-// -DHIPFIRE_RMSNORM_P1A_BATCHED=1 (gfx1201 `_v2` IU4 symbols, gfx1100 `_b8`
-// IU4 symbols) keeps up to 20 Phase-1a row loads in flight per wave instead
-// of one: the incumbent loop waits on each x[i] before issuing x[i + 256], so
-// a wave held a single 128-B request and the sum-of-squares pass was
-// DRAM-latency bound. Same elements, same strictly sequential fma(v, v, acc)
-// chain from +0 as the incumbent loop's contraction, same reduction tree:
-// bit-identical rms.
+// -DHIPFIRE_RMSNORM_P1A_BATCHED=1 (gfx1201 `_v2` IU4 symbols, gfx1100/gfx1151
+// `_b8` IU4 symbols, gfx1151 `_fold_b8`) keeps up to 20 Phase-1a row loads in
+// flight per wave instead of one: the incumbent loop waits on each x[i] before
+// issuing x[i + 256], so a wave held a single 128-B request and the
+// sum-of-squares pass was DRAM-latency bound. Same elements, same strictly
+// sequential fma(v, v, acc) chain from +0 as the incumbent loop's
+// contraction, same reduction tree: bit-identical rms. Under
+// HIPFIRE_RMSNORM_FOLD the batch loads x and delta pairs and forms each
+// element as the incumbent's RN(x + delta) after the drain (MAX8 + DRAIN
+// only).
 //
 // -DHIPFIRE_RMSNORM_AWQ_RCP=1 (gfx1201 A4 `_v2_slab_fdiv`, AWQ only) adds an
 // `awq_rcp` input after `awq_scale`: the planes [R 0..K-1][Rlo K..2K-1]
@@ -75,8 +78,9 @@
 #if defined(HIPFIRE_RMSNORM_FOLD) && !defined(HIPFIRE_IU4_SIDECAR)
 #error "HIPFIRE_RMSNORM_FOLD is an IU4-sidecar producer variant"
 #endif
-#if defined(HIPFIRE_RMSNORM_P1A_BATCHED) && defined(HIPFIRE_RMSNORM_FOLD)
-#error "HIPFIRE_RMSNORM_P1A_BATCHED batches plain x loads only"
+#if defined(HIPFIRE_RMSNORM_P1A_BATCHED) && defined(HIPFIRE_RMSNORM_FOLD) \
+    && !(defined(HIPFIRE_RMSNORM_P1A_DRAIN) && defined(HIPFIRE_RMSNORM_P1A_MAX8))
+#error "HIPFIRE_RMSNORM_FOLD batches only the MAX8 + DRAIN Phase-1a"
 #endif
 #if defined(HIPFIRE_RMSNORM_AWQ_RCP) && !defined(HIPFIRE_RMSNORM_AWQ)
 #error "HIPFIRE_RMSNORM_AWQ_RCP replaces the AWQ divide"
@@ -199,6 +203,21 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 #define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() ((void)0)
 #endif
     int i = tid;
+#ifdef HIPFIRE_RMSNORM_FOLD
+#define HIPFIRE_RMSNORM_P1A_STEP(B) \
+    for (; i + ((B) - 1) * block_size < K; i += (B) * block_size) { \
+        float vb[B], db[B]; \
+        _Pragma("unroll") for (int u = 0; u < (B); ++u) { \
+            vb[u] = x_b[i + u * block_size]; \
+            db[u] = d_b[i + u * block_size]; \
+        } \
+        HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER(); \
+        _Pragma("unroll") for (int u = 0; u < (B); ++u) { \
+            const float v = __fadd_rn(vb[u], db[u]); \
+            local_sum = __fmaf_rn(v, v, local_sum); \
+        } \
+    }
+#else
 #define HIPFIRE_RMSNORM_P1A_STEP(B) \
     for (; i + ((B) - 1) * block_size < K; i += (B) * block_size) { \
         float vb[B]; \
@@ -207,6 +226,7 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         _Pragma("unroll") for (int u = 0; u < (B); ++u) \
             local_sum = __fmaf_rn(vb[u], vb[u], local_sum); \
     }
+#endif
 #ifdef HIPFIRE_RMSNORM_P1A_MAX8
     HIPFIRE_RMSNORM_P1A_STEP(8)
 #else
@@ -216,7 +236,14 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     HIPFIRE_RMSNORM_P1A_STEP(4)
 #undef HIPFIRE_RMSNORM_P1A_STEP
 #undef HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER
+#ifdef HIPFIRE_RMSNORM_FOLD
+    for (; i < K; i += block_size) {
+        const float v = __fadd_rn(x_b[i], d_b[i]);
+        local_sum = __fmaf_rn(v, v, local_sum);
+    }
+#else
     for (; i < K; i += block_size) local_sum = __fmaf_rn(x_b[i], x_b[i], local_sum);
+#endif
 #else
     for (int i = tid; i < K; i += block_size) {
 #ifdef HIPFIRE_RMSNORM_FOLD

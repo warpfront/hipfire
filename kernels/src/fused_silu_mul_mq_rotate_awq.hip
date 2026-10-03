@@ -37,17 +37,13 @@
 #error "HIPFIRE_SILU_H_BF16 requires HIPFIRE_SILU_HIN"
 #endif
 
-// HIPFIRE_GRID_TOKFAST (gfx1201 `_slab_tokfast` twin): token-fastest grid
-// [N, K/256] (blockIdx.x = token, blockIdx.y = 256-group) instead of
-// [K/256, N]. Same per-workgroup math and stores; consecutive workgroups
-// then fill the slab planes' lines together instead of 68 groups apart.
-#ifdef HIPFIRE_GRID_TOKFAST
-#define HIPFIRE_SILU_GROUP_IDX blockIdx.y
-#define HIPFIRE_SILU_TOKEN_IDX blockIdx.x
-#else
-#define HIPFIRE_SILU_GROUP_IDX blockIdx.x
-#define HIPFIRE_SILU_TOKEN_IDX blockIdx.y
-#endif
+// Grid contract: the default twins fold (token, 256-group) into grid.x as
+// x = token * (K/256) + group (group fastest), so the row count never rides
+// grid.y/grid.z (HIP bounds those at 65535). HIPFIRE_GRID_TOKFAST (gfx1201
+// `_slab_tokfast` twin): token-fastest grid [N, K/256] (blockIdx.x = token,
+// blockIdx.y = 256-group); the group count K/256 is the only y extent. Same
+// per-workgroup math and stores; consecutive workgroups then fill the slab
+// planes' lines together instead of 68 groups apart.
 
 #ifndef HIPFIRE_SILU_MQ_ROTATE_KERNEL
 #define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq
@@ -78,16 +74,24 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     int K
 #endif
 ) {
-    const int group = HIPFIRE_SILU_GROUP_IDX;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
+    if (groups_total <= 0) return;
+#ifdef HIPFIRE_GRID_TOKFAST
+    const int group = (int)blockIdx.y;
+    const int token = (int)blockIdx.x;
     if (group >= groups_total) return;
+#else
+    const unsigned bx = blockIdx.x;
+    const int token = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)token * (unsigned)groups_total);
+#endif
 
-    // Batch row: grid.y is the batch dim. For decode grid=[groups_total, 1, 1]
-    // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
-    // grid=[groups_total, N, 1] ([N, groups_total, 1] under HIPFIRE_GRID_TOKFAST);
-    // gate, up, and x_rot are [N × K] row-major.
-    const long long batch_off = (long long)HIPFIRE_SILU_TOKEN_IDX * K;
+    // Batch row: for decode grid=[groups_total, 1, 1] is token 0
+    // (byte-identical to pre-batching). For prefill grid=[N * groups_total,
+    // 1, 1] ([N, groups_total, 1] under HIPFIRE_GRID_TOKFAST); gate, up, and
+    // x_rot are [N × K] row-major.
+    const long long batch_off = (long long)token * K;
 #ifdef HIPFIRE_SILU_HIN
 #ifdef HIPFIRE_SILU_H_BF16
     const hip_bfloat16* h_b = h + batch_off;
@@ -200,7 +204,7 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     }
     emit_iu4_sidecar_from_producer8(
         f0, f1, f2, f3, f4, f5, f6, f7,
-        x_i4, group, (int)HIPFIRE_SILU_TOKEN_IDX, N, tid);
+        x_i4, group, token, N, tid);
 #else
     x_rot_b[base    ] = f0;
     x_rot_b[base + 1] = f1;

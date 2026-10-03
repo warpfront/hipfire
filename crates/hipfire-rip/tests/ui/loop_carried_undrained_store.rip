@@ -1,0 +1,25 @@
+region Tile;
+// Standalone RIP safety fixture, assembled only if the sealed driver accepts it.
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let kspec = KernelSpec {
+        kernel_id: "rip_negative".into(), variant: "negative".into(),
+        arch: spec.arch, symbol: "rip_negative".into(),
+        kernargs: KernargLayout::new(0), user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false, workgroup_size: 32,
+        group_segment_fixed_size: 32768, wave32: true, cu_mode: false,
+    };
+    let mut p = RegPlan::new(256, 104)?;
+    for i in 0..4 { p.v::<8>("vectors", 8 * i, Live::Whole)?; }
+    p.s::<8>("scalars", 0, Live::Whole)?;
+    let mut b = Builder::new(kspec, p);
+    let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    let tile = wg.lds::<Tile>("tile", 0, 16)?;
+    let st = wg.begin_write(tile);
+    wg.loop_carried(".Lloop", st, |wg, st| {
+        let st = wg.ds_store(st, Instruction::new("ds_store_b32 v0, v1", vec![], vec![v(0),v(1)]).memory(MemoryClass::DsStore))?;
+        Ok((st, wg.scmp_wg_uniform(Instruction::new("s_cmp_lg_u32 s4, 0", vec![], vec![s(4)]))?))
+    })?;
+    let end = wg.exit(".Lend")?;
+    wg.end(end)?;
+    b.finish()
+}

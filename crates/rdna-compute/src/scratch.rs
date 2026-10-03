@@ -370,8 +370,9 @@ pub(crate) fn module_load_or_recompile(
 }
 
 /// Launch a kernel, routing through the blob path when graph capture, replay
-/// recording, or force_blob is active. Shared between `Gpu::launch_maybe_blob`
-/// and `ScratchState` methods so the branching logic stays in one place.
+/// recording, a G0 observation, or force_blob is active. Shared between
+/// `Gpu::launch_maybe_blob` and `ScratchState` methods so the branching logic
+/// stays in one place.
 ///
 /// Invariant: for any body, `capture_blobs.len()` after a HipGraph capture
 /// equals `replay.recorded_launches().len()` after a ReplayController capture.
@@ -392,10 +393,20 @@ pub(crate) fn launch_maybe_blob(
     params: &mut [*mut c_void],
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
+    // Fail closed before the recorder / capture tapes see the launch.
+    hip.validate_launch_grid(grid)
+        .map_err(|e| e.with_kernel(func_name))?;
     let record = replay.as_ref().map_or(false, |r| r.is_recording());
-    let result: HipResult<()> = if record || capture_mode || force_blob_path {
+    let observe = replay.as_ref().is_some_and(|r| r.is_g0_observing());
+    let result: HipResult<()> = if record || observe || capture_mode || force_blob_path {
         let mut blob = blob_builder();
         blob.pad_to(16);
+        if observe {
+            replay
+                .as_mut()
+                .unwrap()
+                .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+        }
         if record {
             // Single decision point for how a launch is recorded: the artifact
             // alias table and the record shape are shared with
@@ -412,6 +423,8 @@ pub(crate) fn launch_maybe_blob(
                 shared_mem,
                 blob.as_bytes(),
                 None,
+                &[],
+                compiler,
                 &[],
             );
         }
@@ -437,6 +450,27 @@ pub(crate) fn launch_maybe_blob(
     // kernel the same way the dispatch funnel does. Deliberately no
     // last-kernel recording — this helper has no `Gpu` to record into.
     result.map_err(|e| e.with_kernel(func_name))
+}
+
+/// Fold a `(blocks_per_row, rows)` launch into a one-dimensional grid.
+///
+/// Row/token kernels that used to read the row from `blockIdx.y` decode it as
+/// `blockIdx.x / blocks_per_row` (and the in-row block as
+/// `blockIdx.x % blocks_per_row`), so the row count is not bound by the
+/// device `gridDim.y` limit (65535 on gfx1201). Only overflow of the flat
+/// count is an error; a row is never dropped or clamped.
+pub(crate) fn fold_rows_into_x(blocks_per_row: usize, rows: usize) -> HipResult<[u32; 3]> {
+    match blocks_per_row.checked_mul(rows) {
+        Some(n) if n <= i32::MAX as usize => Ok([n as u32, 1, 1]),
+        _ => Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "folded launch grid {blocks_per_row} blocks/row x {rows} rows exceeds the \
+                 one-dimensional grid.x limit {}; refusing to truncate rows",
+                i32::MAX
+            ),
+        )),
+    }
 }
 
 /// Predicate for the FP16/FP8 scratch fast path. The convert kernel must run
@@ -1504,8 +1538,7 @@ impl ScratchState {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            let grid_x = ((k + 1023) / 1024) as u32;
-            let grid_y = batch_size as u32;
+            let grid = fold_rows_into_x(k.div_ceil(1024), batch_size)?;
             launch_maybe_blob(
                 hip,
                 Some(&*compiler),
@@ -1516,7 +1549,7 @@ impl ScratchState {
                 force_blob_path,
                 Some(replay),
                 "quantize_q8_1_mmq_ds4",
-                [grid_x, grid_y, 1],
+                grid,
                 [256, 1, 1],
                 0,
                 &mut params,
@@ -1590,8 +1623,7 @@ impl ScratchState {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            let grid_x = ((k + 1023) / 1024) as u32;
-            let grid_y = batch_size as u32;
+            let grid = fold_rows_into_x(k.div_ceil(1024), batch_size)?;
             launch_maybe_blob(
                 hip,
                 Some(&*compiler),
@@ -1602,7 +1634,7 @@ impl ScratchState {
                 force_blob_path,
                 Some(replay),
                 "quantize_q8_1_mmq_ds4_x128",
-                [grid_x, grid_y, 1],
+                grid,
                 [256, 1, 1],
                 0,
                 &mut params,
@@ -1679,8 +1711,7 @@ impl ScratchState {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            let grid_x = ((k + 1023) / 1024) as u32;
-            let grid_y = batch_size as u32;
+            let grid = fold_rows_into_x(k.div_ceil(1024), batch_size)?;
             let bytes = batch_size * k * 4 + needed;
             let timer =
                 crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
@@ -1694,7 +1725,7 @@ impl ScratchState {
                 force_blob_path,
                 Some(replay),
                 "quantize_int4_mmq_ds128",
-                [grid_x, grid_y, 1],
+                grid,
                 [256, 1, 1],
                 0,
                 &mut params,
@@ -1846,11 +1877,12 @@ impl ScratchState {
             &mut x_ptr as *mut _ as *mut c_void, &mut y_ptr as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void, &mut n_val as *mut _ as *mut c_void,
         ];
+        let grid = fold_rows_into_x(k.div_ceil(1024), n)?;
         let timer = crate::profile::begin_timer(hip, "quantize", "quantize_int8_mmq_ds128", n*k*4 + needed);
         launch_maybe_blob(
             hip, Some(&*compiler), functions, stream, capture_blobs, capture_mode,
             force_blob_path, Some(replay), "quantize_int8_mmq_ds128",
-            [k.div_ceil(1024) as u32, n as u32, 1], [256, 1, 1], 0, &mut params,
+            grid, [256, 1, 1], 0, &mut params,
             || {
                 let mut b = KernargBlob::new();
                 b.push_ptr(xp); b.push_ptr(yp); b.push_i32(k_val); b.push_i32(n_val); b
@@ -2248,7 +2280,7 @@ impl ScratchState {
     }
 
     /// Phase A Stage A — F2 batched AWQ variant of `rotate_x_mq`.
-    /// Grid.y is the batch dim — processes [N × K] x/x_rot.
+    /// Folded 1-D grid `[(K/256) * N, 1, 1]` (batch = blockIdx.x / (K/256)) — processes [N × K] x/x_rot.
     pub fn rotate_x_mq_awq_batched(
         &mut self,
         hip: &HipRuntime,
@@ -2286,6 +2318,7 @@ impl ScratchState {
             &mut s2 as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
+        let grid = fold_rows_into_x(n_groups as usize, batch_size)?;
         let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
         let result = launch_maybe_blob(
@@ -2298,7 +2331,7 @@ impl ScratchState {
             force_blob_path,
             Some(replay),
             "rotate_x_mq_awq",
-            [n_groups, batch_size as u32, 1],
+            grid,
             [32, 1, 1],
             0,
             &mut params,

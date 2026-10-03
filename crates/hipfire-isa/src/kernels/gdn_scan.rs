@@ -575,6 +575,10 @@ fn phase2(b: &mut Builder) -> R {
             wmma(b, U + 8 * j, cur, st + 4 * j, acc)?;
             wmma(b, O + 8 * j, st + 4 * j, cur + 4, acc)?;
         }
+        // Retire this step's P loads even when DOP=0 skips their consumer.
+        // Six younger Q/K/P loads remain for the next step; the final step
+        // has no prefetch, so both paths drain before joining.
+        b.wait(Counter::Load, if kk < 7 { 6 } else { 0 })?;
         // Waves whose P tile lies above the causal diagonal (DOP = 0) store a
         // +0 score tile: they skip the P product and the exponents.
         sop(b, format!("s_cmp_eq_u32 s{DOP}, 0"), &[], &[DOP])?;

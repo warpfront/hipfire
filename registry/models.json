@@ -1240,10 +1240,10 @@
     },
     "qwen3.8:flash-next": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next.mq4",
+      "file": "qwen3.8-flash-next-gptq3.mq4",
       "size_gb": 125.3,
       "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung (recipe r2, 2026-09-28). MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Differs from qwen3.8:flash-next-mq6q8-pleq8 only in the language head (Q8F16 -> MQ6G256V2). 33.4 tok/s decode vs 32.8 for the previous rung on the same build (gfx1151, 1131-token prompt, greedy, kv q8, graph off); KLD vs the BF16 source 0.0760 decode route / 0.0743 prefill route. Needs a hipfire build at or after cb566dab9 (qt=54 I64 metadata records); max_seq 2048 and the contiguous KV backend.",
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung (GPTQ3 experts, 2026-10-02). Tiers as recipe r2: MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. The routed experts are symmetric and solved with Hessian GPTQ on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 wikitext-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481, against 0.0743 / 1.263 / 0.8936 / 5.537 for the RTN-asym file; pp8192 equal to it on gfx1151. Validated on hipfire fe77c0837 (needs at least cb566dab9, qt=54 I64 metadata records); max_seq 2048 and the contiguous KV backend.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1253,10 +1253,36 @@
 
     "qwen3.8:flash-next-mq4": {
       "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next-gptq3.mq4",
+      "size_gb": 125.3,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung (GPTQ3 experts, 2026-10-02). Tiers as recipe r2: MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. The routed experts are symmetric and solved with Hessian GPTQ on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 wikitext-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481, against 0.0743 / 1.263 / 0.8936 / 5.537 for the RTN-asym file; pp8192 equal to it on gfx1151. Validated on hipfire fe77c0837 (needs at least cb566dab9, qt=54 I64 metadata records); max_seq 2048 and the contiguous KV backend.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      }
+    },
+
+    "qwen3.8:flash-next-gptq3": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next-gptq3.mq4",
+      "size_gb": 125.3,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung (GPTQ3 experts, 2026-10-02). Tiers as recipe r2: MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. The routed experts are symmetric and solved with Hessian GPTQ on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 wikitext-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481, against 0.0743 / 1.263 / 0.8936 / 5.537 for the RTN-asym file; pp8192 equal to it on gfx1151. Validated on hipfire fe77c0837 (needs at least cb566dab9, qt=54 I64 metadata records); max_seq 2048 and the contiguous KV backend.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      }
+    },
+
+    "qwen3.8:flash-next-rtn-asym": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
       "file": "qwen3.8-flash-next.mq4",
       "size_gb": 125.3,
       "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), canonical rung (recipe r2, 2026-09-28). MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Differs from qwen3.8:flash-next-mq6q8-pleq8 only in the language head (Q8F16 -> MQ6G256V2). 33.4 tok/s decode vs 32.8 for the previous rung on the same build (gfx1151, 1131-token prompt, greedy, kv q8, graph off); KLD vs the BF16 source 0.0760 decode route / 0.0743 prefill route. Needs a hipfire build at or after cb566dab9 (qt=54 I64 metadata records); max_seq 2048 and the contiguous KV backend.",
+      "desc": "Qwen3.8-Flash-Next / Qwen4 experimental HFQM (arch 16), previous canonical rung (recipe r2, RTN asymmetric experts; 2026-09-28 to 2026-10-02; superseded by the GPTQ3 file now at qwen3.8:flash-next). MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head, MQ4G256V2/MQ4G128V2 routed experts, Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Differs from qwen3.8:flash-next-mq6q8-pleq8 only in the language head (Q8F16 -> MQ6G256V2). 33.4 tok/s decode vs 32.8 for the previous rung on the same build (gfx1151, 1131-token prompt, greedy, kv q8, graph off); KLD vs the BF16 source 0.0760 decode route / 0.0743 prefill route. Needs a hipfire build at or after cb566dab9 (qt=54 I64 metadata records); max_seq 2048 and the contiguous KV backend.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,

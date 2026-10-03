@@ -351,8 +351,10 @@ Add to `crates/hipfire-arch-gemma4/src/gemma4.rs`:
    `forward_lowered_enabled() && hidden_rb.is_none()`, where `hidden_rb` is the
    **spec-decode** ring buffer, not graph capture (review N7 / Gemini REV-04).
    Gemma 4 has no equivalent spec-decode capture path, so there is nothing extra to
-   gate on. (Graph capture is hardwired off in gemma4 today anyway —
-   `!false /* graph-capture-not-wired */`.)
+   gate on. The original implementation left graph capture hardwired off;
+   v0.4.1 wires warm-up/capture/replay for graph-safe lowered decode bodies,
+   on by default for exact gfx1201 and opt-in elsewhere
+   (`HIPFIRE_GEMMA4_GRAPH` / `HIPFIRE_GRAPH`; `=0` disables).
 
 **Validation:** `cargo test` passes, existing behavior unchanged (gate off).
 
@@ -541,7 +543,7 @@ matching" (review P4); budget the risk on 3-4.
 | MoE branch combines with dense FFN | The `Moe` super-op fires after the dense FFN in the program and consumes its output; `run_moe` encapsulates the combine + outer norm, so the trailing `ResidualGemv(POST_FFN)` is identical dense vs MoE. Matches hand-path ordering exactly. |
 | `V←K` copy ordering on Full layers | Highest parity risk: the copy MUST precede k_norm. `run_attend(FULL)`'s first action is the copy; validate at long context (review B2). |
 | Post-attention double-norm | `Norm(POST_ATTN)` owns the rmsnorm; `ResidualGemv(POST_ATTN)` does residual-only. Never emit/run the norm twice (review B4). |
-| Graph capture interaction | **Not gated.** qwen35's `hidden_rb` gate is spec-decode, not graph capture, and gemma4 has no spec-decode capture path + graph capture is hardwired off today. If gemma4 graph capture is later wired, it needs its own parity check (review N7). |
+| Graph capture interaction | **Not gated by the lowered switch.** qwen35's `hidden_rb` gate is spec-decode, not graph capture, and gemma4 has no spec-decode capture path. v0.4.1 wires graph capture for graph-safe lowered decode bodies: default on for exact gfx1201, opt-in elsewhere, `=0` disables (review N7). |
 | Prefill still uses hand path | Not a risk — prefill and decode are separate functions |
 
 ## Naming convention

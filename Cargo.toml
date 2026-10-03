@@ -9,6 +9,7 @@ members = [
     "crates/railgun-corpus",
     "crates/railgun-jitcorpus",
     "crates/hipfire-isa",
+    "crates/hipfire-rip",
     "crates/hip-bridge",
     "crates/va-bridge",
     "crates/hsa-bridge",

@@ -35,6 +35,8 @@ use redline_dispatch::{
     ResourceBinding, ResourceId,
 };
 
+pub(crate) mod railgun_shadow;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayQuiescence {
     Proven,
@@ -431,6 +433,14 @@ impl Pm4Commands {
         }
     }
 
+    /// The gfx12 command dwords (railgun's shadow diff reads both tapes).
+    fn gfx12_dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Gfx12(commands) => Some(commands.dwords()),
+            Self::Legacy { .. } => None,
+        }
+    }
+
     fn dispatch(
         &mut self,
         kernel: &Kernel,
@@ -474,7 +484,12 @@ impl Pm4Commands {
         boundaries: &mut [Pm4DispatchBoundary],
     ) -> Result<(), String> {
         let Self::Gfx12(commands) = self else {
-            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+            // Legacy boundary flags were recorded while planning; the first
+            // dispatch follows the entry acquire.
+            if let Some(first) = boundaries.first_mut() {
+                first.entry_acquire = true;
+            }
+            return Ok(());
         };
         let attributions = commands
             .dispatch_span_attributions()
@@ -512,7 +527,17 @@ impl Pm4Commands {
                 architecture: Pm4Architecture::Gfx11,
                 commands,
                 ..
-            } => SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands),
+            } => {
+                if dispatch_profile {
+                    SingleQueuePm4Ib::create_boundary_profiled_legacy(device, pool, commands)
+                } else if let Some(ib_pool) = ib_pool {
+                    SingleQueuePm4Ib::create_profiled_legacy_with_ib_pool(
+                        device, pool, ib_pool, commands,
+                    )
+                } else {
+                    SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands)
+                }
+            }
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx12,
                 ..
@@ -584,6 +609,29 @@ fn radiowave_vmem_only_consumer(
     certifications.get(artifact).is_some_and(|certification| {
         certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
     })
+}
+
+/// Where Redline's resource effects for `launch` came from: the object's
+/// Radiowave sidecar, the name-keyed `pointer_effects` table, or neither
+/// (railgun shadow report).
+fn redline_effect_source(
+    certifications: &BTreeMap<PathBuf, Option<CodeObjectCertification>>,
+    launch: &RecordedHipLaunch,
+) -> String {
+    let radiowave = launch
+        .artifact
+        .as_ref()
+        .and_then(|artifact| certifications.get(artifact))
+        .and_then(Option::as_ref)
+        .is_some_and(|certification| certification.argument_effects(&launch.kernel).is_some());
+    if radiowave {
+        "radiowave"
+    } else if launch.accesses.is_some() {
+        "table"
+    } else {
+        "none"
+    }
+    .to_owned()
 }
 
 fn pm4_vmem_acquire_enabled(
@@ -2642,10 +2690,25 @@ impl Pm4RegisterPolicy {
     }
 }
 
+/// Diagnostic opt-in, default off: `HIPFIRE_GFX1100_PM4_EXPERIMENTS=1` lets
+/// the gfx1151 initiator / interleave / resource-limits knobs apply to gfx1100
+/// as well. Without it gfx1100 keeps the legacy encoding byte-for-byte.
+fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) -> &str {
+    if architecture == Pm4Architecture::Gfx11
+        && device_name.eq_ignore_ascii_case("gfx1100")
+        && hipfire_config::process_value("HIPFIRE_GFX1100_PM4_EXPERIMENTS").as_deref() == Some("1")
+    {
+        "gfx1151"
+    } else {
+        device_name
+    }
+}
+
 fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx10DispatchInitiatorPolicy {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INITIATOR")
         .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx10_dispatch_initiator_policy_from_value(architecture, device_name, &value)
@@ -2684,6 +2747,7 @@ fn gfx1151_dispatch_interleave(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Option<Gfx11DispatchInterleave> {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INTERLEAVE")
         .unwrap_or_else(|| "inherit".to_owned());
     let interleave = gfx1151_dispatch_interleave_from_value(architecture, device_name, &value)
@@ -2726,6 +2790,7 @@ fn gfx1151_resource_limits_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx11ComputeResourceLimitsPolicy {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS")
         .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx1151_resource_limits_policy_from_value(architecture, device_name, &value)
@@ -3217,6 +3282,17 @@ pub enum ReplayState {
     Fallback,
 }
 
+/// One launch seen by the G0 eager arm: the eager branch's kernel, geometry
+/// and exact padded kernarg bytes (the same bytes a recording would keep).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct G0Launch {
+    pub kernel: String,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+    pub kernarg: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedHipLaunch {
     pub kernel: String,
@@ -3546,6 +3622,15 @@ pub(crate) fn is_gdn_kernel(kernel: &str) -> bool {
     kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact")
 }
 
+/// Fail-closed gate for the PM4/AQL lowering, which turns a recorded HIP
+/// geometry (or the prepared maximum of a position-bound grid) into a direct
+/// dispatch. HIP rejects such a grid on the device's grid.y/grid.z ceiling, so
+/// the retained transport must not accept a geometry the raw launch refuses.
+fn check_prepared_grid(device_name: &str, symbol: &str, grid: [u32; 3]) -> Result<(), String> {
+    hip_bridge::check_launch_grid(grid, hip_bridge::grid_yz_limit_for_arch(device_name))
+        .map_err(|error| format!("{symbol}: {}", error.message))
+}
+
 fn is_plausible_device_address(value: u64) -> bool {
     // Heuristic: real device pointers are at least page-aligned and in a
     // high virtual range. Small integers (positions, scales, sizes) are
@@ -3824,6 +3909,17 @@ pub fn gfx1201_pm4_pacing_from_config() -> Gfx12DispatchPacing {
         eprintln!("[redline] ignoring HIPFIRE_GFX1201_PM4_PACING: {reason}");
         GFX1201_DEFAULT_PM4_PACING
     })
+}
+
+/// An explicit `HIPFIRE_GFX1201_PM4_PACING` (`off` / `nop:N`), or `None` when
+/// it is unset, `auto` or unparseable. railgun's gfx1201 lowering keeps its
+/// own per-arch pacing (`railgun::plan::ArchLowering`) unless this is set.
+pub(crate) fn gfx1201_pm4_pacing_override() -> Option<Gfx12DispatchPacing> {
+    let value = hipfire_config::process_value("HIPFIRE_GFX1201_PM4_PACING")?;
+    if matches!(value.trim().to_ascii_lowercase().as_str(), "" | "auto") {
+        return None;
+    }
+    parse_gfx1201_pm4_pacing(Some(&value)).ok()
 }
 
 fn parse_gfx1201_pm4_pacing(value: Option<&str>) -> Result<Gfx12DispatchPacing, String> {
@@ -4409,6 +4505,7 @@ impl PreparedPm4Replay {
                 });
             }
         }
+        let patch_started = crate::gap_timing::now();
         // Patch typed kernarg bindings while queue is quiescent.
         // Single code path shared with recorded-HIP replay: both transports
         // must apply the identical binding set via `apply_kernarg_bindings_for_dispatch`.
@@ -4481,16 +4578,27 @@ impl PreparedPm4Replay {
         if let Some(index) = self.kernarg_publish {
             self.kernargs[index].publish_host_writes();
         }
+        crate::gap_timing::add_since(crate::gap_timing::Slot::Patch, patch_started);
+        let wait_started = crate::gap_timing::now();
         // SAFETY: forwarded from the caller that owns the model allocations.
-        unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(|(error, quiescence)| {
-            RetainedReplayFailure {
+        let result = unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(
+            |(error, quiescence)| RetainedReplayFailure {
                 error: error.to_string(),
                 quiescence: match quiescence {
                     Quiescence::Proven => ReplayQuiescence::Proven,
                     Quiescence::Unknown => ReplayQuiescence::Unknown,
                 },
-            }
-        })
+            },
+        );
+        crate::gap_timing::add_since(crate::gap_timing::Slot::SubmitWait, wait_started);
+        if let Ok(timing) = &result {
+            crate::gap_timing::add_ns(
+                crate::gap_timing::Slot::GpuSpan,
+                timing.last_end.saturating_sub(timing.first_start).saturating_mul(1_000_000_000)
+                    / timing.frequency_hz.max(1),
+            );
+        }
+        result
     }
 
     /// Replay one instrumented retained graph exactly once.
@@ -4622,6 +4730,20 @@ pub struct ReplayController {
     window_effects: MemoryEffects,
     /// Shadow-only executor override for the next eligible forward.
     shadow_body_route: Option<ShadowBodyRoute>,
+    /// G0 recording-invariance eager arm (railgun design §5 G0): `Some`
+    /// while every funnel launch is observed with `is_recording()` false, so
+    /// recording-dependent predicates take their eager branch.
+    g0_observation: Option<Vec<G0Launch>>,
+    /// railgun M1 shadow (`HIPFIRE_RAILGUN_SHADOW`): authors railgun's
+    /// program next to every recording and diffs its PM4 lowering against
+    /// the prepared tape. Never changes the route.
+    railgun_shadow: Option<railgun_shadow::RailgunShadow>,
+    /// railgun M2 check mode (`HIPFIRE_RAILGUN_CHECK`): run by
+    /// `Gpu::replay_pm4_routed`, parked here between steps.
+    pub(crate) railgun_check: Option<Box<crate::railgun_check::CheckState>>,
+    /// Count of PM4 programs prepared by this controller: the check mode's
+    /// once-per-program weights verification keys on it.
+    pm4_generation: u64,
 }
 
 /// Which executor the retained body uses on the next eligible forward.
@@ -4705,6 +4827,10 @@ impl ReplayController {
             binding_refresh_pending: false,
             window_effects_base: MemoryEffects::default(),
             window_effects: MemoryEffects::default(),
+            g0_observation: None,
+            railgun_shadow: railgun_shadow::RailgunShadow::from_config(),
+            railgun_check: crate::railgun_check::CheckState::from_config().map(Box::new),
+            pm4_generation: 0,
         }
     }
 
@@ -4824,6 +4950,9 @@ impl ReplayController {
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
         self.window_effects = MemoryEffects::default();
+        if let Some(shadow) = self.railgun_shadow.as_mut() {
+            shadow.reset();
+        }
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -4969,6 +5098,52 @@ impl ReplayController {
 
     pub fn is_recording(&self) -> bool {
         self.state == ReplayState::RecordingWarmup && self.forward_eligible
+    }
+
+    /// Start the G0 eager arm (railgun design §5 G0). Launches through the
+    /// recorder funnels are observed (kernel, geometry, exact kernarg bytes)
+    /// while [`Self::is_recording`] stays false, so every recording-dependent
+    /// predicate takes its eager branch. Refused while a recording is live.
+    pub fn begin_g0_observation(&mut self) -> Result<(), &'static str> {
+        if self.is_recording() {
+            return Err("G0 observation cannot overlap a replay recording");
+        }
+        if self.g0_observation.is_some() {
+            return Err("G0 observation is already active");
+        }
+        self.g0_observation = Some(Vec::new());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn is_g0_observing(&self) -> bool {
+        self.g0_observation.is_some()
+    }
+
+    pub(crate) fn observe_g0_launch(
+        &mut self,
+        kernel: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernarg: &[u8],
+    ) {
+        if let Some(launches) = self.g0_observation.as_mut() {
+            launches.push(G0Launch {
+                kernel: kernel.to_owned(),
+                grid,
+                block,
+                shared_mem,
+                kernarg: kernarg.to_vec(),
+            });
+        }
+    }
+
+    /// Close the G0 eager arm and return the observed launches.
+    pub fn finish_g0_observation(&mut self) -> Result<Vec<G0Launch>, &'static str> {
+        self.g0_observation
+            .take()
+            .ok_or("no G0 observation is active")
     }
 
     /// Apply the model's one-shot plain-AR eligibility decision to this
@@ -5143,6 +5318,7 @@ impl ReplayController {
                 workgroup[axis] = u16::try_from(value)
                     .map_err(|_| format!("{symbol}: workgroup dimension {value} exceeds u16"))?;
             }
+            check_prepared_grid(device.name(), &symbol, launch.grid)?;
             let geometry = LaunchGeometry::from_hip_workgroups(launch.grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             let dispatch = RecordedDispatch::new(0, kernel, geometry, kernarg)
@@ -5348,8 +5524,8 @@ impl ReplayController {
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
-        if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
-            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        if dispatch_profile && pm4_architecture == Pm4Architecture::Gfx10 {
+            return Err("per-dispatch PM4 profiling requires gfx11 or gfx12".to_owned());
         }
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
@@ -5435,6 +5611,7 @@ impl ReplayController {
                     // Keep launch.grid replaced for geometry; dynamic_grids stores prepared_grid.
                 }
             }
+            check_prepared_grid(device.name(), &symbol, geometry_grid)?;
             let geometry = LaunchGeometry::from_hip_workgroups(geometry_grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             device
@@ -5654,6 +5831,8 @@ impl ReplayController {
             let mut resource_frontier = ResourceFrontier::default();
             let mut dependency_waits = 0usize;
             let mut dependency_acquires = 0usize;
+            let shadow_on = self.railgun_shadow.is_some();
+            let mut shadow_decisions = Vec::new();
             for (position, index) in order.iter().copied().enumerate() {
                 let mut boundary = Pm4DispatchBoundary::default();
                 if position != 0 {
@@ -5718,8 +5897,22 @@ impl ReplayController {
                         );
                         commands.acquire_inter_node(gfx12_gcr_trim, boundary.acquire_vmem);
                     }
+                    if shadow_on {
+                        shadow_decisions.push(railgun::shadow::RedlineDecision {
+                            effects: redline_effect_source(&self.radiowave_effect_certifications, current_launch),
+                            resource_independent: resources_independent,
+                            name_acquire: self.pm4_mid_acquire_policy.acquire_between(previous, current),
+                            pre_dispatch_name: gfx12_pre_dispatch_acquire,
+                        });
+                    }
                 } else {
                     resource_frontier.advance(&self.recorded[index], false);
+                    if shadow_on {
+                        shadow_decisions.push(railgun::shadow::RedlineDecision {
+                            effects: redline_effect_source(&self.radiowave_effect_certifications, &self.recorded[index]),
+                            ..Default::default()
+                        });
+                    }
                 }
                 commands
                     .dispatch(
@@ -5799,6 +5992,79 @@ impl ReplayController {
                     }
                 }
             }
+            // railgun M1 shadow: prepare railgun's lowering of the same tape
+            // and diff it against this one. Nothing railgun builds is
+            // submitted; the route below is unchanged.
+            if let Some(shadow) = self.railgun_shadow.as_mut() {
+                let skip = if pm4_architecture != Pm4Architecture::Gfx12 {
+                    Some("railgun M1 authors gfx12 tapes only")
+                } else if reorder_window.is_some() {
+                    Some("the single-IB reorder permutes the recorded order")
+                } else if dispatch_profile {
+                    Some("per-dispatch profile tape")
+                } else {
+                    None
+                };
+                match skip {
+                    Some(reason) if shadow.backend_railgun() => {
+                        return Err(format!("railgun backend refused: {reason}"));
+                    }
+                    Some(reason) => eprintln!("[railgun] shadow skipped: {reason}"),
+                    None => {
+                        let register_policy = self.pm4_register_policy;
+                        let new_commands = || {
+                            Pm4Commands::new_with_dependency(
+                                pm4_architecture,
+                                register_policy,
+                                dispatch_initiator_policy,
+                                dispatch_interleave,
+                                resource_limits_policy,
+                                LegacyDependencyMode::CsPartialFlush,
+                            )
+                        };
+                        let kernarg_images = kernargs
+                            .iter_mut()
+                            .map(|buffer| {
+                                let address = buffer.address() as usize as u64;
+                                (buffer.as_mut_bytes().to_vec(), address)
+                            })
+                            .collect();
+                        let resources = self
+                            .tape_resources
+                            .iter()
+                            .map(|(&(base, bytes), id)| (id.index(), (base, bytes)))
+                            .collect();
+                        let executable = shadow.compare(
+                            railgun_shadow::RedlinePrepared {
+                                device_name: device.name(),
+                                launches: recorded,
+                                ib: commands.gfx12_dwords().unwrap_or(&[]),
+                                kernels: &kernels,
+                                kernargs: kernarg_images,
+                                decisions: std::mem::take(&mut shadow_decisions),
+                                word_patches: &dynamic_kernarg_bindings,
+                                grid_patches: &dynamic_grids,
+                                resources,
+                            },
+                            railgun_shadow::Transport {
+                                pool: &pool,
+                                new_commands: &new_commands,
+                                gcr_trim: gfx12_gcr_trim,
+                                entry_policy: entry_acquire_policy,
+                            },
+                        );
+                        // HIPFIRE_RAILGUN_BACKEND=railgun (M2): the prepared
+                        // tape runs railgun's lowering; a refusal fails the
+                        // prepare closed, never back to this planner's IB.
+                        match executable {
+                            None => {}
+                            Some(Ok(railgun_commands)) => commands = railgun_commands,
+                            Some(Err(reason)) => return Err(format!("railgun backend refused: {reason}")),
+                        }
+                    }
+                }
+            }
+            let command_dwords = commands.len_dwords();
             // HIPFIRE_REDLINE_IB_POOL=vmem: allocate the retained indirect
             // buffer from a GPU-agent (VRAM) pool so the command processor
             // fetches the tape from VRAM instead of re-reading it over the
@@ -5832,6 +6098,9 @@ impl ReplayController {
             )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
+            if self.railgun_shadow.as_ref().is_some_and(railgun_shadow::RailgunShadow::backend_railgun) {
+                return Err("railgun backend refused: multi-queue PM4 tapes are not lowered by railgun".to_owned());
+            }
             let min_parallel_width = pm4_min_parallel_width_from_config();
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_config();
             let max_parallel_phases = pm4_max_parallel_phases_from_config();
@@ -6089,6 +6358,7 @@ impl ReplayController {
             self.binding_revision.0,
             backlog.join(" "),
         );
+        self.pm4_generation += 1;
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -6188,6 +6458,28 @@ impl ReplayController {
         self.observe_replay_result(position, result)
     }
 
+    /// The HIP twin's inputs (railgun check mode, design §2.4): each prepared
+    /// dispatch's kernarg bytes exactly as the last PM4 replay submitted them
+    /// (bindings already applied for that position). Refused while the tape
+    /// patches grids, which the twin would have to re-derive.
+    pub(crate) fn prepared_pm4_submitted_kernargs(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        let prepared = self.prepared_pm4.as_mut().ok_or("no prepared PM4 replay")?;
+        if !prepared.dynamic_grids.is_empty() {
+            return Err(format!("{} dynamic grid patches", prepared.dynamic_grids.len()));
+        }
+        Ok(prepared.kernargs.iter_mut().map(|k| k.as_mut_bytes().to_vec()).collect())
+    }
+
+    /// Generation of the prepared PM4 program (see `pm4_generation`).
+    pub(crate) fn prepared_pm4_generation(&self) -> u64 {
+        self.pm4_generation
+    }
+
+    /// The prepared railgun program's surfaces (`None` without the shadow).
+    pub(crate) fn railgun_program_surfaces(&self) -> Option<railgun_shadow::ProgramSurfaces> {
+        self.railgun_shadow.as_ref().and_then(|s| s.surfaces().cloned())
+    }
+
     pub fn prepared_pm4_dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
         self.prepared_pm4
             .as_ref()
@@ -6271,6 +6563,9 @@ impl ReplayController {
             ReplayState::Ready => return Err("cannot capture after a prepared plan is installed"),
             _ => {}
         }
+        if self.g0_observation.is_some() {
+            return Err("cannot capture during a G0 observation");
+        }
         self.recorded.clear();
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
@@ -6286,6 +6581,9 @@ impl ReplayController {
         self.binding_refresh_pending = false;
         self.window_effects_base = memory_effects::snapshot();
         self.window_effects = MemoryEffects::default();
+        if let Some(shadow) = self.railgun_shadow.as_mut() {
+            shadow.reset();
+        }
         self.state = ReplayState::RecordingWarmup;
         Ok(())
     }
@@ -6528,6 +6826,7 @@ impl ReplayController {
         Ok(count)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_hip_launch_typed_bound(
         &mut self,
         hip: &HipRuntime,
@@ -6539,6 +6838,8 @@ impl ReplayController {
         kernarg: &[u8],
         grid_binding: Option<ReplayGridBinding>,
         declared_kernarg_bindings: &[ReplayKernargBinding],
+        compiler: Option<&crate::compiler::KernelCompiler>,
+        declared_words: &[railgun::kernel::DeclaredWord],
     ) {
         if !self.is_recording() {
             return;
@@ -6580,6 +6881,7 @@ impl ReplayController {
         // unresolvable slot (or unknown kernel) leaves the launch untyped on
         // the raw snapshot path — never a partial slot set.
         let binding_layout = self.build_binding_layout(hip, kernel, kernarg, certified_effects.as_deref());
+        let before = self.recorded.len();
         self.record_hip_launch_with_accesses(
             kernel,
             artifact,
@@ -6592,6 +6894,12 @@ impl ReplayController {
             accesses,
             binding_layout,
         );
+        if self.recorded.len() > before {
+            if let Some(shadow) = self.railgun_shadow.as_mut() {
+                let artifact = self.recorded.last().and_then(|launch| launch.artifact.as_deref());
+                shadow.observe(hip, compiler, kernel, artifact, grid, block, shared_mem, kernarg, declared_words);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -9088,6 +9396,15 @@ mod tests {
     }
 
     #[test]
+    fn prepared_grid_rejects_oversized_yz_on_gfx1201_only() {
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_536, 1]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [1 << 20, 1, 65_536]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_537, 1]).is_err());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 1, 65_537]).is_err());
+        assert!(check_prepared_grid("gfx1100", "k.kd", [7, 65_537, 65_537]).is_ok());
+    }
+
+    #[test]
     fn gfx1151_cu_mask_is_exact_arch_and_wgp_paired() {
         assert_eq!(
             gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "all"),
@@ -9906,6 +10223,31 @@ mod tests {
         controller.observe_shadow(passing(2.0));
         assert_eq!(controller.state(), ReplayState::Fallback);
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn g0_observation_keeps_the_eager_branch_and_excludes_recording() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_g0_observation().unwrap();
+        // The eager arm must not look like a recording to any predicate, and
+        // a recording cannot start underneath it.
+        assert!(!controller.is_recording());
+        assert!(controller.begin_capture().is_err());
+        assert!(controller.begin_g0_observation().is_err());
+        controller.observe_g0_launch("a", [1, 2, 3], [32, 1, 1], 0, &[1, 2]);
+        controller.observe_g0_launch("b", [4, 1, 1], [64, 1, 1], 128, &[3]);
+        // Observed launches never enter the replay tape.
+        assert!(controller.recorded_launches().is_empty());
+        let seen = controller.finish_g0_observation().unwrap();
+        assert_eq!(
+            seen.iter().map(|l| (l.kernel.as_str(), l.grid, l.shared_mem, l.kernarg.clone())).collect::<Vec<_>>(),
+            vec![("a", [1, 2, 3], 0, vec![1, 2]), ("b", [4, 1, 1], 128, vec![3])]
+        );
+        assert!(controller.finish_g0_observation().is_err());
+
+        controller.begin_capture().unwrap();
+        assert!(controller.is_recording());
+        assert!(controller.begin_g0_observation().is_err());
     }
 
     #[test]

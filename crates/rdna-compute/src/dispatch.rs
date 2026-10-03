@@ -909,6 +909,11 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// Qwen4 symmetric MQ4 trunk verified for the dense IU4 route
+    /// (`HIPFIRE_QWEN4_TRUNK_IU4`); set by the Qwen4 forward after every
+    /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
+    /// [`Gpu::qwen4_trunk_iu4_applies`].
+    pub qwen4_trunk_iu4: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -1502,6 +1507,11 @@ impl Gpu {
         // APU vs discrete GPU) from physical topology, which a
         // HIPFIRE_TARGET_ARCH override does not change.
         crate::arch_caps::note_process_gpu_arch(&detected_arch);
+        // The grid.y/grid.z ceiling is a property of the physical device, so
+        // it keys off the detected arch, not the HIPFIRE_TARGET_ARCH override.
+        // Set once here: this `Gpu` owns its `HipRuntime` for exactly one
+        // device, so the per-runtime limit is race-free.
+        hip.set_launch_grid_limit_for_arch(&detected_arch);
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -1665,6 +1675,7 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            qwen4_trunk_iu4: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
@@ -2650,6 +2661,34 @@ impl Gpu {
             shared_mem,
             params,
             ReplayLaunchBindings::NONE,
+            &[],
+            blob_builder,
+        )
+    }
+
+    /// [`Self::launch_maybe_blob`] for a launch whose kernarg carries dynamic
+    /// words (railgun design §1.6: words are declared by the composer at the
+    /// launch site). The declaration reaches the railgun shadow observer only;
+    /// the launch and Redline's recording are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_maybe_blob_declared(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        params: &mut [*mut std::ffi::c_void],
+        declared_words: &[railgun::kernel::DeclaredWord],
+        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
+    ) -> HipResult<()> {
+        self.launch_maybe_blob_bound(
+            func_name,
+            grid,
+            block,
+            shared_mem,
+            params,
+            ReplayLaunchBindings::NONE,
+            declared_words,
             blob_builder,
         )
     }
@@ -2686,6 +2725,7 @@ impl Gpu {
                 grid: grid_binding,
                 kernargs: &[],
             },
+            &[],
             blob_builder,
         )
     }
@@ -2699,9 +2739,16 @@ impl Gpu {
         shared_mem: u32,
         params: &mut [*mut std::ffi::c_void],
         bindings: ReplayLaunchBindings<'_>,
+        railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        // Fail closed before the recorder / capture tapes see the launch: an
+        // oversized grid.y/grid.z must never be recorded, captured, or clamped.
+        self.hip
+            .validate_launch_grid(grid)
+            .map_err(|e| e.with_kernel(func_name))?;
         let record = self.replay.is_recording();
+        let observe = self.replay.is_g0_observing();
         // Slice 1: drain a post-scratch-growth binding refresh before the
         // first launch that follows the growth. Growth always completes
         // before this point (callers invalidate, then grow, then launch), so
@@ -2715,9 +2762,13 @@ impl Gpu {
             }
         }
         let result: HipResult<()> =
-            if record || self.graphs.capture_mode || self.flags.force_blob_path {
+            if record || observe || self.graphs.capture_mode || self.flags.force_blob_path {
                 let mut blob = blob_builder();
                 blob.pad_to(16);
+                if observe {
+                    self.replay
+                        .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+                }
                 if record {
                     let artifact = recorded_launch_artifact(&self.compiler, func_name);
                     self.replay.record_hip_launch_typed_bound(
@@ -2730,6 +2781,8 @@ impl Gpu {
                         blob.as_bytes(),
                         bindings.grid,
                         bindings.kernargs,
+                        Some(&self.compiler),
+                        railgun_words,
                     );
                 }
                 let func = &self.functions[func_name];
@@ -2965,6 +3018,14 @@ impl Gpu {
         bindings: ReplayLaunchBindings<'_>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Fail closed before the recorder / capture tapes see the launch.
+        self.hip
+            .validate_launch_grid(grid)
+            .map_err(|e| e.with_kernel(func_name))?;
+        if self.replay.is_g0_observing() {
+            self.replay
+                .observe_g0_launch(func_name, grid, block, shared_mem, kernargs);
+        }
         if self.replay.is_recording() {
             let artifact = recorded_launch_artifact(&self.compiler, func_name);
             self.replay.record_hip_launch_typed_bound(
@@ -2977,6 +3038,8 @@ impl Gpu {
                 kernargs,
                 bindings.grid,
                 bindings.kernargs,
+                Some(&self.compiler),
+                &[],
             );
         }
         let result = if self.graphs.capture_mode {

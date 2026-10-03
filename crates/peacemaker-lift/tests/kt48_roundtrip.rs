@@ -161,9 +161,9 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
 #[test]
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
-        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "6a2dbe591a58680abbeef680be82a986dc0aee0beb2f46ef7cc74f4b3bfb9111", 12, 362_048),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "8edd7565f6a442b67224cad950b3532a07386c9543b7c04c65e024a8dd4df467", 5, 83_192),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "cc0288f8162aeb1329f0e1a2d9d0fbd88650b501e5be04e77c1205b8f7a1bab3", 5, 83_472),
+        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "1efb0b8b16b510407446dae8dc4ec137955de27d818b424daeb84383c8191fa7", 12, 361_976),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "f166cf72f3c49c286aacbc627beeb204b6022fbf5865db8785dc7b54bce3321d", 5, 83_120),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc", 5, 83_400),
     ] {
         let input = load(relative, sha);
         assert_eq!(input.len(), bytes);
@@ -462,7 +462,7 @@ fn wait_facts_and_obligations() {
     assert_eq!(counts.kmcnt, vec![0; 7]);
     assert_eq!((counts.loadcnt, counts.dscnt, counts.loadcnt_dscnt, counts.alu), (16, 28, 3, 142));
 
-    let facts = replay(body, ARCH).unwrap();
+    let facts = replay(body, ARCH, kernel.wave).unwrap();
     assert_eq!(facts.obligations.len(), 124);
     let ds_stores: Vec<_> = facts.events.iter()
         .filter(|e| name(body.insts.get(e.inst).unwrap()) == "ds_store_2addr_b64")
@@ -494,7 +494,7 @@ fn wait_facts_and_obligations() {
     mutated[at..at + 4].copy_from_slice(&0xbfc7_0001u32.to_le_bytes());
     let weakened = lift(&mutated, Frontend::Hipcc);
     let body = &selected(&weakened.program).body;
-    let facts = replay(body, ARCH).unwrap();
+    let facts = replay(body, ARCH, selected(&weakened.program).wave).unwrap();
     let load = body.insts.get(smem[0].inst).unwrap();
     assert_eq!(name(load), "s_load_b128");
     let stranded: Vec<_> = facts.obligations.iter()
@@ -514,7 +514,7 @@ fn wait_facts_and_obligations() {
 fn replay_follows_feasible_paths_only() {
     let lifted = lift(&kt48_co(), Frontend::Hipcc);
     let kernel = selected(&lifted.program);
-    let facts = peacemaker_ir::passes::waits::replay(&kernel.body, ARCH).unwrap();
+    let facts = peacemaker_ir::passes::waits::replay(&kernel.body, ARCH, kernel.wave).unwrap();
     let sites: BTreeSet<usize> = facts.obligations.iter().map(|o| position(kernel, o.insts[0])).collect();
     for site in [956, 957, 973, 974] {
         assert!(sites.contains(&site), "feasible first-iteration site {site}");
