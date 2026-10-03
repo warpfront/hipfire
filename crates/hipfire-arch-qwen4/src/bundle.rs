@@ -337,15 +337,10 @@ impl Qwen4Bundle {
                 "Qwen4 forward chunk capacity is zero".to_string(),
             ));
         }
-        // A chunk's PLE prefetch is one row-store request: the staging sized
-        // at assembly bounds it.
-        let ple_rows_cap = self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
-        let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk).min(ple_rows_cap);
-        if requested == 0 {
-            return Err(BundleError::Forward(
-                "Qwen4 PLE row store cannot stage one chunk row".to_string(),
-            ));
-        }
+        // A chunk's PLE prefetch may exceed one row-store staging buffer:
+        // RowFetch splits it into consecutive tickets, so the chunk is not
+        // capped by the staging capacity.
+        let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk);
         // The gathered QSA prefill attention (HIPFIRE_QWEN4_QSA_WMMA_GATHER)
         // converts the cache rows it reads into its own scratch: reserve it
         // for the whole context now, before any capture or record, so a
@@ -465,6 +460,17 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Start OS readahead of the PLE rows of `tokens[skip..]`, where `tokens`
+    /// continue from the current position and `tokens[..skip]` is the chunk
+    /// about to run: the next chunk then finds its rows in the page cache
+    /// instead of stalling on cold reads (one chunk ahead, so the hints do not
+    /// queue ahead of the running chunk's own reads).
+    pub(crate) fn ple_readahead(&self, tokens: &[u32], skip: usize) {
+        let mut ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
+        ids.drain(..(skip * crate::ple::PLE_HEAD_COUNT).min(ids.len()));
+        self.ple_rows.readahead(ids);
+    }
+
     /// Install (or clear) the QSA parity observer on the attached forward.
     #[cfg(feature = "reference-parity")]
     pub fn set_qsa_tap(
@@ -530,7 +536,7 @@ impl Qwen4Bundle {
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
     }
 
-    fn spec_forward_rows_with_output(
+    pub(crate) fn spec_forward_rows_with_output(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
@@ -666,6 +672,21 @@ impl Qwen4Bundle {
         let source = source.sub_offset(offset, width);
         gpu.copy_d2d(&source, destination, destination.byte_size())
             .map_err(BundleError::Hip)
+    }
+
+    /// Host copy of the first `rows` logit rows the last spec forward wrote.
+    pub(crate) fn spec_logits_host(&self, gpu: &Gpu, rows: usize) -> Result<Vec<f32>, BundleError> {
+        let spec_logits = self.spec_logits.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec logits are not attached".to_string())
+        })?;
+        let capacity = spec_logits.numel() / self.config.vocab_size;
+        if rows > capacity {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec logits hold at most {capacity} rows, {rows} requested"
+            )));
+        }
+        let logits = spec_logits.sub_offset(0, rows * self.config.vocab_size);
+        gpu.download_f32(&logits).map_err(BundleError::Hip)
     }
 
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
@@ -806,6 +827,35 @@ impl Qwen4Bundle {
                 MtpStep::Append,
             )
             .map(|_| ())
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// [`Self::mtp_append_token`] for `tokens` at `position..`, whose backbone
+    /// hidden rows are the spec-hidden capture rows `first_row..` of the last
+    /// chunked prefill, in one batched MTP step (at most
+    /// [`crate::mtp_gpu::MTP_APPEND_ROWS`] tokens).
+    pub(crate) fn mtp_append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        first_row: usize,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        let width = self.config.hc_count * self.config.hidden_size;
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let (offset, len) = (first_row * width, tokens.len() * width);
+        if offset + len > source.numel() {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden rows are outside capture".to_string(),
+            ));
+        }
+        let hidden = source.sub_offset(offset, len);
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".into()))?
+            .append_rows(gpu, &self.weights, &self.config, tokens, &hidden, position)
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
@@ -1164,6 +1214,7 @@ impl Qwen4Bundle {
             }
         }
         let chunk = self.spec_chunk_rows();
+        let budget = self.config.indexer_budget;
         if let Some(cache) = self.prefix.as_mut() {
             let chunk = chunk.ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
@@ -1171,7 +1222,8 @@ impl Qwen4Bundle {
             cache.published = false;
             cache.mode = mode;
             cache.chunk = chunk;
-            let boundary = prompt.len() / chunk * chunk;
+            let boundary =
+                crate::gpu_forward::prefill_checkpoint_boundary(budget, prompt.len(), chunk);
             cache.capture_at = (boundary > plan.start_pos).then_some(boundary);
         }
         Ok(())

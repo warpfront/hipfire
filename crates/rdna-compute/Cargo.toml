@@ -841,6 +841,18 @@ name = "tmp_scratch_leak_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "fa2_fp8_q0_compare_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fp8_expand_exact_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4v2_residual_row_serial_gfx1151"
+required-features = ["lab"]
+
+[[example]]
 name = "test_kv_slot_desc_ports"
 required-features = ["lab"]
 

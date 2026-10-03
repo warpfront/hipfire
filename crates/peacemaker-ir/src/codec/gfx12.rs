@@ -1104,6 +1104,7 @@ mod tests {
     }
     #[test]
     fn global_address_width_matches_llvm_disassembly_in_both_modes() {
+        if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
         use std::{io::Write, process::{Command, Stdio}};
         for (arch, cpu) in [(Arch::Gfx1100, "gfx1100"), (Arch::Gfx1151, "gfx1151"), (Arch::Gfx1201, "gfx1201")] {
             for (saddr, width) in [(4u32, 1u8), (124, 2)] {

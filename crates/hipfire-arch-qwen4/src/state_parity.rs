@@ -1872,7 +1872,7 @@ fn real_model_probe(
             return Err(format!("allocate real-model MTP logits: {error}"));
         }
     };
-    let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(DRAFTS.len(), 2048);
+    let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(DRAFTS.len(), 2048, None);
     use hipfire_runtime::spec::MtpDrafter;
     let seed = match drafter.mtp_prefill(gpu, bundle, tokens, tokens, 0, false, &|| false) {
         Ok(seed) => seed,

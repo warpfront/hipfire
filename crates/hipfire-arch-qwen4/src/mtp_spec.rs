@@ -6,15 +6,18 @@
 //!
 //! The runtime owns the speculative loop and its pending-seed contract.  This
 //! module only records the native MTP count convention and lowers an already
-//! verified greedy result onto the canonical runtime types.  In particular,
+//! verified prefix (greedy, or naive-sampled at temperature > 0) onto the
+//! canonical runtime types.  In particular,
 //! the seed is never copied into `MtpWindow::committed` or `SpecStep::emit`.
 //! Target rollback counts accepted drafts only; the position helpers take the
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::{Qwen4Bundle, Qwen4PrefixMode, Qwen4PrefixPlan};
+use crate::mtp_gpu::MTP_APPEND_ROWS;
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
+use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::spec::{
     accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpSpeculator, MtpWindow, SpecAdvance,
     SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
@@ -89,14 +92,56 @@ pub fn target_commit_accept_len(accepted: &GreedyAccept) -> usize {
     accepted.accepted - usize::from(accepted_eos)
 }
 
-/// Native MTP uses greedy target picks only.  A sampled request must fail
-/// closed until an exact distribution-verification implementation exists.
-pub fn require_native_greedy(temp: f32) -> Result<(), String> {
-    if !temp.is_finite() || temp.abs() > 1.0e-6 {
-        return Err(
-            "Qwen4 native MTP supports greedy verification only; sampled MTP requires exact distribution verification"
-                .to_string(),
-        );
+/// Turn the argmax picks of the last spec forward's logit rows into the
+/// target's picks for the request.  Greedy keeps the argmaxes.  A sampled
+/// request draws rows in order with the AR producer's sampler instead; drafts
+/// stay argmax, so accepting a draft iff it equals its row's draw (the
+/// unchanged prefix rule) is SpecInfer naive sampling, and every emitted
+/// token is a genuine target draw: the output distribution is exactly AR's.
+///
+/// Drawing stops at the row the prefix rule ends on (the first mismatch, an
+/// accepted `eos`, or the bonus row): rows after it keep their argmax and are
+/// never read.  Every draw is then exactly one emitted token, so the shared
+/// sampler RNG advances as it does under AR and a seeded sampled request
+/// emits AR's tokens wherever the verify logits equal AR's decode logits.
+fn draw_target_picks(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    request: &SpecRequestConfig,
+    drafts: &[u32],
+    eos: u32,
+    picks: &mut [u32],
+) -> Result<(), String> {
+    if request.temp <= 1.0e-6 {
+        return Ok(());
+    }
+    let rows = drafts.len() + 1;
+    if picks.len() < rows {
+        return Err(format!(
+            "Qwen4 native MTP verifier returned {} picks for {} drafts",
+            picks.len(),
+            drafts.len()
+        ));
+    }
+    let mut logits = bundle
+        .spec_logits_host(gpu, rows)
+        .map_err(|error| error.to_string())?;
+    let sampler = SamplerConfig {
+        temperature: request.temp,
+        top_p: request.top_p,
+        top_k: (request.top_k > 0).then_some(request.top_k as u32),
+        min_p: (request.min_p > 0.0).then_some(request.min_p),
+        ..SamplerConfig::greedy()
+    };
+    for (row, logits) in logits
+        .chunks_exact_mut(bundle.config.vocab_size)
+        .enumerate()
+    {
+        picks[row] = sample_cpu(logits, &[], &sampler);
+        match drafts.get(row) {
+            Some(&draft) if draft == picks[row] && draft != eos => {}
+            _ => break,
+        }
     }
     Ok(())
 }
@@ -585,10 +630,18 @@ pub struct Qwen4MtpDrafter {
     /// counts (see `observe_agreement`); picks the verify route and draft
     /// depth when `HIPFIRE_MTP_INCREMENTAL` is unset.
     agreement: [(f32, f32); MTP_MAX_DEPTH],
+    /// Chat end-of-turn token (`<|im_end|>`). Windows stop at it instead of
+    /// the config EOS so an accepted end-of-turn stays pending for the
+    /// terminal flush rather than committing a draft tail past it (a
+    /// strict-prefix terminal this drafter cannot repair).
+    // ponytail: one terminator; a draft run past the config EOS still takes
+    // the unrepaired-terminal rewind. Carry a terminator set if raw
+    // completions need it.
+    end_of_turn: Option<u32>,
 }
 
 impl Qwen4MtpDrafter {
-    pub fn new(max_k: usize, ctx_capacity: usize) -> Self {
+    pub fn new(max_k: usize, ctx_capacity: usize, end_of_turn: Option<u32>) -> Self {
         Self {
             max_k: max_k.clamp(1, 10),
             ctx_capacity,
@@ -598,6 +651,7 @@ impl Qwen4MtpDrafter {
             row_hidden: None,
             prefill_rows: 0,
             agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
+            end_of_turn,
         }
     }
 
@@ -711,9 +765,11 @@ impl Qwen4MtpDrafter {
             timers.mark(gpu, "target_row");
             let pick = {
                 let bundle = Self::bundle(target)?;
-                bundle
+                let mut pick = [bundle
                     .spec_capture_token(gpu, token)
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?];
+                draw_target_picks(bundle, gpu, &self.request, &[], eos, &mut pick)?;
+                pick[0]
             };
             picks.push(pick);
             let row_hidden = self.row_hidden()?;
@@ -869,93 +925,9 @@ impl Qwen4MtpDrafter {
             .as_ref()
             .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())
     }
-}
 
-impl MtpDrafter for Qwen4MtpDrafter {
-    fn mtp_prefill(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        prompt_tokens: &[u32],
-        fill_tokens: &[u32],
-        start_pos: usize,
-        cache_hit: bool,
-        abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
-        require_native_greedy(self.request.temp)?;
-        validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
-        self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
-        // A miss resets target, head and draft policy; a hit restores the
-        // bundle's canonical checkpoint at `start_pos` into all three.
-        let plan = Qwen4PrefixPlan {
-            start_pos: if cache_hit { start_pos } else { 0 },
-        };
-        Self::bundle(target)?
-            .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
-            .map_err(|error| error.to_string())?;
-        self.ensure_resources(gpu, target)?;
-        let capture_at = {
-            let bundle = Self::bundle(target)?;
-            let target_position = bundle.state.position;
-            let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
-            if target_position != start_pos || mtp_position != start_pos {
-                return Err(format!(
-                    "Qwen4 MTP prefill position mismatch: target={}, mtp={}, start={start_pos}",
-                    target_position, mtp_position
-                ));
-            }
-            bundle.prefix_capture_at()
-        };
-        let pending = self.pending_hidden()?;
-        let mut first_token = None;
-        // One chunked target forward per chunk instead of one single-row forward
-        // per prompt token: the shared forward already captures the whole
-        // chunk's wide hidden, and the head then consumes each row in order.
-        // Cost goes from ~1 single-row forward per prompt token to the ordinary
-        // chunked prefill rate plus one head step per token.
-        // Each prompt token selects with its own query and the pooled keys
-        // visible at that position, regardless of target prefill chunking.
-        let chunk_rows = self.prefill_rows.max(1);
-        for (chunk_index, chunk) in fill_tokens.chunks(chunk_rows).enumerate() {
-            if abort() {
-                target.reset_recurrent(gpu)?;
-                return Err("Qwen4 native MTP prefill aborted".to_string());
-            }
-            let base = chunk_index * chunk_rows;
-            let pick = Self::bundle(target)?
-                .spec_prefill_rows(gpu, chunk, true)
-                .map_err(|error| error.to_string())?;
-            for (index, &token) in chunk.iter().enumerate() {
-                if abort() {
-                    target.reset_recurrent(gpu)?;
-                    return Err("Qwen4 native MTP prefill aborted".to_string());
-                }
-                let position = start_pos
-                    .checked_add(base)
-                    .and_then(|value| value.checked_add(index))
-                    .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                let bundle = Self::bundle(target)?;
-                bundle
-                    .copy_spec_hidden_row_to(gpu, index, pending)
-                    .map_err(|error| error.to_string())?;
-                bundle
-                    .mtp_append_token(gpu, token, Some(pending), position)
-                    .map_err(|error| error.to_string())?;
-            }
-            // The head has caught up with the target: the only point a
-            // whole-chunk checkpoint of both owners is canonical.
-            let end = start_pos + base + chunk.len();
-            if capture_at == Some(end) {
-                Self::bundle(target)?
-                    .stage_prefix(gpu, &prompt_tokens[..end])
-                    .map_err(|error| error.to_string())?;
-            }
-            first_token = Some(pick);
-        }
-        Ok(first_token.expect("non-empty MTP prefill produced no seed"))
-    }
-
-    fn mtp_step(
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step_window(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
@@ -966,7 +938,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
-        require_native_greedy(self.request.temp)?;
         if k > self.max_k {
             return Err(format!(
                 "Qwen4 native MTP draft budget {k} exceeds configured K {}",
@@ -1075,9 +1046,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .scratch
                 .as_mut()
                 .ok_or_else(|| "Qwen4 native MTP verify scratch is not allocated".to_string())?;
-            let target_picks = picks
+            let mut target_picks = picks
                 .verify_block(gpu, &block, position, scratch.as_mut(), None)
                 .map_err(|error| error.to_string())?;
+            draw_target_picks(picks, gpu, &self.request, &drafts, eos, &mut target_picks)?;
             let acceptance = accept_native_greedy(&drafts, &target_picks, Some(eos))?;
             accepted_drafts = acceptance.accepted;
             if trace {
@@ -1266,7 +1238,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         result
     }
 
-    fn mtp_forced_advance(
+    fn mtp_forced_advance_tokens(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
@@ -1301,6 +1273,144 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .map_err(|error| error.to_string())?;
         }
         Ok(true)
+    }
+}
+
+impl MtpDrafter for Qwen4MtpDrafter {
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<u32, String> {
+        validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
+        self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+        // A miss resets target, head and draft policy; a hit restores the
+        // bundle's canonical checkpoint at `start_pos` into all three.
+        let plan = Qwen4PrefixPlan {
+            start_pos: if cache_hit { start_pos } else { 0 },
+        };
+        Self::bundle(target)?
+            .begin_prefix(gpu, prompt_tokens, plan, Qwen4PrefixMode::NativeMtp)
+            .map_err(|error| error.to_string())?;
+        self.ensure_resources(gpu, target)?;
+        let capture_at = {
+            let bundle = Self::bundle(target)?;
+            let target_position = bundle.state.position;
+            let mtp_position = bundle.mtp_position().map_err(|error| error.to_string())?;
+            if target_position != start_pos || mtp_position != start_pos {
+                return Err(format!(
+                    "Qwen4 MTP prefill position mismatch: target={}, mtp={}, start={start_pos}",
+                    target_position, mtp_position
+                ));
+            }
+            bundle.prefix_capture_at()
+        };
+        let pending = self.pending_hidden()?;
+        let mut first_token = None;
+        // One chunked target forward per chunk instead of one single-row forward
+        // per prompt token: the shared forward already captures the whole
+        // chunk's wide hidden, and the head then consumes each row in order.
+        // Cost goes from ~1 single-row forward per prompt token to the ordinary
+        // chunked prefill rate plus one head step per token.
+        // Each prompt token selects with its own query and the pooled keys
+        // visible at that position, regardless of target prefill chunking.
+        let chunk_rows = self.prefill_rows.max(1);
+        let budget = Self::bundle(target)?.config.indexer_budget;
+        let mut base = 0usize;
+        while base < fill_tokens.len() {
+            if abort() {
+                target.reset_recurrent(gpu)?;
+                return Err("Qwen4 native MTP prefill aborted".to_string());
+            }
+            let rows = crate::gpu_forward::prefill_chunk_rows(
+                budget,
+                start_pos + base,
+                fill_tokens.len() - base,
+                chunk_rows,
+            );
+            let chunk = &fill_tokens[base..base + rows];
+            let next_rows = crate::gpu_forward::prefill_chunk_rows(
+                budget,
+                start_pos + base + rows,
+                fill_tokens.len() - base - rows,
+                chunk_rows,
+            );
+            if next_rows > 0 {
+                Self::bundle(target)?
+                    .ple_readahead(&fill_tokens[base..base + rows + next_rows], rows);
+            }
+            let mut pick = [Self::bundle(target)?
+                .spec_prefill_rows(gpu, chunk, true)
+                .map_err(|error| error.to_string())?];
+            if base + rows == fill_tokens.len() {
+                let bundle = Self::bundle(target)?;
+                let eos = bundle.config.eos_token_id;
+                draw_target_picks(bundle, gpu, &self.request, &[], eos, &mut pick)?;
+            }
+            let [pick] = pick;
+            // The head appends the chunk's K/V rows in batches; `pending`
+            // ends holding the chunk's last hidden row, as a per-token
+            // append left it.
+            for (batch_index, batch) in chunk.chunks(MTP_APPEND_ROWS).enumerate() {
+                if abort() {
+                    target.reset_recurrent(gpu)?;
+                    return Err("Qwen4 native MTP prefill aborted".to_string());
+                }
+                let first_row = batch_index * MTP_APPEND_ROWS;
+                let position = start_pos
+                    .checked_add(base)
+                    .and_then(|value| value.checked_add(first_row))
+                    .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+                Self::bundle(target)?
+                    .mtp_append_rows(gpu, batch, first_row, position)
+                    .map_err(|error| error.to_string())?;
+            }
+            Self::bundle(target)?
+                .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
+                .map_err(|error| error.to_string())?;
+            first_token = Some(pick);
+            base += rows;
+            // The head has caught up with the target: the only point a
+            // whole-chunk checkpoint of both owners is canonical.
+            let end = start_pos + base;
+            if capture_at == Some(end) {
+                Self::bundle(target)?
+                    .stage_prefix(gpu, &prompt_tokens[..end])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(first_token.expect("non-empty MTP prefill produced no seed"))
+    }
+
+    fn mtp_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        k: usize,
+        eos: u32,
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<MtpWindow, String> {
+        let eos = self.end_of_turn.unwrap_or(eos);
+        self.mtp_step_window(gpu, target, position, seed, emitted, k, eos, grammar)
+    }
+
+    fn mtp_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        self.mtp_forced_advance_tokens(gpu, target, tokens, start_pos, abort)
     }
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -1344,23 +1454,30 @@ impl MtpDrafter for Qwen4MtpDrafter {
     }
 
     fn requires_greedy(&self) -> bool {
-        true
+        false
     }
 
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
     }
 
+    /// Sampled requests verify by naive sampling; see [`draw_target_picks`].
     fn supports_temp_verify(&self) -> bool {
-        false
+        true
     }
 }
 
 /// Build the generic runtime adapter around the native Qwen4 GPU MTP core.
-pub fn build_qwen4_mtp_speculator(max_k: usize, ctx_capacity: usize) -> Box<dyn Speculator> {
+/// `end_of_turn` is the tokenizer's `<|im_end|>` id, when it has one.
+pub fn build_qwen4_mtp_speculator(
+    max_k: usize,
+    ctx_capacity: usize,
+    end_of_turn: Option<u32>,
+) -> Box<dyn Speculator> {
     Box::new(MtpSpeculator::new(Qwen4MtpDrafter::new(
         max_k,
         ctx_capacity,
+        end_of_turn,
     )))
 }
 
@@ -1421,6 +1538,21 @@ mod tests {
     use crate::reference_mtp::MtpQsaGeometry;
 
     #[test]
+    fn native_mtp_prefill_request_accepts_cold_and_exact_suffix() {
+        let prompt = [1u32, 2, 3];
+        assert!(validate_native_mtp_prefill_request(&prompt, &prompt, 0, false).is_ok());
+        assert!(validate_native_mtp_prefill_request(&prompt, &[3], 2, true).is_ok());
+        let err = |fill: &[u32], start, hit| {
+            validate_native_mtp_prefill_request(&prompt, fill, start, hit).unwrap_err()
+        };
+        assert!(err(&prompt, 0, true).contains("non-empty suffix"));
+        assert!(err(&[], 3, true).contains("non-empty suffix"));
+        assert!(err(&[2, 3], 2, true).contains("prompt suffix"));
+        assert!(err(&[3], 2, false).contains("position zero"));
+        assert!(validate_native_mtp_prefill_request(&[], &[], 0, false).is_err());
+    }
+
+    #[test]
     fn native_acceptance_lowers_to_the_runtime_window_and_step() {
         let result = accept_native_greedy(&[10, 11], &[10, 99, 100], None).unwrap();
         assert_eq!(result.committed, vec![10, 99]);
@@ -1457,13 +1589,6 @@ mod tests {
         assert_eq!(eos.committed, vec![10, 99]);
         assert_eq!(eos.accepted, 2);
         assert!(eos.hit_eos);
-
-        assert!(require_native_greedy(-0.0).is_ok());
-        assert!(require_native_greedy(1.0e-6).is_ok());
-        assert!(require_native_greedy(1.0e-5).is_err());
-        assert!(require_native_greedy(f32::INFINITY).is_err());
-        assert!(require_native_greedy(f32::NEG_INFINITY).is_err());
-        assert!(require_native_greedy(f32::NAN).is_err());
     }
 
     #[test]

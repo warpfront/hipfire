@@ -7782,6 +7782,7 @@ pub fn generate_qwen4_ar(
         );
         return;
     }
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
     let required = prompt_tokens
         .len()
         .checked_add(max_tokens)

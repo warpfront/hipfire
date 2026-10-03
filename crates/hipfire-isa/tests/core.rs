@@ -6,7 +6,7 @@ use std::{io::Write,process::{Command,Stdio}};
 #[test]fn sgpr_hazard_tracks_only_valu_read_pairs(){let mut h=Gfx12Sgpr::default();let s=|base|RegRef{kind:Kind::S,base,len:1};assert!(h.step(Pipeline::Salu,&[],&[s(10)],false,false).is_empty());assert!(h.step(Pipeline::Vmem,&[s(10)],&[],false,false).is_empty());assert!(h.step(Pipeline::Valu,&[s(10)],&[],false,false).is_empty());assert!(h.step(Pipeline::Salu,&[],&[s(10)],false,false).is_empty());assert_eq!(h.step(Pipeline::Salu,&[s(10)],&[],false,false),["depctr_sa_sdst(0)"]);assert!(h.step(Pipeline::Valu,&[],&[s(10)],false,false).is_empty());assert_eq!(h.step(Pipeline::Valu,&[s(10)],&[],false,false),["depctr_va_sdst(0)"]);h.step(Pipeline::Salu,&[],&[s(10)],false,false);h.step(Pipeline::Smem,&[],&[],false,false);assert!(h.step(Pipeline::Valu,&[s(10)],&[],false,false).is_empty())}
 #[test]fn ledger_retains_partial_load_and_ds_waits(){let r=|base|RegRef{kind:Kind::V,base,len:1};let mut ledger=Ledger::default();for n in [7,79,91,83]{ledger.record(Arch::Gfx1201,&Instruction::new("global_load_b32",vec![r(n)],vec![]).memory(MemoryClass::VmemLoad))}for (n,expected) in [(7,3),(79,2),(91,1),(83,0)]{let req=ledger.required(&Instruction::new("v_xor",vec![r(100)],vec![r(n)]));assert_eq!(req[0].0,Counter::Load);assert_eq!(req[0].1,expected);ledger.wait(Counter::Load,expected)}for n in [71,75,79]{ledger.record(Arch::Gfx1201,&Instruction::new("ds_load_b64",vec![r(n)],vec![]).memory(MemoryClass::DsLoad))}let req=ledger.required(&Instruction::new("v_wmma",vec![r(3)],vec![r(75)]));assert_eq!(req[0].0,Counter::Ds);assert_eq!(req[0].1,1);ledger.wait(Counter::Ds,1);let req=ledger.required(&Instruction::new("v_wmma",vec![r(3)],vec![r(79)]));assert_eq!(req[0].1,0)}
 #[test]fn reg_lifetimes_and_budget(){let mut p=RegPlan::new(8,8).unwrap();p.v::<4>("a",0,Live::Whole).unwrap();assert!(p.v::<2>("alias",2,Live::Whole).is_err());assert!(p.v::<8>("too_large",2,Live::Whole).is_err());assert!(p.s::<4>("srd",2,Live::Whole).is_err())}
-#[test]fn assembler_golden_tables(){let mc="/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";for (arch,file,table) in [("gfx1201",include_str!("golden/gfx1201.txt"),hipfire_isa::insn::GFX1201_GOLDEN),("gfx1100",include_str!("golden/gfx1100.txt"),hipfire_isa::insn::GFX1100_GOLDEN)]{let lines:Vec<_>=file.lines().collect();assert_eq!(lines,table);let mut child=Command::new(mc).args(["-triple=amdgcn-amd-amdhsa",&format!("-mcpu={arch}"),"-show-encoding"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();child.stdin.take().unwrap().write_all(file.as_bytes()).unwrap();let output=child.wait_with_output().unwrap();assert!(output.status.success(),"{arch}: {}",String::from_utf8_lossy(&output.stderr));let text=String::from_utf8(output.stdout).unwrap();assert_eq!(text.matches("encoding: [").count(),lines.len(),"{arch} output:\n{text}")}}
+#[test]fn assembler_golden_tables(){if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }let mc="/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";for (arch,file,table) in [("gfx1201",include_str!("golden/gfx1201.txt"),hipfire_isa::insn::GFX1201_GOLDEN),("gfx1100",include_str!("golden/gfx1100.txt"),hipfire_isa::insn::GFX1100_GOLDEN)]{let lines:Vec<_>=file.lines().collect();assert_eq!(lines,table);let mut child=Command::new(mc).args(["-triple=amdgcn-amd-amdhsa",&format!("-mcpu={arch}"),"-show-encoding"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();child.stdin.take().unwrap().write_all(file.as_bytes()).unwrap();let output=child.wait_with_output().unwrap();assert!(output.status.success(),"{arch}: {}",String::from_utf8_lossy(&output.stderr));let text=String::from_utf8(output.stdout).unwrap();assert_eq!(text.matches("encoding: [").count(),lines.len(),"{arch} output:\n{text}")}}
 
 #[test]
 fn lds_slot_publication_and_split_barrier() {
@@ -42,6 +42,7 @@ fn raw_instruction_immediates_cannot_evade_architecture_table() {
 
 #[test]
 fn gfx1151_uses_the_gfx11_encoding_table() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     let file = include_str!("golden/gfx1100.txt");
     let mut child = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
         .args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1151", "-show-encoding"])
@@ -166,6 +167,7 @@ fn gfx11_trans_use_is_gfx1100_only_and_vmem_sgpr_needs_no_nop() {
 
 #[test]
 fn typed_instruction_families_encode_on_both_architectures() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     use hipfire_isa::insn::{Wmma, Smem, Global, Vop1};
     use hipfire_isa::reg::S;
     for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
@@ -190,6 +192,7 @@ fn typed_instruction_families_encode_on_both_architectures() {
 
 #[test]
 fn hip_hidden_kernarg_metadata_assembles() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     use hipfire_isa::{Builder, KernelSpec, KernargLayout};
     let spec = KernelSpec {
         kernel_id: "metadata_probe".into(), variant: "default".into(), arch: Arch::Gfx1201,
@@ -211,6 +214,7 @@ fn hip_hidden_kernarg_metadata_assembles() {
 
 #[test]
 fn gfx11_descriptor_extras_assemble() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     use hipfire_isa::{Builder, KernelSpec, KernargLayout};
     for arch in [Arch::Gfx1100, Arch::Gfx1151] {
         let spec = KernelSpec {

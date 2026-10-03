@@ -17,7 +17,8 @@
 // accesses are contiguous in j.  The four branch accumulators of a lane hold
 // the same (token, j), so the branch mix is lane-local.
 // Grid [hidden / 16, ceil(N / 512)], block 256, dynamic LDS 64 * (K + 8) * 2
-// bytes.  hidden % 16 == 0, K % 16 == 0, K <= 504.
+// bytes.  hidden % 16 == 0, K % 16 == 0, K <= 504.  `normalized` rows are
+// `ldn` elements apart.
 
 typedef short __attribute__((ext_vector_type(16))) hru_bf16x16_t;
 typedef float __attribute__((ext_vector_type(8))) hru_f8_t;
@@ -40,7 +41,8 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
     float* __restrict__ mixed,
     int hidden,
     int K,
-    int N) {
+    int N,
+    int ldn) {
     constexpr int TOKENS = 512;  // 4% under 256: half the W staging per token
     extern __shared__ unsigned short hru_w[];
     const int ldw = K + 8;
@@ -54,20 +56,9 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
     }
     __syncthreads();
     const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
-    const int wide = 4 * hidden;
     const int j = j0 + l16;
     const int block_end = min(N, (int)blockIdx.y * TOKENS + TOKENS);
     for (int t0 = blockIdx.y * TOKENS + wave * 16; t0 < block_end; t0 += 128) {
-        // The epilogue's normalized values, fetched before the K loop so the
-        // loads overlap the WMMA work.
-        _Float16 nv[4][8];
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const int token = min(t0 + 2 * i + (lane >> 4), N - 1);
-#pragma unroll
-            for (int br = 0; br < 4; br++)
-                nv[br][i] = normalized[(size_t)token * wide + br * hidden + j];
-        }
         const unsigned short* xr = X + (size_t)min(t0 + l16, N - 1) * K;
         hru_f8_t acc[4];
 #pragma unroll
@@ -83,6 +74,23 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
                 acc[br] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[br]);
             }
         }
+        // The epilogue's normalized values, fetched after the K loop: vmcnt
+        // retires in order, so loads issued before it made the loop's first
+        // X load wait for all 32 of them.  The gates below cover their latency.
+        _Float16 nv[4][8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int token = min(t0 + 2 * i + (lane >> 4), N - 1);
+#pragma unroll
+            for (int br = 0; br < 4; br++)
+                nv[br][i] = normalized[(size_t)token * ldn + br * hidden + j];
+        }
+        float gate[4][8];
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+#pragma unroll
+            for (int br = 0; br < 4; br++)
+                gate[br][i] = hru_bf16r(1.0f / (1.0f + expf(-hru_bf16r(acc[br][i]))));
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int token = t0 + 2 * i + (lane >> 4);
@@ -94,12 +102,7 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16(
             // hyper_read_projected_f32's mix, branch order from +0.0.
             float value = 0.0f;
 #pragma unroll
-            for (int br = 0; br < 4; br++) {
-                const float gate_input = hru_bf16r(acc[br][i]);
-                const float gate = hru_bf16r(1.0f / (1.0f + expf(-gate_input)));
-                const float normed = (float)nv[br][i];
-                value += hru_bf16r(gate * normed);
-            }
+            for (int br = 0; br < 4; br++) value += hru_bf16r(gate[br][i] * (float)nv[br][i]);
             mixed[(size_t)token * hidden + j] = hru_bf16r(value / 4.0f);
         }
     }
@@ -127,7 +130,8 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16_swap(
     float* __restrict__ mixed,
     int hidden,
     int K,
-    int N) {
+    int N,
+    int ldn) {
     constexpr int TOKENS = 512;
     extern __shared__ unsigned short hru_ws[];
     const int ldw = K + 8;
@@ -141,7 +145,6 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16_swap(
     }
     __syncthreads();
     const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15, half = lane >> 4;
-    const int wide = 4 * hidden;
     const int jb = j0 + 8 * half;
     const int block_end = min(N, (int)blockIdx.y * TOKENS + TOKENS);
     for (int t0 = blockIdx.y * TOKENS + wave * 16; t0 < block_end; t0 += 128) {
@@ -184,7 +187,7 @@ extern "C" __global__ __launch_bounds__(256) void hyper_read_up_wmma_bf16_swap(
         uint4 nvv[4];
 #pragma unroll
         for (int br = 0; br < 4; br++)
-            nvv[br] = *(const uint4*)(normalized + (size_t)token * wide + br * hidden + jb);
+            nvv[br] = *(const uint4*)(normalized + (size_t)token * ldn + br * hidden + jb);
         float out[8];
 #pragma unroll
         for (int i = 0; i < 8; i++) {

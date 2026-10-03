@@ -796,6 +796,9 @@ pub fn execute_validated_steps<'a>(
     };
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
+    // A multi-row hyper read outside the `HIPFIRE_QWEN4_HC_FUSE` pairing that
+    // wrote the gates of the hyper write at this index (`next_hyper_write`).
+    let mut read_gates_at: Option<usize> = None;
     while i < steps.len() {
         if hc_fuse {
             use crate::pipeline::layer_ops::{
@@ -1011,6 +1014,30 @@ pub fn execute_validated_steps<'a>(
                     continue;
                 }
             }
+            // Multi-row: a hyper read also writes the gates of the next hyper
+            // write of its (meanwhile unchanged) streams in its norm pass.
+            if let Step::HyperRead(read) = &steps[i] {
+                if let Some(j) = next_hyper_write(steps, i + 1, read) {
+                    let Step::HyperWrite(write) = &steps[j] else {
+                        unreachable!("next_hyper_write returns a hyper write")
+                    };
+                    if crate::pipeline::layer_ops::execute_hyper_read_paired(gpu, read, write)? {
+                        read_gates_at = Some(j);
+                    }
+                    gpu.scratch.prerotated = None;
+                    i += 1;
+                    continue;
+                }
+            }
+            if let Step::HyperWrite(write) = &steps[i] {
+                if read_gates_at == Some(i) {
+                    read_gates_at = None;
+                    crate::pipeline::layer_ops::execute_hyper_write_pregated(gpu, write)?;
+                    gpu.scratch.prerotated = None;
+                    i += 1;
+                    continue;
+                }
+            }
             launch_op(gpu, ctx, &steps[i])?;
             // A pending prerotated input lives until its consumer step ran;
             // a sealed MoE consumes it in one of its granular stages.
@@ -1059,14 +1086,26 @@ fn next_fused_hyper_write(
     read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
 ) -> Option<usize> {
     let streams = read.input.buf.as_ptr();
+    next_hyper_write(steps, from, read).filter(|&j| {
+        matches!(steps.get(j + 1),
+            Some(Step::HyperRead(next)) if next.input.buf.as_ptr() == streams)
+    })
+}
+
+/// The index of the next in-place hyper write of `read`'s streams when only
+/// stream-neutral mixer steps separate it from `read`, so the streams it
+/// normalizes are the ones `read` normalized.
+fn next_hyper_write(
+    steps: &[Step<'_>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<usize> {
+    let streams = read.input.buf.as_ptr();
     for (j, step) in steps.iter().enumerate().skip(from) {
         match step {
             Step::GatedDeltaNet(_) | Step::IndexedAttention(_) | Step::Clear(_) | Step::Moe(_) => {}
             Step::HyperWrite(write)
-                if write.input.buf.as_ptr() == streams
-                    && write.output.buf.as_ptr() == streams
-                    && matches!(steps.get(j + 1),
-                        Some(Step::HyperRead(next)) if next.input.buf.as_ptr() == streams) =>
+                if write.input.buf.as_ptr() == streams && write.output.buf.as_ptr() == streams =>
             {
                 return Some(j);
             }

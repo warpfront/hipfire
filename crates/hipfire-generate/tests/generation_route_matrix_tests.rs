@@ -389,7 +389,7 @@ fn route_matrix_tools_absent_and_present() {
 }
 
 #[test]
-fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
+fn qwen4_native_mtp_route_admits_greedy_and_verifiable_sampled_requests() {
     let mtp = GenerationRouteInputs {
         arch_id: 16,
         has_speculator: true,
@@ -401,8 +401,9 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
 
     // Greedy argmax ignores top_p/top_k/min_p, and serve forwards top_p/top_k
     // whenever the client or the registry sets one, so their presence must
-    // keep a greedy request on native MTP.
-    for greedy in [
+    // keep a greedy request on native MTP. A sampled request stays on it when
+    // the drafter verifies by target draws.
+    for admitted in [
         GenerationRouteInputs {
             user_explicit_sampling: true,
             ..mtp
@@ -411,11 +412,18 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
             min_p: Some(0.1),
             ..mtp
         },
+        GenerationRouteInputs {
+            temp: 0.7,
+            user_explicit_sampling: true,
+            min_p: Some(0.05),
+            supports_temp_swor: true,
+            ..mtp
+        },
     ] {
         assert_eq!(
-            select_generation_route(&greedy),
+            select_generation_route(&admitted),
             GenerationRoute::Qwen4Spec,
-            "greedy Qwen4 request with argmax-neutral sampler fields must use native MTP: {greedy:?}"
+            "Qwen4 request the MTP verify reproduces must use native MTP: {admitted:?}"
         );
     }
 
@@ -424,6 +432,12 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
         GenerationRouteInputs {
             temp: 0.7,
             user_explicit_sampling: true,
+            ..mtp
+        },
+        GenerationRouteInputs {
+            temp: 0.7,
+            nonneutral_penalties: true,
+            supports_temp_swor: true,
             ..mtp
         },
         GenerationRouteInputs {
@@ -454,36 +468,10 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
         assert_eq!(
             select_generation_route(&refused),
             GenerationRoute::Qwen4Ar,
-            "Qwen4 native MTP must refuse non-greedy or non-explicit inputs: {refused:?}"
+            "Qwen4 native MTP must refuse inputs its verify cannot reproduce: {refused:?}"
         );
     }
 }
-#[test]
-fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
-    // Native Qwen4 MTP replays the whole prefix cold.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
-    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
-    // on the loaded family, not on the speculator name "mtp".
-    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
-        false, false
-    ));
-    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
-
-    let plan = hipfire_generate::qwen::plan_from_rendered(
-        &[10, 11],
-        vec![10, 11, 12],
-        false,
-        &[],
-        false,
-        "mtp",
-    );
-    assert!(!plan.cache_hit);
-    assert_eq!(plan.start_pos, 0);
-    assert_eq!(plan.cached_tokens, 0);
-    assert_eq!(plan.new_tokens, vec![10, 11, 12]);
-}
-
 #[test]
 fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL

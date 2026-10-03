@@ -527,7 +527,7 @@ pub(crate) fn combine_order_only(
 /// combines the ten expert rows, folds the shared row, writes the HC streams
 /// and runs the next read's norm + gate projection.  Bitwise
 /// [`combine`] (`initial_zero`) + [`shared_down_hc`] + the next read's
-/// `hyper_norm_gate_outputs`.
+/// `hyper_norm_gate` (F16 read output at `f16_row_pitch`).
 fn shared_down_row_fold(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -544,7 +544,8 @@ fn shared_down_row_fold(
     // The next read's F16 row lives in the shared F16 scratch, which the
     // shared-down GEMM's own F16 input also uses (it is dead by the time the
     // row kernel writes): size it first so nothing reallocates under the GEMM.
-    let x16 = hip(gpu.qwen4_f16_x_scratch(hc.rows * 4 * hc.hidden))?;
+    let ld16 = gpu.f16_row_pitch(4 * hc.hidden);
+    let x16 = hip(gpu.qwen4_f16_x_scratch(hc.rows * ld16))?;
     hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(
         down.buf,
         shared.rotated,
@@ -564,6 +565,7 @@ fn shared_down_row_fold(
         gate_weight: &next.gate_weight,
         next_gates: &next.next_gates,
         normalized_f16: &x16,
+        ld16,
         rows: hc.rows,
         hidden: hc.hidden,
     }))
@@ -678,10 +680,12 @@ pub(crate) fn gate_up(
     }
     if use_path2 && gateup_bf16(gpu, p) {
         let x_f16 = if gateup_rotates_f16(gpu, p, use_path2) {
+            // The grouped kernel reads packed rows (x_row * K).
             Some(hip(gpu.rotate_x_mq_batched_f16(
                 p.x_norm_batch,
                 p.gate_up_k,
                 p.batch_size,
+                p.gate_up_k,
             ))?)
         } else {
             None

@@ -668,7 +668,7 @@ required-features = ["lab"]
 
 [[example]]
 name = "tmp_halo_iu4_calibrate"
-required-features = []
+required-features = ["lab"]
 
 [[example]]
 name = "wmma_fa_spike"
@@ -698,6 +698,34 @@ required-features = ["lab"]
 
 [[example]]
 name = "fp8stream_producer_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_fa2_fp8_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_fa2a_g2"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_fa_packet_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_gfx1201_chunk_exactness"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_i8_gfx12_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_iu4_attrib"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_iu4_gfx12_v3_oracle"
 required-features = ["lab"]
 
 [[example]]

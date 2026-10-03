@@ -10,7 +10,7 @@
 //! of the MoE/shared fold, the HC update and the next normalization.
 //!
 //! Bytewise the unfused chain `moe_down_combine_grouped_top10_bf16in_zinit` ->
-//! `gemm_wmma_lds_128_256_32_64_k64_hcsd` -> `hyper_norm_gate_outputs`; the
+//! `gemm_wmma_lds_128_256_32_64_k64_hcsd` -> `hyper_norm_gate` (F16 read output); the
 //! shared-down GEMM becomes a plain BF16-bits store
 //! ([`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_bf16st`]).
 
@@ -43,8 +43,11 @@ pub struct HcRowFold<'a> {
     pub gate_weight: &'a GpuTensor,
     /// Receives that next write's gate logits `[rows, 4]` (F32).
     pub next_gates: &'a GpuTensor,
-    /// Receives the next read's F16 normalized row `[rows, 4 * hidden]`.
+    /// Receives the next read's F16 normalized row `[rows, ld16]`.
     pub normalized_f16: &'a GpuTensor,
+    /// Row pitch of `normalized_f16` in elements (`Gpu::f16_row_pitch` of
+    /// `4 * hidden`, what the HC read's F16 GEMMs read).
+    pub ld16: usize,
     pub rows: usize,
     pub hidden: usize,
 }
@@ -120,7 +123,9 @@ impl Gpu {
             || p.streams.buf.size() < p.rows * wide * 2
             || p.gates.numel() < p.rows * 4
             || p.next_gates.numel() < p.rows * 4
-            || p.normalized_f16.buf.size() < p.rows * wide * 2
+            || p.ld16 < wide
+            || p.ld16 % 8 != 0
+            || p.normalized_f16.buf.size() < p.rows * p.ld16 * 2
         {
             return Err(HipError::new(0, "hc_row_fold_norm_gate: route does not apply"));
         }
@@ -137,6 +142,7 @@ impl Gpu {
         let ngp = p.next_gates.buf.as_ptr();
         let nop = p.normalized_f16.buf.as_ptr();
         let hv = p.hidden as i32;
+        let ldv = p.ld16 as i32;
         let lds = (p.hidden * 8 + 4 * 256 * 4 + p.hidden * 2 + 16) as u32;
         let mut params = [
             &gp as *const _ as *mut c_void,
@@ -150,6 +156,7 @@ impl Gpu {
             &ngp as *const _ as *mut c_void,
             &nop as *const _ as *mut c_void,
             &hv as *const _ as *mut c_void,
+            &ldv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(ENTRY, [p.rows as u32, 1, 1], [256, 1, 1], lds, &mut params, || {
             let mut b = KernargBlob::new();
@@ -164,6 +171,7 @@ impl Gpu {
             b.push_ptr(ngp);
             b.push_ptr(nop);
             b.push_i32(hv);
+            b.push_i32(ldv);
             b
         })
     }

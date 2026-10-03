@@ -75,17 +75,26 @@ mod tests {
             ([0xdcd6_0000, 0x0004_020a], "global_atomic_add_u32 v10, v2, s[4:5]", false),
             ([0xdcce_4004, 0x0106_0c0d], "global_atomic_swap_b32 v1, v13, v12, s[6:7] offset:4 glc", true),
         ];
+        // The encoding cross-check needs the pinned llvm-mc (resolved like
+        // the gfx12 table gate); the no-GPU CI runner still checks decode.
+        let mc = std::env::var_os("ROCM_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm/core-10.0"))
+            .join("lib/llvm/bin/llvm-mc");
+        let mc = mc.exists().then_some(mc);
         for arch in [Arch::Gfx1100, Arch::Gfx1151] {
             let cpu = if arch == Arch::Gfx1100 { "gfx1100" } else { "gfx1151" };
             for (words, text, returns) in cases {
-                let mut mc = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
-                    .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={cpu}"), "-show-encoding"])
-                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("pinned llvm-mc");
-                mc.stdin.take().unwrap().write_all(format!("{text}\n").as_bytes()).unwrap();
-                let out = mc.wait_with_output().unwrap();
-                assert!(out.status.success(), "{text}: {}", String::from_utf8_lossy(&out.stderr));
-                let expected: String = words.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(",");
-                assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("encoding: [{expected}]")), "{text}");
+                if let Some(mc) = &mc {
+                    let mut child = Command::new(mc)
+                        .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={cpu}"), "-show-encoding"])
+                        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("pinned llvm-mc");
+                    child.stdin.take().unwrap().write_all(format!("{text}\n").as_bytes()).unwrap();
+                    let out = child.wait_with_output().unwrap();
+                    assert!(out.status.success(), "{text}: {}", String::from_utf8_lossy(&out.stderr));
+                    let expected: String = words.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(",");
+                    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("encoding: [{expected}]")), "{text}");
+                }
 
                 let (mut inst, used) = decode(arch, &words).unwrap_or_else(|e| panic!("{text}: {e}"));
                 assert_eq!(used, 2);

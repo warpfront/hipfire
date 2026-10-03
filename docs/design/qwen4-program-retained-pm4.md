@@ -262,7 +262,7 @@ here rather than an optimization.
 
 | Quantity | Value | Source |
 |---|---|---|
-| `max_seq` | exactly 2048 (admission requires it) | `crates/hipfire-loader/src/admission.rs` |
+| `max_seq` | 2048 (the automatic value; admission requires ≥ 2048 since 2026-09-30, exactly 2048 when this was written) | `crates/hipfire-loader/src/admission.rs` |
 | `compress` / `budget` | 4 / 2048 | `crates/hipfire-arch-qwen4/src/config.rs` |
 | indexer heads / kv heads / index_dim | 4 / 1 / 128 | same |
 | main heads / kv heads / head_dim | 24 / 2 / 256 | same |

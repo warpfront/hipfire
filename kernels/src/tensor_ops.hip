@@ -32,10 +32,13 @@ static __device__ __forceinline__ __hip_bfloat16 bf16_add(
 // (gated_delta_net_q8_fast.hip). Per value head, 128 rows of 128 signed
 // bytes (row = value channel, byte = key channel), then, after every head's
 // codes, one F32 scale per row (`value_heads * 128`). A row dequantizes as
-// scale * code. A launch requantizes each row once, after its last token, by
-// the row's absmax with Qwen3.5's stochastic rounding (floor(x * 127 / absmax
-// + u), u uniform in [0, 1) from an LCG seeded by head, row, key channel and
-// frame), so repeated decay does not bias the stored state.
+// scale * code. Every token requantizes each row, by the row's absmax with
+// Qwen3.5's stochastic rounding (floor(x * 127 / absmax + u), u uniform in
+// [0, 1) from an LCG seeded by head, row, key channel and the token's
+// position `frame`), so repeated decay does not bias the stored state. The
+// few-row persistent route does the same per row, which keeps an MTP verify
+// bitwise the single-row decode route; only the chunked prefill scan
+// requantizes once, after its last token.
 static __device__ __forceinline__ signed char* gdn_q8_row(void* slot, int head, int row) {
     return reinterpret_cast<signed char*>(slot) + ((size_t)head * 128 + row) * 128;
 }
@@ -397,8 +400,9 @@ __device__ __forceinline__ void gdn_lds_barrier() {
 // it); a separate instantiation so the plain route's register allocation is
 // unchanged.
 // `kQ8`: `state` and the `row_states` slots are Q8 GDN state slots (see
-// gdn_q8_row) and `frame` seeds the final requantization; the recurrence
-// runs on the dequantized F32 values.
+// gdn_q8_row) and `frame` is the last row's position; the recurrence runs on
+// the dequantized F32 values, requantized after every row with that row's
+// position as a decode step would.
 template <bool kCapture, bool kQ8 = false>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
@@ -443,17 +447,19 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     __shared__ float handoff_out[128];
 
     float state_half[64];
+    // kQ8: the codes and scale of the state after the latest row.
+    int4 packed[4];
+    signed char* const codes = reinterpret_cast<signed char*>(packed);
+    float row_scale = 0.0f;
+    __shared__ float peak_half[2][128];
     if constexpr (kQ8) {
         const int4* codes4 =
             reinterpret_cast<const int4*>(gdn_q8_row(state, value_head, value_index) + kd_base);
-        const float scale =
-            gdn_q8_scales(state, value_heads)[value_head * 128 + value_index];
-        int4 packed[4];
+        row_scale = gdn_q8_scales(state, value_heads)[value_head * 128 + value_index];
         #pragma unroll
         for (int i = 0; i < 4; ++i) packed[i] = codes4[i];
-        const signed char* codes = reinterpret_cast<const signed char*>(packed);
         #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) state_half[kd] = scale * (float)codes[kd];
+        for (int kd = 0; kd < 64; ++kd) state_half[kd] = row_scale * (float)codes[kd];
     } else {
         #pragma unroll
         for (int kd = 0; kd < 64; ++kd) {
@@ -607,37 +613,40 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
+            if constexpr (kQ8) {
+                // Requantize as a decode step at this row's position does:
+                // the row's absmax spans both halves (exchange the half
+                // peaks), and the next row decays the dequantized codes.
+                float peak = 0.0f;
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
+                peak_half[half][value_index] = peak;
+                gdn_lds_barrier();
+                peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
+                const float inv = gdn_q8_inv(peak);
+                row_scale = gdn_q8_scale(peak);
+                const unsigned int row_frame = frame - (unsigned int)(rows - 1 - row);
+                #pragma unroll
+                for (int kd = 0; kd < 64; ++kd) {
+                    codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
+                                             kd_base + kd, row_frame);
+                    state_half[kd] = row_scale * (float)codes[kd];
+                }
+            }
         }
     }
 
     if constexpr (kQ8) {
-        // The row's absmax spans both halves: exchange the half peaks.
-        __shared__ float peak_half[2][128];
-        float peak = 0.0f;
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) peak = fmaxf(peak, fabsf(state_half[kd]));
-        peak_half[half][value_index] = peak;
-        gdn_lds_barrier();
-        peak = fmaxf(peak_half[0][value_index], peak_half[1][value_index]);
-        const float inv = gdn_q8_inv(peak);
         void* const final_slot = kCapture
             ? reinterpret_cast<signed char*>(row_states)
                   + (size_t)(rows - 1) * gdn_q8_slot_bytes(value_heads)
             : state;
-        int4 packed[4];
-        signed char* codes = reinterpret_cast<signed char*>(packed);
-        #pragma unroll
-        for (int kd = 0; kd < 64; ++kd) {
-            codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
-                                     kd_base + kd, frame);
-        }
         int4* dst =
             reinterpret_cast<int4*>(gdn_q8_row(final_slot, value_head, value_index) + kd_base);
         #pragma unroll
         for (int i = 0; i < 4; ++i) dst[i] = packed[i];
         if (half == 0) {
-            gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] =
-                gdn_q8_scale(peak);
+            gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] = row_scale;
         }
         return;
     }
@@ -1042,19 +1051,18 @@ extern "C" __global__ void hyper_write_f32(
 }
 
 // hyper_write_f32 on BF16-stored HC streams (the Qwen4 F16 prefill route):
-// two adjacent columns per thread (one 32-bit pair of BF16 values), the same
-// expression per column, the result stored as BF16 bits.  `hidden` is even.
-// Grid [ceil(branches * hidden / 512), rows], block 256.
-extern "C" __global__ void hyper_write_bf16x2(
-    const unsigned int* input,
+// eight adjacent columns per thread (16-byte loads and store, one gate per
+// thread), the same expression per column, the result stored as BF16 bits.
+// `hidden` % 8 == 0.  Grid [ceil(branches * hidden / 2048), rows], block 256.
+extern "C" __global__ void hyper_write_bf16x8(
+    const uint4* input,
     const float* mixed,
     const float* gates,
-    unsigned int* output,
+    uint4* output,
     int branches,
     int hidden,
     int rows) {
-    const int pair = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    const int column = 2 * pair;
+    const int column = 8 * (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int row = (int)blockIdx.y;
     const int wide = branches * hidden;
     if (row >= rows || column >= wide) return;
@@ -1066,20 +1074,28 @@ extern "C" __global__ void hyper_write_bf16x2(
     const float gate = bf16_to_f32(bf16_round(
         2.0f * bf16_to_f32(bf16_round(
             1.0f / (1.0f + expf(-gate_scaled))))));
-    const float2 m = *(const float2*)(mixed + row * hidden + column % hidden);
-    const unsigned int w = input[(row * wide + column) >> 1];
-    const float lo = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(m.x))))
-        + __uint_as_float(w << 16);
-    const float hi = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(m.y))))
-        + __uint_as_float(w & 0xFFFF0000u);
-    output[(row * wide + column) >> 1] =
-        (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+    const float* m = mixed + (size_t)row * hidden + column % hidden;
+    const float4 m0 = *(const float4*)m, m1 = *(const float4*)(m + 4);
+    const float mv[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+    const size_t at = ((size_t)row * wide + column) >> 3;
+    const uint4 w = input[at];
+    const unsigned int wv[4] = {w.x, w.y, w.z, w.w};
+    unsigned int ov[4];
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        const float lo = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(mv[2 * p]))))
+            + __uint_as_float(wv[p] << 16);
+        const float hi = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(mv[2 * p + 1]))))
+            + __uint_as_float(wv[p] & 0xFFFF0000u);
+        ov[p] = (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+    }
+    output[at] = make_uint4(ov[0], ov[1], ov[2], ov[3]);
 }
 
 // `normalized16`, when non-null, also receives each normalized value rounded
-// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
-// `normalized`, when non-null, then holds the (already BF16-rounded) values
-// as BF16 bits.
+// to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, at row
+// pitch `ld16` elements, and `normalized`, when non-null, then holds the
+// (already BF16-rounded) values as BF16 bits.
 template <typename T>
 static __device__ __forceinline__ void hyper_norm_rows(
     const T* input,
@@ -1088,7 +1104,8 @@ static __device__ __forceinline__ void hyper_norm_rows(
     int branches,
     int hidden,
     int rows,
-    _Float16* normalized16) {
+    _Float16* normalized16,
+    int ld16) {
     const int branch = (int)blockIdx.x;
     const int row = (int)blockIdx.y;
     if (branch >= branches || row >= rows) return;
@@ -1150,7 +1167,7 @@ static __device__ __forceinline__ void hyper_norm_rows(
             const float value = bf16_to_f32(bf16_round(
                 bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
             if (normalized16) {
-                normalized16[column] = (_Float16)value;
+                normalized16[(size_t)row * ld16 + branch * hidden + j] = (_Float16)value;
                 if (normalized)
                     ((unsigned short*)normalized)[column] =
                         (unsigned short)(__float_as_uint(value) >> 16);
@@ -1170,13 +1187,14 @@ extern "C" __global__ void hyper_norm_f32(
     int hidden,
     int rows,
     _Float16* normalized16,
-    int state_bf16) {
+    int state_bf16,
+    int ld16) {
     if (state_bf16)
         hyper_norm_rows((const unsigned short*)input, norm_weight, normalized, branches, hidden,
-                        rows, normalized16);
+                        rows, normalized16, ld16);
     else
         hyper_norm_rows((const float*)input, norm_weight, normalized, branches, hidden, rows,
-                        normalized16);
+                        normalized16, ld16);
 }
 // Lane 0 of `v += __shfl_down(v, off, 32)` for off = 16..1, with the
 // partners moved by permlanex16 / row DPP on gfx11/gfx12 (same additions and
@@ -1204,6 +1222,9 @@ static __device__ __forceinline__ float hc_lane0_tree_sum(float v) {
 // lands in LDS and wave w < 4 replays the BF16 kernels' lane traversal
 // (lane*8, +256), four chains, (a0+a1)+(a2+a3) fold and shuffle tree for gate
 // row w, so both results are bitwise unchanged.
+// With `normalized16` non-null the block also writes the row normalized with
+// `read_norm_weight` as F16 at row pitch `ld16`: hyper_norm_f32's F16 output
+// for a hyper read of the same streams (same inverse RMS, bitwise).
 // Grid [rows], block 256, dynamic LDS (2 * hidden + 4 * 256) * 4 bytes.
 // Requires four branches, hidden % 256 == 0 and hidden <= 2560.
 // `input` is the HC streams (BF16 bits when `state_bf16`).
@@ -1213,7 +1234,10 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     const unsigned short* gate_weight,
     float* gates,
     int hidden,
-    int state_bf16) {
+    int state_bf16,
+    const __hip_bfloat16* read_norm_weight,
+    _Float16* normalized16,
+    int ld16) {
     constexpr int branches = 4;
     constexpr int U = 10;
     extern __shared__ float hc_lds[];
@@ -1267,15 +1291,52 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
         }
         __syncthreads();
     }
+    if (state_bf16 && normalized16) {
+        // The BF16 row is still in LDS: each thread normalizes eight
+        // consecutive values, so the weights load and the F16 read output
+        // store as 16-byte runs (the strided per-value form spent most of
+        // the kernel on 2-byte stores).  Same expressions, same values.
+        for (int v = tid; v < wide / 8; v += 256) {
+            const int j0 = v * 8;
+            const int b = j0 / hidden;
+            const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+            const uint4 rv = ((const uint4*)xsb)[v];
+            const uint4 wv = *(const uint4*)(norm_weight + j0);
+            const uint4 qv = *(const uint4*)(read_norm_weight + j0);
+            const unsigned int rw[4] = {rv.x, rv.y, rv.z, rv.w};
+            const unsigned int ww[4] = {wv.x, wv.y, wv.z, wv.w};
+            const unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w};
+            unsigned int ow[4];
+            _Float16 oq[8];
 #pragma unroll
-    for (int b = 0; b < branches; ++b) {
-        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+            for (int e = 0; e < 8; ++e) {
+                const int sh = (e & 1) ? 0 : 16;
+                const float x = __uint_as_float((rw[e >> 1] << sh) & 0xFFFF0000u);
+                const float w = __uint_as_float((ww[e >> 1] << sh) & 0xFFFF0000u);
+                const float q = __uint_as_float((qw[e >> 1] << sh) & 0xFFFF0000u);
+                const unsigned int nb =
+                    __float_as_uint(bf16_to_f32(bf16_round(x * inv * (1.0f + w)))) >> 16;
+                ow[e >> 1] = (e & 1) ? (ow[e >> 1] | (nb << 16)) : nb;
+                oq[e] = (_Float16)bf16_to_f32(bf16_round(x * inv * (1.0f + q)));
+            }
+            ((uint4*)xsb)[v] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+            *(uint4*)(normalized16 + (size_t)row * ld16 + j0) = __builtin_bit_cast(uint4, oq);
+        }
+    } else {
 #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int j = b * hidden + tid + 256 * u;
-            if (u < per)
-                xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
-                    raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
+        for (int b = 0; b < branches; ++b) {
+            const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int j = b * hidden + tid + 256 * u;
+                if (u < per) {
+                    xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
+                        raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
+                    if (normalized16)
+                        normalized16[(size_t)row * ld16 + j] = (_Float16)bf16_to_f32(bf16_round(
+                            raw[b][u] * inv * (1.0f + bf16_to_f32(read_norm_weight[j]))));
+                }
+            }
         }
     }
     __syncthreads();
@@ -1326,200 +1387,6 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     if (lane == 0) gates[(size_t)row * branches + wave] = sum;
 }
 
-// H4 read side: hyper_norm_gate_f32's exact norm + BF16 gate projection of the
-// streams, plus the normalized row for the HC down projection, in ONE launch,
-// so the paired HC write consumes `gate_logits` instead of re-reading the
-// streams (the streams cannot change between a read and its paired write).
-// Same arithmetic as hyper_norm_gate_f32 (gate projection reads the BF16 LDS
-// row, never an F16-rounded value).  The gate projection is run by waves 0..3
-// with hyper_norm_gate_f32's text; waves 4..7 store the BF16 LDS row.  The two
-// entries differ only in WHICH row copy waves 4..7 store, because adding the
-// second store loop to one kernel changes the gate projection's instruction
-// schedule and with it the sign of a NaN gate when the row mixes NaN signs
-// (the fuzz in fn-wmo/h4 gates this; keep the entries separate):
-//   hyper_norm_gate_outputs      : normalized16 (RNE F16, the F16 WMMA down input)
-//   hyper_norm_gate_outputs_f32  : normalized32 (BF16-rounded value as F32)
-// Both: inv4[row*4+branch] = the branch inverse RMS before normalization
-// (optional), gate_logits[row*4 + branch] always.  The other row pointer is
-// ignored.  Any optional output may be null.
-// Grid [rows], block 256, dynamic LDS (hidden * 8 + 4 * 256 * 4) bytes.
-// Requires four branches, hidden % 256 == 0 and hidden <= 2560.
-template <bool F32OUT>
-static __device__ __forceinline__ void hyper_norm_gate_outputs_body(
-    const void* input,
-    const __hip_bfloat16* norm_weight,
-    const unsigned short* gate_weight,
-    float* gate_logits,
-    _Float16* normalized16,
-    float* normalized32,
-    float* inv4,
-    int hidden,
-    int state_bf16) {
-    constexpr int branches = 4;
-    constexpr int U = 10;
-    extern __shared__ float hc_lds[];
-    const int wide = branches * hidden;
-    const int per = hidden / 256;
-    unsigned short* xsb = (unsigned short*)hc_lds;
-    float* rms_sum = hc_lds + wide / 2;
-    const int row = (int)blockIdx.x;
-    const int tid = (int)threadIdx.x;
-    const size_t in = (size_t)row * wide;
-    float raw[branches][U];
-    if (state_bf16) {
-        const uint4* s = (const uint4*)((const unsigned short*)input + in);
-        for (int v = tid; v < wide / 8; v += 256) ((uint4*)xsb)[v] = s[v];
-        __syncthreads();
-#pragma unroll
-        for (int b = 0; b < branches; ++b)
-#pragma unroll
-            for (int u = 0; u < U; ++u)
-                raw[b][u] = u < per
-                    ? __uint_as_float((unsigned int)xsb[b * hidden + tid + 256 * u] << 16)
-                    : 0.0f;
-    } else {
-        const float* s = (const float*)input + in;
-#pragma unroll
-        for (int b = 0; b < branches; ++b)
-#pragma unroll
-            for (int u = 0; u < U; ++u)
-                raw[b][u] = u < per ? s[b * hidden + tid + 256 * u] : 0.0f;
-    }
-#pragma unroll
-    for (int b = 0; b < branches; ++b) {
-        float partial = 0.0f;
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            raw[b][u] = bf16_to_f32(bf16_round(raw[b][u]));
-            if (u < per) partial += raw[b][u] * raw[b][u];
-        }
-        rms_sum[b * 256 + tid] = partial;
-    }
-    __syncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-#pragma unroll
-            for (int b = 0; b < branches; ++b)
-                rms_sum[b * 256 + tid] += rms_sum[b * 256 + tid + stride];
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int b = 0; b < branches; ++b) {
-        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int j = b * hidden + tid + 256 * u;
-            if (u < per)
-                xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
-                    raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
-        }
-    }
-    __syncthreads();
-    const int wave = tid >> 5;
-    const int lane = tid & 31;
-    if (wave >= branches) {
-        // Waves 4..7 (idle in the gate projection) store the BF16 LDS row; the
-        // projection below, run by waves 0..3, is hyper_norm_gate_f32's text.
-        const int t2 = tid - branches * 32;
-        if (inv4 && t2 < branches)
-            inv4[(size_t)row * branches + t2] =
-                rsqrtf(rms_sum[t2 * 256] / (float)hidden + 1.0e-6f);
-        if constexpr (!F32OUT) if (normalized16) {
-            for (int v = t2; v < wide / 8; v += 4 * 32) {
-                const uint4 xv = ((const uint4*)xsb)[v];
-                typedef _Float16 half8v __attribute__((ext_vector_type(8)));
-                half8v h;
-                h[0] = (_Float16)__uint_as_float(xv.x << 16);
-                h[1] = (_Float16)__uint_as_float(xv.x & 0xFFFF0000u);
-                h[2] = (_Float16)__uint_as_float(xv.y << 16);
-                h[3] = (_Float16)__uint_as_float(xv.y & 0xFFFF0000u);
-                h[4] = (_Float16)__uint_as_float(xv.z << 16);
-                h[5] = (_Float16)__uint_as_float(xv.z & 0xFFFF0000u);
-                h[6] = (_Float16)__uint_as_float(xv.w << 16);
-                h[7] = (_Float16)__uint_as_float(xv.w & 0xFFFF0000u);
-                ((half8v*)(normalized16 + in))[v] = h;
-            }
-        }
-        if constexpr (F32OUT) if (normalized32) {
-            for (int v = t2; v < wide / 8; v += 4 * 32) {
-                const uint4 xv = ((const uint4*)xsb)[v];
-                float4* o = (float4*)(normalized32 + in) + 2 * v;
-                o[0] = make_float4(__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u),
-                                   __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u));
-                o[1] = make_float4(__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u),
-                                   __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u));
-            }
-        }
-        return;
-    }
-    const unsigned short* w_row = gate_weight + (size_t)wave * wide;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    constexpr int BATCH = 10;
-    int i = lane * 8;
-    for (; i + 8 + (BATCH - 1) * 256 <= wide; i += BATCH * 256) {
-        uint4 wb[BATCH];
-#pragma unroll
-        for (int u = 0; u < BATCH; ++u) wb[u] = *(const uint4*)(w_row + i + u * 256);
-#pragma unroll
-        for (int u = 0; u < BATCH; ++u) {
-            const uint4 wv = wb[u];
-            const uint4 xv = *(const uint4*)(xsb + i + u * 256);
-            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
-            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
-            a0 += __uint_as_float(wv.x << 16) * xa.x;
-            a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
-            a2 += __uint_as_float(wv.y << 16) * xa.z;
-            a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
-            a0 += __uint_as_float(wv.z << 16) * xb.x;
-            a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
-            a2 += __uint_as_float(wv.w << 16) * xb.z;
-            a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
-        }
-    }
-    for (; i + 8 <= wide; i += 32 * 8) {
-        const uint4 wv = *(const uint4*)(w_row + i);
-        const uint4 xv = *(const uint4*)(xsb + i);
-        const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
-        const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
-        a0 += __uint_as_float(wv.x << 16) * xa.x;
-        a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
-        a2 += __uint_as_float(wv.y << 16) * xa.z;
-        a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
-        a0 += __uint_as_float(wv.z << 16) * xb.x;
-        a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
-        a2 += __uint_as_float(wv.w << 16) * xb.z;
-        a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
-    }
-    const float sum = hc_lane0_tree_sum((a0 + a1) + (a2 + a3));
-    if (lane == 0) gate_logits[(size_t)row * branches + wave] = sum;
-}
-extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_outputs(
-    const void* input,
-    const __hip_bfloat16* norm_weight,
-    const unsigned short* gate_weight,
-    float* gate_logits,
-    _Float16* normalized16,
-    float* normalized32,
-    float* inv4,
-    int hidden,
-    int state_bf16) {
-    hyper_norm_gate_outputs_body<false>(input, norm_weight, gate_weight, gate_logits,
-                                        normalized16, normalized32, inv4, hidden, state_bf16);
-}
-extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_outputs_f32(
-    const void* input,
-    const __hip_bfloat16* norm_weight,
-    const unsigned short* gate_weight,
-    float* gate_logits,
-    _Float16* normalized16,
-    float* normalized32,
-    float* inv4,
-    int hidden,
-    int state_bf16) {
-    hyper_norm_gate_outputs_body<true>(input, norm_weight, gate_weight, gate_logits,
-                                       normalized16, normalized32, inv4, hidden, state_bf16);
-}
 // HC read tail on gfx1151: the BF16 [wide, low_rank] up projection
 // (gemm_bf16_xf32_multirow's per-thread route, 256 < low_rank <= 512) fused
 // with hyper_read_projected_f32, so the projected gate logits never reach
@@ -1804,6 +1671,99 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     }
 }
 
+// gated_delta_conv_bf16_f32_batched_k4 with BF16 input and output, four
+// channels per thread (8-byte row accesses instead of 2-byte ones); every
+// channel's arithmetic is the scalar kernel's.  The gate parameters take the
+// blocks past the channel grid on every row of the grid, not just row 0.
+// Grid [channels / 1024 + param blocks per row, ceil(rows / 8)], block 256.
+// channels % 4 == 0.
+extern "C" __global__ void gated_delta_conv_bf16x4_batched_k4(
+    const unsigned short* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    unsigned short* output,
+    float* next_history,
+    int rows,
+    int channels,
+    int start_cursor,
+    const float* param_a,
+    const float* param_b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    float* gate,
+    float* beta,
+    int param_elements,
+    int heads) {
+    const int conv_blocks = (channels / 4 + 255) / 256;
+    if ((int)blockIdx.x >= conv_blocks) {
+        const int per_row = (int)gridDim.x - conv_blocks;
+        const int flat = ((int)blockIdx.y * per_row + (int)blockIdx.x - conv_blocks) * 256 + (int)threadIdx.x;
+        if (flat < param_elements)
+            gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+        return;
+    }
+    const int channel = ((int)blockIdx.x * 256 + (int)threadIdx.x) * 4;
+    const int r0 = (int)blockIdx.y * 8;
+    if (channel >= channels || r0 >= rows) return;
+    struct bf4 { __hip_bfloat16 v[4]; };
+    auto in = [&](int j) {
+        const uint2 u = *(const uint2*)(input + (size_t)j * channels + channel);
+        bf4 o;
+        o.v[0].data = (unsigned short)(u.x & 0xFFFFu);
+        o.v[1].data = (unsigned short)(u.x >> 16);
+        o.v[2].data = (unsigned short)(u.y & 0xFFFFu);
+        o.v[3].data = (unsigned short)(u.y >> 16);
+        return o;
+    };
+    auto x = [&](int j) {
+        if (j >= 0) return in(j);
+        const float4 h = *(const float4*)(history + ((start_cursor + j + 3) % 3) * channels + channel);
+        bf4 o;
+        o.v[0] = bf16_round(h.x);
+        o.v[1] = bf16_round(h.y);
+        o.v[2] = bf16_round(h.z);
+        o.v[3] = bf16_round(h.w);
+        return o;
+    };
+    float k[4][4];
+    for (int c = 0; c < 4; ++c)
+        for (int t = 0; t < 4; ++t) k[c][t] = bf16_to_f32(kernel[(channel + c) * 4 + t]);
+    bf4 h0 = x(r0 - 3), h1 = x(r0 - 2), h2 = x(r0 - 1);
+    bf4 tail[3];
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s) {
+            const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+            tail[s] = x(j);
+        }
+    }
+    const int r1 = min(r0 + 8, rows);
+#pragma unroll
+    for (int r = r0; r < r0 + 8; ++r) {
+        if (r >= r1) break;
+        const bf4 current = in(r);
+        unsigned short o[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            float value = k[c][3] * bf16_to_f32(current.v[c]);
+            value += k[c][0] * bf16_to_f32(h0.v[c]);
+            value += k[c][1] * bf16_to_f32(h1.v[c]);
+            value += k[c][2] * bf16_to_f32(h2.v[c]);
+            o[c] = bf16_round(value * (1.0f / (1.0f + expf(-value)))).data;
+        }
+        *(uint2*)(output + (size_t)r * channels + channel) =
+            make_uint2(o[0] | ((unsigned)o[1] << 16), o[2] | ((unsigned)o[3] << 16));
+        h0 = h1;
+        h1 = h2;
+        h2 = current;
+    }
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s)
+            *(float4*)(next_history + s * channels + channel) = make_float4(
+                bf16_to_f32(tail[s].v[0]), bf16_to_f32(tail[s].v[1]),
+                bf16_to_f32(tail[s].v[2]), bf16_to_f32(tail[s].v[3]));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Convolution + Q/K norm in one launch (Flash-Next H5; opt-in, chunked-GDN
 // wave32 route only: gfx1151 / gfx1201 with a gated_delta_qk_norm_bf16_batched
@@ -2047,7 +2007,6 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
             next_history[s * channels + channel] = bf16_to_f32(tail[s]);
     }
 }
-
 // Row-batched parameter expansion; source BF16 boundaries match decode.
 extern "C" __global__ void gated_delta_params_bf16_f32_batched(
     const float* a,
@@ -3071,6 +3030,89 @@ static __device__ __forceinline__ void qsa_select_batched_serial(
     }
 }
 
+// Block scores of up to R (8 or 16) consecutive query rows (index_heads == 4,
+// index_dim % 4 == 0, index_dim <= 128): each pooled key row is read once for
+// the R rows instead of once per row.  Every (row, block) score is
+// indexed_attention_select_score4_f32's exact arithmetic (per-head serial
+// d-order dots, heads summed in order).  Row r scores blocks below its own
+// visible count into scores[r * score_stride + block].
+// Grid [ceil(block_count / 256), ceil(rows / R)], block 256.
+template <int R>
+__device__ __forceinline__ void indexed_attention_select_scores_rows(
+    const float* query,
+    const float* pooled,
+    float* scores,
+    int rows,
+    int query_row_stride,
+    int block_count,
+    int index_dim,
+    int compress,
+    int position_start,
+    int score_stride) {
+    __shared__ __align__(16) float qs[R * 4 * 128];
+    const int row0 = (int)blockIdx.y * R;
+    const int nrows = min(R, rows - row0);
+    const int width = 4 * index_dim;
+    for (int i = (int)threadIdx.x; i < nrows * width; i += 256) {
+        const int r = i / width;
+        qs[r * 4 * 128 + (i - r * width) / index_dim * 128 + (i - r * width) % index_dim] =
+            query[(row0 + r) * query_row_stride + (i - r * width)];
+    }
+    __syncthreads();
+    const int block = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    if (block >= block_count) return;
+    const float4* p4 = reinterpret_cast<const float4*>(pooled + block * index_dim);
+    float dot[R][4];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int h = 0; h < 4; ++h) dot[r][h] = 0.0f;
+    for (int d4 = 0; d4 < index_dim / 4; ++d4) {
+        const float4 p = p4[d4];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const float4 a = *reinterpret_cast<const float4*>(qs + r * 4 * 128 + h * 128 + d4 * 4);
+                dot[r][h] += a.x * p.x;
+                dot[r][h] += a.y * p.y;
+                dot[r][h] += a.z * p.z;
+                dot[r][h] += a.w * p.w;
+            }
+        }
+    }
+    // No break/continue: the loop must fully unroll so `dot` stays in
+    // registers (with them, the 16-row kernel spills it to scratch).
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int visible_blocks = (position_start + row0 + r + 1) / compress;
+        if (r < nrows && block < visible_blocks) {
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < 4; ++h) score += fmaxf(dot[r][h] / sqrtf((float)index_dim), 0.0f);
+            scores[(row0 + r) * score_stride + block] = score;
+        }
+    }
+}
+
+// Eight rows per pooled read: decode and few-row verify.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_scores_rows8_f32(
+    const float* query, const float* pooled, float* scores, int rows, int query_row_stride,
+    int block_count, int index_dim, int compress, int position_start, int score_stride) {
+    indexed_attention_select_scores_rows<8>(query, pooled, scores, rows, query_row_stride,
+                                            block_count, index_dim, compress, position_start,
+                                            score_stride);
+}
+
+// Sixteen rows per pooled read: prefill (half the pooled-key reads per row).
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_scores_rows16_f32(
+    const float* query, const float* pooled, float* scores, int rows, int query_row_stride,
+    int block_count, int index_dim, int compress, int position_start, int score_stride) {
+    indexed_attention_select_scores_rows<16>(query, pooled, scores, rows, query_row_stride,
+                                             block_count, index_dim, compress, position_start,
+                                             score_stride);
+}
+
 #define QSA_SELECT_SERIAL(NAME, POOLED)                                                    \
     extern "C" __global__ void NAME(const float* query, const POOLED* pooled, int* selected, \
                                     int rows, int query_row_stride, int block_count,         \
@@ -3272,6 +3314,149 @@ static __device__ __forceinline__ void qsa_select_batched(
     }
 }
 
+// indexed_attention_select_f32_batched's selection over block scores already
+// in memory (indexed_attention_select_scores_rows8_f32, row stride
+// `score_stride`), emitting the same bytes: the top `chosen` blocks by
+// (score desc, index asc), then the causal tail. Scores are non-negative,
+// non-NaN, never -0 floats, so their bits order like the values: a four-pass
+// 8-bit radix select over the bits finds T, the chosen-th largest key, with
+// LDS histograms (no score row in LDS, so many rows share a CU). Keys above
+// T are ranked among themselves; the first keys equal to T, in index order,
+// take the remaining ranks. budget_blocks <= 512.
+// Grid [rows], block 256.
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_select_from_scores(
+    const float* scores,
+    int score_stride,
+    int* selected,
+    int rows,
+    int block_count,
+    int budget_blocks,
+    int compress,
+    int position_start,
+    int capacity,
+    int* mirror) {
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    if (row != rows - 1) mirror = nullptr;
+    __shared__ unsigned hist[8][256];  // one copy per wave: fewer atomic collisions
+    __shared__ int wave_totals[8];
+    __shared__ unsigned radix_prefix;
+    __shared__ int radix_need;
+    __shared__ int2 entries[512];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int visible = position_start + row + 1;
+    const int row_block_count = min(visible / compress, block_count);
+    const int chosen = min(budget_blocks, row_block_count);
+    const unsigned* keys = reinterpret_cast<const unsigned*>(scores + row * score_stride);
+    int* row_selected = selected + row * capacity;
+    for (int i = tid; i < capacity; i += 256) {
+        row_selected[i] = -1;
+        if (mirror) mirror[i] = -1;
+    }
+    if (chosen > 0) {
+        unsigned prefix = 0u;
+        int need = chosen;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            const unsigned high = shift == 24 ? 0u : ~0u << (shift + 8);
+#pragma unroll
+            for (int w = 0; w < 8; ++w) hist[w][tid] = 0u;
+            __syncthreads();
+            for (int block = tid; block < row_block_count; block += 256) {
+                const unsigned key = keys[block];
+                if ((key & high) == prefix) atomicAdd(&hist[wave][(key >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            // Thread t owns digit 255 - t: an inclusive scan over t gives the
+            // count at or above each digit; the digit where it first reaches
+            // `need` holds the chosen-th largest key.
+            int count = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) count += (int)hist[w][255 - tid];
+            int at_or_above = count;
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const int up = __shfl_up(at_or_above, offset, 32);
+                if (lane >= offset) at_or_above += up;
+            }
+            if (lane == 31) wave_totals[wave] = at_or_above;
+            __syncthreads();
+            for (int w = 0; w < wave; ++w) at_or_above += wave_totals[w];
+            if (at_or_above >= need && at_or_above - count < need) {
+                radix_prefix = prefix | ((unsigned)(255 - tid) << shift);
+                radix_need = need - (at_or_above - count);
+            }
+            __syncthreads();
+            prefix = radix_prefix;
+            need = radix_need;
+        }
+        // prefix = T; `need` keys equal to T are taken, every key above T is.
+        const int above = chosen - need;
+        const int per = (row_block_count + 255) / 256;
+        const int first = min(tid * per, row_block_count);
+        const int last = min(first + per, row_block_count);
+        int packed = 0;
+        for (int block = first; block < last; ++block) {
+            const unsigned key = keys[block];
+            packed += key > prefix ? 1 : (key == prefix ? 1 << 16 : 0);
+        }
+        int inclusive = packed;
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int up = __shfl_up(inclusive, offset, 32);
+            if (lane >= offset) inclusive += up;
+        }
+        if (lane == 31) wave_totals[wave] = inclusive;
+        __syncthreads();
+        int before = 0;
+        for (int w = 0; w < wave; ++w) before += wave_totals[w];
+        const int exclusive = before + inclusive - packed;
+        int above_slot = exclusive & 0xffff;
+        int equal_seen = exclusive >> 16;
+        for (int block = first; block < last; ++block) {
+            const unsigned key = keys[block];
+            if (key > prefix) {
+                entries[above_slot++] = make_int2((int)key, block);
+            } else if (key == prefix) {
+                if (equal_seen < need) entries[above + equal_seen] = make_int2((int)key, block);
+                ++equal_seen;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int i = tid + k * 256;
+            if (i >= chosen) break;
+            const int2 entry = entries[i];
+            int rank = i;
+            if (i < above) {
+                rank = 0;
+                const unsigned key = (unsigned)entry.x;
+                for (int j = 0; j < above; ++j) {
+                    const int2 other = entries[j];
+                    rank += (unsigned)other.x > key
+                        || ((unsigned)other.x == key && other.y < entry.y);
+                }
+            }
+            for (int slot = 0; slot < compress; ++slot) {
+                const int index = rank * compress + slot;
+                const int token = entry.y * compress + slot;
+                if (index < capacity && token < visible) {
+                    row_selected[index] = token;
+                    if (mirror) mirror[index] = token;
+                }
+            }
+        }
+    }
+    __syncthreads();  // the -1 fill above precedes the tail writes
+    const int tail_start = row_block_count * compress;
+    const int offset = chosen * compress;
+    for (int token = tail_start + tid;
+         token < visible && offset + (token - tail_start) < capacity;
+         token += 256) {
+        row_selected[offset + (token - tail_start)] = token;
+        if (mirror) mirror[offset + (token - tail_start)] = token;
+    }
+}
 #define QSA_SELECT_PARALLEL(NAME, POOLED)                                                      \
     extern "C" __global__ void NAME(const float* query, const POOLED* pooled, int* selected,    \
                                     int rows, int query_row_stride, int block_count,            \
@@ -3857,7 +4042,7 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
     // Invalid (-1) rows hold weight 0 (their score was never exponentiated)
     // and read value 0, so they add +0.0 to sums that are never -0.0: the
     // accumulation is branch-free and still bitwise the skipping version.
-    // Eight value loads are issued before their in-order accumulation.
+    // Sixteen value loads are issued before their in-order accumulation.
     // Token indices are block-uniform: read them as scalars and fetch each
     // value row through a scalar buffer offset (invalid rows read row 0 and
     // select 0.0, exactly the value the skipped row contributed).
@@ -3878,12 +4063,12 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
         }
     };
     int i = 0;
-    for (; i + 8 <= selected_len; i += 8) {
-        float value[8];
+    for (; i + 16 <= selected_len; i += 16) {
+        float value[16];
 #pragma unroll
-        for (int u = 0; u < 8; ++u) value[u] = value_at(i + u);
+        for (int u = 0; u < 16; ++u) value[u] = value_at(i + u);
 #pragma unroll
-        for (int u = 0; u < 8; ++u) {
+        for (int u = 0; u < 16; ++u) {
             const float4 w4 = *reinterpret_cast<const float4*>(weights + (i + u) * QSA_HG);
             denominator[0] += w4.x;
             numerator[0] += w4.x * value[u];
@@ -3917,6 +4102,186 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
     }
 }
 #undef QSA_HG
+#undef QSA_HD
+
+// Bitwise-equal to indexed_attention_attention_f32_batched_hg4 (and so to the
+// serial kernel) for head_dim 256 and twelve query heads per KV head: one
+// workgroup owns the whole KV group, so every selected key and value row is
+// read once instead of once per four heads. Each thread keeps the scores of
+// its (up to QSA_T) selected rows for all twelve heads in registers — the
+// same serial d-order dots — so no score array lives in LDS; the weights of
+// one 256-row tile at a time go through LDS for the in-order channel sums.
+#define QSA_G 12
+#define QSA_T 9
+#define QSA_HD 256
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f32_batched_hg12(
+    const float* q_with_gate,
+    const float* full_keys,
+    const float* full_values,
+    const int* selected_indices,
+    float* output,
+    int rows,
+    int position_start,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int budget_blocks,
+    int compress,
+    int capacity,
+    int full_capacity) {
+    int row = (int)blockIdx.z;
+    if (row >= rows) return;
+    int visible = position_start + row + 1;
+    int block_count = visible / compress;
+    int chosen = budget_blocks < block_count ? budget_blocks : block_count;
+    int selected_len = chosen * compress + visible - block_count * compress;
+    if (selected_len > capacity) selected_len = capacity;
+    __shared__ __align__(16) float weights[256 * QSA_G];  // one tile, [row][head]
+    __shared__ float wave_max[8 * QSA_G];
+    __shared__ float maxes[QSA_G];
+    const int tid = (int)threadIdx.x;
+    const int kv_head = (int)blockIdx.x;
+    const int head0 = kv_head * QSA_G;
+    const int kv_stride = n_kv_heads * QSA_HD;
+    const float* keys = full_keys + kv_head * QSA_HD;
+    const float* values = full_values + kv_head * QSA_HD;
+    const int* row_selected = selected_indices + row * capacity;
+    const int q_row = row * 2 * n_heads * QSA_HD;
+    const float* __restrict__ qg = q_with_gate + q_row + head0 * QSA_HD * 2;
+
+    float scores[QSA_T][QSA_G];
+    unsigned valid_rows = 0u;  // bit t: this thread's tile-t row is a live key
+    float partial_max[QSA_G];
+#pragma unroll
+    for (int h = 0; h < QSA_G; ++h) partial_max[h] = -3.402823466e+38f;
+#pragma unroll
+    for (int t = 0; t < QSA_T; ++t) {
+        const int index = t * 256 + tid;
+        int token = index < selected_len ? row_selected[index] : -1;
+        if (!(token >= 0 && token < full_capacity && token < visible)) token = -1;
+#pragma unroll
+        for (int h = 0; h < QSA_G; ++h) scores[t][h] = 0.0f;
+        if (token >= 0) {
+            const float4* key4 = reinterpret_cast<const float4*>(keys + token * kv_stride);
+#pragma unroll 2
+            for (int d4 = 0; d4 < QSA_HD / 4; ++d4) {
+                const float4 k4 = key4[d4];
+#pragma unroll
+                for (int h = 0; h < QSA_G; ++h) {
+                    const float4 q4 = reinterpret_cast<const float4*>(qg + h * QSA_HD * 2)[d4];
+                    scores[t][h] += q4.x * k4.x;
+                    scores[t][h] += q4.y * k4.y;
+                    scores[t][h] += q4.z * k4.z;
+                    scores[t][h] += q4.w * k4.w;
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < QSA_G; ++h) {
+            scores[t][h] = scores[t][h] / sqrtf((float)QSA_HD);
+            if (token >= 0) partial_max[h] = fmaxf(partial_max[h], scores[t][h]);
+        }
+        if (token >= 0) valid_rows |= 1u << t;
+    }
+    // fmaxf is exact and order-independent: any reduction tree matches.
+#pragma unroll
+    for (int h = 0; h < QSA_G; ++h) {
+        float m = partial_max[h];
+        for (int offset = 16; offset > 0; offset >>= 1) m = fmaxf(m, __shfl_xor(m, offset, 32));
+        partial_max[h] = m;
+    }
+    if ((tid & 31) == 0) {
+#pragma unroll
+        for (int h = 0; h < QSA_G; ++h) wave_max[(tid >> 5) * QSA_G + h] = partial_max[h];
+    }
+    __syncthreads();
+    if (tid < QSA_G) {
+        float m = -3.402823466e+38f;
+        for (int w = 0; w < 8; ++w) m = fmaxf(m, wave_max[w * QSA_G + tid]);
+        maxes[tid] = m;
+    }
+    __syncthreads();
+
+    const int channel = tid;
+    float denominator[QSA_G];
+    float numerator[QSA_G];
+#pragma unroll
+    for (int h = 0; h < QSA_G; ++h) {
+        denominator[h] = 0.0f;
+        numerator[h] = 0.0f;
+    }
+    const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)values, 0, 0x7FFFFFFF, 0x31004000);
+    const int voff = channel * 4;
+    auto value_at = [&](int index) {
+        const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
+        const bool ok = token >= 0 && token < full_capacity && token < visible;
+        const float v = __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(
+            vrsrc, voff, ok ? token * kv_stride * 4 : 0, 0));
+        return ok ? v : 0.0f;
+    };
+#pragma unroll
+    for (int t = 0; t < QSA_T; ++t) {
+        const int base = t * 256;
+        if (base >= selected_len) break;
+        // Invalid rows keep weight 0: their score is never exponentiated.
+        const bool valid = (valid_rows >> t) & 1u;
+#pragma unroll
+        for (int h = 0; h < QSA_G; ++h)
+            weights[tid * QSA_G + h] = valid ? expf(scores[t][h] - maxes[h]) : 0.0f;
+        __syncthreads();
+        const int count = min(256, selected_len - base);
+        int u = 0;
+        for (; u + 8 <= count; u += 8) {
+            float value[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) value[k] = value_at(base + u + k);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const float4* w4 = reinterpret_cast<const float4*>(weights + (u + k) * QSA_G);
+#pragma unroll
+                for (int q = 0; q < QSA_G / 4; ++q) {
+                    const float4 w = w4[q];
+                    denominator[4 * q] += w.x;
+                    numerator[4 * q] += w.x * value[k];
+                    denominator[4 * q + 1] += w.y;
+                    numerator[4 * q + 1] += w.y * value[k];
+                    denominator[4 * q + 2] += w.z;
+                    numerator[4 * q + 2] += w.z * value[k];
+                    denominator[4 * q + 3] += w.w;
+                    numerator[4 * q + 3] += w.w * value[k];
+                }
+            }
+        }
+        for (; u < count; ++u) {
+            const float value = value_at(base + u);
+            const float4* w4 = reinterpret_cast<const float4*>(weights + u * QSA_G);
+#pragma unroll
+            for (int q = 0; q < QSA_G / 4; ++q) {
+                const float4 w = w4[q];
+                denominator[4 * q] += w.x;
+                numerator[4 * q] += w.x * value;
+                denominator[4 * q + 1] += w.y;
+                numerator[4 * q + 1] += w.y * value;
+                denominator[4 * q + 2] += w.z;
+                numerator[4 * q + 2] += w.z * value;
+                denominator[4 * q + 3] += w.w;
+                numerator[4 * q + 3] += w.w * value;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int h = 0; h < QSA_G; ++h) {
+        int head = head0 + h;
+        float gate = q_with_gate[q_row + head * QSA_HD * 2 + QSA_HD + channel];
+        output[row * n_heads * QSA_HD + head * QSA_HD + channel] = denominator[h] > 0.0f
+            ? numerator[h] / denominator[h] / (1.0f + expf(-gate))
+            : 0.0f;
+    }
+}
+#undef QSA_G
+#undef QSA_T
 #undef QSA_HD
 
 template <int F>

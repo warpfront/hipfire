@@ -694,7 +694,10 @@ Caveats that are part of the fixture, not trivia:
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
 - **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
-  which keep the retained Redline AR route; greedy requests only.** Each MTP
+  which keep the retained Redline AR route.** Greedy requests verify against
+  the target argmax. Sampled requests (temperature > 0, neutral penalties)
+  verify against one AR-sampler draw per row, which is exact naive sampling.
+  Non-neutral penalties keep AR. Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
@@ -738,11 +741,11 @@ Caveats that are part of the fixture, not trivia:
   was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
   with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
   [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
-- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
-  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
-  `memory.max_seq` forced to 2048), so it fails closed at load and never
-  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
-  bench-side `max_seq` knob — not an MTP change.
+- Qwen4 loads admit `max_seq` from 2048 (the automatic value) up to the
+  model's `max_position_embeddings`; before 2026-09-30 it had to be exactly
+  2048, so `hipfire bench` (which asks for the configured `memory.max_seq`)
+  failed closed at load. Contexts past 2048 select attention blocks through
+  the QSA indexer; every measurement above was taken at `max_seq=2048`.
 - Decode numbers are not comparable across instruments: the raw decode probe
   measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
   Same model, different measurement; never average or compare them across.

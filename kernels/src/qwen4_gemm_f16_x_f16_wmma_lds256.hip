@@ -666,7 +666,7 @@ static __device__ __forceinline__ float wlds_bf16_scaled_add(
 // an optional F32 mirror gets the unrounded value.  Stage 2 (accumulators
 // dead): each item = (token t, channels c0..c0+7) reads the four stream
 // columns br*H + c0.. of token t (old values), applies the four gates (the
-// paired read's hyper_norm_gate_outputs logits through the same expression as
+// paired read's hyper_norm_gate logits through the same expression as
 // hyper_write_bf16x2) and overwrites them; one item owns its columns.
 // Requires H % 8 == 0 (the caller's M).  Keep byte-identical across the files
 // carrying this block (gfx11 bt, gfx12 bt, lds256).
@@ -1431,6 +1431,11 @@ WLDS_KERNEL(gemm_wmma_lds_128_256_64_64_k32_p,  128, 256, 4, 4, 32, false, true)
 // workgroups for 40 CUs; 64 x 64 gives 90 (same K order per output, bitwise).
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64,       64,  64, 2, 4, 64, false, false)
 WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k64_p,     64,  64, 2, 4, 64, false, true)
+// KS 32: the same tile and K order at half the LDS per stage, 362 -> 342 us
+// cold at 320 x 10240 x 1131 (bitwise). The plain form is the pipelining
+// kill switch's twin (HIPFIRE_FLUX_GEMM_PIPE=0).
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k32,       64,  64, 2, 4, 32, false, false)
+WLDS_KERNEL(gemm_wmma_lds_64_64_32_64_k32_p,     64,  64, 2, 4, 32, false, true)
 // HIPFIRE_QWEN4_HC_DOWN_TILE (shape-specific narrow long-K HC-down scheduling, idea from Gufo
 // upstream: gufo-org/gufo @1071b361, MIT): the same 320 x 10240 shape on one 160 x 64 block of
 // five 32 x 64 waves, 256 workgroups instead of 640. Each output's K order and store are the

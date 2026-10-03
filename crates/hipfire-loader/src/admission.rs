@@ -927,12 +927,18 @@ pub fn admit_source_with_options(
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?
             .admit_options(draft_path, options)?;
-        admit_qwen4_source(
+        let admitted = admit_qwen4_source(
             &source,
             hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
             InputModality::Text,
             native_mtp,
         )?;
+        let positions = admitted.config.max_position_embeddings;
+        if max_seq > positions {
+            return Err(format!(
+                "qwen4: max_seq {max_seq} exceeds max_position_embeddings {positions}"
+            ));
+        }
         (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors

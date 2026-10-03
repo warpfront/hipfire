@@ -504,6 +504,24 @@ impl SourceReaderImpl for HfqRangeReader {
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
     }
+
+    fn advise_willneed(&self, offset: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            if let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) {
+                // A hint only: the result does not affect correctness.
+                unsafe {
+                    libc::posix_fadvise(
+                        self.file.as_raw_fd(),
+                        offset,
+                        len,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Author-recommended sampling defaults baked into a .hfq's

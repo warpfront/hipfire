@@ -2489,6 +2489,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         // The retrying serve path threads a real counter instead (main.rs:4234).
         "attempt_id": 1,
     });
+    if args.max_tokens.is_none() {
+        // The configured default is only a ceiling: the daemon fits it to the
+        // context left after the prompt, as serve does for an omitted value.
+        request["max_tokens_fit"] = serde_json::Value::Bool(true);
+    }
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
     insert_optional_u64(&mut request, "top_k", top_k);

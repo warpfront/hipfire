@@ -3564,7 +3564,12 @@ impl Gpu {
     }
 
     /// Re-quantize f32 activations for the gfx1201 A8 MMQ consumer.
-    pub fn ensure_int8_mmq_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_int8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
         if crate::scratch::scratch_will_grow(
             self.scratch.int8_mmq_x_scratch_bytes,
@@ -3574,15 +3579,28 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch.ensure_int8_mmq_x(
-            &self.hip, &mut self.compiler, &mut self.modules, &mut self.functions,
-            self.active_stream.as_ref(), &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode, self.flags.force_blob_path, &mut self.replay,
-            self.device_id, x, n, k,
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
         )
     }
 
     /// Reserve (without launching the quantizer) for a fused A8 producer.
-    pub fn reserve_int8_mmq(&mut self, k: usize, n: usize) -> HipResult<crate::scratch::Int8MmqReservation> {
+    pub fn reserve_int8_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
         if k != 0 && n != 0 && k % 256 == 0 {
             let needed = crate::scratch::int8_mmq_x_needed(k, n);
             if crate::scratch::scratch_will_grow(
@@ -3597,7 +3615,10 @@ impl Gpu {
     }
 
     pub fn int8_mmq_prepared_ptr(
-        &self, prepared: &crate::scratch::Int8MmqPrepared, k: usize, n: usize,
+        &self,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        k: usize,
+        n: usize,
     ) -> HipResult<*mut c_void> {
         let (generation, ptr) = self.scratch.int8_mmq_live();
         prepared.checked_ptr(generation, ptr, k, n)
@@ -3608,7 +3629,9 @@ impl Gpu {
             && self.mq4v2_symmetric
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64 && k > 0 && k % 256 == 0
+            && n >= 64
+            && k > 0
+            && k % 256 == 0
     }
 
     /// True when the portable producer-sidecar route is live for this call:
@@ -3882,8 +3905,9 @@ impl Gpu {
 
     /// Model-lifetime F16 shadow of a BF16 `[M × K]` weight, keyed on its
     /// device pointer (weights are immutable after load); freed with the other
-    /// shadows on unload.  BF16 -> F16 rounds (and flushes values below the F16
-    /// range): callers must be accuracy-gated.
+    /// shadows on unload.  Rows are stored at [`Gpu::f16_row_pitch`]`(k)`.
+    /// BF16 -> F16 rounds (and flushes values below the F16 range): callers
+    /// must be accuracy-gated.
     pub(crate) fn ensure_bf16_f16_shadow(
         &mut self,
         weight: &GpuTensor,
@@ -3895,7 +3919,8 @@ impl Gpu {
             return Ok(shadow.buf.as_ptr());
         }
         let n = m * k;
-        let fp16 = self.alloc_tensor(&[n], DType::F16)?;
+        let ld = self.f16_row_pitch(k);
+        let fp16 = self.alloc_tensor(&[m * ld], DType::F16)?;
         self.ensure_kernel(
             "gemm_bf16_xf32_multirow",
             kernels::GEMM_BF16_XF32_MULTIROW_SRC,
@@ -3905,10 +3930,14 @@ impl Gpu {
         let op = fp16.buf.as_ptr();
         let nv =
             i32::try_from(n).map_err(|_| hip_bridge::HipError::new(0, "BF16 shadow too large"))?;
+        let kv = k as i32;
+        let ldv = ld as i32;
         let mut params = [
             &ip as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
             &nv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &ldv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "convert_bf16_to_f16",
@@ -3921,6 +3950,8 @@ impl Gpu {
                 b.push_ptr(ip);
                 b.push_ptr(op);
                 b.push_i32(nv);
+                b.push_i32(kv);
+                b.push_i32(ldv);
                 b
             },
         )?;
@@ -4028,7 +4059,9 @@ impl Gpu {
             if self.functions.contains_key(func_name) {
                 continue;
             }
-            let obj_path = self.compiler.compile_for_symbol(module_name, source, func_name)?;
+            let obj_path = self
+                .compiler
+                .compile_for_symbol(module_name, source, func_name)?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(module_name) {
                 let module = crate::scratch::module_load_or_recompile(

@@ -2839,10 +2839,13 @@ impl Gpu {
         bf16_out: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let func = if bf16_out {
-            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out"
-        } else {
-            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151"
+        // Eight row tiles per workgroup share X through LDS (bitwise the
+        // per-wave kernel); M % 128 == 0 on this route's shapes.
+        let x8 = bf16_out && m.is_multiple_of(128);
+        let func = match (x8, bf16_out) {
+            (true, _) => "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out",
+            (false, true) => "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out",
+            (false, false) => "gemm_mq4g128v2_moe_grouped_wmma_gfx1151",
         };
         const FUNC: &str = "gemm_mq4g128v2_moe_grouped_wmma_gfx1151";
         self.ensure_kernel(
@@ -2875,8 +2878,12 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
         let result = self.launch_maybe_blob(
             func,
-            [m.div_ceil(16) as u32, grouped_rows.div_ceil(16) as u32, 1],
-            [32, 1, 1],
+            if x8 {
+                [(m / 128) as u32, grouped_rows.div_ceil(16) as u32, 1]
+            } else {
+                [m.div_ceil(16) as u32, grouped_rows.div_ceil(16) as u32, 1]
+            },
+            [if x8 { 256 } else { 32 }, 1, 1],
             0,
             &mut params,
             || {

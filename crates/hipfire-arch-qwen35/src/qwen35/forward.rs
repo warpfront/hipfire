@@ -2018,6 +2018,15 @@ pub fn forward_scratch_mrope(
             gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
         );
     };
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_mrope")?;
+    super::prefill::release_widened_pbs_for_kv_growth(
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
+    )?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     mark_mrope_forward_ineligible(gpu);
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by
     // the KV write and flash attention, which want the PHYSICAL slot).
@@ -2062,6 +2071,15 @@ pub fn forward_scratch_embed_mrope(
             scratch,
         );
     };
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed_mrope")?;
+    super::prefill::release_widened_pbs_for_kv_growth(
+        gpu,
+        kv_cache,
+        config,
+        scratch,
+        required_tokens,
+    )?;
+    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     mark_mrope_forward_ineligible(gpu);
     let pos_i32 = pos as i32;
     gpu.hip

@@ -82,8 +82,9 @@ extern "C" __global__ __launch_bounds__(256) void hc_row_fold_norm_gate(
     const __hip_bfloat16* __restrict__ norm_weight,   // next read's norm weight [4 * hidden]
     const unsigned short* __restrict__ gate_weight,   // next write's BF16 gate weight [4, 4 * hidden]
     float* __restrict__ next_gates,                    // [tokens, 4]
-    _Float16* __restrict__ normalized16,               // [tokens, 4 * hidden] F16
-    int hidden) {
+    _Float16* __restrict__ normalized16,               // [tokens, ld16] F16, ld16 >= 4 * hidden
+    int hidden,
+    int ld16) {
     constexpr int branches = 4;
     constexpr int U = 10;
     extern __shared__ float hc_lds[];
@@ -223,7 +224,7 @@ extern "C" __global__ __launch_bounds__(256) void hc_row_fold_norm_gate(
             h[5] = (_Float16)__uint_as_float(xv.z & 0xFFFF0000u);
             h[6] = (_Float16)__uint_as_float(xv.w << 16);
             h[7] = (_Float16)__uint_as_float(xv.w & 0xFFFF0000u);
-            ((half8v*)(normalized16 + in))[v] = h;
+            ((half8v*)(normalized16 + (size_t)row * ld16))[v] = h;
         }
         return;
     }

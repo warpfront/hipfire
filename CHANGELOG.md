@@ -1,5 +1,98 @@
 # Changelog
 
+## Unreleased
+- **Qwen4 (Flash-Next): `hyper_norm_gate_outputs` is removed.** The HC read
+  that also projects its paired write's gates (default on the F16 prefill
+  route, and `HIPFIRE_QWEN4_HC_FUSE` level 1) runs `hyper_norm_gate` with its
+  F16 read output, which writes the padded row pitch the HC GEMMs read. The
+  two kernels' gates and F16 rows were byte-identical at 512, 2048 and 8192
+  rows; on the BF16 streams this route uses, `hyper_norm_gate` was 9-26%
+  faster (8192 rows: 1549 vs 1695 us).
+- **Qwen4 (Flash-Next) on gfx1151: past-budget QSA chunks of 16-511 rows
+  run on the gathered F16 WMMA kernel instead of the sparse one.** Both round
+  Q, K, V and the probabilities to F16. Against the exact kernels, KLD was
+  the same (paired over 10 WikiText-2 samples at 4K-16K context: sparse
+  mean 0.0314, gathered 0.0254, t = 1.36), and each chunk was 0-2% faster
+  (16 rows: 143 -> 140 ms; 256 rows: 646 -> 638 ms at 16K). This covers
+  prompt-cache suffixes and short tails. `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0`
+  returns them, and the >= 512-row chunks, to the sparse kernel. gfx1201
+  keeps the exact kernels below 512 rows.
+- **Qwen4 (Flash-Next): native MTP now runs sampled (temperature > 0)
+  requests; they used to fall back to AR.** Drafts stay the head's argmax.
+  Each verify row's target token is drawn with the AR sampler, in row order,
+  up to the row where acceptance ends, and a draft is accepted only when it
+  equals that draw (SpecInfer naive sampling). Every emitted token is one
+  draw from the target, and the sampler RNG advances exactly as under AR.
+  Seeded sampled MTP emits AR's exact token ids: 26/26 runs on the default
+  route (2 prompts × greedy, T=0.7/top_p=0.95 and T=1.0 × 6 seeds × 128
+  tokens), and on both forced routes in `qwen4_seeded_sampled_mtp_matches_ar`.
+  Greedy requests are unchanged. Requests with non-neutral
+  repeat/presence/frequency penalties still run AR. On gfx1151, single runs,
+  `max_seq` 2048, decode went from 34.1 (AR) to 63.4 tok/s on a code prompt
+  at T=0.7, and from 32.9 to 46.2 tok/s on a prose prompt.
+- **Qwen4 (Flash-Next): an MTP verify of 2–8 rows is again bitwise the
+  single-row decode, so greedy MTP once more emits AR's tokens.** Since the Q8
+  GDN state became the default (v0.4.0, `7289862bf`, merged into this branch
+  in `d685aae24`), the persistent few-row GDN kernel requantized the state once
+  per launch, while decode requantizes after every token. Rows after the first
+  therefore saw a different state: their logits were off by up to ~1.9
+  (`qwen4_rows`), and greedy MTP left AR's ids within 16–83 tokens. The
+  kernel now requantizes after every row with that row's position, so rows
+  2..8 are bitwise again. The chunked prefill scan (≥512 rows) is unchanged.
+  A 167-token prefill (persistent route) costs 1.6% more (447 → 455 ms).
+- **Qwen4 (Flash-Next): two HC projections no longer change their sum order
+  between one row and a 2–8-row verify.** Decode runs the final HC read's
+  BF16 down projection and the HC write gate projection through
+  `gemv_bf16_xf32_k4`, while 2–8 rows went through the multi-row GEMM and the
+  fused `hyper_norm_gate`. The results differed in the last F32 bit. Because the
+  values are BF16-rounded downstream, this only rarely reached a verify row's
+  logits (~1e-6 relative): in 1 of 24 seeded sampled MTP runs it flipped a draw at token 89.
+  Rows 2–8 now run the one-row kernel per row; a 3-row window followed by a
+  4-row window (the triggering shape) is bitwise again over 127 replayed rows.
+  MTP decode on a code prompt is unchanged (62.6 → 63.0 tok/s median).
+- **Qwen4 long context on gfx1151: 32k-token prompt at `max_seq` 65536 with
+  MTP goes from 628 to 1490 tok/s prefill and 29.2 to 53.7 tok/s decode.**
+  QSA block selection picks its top blocks with a radix select over block
+  scores computed eight (decode) or sixteen (prefill) query rows per
+  pooled-key read. The MTP head appends prompt K/V 256 rows per step. Q8 batched GEMM rows share X
+  through LDS. Prefill chunks grow to 8192 rows, and the first chunk ends at
+  the 2048-token index budget, so it stays on the dense route. Spec logit
+  scratch is bounded to the verify rows. The next chunk's PLE rows are read ahead
+  (`posix_fadvise`), which cuts a fresh daemon's first 32k prefill from
+  28.5 s to 26.7 s. Sparse attention past the budget runs in F16 WMMA, the
+  same rounding as the dense route. It is not bit-exact: greedy ids at 32k
+  diverge from the exact F32 kernel after 105 tokens, the text stays
+  coherent, and first-2048-token KLD is unchanged (0.083874).
+  `HIPFIRE_QWEN4_F16_WMMA=0` keeps the exact kernels. All other changes are
+  bit-identical.
+- **Qwen4 (Flash-Next): prompts past ~1638 tokens no longer fail with a PLE
+  row-prefetch error.** One prefill chunk (up to 2048 tokens) needs 16 PLE rows
+  per token, more than one 8 MiB row-staging buffer holds; `RowFetch` now
+  splits the request and stages the parts in order. This failed even at the
+  default 2048-token context.
+- **Qwen4 prefill on gfx1151 is ~11% faster** (1282 → 1419 tok/s on a
+  1131-token prompt; 719 → 787 tok/s at 32k), with bit-identical logits: MoE
+  grouped gate/up and down kernels share X through LDS, padded F16 row pitches
+  for the HC and MQ6 GEMMs, fused HC read/write gate passes, a four-channel GDN
+  convolution, and the top-10 router's wave minimum no longer runs through
+  double precision.
+- **`hipfire run qwen3.8:flash-next` works with the default config.** Qwen4's
+  2048-token context is below the default `max_tokens` (4096), and the Qwen4 AR
+  route refused every such request. The Qwen4 AR route now fits an omitted
+  `max_tokens` like the other routes, and `hipfire run` without `-n` marks its
+  configured `max_tokens` as a ceiling (`max_tokens_fit`), as serve does for an
+  omitted value. An explicit `-n` is still refused when it does not fit.
+- **Qwen4 (Flash-Next): the whole-chunk prefix checkpoint follows this
+  branch's prefill schedule.** A chunk starting inside the QSA index budget
+  ends at it, so the cold schedule's chunk ends are 2048, 2048 + C, ...; the
+  checkpoint is taken at the last of those that fits the prompt, and a hit
+  replays the cold prefill's exact chunks. Prompts from 2048 tokens can hit.
+  Native MTP windows stop at `<|im_end|>` rather than the config EOS, so an
+  accepted end-of-turn is not committed with a draft tail past it. The
+  `HIPFIRE_QWEN4_HC_ROW_FOLD` row kernel writes its F16 row at the HC read's
+  padded `f16_row_pitch`.
+- **gfx1151: fix garbage output on Qwen3.5-family prompts that prefill through the GDN chunk scan with a partial last chunk.** The `gdn_chunk_scan_gfx1151` twin let clang sink its final output WMMAs into the `tok < rows` store branch. WMMA then ran with the tail lanes masked off, so the valid rows of a partial 16-row block read undefined operands (off by ~5e3, or NaN). Full 64-row chunks were unaffected. A 291-token prompt on qwen3.8-27b decoded `MENTS` under AR and MTP alike; `HIPFIRE_GFX1151_GDN_SCAN=0` was the workaround. An empty `asm volatile` pin now keeps the WMMAs at full EXEC, and the twin is again byte-identical to `gdn_chunk_scan` for every tail length. Regression test: `crates/rdna-compute/tests/gdn_chunk_scan_tail.rs` (ignored; GPU).
+
 ## v0.4.1 — unreleased (target 2026-10-06)
 
 ### Highlights
@@ -23,11 +116,11 @@
   - `HIPFIRE_QWEN4_GDN_Q8_INLINE`: a Q8 GDN state is decoded and requantized inside the chunk recurrence (new module `gated_delta_chunk_q8_wmma`, inventoried for gfx1151 only) instead of by the `gdn_state_q8_to_f32` / `gdn_state_f32_to_q8` launches around it.
   - Evidence (Strix Halo, gfx1151, scoped `rdna-compute` tests): gated output, final state, convolution ring, gate/beta and the Q8 slot are byte-for-byte the incumbent arms' (530 rows with a ragged tile and a nonzero ring cursor; 512–530 rows at start positions 0 to 262143 for Q8). The existing Q8 chunk test's slot digest is the same with the flags on and off. Kernel packs vs `fddd7ada5`: gfx1100 and gfx1201 are identical (132 and 137 modules); gfx1151 is identical in 121 modules and adds `gated_delta_chunk_q8_wmma`. The new convolution kernel lives in the JIT-only `tensor_ops` module, which no pack carries.
 - **Qwen3.8-Flash-Next (Qwen4) on gfx1151/gfx1201: three more opt-in, bytewise-identical prefill fusions (`HIPFIRE_QWEN4_HC_FUSE=1|2|3`, `HIPFIRE_QWEN4_HC_UP_TILE=1`, `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT=1`; all default off).** Exact gfx1151 and gfx1201 only (gfx1100, gfx1200 and every other arch ignore them); each needs the F16 WMMA prefill route it hooks into (gfx1201 also `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` for the HC read) and none runs under a recorder, a retained tape or a graph capture. Unset or `0` keeps every launch of the incumbent route; each flag is its own kill switch. A stage whose shapes or routes it does not admit runs the incumbent launches, having launched nothing of its own.
-  - `HIPFIRE_QWEN4_HC_FUSE`: level 1 makes the HC read's norm launch also project its paired HC write's gates (`hyper_norm_gate_outputs`), so the write skips its own norm + gate launch; level 2 also has the MQ6G256V2 attention output projection (GDN `output`, QSA `o_proj`) apply the HC write in its GEMM epilogue (`gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw`, gfx1201 `gemm_mq6g256v2_wmma_gfx12_bt8_hcw` from 64 rows), so the attention output is never materialized; level 3 (gfx1151) also folds the BF16 scaled add and the HC write into the BF16 shared-expert down GEMM (`gemm_wmma_lds_128_256_32_64_k64_hcsd`). At level 3 the routed `moe_output` rows are not rewritten with the shared-down sum (nothing reads them after the write). The HC streams are bytewise those of the unfused sequence.
+  - `HIPFIRE_QWEN4_HC_FUSE`: level 1 makes the HC read's norm launch also project its paired HC write's gates (`hyper_norm_gate` with its F16 read output), so the write skips its own norm + gate launch; level 2 also has the MQ6G256V2 attention output projection (GDN `output`, QSA `o_proj`) apply the HC write in its GEMM epilogue (`gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw`, gfx1201 `gemm_mq6g256v2_wmma_gfx12_bt8_hcw` from 64 rows), so the attention output is never materialized; level 3 (gfx1151) also folds the BF16 scaled add and the HC write into the BF16 shared-expert down GEMM (`gemm_wmma_lds_128_256_32_64_k64_hcsd`). At level 3 the routed `moe_output` rows are not rewritten with the shared-down sum (nothing reads them after the write). The HC streams are bytewise those of the unfused sequence.
   - `HIPFIRE_QWEN4_HC_UP_TILE`: the HC read's up projection + branch mix runs on retiled operand-swapped entries (`hyper_read_up_wmma_bf16_swap` on gfx1151; `hyper_read_up_wmma_bf16_gfx1201_t128` on gfx1201 when `low_rank % 64 == 0`), bytewise the baseline entries' output.
   - `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`: the qt44 BF16-row grouped combine starts from +0.0 (`moe_down_combine_grouped_top10_bf16in_zinit`; the original symbol is unchanged) and the `moe_output` zero fill before the sealed MoE call is not launched. The fill stays whenever the call is not that route, the target is not exactly the cleared tensor, or anything is recorded or captured, and a fill taken over but not consumed by the combine fails the call instead of leaving the target uncleared.
-  - Evidence (scoped tests, flags forced on in the test body, Strix Halo gfx1151 and a Radeon AI PRO R9700 gfx1201): HC read gates (`hyper_norm_gate_outputs`) vs `hyper_norm_gate` + `hyper_norm_f16` at 1, 37, 512 and 530 rows, F32 and BF16-bit streams, both arches byte-for-byte; HC up+mix retiled vs baseline at 131 ragged rows, both arches byte-for-byte; attention-epilogue GDN/QSA output projection + HC write vs projection + pregated write at 131 and 530 rows, F32 and BF16-bit streams, F32 and BF16 activations, both arches byte-for-byte; shared-down fold vs F16 GEMM + scaled add + `hyper_write` at 512, 530 and 1100 rows, F32 and BF16-bit streams, with and without the routed rewrite, gfx1151 byte-for-byte; zero-init combine into a dirty target vs zero fill + the unchanged combine at 1, 37 and 530 tokens, both arches byte-for-byte (kernel harness: 48 cases EXACT0 on gfx1201). R9700 per-call medians over three fresh processes, zero fill + combine → zero-init combine: 0.401 → 0.378 ms at 2048 tokens, 1.289 → 1.008 ms at 8192. Kernel packs vs `fddd7ada5`: gfx1100 and gfx1201 are identical (132 and 137 modules); gfx1151 is identical in 121 modules and adds only `gated_delta_chunk_q8_wmma`. Every other new entry lives in a JIT-only module (`tensor_ops`, `qwen4_gemm_mqv2_wmma_gfx11_bt`, `gemm_mq6g256v2_residual_wmma_gfx12_bt*`, `gemm_wmma_lds256`, `moe_down_combine_grouped_top10`) that no pack carries. A full-model forward with the flags on has not been run.
-- **Qwen3.8-Flash-Next (Qwen4) on gfx1151: opt-in, bytewise-identical MoE row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD=1`, default off; idea from Gufo upstream, gufo-org/gufo @1071b361, MIT).** With `HIPFIRE_QWEN4_HC_FUSE=3` and `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT=1`, when a sealed MoE call's HC write is directly followed by the next layer's HC read of the same streams (F16 WMMA read route, BF16 streams, eager), the shared-down GEMM stores BF16 rows (`gemm_wmma_lds_128_256_32_64_k64_bf16st`) and one per-token kernel (`hc_row_fold_norm_gate`) replaces the combine, the `hcsd` fold + HC write epilogue and the next read's `hyper_norm_gate_outputs`: it combines the ten expert rows in rank order, folds the shared row, writes the four streams and emits the next read's F16 normalized row and its paired write's gate logits; that read then skips its norm-and-gate launch. Unset or `0` keeps the incumbent launches.
+  - Evidence (scoped tests, flags forced on in the test body, Strix Halo gfx1151 and a Radeon AI PRO R9700 gfx1201): HC up+mix retiled vs baseline at 131 ragged rows, both arches byte-for-byte; attention-epilogue GDN/QSA output projection + HC write vs projection + pregated write at 131 and 530 rows, F32 and BF16-bit streams, F32 and BF16 activations, both arches byte-for-byte; shared-down fold vs F16 GEMM + scaled add + `hyper_write` at 512, 530 and 1100 rows, F32 and BF16-bit streams, with and without the routed rewrite, gfx1151 byte-for-byte; zero-init combine into a dirty target vs zero fill + the unchanged combine at 1, 37 and 530 tokens, both arches byte-for-byte (kernel harness: 48 cases EXACT0 on gfx1201). R9700 per-call medians over three fresh processes, zero fill + combine → zero-init combine: 0.401 → 0.378 ms at 2048 tokens, 1.289 → 1.008 ms at 8192. Kernel packs vs `fddd7ada5`: gfx1100 and gfx1201 are identical (132 and 137 modules); gfx1151 is identical in 121 modules and adds only `gated_delta_chunk_q8_wmma`. Every other new entry lives in a JIT-only module (`tensor_ops`, `qwen4_gemm_mqv2_wmma_gfx11_bt`, `gemm_mq6g256v2_residual_wmma_gfx12_bt*`, `gemm_wmma_lds256`, `moe_down_combine_grouped_top10`) that no pack carries. A full-model forward with the flags on has not been run.
+- **Qwen3.8-Flash-Next (Qwen4) on gfx1151: opt-in, bytewise-identical MoE row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD=1`, default off; idea from Gufo upstream, gufo-org/gufo @1071b361, MIT).** With `HIPFIRE_QWEN4_HC_FUSE=3` and `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT=1`, when a sealed MoE call's HC write is directly followed by the next layer's HC read of the same streams (F16 WMMA read route, BF16 streams, eager), the shared-down GEMM stores BF16 rows (`gemm_wmma_lds_128_256_32_64_k64_bf16st`) and one per-token kernel (`hc_row_fold_norm_gate`) replaces the combine, the `hcsd` fold + HC write epilogue and the next read's norm + gate launch: it combines the ten expert rows in rank order, folds the shared row, writes the four streams and emits the next read's F16 normalized row and its paired write's gate logits; that read then skips its norm-and-gate launch. Unset or `0` keeps the incumbent launches.
   - Evidence (Strix Halo, gfx1151): standalone harness, 18 cases (N = 8192, 8188, 512, 17, 1; tied experts, -1 and out-of-range routes, +-0, NaN, inf, F16/BF16 extremes in every operand) memcmp of streams, F16 row and gate logits: 0 differing bytes; `qwen4_qsa_ctx` CTX=8192 logits md5 identical flag off and on. N = 8192 per MLP layer: combine 2.44 + hcsd 2.72 + norm-gate 1.75 = 6.91 ms -> bf16st 1.09 + row fold 4.91 = 6.00 ms (-0.91 ms).
 - **Qwen3.8-Flash-Next (Qwen4): gathered F16 WMMA QSA prefill attention, default on for gfx1151 and gfx1201 (`HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` opts out).** Prefill chunks of ≥ 512 rows that the full-window dense route does not take run on new modules: `indexed_attention_gathered_wmma.gfx1151.hip` (gfx1151, F32 state) and `indexed_attention_gathered_wmma.gfx1201.hip` (gfx1201, fp8 state). With `=0`, every launch is still `indexed_attention_attention_*_batched_hg4`, and every existing code object is byte-identical on gfx1100, gfx1151 and gfx1201.
   - Each call first converts the layer's cache rows `[0, end)` to F16 K plus a block-transposed V. One workgroup per (row, KV head) then walks the row's selection in 128-entry tiles.

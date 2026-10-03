@@ -126,6 +126,41 @@ pub fn qwen4_forward_device_bytes(config: &Qwen4Config, rows: usize) -> Option<u
 /// pp8192 on gfx1201, measured as load-time free minus prefill-time free).
 pub(crate) const QWEN4_FORWARD_HEADROOM_BYTES: u64 = 1 << 30;
 
+/// Rows of the next prefill chunk at `position` with `remaining` tokens: at
+/// most `max_chunk`, and a chunk starting inside the QSA index budget ends at
+/// it, so every row of that chunk selects its whole causal window and the
+/// chunk takes the dense attention route.
+pub(crate) fn prefill_chunk_rows(
+    indexer_budget: usize,
+    position: usize,
+    remaining: usize,
+    max_chunk: usize,
+) -> usize {
+    let rows = remaining.min(max_chunk);
+    match indexer_budget.checked_sub(position) {
+        Some(to_budget) if to_budget > 0 => rows.min(to_budget),
+        _ => rows,
+    }
+}
+
+/// Last whole-chunk end of the cold [`prefill_chunk_rows`] schedule from
+/// position zero that fits in `len` tokens (0 if none). The schedule from any
+/// such end onward is the cold one, so a prefix checkpoint taken there and
+/// replayed from it runs the cold prefill's exact chunks.
+pub(crate) fn prefill_checkpoint_boundary(
+    indexer_budget: usize,
+    len: usize,
+    max_chunk: usize,
+) -> usize {
+    let mut end = 0usize;
+    loop {
+        let rows = prefill_chunk_rows(indexer_budget, end, max_chunk, max_chunk);
+        match end.checked_add(rows) {
+            Some(next) if rows > 0 && next <= len => end = next,
+            _ => return end,
+        }
+    }
+}
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
@@ -196,17 +231,16 @@ impl Qwen4OutputPolicy {
 #[derive(Clone, Copy)]
 pub(crate) enum Qwen4ProfilePhase {
     MoeSeal,
+    /// Waiting for the PLE row reads and copying them to the host upload buffer.
     PleWait,
-    PleStage,
     PleUpload,
     PleApply,
 }
 
 impl Qwen4ProfilePhase {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::MoeSeal,
         Self::PleWait,
-        Self::PleStage,
         Self::PleUpload,
         Self::PleApply,
     ];
@@ -215,7 +249,6 @@ impl Qwen4ProfilePhase {
         match self {
             Self::MoeSeal => "moe_seal",
             Self::PleWait => "ple_wait",
-            Self::PleStage => "ple_stage",
             Self::PleUpload => "ple_upload",
             Self::PleApply => "ple_apply",
         }
@@ -2470,10 +2503,19 @@ impl Qwen4GpuForward {
         )?;
         let vocab = bundle.config.vocab_size;
         let max_chunk = self.scratch.max_chunk;
+        let (start, budget) = (bundle.state.position, bundle.config.indexer_budget);
+        let chunk_rows = |offset: usize| {
+            prefill_chunk_rows(budget, start + offset, tokens.len() - offset, max_chunk)
+        };
         let preflight_rows = if output_rows == Qwen4OutputRows::Final {
-            (tokens.len() - 1) % max_chunk + 1
+            let (mut offset, mut last) = (0, 0);
+            while offset < tokens.len() {
+                last = chunk_rows(offset);
+                offset += last;
+            }
+            last
         } else {
-            tokens.len().min(max_chunk)
+            chunk_rows(0)
         };
         let preflight_output_rows = output_rows.count(preflight_rows);
         let preflight_logits = logits.sub_offset(0, preflight_output_rows * vocab);
@@ -2486,8 +2528,12 @@ impl Qwen4GpuForward {
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
         while offset < tokens.len() {
-            let rows = (tokens.len() - offset).min(max_chunk);
+            let rows = chunk_rows(offset);
             let final_chunk = offset + rows == tokens.len();
+            if !final_chunk {
+                let next = chunk_rows(offset + rows);
+                bundle.ple_readahead(&tokens[offset..offset + rows + next], rows);
+            }
             let selected_rows = output_rows.count(rows);
             let logits_offset = if output_rows == Qwen4OutputRows::All {
                 offset
@@ -3208,7 +3254,7 @@ impl Qwen4GpuForward {
             let vocab = config.vocab_size;
             let read_token = &mut device_read;
             let mut stage_ple = |gpu: &mut Gpu| -> Result<(), Qwen4GpuForwardError> {
-                if ple.lease().is_some() {
+                if ple.is_staged() {
                     return Ok(());
                 }
                 if device_token.is_some() {
@@ -3234,18 +3280,10 @@ impl Qwen4GpuForward {
                 }
 
                 let wait_started = qwen4_profile_start();
-                let lease_result = ple.wait();
+                let stage_result = ple.stage_into(host_ple_bytes);
                 qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
-                let lease =
-                    lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                let upload_len = lease
-                    .as_bytes()
-                    .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
-                    .len();
-                let stage_started = qwen4_profile_start();
-                let stage_result = lease.stage_into(&mut host_ple_bytes[..upload_len]);
-                qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
-                stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+                let upload_len =
+                    stage_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let upload_started = qwen4_profile_start();
                 // After a device-token readback the host has synchronized past
                 // the previous forward's upload, so the staging buffer is free.
@@ -3257,8 +3295,7 @@ impl Qwen4GpuForward {
                 };
                 qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
                 upload_result?;
-                lease
-                    .validate_after_upload()
+                ple.validate_after_upload()
                     .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
                 let apply_started = qwen4_profile_start();
                 if ple_rows_f16 {
@@ -3707,5 +3744,22 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
             gpu.replay.poison(reason.clone());
             eprintln!("[redline] falling back to HIP: {reason}");
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::prefill_checkpoint_boundary as boundary;
+
+    #[test]
+    fn boundary_is_a_cold_schedule_chunk_end() {
+        // Budget 2048, chunk 8192: the cold schedule ends at 2048, 10240, ...
+        assert_eq!(boundary(2048, 1000, 8192), 0);
+        assert_eq!(boundary(2048, 2048, 8192), 2048);
+        assert_eq!(boundary(2048, 10239, 8192), 2048);
+        assert_eq!(boundary(2048, 10240, 8192), 10240);
+        assert_eq!(boundary(2048, 30000, 8192), 2048 + 3 * 8192);
+        // No budget split: plain multiples of the chunk.
+        assert_eq!(boundary(0, 20000, 4096), 16384);
     }
 }

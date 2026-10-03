@@ -74,7 +74,8 @@ __device__ __forceinline__ void mq_rotate_x_f16_body(
     _Float16* __restrict__ x_out,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
-    int K
+    int K,
+    int ldo
 ) {
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
@@ -82,9 +83,8 @@ __device__ __forceinline__ void mq_rotate_x_f16_body(
     const int batch = linear_group / groups_total;
     const int group = linear_group - batch * groups_total;
 
-    const long long batch_off = (long long)batch * K;
-    const XT* x_in_b  = x_in  + batch_off;
-          _Float16* x_out_b = x_out + batch_off;
+    const XT* x_in_b  = x_in  + (long long)batch * K;
+          _Float16* x_out_b = x_out + (long long)batch * ldo;
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
@@ -155,15 +155,16 @@ __device__ __forceinline__ void mq_rotate_x_f16_body(
     #undef MQ_ROT_F16
     *(uint4*)(x_out_b + base) = __builtin_bit_cast(uint4, h_);
 }
+// Output rows are `ldo` halves apart (>= K; see Gpu::f16_row_pitch).
 extern "C" __launch_bounds__(32, 16)
 __global__ void mq_rotate_x_f16(
     const float* __restrict__ x_in, _Float16* __restrict__ x_out,
-    const float* __restrict__ signs1, const float* __restrict__ signs2, int K) {
-    mq_rotate_x_f16_body(x_in, x_out, signs1, signs2, K);
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int K, int ldo) {
+    mq_rotate_x_f16_body(x_in, x_out, signs1, signs2, K, ldo);
 }
 extern "C" __launch_bounds__(32, 16)
 __global__ void mq_rotate_x_bf16_f16(
     const unsigned short* __restrict__ x_in, _Float16* __restrict__ x_out,
-    const float* __restrict__ signs1, const float* __restrict__ signs2, int K) {
-    mq_rotate_x_f16_body(x_in, x_out, signs1, signs2, K);
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int K, int ldo) {
+    mq_rotate_x_f16_body(x_in, x_out, signs1, signs2, K, ldo);
 }

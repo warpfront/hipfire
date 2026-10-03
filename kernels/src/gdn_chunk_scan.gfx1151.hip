@@ -180,6 +180,10 @@ __global__ void gdn_chunk_scan_gfx1151(
   for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
 #pragma unroll
    for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+  // WMMA needs every lane active. Without this pin, clang sinks the O
+  // WMMAs (only used by the store) into `if(tok<rows)`, and on a partial
+  // chunk the masked lanes' operand rows come out undefined.
+  asm volatile("" : "+v"(O[0]), "+v"(O[1]));
   const int tok=mt*16+lo;
   if(tok<rows){float*ob=out+((unsigned long long)(parent0+tok)*48+head)*GS_D+vbase;
 #pragma unroll

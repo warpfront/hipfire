@@ -140,6 +140,7 @@ fn assemble(text: &str, arch: &str) {
 
 #[test]
 fn v2c_module_assembles_for_gfx1100_with_zero_diagnostics() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     assemble(&iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1, "gfx1100")
 }
 
@@ -207,6 +208,7 @@ fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
 /// `.text` of the committed bundles.
 #[test]
 fn committed_gfx1201_bundles_equal_fresh_emission() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let token = iu4_gemm::emit_module(iu4_gemm::Fold::K128, iu4_gemm::Tile::T128x128x8, iu4_gemm::Cacc::One, iu4_gemm::ALayout::Token, Arch::Gfx1201).unwrap().1;
     let slab = iu4_gemm::emit_module(iu4_gemm::Fold::K128, iu4_gemm::Tile::T128x128x8, iu4_gemm::Cacc::One, iu4_gemm::ALayout::Slab, Arch::Gfx1201).unwrap().1;
@@ -255,12 +257,13 @@ fn v2b_fold_is_fully_vopd_paired_in_every_entry() {
 }
 
 #[test]
-fn v2b_module_assembles_for_gfx1151_with_zero_diagnostics() { assemble(&iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1, "gfx1151") }
+fn v2b_module_assembles_for_gfx1151_with_zero_diagnostics() {if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; } assemble(&iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1, "gfx1151") }
 
 /// The runtime embeds the certified gfx1151 bundle: it must be exactly what
 /// the builder emits today.
 #[test]
 fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2b::MODULE)).unwrap();
     let text = iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1;
@@ -271,6 +274,7 @@ fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
 /// the builder emits today.
 #[test]
 fn committed_gfx1100_v2c_bundle_equals_fresh_emission() {
+    if !std::path::Path::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc").exists() { eprintln!("skip: no pinned ROCm 10 llvm-mc"); return; }
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2c::MODULE)).unwrap();
     let text = iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1;

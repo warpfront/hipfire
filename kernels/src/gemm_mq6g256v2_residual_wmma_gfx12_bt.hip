@@ -20,7 +20,7 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 // an optional F32 mirror gets the unrounded value.  Stage 2 (accumulators
 // dead): each item = (token t, channels c0..c0+7) reads the four stream
 // columns br*H + c0.. of token t (old values), applies the four gates (the
-// paired read's hyper_norm_gate_outputs logits through the same expression as
+// paired read's hyper_norm_gate logits through the same expression as
 // hyper_write_bf16x2) and overwrites them; one item owns its columns.
 // Requires H % 8 == 0 (the caller's M).  Keep byte-identical across the files
 // carrying this block (gfx11 bt, gfx12 bt, lds256).
