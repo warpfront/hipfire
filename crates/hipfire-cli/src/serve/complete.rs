@@ -3425,7 +3425,12 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "ttft_ms": done.get("ttft_ms"),
         "prefill_ms": done.get("prefill_ms"),
         "prefill_tok_s": done.get("prefill_tok_s"),
-        "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
+        // Pure passthrough: relaying the wall-inclusive `tok_s` under
+        // `decode_tok_s` (the slots route reports only the former) made
+        // clients present prefill time as decode speed — measured ~3x low
+        // on gfx1101 multi-slot. `hipfire.tok_s` carries the wall number
+        // for clients that want it.
+        "decode_tok_s": done.get("decode_tok_s"),
         "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
