@@ -595,6 +595,11 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        // A `Bo` is a cheap `Clone` handle over `Arc<BoState>`, so `&mut self`
+        // would not buy real exclusivity (a clone can hand out the same view);
+        // the invariant is the caller contract documented above, which is the
+        // pattern clippy's `mut_from_ref` cannot model.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.
@@ -1232,6 +1237,9 @@ mod imp_stub {
         pub fn as_slice(&self) -> &[u8] {
             &[]
         }
+        // See the linux `Bo::as_mut_slice`: `Bo` is a shared handle, so the
+        // lint's suggested `&mut self` is not the right shape here either.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: zero-length, aligned, never dereferenced for I/O.
             unsafe { &mut *std::ptr::slice_from_raw_parts_mut(std::ptr::NonNull::dangling().as_ptr(), 0) }

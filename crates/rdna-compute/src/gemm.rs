@@ -23610,40 +23610,38 @@ impl Gpu {
             kernels::GEMM_QKVZA_HFQ6G256_SRC,
             "gemm_qkvza_hfq6g256",
         )?;
-        let func = &self.functions["gemm_qkvza_hfq6g256"];
-
-        let mut aq = a_qkv.buf.as_ptr();
-        let mut az = a_z.buf.as_ptr();
-        let mut ab = a_beta.buf.as_ptr();
-        let mut aa = a_alpha.buf.as_ptr();
-        let mut xp = x.buf.as_ptr();
-        let mut yq = y_qkv.buf.as_ptr();
-        let mut yz = y_z.buf.as_ptr();
-        let mut yb = y_beta.buf.as_ptr();
-        let mut ya = y_alpha.buf.as_ptr();
-        let mut q_m = qkv_m as i32;
-        let mut z_m_val = z_m as i32;
-        let mut b_m = beta_m as i32;
-        let mut a_m = alpha_m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m = qkv_m as i32;
+        let z_m_val = z_m as i32;
+        let b_m = beta_m as i32;
+        let a_m = alpha_m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut aq as *mut _ as *mut c_void,
-            &mut az as *mut _ as *mut c_void,
-            &mut ab as *mut _ as *mut c_void,
-            &mut aa as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yq as *mut _ as *mut c_void,
-            &mut yz as *mut _ as *mut c_void,
-            &mut yb as *mut _ as *mut c_void,
-            &mut ya as *mut _ as *mut c_void,
-            &mut q_m as *mut _ as *mut c_void,
-            &mut z_m_val as *mut _ as *mut c_void,
-            &mut b_m as *mut _ as *mut c_void,
-            &mut a_m as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &q_m as *const _ as *mut c_void,
+            &z_m_val as *const _ as *mut c_void,
+            &b_m as *const _ as *mut c_void,
+            &a_m as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
         ];
 
         let batch_tiles = {
@@ -23657,16 +23655,32 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_hfq6g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m);
+                b.push_i32(z_m_val);
+                b.push_i32(b_m);
+                b.push_i32(a_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -24219,34 +24233,32 @@ impl Gpu {
             kernels::GEMM_QKV_HFQ6G256_SRC,
             "gemm_qkv_hfq6g256",
         )?;
-        let func = &self.functions["gemm_qkv_hfq6g256"];
-
-        let mut aq = a_q.buf.as_ptr();
-        let mut ak = a_k.buf.as_ptr();
-        let mut av = a_v.buf.as_ptr();
-        let mut xp = x.buf.as_ptr();
-        let mut yq = y_q.buf.as_ptr();
-        let mut yk = y_k.buf.as_ptr();
-        let mut yv = y_v.buf.as_ptr();
-        let mut q_m_val = q_m as i32;
-        let mut k_m_val = k_m as i32;
-        let mut v_m_val = v_m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_val = q_m as i32;
+        let k_m_val = k_m as i32;
+        let v_m_val = v_m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut aq as *mut _ as *mut c_void,
-            &mut ak as *mut _ as *mut c_void,
-            &mut av as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yq as *mut _ as *mut c_void,
-            &mut yk as *mut _ as *mut c_void,
-            &mut yv as *mut _ as *mut c_void,
-            &mut q_m_val as *mut _ as *mut c_void,
-            &mut k_m_val as *mut _ as *mut c_void,
-            &mut v_m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_val as *const _ as *mut c_void,
+            &k_m_val as *const _ as *mut c_void,
+            &v_m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
         ];
 
         let batch_tiles = {
@@ -24259,16 +24271,29 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_hfq6g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
