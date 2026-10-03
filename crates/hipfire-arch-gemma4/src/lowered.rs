@@ -674,6 +674,27 @@ fn load_gemma4_awq_scale(
     Ok(Some(t))
 }
 
+/// HFQ4-G128 rows each start a fresh 72-byte group; a trailing partial group
+/// is padded. Files quantized before the 2-D packer (`b4846285e`) packed
+/// groups across rows whenever `K % 128 != 0` (Gemma 4 expert `down_proj`,
+/// K = 704), which every per-row kernel reads as garbage. Refuse them.
+fn check_hfq4g128_rows(name: &str, m: usize, k: usize, bytes: usize) -> HipResult<()> {
+    let rows = m * k.div_ceil(128) * 72;
+    if bytes == rows {
+        return Ok(());
+    }
+    let reason = if bytes == (m * k).div_ceil(128) * 72 {
+        "packs HFQ4-G128 groups across rows (quantized before hipfire-quantize \
+         b4846285e); requantize the model"
+    } else {
+        "has an unexpected byte size"
+    };
+    Err(hip_bridge::HipError::new(
+        0,
+        &format!("{name} [{m} x {k}] {reason} ({bytes} bytes, expected {rows})"),
+    ))
+}
+
 /// Load a quantized projection weight. Mirrors qwen35::load_weight_tensor_raw
 /// but uses the Gemma 4 tensor-name convention (`model.language_model.<name>`).
 fn load_gemma4_weight(
@@ -794,6 +815,7 @@ fn load_gemma4_weight_impl(
         11 => DType::HFQ3G256,
         12 => DType::HFQ3G128,
         13 => DType::MQ4G256,
+        44 => DType::MQ4G256V2,
         14 => DType::MQ8G256,
         15 => DType::MQ6G256,
         17 => DType::MQ3G256,
@@ -811,6 +833,9 @@ fn load_gemma4_weight_impl(
             ));
         }
     };
+    if dtype == DType::HFQ4G128 {
+        check_hfq4g128_rows(name, m, k, data.len())?;
+    }
     let buf = upload_pooled_bytes(gpu, data, &[data.len()])?;
     // Fault seam: fail after the primary owns its buffer but before the
     // sidecar attaches. Rollback here frees the primary directly — the outer
@@ -1014,6 +1039,7 @@ fn load_moe_layer_extras(
             12 => DType::HFQ3G128,
             // MQ4G256 (13) and MG4G256 (30) share dispatch.
             13 | 30 => DType::MQ4G256,
+            44 => DType::MQ4G256V2,
             14 => DType::MQ8G256,
             15 => DType::MQ6G256,
             17 => DType::MQ3G256,
@@ -1025,6 +1051,21 @@ fn load_moe_layer_extras(
                 ));
             }
         };
+        if dtype == DType::HFQ4G128 {
+            let (m, k) = match first_info.shape[..] {
+                [m, k] => (m as usize, k as usize),
+                _ => {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "{first_name}: expected a 2-D shape, got {:?}",
+                            first_info.shape
+                        ),
+                    ))
+                }
+            };
+            check_hfq4g128_rows(&first_name, m, k, bytes_per_expert)?;
+        }
         // Concat all experts' bytes into one CPU buffer, upload once.
         let mut concat = Vec::with_capacity(bytes_per_expert * n_exp);
         concat.extend_from_slice(first_data);
@@ -2298,6 +2339,18 @@ mod scratch_geometry_tests {
     }
 
     #[test]
+    fn hfq4g128_rows_must_start_fresh_groups() {
+        // K = 704: 5.5 groups per row. The 2-D packer pads each row to 6 groups.
+        assert!(check_hfq4g128_rows("w", 2816, 704, 2816 * 6 * 72).is_ok());
+        // The pre-b4846285e flat packer straddles rows: refused with its cause.
+        let err = check_hfq4g128_rows("w", 2816, 704, 15488 * 72).unwrap_err();
+        assert!(err.to_string().contains("across rows"), "{err}");
+        assert!(check_hfq4g128_rows("w", 2816, 704, 2816 * 6 * 72 - 72).is_err());
+        // Group-aligned K: both packers agree.
+        assert!(check_hfq4g128_rows("w", 4, 256, 4 * 2 * 72).is_ok());
+    }
+
+    #[test]
     fn decode_partials_cover_q8_decode_tile() {
         let cfg = dummy_cfg_31b();
         // gfx1100 decodes Q8 with tile32 up to 8K: 4x the tile-128 partials.
@@ -3061,9 +3114,11 @@ pub fn forward_scratch(
                 LayerWeights::Full(lw) => &lw.moe,
             };
             moe.as_ref().map_or(true, |m| m.experts.first().is_some_and(|e| {
-                matches!(e.gate_up_proj.gpu_dtype,
-                    DType::MQ4G256 | DType::HFQ4G256 | DType::HFQ6G256 | DType::Q8_0)
-                    && e.down_proj.gpu_dtype == DType::HFQ4G128
+                e.down_proj.gpu_dtype == DType::HFQ4G128
+                    && hipfire_dispatch::pipeline::sandwich::RoutedExperts::supports(
+                        e.gate_up_proj.gpu_dtype,
+                        e.down_proj.gpu_dtype,
+                    )
             }))
         })
         && hipfire_config::developer_var("HIPFIRE_GEMMA4_DUMP").as_deref() != Ok("1");

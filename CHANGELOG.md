@@ -215,8 +215,13 @@
     switches are removed; the fused routes are always on. The debug switches
     `HIPFIRE_GEMMA4_{BASELINE_ATTN,ATTN_VERIFY,GEMM_VERIFY}` and
     `HIPFIRE_MOE_{BYPASS,BUCKETED}` are removed with their hand-written paths.
-  - A MoE checkpoint whose expert formats have no indexed kernel pair now
-    refuses to load instead of running a host-side expert loop.
+  - The 26B-A4B lowered stack loads MQ4G256V2 weights and runs MQ4G256V2 and
+    MQ6G256 routed experts on the indexed kernels, which is what the current
+    quantizer emits for it. A MoE checkpoint whose expert formats have no
+    indexed kernel pair now refuses to load instead of running a host-side
+    expert loop, and so does one whose HFQ4-G128 expert `down_proj` (K = 704)
+    was packed across rows by a quantizer before `b4846285e`; both produced
+    garbage. Requantize such files.
 
 - Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
   bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`

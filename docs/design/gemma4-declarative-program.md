@@ -125,8 +125,15 @@ batched kernel one GEMV per row.
   logit traces; EAGLE (now opt-in on beta via `HIPFIRE_GEMMA4_EAGLE=1`) is
   byte-identical with per-prompt tau 3.368/3.459/2.667/3.447/3.514 on both;
   26B-A4B q8-experts: 3 of 5 identical, 2 diverge late (chars 295 and 322),
-  coherent; `gemma4-26b-a4b.mq4` (MQ6G256/HFQ4G128 experts) produces garbage
-  on beta and refuses at load here. `serve_harness.py --thinking off
+  coherent. The local `gemma4-26b-a4b.mq4` produces garbage on beta for two
+  reasons: its HFQ4-G128 expert `down_proj` (K = 704) was packed across rows
+  by the quantizer before `b4846285e`, and its 4 MQ6G256 expert layers had no
+  indexed gate/up route. Such files now refuse at load. A requantization with
+  the current quantizer (MQ4G256V2/MQ6G256 gate/up, row-padded HFQ4-G128 down)
+  loads and runs: coherent greedy text, serve battery with no runaway, empty or
+  attractor turns, Redline `--pm4` shadow exact (1202 launches), hipGraph
+  decode identical to direct decode, `prefill_parity_gemma4` same argmax and
+  continuation. `serve_harness.py --thinking off
   --sampling greedy`: 12B battery and chain, E4B battery and 26B battery
   `transcript_byte_identical=true` against beta. 26B Redline `--pm4
   --skip-prefill` shadow exact on both (beta 1263 launches, hash

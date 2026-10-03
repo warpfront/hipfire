@@ -103,7 +103,7 @@ fn unsupported_expert_formats(weights: &lowered::Gemma4Weights) -> Option<String
         (!hipfire_dispatch::pipeline::sandwich::RoutedExperts::supports(gate_up, down)).then(|| {
             format!(
                 "gemma4 MoE: expert formats gate_up={gate_up:?} down={down:?} have no indexed \
-                 kernel; requantize experts to MQ4G256/HFQ4G256/HFQ6G256/Q8_0 gate_up with \
+                 kernel; requantize experts to MQ4G256(V2)/MQ6G256/HFQ4G256/HFQ6G256/Q8_0 gate_up with \
                  Q8_0/HFQ4G128 down"
             )
         })

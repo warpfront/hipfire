@@ -848,7 +848,12 @@ impl RoutedExperts<'_> {
     pub fn supports(gate_up: DType, down: DType) -> bool {
         matches!(
             gate_up,
-            DType::MQ4G256 | DType::HFQ4G256 | DType::HFQ6G256 | DType::Q8_0
+            DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ6G256
+                | DType::HFQ4G256
+                | DType::HFQ6G256
+                | DType::Q8_0
         ) && matches!(down, DType::Q8_0 | DType::HFQ4G128)
     }
 }
@@ -970,6 +975,22 @@ fn routed_row(
                 hidden,
             )
             .map_err(hip)?;
+        }
+        // FWHT-rotated input; MQ6G256 reads it with the HFQ6G256 kernel.
+        DType::MQ4G256V2 | DType::MQ6G256 => {
+            gpu.rotate_x_mq(r.input, r.input_rot, hidden).map_err(hip)?;
+            crate::pipeline::run_uniform_moe_gate_up(
+                gpu,
+                e.gate_up_dtype,
+                e.gate_up_ptrs,
+                r.topk_indices,
+                r.input_rot,
+                r.gate,
+                r.up,
+                2 * mi,
+                hidden,
+                k,
+            )?
         }
         DType::HFQ4G256 | DType::HFQ6G256 => crate::pipeline::run_uniform_moe_gate_up(
             gpu,
