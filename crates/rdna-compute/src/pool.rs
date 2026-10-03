@@ -97,4 +97,16 @@ impl GpuPool {
             }
         }
     }
+
+    /// Total bytes sitting in free lists: VRAM that has been returned to the
+    /// pool but not reclaimed by a later allocation. `upload_raw` bypasses the
+    /// pool entirely, so these bytes are unreachable to the weight loader until
+    /// `drain` runs — a failed load's rollback parks every completed layer here.
+    pub fn freelist_bytes(&self) -> usize {
+        self.free_lists
+            .values()
+            .flat_map(|list| list.iter())
+            .map(|buf| buf.size())
+            .sum()
+    }
 }

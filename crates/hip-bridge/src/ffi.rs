@@ -512,22 +512,53 @@ const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 /// the runtime initializes, so they are set before it loads. APUs ignore the
 /// first switch.
 ///
-/// Both switches are process-global, and together they slow other loads: on
-/// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
-/// 1.00-1.01 s. So they are set only in a process configured to host-map
-/// Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), the one known to hold
-/// tens of GB of host memory the GPU reads.
+/// The two switches cover the two classes of userptr page and they are priced
+/// very differently, so they are armed differently:
+///
+/// * `GPU_PINNED_MIN_XFER_SIZE` covers the **pageable copy source** — the
+///   mapped model file's page-cache pages, which clr otherwise pins in place
+///   for every large weight upload. That source exists on *every* weight load,
+///   on every architecture, so this switch is armed in every Linux process.
+///   Measured free on gfx1201 / Qwen3.8-27B MQ3-Pro (warm cache, three reps
+///   each): weight sweep 1190-1198 ms armed vs 1204-1210 ms unarmed.
+/// * `HSA_USERPTR_FOR_PAGED_MEM=0` covers `hipHostMalloc` blocks, and it is
+///   the half that costs (same model and box: +8-11 % on the sweep; the commit
+///   that introduced the gate measured ~+20 % on H2), so it stays scoped to
+///   the process known to hold tens of GB of them — host-mapped Qwen4 experts.
+///
+/// Neither name is a published interface. `GPU_PINNED_MIN_XFER_SIZE` is absent
+/// from HIP's own environment-variable reference and from AMD's env-var page
+/// (checked against ROCm 7.2), and `HSA_USERPTR_FOR_PAGED_MEM` is a libhsakmt
+/// knob; clr/libhsakmt read each once, at runtime initialization. They are used
+/// here because the alternative is the stall described above
+/// (ROCm/rocm-systems#12528), and `f5731a506` relied on them first, for
+/// host-mapped Qwen4 experts. `docs/env-vars.md` records that provenance so
+/// neither reads as supported API.
+///
+/// Evidence: under an 8 GiB host-memory ballast, an unarmed 27B load stalls at
+/// a varying `loading layer N/64` on both a partial-GPU-offload and a
+/// fully-resident configuration; `GPU_PINNED_MIN_XFER_SIZE` alone loads 7/7.
+/// See the `fix/host-memory-reclaim-stall` branch commit for the full table.
 fn keep_host_memory_out_of_reclaim() {
-    if !cfg!(target_os = "linux") || !host_maps_qwen4_experts() {
+    if !cfg!(target_os = "linux") {
         return;
     }
-    for (name, value) in [
-        (HSA_USERPTR_FOR_PAGED_MEM, "0"),
-        (GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB),
-    ] {
-        if std::env::var_os(name).is_none() {
-            std::env::set_var(name, value);
-        }
+    let mut applied = Vec::new();
+    if std::env::var_os(GPU_PINNED_MIN_XFER_SIZE).is_none() {
+        std::env::set_var(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB);
+        applied.push(format!(
+            "{GPU_PINNED_MIN_XFER_SIZE}={STAGE_ALL_PAGEABLE_COPIES_MB}"
+        ));
+    }
+    if host_maps_qwen4_experts() && std::env::var_os(HSA_USERPTR_FOR_PAGED_MEM).is_none() {
+        std::env::set_var(HSA_USERPTR_FOR_PAGED_MEM, "0");
+        applied.push(format!("{HSA_USERPTR_FOR_PAGED_MEM}=0"));
+    }
+    if !applied.is_empty() {
+        eprintln!(
+            "[hipfire] host-memory reclaim mitigation armed: {}",
+            applied.join(", ")
+        );
     }
 }
 

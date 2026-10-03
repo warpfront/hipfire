@@ -17,6 +17,33 @@ use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+/// Developer diagnostic: `HIPFIRE_LOAD_TRACE=1` prints one line per weight
+/// upload/free on the model-load path, each with free VRAM and the buffer
+/// pool's counters. It exists to localize a stalled or leaking load to a
+/// specific tensor without a debugger (ptrace is unavailable in this tree's
+/// dev environment), and is a strict no-op unless the knob is set.
+pub fn load_trace_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some()
+    });
+    *ON
+}
+
+/// See [`load_trace_enabled`]. Cheap no-op when tracing is off.
+#[inline]
+pub fn load_trace(gpu: &Gpu, args: std::fmt::Arguments<'_>) {
+    if !load_trace_enabled() {
+        return;
+    }
+    let (free, total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+    let (new, reused, alloc) = gpu.pool_stats();
+    let parked = gpu.pool_freelist_bytes();
+    eprintln!(
+        "[load-trace] {args} | free_vram={free} total_vram={total} pool_new={new} \
+         pool_reused={reused} pool_alloc_bytes={alloc} pool_parked_bytes={parked}"
+    );
+}
+
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
 /// 16 B fp16 codebook (8 entries) + 96 B 3-bit packed indices = 112 B.
@@ -3972,6 +3999,10 @@ impl Gpu {
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let alloc_bytes = byte_size.saturating_add(HOST_TAIL_PAD_BYTES);
+        load_trace(
+            self,
+            format_args!("alloc_host_mapped begin bytes={alloc_bytes} logical={byte_size}"),
+        );
         let host_ptr = self
             .hip
             .host_malloc(alloc_bytes, hip_bridge::HIP_HOST_MALLOC_MAPPED)
@@ -3987,6 +4018,10 @@ impl Gpu {
             })?;
         // The device alias is what kernels are handed; the host pointer is what
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
+        load_trace(
+            self,
+            format_args!("alloc_host_mapped got_host_ptr bytes={alloc_bytes}"),
+        );
         let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
             Ok(p) if !p.is_null() => p,
             _ => host_ptr,
@@ -4470,7 +4505,12 @@ impl Gpu {
         copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
+        load_trace(self, format_args!("upload_raw bytes={}", data.len()));
         let buf = self.hip.malloc(data.len())?;
+        load_trace(
+            self,
+            format_args!("upload_raw malloc_ok bytes={}", data.len()),
+        );
         if let Err(err) = copy(&self.hip, &buf, data) {
             // hip.malloc owner — hip.free only. free_tensor would pool it.
             let _ = self.hip.free(buf);
@@ -4557,6 +4597,10 @@ impl Gpu {
                 &format!("refusing to pool non-owning tensor at 0x{key:x}"),
             ))
         } else {
+            load_trace(
+                self,
+                format_args!("free_tensor park_to_pool bytes={}", tensor.buf.size()),
+            );
             self.pool.free(tensor.buf);
             Ok(())
         }
@@ -4858,6 +4902,13 @@ impl Gpu {
         if let Some(stream) = self.active_stream.as_ref() {
             self.hip.stream_synchronize(stream)?;
         }
+        load_trace(
+            self,
+            format_args!(
+                "release_tensor_immediate hipFree bytes={}",
+                tensor.buf.size()
+            ),
+        );
         self.hip.free(tensor.buf)
     }
 
@@ -4878,6 +4929,14 @@ impl Gpu {
             self.pool.total_reused,
             self.pool.total_allocated,
         )
+    }
+
+    /// Bytes currently parked in the pool's free lists (not live owners).
+    /// A load that fails after publishing layers parks every completed weight
+    /// blob here via `free_tensor`, and `upload_raw` never reclaims it, so this
+    /// is the stranded VRAM headroom after a rollback.
+    pub fn pool_freelist_bytes(&self) -> usize {
+        self.pool.freelist_bytes()
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.

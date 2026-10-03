@@ -2970,6 +2970,16 @@ impl WeightSource for HfqSource<'_> {
         let p = format!("layers.{layer_idx}");
         let page = self.hfq.layer_data_range(&p);
         let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu)?;
+        if rdna_compute::load_trace_enabled() {
+            let (free, total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+            let (new, reused, alloc) = gpu.pool_stats();
+            eprintln!(
+                "[load-trace] layer {layer_idx} done free_vram={free} total_vram={total} \
+                 pool_new={new} pool_reused={reused} pool_alloc_bytes={alloc} \
+                 pool_parked_bytes={}",
+                gpu.pool_freelist_bytes()
+            );
+        }
         if let Some((start, end)) = page {
             self.hfq.drop_pages_range(start, end - start);
         }

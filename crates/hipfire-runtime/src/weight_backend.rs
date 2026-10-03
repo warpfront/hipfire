@@ -1451,6 +1451,12 @@ impl<'a> WeightBackend for HfqBackend<'a> {
 
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
         let name = hfq_proj_name(self.layer, rel);
+        if rdna_compute::load_trace_enabled() {
+            eprintln!(
+                "[load-trace] proj L{} {name} m={m} k={k} host_local={}",
+                self.layer, self.host_local
+            );
+        }
         if self.host_local {
             // An offloaded layer whose arch ships no host reader is a configuration
             // error, not something to paper over with a device allocation: the
@@ -1472,6 +1478,9 @@ impl<'a> WeightBackend for HfqBackend<'a> {
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
+        if rdna_compute::load_trace_enabled() {
+            eprintln!("[load-trace] norm L{} {name} shape={shape:?}", self.layer);
+        }
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_norm(info.quant_type, &data, shape, self.norm_bias);
@@ -1483,6 +1492,9 @@ impl<'a> WeightBackend for HfqBackend<'a> {
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
+        if rdna_compute::load_trace_enabled() {
+            eprintln!("[load-trace] raw_f32 L{} {name} n={n}", self.layer);
+        }
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_to_f32(info.quant_type, &data, n);
