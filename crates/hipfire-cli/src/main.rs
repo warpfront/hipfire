@@ -11645,6 +11645,7 @@ mod tests {
                     continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
+                    needs_session_reset: false,
                     kv_override: None,
                     kv_k_override: None,
                     kv_v_override: None,

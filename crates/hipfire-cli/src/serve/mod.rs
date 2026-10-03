@@ -247,6 +247,11 @@ pub(crate) struct ServeRuntime {
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
+    /// Set when an attempt failed mid-generation without a rollback: the
+    /// slot session is mid-turn, so the next attempt cold-resets before
+    /// generating (see `poisons_session_state` in `complete.rs`). Cleared
+    /// by that reset and by `clear_resident`.
+    pub(crate) needs_session_reset: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_k_override: Option<String>,
     pub(crate) kv_v_override: Option<String>,
@@ -1387,6 +1392,7 @@ pub(crate) fn serve_foreground(
             continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
+            needs_session_reset: false,
             kv_override: args.kv_mode.clone(),
             kv_k_override: args.kv_k.clone(),
             kv_v_override: args.kv_v.clone(),
@@ -1858,6 +1864,7 @@ impl ServeRuntime {
         self.continuous_batch_capable = false;
         self.current_max_seq = 0;
         self.cache_capable = false;
+        self.needs_session_reset = false;
         self.resident_model = None;
         let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
         meta.current_model = None;

@@ -1,3 +1,4 @@
+mod common;
 use hipfire_isa::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
 use hipfire_isa::kernels::iu4_k1::{emit_fold, FoldRegisters, Variant};
 use hipfire_isa::reg::Live;
@@ -23,6 +24,7 @@ fn k1_explicit_and_hidden_arguments_match_hipcc() {
 
 #[test]
 fn all_96_k1_fold_packets_encode_on_gfx1201() {
+    if common::no_llvm() { return }
     let mut plan = RegPlan::new(200, 48).unwrap();
     let cacc = std::array::from_fn(|i| {
         plan.v::<8>("cacc", (i * 8) as u8, Live::Whole).unwrap()

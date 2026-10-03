@@ -63,6 +63,7 @@ mod tests {
     fn global_atomic_return_form_is_the_glc_bit() {
         use std::{io::Write, process::{Command, Stdio}};
         use crate::{effects::MemClass, operand::Operand, reg::{Kind, RegRef}};
+        let Some(llvm_mc) = crate::pinned_llvm_mc() else { return };
         let cases: [([u32; 2], &str, bool); 10] = [
             ([0xdcd2_4000, 0x0000_0002], "global_atomic_cmpswap_b32 v0, v2, v[0:1], s[0:1] glc", true),
             ([0xdcd2_4004, 0x0000_0002], "global_atomic_cmpswap_b32 v0, v2, v[0:1], s[0:1] offset:4 glc", true),
@@ -78,7 +79,7 @@ mod tests {
         for arch in [Arch::Gfx1100, Arch::Gfx1151] {
             let cpu = if arch == Arch::Gfx1100 { "gfx1100" } else { "gfx1151" };
             for (words, text, returns) in cases {
-                let mut mc = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
+                let mut mc = Command::new(&llvm_mc)
                     .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={cpu}"), "-show-encoding"])
                     .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("pinned llvm-mc");
                 mc.stdin.take().unwrap().write_all(format!("{text}\n").as_bytes()).unwrap();

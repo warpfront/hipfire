@@ -2141,6 +2141,38 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     Ok(())
 }
 
+/// True when a generation error leaves the daemon's slot session mid-turn
+/// and the next request must cold-reset instead of building on it.
+///
+/// Only errors raised *after* generation started qualify: pre-generation
+/// refusals (validation, malformed, context-length), capacity/queue
+/// rejections, cancellations, transport hiccups and infra classes never
+/// touched the engine. `rolled_back == false` alone is not enough — a
+/// validation 400 also reports it trivially, and poisoning on every 400
+/// would discard the cross-turn prefix cache. Any unrecognized class with
+/// a missing rollback poisons (fail-safe).
+fn poisons_session_state(error: &hipfire_client::ClientError) -> bool {
+    use hipfire_client::error_class as ec;
+    let Some(typed) = error.typed_daemon() else {
+        return false;
+    };
+    !typed.rolled_back
+        && !matches!(
+            typed.class.as_str(),
+            ec::TRANSIENT
+                | ec::MALFORMED
+                | ec::VALIDATION
+                | ec::CONTEXT_LENGTH
+                | ec::CANCEL
+                | ec::TRANSPORT
+                | ec::UNSUPPORTED
+                | ec::INTERNAL
+                | ec::OVERLOAD
+                | ec::ADAPTIVE_POISON
+                | ec::DETERMINISTIC_MISMATCH
+        )
+}
+
 /// One correlated generation attempt under the shared serve runtime lock.
 ///
 /// `identity` is the public completion identity (stable across retries);
@@ -2196,15 +2228,19 @@ pub(crate) fn complete_request_attempt(
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
-        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+        if force_reset
+            || runtime.needs_session_reset
+            || (!runtime.cache_capable && !runtime.continuous_batch_capable)
+        {
             if let Err(error) = runtime.engine.reset(attempt_id) {
-                if force_reset {
-                    // Rollback could not be attested: model state is unknown, so
-                    // the next request must full-reload rather than trust it.
-                    runtime.clear_resident(&shared.meta);
-                }
+                // Rollback could not be attested: model state is unknown, so
+                // the next request must full-reload rather than trust it —
+                // whether the reset was forced by retry policy or by a
+                // poisoned prior attempt.
+                runtime.clear_resident(&shared.meta);
                 return Err(error.into());
             }
+            runtime.needs_session_reset = false;
         }
         let contract = project_request_contract(
             body,
@@ -2642,6 +2678,20 @@ pub(crate) fn complete_request_attempt(
                 .unwrap_or_else(|error| error.into_inner())
                 .engine
                 .terminate();
+        } else if poisons_session_state(error) {
+            // The daemon failed mid-generation and could not roll the slot
+            // back, so the session state is mid-turn. Without this, the
+            // next request continues from the poisoned state (observed: the
+            // follow-up turn echoed the failed turn's prompt verbatim).
+            shared
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .needs_session_reset = true;
+            eprintln!(
+                "[hipfire] generation failed without rollback ({error}); \
+                 session state poisoned — next request cold-resets"
+            );
         }
     }
     let done = gen_result?;
@@ -3731,6 +3781,43 @@ mod tests {
                 id: Some("req-t15".into()),
             },
         ))
+    }
+
+    #[test]
+    fn poisons_session_state_only_for_mid_generation_failures() {
+        use hipfire_client::{error_class as ec, ClientError, TypedDaemonError};
+        let daemon_err = |class: &str, rolled_back: bool| {
+            ClientError::Daemon(TypedDaemonError {
+                message: "unsafe multi_slot terminal: open_think".into(),
+                class: class.into(),
+                retryable: false,
+                rolled_back,
+                attempt_id: 7,
+                id: Some("chatcmpl-1".into()),
+            })
+        };
+        // The observed corruption: generation failed, no rollback.
+        assert!(poisons_session_state(&daemon_err("generation", false)));
+        // Unknown future classes with a missing rollback fail safe.
+        assert!(poisons_session_state(&daemon_err("something_new", false)));
+        // A rolled-back generation failure keeps the session.
+        assert!(!poisons_session_state(&daemon_err("generation", true)));
+        // Pre-generation refusals never touched the engine.
+        for class in [
+            ec::VALIDATION,
+            ec::MALFORMED,
+            ec::CONTEXT_LENGTH,
+            ec::CANCEL,
+            ec::TRANSPORT,
+            ec::UNSUPPORTED,
+            ec::INTERNAL,
+            ec::OVERLOAD,
+            ec::TRANSIENT,
+        ] {
+            assert!(!poisons_session_state(&daemon_err(class, false)), "{class}");
+        }
+        // Non-daemon errors (build/IO) are not session poisoning.
+        assert!(!poisons_session_state(&ClientError::Io(std::io::Error::other("boom"))));
     }
 
     #[test]
