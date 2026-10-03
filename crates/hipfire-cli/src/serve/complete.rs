@@ -1887,9 +1887,9 @@ pub(crate) fn validate_response_format(
             if !js.is_object() {
                 bail_invalid!("response_format.json_schema must be an object");
             }
-            let schema = js
-                .get("schema")
-                .ok_or_else(|| invalid_request!("response_format.json_schema.schema is required"))?;
+            let schema = js.get("schema").ok_or_else(|| {
+                invalid_request!("response_format.json_schema.schema is required")
+            })?;
             if !schema.is_object() {
                 bail_invalid!("response_format.json_schema.schema must be an object");
             }
@@ -2141,6 +2141,38 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     Ok(())
 }
 
+/// True when a generation error leaves the daemon's slot session mid-turn
+/// and the next request must cold-reset instead of building on it.
+///
+/// Only errors raised *after* generation started qualify: pre-generation
+/// refusals (validation, malformed, context-length), capacity/queue
+/// rejections, cancellations, transport hiccups and infra classes never
+/// touched the engine. `rolled_back == false` alone is not enough — a
+/// validation 400 also reports it trivially, and poisoning on every 400
+/// would discard the cross-turn prefix cache. Any unrecognized class with
+/// a missing rollback poisons (fail-safe).
+fn poisons_session_state(error: &hipfire_client::ClientError) -> bool {
+    use hipfire_client::error_class as ec;
+    let Some(typed) = error.typed_daemon() else {
+        return false;
+    };
+    !typed.rolled_back
+        && !matches!(
+            typed.class.as_str(),
+            ec::TRANSIENT
+                | ec::MALFORMED
+                | ec::VALIDATION
+                | ec::CONTEXT_LENGTH
+                | ec::CANCEL
+                | ec::TRANSPORT
+                | ec::UNSUPPORTED
+                | ec::INTERNAL
+                | ec::OVERLOAD
+                | ec::ADAPTIVE_POISON
+                | ec::DETERMINISTIC_MISMATCH
+        )
+}
+
 /// One correlated generation attempt under the shared serve runtime lock.
 ///
 /// `identity` is the public completion identity (stable across retries);
@@ -2196,15 +2228,19 @@ pub(crate) fn complete_request_attempt(
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
-        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+        if force_reset
+            || runtime.needs_session_reset
+            || (!runtime.cache_capable && !runtime.continuous_batch_capable)
+        {
             if let Err(error) = runtime.engine.reset(attempt_id) {
-                if force_reset {
-                    // Rollback could not be attested: model state is unknown, so
-                    // the next request must full-reload rather than trust it.
-                    runtime.clear_resident(&shared.meta);
-                }
+                // Rollback could not be attested: model state is unknown, so
+                // the next request must full-reload rather than trust it —
+                // whether the reset was forced by retry policy or by a
+                // poisoned prior attempt.
+                runtime.clear_resident(&shared.meta);
                 return Err(error.into());
             }
+            runtime.needs_session_reset = false;
         }
         let contract = project_request_contract(
             body,
@@ -2642,6 +2678,20 @@ pub(crate) fn complete_request_attempt(
                 .unwrap_or_else(|error| error.into_inner())
                 .engine
                 .terminate();
+        } else if poisons_session_state(error) {
+            // The daemon failed mid-generation and could not roll the slot
+            // back, so the session state is mid-turn. Without this, the
+            // next request continues from the poisoned state (observed: the
+            // follow-up turn echoed the failed turn's prompt verbatim).
+            shared
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .needs_session_reset = true;
+            eprintln!(
+                "[hipfire] generation failed without rollback ({error}); \
+                 session state poisoned — next request cold-resets"
+            );
         }
     }
     let done = gen_result?;
@@ -2813,13 +2863,12 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             return Err("min_p must be within [0, 1]".to_owned());
         }
     }
-    if body
-        .get("reasoning_effort")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
-    {
-        return Err("reasoning_effort is not supported".to_owned());
-    }
+    // `reasoning_effort` is not refused here: `apply_http_reasoning_request`
+    // already owns the field end-to-end — it normalises qwen_jinja's
+    // vocabulary (low|medium|xhigh), maps the OpenAI spellings onto it, drops
+    // the dial with a warning when the loaded template does not natively
+    // honour it, and drops it when thinking is off. Refusing it here rejected
+    // requests the sequential route accepts, and pre-empted that logic.
     // Finite caps (>= 2) are ENFORCED end-to-end on the multi-slot route
     // (the grammar cursor force-closes the span at the budget —
     // vLLM thinking_token_budget parity), so they are forwarded, not
@@ -3038,9 +3087,13 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
                 .find_map(|prefix| url.strip_prefix(prefix))
                 .ok_or_else(|| {
                     if url.starts_with("data:") {
-                        invalid_request!("only base64 PNG and JPEG image_url data URIs are supported")
+                        invalid_request!(
+                            "only base64 PNG and JPEG image_url data URIs are supported"
+                        )
                     } else {
-                        invalid_request!("remote image_url values are unsupported; send a base64 data URI")
+                        invalid_request!(
+                            "remote image_url values are unsupported; send a base64 data URI"
+                        )
                     }
                 })?;
             if payload.is_empty() {
@@ -3425,7 +3478,12 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "ttft_ms": done.get("ttft_ms"),
         "prefill_ms": done.get("prefill_ms"),
         "prefill_tok_s": done.get("prefill_tok_s"),
-        "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
+        // Pure passthrough: relaying the wall-inclusive `tok_s` under
+        // `decode_tok_s` (the slots route reports only the former) made the
+        // UI present prefill time as decode speed — measured 3x low on
+        // gfx1101 multi-slot. `hipfire.tok_s` carries the wall number for
+        // clients that want it.
+        "decode_tok_s": done.get("decode_tok_s"),
         "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
@@ -3731,6 +3789,45 @@ mod tests {
                 id: Some("req-t15".into()),
             },
         ))
+    }
+
+    #[test]
+    fn poisons_session_state_only_for_mid_generation_failures() {
+        use hipfire_client::{error_class as ec, TypedDaemonError};
+        let daemon_err = |class: &str, rolled_back: bool| {
+            ClientError::Daemon(TypedDaemonError {
+                message: "unsafe multi_slot terminal: open_think".into(),
+                class: class.into(),
+                retryable: false,
+                rolled_back,
+                attempt_id: 7,
+                id: Some("chatcmpl-1".into()),
+            })
+        };
+        // The observed corruption: generation failed, no rollback.
+        assert!(poisons_session_state(&daemon_err("generation", false)));
+        // Unknown future classes with a missing rollback fail safe.
+        assert!(poisons_session_state(&daemon_err("something_new", false)));
+        // A rolled-back generation failure keeps the session.
+        assert!(!poisons_session_state(&daemon_err("generation", true)));
+        // Pre-generation refusals never touched the engine.
+        for class in [
+            ec::VALIDATION,
+            ec::MALFORMED,
+            ec::CONTEXT_LENGTH,
+            ec::CANCEL,
+            ec::TRANSPORT,
+            ec::UNSUPPORTED,
+            ec::INTERNAL,
+            ec::OVERLOAD,
+            ec::TRANSIENT,
+        ] {
+            assert!(!poisons_session_state(&daemon_err(class, false)), "{class}");
+        }
+        // Non-daemon errors (build/IO) are not session poisoning.
+        assert!(!poisons_session_state(&ClientError::Io(
+            std::io::Error::other("boom")
+        )));
     }
 
     #[test]
@@ -7622,9 +7719,7 @@ mod tests {
             (request_error_status(&error), error.to_string())
         };
         let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
-        let image = |url: &str| {
-            serde_json::json!({"type": "image_url", "image_url": {"url": url}})
-        };
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
         let reasoning = |body: serde_json::Value| -> Result<()> {
             apply_http_reasoning_request(
                 &body,
@@ -7685,7 +7780,10 @@ mod tests {
                 "max_tokens must be between",
                 contract(serde_json::json!({"max_tokens": 0})),
             ),
-            ("n != 1", contract(serde_json::json!({"max_tokens": 8, "n": 2}))),
+            (
+                "n != 1",
+                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+            ),
             (
                 "temperature must be within",
                 contract(serde_json::json!({"max_tokens": 8, "temperature": 3.0})),

@@ -37,6 +37,7 @@ pub(crate) mod metrics;
 
 pub mod complete;
 pub mod http;
+pub(crate) mod ui;
 
 #[derive(Debug)]
 pub(crate) struct ServeMeta {
@@ -233,6 +234,13 @@ pub(crate) struct LoadedInfo {
     pub(crate) n_embd: u64,
     /// Vocabulary size (`vocab`) — llama.cpp's `meta.n_vocab`.
     pub(crate) n_vocab: u64,
+    /// Reasoning contract of the resident model (`wire_name` spelling);
+    /// empty string until a load ack publishes one.
+    pub(crate) reasoning_contract: String,
+    /// The template accepts a `reasoning_effort` dial natively.
+    pub(crate) reasoning_effort_native: bool,
+    /// Effort rungs the resident model's chat template accepts.
+    pub(crate) reasoning_efforts: Vec<String>,
 }
 
 pub(crate) struct ServeRuntime {
@@ -247,6 +255,11 @@ pub(crate) struct ServeRuntime {
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
+    /// Set when an attempt failed mid-generation without a rollback: the
+    /// slot session is mid-turn, so the next attempt cold-resets before
+    /// generating (see `poisons_session_state` in `complete.rs`). Cleared
+    /// by that reset and by `clear_resident`.
+    pub(crate) needs_session_reset: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_k_override: Option<String>,
     pub(crate) kv_v_override: Option<String>,
@@ -300,6 +313,9 @@ pub(crate) struct ServeShared {
     /// was built with — never a separate source of truth. Immutable:
     /// route capabilities are configuration, not live state.
     pub(crate) capabilities: serde_json::Value,
+    /// `serve.ui` / `--ui`: the /ui chat-frontend routes are live. Immutable
+    /// for the process lifetime, like `capabilities`.
+    pub(crate) ui_enabled: bool,
 }
 
 /// Build the route capability advertisement from the resolved serve
@@ -322,6 +338,7 @@ pub(crate) fn route_capabilities(
     queue_timeout_ms: u64,
     stream_stall_timeout_ms: Option<u64>,
     max_request_bytes: u64,
+    chat_ui: bool,
 ) -> serde_json::Value {
     // Structured output is a property of the multi-slot route (the strict
     // json_schema subset + framing-aware cursor live in the slot engine);
@@ -351,6 +368,7 @@ pub(crate) fn route_capabilities(
         "queue_timeout_ms": queue_timeout_ms,
         "stream_stall_timeout_ms": stream_stall_timeout_ms,
         "max_request_bytes": max_request_bytes,
+        "chat_ui": chat_ui,
         // Honest refusal list: fields this route rejects BEFORE generation
         // (typed 400s). Mirrors `multi_slot_request_supported` (gateway) +
         // `validate_generate_caps` (daemon), which together refuse every
@@ -368,7 +386,6 @@ pub(crate) fn route_capabilities(
                 "logit_bias",
                 "echo",
                 "suffix",
-                "reasoning_effort",
                 "response_format:json_object",
                 "tools+image",
             ])
@@ -812,7 +829,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: "cancelled".to_string(),
                     retry_after_seconds: self.retry_after_seconds(),
-                    });
+                });
             }
             {
                 let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1172,6 +1189,11 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
             .arg("--continuous-batch-size")
             .arg(batch.to_string());
     }
+    if args.ui || args.open {
+        // --open is a one-shot launcher action in the parent; the detached
+        // child only needs the route enabled.
+        command.arg("--ui");
+    }
     let mut child = command.spawn().context("failed to detach native serve")?;
     let probe_host = match host {
         "0.0.0.0" => "127.0.0.1",
@@ -1193,6 +1215,24 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
                 child.id(),
                 log_path.display()
             );
+            // Announce from the effective state — CLI flags OR `serve.ui`
+            // config. Without the config leg, a config-enabled UI on a
+            // LAN bind existed with only a line buried in serve.log.
+            let ui_via_config = resolved_global(paths, true)
+                .map(|(_, global)| config_bool(&global, "serve.ui").unwrap_or(false))
+                .unwrap_or(false);
+            if args.ui || args.open || ui_via_config {
+                println!("chat UI: {}", serve_ui_url(host, port));
+                if !host_is_loopback(host) {
+                    println!(
+                        "WARNING: chat UI is unauthenticated and bound to {host} — \
+                         reachable from non-loopback clients"
+                    );
+                }
+                if args.open {
+                    open_browser(&serve_ui_url(host, port));
+                }
+            }
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -1219,6 +1259,53 @@ pub(crate) fn health_ready(host: &str, port: u16) -> bool {
         .get(&url)
         .call()
         .is_ok_and(|response| response.status().is_success())
+}
+
+/// Browser-facing URL for the embedded chat UI. Wildcard binds are not
+/// navigable, so they are projected to their loopback counterpart (same
+/// projection the detach readiness probe uses).
+pub(crate) fn serve_ui_url(host: &str, port: u16) -> String {
+    let browse_host = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
+    };
+    if browse_host.contains(':') {
+        format!("http://[{browse_host}]:{port}/ui")
+    } else {
+        format!("http://{browse_host}:{port}/ui")
+    }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    if matches!(host, "localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Best-effort browser launch; failure is a warning, never a serve failure.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = Command::new("cmd");
+        c.arg("/c").arg("start").arg("");
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(error) = command.spawn() {
+        eprintln!("[hipfire] could not open a browser ({error}); visit {url}");
+    }
 }
 
 pub(crate) fn serve_foreground(
@@ -1339,6 +1426,17 @@ pub(crate) fn serve_foreground(
         allow_paths: config_bool(&global, "serve.allow_request_paths")?,
         operator_model: Some(default_model.clone()),
     };
+    // `--open` implies `--ui`: the launcher promise is meaningless without
+    // the route. Config/env (`serve.ui` / HIPFIRE_SERVE_UI) also enables it.
+    let ui_enabled = args.ui || args.open || config_bool(&global, "serve.ui")?;
+    if ui_enabled && !host_is_loopback(host) {
+        // The gateway already answers /v1/chat/completions cross-origin; the
+        // UI flag makes that reachable from any browser on the network.
+        eprintln!(
+            "[hipfire] WARNING: chat UI is unauthenticated and bound to {host} — \
+             reachable from non-loopback clients"
+        );
+    }
     let instance_token = serve_instance_token();
     // Admission width: experimental multi-slot projects N concurrent daemon
     // sessions; continuous batch admits up to continuous_batch_size. Take the
@@ -1371,6 +1469,7 @@ pub(crate) fn serve_foreground(
         queue_timeout.as_millis() as u64,
         stream_stall_timeout.map(|t| t.as_millis() as u64),
         max_request_bytes,
+        ui_enabled,
     );
     let shared = Arc::new(ServeShared {
         capabilities,
@@ -1387,6 +1486,7 @@ pub(crate) fn serve_foreground(
             continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
+            needs_session_reset: false,
             kv_override: args.kv_mode.clone(),
             kv_k_override: args.kv_k.clone(),
             kv_v_override: args.kv_v.clone(),
@@ -1416,6 +1516,7 @@ pub(crate) fn serve_foreground(
         retry_backoff,
         backoff_hook: Mutex::new(None),
         stream_stall_timeout,
+        ui_enabled,
     });
     let bind = format_bind(host, port);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1455,6 +1556,12 @@ pub(crate) fn serve_foreground(
     })
     .context("failed to install serve signal handler")?;
     eprintln!("[hipfire] native serve listening on http://{bind}");
+    if ui_enabled {
+        eprintln!("[hipfire] chat UI: {}", serve_ui_url(host, port));
+        if args.open {
+            open_browser(&serve_ui_url(host, port));
+        }
+    }
     if !args.no_prewarm {
         let shared = Arc::clone(&shared);
         let pid_path = pid_path.clone();
@@ -1650,7 +1757,8 @@ impl ServeRuntime {
             )?;
             path = entry.map(|entry| self.paths.models.join(&entry.file));
         }
-        let path = path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
+        let path =
+            path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if self.current_path.as_ref() != Some(&path) {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
@@ -1785,6 +1893,11 @@ impl ServeRuntime {
                     .get("vocab")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
+                // Mirror of the runtime fields above: /health serves these
+                // from ServeMeta because it must not take the runtime lock.
+                reasoning_contract: self.current_reasoning_contract.wire_name().to_owned(),
+                reasoning_effort_native: self.current_reasoning_effort_native,
+                reasoning_efforts: self.current_reasoning_efforts.clone(),
             };
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
@@ -1858,11 +1971,17 @@ impl ServeRuntime {
         self.continuous_batch_capable = false;
         self.current_max_seq = 0;
         self.cache_capable = false;
+        self.needs_session_reset = false;
         self.resident_model = None;
         let mut meta = meta.lock().unwrap_or_else(|error| error.into_inner());
         meta.current_model = None;
         meta.n_ctx = 0;
-        meta.loaded = LoadedInfo::default();
+        // `unsupported` rather than `LoadedInfo::default()`'s `""`: a load
+        // that has never happened and a loaded non-reasoning model should
+        // read the same at /health, not two spellings of "no reasoning".
+        let mut loaded = LoadedInfo::default();
+        loaded.reasoning_contract = "unsupported".to_owned();
+        meta.loaded = loaded;
     }
 
     /// Replace a daemon that exited: reap it (freeing its GPU memory), then
@@ -1887,7 +2006,9 @@ impl ServeRuntime {
                     return Ok(resident);
                 }
                 Err(error) => {
-                    eprintln!("[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}");
+                    eprintln!(
+                        "[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}"
+                    );
                 }
             }
             if attempt < attempts {
@@ -2015,9 +2136,7 @@ pub(crate) fn validate_multi_slot_startup(
     // zero-byte pool is a guaranteed load failure, not a silently-disabled
     // cache). Catch it at startup rather than per-request HTTP 500.
     if prefix_cache && prefix_cache_max_bytes == 0 {
-        return Err(
-            "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned(),
-        );
+        return Err("serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned());
     }
     if multi_slot_enabled {
         let scratch_rows = prefill_chunk
@@ -2978,7 +3097,8 @@ mod tests {
         let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
-        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        let err =
+            validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
     }
 
@@ -3006,7 +3126,8 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_prefill_min_above_chunk() {
-        let err = validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2, false, 0).unwrap_err();
+        let err =
+            validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2, false, 0).unwrap_err();
         assert!(
             err.contains("must be <= serve.multi_slot_prefill_chunk"),
             "{err}"
@@ -3074,7 +3195,11 @@ mod tests {
             .acquire_for_with_bytes(true, Some("m"), 999_999_999)
             .unwrap_err();
         // Should be a timeout (queue wait), not a QueueFull byte error.
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
     }
 
     // ---- Permit released exactly once (spec §5.3) ----
@@ -3150,7 +3275,11 @@ mod tests {
         let err = admission
             .acquire_for_with_bytes(true, Some("m"), 300)
             .unwrap_err();
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
         // Queued bytes must be released on timeout.
         assert_eq!(admission.queued_bytes(), 0);
         assert_eq!(admission.inflight(), 1);
@@ -3234,7 +3363,11 @@ mod tests {
         ));
         let _holder = admission.acquire().unwrap();
         let err = admission.acquire().unwrap_err();
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -3274,6 +3407,7 @@ mod capabilities_tests {
             30000,
             Some(30_000),
             64 << 20,
+            /*chat_ui*/ true,
         )
     }
 
@@ -3285,6 +3419,7 @@ mod capabilities_tests {
         let caps = route();
         assert_eq!(caps["mode"], "multi-slot");
         assert_eq!(caps["multi_slot"], true);
+        assert_eq!(caps["chat_ui"], true);
         assert_eq!(caps["multi_slot_slots"], 2);
         assert_eq!(caps["multi_slot_ctx"], 50000);
         assert_eq!(caps["prefix_cache"], true);
@@ -3307,7 +3442,6 @@ mod capabilities_tests {
             "logit_bias",
             "echo",
             "suffix",
-            "reasoning_effort",
             "response_format:json_object",
             "tools+image",
         ] {
@@ -3316,6 +3450,10 @@ mod capabilities_tests {
                 "refusal list must contain {field}"
             );
         }
+        assert!(
+            !refused.iter().any(|v| v == "reasoning_effort"),
+            "the effort dial reaches the template on the multi-slot route"
+        );
     }
 
     /// The standard route must NOT advertise multi-slot/structured-output
@@ -3338,14 +3476,41 @@ mod capabilities_tests {
             30000,
             None,
             64 << 20,
+            false,
         );
         assert_eq!(caps["mode"], "standard");
         assert_eq!(caps["multi_slot"], false);
+        assert_eq!(caps["chat_ui"], false);
         assert_eq!(caps["structured_output"], false);
         assert!(caps["structured_output_subset"].is_null());
         assert_eq!(caps["prefix_cache"], false);
         let refused = caps["refused_request_fields"].as_array().unwrap();
-        assert!(refused.is_empty(), "the standard route refuses none of these fields");
+        assert!(
+            refused.is_empty(),
+            "the standard route refuses none of these fields"
+        );
         assert!(caps["stream_stall_timeout_ms"].is_null());
+    }
+
+    #[test]
+    fn serve_ui_url_projects_wildcards_and_brackets_ipv6() {
+        assert_eq!(serve_ui_url("0.0.0.0", 11435), "http://127.0.0.1:11435/ui");
+        assert_eq!(serve_ui_url("::", 11435), "http://[::1]:11435/ui");
+        assert_eq!(serve_ui_url("::1", 8000), "http://[::1]:8000/ui");
+        assert_eq!(serve_ui_url("192.168.1.5", 80), "http://192.168.1.5:80/ui");
+        assert_eq!(
+            serve_ui_url("localhost", 11435),
+            "http://localhost:11435/ui"
+        );
+    }
+
+    #[test]
+    fn host_is_loopback_matches_names_and_loopback_ips_only() {
+        for host in ["localhost", "127.0.0.1", "127.1.2.3", "::1"] {
+            assert!(host_is_loopback(host), "{host}");
+        }
+        for host in ["0.0.0.0", "::", "192.168.1.5", "example.local", ""] {
+            assert!(!host_is_loopback(host), "{host}");
+        }
     }
 }

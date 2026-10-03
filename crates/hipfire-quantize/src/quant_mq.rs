@@ -3,10 +3,9 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
+use crate::quant_fwht::cpu_fwht_256;
 #[cfg(test)]
 use crate::{hfq::QuantType, pipeline_gguf::GgufFormat, quant_fwht::gen_fwht_signs};
-use crate::quant_fwht::cpu_fwht_256;
-
 
 use crate::gguf_input;
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
@@ -167,7 +166,9 @@ fn quantize_mq3g256v2_impl(
             let off = h * 128;
             let values = &group[off..off + 128];
             if symmetric {
-                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                let amax = values
+                    .iter()
+                    .fold(0.0f32, |acc, &value| acc.max(value.abs()));
                 if amax == 0.0 {
                     scales[h] = 0;
                     zeros[h] = f32_to_f16(-0.0);
@@ -208,8 +209,9 @@ fn quantize_mq3g256v2_impl(
                 let zero = f16_to_f32(zeros[h]);
                 let inverse = 1.0 / scale;
                 for i in 0..128 {
-                    q[off + i] =
-                        ((group[off + i] - zero) * inverse + 0.5).floor().clamp(0.0, 7.0) as u8;
+                    q[off + i] = ((group[off + i] - zero) * inverse + 0.5)
+                        .floor()
+                        .clamp(0.0, 7.0) as u8;
                 }
             } else {
                 let lo = values.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -313,7 +315,9 @@ fn quantize_mq2g256v2_impl(
             let off = h * 128;
             let values = &group[off..off + 128];
             if symmetric {
-                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                let amax = values
+                    .iter()
+                    .fold(0.0f32, |acc, &value| acc.max(value.abs()));
                 if amax == 0.0 {
                     scales[h] = 0;
                     zeros[h] = f32_to_f16(-0.0);
@@ -354,8 +358,9 @@ fn quantize_mq2g256v2_impl(
                 let zero = f16_to_f32(zeros[h]);
                 let inverse = 1.0 / scale;
                 for i in 0..128 {
-                    q[off + i] =
-                        ((group[off + i] - zero) * inverse + 0.5).floor().clamp(0.0, 3.0) as u8;
+                    q[off + i] = ((group[off + i] - zero) * inverse + 0.5)
+                        .floor()
+                        .clamp(0.0, 3.0) as u8;
                 }
             } else {
                 let lo = values.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -3204,7 +3209,10 @@ mod mqv2_symmetric_tests {
             .collect();
         let got = quantize_mq3g256v2(&w, m, k, &s1, &s2);
         let want = legacy_mq3g256v2_asymmetric(&w, m, k, &s1, &s2);
-        assert_eq!(got, want, "public MQ3V2 must stay byte-identical when asymmetric");
+        assert_eq!(
+            got, want,
+            "public MQ3V2 must stay byte-identical when asymmetric"
+        );
     }
 
     #[test]
@@ -3218,20 +3226,29 @@ mod mqv2_symmetric_tests {
             .collect();
         let got = quantize_mq2g256v2(&w, m, k, &s1, &s2);
         let want = legacy_mq2g256v2_asymmetric(&w, m, k, &s1, &s2);
-        assert_eq!(got, want, "public MQ2V2 must stay byte-identical when asymmetric");
+        assert_eq!(
+            got, want,
+            "public MQ2V2 must stay byte-identical when asymmetric"
+        );
     }
 
     #[test]
     fn mq3v2_symmetric_zero_is_neg_four_d() {
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
-        let w: Vec<f32> = (0..256).map(|i| ((i as f32 - 128.0) * 0.02).sin() * 0.8).collect();
+        let w: Vec<f32> = (0..256)
+            .map(|i| ((i as f32 - 128.0) * 0.02).sin() * 0.8)
+            .collect();
         let blob = quantize_mq3g256v2_symmetric(&w, 1, 256, &s1, &s2);
         for half in 0..2 {
             let base = half * 4;
             let d = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
             let z_bits = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
-            assert_eq!(z_bits, f32_to_f16(-4.0 * d), "half {half}: zero must be f16(-4*d)");
+            assert_eq!(
+                z_bits,
+                f32_to_f16(-4.0 * d),
+                "half {half}: zero must be f16(-4*d)"
+            );
         }
     }
 
@@ -3239,13 +3256,19 @@ mod mqv2_symmetric_tests {
     fn mq2v2_symmetric_zero_is_neg_two_d() {
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
-        let w: Vec<f32> = (0..256).map(|i| ((i as f32 - 128.0) * 0.02).sin() * 0.8).collect();
+        let w: Vec<f32> = (0..256)
+            .map(|i| ((i as f32 - 128.0) * 0.02).sin() * 0.8)
+            .collect();
         let blob = quantize_mq2g256v2_symmetric(&w, 1, 256, &s1, &s2);
         for half in 0..2 {
             let base = half * 4;
             let d = f16_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
             let z_bits = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
-            assert_eq!(z_bits, f32_to_f16(-2.0 * d), "half {half}: zero must be f16(-2*d)");
+            assert_eq!(
+                z_bits,
+                f32_to_f16(-2.0 * d),
+                "half {half}: zero must be f16(-2*d)"
+            );
         }
     }
 
@@ -3534,13 +3557,8 @@ mod mq2_lloyd_anchored_tests {
             .map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0)
             .collect();
         let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
-        for blk in out.chunks_exact(72) {
-            for &b in &blk[8..] {
-                for j in 0..4 {
-                    assert!(((b >> (j * 2)) & 0x3) <= 3);
-                }
-            }
-        }
+        // 2-bit indices are in range by construction; pin the block geometry.
+        assert_eq!(out.len(), 2 * 72);
         // Canonical hyphen and underscore aliases resolve to Mq2LloydAnchored,
         // remaining distinct from the affine MQ2V2 path.
         assert_eq!(

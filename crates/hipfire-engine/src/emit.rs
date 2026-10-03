@@ -48,6 +48,44 @@ pub fn render_tail_opens_think(rendered: &str) -> bool {
     rendered.trim_end().ends_with("<think>")
 }
 
+/// The assistant framing a rendered prompt's generation turn sits in.
+///
+/// Companion to [`render_tail_opens_think`]. The Jinja render owns the
+/// generation suffix, so the framing used for continuation and for the
+/// engine's reasoning state must be read back from the rendered bytes — not
+/// assumed from the request's `assistant_prefix`, and not from the
+/// tokenizer's token inventory. A tokenizer that registers `<think>` does
+/// not imply the prompt frames a think block: the standard Qwen3-family
+/// template emits no opener when thinking is enabled and lets the model
+/// generate `<think>` itself, while `enable_thinking=false` emits a closed
+/// `<think>\n\n</think>\n\n` block.
+///
+/// Only the live generation turn — the segment after the last
+/// `<|im_start|>` — is classified, and by think-marker pairs rather than by
+/// suffix match: history assistant turns legitimately contain closed think
+/// blocks, user content may carry literal think markup, and a template may
+/// seed reasoning text after the opener (`<think>Let me…`), which a bare
+/// `ends_with` would misread as `Plain` and route the span's reasoning to
+/// the visible channel. A render with no `<|im_start|>` (non-ChatML
+/// template) classifies the whole trimmed render.
+pub fn render_assistant_prefix(rendered: &str) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+    use hipfire_runtime::prompt_frame::AssistantPrefix;
+    let turn = rendered
+        .rfind("<|im_start|>")
+        .map(|at| &rendered[at..])
+        .unwrap_or(rendered);
+    match (turn.rfind("<think>"), turn.rfind("</think>")) {
+        // The newest marker in the live turn is an unclosed opener — the
+        // bare `<think>` tail, a seeded one, or a re-opened span.
+        (Some(_), None) => AssistantPrefix::OpenThink,
+        (Some(o), Some(c)) if o > c => AssistantPrefix::OpenThink,
+        // The live turn carries a closed think span (the thinking-off guard
+        // block) or only a stray closer.
+        (_, Some(_)) => AssistantPrefix::ClosedThink,
+        (None, None) => AssistantPrefix::Plain,
+    }
+}
+
 /// Reduce the authoritative rendered-prompt state to the signal consumed by
 /// speculative emitters. Jinja owns the generation suffix, so the request's
 /// `assistant_prefix` is not authoritative once rendering succeeds.

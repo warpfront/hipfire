@@ -74,7 +74,6 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
     );
 }
 
-
 /// The per-arch multi-slot engine behind the four-method surface
 /// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
 ///
@@ -106,16 +105,13 @@ type AnySlotEngine = Box<dyn hipfire_runtime::serve::SlotEngineHandle>;
 /// family-neutral `SlotEngineConfig` carries every serve.* knob; the carrier
 /// maps it onto its own engine config. `Err` names the arch when no carrier
 /// provides a slot engine.
-fn spawn_slot_engine(
-    arch_id: u32,
-    cfg: SlotEngineConfig,
-) -> Result<AnySlotEngine, String> {
+fn spawn_slot_engine(arch_id: u32, cfg: SlotEngineConfig) -> Result<AnySlotEngine, String> {
     let carrier = hipfire_loader::carrier_for(arch_id).ok_or_else(|| {
         format!("no carrier claims arch_id {arch_id} — slot mode cannot dispatch")
     })?;
-    carrier.spawn_slot_engine(cfg).map_err(|e| {
-        format!("no multi-slot engine for arch_id {arch_id}: {e}")
-    })
+    carrier
+        .spawn_slot_engine(cfg)
+        .map_err(|e| format!("no multi-slot engine for arch_id {arch_id}: {e}"))
 }
 
 /// Slot-engine load parameters parsed from a `load` message. The daemon's
@@ -837,6 +833,16 @@ impl SlotBackend {
         let has_think = self.tokenizer.special_token_id("<think>").is_some();
         let thinking_enabled_opt = msg.get("thinking_enabled").and_then(|v| v.as_bool());
         let assistant_prefix_opt = msg.get("assistant_prefix").and_then(|v| v.as_str());
+        // Raw effort rung, spelled exactly as the sequential route consumes it
+        // (`reasoning_effort`, with the project-custom `thinking_mode` alias).
+        // Kept verbatim — no lowercasing and no rung validation here — so the
+        // template stays the authority on which rungs it accepts. A rejected
+        // rung surfaces as a render error (validation), never a silent
+        // downgrade.
+        let raw_reasoning_effort = msg
+            .get("reasoning_effort")
+            .or_else(|| msg.get("thinking_mode"))
+            .and_then(|v| v.as_str());
         if max_think_tokens == Some(1)
             && (thinking_enabled_opt == Some(true) || assistant_prefix_opt == Some("open_think"))
         {
@@ -945,8 +951,19 @@ impl SlotBackend {
                 // max_think is fallback only, so when assistant_prefix present we ignore it, but if max_think==1 vs open_think contradiction we still prefer authority and ignore fallback.
                 (enabled, actual)
             } else {
-                // Fallback to max_think_tokens compatibility
-                let enabled = has_think && max_think_tokens != Some(1);
+                // Fallback: `thinking_enabled` and `assistant_prefix` are both
+                // absent, so defer to the shared sequential derivation — an
+                // explicit disable rung (`none`/`off`/`chat`) turns thinking
+                // off, and the immediate-close sentinel (1) does too. Same
+                // result as before, plus the disable rungs the sequential and
+                // batch routes already honour; still gated on this model
+                // actually carrying a `<think>` token.
+                let (enabled, _) = hipfire_engine::prompt::qwen_jinja_reasoning(
+                    None,
+                    raw_reasoning_effort,
+                    max_think_tokens.unwrap_or(0) as usize,
+                );
+                let enabled = enabled && has_think;
                 let exp = if enabled {
                     AssistantPrefix::OpenThink
                 } else if has_think {
@@ -958,6 +975,12 @@ impl SlotBackend {
             };
         // Additional contradiction: if max_think==1 but thinking_enabled true? Already handled as authority wins, but spec says reject contradictions. If fallback path derived enabled true but max_think==1 would have been false, but since thinking_enabled absent we use max_think, so not contradictory.
         // If has_think false, ensure plain regardless.
+
+        // The effort rung handed to the Jinja template; see
+        // `slot_jinja_effort` for the suppression rule and why it is not keyed
+        // on this route's `enable_thinking`.
+        let jinja_effort =
+            slot_jinja_effort(thinking_enabled_opt, raw_reasoning_effort, max_think_tokens);
 
         // Consume only the gateway-projected tool contract. Raw OpenAI
         // tool_choice never reaches this owner.
@@ -1076,7 +1099,7 @@ impl SlotBackend {
         }
 
         let mut visual_data = None;
-        let (prompt_tokens, started_in_think) = if let Some(image) = slot_image {
+        let (prompt_tokens, prefix) = if let Some(image) = slot_image {
             // The projected message view carries the system text; fall back to
             // the top-level `system` field for prompt-only requests.
             let system = messages
@@ -1086,11 +1109,10 @@ impl SlotBackend {
                 .or_else(|| msg.get("system").and_then(|v| v.as_str()));
             match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
                 Ok((tokens, vd)) => {
+                    // The VL builder frames the assistant turn itself from
+                    // `expected_prefix`, so that is authoritative here.
                     visual_data = Some(vd);
-                    (
-                        tokens,
-                        matches!(expected_prefix, AssistantPrefix::OpenThink),
-                    )
+                    (tokens, expected_prefix)
                 }
                 Err(reason) => {
                     hipfire_engine::emit::emit_active_attempt_error(
@@ -1114,7 +1136,7 @@ impl SlotBackend {
                 enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: None,
+                reasoning_effort: jinja_effort,
             };
             let rendered = match frame.render_messages(&messages, tools, None) {
                 Ok(rendered) => rendered,
@@ -1131,8 +1153,13 @@ impl SlotBackend {
                     return Ok(());
                 }
             };
-            let started = rendered.trim_end().ends_with("<think>");
-            (self.tokenizer.encode(&rendered), started)
+            // The template owns the generation suffix: read the assistant
+            // framing back from what it emitted. A thinking-on request that
+            // the template answers with a bare `assistant\n` (standard
+            // Qwen3-family behaviour — the model opens `<think>` itself)
+            // frames `Plain`, not `ClosedThink`.
+            let framing = hipfire_engine::emit::render_assistant_prefix(&rendered);
+            (self.tokenizer.encode(&rendered), framing)
         } else {
             if tools.is_some()
                 || messages
@@ -1162,36 +1189,15 @@ impl SlotBackend {
                 assistant_prefix: expected_prefix,
                 raw: false,
             };
-            (
-                frame.build_multi_turn(&history),
-                matches!(expected_prefix, AssistantPrefix::OpenThink),
-            )
+            // `ChatFrame` frames the assistant turn itself from
+            // `expected_prefix`, so that is authoritative here.
+            (frame.build_multi_turn(&history), expected_prefix)
         };
 
-        // Now prefix for continuation is expected_prefix but also must agree with started_in_think
-        let prefix = if started_in_think {
-            AssistantPrefix::OpenThink
-        } else if has_think {
-            AssistantPrefix::ClosedThink
-        } else {
-            AssistantPrefix::Plain
-        };
-        // Enforce that prefix matches expected_prefix and enable_thinking
-        if prefix != expected_prefix {
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!(
-                    "reasoning prefix mismatch: expected {:?} got {:?}",
-                    expected_prefix, prefix
-                ),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
+        // Every branch above now reports the framing the prompt actually
+        // ends in. There is nothing left to reconcile: the Jinja render owns
+        // the generation suffix, and the two builders frame it themselves.
+        let started_in_think = matches!(prefix, AssistantPrefix::OpenThink);
         let prompt_len = prompt_tokens.len();
         // A client that omitted max_tokens gets the default clamped to the
         // room left after the prompt, exactly like the sequential route.
@@ -1359,34 +1365,17 @@ impl SlotBackend {
         let mut cached_tokens: usize = 0;
         let mut prefill_tokens: usize = prompt_len;
         let t_start = Instant::now();
+        // The parser's initial think state follows the prompt's framing, not
+        // the request's `enable_thinking`. `enable_thinking` is a Jinja input:
+        // a thinking-on Qwen3-family render frames no opener and the model
+        // emits `<think>` itself, so the parser must start outside the
+        // reasoning span and open it on that token. Equating the two rejected
+        // every thinking-on request.
         let think_mode = if started_in_think {
             ThinkMode::Low
         } else {
             ThinkMode::NonThink
         };
-        // Validate think_mode agrees with enable_thinking
-        let expected_think_mode = if enable_thinking {
-            ThinkMode::Low
-        } else {
-            ThinkMode::NonThink
-        };
-        if think_mode != expected_think_mode {
-            emit_qwen_ar_slot_error(
-                stdout,
-                id,
-                "think_mode mismatch with enable_thinking",
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            if let Some(sess) = accepted_session.take() {
-                self.close_session(sess);
-            } else if let Some(session) = claimed_session {
-                self.close_session(session);
-            }
-            return Ok(());
-        }
         let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
@@ -2010,6 +1999,32 @@ pub(crate) fn resolve_slot_sampling(
     Ok((temperature, top_p, max_tokens, fit))
 }
 
+/// The `reasoning_effort` rung handed to the Jinja template on this route.
+///
+/// Suppression mirrors `hipfire_engine::prompt::qwen_jinja_reasoning`: an
+/// explicit `thinking_enabled = false`, a disable rung, or the immediate-close
+/// sentinel (`max_think_tokens = 1`) leave the variable undefined so the
+/// template's own default applies. `auto` is the client's "no preference"
+/// spelling and is left undefined too. The rung itself is passed verbatim —
+/// the template is the authority on which values it accepts, and a rejected
+/// one fails the render as validation.
+///
+/// Deliberately NOT keyed on the route's `enable_thinking`: that flag
+/// describes the `<think>`-token ChatML framing, and a template that opens
+/// reasoning through a different token (e.g. `<ifm|think>`) keeps it false —
+/// keying on it would silence the dial on exactly the models that use it.
+fn slot_jinja_effort<'a>(
+    thinking_enabled: Option<bool>,
+    raw_effort: Option<&'a str>,
+    max_think_tokens: Option<u64>,
+) -> Option<&'a str> {
+    let disable_rung = matches!(raw_effort, Some("none") | Some("off") | Some("chat"));
+    if thinking_enabled == Some(false) || max_think_tokens == Some(1) || disable_rung {
+        return None;
+    }
+    raw_effort.filter(|rung| *rung != "auto")
+}
+
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     // Optional numeric controls must not silently fall back to defaults when
     // present with the wrong JSON type. The parsing path uses as_f64/as_u64;
@@ -2122,8 +2137,7 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                     );
                 }
             };
-            if let Err(e) =
-                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+            if let Err(e) = saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
             {
                 return Some(format!("response_format json_schema: {e}"));
             }
@@ -2166,13 +2180,10 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
             return Some("top_p must be within (0, 1]".to_string());
         }
     }
-    if msg
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.eq_ignore_ascii_case("none"))
-    {
-        return Some("reasoning_effort is not supported in experimental multi-slot".to_string());
-    }
+    // `reasoning_effort` is ACCEPTED: it is plumbed to the Jinja template (and
+    // used to derive the enable/disable pair) exactly as on the sequential and
+    // batch routes. A rung the model's template rejects surfaces as a render
+    // error, which is validation — not a silent downgrade.
     // max_think_tokens >= 2 is ACCEPTED here (was refused): the engine now
     // enforces finite think budgets — the grammar cursor force-closes the
     // span at the budget (vLLM thinking_token_budget parity). Enforced
@@ -2943,6 +2954,32 @@ mod tests {
         assert!(err.contains("maximum encoded size"), "unexpected: {err}");
     }
 
+    /// The effort dial reaches the template only when the client actually
+    /// asked for reasoning. Keyed on the request, not on the route's
+    /// `<think>`-token framing: a template that opens reasoning with another
+    /// token keeps that framing false and must still get the rung.
+    #[test]
+    fn slot_effort_reaches_the_template_except_when_reasoning_is_off() {
+        // A rung is passed through verbatim, including ones the template may
+        // reject (that failure belongs to the render, as validation).
+        assert_eq!(slot_jinja_effort(None, Some("high"), None), Some("high"));
+        assert_eq!(slot_jinja_effort(None, Some("xhigh"), None), Some("xhigh"));
+        assert_eq!(slot_jinja_effort(Some(true), Some("low"), None), Some("low"));
+        // `auto` and absent mean "no preference": leave it undefined so the
+        // template's own default applies.
+        assert_eq!(slot_jinja_effort(None, Some("auto"), None), None);
+        assert_eq!(slot_jinja_effort(None, None, None), None);
+        // Reasoning off — explicitly, by a disable rung, or by the
+        // immediate-close sentinel — suppresses the dial entirely.
+        assert_eq!(slot_jinja_effort(Some(false), Some("high"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("none"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("off"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("chat"), None), None);
+        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(1)), None);
+        // A finite budget is not a disable: the rung survives it.
+        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(64)), Some("high"));
+    }
+
     #[test]
     fn decode_image_base64_strips_data_urls_and_rejects_garbage() {
         assert_eq!(
@@ -3335,6 +3372,11 @@ mod tests {
             json!({"repeat_penalty": 1.05}),
             json!({"presence_penalty": 1.5}),
             json!({"min_p": 0.05}),
+            // The effort dial is honoured on this route: it reaches the Jinja
+            // template, so it is accepted at the door (a rung the template
+            // rejects fails the render instead).
+            json!({"reasoning_effort": "high"}),
+            json!({"reasoning_effort": "xhigh"}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_none(),
@@ -3345,7 +3387,6 @@ mod tests {
             json!({"repeat_penalty": 2.5}),
             json!({"presence_penalty": -0.1}),
             json!({"min_p": 1.5}),
-            json!({"reasoning_effort": "high"}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_some(),
@@ -3439,11 +3480,6 @@ mod tests {
             (
                 "submit",
                 "multi_slot submit: engine unavailable",
-                "internal",
-            ),
-            (
-                "think",
-                "think_mode mismatch with enable_thinking",
                 "internal",
             ),
             (

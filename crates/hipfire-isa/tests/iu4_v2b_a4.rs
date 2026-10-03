@@ -7,6 +7,8 @@ use hipfire_isa::kernels::iu4_v2b_a4::{self, Epi, Spec};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+mod common;
+
 const LLVM: &str = "/opt/rocm/core-10.0/lib/llvm/bin";
 
 fn twin(epi: Epi) -> hipfire_isa::Emitted { iu4_v2b_a4::emit(Spec { arch: Arch::Gfx1151, epi }).unwrap() }
@@ -43,6 +45,7 @@ fn m512_k_loop_census_per_k256() {
 
 #[test]
 fn m512_module_assembles_for_gfx1151_with_zero_diagnostics() {
+    if common::no_llvm() { return }
     let text = iu4_v2b_a4::emit_module(Arch::Gfx1151).unwrap().1;
     let mut child = Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1151", "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();

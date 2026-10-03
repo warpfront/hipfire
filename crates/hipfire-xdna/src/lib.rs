@@ -306,10 +306,8 @@ pub(crate) const DRM_IOCTL_AMDXDNA_SYNC_BO: u32 =
 pub(crate) const DRM_IOCTL_AMDXDNA_EXEC_CMD: u32 =
     drm_iowr(DRM_COMMAND_BASE + 6, size_of::<ExecCmd>());
 pub(crate) const DRM_IOCTL_GEM_CLOSE: u32 = drm_iow(0x09, size_of::<GemClose>());
-pub(crate) const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 =
-    drm_iowr(0x2e, size_of::<PrimeHandle>());
-pub(crate) const DRM_IOCTL_SYNCOBJ_DESTROY: u32 =
-    drm_iowr(0xc0, size_of::<SyncobjDestroy>());
+pub(crate) const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = drm_iowr(0x2e, size_of::<PrimeHandle>());
+pub(crate) const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = drm_iowr(0xc0, size_of::<SyncobjDestroy>());
 pub(crate) const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 =
     drm_iowr(0xca, size_of::<SyncobjTimelineWait>());
 
@@ -322,8 +320,8 @@ pub(crate) const PACKET_WORDS: usize = 17;
 pub(crate) const PACKET_BYTES: usize = PACKET_WORDS * 4;
 /// Packet-absolute byte offset of `bo0` (payload-relative `0x14` + 8-byte
 /// header/mask prefix). 4-mod-8 unaligned by construction.
-    #[allow(dead_code)] // pinned by the golden layout test
-    pub(crate) const BO0_PACKET_OFFSET: usize = 0x1c;
+#[allow(dead_code)] // pinned by the golden layout test
+pub(crate) const BO0_PACKET_OFFSET: usize = 0x1c;
 /// Maximum buffer arguments per submit (`bo0..bo4`; unused slots are zero).
 pub(crate) const MAX_BO_ARGS: usize = 5;
 
@@ -425,8 +423,7 @@ mod imp {
         {
             // SAFETY: reads no memory; flushes lines covering a valid mapping.
             unsafe {
-                let mut cl: libc::c_long =
-                    libc::sysconf(libc::_SC_LEVEL1_DCACHE_LINESIZE);
+                let mut cl: libc::c_long = libc::sysconf(libc::_SC_LEVEL1_DCACHE_LINESIZE);
                 if cl <= 0 {
                     cl = 64;
                 }
@@ -492,15 +489,35 @@ mod imp {
                 let map_len = round_page(CMD_BO_SIZE);
                 // SAFETY: mapping created by this device, still live.
                 unsafe { libc::munmap(slot.ptr as *mut _, map_len) };
-                let mut g = super::GemClose { handle: slot.handle, pad: 0 };
+                let mut g = super::GemClose {
+                    handle: slot.handle,
+                    pad: 0,
+                };
                 let _ = ioctl(fd, super::DRM_IOCTL_GEM_CLOSE, &mut g as *mut _ as *mut _);
             }
             drop(slot);
-            let mut d = super::SyncobjDestroy { handle: self.syncobj, pad: 0 };
-            let _ = ioctl(fd, super::DRM_IOCTL_SYNCOBJ_DESTROY, &mut d as *mut _ as *mut _);
-            let mut h = super::DestroyHwctx { handle: self.hwctx, pad: 0 };
-            let _ = ioctl(fd, super::DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &mut h as *mut _ as *mut _);
-            let mut g = super::GemClose { handle: self.heap_handle, pad: 0 };
+            let mut d = super::SyncobjDestroy {
+                handle: self.syncobj,
+                pad: 0,
+            };
+            let _ = ioctl(
+                fd,
+                super::DRM_IOCTL_SYNCOBJ_DESTROY,
+                &mut d as *mut _ as *mut _,
+            );
+            let mut h = super::DestroyHwctx {
+                handle: self.hwctx,
+                pad: 0,
+            };
+            let _ = ioctl(
+                fd,
+                super::DRM_IOCTL_AMDXDNA_DESTROY_HWCTX,
+                &mut h as *mut _ as *mut _,
+            );
+            let mut g = super::GemClose {
+                handle: self.heap_handle,
+                pad: 0,
+            };
             let _ = ioctl(fd, super::DRM_IOCTL_GEM_CLOSE, &mut g as *mut _ as *mut _);
             if !self.heap_res_base.is_null() {
                 // SAFETY: reservation created by `open`, still live.
@@ -544,7 +561,10 @@ mod imp {
                 unsafe { libc::munmap(self.ptr as *mut _, self.map_len) };
             }
             if self.handle != super::INVALID_BO_HANDLE {
-                let mut g = super::GemClose { handle: self.handle, pad: 0 };
+                let mut g = super::GemClose {
+                    handle: self.handle,
+                    pad: 0,
+                };
                 let _ = ioctl(
                     self.dev.fd,
                     super::DRM_IOCTL_GEM_CLOSE,
@@ -595,6 +615,9 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        // `Bo` is a cloneable handle to one shared mapping, so `&mut self`
+        // would not prevent aliasing; exclusivity is the documented contract.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.
@@ -615,8 +638,12 @@ mod imp {
                 offset: 0,
                 size: self.state.len as u64,
             };
-            ioctl(self.state.dev.fd, super::DRM_IOCTL_AMDXDNA_SYNC_BO, &mut s as *mut _ as *mut _)
-                .map_err(|_| XdnaError::os("publish-sync"))
+            ioctl(
+                self.state.dev.fd,
+                super::DRM_IOCTL_AMDXDNA_SYNC_BO,
+                &mut s as *mut _ as *mut _,
+            )
+            .map_err(|_| XdnaError::os("publish-sync"))
         }
 
         /// Invalidate CPU caches after device write (readback path): flush,
@@ -693,7 +720,8 @@ mod imp {
             }
 
             // --- device heap (must precede hwctx, per probe) ---
-            let (heap_handle, heap_xdna, heap_map_off) = create_bo_get(fd, super::BO_DEV_HEAP, HEAP_SIZE, "heap")?;
+            let (heap_handle, heap_xdna, heap_map_off) =
+                create_bo_get(fd, super::BO_DEV_HEAP, HEAP_SIZE, "heap")?;
             if heap_xdna == super::INVALID_ADDR {
                 cleanup_handle(fd, heap_handle);
                 // SAFETY: fd owned here.
@@ -770,8 +798,12 @@ mod imp {
                 num_tiles: NUM_TILES,
                 ..Default::default()
             };
-            if let Err(e) = ioctl(fd, super::DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &mut c as *mut _ as *mut _)
-                .map_err(|_| XdnaError::os("create-hwctx"))
+            if let Err(e) = ioctl(
+                fd,
+                super::DRM_IOCTL_AMDXDNA_CREATE_HWCTX,
+                &mut c as *mut _ as *mut _,
+            )
+            .map_err(|_| XdnaError::os("create-hwctx"))
             {
                 // SAFETY: owned mappings/fd.
                 unsafe { libc::munmap(aligned as *mut _, HEAP_MAX) };
@@ -783,18 +815,19 @@ mod imp {
             let (hwctx, syncobj) = (c.handle, c.syncobj_handle);
 
             // --- preallocated CMD BO ---
-            let (cmd_handle, _, cmd_map_off) = match create_bo_get(fd, super::BO_CMD, CMD_BO_SIZE, "cmd-bo") {
-                Ok(v) => v,
-                Err(e) => {
-                    destroy_hwctx_syncobj(fd, hwctx, syncobj);
-                    // SAFETY: owned mappings/fd.
-                    unsafe { libc::munmap(aligned as *mut _, HEAP_MAX) };
-                    cleanup_handle(fd, heap_handle);
-                    // SAFETY: fd owned here.
-                    unsafe { libc::close(fd) };
-                    return Err(e);
-                }
-            };
+            let (cmd_handle, _, cmd_map_off) =
+                match create_bo_get(fd, super::BO_CMD, CMD_BO_SIZE, "cmd-bo") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        destroy_hwctx_syncobj(fd, hwctx, syncobj);
+                        // SAFETY: owned mappings/fd.
+                        unsafe { libc::munmap(aligned as *mut _, HEAP_MAX) };
+                        cleanup_handle(fd, heap_handle);
+                        // SAFETY: fd owned here.
+                        unsafe { libc::close(fd) };
+                        return Err(e);
+                    }
+                };
             if cmd_map_off == super::INVALID_ADDR {
                 let e = XdnaError::code("cmd-bo-map", libc::ENXIO);
                 destroy_hwctx_syncobj(fd, hwctx, syncobj);
@@ -844,7 +877,10 @@ mod imp {
                     heap_cpu: heap_cpu as *mut u8,
                     heap_res_base: aligned as *mut u8,
                     heap_res_len: HEAP_MAX,
-                    cmd: Mutex::new(CmdSlot { handle: cmd_handle, ptr: cmd_ptr as *mut u32 }),
+                    cmd: Mutex::new(CmdSlot {
+                        handle: cmd_handle,
+                        ptr: cmd_ptr as *mut u32,
+                    }),
                     inflight: Mutex::new(None),
                 }),
             })
@@ -942,23 +978,45 @@ mod imp {
             if bytes == 0 {
                 return Err(XdnaError::code("import", libc::EINVAL));
             }
-            let mut p = super::PrimeHandle { handle: 0, flags: 0, fd };
-            ioctl(self.inner.fd, super::DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut p as *mut _ as *mut _)
-                .map_err(|_| XdnaError::os("prime-import"))?;
+            let mut p = super::PrimeHandle {
+                handle: 0,
+                flags: 0,
+                fd,
+            };
+            ioctl(
+                self.inner.fd,
+                super::DRM_IOCTL_PRIME_FD_TO_HANDLE,
+                &mut p as *mut _ as *mut _,
+            )
+            .map_err(|_| XdnaError::os("prime-import"))?;
             if p.handle == super::INVALID_BO_HANDLE {
                 return Err(XdnaError::code("prime-import", libc::ENXIO));
             }
-            let mut g = super::GetBoInfo { handle: p.handle, ..Default::default() };
-            if ioctl(self.inner.fd, super::DRM_IOCTL_AMDXDNA_GET_BO_INFO, &mut g as *mut _ as *mut _)
-                .map_err(|_| XdnaError::os("import-bo-info"))
-                .is_err()
+            let mut g = super::GetBoInfo {
+                handle: p.handle,
+                ..Default::default()
+            };
+            if ioctl(
+                self.inner.fd,
+                super::DRM_IOCTL_AMDXDNA_GET_BO_INFO,
+                &mut g as *mut _ as *mut _,
+            )
+            .map_err(|_| XdnaError::os("import-bo-info"))
+            .is_err()
             {
                 cleanup_handle(self.inner.fd, p.handle);
                 return Err(XdnaError::os("import-bo-info"));
             }
             // `xdna_addr == INVALID` is the expected outcome for an imported
             // handle; the post-mmap VA is the usable NPU address.
-            self.create_bo_locked(super::BO_SHMEM, bytes, true, p.handle, g.xdna_addr, g.map_offset)
+            self.create_bo_locked(
+                super::BO_SHMEM,
+                bytes,
+                true,
+                p.handle,
+                g.xdna_addr,
+                g.map_offset,
+            )
         }
 
         /// Load a kernel: copy the PDI into a `DEV` BO and configure the
@@ -971,8 +1029,14 @@ mod imp {
             // PDI DEV BO + visibility.
             let (pdi_handle, pdi_xdna, pdi_map) =
                 create_bo_get(self.inner.fd, super::BO_DEV, pdi.len(), "pdi")?;
-            let pdi_bo =
-                self.create_bo_locked(super::BO_DEV, pdi.len(), false, pdi_handle, pdi_xdna, pdi_map)?;
+            let pdi_bo = self.create_bo_locked(
+                super::BO_DEV,
+                pdi.len(),
+                false,
+                pdi_handle,
+                pdi_xdna,
+                pdi_map,
+            )?;
             pdi_bo.as_mut_slice().copy_from_slice(pdi);
             pdi_bo.publish().map_err(|_| XdnaError::os("pdi-sync"))?;
 
@@ -980,7 +1044,11 @@ mod imp {
             let cfg = super::HwctxParamConfigCu {
                 num_cus: 1,
                 pad: [0; 3],
-                cu: super::CuConfig { cu_bo: pdi_handle, cu_func: 0, pad: [0; 3] },
+                cu: super::CuConfig {
+                    cu_bo: pdi_handle,
+                    cu_func: 0,
+                    pad: [0; 3],
+                },
             };
             let mut c = super::ConfigHwctx {
                 handle: self.inner.hwctx,
@@ -989,8 +1057,12 @@ mod imp {
                 param_val_size: size_of::<super::HwctxParamConfigCu>() as u32,
                 pad: 0,
             };
-            ioctl(self.inner.fd, super::DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &mut c as *mut _ as *mut _)
-                .map_err(|_| XdnaError::os("config-hwctx"))?;
+            ioctl(
+                self.inner.fd,
+                super::DRM_IOCTL_AMDXDNA_CONFIG_HWCTX,
+                &mut c as *mut _ as *mut _,
+            )
+            .map_err(|_| XdnaError::os("config-hwctx"))?;
 
             // Instructions DEV BO + visibility; device address is mandatory.
             let (in_handle, in_xdna, in_map) =
@@ -999,9 +1071,18 @@ mod imp {
                 cleanup_handle(self.inner.fd, in_handle);
                 return Err(XdnaError::code("insts-addr", libc::ENXIO));
             }
-            let insts_bo = self.create_bo_locked(super::BO_DEV, insts.len(), false, in_handle, in_xdna, in_map)?;
+            let insts_bo = self.create_bo_locked(
+                super::BO_DEV,
+                insts.len(),
+                false,
+                in_handle,
+                in_xdna,
+                in_map,
+            )?;
             insts_bo.as_mut_slice().copy_from_slice(insts);
-            insts_bo.publish().map_err(|_| XdnaError::os("insts-sync"))?;
+            insts_bo
+                .publish()
+                .map_err(|_| XdnaError::os("insts-sync"))?;
 
             Ok(LoadedKernel {
                 pdi: pdi_bo,
@@ -1051,8 +1132,12 @@ mod imp {
                     offset: 0,
                     size: super::PACKET_BYTES as u64,
                 };
-                ioctl(self.inner.fd, super::DRM_IOCTL_AMDXDNA_SYNC_BO, &mut s as *mut _ as *mut _)
-                    .map_err(|_| XdnaError::os("submit-publish"))?;
+                ioctl(
+                    self.inner.fd,
+                    super::DRM_IOCTL_AMDXDNA_SYNC_BO,
+                    &mut s as *mut _ as *mut _,
+                )
+                .map_err(|_| XdnaError::os("submit-publish"))?;
 
                 // EXEC_CMD arg handles: [insts, args...].
                 let mut handles = [0u32; 1 + super::MAX_BO_ARGS];
@@ -1069,8 +1154,12 @@ mod imp {
                     arg_count: (1 + args.len()) as u32,
                     ..Default::default()
                 };
-                ioctl(self.inner.fd, super::DRM_IOCTL_AMDXDNA_EXEC_CMD, &mut e as *mut _ as *mut _)
-                    .map_err(|_| XdnaError::os("exec-cmd"))?;
+                ioctl(
+                    self.inner.fd,
+                    super::DRM_IOCTL_AMDXDNA_EXEC_CMD,
+                    &mut e as *mut _ as *mut _,
+                )
+                .map_err(|_| XdnaError::os("exec-cmd"))?;
 
                 *inflight = Some(e.seq);
 
@@ -1082,7 +1171,11 @@ mod imp {
                 }
                 // NOTE: `kernel.pdi` stays alive via the caller's
                 // `LoadedKernel`; only execution pins travel with the job.
-                Ok(Submission { dev: self.inner.clone(), seq: e.seq, pins })
+                Ok(Submission {
+                    dev: self.inner.clone(),
+                    seq: e.seq,
+                    pins,
+                })
             }
         }
 
@@ -1120,7 +1213,10 @@ mod imp {
         /// them — recover by dropping the device.
         pub fn wait(&self, timeout: Duration) -> Result<()> {
             // SAFETY: clock_gettime with a valid timespec.
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
             if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
                 return Err(XdnaError::os("wait-clock"));
             }
@@ -1138,8 +1234,12 @@ mod imp {
                 flags: super::SYNCOBJ_WAIT_FOR_SUBMIT,
                 ..Default::default()
             };
-            ioctl(self.dev.fd, super::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut w as *mut _ as *mut _)
-                .map_err(|_| XdnaError::os("wait"))?;
+            ioctl(
+                self.dev.fd,
+                super::DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+                &mut w as *mut _ as *mut _,
+            )
+            .map_err(|_| XdnaError::os("wait"))?;
 
             let state = {
                 let slot = self.dev.cmd.lock();
@@ -1167,23 +1267,59 @@ mod imp {
     }
 
     fn destroy_hwctx_syncobj(fd: RawFd, hwctx: u32, syncobj: u32) {
-        let mut d = super::SyncobjDestroy { handle: syncobj, pad: 0 };
-        let _ = ioctl(fd, super::DRM_IOCTL_SYNCOBJ_DESTROY, &mut d as *mut _ as *mut _);
-        let mut h = super::DestroyHwctx { handle: hwctx, pad: 0 };
-        let _ = ioctl(fd, super::DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &mut h as *mut _ as *mut _);
+        let mut d = super::SyncobjDestroy {
+            handle: syncobj,
+            pad: 0,
+        };
+        let _ = ioctl(
+            fd,
+            super::DRM_IOCTL_SYNCOBJ_DESTROY,
+            &mut d as *mut _ as *mut _,
+        );
+        let mut h = super::DestroyHwctx {
+            handle: hwctx,
+            pad: 0,
+        };
+        let _ = ioctl(
+            fd,
+            super::DRM_IOCTL_AMDXDNA_DESTROY_HWCTX,
+            &mut h as *mut _ as *mut _,
+        );
     }
 
-    fn create_bo_get(fd: RawFd, bo_type: u32, size: usize, stage: &'static str) -> Result<(u32, u64, u64)> {
-        let mut c = super::CreateBo { flags: 0, vaddr: 0, size: size as u64, bo_type, handle: 0 };
-        ioctl(fd, super::DRM_IOCTL_AMDXDNA_CREATE_BO, &mut c as *mut _ as *mut _)
-            .map_err(|_| XdnaError::os(stage))?;
+    fn create_bo_get(
+        fd: RawFd,
+        bo_type: u32,
+        size: usize,
+        stage: &'static str,
+    ) -> Result<(u32, u64, u64)> {
+        let mut c = super::CreateBo {
+            flags: 0,
+            vaddr: 0,
+            size: size as u64,
+            bo_type,
+            handle: 0,
+        };
+        ioctl(
+            fd,
+            super::DRM_IOCTL_AMDXDNA_CREATE_BO,
+            &mut c as *mut _ as *mut _,
+        )
+        .map_err(|_| XdnaError::os(stage))?;
         if c.handle == super::INVALID_BO_HANDLE {
             return Err(XdnaError::code(stage, libc::ENXIO));
         }
-        let mut g = super::GetBoInfo { handle: c.handle, ..Default::default() };
-        if ioctl(fd, super::DRM_IOCTL_AMDXDNA_GET_BO_INFO, &mut g as *mut _ as *mut _)
-            .map_err(|_| XdnaError::os("get-bo-info"))
-            .is_err()
+        let mut g = super::GetBoInfo {
+            handle: c.handle,
+            ..Default::default()
+        };
+        if ioctl(
+            fd,
+            super::DRM_IOCTL_AMDXDNA_GET_BO_INFO,
+            &mut g as *mut _ as *mut _,
+        )
+        .map_err(|_| XdnaError::os("get-bo-info"))
+        .is_err()
         {
             cleanup_handle(fd, c.handle);
             return Err(XdnaError::os("get-bo-info"));
@@ -1211,7 +1347,10 @@ mod imp_stub {
     #[derive(Clone)]
     pub struct XdnaDevice;
 
-    const OFF: XdnaError = XdnaError { stage: "linux-only", errno: libc::ENOSYS };
+    const OFF: XdnaError = XdnaError {
+        stage: "linux-only",
+        errno: libc::ENOSYS,
+    };
 
     impl Bo {
         pub fn vaddr(&self) -> u64 {
@@ -1234,7 +1373,9 @@ mod imp_stub {
         }
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: zero-length, aligned, never dereferenced for I/O.
-            unsafe { &mut *std::ptr::slice_from_raw_parts_mut(std::ptr::NonNull::dangling().as_ptr(), 0) }
+            unsafe {
+                &mut *std::ptr::slice_from_raw_parts_mut(std::ptr::NonNull::dangling().as_ptr(), 0)
+            }
         }
         pub fn publish(&self) -> Result<()> {
             Err(OFF)
@@ -1371,7 +1512,11 @@ mod tests {
         let words = build_packet_words(
             0x0102_0304_0506_0708,
             142_544, // stock gate insts bytes
-            &[0x1111_1111_2222_2222, 0x3333_3333_4444_4444, 0x5555_5555_6666_6666],
+            &[
+                0x1111_1111_2222_2222,
+                0x3333_3333_4444_4444,
+                0x5555_5555_6666_6666,
+            ],
         )
         .unwrap();
         assert_eq!(words.len(), PACKET_WORDS);
@@ -1395,7 +1540,10 @@ mod tests {
         assert_eq!(bytes, GOLDEN);
         // bo0 lands at packet 0x1c == payload-relative 0x14 (8-byte prefix).
         assert_eq!(BO0_PACKET_OFFSET, 0x1c);
-        assert_eq!(&bytes[BO0_PACKET_OFFSET..BO0_PACKET_OFFSET + 8], &GOLDEN[28..36]);
+        assert_eq!(
+            &bytes[BO0_PACKET_OFFSET..BO0_PACKET_OFFSET + 8],
+            &GOLDEN[28..36]
+        );
         assert_eq!(BO0_PACKET_OFFSET - 8, 0x14);
         assert_eq!(BO0_PACKET_OFFSET % 8, 4);
     }
@@ -1410,9 +1558,15 @@ mod tests {
         assert_eq!(words[7], 1);
         assert_eq!(words[15], 5);
         assert_eq!(words[16], 0); // high word of bo4
-        // Six args do not fit bo0..bo4.
+                                  // Six args do not fit bo0..bo4.
         let err = build_packet_words(0, 0, &[1, 2, 3, 4, 5, 6]).unwrap_err();
-        assert_eq!(err, XdnaError { stage: "submit-args", errno: libc::EINVAL });
+        assert_eq!(
+            err,
+            XdnaError {
+                stage: "submit-args",
+                errno: libc::EINVAL
+            }
+        );
     }
 
     /// Integration: open `/dev/accel/accel0` and run a tiny GEMM if the
@@ -1455,17 +1609,25 @@ mod tests {
 
         let dev = XdnaDevice::open(Path::new("/dev/accel/accel0")).expect("open device");
         let kernel = dev
-            .load_kernel(&std::fs::read(&pdi_p).unwrap(), &std::fs::read(&insts_p).unwrap())
+            .load_kernel(
+                &std::fs::read(&pdi_p).unwrap(),
+                &std::fs::read(&insts_p).unwrap(),
+            )
             .expect("load kernel");
         let a = dev.alloc(m * k, BoKind::Share).unwrap();
         let b = dev.alloc(k * n, BoKind::Share).unwrap();
         let c = dev.alloc(m * n * 4, BoKind::Share).unwrap();
-        a.as_mut_slice().copy_from_slice(&std::fs::read(&a_p).unwrap());
-        b.as_mut_slice().copy_from_slice(&std::fs::read(&b_p).unwrap());
+        a.as_mut_slice()
+            .copy_from_slice(&std::fs::read(&a_p).unwrap());
+        b.as_mut_slice()
+            .copy_from_slice(&std::fs::read(&b_p).unwrap());
         a.publish().unwrap();
         b.publish().unwrap();
-        let sub = dev.submit(&kernel, &[(&a).into(), (&b).into(), (&c).into()]).unwrap();
-        sub.wait(Duration::from_secs(30)).expect("tiny GEMM completion");
+        let sub = dev
+            .submit(&kernel, &[(&a).into(), (&b).into(), (&c).into()])
+            .unwrap();
+        sub.wait(Duration::from_secs(30))
+            .expect("tiny GEMM completion");
         c.invalidate();
         assert_eq!(c.as_slice(), std::fs::read(&cref_p).unwrap().as_slice());
         dev.quiesce().unwrap();
