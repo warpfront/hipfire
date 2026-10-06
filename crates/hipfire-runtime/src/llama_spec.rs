@@ -9,9 +9,9 @@
 //! through `impl SpecTarget for LlamaBundle` (in `hipfire-arch-llama`).
 
 use crate::llama::{
-    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_compute,
-    forward_scratch_embed, is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink,
-    KvCache, LlamaConfig, LlamaWeights, PrefillBatchScratch,
+    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_embed,
+    is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink, KvCache, LlamaConfig,
+    LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -375,13 +375,15 @@ fn verify_block_logits_or_argmax(
 
     let eligible = batched_verify_eligible(gpu, weights, kv_cache, n, pbs);
 
-    // DFlash hidden capture only flows through the batched path; the per-token
-    // fallback below does not run the capturing per-layer loop.
-    // When the block is too small for the batched path (n < MIN_BATCH), silently
-    // skip the capture by clearing the capture sink — the caller checks whether
-    // hidden_out is non-empty, so an empty result is the correct "not captured"
-    // signal and does not break correctness.
-    let capture = if !eligible { None } else { capture };
+    // DFlash hidden capture: the batched path captures every row; the per-token
+    // fallback (n < MIN_BATCH, or ineligible dtypes/KV) captures through
+    // `forward_scratch_compute_capture`, the same per-token capture prefill
+    // uses, so a 1..3-row block still returns `n × extract × dim` hidden rows.
+    // (Previously the fallback captured nothing and the generic DFlash commit
+    // sliced an empty buffer: a daemon panic whenever the remaining budget made
+    // the block 1-3 rows.) The GPU-resident sink variant is only ever passed
+    // for eligible blocks; the per-token capture is host-only.
+    let mut capture = capture;
 
     if eligible {
         // Single batched forward (n <= pbs.max_batch ⇒ one chunk) populates
@@ -475,7 +477,16 @@ fn verify_block_logits_or_argmax(
     } else {
         for (i, &tok) in block.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
-            forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
+            let host_sink = capture.as_deref_mut().filter(|c| c.hidden_gpu.is_none());
+            crate::llama::forward_scratch_compute_capture(
+                gpu,
+                weights,
+                config,
+                start_pos + i,
+                kv_cache,
+                scratch,
+                host_sink,
+            )?;
             if let Some(sc) = sample.as_mut() {
                 let pick = sample_one(gpu, &scratch.logits, vocab, sc)?;
                 out.push(pick);
