@@ -1,0 +1,5 @@
+loaded arch=qwen3_5 dim=5120 layers=64 vocab=248320
+decode: stable=True launches=755 kernels=19 hash=7a4fcf45ac7c7f59 median=37.5 tok/s
+aql-contracts: kernels=19
+shadow: backend=pm4_ib exact=True gdn_frame_exact=True pm4_ib=97852.3us hip=110190.7us delta=-11.20%
+report=/home/husrcf/Code/hipfire-gfx12-k5120-20261006/tmp/gfx12-k5120/validation-003/replay-1.json pass=True

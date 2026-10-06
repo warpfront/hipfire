@@ -1,0 +1,668 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling serde_core v1.0.228
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling version_check v0.9.5
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.150
+   Compiling thiserror v2.0.18
+   Compiling serde v1.0.228
+   Compiling typenum v1.20.1
+   Compiling memchr v2.8.3
+   Compiling generic-array v0.14.7
+   Compiling cfg-if v1.0.4
+   Compiling itoa v1.0.18
+   Compiling crossbeam-utils v0.8.22
+   Compiling winnow v1.0.4
+   Compiling winnow v0.7.15
+   Compiling crossbeam-epoch v0.9.20
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling cpufeatures v0.2.17
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling syn v2.0.119
+   Compiling crossbeam-deque v0.8.7
+   Compiling libloading v0.9.0
+   Compiling rayon-core v1.13.0
+   Compiling either v1.16.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling rayon v1.12.0
+   Compiling serde_spanned v1.1.1
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v2.0.18
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling hipfire-config v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/hipfire-config)
+   Compiling railgun-corpus v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/railgun-corpus)
+   Compiling radiowave v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/radiowave)
+   Compiling railgun v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/railgun)
+   Compiling redline-rocr v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/redline-rocr)
+   Compiling hip-bridge v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/hip-bridge)
+   Compiling redline-dispatch v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/redline-dispatch)
+warning: method `replay_and_wait_inner` is never used
+   --> crates/redline-dispatch/src/aql/replay.rs:666:15
+    |
+ 91 | impl SingleQueuePm4Ib {
+    | --------------------- method in this implementation
+...
+666 |     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `redline-dispatch` (lib) generated 1 warning
+   Compiling rdna-compute v0.4.1 (/home/husrcf/Code/hipfire-gfx12-k5120-base-20261006/crates/rdna-compute)
+warning: unused import: `std::ffi::c_void`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:19:5
+   |
+19 | use std::ffi::c_void;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Gpu`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:21:23
+   |
+21 | use crate::dispatch::{Gpu, GpuTensor};
+   |                       ^^^
+
+warning: unused import: `hip_bridge::HipResult`
+  --> crates/rdna-compute/src/qwen35_fa_batch.rs:22:5
+   |
+22 | use hip_bridge::HipResult;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/attention.rs:14858:13
+      |
+14858 |         let func = &self.functions["kv_cache_write"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> crates/rdna-compute/src/dispatch.rs:4682:9
+     |
+4682 |         unsafe { self.hip.memcpy_htod(&tensor.buf, bytes)? }
+     |         ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/dispatch.rs:4679:13
+     |
+4679 |         let mut tensor = self.alloc_host_mapped_tensor(byte_size, shape, DType::F32)?;
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/dispatch.rs:4865:13
+     |
+4865 |         let mut tensor = self.alloc_host_mapped_tensor(data.len(), shape, DType::Raw)?;
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/gemm.rs:31300:13
+      |
+31300 |         let func = &self.functions["gemv_q8_0_moe_gate_up_k8_indexed"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: variable does not need to be mutable
+     --> crates/rdna-compute/src/gemm.rs:33761:13
+      |
+33761 |         let mut yg_tmp = self.alloc_tensor(&[n_padded, gate_m], DType::F32)?;
+      |             ----^^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+     --> crates/rdna-compute/src/gemm.rs:33762:13
+      |
+33762 |         let mut yu_tmp = self.alloc_tensor(&[n_padded, up_m], DType::F32)?;
+      |             ----^^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:372:5
+    |
+372 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:389:5
+    |
+389 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:454:9
+    |
+454 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:479:9
+    |
+479 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:504:9
+    |
+504 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:523:9
+    |
+523 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:828:9
+    |
+828 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:855:9
+    |
+855 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:882:9
+    |
+882 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:902:9
+    |
+902 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `src`
+     --> crates/rdna-compute/src/kernels.rs:10150:30
+      |
+10150 |                         let (src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
+      |                              ^^^ help: if this is intentional, prefix it with an underscore: `_src`
+
+warning: unused variable: `src`
+     --> crates/rdna-compute/src/kernels.rs:10157:30
+      |
+10157 |                         let (src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
+      |                              ^^^ help: if this is intentional, prefix it with an underscore: `_src`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:1096:13
+     |
+1096 |         let func = &self.functions["rope_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:6195:13
+     |
+6195 |         let func = &self.functions["bias_add_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `step`
+    --> crates/rdna-compute/src/page_pool.rs:1377:13
+     |
+1377 |         for step in 0..2000 {
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_step`
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/replay.rs:5547:13
+     |
+5547 |         let mut dynamic_gdn_frames = Vec::new();
+     |             ----^^^^^^^^^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `v`
+     --> crates/rdna-compute/src/replay.rs:10942:13
+      |
+10942 |         let v = u32::from_le_bytes(kernarg_third[16..20].try_into().unwrap());
+      |             ^ help: if this is intentional, prefix it with an underscore: `_v`
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/tensor_ops.rs:8764:13
+     |
+8764 |         let mut selected = gpu
+     |             ----^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/rdna-compute/src/tensor_ops.rs:9463:21
+     |
+9463 |                 let mut streams = |gpu: &mut Gpu| {
+     |                     ----^^^^^^^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: constant `N_TILE` is never used
+    --> crates/rdna-compute/src/attention.rs:4862:15
+     |
+4862 |         const N_TILE: usize = 16;
+     |               ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `launch_maybe_blob_declared` is never used
+    --> crates/rdna-compute/src/dispatch.rs:2679:19
+     |
+1203 | impl Gpu {
+     | -------- method in this implementation
+...
+2679 |     pub(crate) fn launch_maybe_blob_declared(
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ5G256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1070:11
+     |
+1070 | pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
+     |           ^^^^^^^^^^^^^^^^
+
+warning: constant `BLOCK_I4_128_QUANT_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1114:11
+     |
+1114 | pub const BLOCK_I4_128_QUANT_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O2_R8_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:3010:11
+     |
+3010 | pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O2_R8_GFX1151_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4540:11
+     |
+4540 | pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `DEQUANT_HFQ4G256_TO_F16_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4839:11
+     |
+4839 | pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ5G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6317:11
+     |
+6317 | pub const FUSED_QKV_MQ5G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ6G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6324:11
+     |
+6324 | pub const FUSED_QKV_MQ6G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ3G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6331:11
+     |
+6331 | pub const FUSED_QKV_MQ3G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FUSED_QKV_MQ2G256V2_QWEN2_BIAS_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6338:11
+     |
+6338 | pub const FUSED_QKV_MQ2G256V2_QWEN2_BIAS_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `DYNAMIC_CAUSAL_CONV_F32_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6856:11
+     |
+6856 | pub const DYNAMIC_CAUSAL_CONV_F32_SRC: &str = DYNAMIC_CONV_F32_SRC;
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7458:11
+     |
+7458 | pub const ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:7463:11
+     |
+7463 | pub const ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B4_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8436:11
+     |
+8436 | pub const GATED_DELTA_NET_Q8_COMPACT2_B4_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B8_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8440:11
+     |
+8440 | pub const GATED_DELTA_NET_Q8_COMPACT2_B8_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B12_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8444:11
+     |
+8444 | pub const GATED_DELTA_NET_Q8_COMPACT2_B12_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B16_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8448:11
+     |
+8448 | pub const GATED_DELTA_NET_Q8_COMPACT2_B16_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8456:11
+     |
+8456 | pub const GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8464:11
+     |
+8464 | pub const GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8471:11
+     |
+8471 | pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B32_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8542:11
+     |
+8542 | pub const CONV1D_SILU_SPLIT_QKNORM_B32_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B64_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8546:11
+     |
+8546 | pub const CONV1D_SILU_SPLIT_QKNORM_B64_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B128_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8550:11
+     |
+8550 | pub const CONV1D_SILU_SPLIT_QKNORM_B128_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8564:11
+     |
+8564 | pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8966:11
+     |
+8966 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8968:11
+     |
+8968 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8970:11
+     |
+8970 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8975:11
+     |
+8975 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8977:11
+     |
+8977 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8979:11
+     |
+8979 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8981:11
+     |
+8981 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:8983:11
+     |
+8983 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:9384:11
+     |
+9384 | pub const V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMM_HFQ4G256_WMMA_GFX12_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:9641:11
+     |
+9641 | pub const GEMM_HFQ4G256_WMMA_GFX12_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:9669:11
+     |
+9669 | pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:9673:11
+     |
+9673 | pub const ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:443:5
+    |
+441 | struct RawKernelMeta {
+    |        ------------- field in this struct
+442 |     pgm_rsrc1: u32,
+443 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+warning: method `replay_and_wait_profiled` is never used
+    --> crates/rdna-compute/src/replay.rs:4326:15
+     |
+4322 | impl PreparedPm4Graph {
+     | --------------------- method in this implementation
+...
+4326 |     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sample_top_p_parallel_precompile_specs` is never used
+  --> crates/rdna-compute/src/sampling.rs:68:15
+   |
+68 | pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String); 4] {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable `M` should have a snake case name
+     --> crates/rdna-compute/src/gemm.rs:46510:14
+      |
+46510 |         for (M, K, N) in [
+      |              ^ help: convert the identifier to snake case: `m`
+      |
+      = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: variable `K` should have a snake case name
+     --> crates/rdna-compute/src/gemm.rs:46510:17
+      |
+46510 |         for (M, K, N) in [
+      |                 ^ help: convert the identifier to snake case (notice the capitalization): `k`
+
+warning: variable `N` should have a snake case name
+     --> crates/rdna-compute/src/gemm.rs:46510:20
+      |
+46510 |         for (M, K, N) in [
+      |                    ^ help: convert the identifier to snake case: `n`
+
+warning: unused `Result` that must be used
+     --> crates/rdna-compute/src/gemv.rs:16417:9
+      |
+16417 |         crate::profile::end_timer(&self.hip, timer);
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+16417 |         let _ = crate::profile::end_timer(&self.hip, timer);
+      |         +++++++
+
+warning: `rdna-compute` (lib test) generated 73 warnings (run `cargo fix --lib -p rdna-compute --tests` to apply 28 suggestions)
+    Finished `release` profile [optimized] target(s) in 19.79s
+     Running unittests src/lib.rs (target/release/deps/rdna_compute-1905139eb7440989)
+
+running 4 tests
+test tensor_ops::tests::gdn_q8_inline_hookup_is_bytewise_the_conversion_arm ... ok
+test tensor_ops::tests::gdn_q8_state_chunk_route_tracks_f32 ... ok
+test tensor_ops::tests::gdn_q8_state_tracks_f32_on_every_route ... FAILED
+test tensor_ops::tests::gdn_q8_verify_matches_single_row ... FAILED
+
+failures:
+
+---- tensor_ops::tests::gdn_q8_state_tracks_f32_on_every_route stdout ----
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/husrcf/.hipfire_kernels/gfx1201
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+Q8 decode: output rel 9.029e-4, state rel 7.114e-3
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+Q8 batch 2 rows: output rel 0.000e0, state rel 6.945e-3
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+
+thread 'tensor_ops::tests::gdn_q8_state_tracks_f32_on_every_route' (3061906) panicked at crates/rdna-compute/src/tensor_ops.rs:6629:13:
+2 rows: captured verify output is not single-row decode's
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tensor_ops::tests::gdn_q8_verify_matches_single_row stdout ----
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/husrcf/.hipfire_kernels/gfx1201
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+  tensor_ops: indexed package verified: /home/husrcf/.hipfire/bin/kernels/compiled/gfx1201/tensor_ops.hsaco
+GDN_Q8_SEAM direct n=2: verify output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=2 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=2 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=3: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=3 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=3 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=3 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=4: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM direct n=4 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=4 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=4 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=4 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM direct n=5: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM direct n=5 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=5 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=5 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=5 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM direct n=5 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM direct n=6: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM direct n=6 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=6 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=6 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=6 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM direct n=6 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM direct n=6 keep=6: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM direct n=7: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401)]
+GDN_Q8_SEAM direct n=7 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=7 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=7 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=7 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM direct n=7 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM direct n=7 keep=6: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM direct n=7 keep=7: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401)]
+GDN_Q8_SEAM direct n=8: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401), (7, 410)]
+GDN_Q8_SEAM direct n=8 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM direct n=8 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM direct n=8 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM direct n=8 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM direct n=8 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM direct n=8 keep=6: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM direct n=8 keep=7: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401)]
+GDN_Q8_SEAM direct n=8 keep=8: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401), (7, 410)]
+GDN_Q8_SEAM graph n=2: verify output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=2 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=2 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=3: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=3 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=3 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=3 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=4: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM graph n=4 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=4 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=4 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=4 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM graph n=5: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM graph n=5 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=5 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=5 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=5 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM graph n=5 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM graph n=6: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM graph n=6 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=6 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=6 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=6 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM graph n=6 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM graph n=6 keep=6: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM graph n=7: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401)]
+GDN_Q8_SEAM graph n=7 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=7 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=7 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=7 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM graph n=7 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM graph n=7 keep=6: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM graph n=7 keep=7: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401)]
+GDN_Q8_SEAM graph n=8: verify output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401), (7, 410)]
+GDN_Q8_SEAM graph n=8 keep=1: rollback output (row, differing f32s) [(0, 558)]
+GDN_Q8_SEAM graph n=8 keep=2: rollback output (row, differing f32s) [(0, 558), (1, 418)]
+GDN_Q8_SEAM graph n=8 keep=3: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441)]
+GDN_Q8_SEAM graph n=8 keep=4: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408)]
+GDN_Q8_SEAM graph n=8 keep=5: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421)]
+GDN_Q8_SEAM graph n=8 keep=6: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396)]
+GDN_Q8_SEAM graph n=8 keep=7: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401)]
+GDN_Q8_SEAM graph n=8 keep=8: rollback output (row, differing f32s) [(0, 558), (1, 418), (2, 441), (3, 408), (4, 421), (5, 396), (6, 401), (7, 410)]
+
+thread 'tensor_ops::tests::gdn_q8_verify_matches_single_row' (3061914) panicked at crates/rdna-compute/src/tensor_ops.rs:6447:9:
+84 Q8 verify/rollback seams leave AR
+
+
+failures:
+    tensor_ops::tests::gdn_q8_state_tracks_f32_on_every_route
+    tensor_ops::tests::gdn_q8_verify_matches_single_row
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 448 filtered out; finished in 0.44s
+
+error: test failed, to rerun pass `-p rdna-compute --lib`

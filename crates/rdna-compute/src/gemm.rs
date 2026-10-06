@@ -36979,11 +36979,19 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (module_v2, source, func_name) = if self.flags.mq4v2_gateup_k5120_enabled(gate_m, up_m, k) {
-            (
-                "fused_gate_up_mq4g256v2_k5120_gfx1100",
-                kernels::fused_gate_up_mq4g256v2_k5120_gfx1100_src(),
-                "fused_gate_up_mq4g256v2_k5120_gfx1100",
-            )
+            if self.arch == "gfx1201" {
+                (
+                    "fused_gate_up_mq4g256v2_k5120_gfx1201",
+                    kernels::fused_gate_up_mq4g256v2_k5120_gfx1201_src(),
+                    "fused_gate_up_mq4g256v2_k5120_gfx1201",
+                )
+            } else {
+                (
+                    "fused_gate_up_mq4g256v2_k5120_gfx1100",
+                    kernels::fused_gate_up_mq4g256v2_k5120_gfx1100_src(),
+                    "fused_gate_up_mq4g256v2_k5120_gfx1100",
+                )
+            }
         } else {
             (
                 "fused_gate_up_hfq4g256_mq4v2",

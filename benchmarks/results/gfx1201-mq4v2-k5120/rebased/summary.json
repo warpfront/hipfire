@@ -1,0 +1,54 @@
+{
+  "rows": [
+    {
+      "gen": 4096,
+      "decode_tok_s": 40.1,
+      "ttft_s": 0.108,
+      "wall_s": 102.209,
+      "request_md5": "d63ed9c1321719c2408a599b4d098f77",
+      "arm": "A1",
+      "output_sha256": "078e1ea2e2d9f2a58e9c34fa8e44ec7705a71a1205f707567f25fecea2229131"
+    },
+    {
+      "gen": 4096,
+      "decode_tok_s": 40.2,
+      "ttft_s": 0.103,
+      "wall_s": 101.921,
+      "request_md5": "d63ed9c1321719c2408a599b4d098f77",
+      "arm": "B1",
+      "output_sha256": "078e1ea2e2d9f2a58e9c34fa8e44ec7705a71a1205f707567f25fecea2229131"
+    },
+    {
+      "gen": 4096,
+      "decode_tok_s": 40.2,
+      "ttft_s": 0.103,
+      "wall_s": 102.08,
+      "request_md5": "d63ed9c1321719c2408a599b4d098f77",
+      "arm": "B2",
+      "output_sha256": "078e1ea2e2d9f2a58e9c34fa8e44ec7705a71a1205f707567f25fecea2229131"
+    },
+    {
+      "gen": 4096,
+      "decode_tok_s": 40.1,
+      "ttft_s": 0.102,
+      "wall_s": 102.296,
+      "request_md5": "d63ed9c1321719c2408a599b4d098f77",
+      "arm": "A2",
+      "output_sha256": "078e1ea2e2d9f2a58e9c34fa8e44ec7705a71a1205f707567f25fecea2229131"
+    }
+  ],
+  "generic": {
+    "min": 40.1,
+    "median": 40.1,
+    "max": 40.1
+  },
+  "k5120": {
+    "min": 40.2,
+    "median": 40.2,
+    "max": 40.2
+  },
+  "speedup": 1.0024937655860349,
+  "logits_bytes": 3973120,
+  "logits_sha256": "58f097ef09eb992c17c74d727403767b7512beee065b48f6800f1d5b3f627a12",
+  "scope": "Fresh-process AR TG4096 ABBA; two samples per arm. TTFT is diagnostic, not a warmed prefill claim."
+}

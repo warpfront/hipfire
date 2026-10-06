@@ -771,6 +771,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
             | "fused_gate_up_mq4g256v2_k5120_gfx1100"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1201"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -1513,6 +1514,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
             | "fused_gate_up_mq4g256v2_k5120_gfx1100"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1201"
     ) {
         return Some(64);
     }
@@ -7616,6 +7618,7 @@ mod tests {
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_gate_up_mq4g256v2",
         "fused_gate_up_mq4g256v2_k5120_gfx1100",
+        "fused_gate_up_mq4g256v2_k5120_gfx1201",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
@@ -9188,15 +9191,19 @@ mod tests {
 
     #[test]
     fn fused_gate_up_mq4v2_k5120_matches_generic_replay_contract() {
-        let candidate = "fused_gate_up_mq4g256v2_k5120_gfx1100";
-        let baseline = "fused_gate_up_mq4g256v2";
-        assert_eq!(expected_kernarg_bytes(candidate), Some(64));
-        let got = pointer_effects(candidate).unwrap();
-        let want = pointer_effects(baseline).unwrap();
-        assert_eq!(got.len(), want.len());
-        for (got, want) in got.iter().zip(want.iter()) {
-            assert_eq!(got.offset, want.offset);
-            assert_eq!(got.mode, want.mode);
+        for candidate in [
+            "fused_gate_up_mq4g256v2_k5120_gfx1100",
+            "fused_gate_up_mq4g256v2_k5120_gfx1201",
+        ] {
+            let baseline = "fused_gate_up_mq4g256v2";
+            assert_eq!(expected_kernarg_bytes(candidate), Some(64));
+            let got = pointer_effects(candidate).unwrap();
+            let want = pointer_effects(baseline).unwrap();
+            assert_eq!(got.len(), want.len());
+            for (got, want) in got.iter().zip(want.iter()) {
+                assert_eq!(got.offset, want.offset);
+                assert_eq!(got.mode, want.mode);
+            }
         }
     }
 

@@ -7103,6 +7103,18 @@ pub fn fused_gate_up_mq4g256v2_k5120_gfx1100_src() -> &'static str {
         )
     })
 }
+/// gfx1201 twin preserves the target's existing weight-buffer cache policy.
+pub fn fused_gate_up_mq4g256v2_k5120_gfx1201_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        let generic = "const int groups_per_row = K / 256;";
+        assert_eq!(FUSED_GATE_UP_MQ4G256V2_SRC.matches(generic).count(), 1);
+        format!(
+            "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2_k5120_gfx1201\n{}",
+            FUSED_GATE_UP_MQ4G256V2_SRC.replace(generic, "const int groups_per_row = 20;")
+        )
+    })
+}
 /// MQ4G256V2-Lloyd (qt=52) fused gate+up decode: `-DHIPFIRE_MQ4G256V2_LUT=1`
 /// adds 16 kernel-arg dwords (gate + up centered f16 codebooks) and decodes
 /// nibbles through the block's row-source LUT. Distinct symbol so the module

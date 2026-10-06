@@ -14,6 +14,11 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 : "${MODEL:?Set MODEL to the pinned Qwen3.8-27B MQ4-XT artifact}"
 : "${OUT:?Set OUT to a new results directory}"
+FLAG_ENV=${FLAG_ENV:-HIPFIRE_MQ4V2_GATEUP_K5120}
+case "$FLAG_ENV" in
+  HIPFIRE_MQ4V2_GATEUP_K5120|HIPFIRE_GFX12_MQ4V2_GATEUP_K5120) ;;
+  *) echo "Unsupported flag: $FLAG_ENV" >&2; exit 2;;
+esac
 mkdir "$OUT"
 OUT=$(cd "$OUT" && pwd)
 MODEL=$(realpath "$MODEL")
@@ -34,9 +39,9 @@ sha256sum benchmarks/scripts/mq4v2_k5120_abba.sh benchmarks/scripts/mq4v2_k5120_
 rocm-smi > "$OUT/gpu-before.txt"
 for arm in A1 B1 B2 A2; do
   case "$arm" in A*) flag=0;; B*) flag=1;; esac
-  export HIPFIRE_MQ4V2_GATEUP_K5120="$flag"
-  printf 'HIP_VISIBLE_DEVICES=%s\nHIPFIRE_MQ4V2_GATEUP_K5120=%s\n' \
-    "$HIP_VISIBLE_DEVICES" "$flag" > "$OUT/$arm-routing.txt"
+  export "$FLAG_ENV=$flag"
+  printf 'HIP_VISIBLE_DEVICES=%s\n%s=%s\n' \
+    "$HIP_VISIBLE_DEVICES" "$FLAG_ENV" "$flag" > "$OUT/$arm-routing.txt"
   printf '%s %s flag=%s\n' "$(date -Is)" "$arm" "$flag"
   python3 benchmarks/scripts/mq4v2_k5120_serve.py --model "$MODEL" \
     --mode battery --prompt-file "$PROMPT" --thinking off --max-think-tokens 1 \

@@ -227,6 +227,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "gfx1100" => add!("gemv_hfq4g256_rdna3", kernels::GEMV_HFQ4G256_GFX1100_SRC, ["gemv_hfq4g256"]),
         _ => add!("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC, ["gemv_hfq4g256"]),
     }
+    if arch == "gfx1201" {
+        add!("fused_gate_up_mq4g256v2_k5120_gfx1201", kernels::fused_gate_up_mq4g256v2_k5120_gfx1201_src(), ["fused_gate_up_mq4g256v2_k5120_gfx1201"]);
+    }
     if arch == "gfx1100" {
         add!("fused_gate_up_mq4g256v2_k5120_gfx1100", kernels::fused_gate_up_mq4g256v2_k5120_gfx1100_src(), ["fused_gate_up_mq4g256v2_k5120_gfx1100"]);
         // Default gfx1100 precompile branches (dispatch.rs:4944-4962,5304-5308).
@@ -1134,6 +1137,28 @@ mod tests {
     }
 
     #[test]
+    fn mq4v2_k5120_gfx1201_inventory_preserves_cache_policy() {
+        let module = "fused_gate_up_mq4g256v2_k5120_gfx1201";
+        let registry = entries("gfx1201", "").unwrap();
+        let candidate = registry.iter().find(|e| e.module == module).unwrap();
+        assert_eq!(candidate.symbols, [module]);
+        let body = candidate.source().strip_prefix(
+            "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2_k5120_gfx1201\n"
+        ).unwrap();
+        assert_eq!(
+            body.replace("const int groups_per_row = 20;", "const int groups_per_row = K / 256;"),
+            kernels::FUSED_GATE_UP_MQ4G256V2_SRC
+        );
+        assert!(registry.iter().any(|e| e.symbols.contains(&"fused_gate_up_mq4g256v2")));
+        for arch in ["gfx1100", "gfx1151", "gfx906", "gfx942"] {
+            assert!(!entries(arch, "").unwrap().iter().any(|e| e.module == module));
+        }
+        for arch in ["gfx1101", "gfx1200"] {
+            assert!(matches!(entries(arch, ""), Err(RegistryError::UnsupportedArch(_))));
+        }
+    }
+
+    #[test]
     fn kernel_registry_p0_sources_are_byte_identical() {
         let root = Path::new("/home/kaden/qcal/boundary/p0/raw");
         // The gfx1201 runtime appends this default via FeatureFlags at init;
@@ -1160,8 +1185,8 @@ mod tests {
         // compiler-free packs, the 36 Qwen3.8-Flash-Next modules
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv) and the 32
         // Qwen3.5-MoE modules (tests/fixtures/kernel-trace-qwen35.tsv). Those
-        // 113 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 113, "unexpected gfx1201 inventory size");
+        // 113 keys plus the opt-in exact-K5120 gate/up twin are additional to P0's 92.
+        assert_eq!(registry.len(), count + 114, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
