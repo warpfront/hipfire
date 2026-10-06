@@ -1,0 +1,93 @@
+Add Python type hints to every function and method signature in the module below and add a one-line docstring to every function and method that lacks one. Do not change any logic, names, or comments. Output the complete modified module and nothing else.
+
+import json
+import os
+import time
+from collections import defaultdict
+
+
+class RateLimiter:
+    def __init__(self, max_calls, period):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = defaultdict(list)
+
+    def allow(self, key):
+        now = time.monotonic()
+        window = [t for t in self.calls[key] if now - t < self.period]
+        self.calls[key] = window
+        if len(window) >= self.max_calls:
+            return False
+        window.append(now)
+        return True
+
+    def reset(self, key=None):
+        if key is None:
+            self.calls.clear()
+        else:
+            self.calls.pop(key, None)
+
+
+class JsonStore:
+    def __init__(self, path):
+        self.path = path
+        self.data = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                self.data = json.load(f)
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.flush()
+
+    def delete(self, key):
+        if key in self.data:
+            del self.data[key]
+            self.flush()
+            return True
+        return False
+
+    def flush(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2, sort_keys=True)
+        os.replace(tmp, self.path)
+
+
+def parse_duration(text):
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    text = text.strip().lower()
+    if not text:
+        raise ValueError("empty duration")
+    if text[-1] in units:
+        return float(text[:-1]) * units[text[-1]]
+    return float(text)
+
+
+def chunked(items, size):
+    if size <= 0:
+        raise ValueError("size must be positive")
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def merge_counts(*dicts):
+    total = defaultdict(int)
+    for d in dicts:
+        for key, value in d.items():
+            total[key] += value
+    return dict(total)
+
+
+def retry(func, attempts=3, delay=0.5):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return func()
+        except Exception as error:
+            last_error = error
+            time.sleep(delay * (2 ** attempt))
+    raise last_error

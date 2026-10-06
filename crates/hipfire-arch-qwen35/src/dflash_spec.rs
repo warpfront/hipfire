@@ -654,6 +654,9 @@ impl Speculator for DflashSpeculator {
     ) -> Result<PrefillOutcome, String> {
         self.adaptive.reset();
         self.last_window = None;
+        if let Some(t) = self.df.draft_scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -1009,6 +1012,11 @@ impl Speculator for DflashSpeculator {
                 Some(&mut self.df.verify_pm4),
             )
         };
+        if self.df.ddtree.is_none() {
+            if let (Ok(r), Some(t)) = (&result, self.df.draft_scratch.online.as_mut()) {
+                t.observe(position, &r.committed[1..], r.accepted);
+            }
+        }
 
         let lowered = result
             .map(lower_qwen35)
@@ -1216,6 +1224,9 @@ impl Speculator for DflashSpeculator {
         // the full block; the controller re-shrinks only after a fresh
         // 8-cycle window (no cross-request stale-history shrink).
         self.adaptive.reset();
+        if let Some(t) = self.df.draft_scratch.online.as_mut() {
+            t.reset();
+        }
     }
 
     fn requires_greedy(&self) -> bool {

@@ -5026,6 +5026,19 @@ fn draft_dflash_block_rank(
                 &mut Vec::new(),
                 &mut Vec::new(),
             )?;
+        } else if let Some(tuner) = draft_scratch.online.as_mut() {
+            drafted.extend(tuner.propose_from_logits(
+                gpu,
+                &logits_batch,
+                vocab,
+                batch,
+                position,
+                seed_token,
+            )?);
+            if tuner.mode == hipfire_runtime::dflash_online::Mode::Sweep {
+                // Always rejected: every cycle commits exactly one target token.
+                drafted[1..].fill(vocab as u32 - 1);
+            }
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);

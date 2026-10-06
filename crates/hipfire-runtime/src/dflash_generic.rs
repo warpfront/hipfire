@@ -481,6 +481,10 @@ impl GenericDflashSpeculator {
         // seed dropped), next_seed = bonus. emit.len() == accepted + 1 drives the
         // daemon's position += emit.len(). Pre-commit budget guarantees
         // emit.len() <= max_emit; cap_emit is defensive only.
+        if let Some(t) = self.scratch.online.as_mut() {
+            let committed: Vec<u32> = drafts[..accepted].iter().copied().chain([bonus]).collect();
+            t.observe(position, &committed, accepted);
+        }
         let emit = drafts[..accepted]
             .iter()
             .copied()
@@ -574,6 +578,9 @@ impl Speculator for GenericDflashSpeculator {
             (prompt_tokens, 0)
         };
 
+        if let Some(t) = self.scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
         if !cache_hit {
             // Cold start: drop both the cumulative host shadow and the draft's
             // upload/projection tracking so the first step re-uploads from row 0.
@@ -734,10 +741,24 @@ impl Speculator for GenericDflashSpeculator {
         let draft_logits = target.lm_head_logits(gpu, &draft_hidden, batch)?;
         debug_assert_eq!(draft_logits.len(), batch * self.config.vocab_size);
         let vocab = self.config.vocab_size;
-        let mut drafts: Vec<u32> = Vec::with_capacity(batch);
-        for i in 0..batch {
-            drafts.push(llama::argmax(&draft_logits[i * vocab..(i + 1) * vocab]));
-        }
+        let drafts: Vec<u32> = match self.scratch.online.as_mut().filter(|_| !self.tree.enabled) {
+            // Developer online draft tuner: re-rank the host top-K. Drafts stay
+            // deterministic, which both the greedy accept and the temp>0 naive
+            // sampling verify (exact for any deterministic draft) require.
+            Some(t) => {
+                let (ids, vals) = crate::dflash_online::top_k_rows(&draft_logits, vocab, batch);
+                let picks = t.propose(position, seed, &ids, &vals, batch);
+                if t.mode == crate::dflash_online::Mode::Sweep {
+                    // Always rejected: every cycle commits exactly one target token.
+                    vec![vocab as u32 - 1; batch]
+                } else {
+                    picks
+                }
+            }
+            None => (0..batch)
+                .map(|i| llama::argmax(&draft_logits[i * vocab..(i + 1) * vocab]))
+                .collect(),
+        };
         for (i, &d) in drafts.iter().enumerate() {
             block[i + 1] = d;
         }
@@ -1007,6 +1028,9 @@ impl Speculator for GenericDflashSpeculator {
         self.sample_top_p = cfg.top_p;
         self.sample_top_k = cfg.top_k_cut();
         self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
+        if let Some(t) = self.scratch.online.as_mut() {
+            t.reset();
+        }
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {

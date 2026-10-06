@@ -37,6 +37,7 @@ pub mod dflash;
 /// analogue is `dspark_block_controller`. Pure math, no GPU types.
 pub mod dflash_adaptive_block;
 pub mod dflash_generic;
+pub mod dflash_online;
 pub mod dspark_block_controller;
 pub mod dspark_core;
 pub mod ep;
