@@ -631,6 +631,10 @@ name = "test_wmma_residual_hfq3"
 required-features = ["lab"]
 
 [[example]]
+name = "tp2_cross_device_graph_reduce"
+required-features = ["lab"]
+
+[[example]]
 name = "tp4_cross_device_graph_barrier"
 required-features = ["lab"]
 

@@ -149,7 +149,11 @@ pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
 #[derive(Clone, Copy)]
 enum QresidentOut<'a> {
     F32(&'a GpuTensor),
-    A4Slab { qgate: &'a GpuTensor, awq: &'a GpuTensor, x_i4: &'a GpuTensor },
+    A4Slab {
+        qgate: &'a GpuTensor,
+        awq: &'a GpuTensor,
+        x_i4: &'a GpuTensor,
+    },
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -490,7 +494,10 @@ const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
     module: "attention_verify_wmma_gfx1151",
     src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
     qk: "attention_verify_wmma_qk_gfx1151",
-    pv: ["attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151"],
+    pv: [
+        "attention_verify_wmma_pv1s_d4_gfx1151",
+        "attention_verify_wmma_pv2_d2_gfx1151",
+    ],
 };
 
 fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
@@ -551,7 +558,11 @@ pub struct VerifyWmmaGeometry {
 
 impl Default for VerifyWmmaGeometry {
     fn default() -> Self {
-        Self { packed: true, qk_waves: 160, pv: None }
+        Self {
+            packed: true,
+            qk_waves: 160,
+            pv: None,
+        }
     }
 }
 
@@ -4374,7 +4385,11 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC, false)
                 }
             );
-            let module = if multi_slot { format!("{module}_paged") } else { module };
+            let module = if multi_slot {
+                format!("{module}_paged")
+            } else {
+                module
+            };
             self.ensure_kernel(&module, &src, func)?;
         }
 
@@ -4570,8 +4585,11 @@ impl Gpu {
     /// would synchronize, free and malloc mid-capture). A cold capture keeps
     /// the incumbent route instead of failing the capture.
     fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
-        self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
-            && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
+        self.functions
+            .contains_key("attention_q8_0_fa2_gqa_gfx1201")
+            && self
+                .functions
+                .contains_key("attention_fa2_q_preconvert_gfx1201")
             && !crate::scratch::scratch_will_grow(
                 self.scratch.fa2_q16_scratch_bytes,
                 self.scratch.fa2_q16_scratch.is_some(),
@@ -4855,7 +4873,11 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernel_src, false)
                 }
             );
-            let module = if multi_slot { format!("{module}_paged") } else { module };
+            let module = if multi_slot {
+                format!("{module}_paged")
+            } else {
+                module
+            };
             self.ensure_kernel(&module, &src, func)?;
         }
         const M_TILE: usize = 16;
@@ -5930,8 +5952,18 @@ impl Gpu {
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
-            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            QRESIDENT_V2_LDS_BYTES,
+            true,
+            q,
+            k_cache,
+            v_cache,
+            QresidentOut::F32(out),
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
         )
     }
 
@@ -5960,18 +5992,28 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if q.dtype != crate::DType::Raw
-            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
-        {
-            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        if q.dtype != crate::DType::Raw || q.buf.size() < batch_size * n_heads * (head_dim + 4) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Q8 resident attention requires Raw codes and scales",
+            ));
         }
         self.ensure_mq_signs()?;
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC,
-            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache,
-            QresidentOut::A4Slab { qgate, awq, x_i4 }, positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            QRESIDENT_V2_LDS_BYTES,
+            true,
+            q,
+            k_cache,
+            v_cache,
+            QresidentOut::A4Slab { qgate, awq, x_i4 },
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
         )
     }
 
@@ -6837,11 +6879,20 @@ impl Gpu {
             && self.arch == "gfx1151"
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
         let (module, preconvert) = if r3 {
-            ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
+            (
+                "attention_q8_0_fa2_gqa_gfx1100",
+                "attention_fa2_q_preconvert_gfx1100",
+            )
         } else if twin {
-            ("attention_q8_0_fa2_gqa_gfx1151", "attention_fa2_q_preconvert_gfx1151")
+            (
+                "attention_q8_0_fa2_gqa_gfx1151",
+                "attention_fa2_q_preconvert_gfx1151",
+            )
         } else {
-            ("attention_q8_0_fa2_gqa_gfx11", "attention_fa2_q_preconvert_gfx11")
+            (
+                "attention_q8_0_fa2_gqa_gfx11",
+                "attention_fa2_q_preconvert_gfx11",
+            )
         };
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
@@ -8208,8 +8259,15 @@ impl Gpu {
         let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
         // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
         let qk_block = (32 * nf.max(4)) as u32;
-        let qk_splits = geom.qk_waves.div_ceil(row_groups * n_kv_heads * nf).clamp(1, t_stride);
-        let pv = geom.pv.unwrap_or(if nf >= 4 { VerifyWmmaPv::Chunk2Whole2 } else { VerifyWmmaPv::Chunk1Split4 });
+        let qk_splits = geom
+            .qk_waves
+            .div_ceil(row_groups * n_kv_heads * nf)
+            .clamp(1, t_stride);
+        let pv = geom.pv.unwrap_or(if nf >= 4 {
+            VerifyWmmaPv::Chunk2Whole2
+        } else {
+            VerifyWmmaPv::Chunk1Split4
+        });
         let pv_chunks = pv.chunks();
         // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
         let pv_block = (32 * nf.max(pv_chunks)) as u32;
@@ -9488,7 +9546,11 @@ impl Gpu {
                 ),
             ));
         }
-        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, TILE)?;
+        self.ensure_kernel(
+            TILE,
+            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+            TILE,
+        )?;
         self.ensure_kernel(
             REDUCE,
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -15229,7 +15291,6 @@ impl Gpu {
         )
     }
 
-
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
     /// a multiple of `n_kv_heads`. See `kernels/src/attention_dflash.hip`
@@ -18649,6 +18710,146 @@ impl Gpu {
                 b.push_ptr(t3);
                 b.push_ptr(xo);
                 b.push_i32(h);
+                b
+            },
+        )
+    }
+
+    /// Resolve the gfx1100 TP2 graph-signal module before graph capture. JIT
+    /// compilation is not capture-safe, so model load calls this once per rank.
+    pub fn ensure_tp_graph_signal_gfx1100_kernels(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "ensure_tp_graph_signal_gfx1100_kernels requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_barrier_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_barrier_gfx1100",
+        )?;
+        self.ensure_kernel(
+            "tp_graph_signal_reduce_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_reduce_gfx1100",
+        )
+    }
+
+    /// Advance this rank's gfx1100 TP2 graph generation and wait until the
+    /// peer reaches the same barrier. The generation is device-resident, so a
+    /// captured graph can replay without host-side signal resets.
+    pub fn tp_graph_signal_barrier_gfx1100(
+        &mut self,
+        local_signal: &DeviceBuffer,
+        peer_signal: &DeviceBuffer,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_barrier_gfx1100 requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_barrier_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_barrier_gfx1100",
+        )?;
+
+        let local_ptr = local_signal.as_ptr();
+        let peer_ptr = peer_signal.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tp_graph_signal_barrier_gfx1100",
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(local_ptr);
+                b.push_ptr(peer_ptr);
+                b
+            },
+        )
+    }
+
+    /// Fused reusable TP2 graph barrier and rank-ordered residual reduction.
+    /// Each rank publishes its local partial into the peer-owned coherent
+    /// shadow. `local_is_first` then preserves `x + (p0 + p1)` bit order on
+    /// both devices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tp_graph_signal_reduce_gfx1100(
+        &mut self,
+        local_signal: &DeviceBuffer,
+        peer_signal: &DeviceBuffer,
+        x: &DeviceBuffer,
+        local_partial: &DeviceBuffer,
+        peer_shadow: *mut c_void,
+        local_shadow: *const c_void,
+        local_is_first: bool,
+        count: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_reduce_gfx1100 requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_reduce_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_reduce_gfx1100",
+        )?;
+
+        let local_ptr = local_signal.as_ptr();
+        let peer_ptr = peer_signal.as_ptr();
+        let x_ptr = x.as_ptr();
+        let local_partial_ptr = local_partial.as_ptr();
+        let local_is_first_arg = i32::from(local_is_first);
+        let count_arg = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "TP2 graph reduce count exceeds i32"))?;
+        let mut params: Vec<*mut c_void> = vec![
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &local_partial_ptr as *const _ as *mut c_void,
+            &peer_shadow as *const _ as *mut c_void,
+            &local_shadow as *const _ as *mut c_void,
+            &local_is_first_arg as *const _ as *mut c_void,
+            &count_arg as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tp_graph_signal_reduce_gfx1100",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(local_ptr);
+                b.push_ptr(peer_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(local_partial_ptr);
+                b.push_ptr(peer_shadow);
+                b.push_ptr(local_shadow);
+                b.push_i32(local_is_first_arg);
+                b.push_i32(count_arg);
                 b
             },
         )
@@ -22594,7 +22795,6 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b.push_f32(scale);
     b
 }
-
 
 /// `*_paged` symbol of a descriptor-aware kernel launched through the
 /// givens4/turbo assembler, or `None` when the kernel has no paged variant.

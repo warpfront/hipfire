@@ -26,7 +26,7 @@ use crate::device_mesh::{DeviceMesh, DimKind};
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
-    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM, HIP_HOST_MALLOC_MAPPED,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -164,17 +164,20 @@ pub struct Gpus {
     /// One process-lifetime dependency event per rank for peer-consumer
     /// collectives. Re-recording avoids 86 create/destroy pairs per DS4 token.
     rank_barrier_events: Vec<Event>,
-    /// Second process-lifetime dependency event per rank, owned by the
-    /// symmetric direct-peer-read allreduce
-    /// ([`Gpus::all_reduce_sum_f32_peer_direct_add`]): `E_done[r]` is recorded
-    /// after rank r's peer-read consumer, and each rank waits the peer's
-    /// `E_done` before overwriting its own partial on the next layer.
-    /// Separate pool from `rank_barrier_events` (the producer events) so the
-    /// two generations never alias.
+    /// Second process-lifetime dependency event per rank. The ordinary
+    /// symmetric direct-peer-read allreduce uses it as `E_done[r]`, recorded
+    /// after rank r's peer-read consumer. The alternating-buffer variant uses
+    /// the two event pools as independent producer-ready generations, one per
+    /// partial-buffer slot. The two protocols are never active concurrently.
     rank_done_events: Vec<Event>,
     /// One 8-byte system-visible epoch per rank for the exact-gated gfx1201
     /// TP3/TP4 graph route. Each captured barrier advances the epoch.
     tp_graph_signals: Vec<DeviceBuffer>,
+    /// System-visible payload exchange for gfx1100 TP2 whole-token graphs.
+    /// Ordinary peer VRAM can remain stale across captured graph replays.
+    tp_graph_payloads: Vec<DeviceBuffer>,
+    tp_graph_payload_host: Option<usize>,
+    tp_graph_payload_bytes: usize,
     tp_graph_barrier_count: usize,
     tp_graph_capture_epoch: usize,
 }
@@ -332,6 +335,9 @@ impl Gpus {
             rank_barrier_events: Vec::new(),
             rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
+            tp_graph_payloads: Vec::new(),
+            tp_graph_payload_host: None,
+            tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
         }
@@ -389,6 +395,9 @@ impl Gpus {
             rank_barrier_events: Vec::new(),
             rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
+            tp_graph_payloads: Vec::new(),
+            tp_graph_payload_host: None,
+            tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
         })
@@ -439,6 +448,9 @@ impl Gpus {
             rank_barrier_events: Vec::new(),
             rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
+            tp_graph_payloads: Vec::new(),
+            tp_graph_payload_host: None,
+            tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
         })
@@ -917,7 +929,7 @@ impl Gpus {
     /// the prior consumer on the same FIFO stream.
     pub fn barrier_rank_streams_reuse(&mut self) -> HipResult<()> {
         if self.tp_graph_signals.len() == self.devices.len()
-            && matches!(self.devices.len(), 3 | 4)
+            && self.tp_graph_signal_topology_supported()
             && self.devices.iter().all(|device| device.graphs.capture_mode)
         {
             return self.capture_tp_graph_barrier();
@@ -1004,19 +1016,24 @@ impl Gpus {
         Ok(())
     }
 
-    /// Allocate one fixed gfx1201 TP3/TP4 graph epoch before peer access is
-    /// enabled. ROCm signal memory accepts the proven 8-byte allocation; a
-    /// monotonically increasing epoch reuses it for every layer boundary.
+    fn tp_graph_signal_topology_supported(&self) -> bool {
+        (self.devices.len() == 2 && self.devices.iter().all(|device| device.arch == "gfx1100"))
+            || (matches!(self.devices.len(), 3 | 4)
+                && self
+                    .devices
+                    .iter()
+                    .all(|device| device.arch_caps.is_gfx1201()))
+    }
+
+    /// Allocate one fixed graph epoch before peer access is enabled. The
+    /// admitted topologies are gfx1100 TP2 and gfx1201 TP3/TP4. ROCm signal
+    /// memory accepts the proven 8-byte allocation; a monotonically increasing
+    /// epoch reuses it for every layer boundary.
     pub fn prepare_tp_graph_signals(&mut self, barriers: usize) -> HipResult<()> {
-        if !matches!(self.devices.len(), 3 | 4)
-            || !self
-                .devices
-                .iter()
-                .all(|device| device.arch_caps.is_gfx1201())
-        {
+        if !self.tp_graph_signal_topology_supported() {
             return Err(HipError::new(
                 0,
-                "prepare_tp_graph_signals requires three or four gfx1201 devices",
+                "prepare_tp_graph_signals requires gfx1100 TP2 or gfx1201 TP3/TP4",
             ));
         }
         if barriers == 0 {
@@ -1038,6 +1055,11 @@ impl Gpus {
 
         let bytes = std::mem::size_of::<u64>();
         let n = self.devices.len();
+        if n == 2 {
+            for gpu in &mut self.devices {
+                gpu.ensure_tp_graph_signal_gfx1100_kernels()?;
+            }
+        }
         let mut signals = Vec::with_capacity(n);
         for rank in 0..n {
             let gpu = &self.devices[rank];
@@ -1064,6 +1086,71 @@ impl Gpus {
         self.tp_graph_signals = signals;
         self.tp_graph_barrier_count = barriers;
         self.tp_graph_capture_epoch = 0;
+        Ok(())
+    }
+
+    /// Reserve one peer-owned payload shadow per rank before whole-token graph
+    /// capture. gfx1100 graph replay publishes into the peer's shadow and then
+    /// consumes only local VRAM, avoiding stale remote payload reads.
+    pub fn prepare_tp_graph_peer_shadows(&mut self, bytes: usize) -> HipResult<()> {
+        if self.devices.len() != 2 || !self.devices.iter().all(|device| device.arch == "gfx1100") {
+            return Err(HipError::new(
+                0,
+                "prepare_tp_graph_peer_shadows requires gfx1100 TP2",
+            ));
+        }
+        if bytes == 0 {
+            return Err(HipError::new(
+                0,
+                "prepare_tp_graph_peer_shadows requires a non-zero payload",
+            ));
+        }
+        if !self.tp_graph_payloads.is_empty() {
+            return if self.tp_graph_payloads.len() == self.devices.len()
+                && self.tp_graph_payload_bytes >= bytes
+            {
+                Ok(())
+            } else {
+                Err(HipError::new(
+                    0,
+                    "prepare_tp_graph_peer_shadows cannot resize live payloads",
+                ))
+            };
+        }
+
+        let total_bytes = bytes
+            .checked_mul(self.devices.len())
+            .ok_or_else(|| HipError::new(0, "TP graph payload size overflow"))?;
+        self.devices[0].bind_thread()?;
+        let host = self.devices[0]
+            .hip
+            .host_malloc(total_bytes, HIP_HOST_MALLOC_MAPPED)?;
+        // One host allocation is mapped separately into each device context;
+        // graph kernels use their rank-local alias to the same coherent pages.
+        let mut payloads = Vec::with_capacity(self.devices.len());
+        for rank in 0..self.devices.len() {
+            let gpu = &self.devices[rank];
+            gpu.bind_thread()?;
+            let dev_ptr = match gpu.hip.host_get_device_pointer(host, 0) {
+                Ok(ptr) => ptr,
+                Err(error) => {
+                    self.devices[0].bind_thread()?;
+                    let _ = self.devices[0].hip.host_free(host);
+                    return Err(error);
+                }
+            };
+            // SAFETY: `host` remains owned by `tp_graph_payload_host` until
+            // every captured graph has been destroyed and the views cleared.
+            payloads.push(unsafe { DeviceBuffer::from_raw(dev_ptr, total_bytes) });
+        }
+        self.devices[0].bind_thread()?;
+        if let Err(error) = self.devices[0].hip.memset(&payloads[0], 0, total_bytes) {
+            let _ = self.devices[0].hip.host_free(host);
+            return Err(error);
+        }
+        self.tp_graph_payloads = payloads;
+        self.tp_graph_payload_host = Some(host as usize);
+        self.tp_graph_payload_bytes = bytes;
         Ok(())
     }
 
@@ -1097,7 +1184,7 @@ impl Gpus {
 
     pub fn tp_graph_signals_ready(&self, barriers: usize) -> bool {
         self.tp_graph_signals.len() == self.devices.len()
-            && matches!(self.devices.len(), 3 | 4)
+            && self.tp_graph_signal_topology_supported()
             && self.tp_graph_barrier_count == barriers
     }
 
@@ -1106,6 +1193,8 @@ impl Gpus {
     /// share it.
     pub fn free_tp_graph_signals(&mut self) -> HipResult<()> {
         let signals = std::mem::take(&mut self.tp_graph_signals);
+        self.tp_graph_payloads.clear();
+        let payload_host = self.tp_graph_payload_host.take();
         let mut first_error = None;
         for (rank, signal) in signals.into_iter().enumerate() {
             if let Err(error) = self.devices[rank]
@@ -1115,6 +1204,15 @@ impl Gpus {
                 first_error.get_or_insert(error);
             }
         }
+        if let Some(host) = payload_host {
+            if let Err(error) = self.devices[0]
+                .bind_thread()
+                .and_then(|_| self.devices[0].hip.host_free(host as *mut c_void))
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.tp_graph_payload_bytes = 0;
         self.tp_graph_barrier_count = 0;
         self.tp_graph_capture_epoch = 0;
         match first_error {
@@ -1134,11 +1232,19 @@ impl Gpus {
                 ),
             ));
         }
-        let epoch = u32::try_from(epoch_index + 1)
-            .map_err(|_| HipError::new(0, "TP graph barrier epoch exceeds u32"))?;
         let signals = &self.tp_graph_signals;
         let devices = &mut self.devices;
         let n = devices.len();
+        if n == 2 {
+            for rank in 0..n {
+                devices[rank]
+                    .tp_graph_signal_barrier_gfx1100(&signals[rank], &signals[1 - rank])?;
+            }
+            self.tp_graph_capture_epoch += 1;
+            return Ok(());
+        }
+        let epoch = u32::try_from(epoch_index + 1)
+            .map_err(|_| HipError::new(0, "TP graph barrier epoch exceeds u32"))?;
         for rank in 0..n {
             devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
         }
@@ -1192,6 +1298,9 @@ impl Gpus {
             rank_barrier_events: Vec::new(),
             rank_done_events: Vec::new(),
             tp_graph_signals: Vec::new(),
+            tp_graph_payloads: Vec::new(),
+            tp_graph_payload_host: None,
+            tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
         })
@@ -2226,14 +2335,58 @@ impl Gpus {
         residuals: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
-        const OPERATION: &str = "all_reduce_sum_f32_peer_direct_add";
+        self.all_reduce_sum_f32_peer_direct_add_impl(partials, residuals, count, None)
+    }
+
+    /// Symmetric direct-peer-read all-reduce for a caller that alternates two
+    /// distinct partial buffers on every invocation.
+    ///
+    /// `partial_slot` must alternate `0, 1, 0, 1, ...`; slot 0 uses
+    /// `rank_barrier_events`, slot 1 uses `rank_done_events`. Because a rank
+    /// cannot produce the next slot until its own consumer of the previous
+    /// slot has completed, waiting for the peer's next producer event also
+    /// proves that the peer has finished reading the previous slot. This
+    /// removes the ordinary protocol's per-invocation done-event record and
+    /// reverse wait without changing arithmetic or operand order.
+    ///
+    /// The caller owns the alternation contract. Use
+    /// [`Self::all_reduce_sum_f32_peer_direct_add`] when the same partial
+    /// buffer may be reused by consecutive calls.
+    pub fn all_reduce_sum_f32_peer_direct_add_alternating(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        residuals: &[&DeviceBuffer],
+        count: usize,
+        partial_slot: usize,
+    ) -> HipResult<()> {
+        if partial_slot > 1 {
+            return Err(HipError::new(
+                0,
+                "all_reduce_sum_f32_peer_direct_add_alternating: partial_slot must be 0 or 1",
+            ));
+        }
+        self.all_reduce_sum_f32_peer_direct_add_impl(partials, residuals, count, Some(partial_slot))
+    }
+
+    fn all_reduce_sum_f32_peer_direct_add_impl(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        residuals: &[&DeviceBuffer],
+        count: usize,
+        alternating_slot: Option<usize>,
+    ) -> HipResult<()> {
+        let operation = if alternating_slot.is_some() {
+            "all_reduce_sum_f32_peer_direct_add_alternating"
+        } else {
+            "all_reduce_sum_f32_peer_direct_add"
+        };
         if self.active_peer_lease.is_some()
             || self.peer_lease_quarantined
             || !self.peer_lease_buffers.is_empty()
         {
             return Err(HipError::new(
                 0,
-                &format!("{OPERATION}: peer scratch is leased — use the leased reduction API"),
+                &format!("{operation}: peer scratch is leased — use the leased reduction API"),
             ));
         }
         let n = self.devices.len();
@@ -2241,7 +2394,7 @@ impl Gpus {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "{OPERATION}: partials.len()={} != n_devices={n}",
+                    "{operation}: partials.len()={} != n_devices={n}",
                     partials.len()
                 ),
             ));
@@ -2250,7 +2403,7 @@ impl Gpus {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "{OPERATION}: residuals.len()={} != n_devices={n}",
+                    "{operation}: residuals.len()={} != n_devices={n}",
                     residuals.len()
                 ),
             ));
@@ -2260,13 +2413,13 @@ impl Gpus {
         }
         let bytes = count
             .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| HipError::new(0, &format!("{OPERATION}: byte count overflow")))?;
+            .ok_or_else(|| HipError::new(0, &format!("{operation}: byte count overflow")))?;
         for (rank, buffer) in partials.iter().enumerate() {
             if buffer.size() < bytes {
                 return Err(HipError::new(
                     0,
                     &format!(
-                        "{OPERATION}: partial rank {rank} has {} bytes, needs {bytes}",
+                        "{operation}: partial rank {rank} has {} bytes, needs {bytes}",
                         buffer.size()
                     ),
                 ));
@@ -2277,7 +2430,7 @@ impl Gpus {
                 return Err(HipError::new(
                     0,
                     &format!(
-                        "{OPERATION}: residual rank {rank} has {} bytes, needs {bytes}",
+                        "{operation}: residual rank {rank} has {} bytes, needs {bytes}",
                         buffer.size()
                     ),
                 ));
@@ -2291,12 +2444,72 @@ impl Gpus {
                 partials,
                 Some(residuals),
                 count,
-                OPERATION,
+                operation,
             );
         }
 
+        // A whole-token per-rank graph cannot contain cross-device HIP event
+        // waits. The alternating-buffer caller instead inserts one captured
+        // system-scope producer barrier, then records the same peer-read add
+        // kernel into each rank graph. Fail closed if capture reached this
+        // route without the exact-gated signal tape prepared at model load.
+        if alternating_slot.is_some()
+            && self.devices.iter().all(|device| device.graphs.capture_mode)
+        {
+            if self.tp_graph_signals.len() != n || !self.tp_graph_signal_topology_supported() {
+                return Err(HipError::new(
+                    0,
+                    &format!("{operation}: graph capture has no admitted TP signal tape"),
+                ));
+            }
+            let epoch_index = self.tp_graph_capture_epoch;
+            if epoch_index >= self.tp_graph_barrier_count {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "TP graph reduce epoch {epoch_index} exceeds prepared capacity {}",
+                        self.tp_graph_barrier_count
+                    ),
+                ));
+            }
+            if self.tp_graph_payloads.len() != n || self.tp_graph_payload_bytes < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!("{operation}: TP graph peer shadows were not prepared before capture"),
+                ));
+            }
+            for rank in 0..n {
+                let base = self.tp_graph_payloads[rank].as_ptr().cast::<u8>();
+                // Each rank writes into the segment consumed by its peer and
+                // reads the segment addressed to itself, using the alias
+                // resolved in its own HIP context.
+                let peer_shadow = unsafe {
+                    base.add((1 - rank) * self.tp_graph_payload_bytes)
+                        .cast::<c_void>()
+                };
+                let local_shadow = unsafe {
+                    base.add(rank * self.tp_graph_payload_bytes)
+                        .cast::<c_void>() as *const c_void
+                };
+                self.devices[rank].tp_graph_signal_reduce_gfx1100(
+                    &self.tp_graph_signals[rank],
+                    &self.tp_graph_signals[1 - rank],
+                    residuals[rank],
+                    partials[rank],
+                    peer_shadow,
+                    local_shadow,
+                    rank == 0,
+                    count,
+                )?;
+            }
+            self.tp_graph_capture_epoch += 1;
+            return Ok(());
+        }
+
         let result = (|| -> HipResult<()> {
-            // Both lifetime event pools before any partial mutation.
+            // Both pools exist before any partial mutation. The ordinary
+            // protocol uses producer + consumer-complete generations; the
+            // alternating protocol uses one producer generation per slot.
             self.ensure_rank_barrier_events()?;
             self.ensure_rank_done_events()?;
 
@@ -2307,11 +2520,15 @@ impl Gpus {
                 let stream = gpu.active_stream.as_ref().ok_or_else(|| {
                     HipError::new(
                         0,
-                        &format!("{OPERATION}: device {rank} lost its active_stream"),
+                        &format!("{operation}: device {rank} lost its active_stream"),
                     )
                 })?;
-                gpu.hip
-                    .event_record(&self.rank_barrier_events[rank], Some(stream))?;
+                let producer_event = if alternating_slot == Some(1) {
+                    &self.rank_done_events[rank]
+                } else {
+                    &self.rank_barrier_events[rank]
+                };
+                gpu.hip.event_record(producer_event, Some(stream))?;
             }
 
             // Rank-order operands: p_first is always rank 0's partial and
@@ -2336,11 +2553,15 @@ impl Gpus {
                     let stream = gpu.active_stream.as_ref().ok_or_else(|| {
                         HipError::new(
                             0,
-                            &format!("{OPERATION}: device {rank} lost its active_stream"),
+                            &format!("{operation}: device {rank} lost its active_stream"),
                         )
                     })?;
-                    gpu.hip
-                        .stream_wait_event(stream, &self.rank_barrier_events[peer])?;
+                    let producer_event = if alternating_slot == Some(1) {
+                        &self.rank_done_events[peer]
+                    } else {
+                        &self.rank_barrier_events[peer]
+                    };
+                    gpu.hip.stream_wait_event(stream, producer_event)?;
                 }
                 {
                     let x = GpuTensor {
@@ -2350,12 +2571,12 @@ impl Gpus {
                     };
                     self.devices[rank].add_peer_residual_f32(&x, &p_first, p_second_ptr, count)?;
                 }
-                {
+                if alternating_slot.is_none() {
                     let gpu = &self.devices[rank];
                     let stream = gpu.active_stream.as_ref().ok_or_else(|| {
                         HipError::new(
                             0,
-                            &format!("{OPERATION}: device {rank} lost its active_stream"),
+                            &format!("{operation}: device {rank} lost its active_stream"),
                         )
                     })?;
                     gpu.hip
@@ -2366,18 +2587,20 @@ impl Gpus {
             // (e) Reverse source-reuse: each rank waits the peer's done event
             // so the next layer's producer cannot overwrite the partial the
             // peer may still be reading.
-            for rank in 0..n {
-                let peer = 1 - rank;
-                let gpu = &self.devices[rank];
-                gpu.bind_thread()?;
-                let stream = gpu.active_stream.as_ref().ok_or_else(|| {
-                    HipError::new(
-                        0,
-                        &format!("{OPERATION}: device {rank} lost its active_stream"),
-                    )
-                })?;
-                gpu.hip
-                    .stream_wait_event(stream, &self.rank_done_events[peer])?;
+            if alternating_slot.is_none() {
+                for rank in 0..n {
+                    let peer = 1 - rank;
+                    let gpu = &self.devices[rank];
+                    gpu.bind_thread()?;
+                    let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                        HipError::new(
+                            0,
+                            &format!("{operation}: device {rank} lost its active_stream"),
+                        )
+                    })?;
+                    gpu.hip
+                        .stream_wait_event(stream, &self.rank_done_events[peer])?;
+                }
             }
 
             Ok(())

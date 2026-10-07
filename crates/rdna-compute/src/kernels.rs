@@ -4217,8 +4217,10 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// (was b7809d03…), gfx1201 9d0b83cc14bfb50118c2b77f1f925330372fcc730ca7140cc00bbf0614d32607
 /// (was deee483f…); each differs only by the `.comment` stamp
 /// (`hipfire peacemaker native-emit`).
-pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
-pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
+pub const QSA_GATHER_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
+pub const QSA_GATHER_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// Certified builder module of the live QSA selector pair
 /// (`hipfire-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
 /// obligation-free): the rows16 F32 score and the select-from-scores kernels,
@@ -4227,7 +4229,8 @@ pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_ga
 /// `indexed_attention_select_from_scores` in `kernels/src/tensor_ops.hip`.
 /// Default on (`HIPFIRE_QWEN4_QSA_SCORE_PM=0` / `HIPFIRE_QWEN4_QSA_SELECT_PM=0`
 /// keep the hipcc kernels).
-pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
+pub const QSA_SELECT_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
 /// Certified builder module of gfx1201's MQ6 trunk overwrite GEMM
 /// (`hipfire-isa emit --kernel qwen4_mq6_x4 --epi all --arch gfx1201`, M7
 /// obligation-free; `hipfire peacemaker native-emit` writes the bundle): the
@@ -4239,7 +4242,8 @@ pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_se
 /// Default on (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps the hipcc kernel).
 /// SHA-256 1d2662aa9d16c3dba66603f83bd84a5234cd5c7d1b4d57141e2a0f6e88c952cf
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
-pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
+pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1151's MQ6 trunk GEMM
 /// (`hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 --arch gfx1151`, M7
 /// obligation-free): the exact twin of the U3 `resid_bt_xlds<6, 8, 8, true, ..>`
@@ -4251,12 +4255,14 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen
 /// N >= 2048 (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps hipcc).
 /// SHA-256 24aa35df635e08bb04df422bbb0faaa9dc491579d13619794fa9d77c122b7b01
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
-pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
+pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with
 /// `HIPFIRE_QWEN4_QSA_SCORE_PM=0` retaining the fused hipcc BF16 selector.
-pub const QSA_SELECT_BF16_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_bf16_pm_gfx1151.hxaco");
+pub const QSA_SELECT_BF16_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qsa_select_bf16_pm_gfx1151.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.
 pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_sym_check.gfx1201.hip");
@@ -7334,8 +7340,7 @@ pub const KV_SLOT_DESC_H: &str = include_str!("../../../kernels/src/kv_slot_desc
 /// [`KV_SLOT_DESC_H`] only for the `*_paged` module variants the slot engine
 /// launches with real descriptors; every descriptor-less (default-route)
 /// module keeps the legacy header and its exact source bytes.
-pub const KV_SLOT_DESC_PAGED_H: &str =
-    include_str!("../../../kernels/src/kv_slot_desc_paged.h");
+pub const KV_SLOT_DESC_PAGED_H: &str = include_str!("../../../kernels/src/kv_slot_desc_paged.h");
 
 /// Assemble a descriptor-consuming kernel translation unit for the runtime
 /// compile (which has no `-I` to `kernels/src`): strip `body`'s
@@ -7345,7 +7350,11 @@ pub const KV_SLOT_DESC_PAGED_H: &str =
 /// key); `paged == true` prepends [`KV_SLOT_DESC_PAGED_H`], which also defines
 /// `HIPFIRE_KV_SLOT_PAGED` for bodies that carry paged-only parameters.
 pub fn kv_slot_desc_source(body: &str, paged: bool) -> String {
-    let header = if paged { KV_SLOT_DESC_PAGED_H } else { KV_SLOT_DESC_H };
+    let header = if paged {
+        KV_SLOT_DESC_PAGED_H
+    } else {
+        KV_SLOT_DESC_H
+    };
     let stripped = body
         .replace("#include \"kv_slot_desc.h\"", "")
         .replace("#include \"kv_slot_desc_paged.h\"", "");
@@ -7826,8 +7835,9 @@ pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC: &str =
 /// byte-identical to [`ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC`]
 /// on the same partials. Same 11-arg ABI; one 1024-thread workgroup per head,
 /// dynamic LDS 2 * max_tiles floats. gfx1100 only.
-pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate_dec.gfx1100.hip");
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC: &str = include_str!(
+    "../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate_dec.gfx1100.hip"
+);
 /// GQA-shared Q8_0 decode flash tile (`attention_flash_q8_0_tile_gqa_gfx1151`):
 /// one 256-thread workgroup per (kv head, tile) serves the six q heads of its kv
 /// head, so each Q8_0 K/V tile is read once. Same 13-arg ABI and byte-identical
@@ -8088,10 +8098,12 @@ pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
 /// both archs and differs from the unfused chain in the last bit, so the
 /// lowered decode diverged from the hand decode (`HIPFIRE_FORWARD_LOWERED=0`).
 fn qwen36_27b_fa_prep_body(entry: &str) -> String {
-    let body = QWEN35_FA_PREP_GFX1100_SRC
-        .replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");
+    let body =
+        QWEN35_FA_PREP_GFX1100_SRC.replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");
     assert_eq!(body.matches("__builtin_fmaf").count(), 2);
-    format!("#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n#define QWEN_FA_PREP_EXACT_ROPE 1\n{body}")
+    format!(
+        "#define HIPFIRE_QWEN35_FA_PREP_KERNEL {entry}\n#define QWEN_FA_PREP_EXACT_ROPE 1\n{body}"
+    )
 }
 pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
     static SRC: std::sync::LazyLock<String> =
@@ -9316,6 +9328,10 @@ pub const HC_MIX_4STREAM_PEER4_GFX1201_SRC: &str =
 /// gfx1201 TP3/TP4 graph-resident system-scope producer barrier.
 pub const TP_GRAPH_SIGNAL_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/tp4_graph_signal.gfx1201.hip");
+
+/// gfx1100 TP2 graph-resident system-scope producer barrier.
+pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip");
 
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");
 

@@ -1463,18 +1463,53 @@ fn ar_graph_binding(
     mix(s.pos_buf.as_ptr());
     mix(s.pos_buf3.as_ptr());
     for t in [
-        &s.x, &s.tmp, &s.dn_qkv, &s.dn_z, &s.dn_alpha, &s.dn_beta, &s.dn_conv_out, &s.dn_q,
-        &s.dn_k, &s.dn_v, &s.dn_q_raw, &s.dn_k_raw, &s.dn_attn_out, &s.dn_normed, &s.fa_q_full,
-        &s.fa_q, &s.fa_gate, &s.fa_k, &s.fa_v, &s.fa_attn_out, &s.o, &s.gate_ffn, &s.up,
-        &s.ffn_hidden, &s.ffn_out, &s.logits, &s.sample_buf, &s.repeat_buf, &s.x_rot,
+        &s.x,
+        &s.tmp,
+        &s.dn_qkv,
+        &s.dn_z,
+        &s.dn_alpha,
+        &s.dn_beta,
+        &s.dn_conv_out,
+        &s.dn_q,
+        &s.dn_k,
+        &s.dn_v,
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        &s.dn_attn_out,
+        &s.dn_normed,
+        &s.fa_q_full,
+        &s.fa_q,
+        &s.fa_gate,
+        &s.fa_k,
+        &s.fa_v,
+        &s.fa_attn_out,
+        &s.o,
+        &s.gate_ffn,
+        &s.up,
+        &s.ffn_hidden,
+        &s.ffn_out,
+        &s.logits,
+        &s.sample_buf,
+        &s.repeat_buf,
+        &s.x_rot,
         &s.flash_partials,
     ] {
         mix(t.buf.as_ptr());
     }
     for t in [
-        &s.moe_router_logits, &s.moe_scalar_buf, &s.moe_x_rot, &s.moe_gate_up_buf,
-        &s.moe_gate_buf, &s.moe_up_buf, &s.moe_ffn_hidden, &s.moe_ffn_out, &s.moe_gate_batch,
-        &s.moe_up_batch, &s.moe_rot_batch, &s.moe_topk_indices, &s.moe_topk_weights,
+        &s.moe_router_logits,
+        &s.moe_scalar_buf,
+        &s.moe_x_rot,
+        &s.moe_gate_up_buf,
+        &s.moe_gate_buf,
+        &s.moe_up_buf,
+        &s.moe_ffn_hidden,
+        &s.moe_ffn_out,
+        &s.moe_gate_batch,
+        &s.moe_up_batch,
+        &s.moe_rot_batch,
+        &s.moe_topk_indices,
+        &s.moe_topk_weights,
         &s.moe_down_expanded,
     ]
     .into_iter()
@@ -4296,7 +4331,7 @@ fn dense_tp_ffn_partial(
         &[Step::Gemv {
             w: &wr,
             input: GemvInput::Raw(&s.ffn_hidden),
-            out: &s.o,
+            out: &s.ffn_out,
         }],
     )
     .map_err(|e| HipError::new(0, &e.to_string()))
@@ -4561,24 +4596,21 @@ fn dense_tp_all_reduce_sum_f32(
     }
 }
 
-fn dense_tp_allreduce(gpus: &mut Gpus, scratches: &[Qwen35Scratch], count: usize) -> HipResult<()> {
-    let refs: Vec<_> = scratches.iter().map(|s| &s.o.buf).collect();
-    dense_tp_all_reduce_sum_f32(gpus, &refs, count)
-}
-
-fn dense_tp_add_residual(gpus: &mut Gpus, scratches: &[Qwen35Scratch]) -> HipResult<()> {
-    for (rank, scratch) in scratches.iter().enumerate() {
-        gpus.devices[rank].bind_thread()?;
-        gpus.devices[rank].add_f32(&scratch.x, &scratch.o, &scratch.x)?;
-    }
-    Ok(())
-}
-
 /// Kill switch for the symmetric direct-peer-read TP allreduce:
 /// `HIPFIRE_TP_PEER_DIRECT=0` restores the rooted gather/fold/broadcast.
 /// Default ON for the n == 2 peer-access fast path.
 fn tp_peer_direct_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_TP_PEER_DIRECT")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+/// Kill switch for the alternating-partial producer-only synchronization.
+/// `0` restores the ordinary direct-peer protocol while keeping every other
+/// dense TP dispatch and buffer choice identical for route A/B.
+fn tp_peer_alternating_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_TP_PEER_ALTERNATING")
         .ok()
         .as_deref()
         != Some("0")
@@ -4603,14 +4635,39 @@ fn dense_tp_allreduce_add(
     gpus: &mut Gpus,
     scratches: &[Qwen35Scratch],
     count: usize,
+    partial_slot: usize,
 ) -> HipResult<()> {
+    let partial_tensors: Vec<_> = scratches
+        .iter()
+        .map(|scratch| {
+            if partial_slot == 0 {
+                &scratch.o
+            } else {
+                &scratch.ffn_out
+            }
+        })
+        .collect();
     if gpus.peer_access_enabled {
-        let partials: Vec<_> = scratches.iter().map(|scratch| &scratch.o.buf).collect();
+        let partials: Vec<_> = partial_tensors.iter().map(|tensor| &tensor.buf).collect();
         let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
-        dense_tp_allreduce_add_route(gpus, &partials, &residuals, count)
+        if gpus.devices.len() == 2 && tp_peer_direct_enabled() && tp_peer_alternating_enabled() {
+            gpus.all_reduce_sum_f32_peer_direct_add_alternating(
+                &partials,
+                &residuals,
+                count,
+                partial_slot,
+            )
+        } else {
+            dense_tp_allreduce_add_route(gpus, &partials, &residuals, count)
+        }
     } else {
-        dense_tp_allreduce(gpus, scratches, count)?;
-        dense_tp_add_residual(gpus, scratches)
+        let partials: Vec<_> = partial_tensors.iter().map(|tensor| &tensor.buf).collect();
+        dense_tp_all_reduce_sum_f32(gpus, &partials, count)?;
+        for (rank, (scratch, partial)) in scratches.iter().zip(partial_tensors.iter()).enumerate() {
+            gpus.devices[rank].bind_thread()?;
+            gpus.devices[rank].add_f32(&scratch.x, partial, &scratch.x)?;
+        }
+        Ok(())
     }
 }
 
@@ -4764,9 +4821,9 @@ fn forward_scratch_dense_tp_layers(
             dn_states,
             scratches,
         )?;
-        dense_tp_allreduce_add(gpus, scratches, dim)?;
+        dense_tp_allreduce_add(gpus, scratches, dim, 0)?;
         dense_tp_local_ffn(gpus, weights, configs, layer_idx, scratches)?;
-        dense_tp_allreduce_add(gpus, scratches, dim)?;
+        dense_tp_allreduce_add(gpus, scratches, dim, 1)?;
         if configs[0].layer_types[layer_idx] == LayerType::LinearAttention {
             delta_layer_idx += 1;
         }
@@ -4780,6 +4837,19 @@ fn dense_tp_graph_enabled(gpus: &Gpus, kv_caches: &[llama::KvCache]) -> bool {
             let arch_default = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
             gpu.flags.graph_ar && gpu.flags.graph_forward.unwrap_or(arch_default)
         })
+}
+
+fn dense_tp_full_graph_enabled(gpus: &Gpus, n_layers: usize) -> bool {
+    hipfire_config::developer_var("HIPFIRE_TP_FULL_GRAPH")
+        .ok()
+        .as_deref()
+        == Some("1")
+        && tp_peer_direct_enabled()
+        && tp_peer_alternating_enabled()
+        && gpus.peer_access_enabled
+        && gpus.devices.len() == 2
+        && gpus.devices.iter().all(|gpu| gpu.arch == "gfx1100")
+        && gpus.tp_graph_signals_ready(n_layers * 2)
 }
 
 fn dense_tp_drop_graphs(gpus: &mut Gpus, mark_dirty: bool) {
@@ -4809,6 +4879,116 @@ fn dense_tp_abort_captures(gpus: &mut Gpus) {
         }
     }
     dense_tp_drop_graphs(gpus, true);
+}
+
+/// Capture/replay one whole-token graph per gfx1100 TP2 rank. Cross-rank
+/// producer dependencies are graph-resident system-scope signal kernels; the
+/// peer residual add remains the existing rank-ordered arithmetic.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_dense_tp_full_graph(
+    gpus: &mut Gpus,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    let n = gpus.devices.len();
+    let captured = gpus
+        .devices
+        .iter()
+        .filter(|gpu| gpu.graphs.graph_exec.is_some())
+        .count();
+    if captured != 0 && captured != n {
+        dense_tp_drop_graphs(gpus, true);
+        return Err(HipError::new(
+            0,
+            &format!("dense TP whole-token graph state is partial: {captured}/{n}"),
+        ));
+    }
+
+    if captured == 0 {
+        dense_tp_drop_graphs(gpus, false);
+        gpus.begin_tp_graph_signal_capture()?;
+        for rank in 0..n {
+            let begin = {
+                let gpu = &mut gpus.devices[rank];
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => {
+                        gpu.graphs
+                            .begin_graph_capture_relaxed(&gpu.hip, gpu.device_id, stream)
+                    }
+                    None => Err(HipError::new(
+                        0,
+                        &format!("dense TP whole-token graph rank {rank} has no active stream"),
+                    )),
+                }
+            };
+            if let Err(error) = begin {
+                dense_tp_abort_captures(gpus);
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = forward_scratch_dense_tp_layers(
+            gpus, weights, configs, pos, kv_caches, dn_states, scratches,
+        ) {
+            dense_tp_abort_captures(gpus);
+            return Err(error);
+        }
+        let expected_barriers = configs[0].n_layers * 2;
+        if gpus.tp_graph_captured_signal_count() != expected_barriers {
+            dense_tp_abort_captures(gpus);
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dense TP whole-token graph captured {} barriers, expected {expected_barriers}",
+                    gpus.tp_graph_captured_signal_count()
+                ),
+            ));
+        }
+
+        for rank in 0..n {
+            let end = {
+                let gpu = &mut gpus.devices[rank];
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu
+                        .graphs
+                        .end_graph_capture(&gpu.hip, gpu.device_id, stream),
+                    None => Err(HipError::new(
+                        0,
+                        &format!("dense TP whole-token graph rank {rank} has no active stream"),
+                    )),
+                }
+            };
+            if let Err(error) = end {
+                dense_tp_abort_captures(gpus);
+                return Err(error);
+            }
+        }
+        for gpu in &mut gpus.devices {
+            gpu.graphs.ar_forward_replay_enabled = true;
+        }
+        if ar_graph_trace_enabled() {
+            eprintln!(
+                "[qwen-dense-tp-graph] captured whole-token tp=2 barriers={expected_barriers} pos={pos}"
+            );
+        }
+    }
+
+    // The gfx1100 TP2 barrier advances a device-resident generation on every
+    // replay. Rank streams remain FIFO-ordered, so neither a host drain nor a
+    // signal reset is required between token graphs.
+    for rank in 0..n {
+        let gpu = &gpus.devices[rank];
+        gpu.graphs.graph_launch(
+            &gpu.hip,
+            gpu.device_id,
+            gpu.active_stream.as_ref().expect("validated active stream"),
+        )?;
+    }
+    Ok(())
 }
 
 /// Launch one rank-local segment on every device. Segments contain no RCCL,
@@ -5002,7 +5182,7 @@ fn forward_scratch_dense_tp_segmented(
             dense_tp_launch_segment(gpus, segment)?;
         }
         segment += 1;
-        dense_tp_allreduce_add(gpus, scratches, dim)?;
+        dense_tp_allreduce_add(gpus, scratches, dim, 0)?;
 
         if capture {
             dense_tp_capture_and_launch_segment(gpus, |gpus| {
@@ -5012,7 +5192,7 @@ fn forward_scratch_dense_tp_segmented(
             dense_tp_launch_segment(gpus, segment)?;
         }
         segment += 1;
-        dense_tp_allreduce_add(gpus, scratches, dim)?;
+        dense_tp_allreduce_add(gpus, scratches, dim, 1)?;
 
         if configs[0].layer_types[layer_idx] == LayerType::LinearAttention {
             delta_layer_idx += 1;
@@ -5095,6 +5275,26 @@ pub fn forward_scratch_dense_tp(
             dense_tp_drop_graphs(gpus, true);
         }
         return forward_scratch_dense_tp_layers(
+            gpus, weights, configs, pos, kv_caches, dn_states, scratches,
+        );
+    }
+
+    if dense_tp_full_graph_enabled(gpus, n_layers) {
+        if gpus
+            .devices
+            .iter()
+            .any(|gpu| gpu.graphs.ar_forward_kernel_dirty)
+        {
+            forward_scratch_dense_tp_layers(
+                gpus, weights, configs, pos, kv_caches, dn_states, scratches,
+            )?;
+            for gpu in &mut gpus.devices {
+                gpu.graphs.ar_forward_kernel_dirty = false;
+                gpu.graphs.ar_forward_replay_enabled = false;
+            }
+            return Ok(());
+        }
+        return forward_scratch_dense_tp_full_graph(
             gpus, weights, configs, pos, kv_caches, dn_states, scratches,
         );
     }
@@ -5450,7 +5650,9 @@ fn forward_prefill_dense_tp_batched(
                                 hd,
                                 BatchSemantics::Sequential,
                                 None,
-                                captures.as_ref().and_then(|caps| caps[rank].tape.as_deref()),
+                                captures
+                                    .as_ref()
+                                    .and_then(|caps| caps[rank].tape.as_deref()),
                                 0,
                                 delta_layer_idx,
                                 q8_flags[rank],
@@ -7484,7 +7686,8 @@ mod tests {
     #[test]
     fn flash_partials_split_sizing_is_exact_gfx1100_only() {
         // Legacy: batch rows at min(q8 tile, 128, batched tile).
-        let legacy = |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
+        let legacy =
+            |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
 
         // gfx1100 Qwen3.8-27B at 8K (Q8 decode tile32, batched tile128): 32
         // batched rows at tile128 dominate one tile32 decode row, half the
@@ -7499,15 +7702,33 @@ mod tests {
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(1)), 6_340_608);
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(64)), 101_449_728);
         // Past 8K gfx1100 decodes at tile128 too: legacy sizing.
-        assert_eq!(len("gfx1100", 24, 65_536, 128, 128, None), legacy(24, 65_536, 128));
+        assert_eq!(
+            len("gfx1100", 24, 65_536, 128, 128, None),
+            legacy(24, 65_536, 128)
+        );
 
         // Every other arch keeps the legacy buffer, including the shapes whose
         // decode tile is finer than the batched tile.
-        assert_eq!(len("gfx1201", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1151", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1201", 8, 8_192, 16, 128, None), legacy(8, 8_192, 16));
-        assert_eq!(len("gfx1151", 16, 2_048, 32, 128, None), legacy(16, 2_048, 32));
-        assert_eq!(len("gfx1101", 24, 8_192, 32, 128, None), legacy(24, 8_192, 32));
+        assert_eq!(
+            len("gfx1201", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1151", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1201", 8, 8_192, 16, 128, None),
+            legacy(8, 8_192, 16)
+        );
+        assert_eq!(
+            len("gfx1151", 16, 2_048, 32, 128, None),
+            legacy(16, 2_048, 32)
+        );
+        assert_eq!(
+            len("gfx1101", 24, 8_192, 32, 128, None),
+            legacy(24, 8_192, 32)
+        );
     }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {

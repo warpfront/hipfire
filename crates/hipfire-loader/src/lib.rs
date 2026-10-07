@@ -1968,7 +1968,10 @@ fn resolve_qwen35_mtp_head(
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
-) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Vec<String>,
+) {
     use hipfire_arch_qwen35::mtp_head;
     let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
     let sidecar = sidecar.unwrap_or_else(|| trunk_path.with_extension("mtp"));
@@ -4140,6 +4143,31 @@ fn load_model_tp_qwen35_dense(
         .can_access_peer_all()
         .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
     if peer {
+        let full_graph_requested = hipfire_config::developer_var("HIPFIRE_TP_FULL_GRAPH")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let full_graph_admitted = full_graph_requested
+            && tp == 2
+            && staging
+                .gpus_mut()
+                .devices
+                .iter()
+                .all(|device| device.arch == "gfx1100");
+        if full_graph_admitted {
+            staging
+                .gpus_mut()
+                .prepare_tp_graph_signals(config.n_layers * 2)
+                .map_err(|e| format!("prepare gfx1100 TP2 graph signals: {e:?}"))?;
+            staging
+                .gpus_mut()
+                .prepare_tp_graph_peer_shadows(config.dim * std::mem::size_of::<f32>())
+                .map_err(|e| format!("prepare gfx1100 TP2 graph peer shadows: {e:?}"))?;
+            eprintln!(
+                "[loader] dense qwen gfx1100 TP2 whole-token graph signal tape: {} barriers",
+                config.n_layers * 2
+            );
+        }
         let enabled = staging
             .gpus_mut()
             .enable_peer_all()
@@ -4183,7 +4211,9 @@ fn load_model_tp_qwen35_dense(
             } else {
                 errors.join("; ")
             };
-            return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
+            return Err(format!(
+                "MTP head required (mtp=on) but not loaded: {reason}"
+            ));
         }
         head
     } else {
@@ -4776,9 +4806,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
