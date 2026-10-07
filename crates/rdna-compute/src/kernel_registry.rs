@@ -542,6 +542,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen4_gemv_mq6g256v2", kernels::QWEN4_GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4"]);
         add!("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, [
             "gemv_q8_0_k2560_staged", "gemv_q8_0_k2560_staged_pair", "gemv_q8_0_k2560_staged_rows", "gemv_q8_0_k2560_staged_rows_tiled",
+            "gemv_q8_0_k2560_staged_rows_x2",
             "gemv_q8_0_k320_staged",
             "gemv_q8_0_k320_staged_rows", "gemv_q8_0_k8", "gemv_q8_0_k8_rows_r2", "gemv_q8_0_k8_rows_r3", "gemv_q8_0_k8_rows_r4",
             "gemv_q8_0_k8_rows_r5", "gemv_q8_0_k8_rows_r6", "gemv_q8_0_k8_rows_r7", "gemv_q8_0_k8_rows_r8", "quantize_bf16_q8_0",

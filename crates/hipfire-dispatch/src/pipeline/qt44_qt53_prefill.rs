@@ -122,7 +122,7 @@ pub(crate) fn router_projection(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     // Projected by the shared gate/up stage's launch instead.
-    if router_with_shared(p) || router_shares_f16(gpu, p) {
+    if router_with_shared(p) || router_with_selector(gpu, p) || router_shares_f16(gpu, p) {
         return Ok(());
     }
     batch_projection(
@@ -149,6 +149,23 @@ fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
             ]
             .iter()
             .all(|w| w.dtype == DType::BF16)
+        })
+}
+
+/// Whether a few-row forward on gfx11+ projects the router together with the
+/// BF16 shared selector (one K, both reading `x_norm_batch`) in one grouped
+/// BF16 row launch when the shared gate/up are not BF16 (the decode Q8
+/// copies). The grouped row kernel computes each projection bitwise as its
+/// own launch; the shared gate/up stage runs right after the router stage.
+fn router_with_selector(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    (2..=8).contains(&p.batch_size)
+        && gpu.arch_caps.has_gfx11_plus_simt()
+        && !router_with_shared(p)
+        && p.prelude.router.dtype == DType::BF16
+        && p.x_norm_batch.dtype == DType::F32
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            shared.weights.selector.dtype == DType::BF16
+                && shared.weights.selector.k == p.prelude.router.k
         })
 }
 
@@ -243,25 +260,38 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
             ],
         )?;
     } else {
-        let x_selector = match shared.weights.selector.dtype {
-            DType::BF16 | DType::F32 => p.x_norm_batch,
-            DType::MQ4G256V2 => p.x_rot_batch,
-            _ => {
-                return Err(DispatchError::UnsupportedVariant {
-                    family: "moe",
-                    variant: "qt44-qt53-shared-selector-dtype",
-                    arch: "",
-                    quant: "unsupported",
-                })
-            }
-        };
-        batch_projection(
-            gpu,
-            &shared.weights.selector,
-            x_selector,
-            shared.scalar,
-            p.batch_size,
-        )?;
+        if router_with_selector(gpu, p) {
+            super::layer_ops::project_weights(
+                gpu,
+                p.x_norm_batch,
+                p.batch_size,
+                None,
+                &[
+                    (&p.prelude.router, p.prelude.router_logits),
+                    (&weights.selector, shared.scalar),
+                ],
+            )?;
+        } else {
+            let x_selector = match shared.weights.selector.dtype {
+                DType::BF16 | DType::F32 => p.x_norm_batch,
+                DType::MQ4G256V2 => p.x_rot_batch,
+                _ => {
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "moe",
+                        variant: "qt44-qt53-shared-selector-dtype",
+                        arch: "",
+                        quant: "unsupported",
+                    })
+                }
+            };
+            batch_projection(
+                gpu,
+                &shared.weights.selector,
+                x_selector,
+                shared.scalar,
+                p.batch_size,
+            )?;
+        }
         let x_gate = match shared.weights.gate.dtype {
             DType::BF16 | DType::F32 | DType::Q8_0 => p.x_norm_batch,
             DType::MQ4G256V2 => p.x_rot_batch,
@@ -274,14 +304,29 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
                 })
             }
         };
-        batch_projection(
-            gpu,
-            &shared.weights.gate,
-            x_gate,
-            shared.gate_out,
-            p.batch_size,
-        )?;
-        batch_projection(gpu, &shared.weights.up, x_gate, shared.up_out, p.batch_size)?;
+        let (gate, up) = (&shared.weights.gate, &shared.weights.up);
+        if gate.dtype == DType::Q8_0
+            && up.dtype == DType::Q8_0
+            && gate.k == 2560
+            && up.k == 2560
+            && gpu.gemv_q8_0_staged_rows_supported(2560, p.batch_size)
+        {
+            // Few-row verify: the Q8 decode copies of the shared gate and up
+            // read the same rows; one launch, each row the single kernel's.
+            hip(gpu.gemv_q8_0_k2560_staged_rows_x2(
+                gate.buf,
+                shared.gate_out,
+                gate.m,
+                up.buf,
+                shared.up_out,
+                up.m,
+                x_gate,
+                p.batch_size,
+            ))?;
+        } else {
+            batch_projection(gpu, gate, x_gate, shared.gate_out, p.batch_size)?;
+            batch_projection(gpu, up, x_gate, shared.up_out, p.batch_size)?;
+        }
     }
     // BF16 recipe: every reader rounds what it reads (the top-10 router its
     // logits, the shared activation its selector, gate and up), so no

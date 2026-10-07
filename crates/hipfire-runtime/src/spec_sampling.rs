@@ -144,32 +144,18 @@ impl SparseDist {
         scratch: &mut Vec<(u32, f32)>,
     ) -> Result<(), String> {
         spec.check_temperature()?;
-        let pool = spec.pool.max(1);
-        // `sample_pool`'s fixed slots: each finite logit above the current
-        // minimum replaces it, then the minimum is rescanned.
+        let pool = spec.pool.clamp(1, SampleSpec::MAX_POOL);
+        // `sample_pool`'s fixed slots and replacement order (`gather_pool`).
+        let mut vals = [f32::NEG_INFINITY; SampleSpec::MAX_POOL];
+        let mut idx = [0u32; SampleSpec::MAX_POOL];
+        let max_logit = crate::llama::gather_pool(logits, &mut vals[..pool], &mut idx[..pool]);
         scratch.clear();
-        scratch.resize(pool, (0, f32::NEG_INFINITY));
-        let mut min_pos = 0usize;
-        let mut min_val = f32::NEG_INFINITY;
-        let mut max_logit = f32::NEG_INFINITY;
-        for (i, &l) in logits.iter().enumerate() {
-            if !l.is_finite() {
-                continue;
-            }
-            if l > max_logit {
-                max_logit = l;
-            }
-            if l > min_val {
-                scratch[min_pos] = (i as u32, l);
-                min_val = f32::INFINITY;
-                for (j, &(_, v)) in scratch.iter().enumerate() {
-                    if v < min_val {
-                        min_val = v;
-                        min_pos = j;
-                    }
-                }
-            }
-        }
+        scratch.extend(
+            idx[..pool]
+                .iter()
+                .copied()
+                .zip(vals[..pool].iter().copied()),
+        );
         let inv_temp = 1.0 / spec.temperature;
         let entries = &mut self.entries;
         entries.clear();

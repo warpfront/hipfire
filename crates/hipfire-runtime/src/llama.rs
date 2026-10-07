@@ -7771,6 +7771,66 @@ pub fn sample_top_k_p(
     }
 }
 
+/// The CPU samplers' pool gather: the largest finite logit, and in
+/// `vals`/`idx` (`NEG_INFINITY`/`0` on entry, equal lengths) the pool of
+/// highest finite logits exactly as one sequential replacement pass leaves
+/// it — each logit above the pool minimum replaces the first minimal slot —
+/// slot order and tie choice included, so callers' sorts and sums are
+/// unchanged. Non-finite logits are ignored.
+///
+/// A 256-logit chunk whose maximum does not exceed the pool minimum changes
+/// nothing but the maximum, so it is skipped after one branch-free lane-wise
+/// max; nearly every chunk of a vocabulary row is. NaN never wins the lane
+/// max and `+Inf` forces the chunk through the sequential pass, so a skipped
+/// chunk's maximum is finite (or `-Inf`, which moves nothing).
+pub(crate) fn gather_pool(logits: &[f32], vals: &mut [f32], idx: &mut [u32]) -> f32 {
+    const CHUNK: usize = 256;
+    const LANES: usize = 8;
+    let mut min_pos = 0usize;
+    let mut min_val = f32::NEG_INFINITY;
+    let mut max_logit = f32::NEG_INFINITY;
+    for (c, chunk) in logits.chunks(CHUNK).enumerate() {
+        if chunk.len() == CHUNK {
+            let mut lane = [f32::NEG_INFINITY; LANES];
+            for group in chunk.chunks_exact(LANES) {
+                for (m, &l) in lane.iter_mut().zip(group) {
+                    *m = if l > *m { l } else { *m };
+                }
+            }
+            let top = lane
+                .iter()
+                .fold(f32::NEG_INFINITY, |m, &v| if v > m { v } else { m });
+            if top <= min_val {
+                // Only logits <= the pool minimum: none enters.
+                if top > max_logit {
+                    max_logit = top;
+                }
+                continue;
+            }
+        }
+        for (j, &l) in chunk.iter().enumerate() {
+            if !l.is_finite() {
+                continue;
+            }
+            if l > max_logit {
+                max_logit = l;
+            }
+            if l > min_val {
+                vals[min_pos] = l;
+                idx[min_pos] = (c * CHUNK + j) as u32;
+                min_val = f32::INFINITY;
+                for (k, &v) in vals.iter().enumerate() {
+                    if v < min_val {
+                        min_val = v;
+                        min_pos = k;
+                    }
+                }
+            }
+        }
+    }
+    max_logit
+}
+
 /// [`sample_top_k_p`] over a fixed `N`-wide candidate pool (no heap
 /// allocation). `cap` is in `1..=N`; `min_p` is in `[0, 1]`.
 fn sample_pool<const N: usize>(
@@ -7783,8 +7843,8 @@ fn sample_pool<const N: usize>(
     let top_p = top_p.clamp(0.0, 1.0);
     let inv_temp = 1.0 / temperature;
 
-    // Single pass: find max AND top-N indices from raw logits simultaneously.
-    // Uses a fixed-size array (no heap alloc) with manual min-tracking.
+    // One gather pass ([`gather_pool`]): the max AND the top-N indices from
+    // raw logits, in fixed-size arrays (no heap alloc).
     //
     // FINITE GUARD (ported from sample_full_dist, the O1 fix): only finite
     // logits feed `max_logit` and the top-N set. A `+Inf` logit must not become
@@ -7794,30 +7854,7 @@ fn sample_pool<const N: usize>(
     // below, and if no finite mass survives we fall back to the NaN-safe argmax.
     let mut topk_val = [f32::NEG_INFINITY; N];
     let mut topk_idx = [0u32; N];
-    let mut min_pos = 0usize; // index of smallest element in topk
-    let mut min_val = f32::NEG_INFINITY;
-    let mut max_logit = f32::NEG_INFINITY;
-
-    for (i, &l) in logits.iter().enumerate() {
-        if !l.is_finite() {
-            continue;
-        }
-        if l > max_logit {
-            max_logit = l;
-        }
-        if l > min_val {
-            topk_val[min_pos] = l;
-            topk_idx[min_pos] = i as u32;
-            // Find new min
-            min_val = f32::INFINITY;
-            for j in 0..N {
-                if topk_val[j] < min_val {
-                    min_val = topk_val[j];
-                    min_pos = j;
-                }
-            }
-        }
-    }
+    let max_logit = gather_pool(logits, &mut topk_val, &mut topk_idx);
 
     // Softmax only the N candidates (temperature-scaled). FINITE GUARD: a slot
     // still holding NEG_INFINITY (fewer than N finite logits) or a non-
@@ -8300,6 +8337,82 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-pass replacement gather `gather_pool` must reproduce slot for
+    /// slot (values, ids, slot order, tie choice) and its max, bit for bit.
+    fn gather_pool_reference(logits: &[f32], n: usize) -> (Vec<f32>, Vec<u32>, f32) {
+        let (mut vals, mut idx) = (vec![f32::NEG_INFINITY; n], vec![0u32; n]);
+        let (mut min_pos, mut min_val, mut max_logit) = (0, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (i, &l) in logits.iter().enumerate() {
+            if !l.is_finite() {
+                continue;
+            }
+            if l > max_logit {
+                max_logit = l;
+            }
+            if l > min_val {
+                vals[min_pos] = l;
+                idx[min_pos] = i as u32;
+                min_val = f32::INFINITY;
+                for (j, &v) in vals.iter().enumerate() {
+                    if v < min_val {
+                        min_val = v;
+                        min_pos = j;
+                    }
+                }
+            }
+        }
+        (vals, idx, max_logit)
+    }
+
+    #[test]
+    fn gather_pool_matches_sequential_replacement() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for len in [1usize, 19, 20, 63, 64, 65, 200, 255, 256, 257, 4099, 70_000] {
+            // Continuous, then coarsely quantized (many ties) logits.
+            let row: Vec<f32> = (0..len)
+                .map(|_| (next() >> 40) as f32 / 1e6 - 8.0)
+                .collect();
+            rows.push(row.iter().map(|v| (v * 2.0).round() / 2.0).collect());
+            rows.push(row);
+        }
+        let mut asc: Vec<f32> = (0..5000).map(|i| i as f32 * 1e-3).collect();
+        rows.push(asc.clone());
+        asc.reverse();
+        rows.push(asc);
+        rows.push(vec![3.0; 300]);
+        let mut special: Vec<f32> = (0..1000).map(|i| ((i * 37) % 101) as f32 - 50.0).collect();
+        for (i, v) in [
+            (5, f32::NAN),
+            (70, f32::INFINITY),
+            (71, f32::NEG_INFINITY),
+            (900, 49.0),
+        ] {
+            special[i] = v;
+        }
+        special[130] = -0.0;
+        special[131] = 0.0;
+        rows.push(special);
+        rows.push(vec![f32::NAN; 130]);
+        for row in &rows {
+            for n in [CPU_SAMPLE_LEGACY_POOL, CPU_SAMPLE_WIDE_POOL] {
+                let (rv, ri, rm) = gather_pool_reference(row, n);
+                let (mut vals, mut idx) = (vec![f32::NEG_INFINITY; n], vec![0u32; n]);
+                let max = gather_pool(row, &mut vals, &mut idx);
+                assert_eq!(max.to_bits(), rm.to_bits(), "max, len {}", row.len());
+                assert_eq!(idx, ri, "ids, len {} pool {n}", row.len());
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&vals), bits(&rv), "vals, len {} pool {n}", row.len());
+            }
+        }
+    }
 
     #[test]
     fn qwen3_flash_mode_policy_matches_rdna_generation() {

@@ -193,10 +193,10 @@ static __device__ __forceinline__ void gemv_q8_0_k2560_staged_rows_body(
     const float* __restrict__ x,
     float* __restrict__ y,
     int M,
-    int rows
+    int rows,
+    int row
 ) {
     __shared__ __align__(16) unsigned int staged_row[680];
-    const int row = blockIdx.x;
     if (row >= M) return;
     const int tid = threadIdx.x;
     const unsigned int* src = reinterpret_cast<const unsigned int*>(A_q8 + (size_t)row * 2720);
@@ -223,7 +223,28 @@ extern "C" __global__ void gemv_q8_0_k2560_staged_rows(
     int M,
     int rows
 ) {
-    gemv_q8_0_k2560_staged_rows_body(A_q8, x, y, M, rows);
+    gemv_q8_0_k2560_staged_rows_body(A_q8, x, y, M, rows, (int)blockIdx.x);
+}
+
+// Two K = 2560 matrices that read the same activation rows (the few-row
+// verify's shared-expert gate and up) in one launch: blocks [0, M0) run
+// matrix 0, blocks [M0, M0 + M1) matrix 1. Same body, so every row is
+// bitwise the single-matrix kernel's.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q8_0_k2560_staged_rows_x2(
+    const unsigned char* __restrict__ A0,
+    float* __restrict__ y0,
+    int M0,
+    const unsigned char* __restrict__ A1,
+    float* __restrict__ y1,
+    int M1,
+    const float* __restrict__ x,
+    int rows
+) {
+    const bool second = (int)blockIdx.x >= M0;
+    gemv_q8_0_k2560_staged_rows_body(
+        second ? A1 : A0, x, second ? y1 : y0, second ? M1 : M0, rows,
+        second ? (int)blockIdx.x - M0 : (int)blockIdx.x);
 }
 
 // gemv_q8_0_k2560_staged_rows over many `tile`-row tiles in one launch (prompt
@@ -243,7 +264,7 @@ extern "C" __global__ void gemv_q8_0_k2560_staged_rows_tiled(
     const int first = (int)blockIdx.y * tile;
     const int n = rows - first < tile ? rows - first : tile;
     gemv_q8_0_k2560_staged_rows_body(
-        A_q8, x + (size_t)first * 2560, y + (size_t)first * M, M, n);
+        A_q8, x + (size_t)first * 2560, y + (size_t)first * M, M, n, (int)blockIdx.x);
 }
 
 __launch_bounds__(64)

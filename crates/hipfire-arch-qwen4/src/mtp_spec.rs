@@ -596,8 +596,14 @@ fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
 /// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
 /// 8 ~98) plus ~2.7 ms per draft step.
 const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
-/// Per-window decay of the per-depth agreement counts.
-const MTP_AGREEMENT_DECAY: f32 = 0.875;
+/// Per-window decay of the per-depth agreement counts, and of the AR floor's
+/// measured window costs and n-gram yield history (~30-window memory). The
+/// floor retires a request to AR, stickily, once no native route's measured
+/// cost per expected token beats AR. With an ~8-window memory (0.875) an
+/// early run of rejections or one slow window retired requests that native
+/// MTP was winning: on sampled HumanEval/0-9, /1 and /6 retired in every run.
+/// Decaying only the agreement at 0.97 still retired /6 in every run.
+const MTP_AGREEMENT_DECAY: f32 = 0.97;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
 const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
 /// Per-window relaxation of a depth the window did not compare toward

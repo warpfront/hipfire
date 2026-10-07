@@ -18769,6 +18769,69 @@ impl Gpu {
         })
     }
 
+    /// [`Gpu::gemv_q8_0_staged_rows`] (K = 2560) of two matrices that read
+    /// the same `rows` activation rows, in one launch; each output row is
+    /// bitwise the single-matrix kernel's. Few-row verify, shared gate/up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_k2560_staged_rows_x2(
+        &mut self,
+        a0: &GpuTensor,
+        y0: &GpuTensor,
+        m0: usize,
+        a1: &GpuTensor,
+        y1: &GpuTensor,
+        m1: usize,
+        x: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        if !self.gemv_q8_0_staged_rows_supported(2560, rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_k2560_staged_rows_x2 shape",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_k2560_staged_rows_x2";
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
+        let (a0_ptr, y0_ptr, a1_ptr, y1_ptr) = (
+            a0.buf.as_ptr(),
+            y0.buf.as_ptr(),
+            a1.buf.as_ptr(),
+            y1.buf.as_ptr(),
+        );
+        let x_ptr = x.buf.as_ptr();
+        let (m0_val, m1_val, rows_val) = (m0 as i32, m1 as i32, rows as i32);
+        let mut params = [
+            &a0_ptr as *const _ as *mut c_void,
+            &y0_ptr as *const _ as *mut c_void,
+            &m0_val as *const _ as *mut c_void,
+            &a1_ptr as *const _ as *mut c_void,
+            &y1_ptr as *const _ as *mut c_void,
+            &m1_val as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(m0 + m1) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a0_ptr);
+                b.push_ptr(y0_ptr);
+                b.push_i32(m0_val);
+                b.push_ptr(a1_ptr);
+                b.push_ptr(y1_ptr);
+                b.push_i32(m1_val);
+                b.push_ptr(x_ptr);
+                b.push_i32(rows_val);
+                b
+            },
+        )
+    }
+
     /// [`Gpu::gemv_q8_0_staged_rows`]'s K = 2560 kernel over any `rows >= 1`
     /// activation rows (x row stride 2560, y row stride M) in one launch of
     /// grid `[m, ceil(rows / 8)]`: each block stages its weight row once and

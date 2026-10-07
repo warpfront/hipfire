@@ -3138,6 +3138,70 @@ mod tests {
         );
     }
 
+    /// The two-matrix K = 2560 Q8 row launch must write each matrix's rows
+    /// bitwise as its own `gemv_q8_0_staged_rows` launch does.
+    #[test]
+    fn q8_k2560_staged_rows_x2_is_bitwise_two_launches() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const K: usize = 2560;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut matrix = |m: usize| {
+            let mut bytes = vec![0u8; m * K / 32 * 34];
+            for block in bytes.chunks_exact_mut(34) {
+                let scale = 0x1C00u16 + (next() % 0x0800) as u16;
+                block[..2].copy_from_slice(&scale.to_le_bytes());
+                for b in &mut block[2..] {
+                    *b = next() as u8;
+                }
+            }
+            gpu.upload_raw(&bytes, &[bytes.len()]).expect("q8 matrix")
+        };
+        let (m0, m1) = (640usize, 640usize);
+        let (a0, a1) = (matrix(m0), matrix(m1));
+        if !gpu.gemv_q8_0_staged_rows_supported(K, 3) {
+            eprintln!("skip: staged rows unsupported on this arch");
+            return;
+        }
+        for rows in 2..=8usize {
+            let x: Vec<f32> = (0..rows * K)
+                .map(|i| ((i * 2_654_435_761) % 8191) as f32 / 4096.0 - 1.0)
+                .collect();
+            let x = gpu.upload_f32(&x, &[rows * K]).expect("x");
+            let outs: Vec<GpuTensor> = (0..4)
+                .map(|i| {
+                    gpu.zeros(&[rows * if i % 2 == 0 { m0 } else { m1 }], DType::F32)
+                        .expect("y")
+                })
+                .collect();
+            gpu.gemv_q8_0_staged_rows(&a0, &x, &outs[0], m0, K, rows)
+                .expect("single 0");
+            gpu.gemv_q8_0_staged_rows(&a1, &x, &outs[1], m1, K, rows)
+                .expect("single 1");
+            gpu.gemv_q8_0_k2560_staged_rows_x2(&a0, &outs[2], m0, &a1, &outs[3], m1, &x, rows)
+                .expect("x2");
+            for (single, paired) in [(&outs[0], &outs[2]), (&outs[1], &outs[3])] {
+                let a = gpu.download_f32(single).expect("download");
+                let b = gpu.download_f32(paired).expect("download");
+                assert!(a.iter().any(|v| *v != 0.0));
+                let differing = a
+                    .iter()
+                    .zip(&b)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count();
+                assert_eq!(differing, 0, "x2 differs in {differing} cells, rows={rows}");
+            }
+        }
+    }
+
     /// H8a: the BF16-row combine started from +0.0 (`initial_zero`) must leave
     /// a dirty target bytewise as the zero-filled target the unchanged symbol
     /// accumulates into, with dead (-1) and duplicate routes and ragged tokens.

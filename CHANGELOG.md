@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Flash-Next performance
+- **Qwen3.8-Flash-Next (Qwen4) sampled MTP decode: HumanEval/0–9 with the Qwen card sampler (T0.7 / top_p 0.8 / top_k 20 / presence 1.5, thinking off) goes from 40.1 to 51.9 tok/s on Strix Halo (+29 %).** The changes:
+  - The per-depth draft-agreement decay goes 0.875 → 0.97 (a window memory of ~30 instead of ~8); the same constant decays the AR floor's measured window costs and the n-gram yield history. The floor prices each native depth by its measured cost over `expected_emitted(agreement)` and retires a request to AR, stickily, once no native route beats AR. With the short memory an early run of rejections, or one slow window, was enough to retire a request native MTP was winning. On v0.4.1, HumanEval/1 and /6 retired in every run (τ 0.03, ~32 tok/s AR for the rest of the request). At 0.97 they stay on MTP; in 14 runs at 0.97 one request (HumanEval/1) retired once. Mean τ goes 1.58 → 1.91. The emitted stream is still AR's in distribution; only the route and depth choice change.
+  - `llama::gather_pool`, the pool gather of the CPU AR sampler and of `SparseDist::build_from_logits`, skips 256-logit chunks whose lane-wise maximum cannot enter the pool. Slot order, tie choice and the maximum are those of the sequential gather, and a unit test pins them bit for bit. A 248K-vocab verify row's distribution went from ~1.4 ms to ~40 µs of host time.
+  - A live (not recorded, not captured) `indexed_attention_pool_rope` launch covers only the active blocks instead of the pooled capacity. At `max_seq` 262144 the masked workgroups cost ~100 µs per launch. Recorded and captured launches keep the position-independent bound.
+  - A 2–8-row verify merges two launch pairs per layer: the router with the BF16 shared selector (one `gemv_bf16_xf32_x4_rows`), and the Q8 shared gate with up (the new `gemv_q8_0_k2560_staged_rows_x2`). A GPU unit test pins the merged Q8 launch bit for bit against two single launches.
+  - Measured on Strix Halo (gfx1151), canonical GPTQ3 artifact, fresh `hipfire serve` per run, `max_seq` 262144, seed 123, one warm pass and one measured pass, decode (n−1)/time. Cumulative means: v0.4.1 40.1 (2 runs), + gather 43.5 (2), + QSA grid 45.0 (2), + launch merges 44.7 (2), + decay 51.6 (2). Final stack 51.7 / 51.3 / 52.3 / 52.2 / 51.5 / 52.4 (six runs, mean 51.9). Ablations against the final stack: without the launch merges 51.5 / 50.4 / 51.7. With the agreement decay at 0.97 but the floor's cost decay left at 0.875, HumanEval/6 still retired in every run (48.3 / 49.4 / 49.5). Adding a re-measured static window-cost table changed nothing, so it is not included: the floor's measured costs supersede it. All runs: 10/10 answers finish on `stop` and pass their HumanEval tests.
+
 ## v0.4.1 — 2026-10-07
 
 ### Release summary

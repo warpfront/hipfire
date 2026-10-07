@@ -3989,7 +3989,16 @@ fn indexed_attention_pool_rope_impl(
             ),
         ));
     }
-    let block_grid = checked_u32(p.grid_bound, "QSA pool/RoPE block grid")?;
+    // A recorded or captured launch keeps the position-independent bound; a
+    // live one needs only the active blocks (the kernel masks the rest, so
+    // the output is the same). At a 262144-token capacity the masked
+    // workgroups alone cost ~100 µs per launch.
+    let live_grid = if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+        p.grid_bound
+    } else {
+        p.block_count
+    };
+    let block_grid = checked_u32(live_grid, "QSA pool/RoPE block grid")?;
     let dim_grid = blocks(p.index_dim)?;
     if p.raw_keys.numel() < raw_elements || p.pooled.numel() < pooled_elements {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
