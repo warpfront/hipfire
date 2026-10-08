@@ -48,7 +48,8 @@
 //! into the step representation.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
@@ -62,13 +63,42 @@ use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{GemvInput, Step};
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 
-/// Cached `memory.offload_exec == Cpu`, mirroring the `forward_lowered_enabled`
-/// precedent: resolved once from the process snapshot, never re-read per step.
-pub fn cpu_exec_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        hipfire_config::memory::offload_exec() == hipfire_config::memory::OffloadExec::Cpu
+/// `memory.offload_exec` resolved once from the process snapshot, mirroring the
+/// `forward_lowered_enabled` precedent: read once, never per step.
+///
+/// One cached snapshot backs both predicates below, so the mode is resolved
+/// exactly once for the process rather than once per boolean derived from it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostExecMode {
+    Pcie,
+    Cpu,
+    Passback,
+}
+
+fn host_exec_mode() -> HostExecMode {
+    static MODE: LazyLock<HostExecMode> = LazyLock::new(|| {
+        match hipfire_config::memory::offload_exec() {
+            hipfire_config::memory::OffloadExec::Cpu => HostExecMode::Cpu,
+            hipfire_config::memory::OffloadExec::Passback => HostExecMode::Passback,
+            hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
+        }
     });
-    *ENABLED
+    *MODE
+}
+
+/// `memory.offload_exec` executes some or all of a spilled step host-side
+/// (`cpu` or `passback`), so the CPU multiplies its weights
+/// ([`passback_enabled`] distinguishes the split form). Every host-exec
+/// mechanism in this module keys on this predicate, so both modes are covered
+/// without renaming a call site.
+pub fn cpu_exec_enabled() -> bool {
+    host_exec_mode() != HostExecMode::Pcie
+}
+
+/// `memory.offload_exec == passback`: the CPU runs a spilled step and hands part
+/// of its output rows back to the GPU ([`crate::offload_split`]).
+pub fn passback_enabled() -> bool {
+    host_exec_mode() == HostExecMode::Passback
 }
 
 /// (steps executed on the CPU, host-mapped steps that stayed on the GPU).
@@ -81,11 +111,135 @@ pub fn cpu_exec_enabled() -> bool {
 static CPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 static HOST_MAPPED_GPU_STEPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Cumulative wall time spent *inside* CPU-executed steps, entry to return: the
+/// D2H drain, the multiplication, the H2D. Paired with [`CPU_STEPS`] for the
+/// GPU-idle accounting in [`report_idle`].
+///
+/// A pass-back *split* step is deliberately NOT charged here: its wall contains
+/// real GPU work, so folding it in would inflate the "GPU-idle lower bound" that
+/// [`report_idle`] documents. Split steps have their own counters below.
+static CPU_STEP_WALL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Pass-back split steps: how many, how many of their output rows went to the
+/// GPU, and their total wall. Counted separately from [`CPU_STEPS`] for the
+/// reason above; [`split_counters`] is the reader.
+static SPLIT_STEPS: AtomicUsize = AtomicUsize::new(0);
+static SPLIT_GPU_ROWS: AtomicU64 = AtomicU64::new(0);
+static SPLIT_WALL_NS: AtomicU64 = AtomicU64::new(0);
+
 pub fn cpu_exec_counters() -> (usize, usize) {
     (
         CPU_STEPS.load(Ordering::Relaxed),
         HOST_MAPPED_GPU_STEPS.load(Ordering::Relaxed),
     )
+}
+
+/// `(split steps, rows handed to the GPU)`.
+pub fn split_counters() -> (usize, u64) {
+    (
+        SPLIT_STEPS.load(Ordering::Relaxed),
+        SPLIT_GPU_ROWS.load(Ordering::Relaxed),
+    )
+}
+
+/// Which engine(s) executed a step, for [`finish_step`]'s accounting.
+#[derive(Clone, Copy)]
+pub(crate) enum HostExec {
+    /// The whole step ran on the CPU (`memory.offload_exec=cpu`).
+    Cpu,
+    /// A pass-back split: the GPU ran the first `gpu_rows` output rows, the CPU
+    /// the rest.
+    Split { gpu_rows: usize },
+}
+
+/// Wall-clock partition of a decode run into CPU-step time and everything else.
+///
+/// A CPU-executed step is a host sync point: its D2H drains the stream, the
+/// multiplication and the H2D run on the host, so the compute units execute
+/// nothing for its whole duration — *provided* nothing else is using the device.
+/// Over a decode-only span (prefill is GPU-side and never enters the seam) the
+/// fraction of the wall spent inside those steps is therefore a **lower bound**
+/// on the GPU's idle fraction, and the headroom a "hand some of the spilled
+/// work back to an idle GPU" scheme would be spending. `HIPFIRE_CPU_EXEC_TRACE=1`
+/// prints it per window; it is not a correctness signal and nothing depends on
+/// it.
+#[derive(Clone, Copy)]
+struct IdleWindow {
+    anchor: Instant,
+    cpu_ns: u64,
+    steps: usize,
+    split_steps: usize,
+    split_rows: u64,
+    split_wall_ns: u64,
+}
+
+/// `None` until the first report; a window is the span between two consecutive
+/// reports. Windows rather than a cumulative ratio because `hipfire bench
+/// --runs N` decodes several times inside one process and the gaps between runs
+/// are neither GPU-idle nor CPU-step time — a cumulative ratio would dilute
+/// every window that spanned one.
+static IDLE_WINDOW: Mutex<Option<IdleWindow>> = Mutex::new(None);
+
+/// Print the CPU-step share of the wall since the last report. Called from
+/// [`trace_step`] at the same doubling schedule as the per-shape lines, so the
+/// last windows of a run cover the bulk of it and the cold first steps sit in
+/// the first, discarded, window.
+fn report_idle(steps: usize) {
+    let total_cpu_ns = CPU_STEP_WALL_NS.load(Ordering::Relaxed);
+    let (total_split_steps, total_split_rows) = split_counters();
+    let total_split_wall = SPLIT_WALL_NS.load(Ordering::Relaxed);
+    let Ok(mut window) = IDLE_WINDOW.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let Some(previous) = window.as_mut() else {
+        *window = Some(IdleWindow {
+            anchor: now,
+            cpu_ns: total_cpu_ns,
+            steps,
+            split_steps: total_split_steps,
+            split_rows: total_split_rows,
+            split_wall_ns: total_split_wall,
+        });
+        return;
+    };
+    let span = now.duration_since(previous.anchor);
+    let cpu_ns = total_cpu_ns.saturating_sub(previous.cpu_ns);
+    let window_steps = steps - previous.steps;
+    let split_steps = total_split_steps.saturating_sub(previous.split_steps);
+    let split_rows = total_split_rows.saturating_sub(previous.split_rows);
+    let split_wall_ns = total_split_wall.saturating_sub(previous.split_wall_ns);
+    previous.anchor = now;
+    previous.cpu_ns = total_cpu_ns;
+    previous.steps = steps;
+    previous.split_steps = total_split_steps;
+    previous.split_rows = total_split_rows;
+    previous.split_wall_ns = total_split_wall;
+    let span_ns = span.as_nanos() as u64;
+    if span_ns == 0 {
+        return;
+    }
+    let per_step_us = cpu_ns as f64 / window_steps.max(1) as f64 / 1e3;
+    // A split step's wall contains GPU work, so it is excluded from the CPU-idle
+    // numerator (see CPU_STEP_WALL_NS) — but the window must not hide it either,
+    // hence the suffix.
+    let split_note = if split_steps == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {split_steps} split steps ({split_rows} rows on GPU, {:.0}ms split wall) not \
+             counted as CPU-idle",
+            split_wall_ns as f64 / 1e6,
+        )
+    };
+    eprintln!(
+        "cpu exec: idle {:.1}% — window ending at step {steps} covers {window_steps} steps: \
+         {:.0}ms wall, {:.0}ms on CPU ({per_step_us:.0}us CPU/step) \
+         — GPU-idle lower bound, see report_idle{split_note}",
+        100.0 * cpu_ns as f64 / span_ns as f64,
+        span_ns as f64 / 1e6,
+        cpu_ns as f64 / 1e6,
+    );
 }
 
 /// Per-step wall-time split, in nanoseconds: device→host, the GEMV itself,
@@ -102,7 +256,17 @@ struct StepStats {
     calls: u64,
     d2h_ns: u64,
     gemv_ns: u64,
+    /// Whole-CPU steps: the blocking H2D. Split steps: the join (the blocking H2D,
+    /// which in a split also carries the GPU arm's wait).
     h2d_ns: u64,
+    /// The shape's kind, latched by its first call: a shape either always splits
+    /// or never does, because the decision is a property of the shape and the
+    /// scheduler's share is clamped away from 0 and 1.
+    split: bool,
+    /// Split-only: rows the CPU arm multiplied, and rows the GPU arm took, summed
+    /// over the shape's calls so the throughput figures below can be derived.
+    split_cpu_rows: u64,
+    split_gpu_rows: u64,
 }
 
 /// `(quant, m, k, rotated, residual, awq)` → running per-shape totals.
@@ -194,13 +358,13 @@ pub fn reject_cpu_exec_under_redline(
     replay_enabled: bool,
 ) -> Result<(), String> {
     if cpu_exec_redline_conflict(cpu_exec_enabled(), i_gpu_start, replay_enabled) {
-        return Err(
-            "memory.offload_exec=cpu conflicts with the retained-replay (Redline) backend: the \
+        let mode = hipfire_config::memory::offload_exec();
+        return Err(format!(
+            "memory.offload_exec={mode} conflicts with the retained-replay (Redline) backend: the \
              replay tape records GPU launches and does not execute the CPU-executed steps, so a \
              replayed route would compute from stale activations. Set memory.offload_exec=pcie \
              (HIPFIRE_OFFLOAD_EXEC=pcie) or replay.backend=hip"
-                .to_string(),
-        );
+        ));
     }
     Ok(())
 }
@@ -211,7 +375,11 @@ pub fn reject_cpu_exec_under_redline(
 pub fn log_capture_disabled_once() {
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| {
-        eprintln!("cpu exec: hipGraph capture disabled (CPU-executed steps present)");
+        if passback_enabled() {
+            eprintln!("passback: hipGraph capture disabled (host-executed steps present)");
+        } else {
+            eprintln!("cpu exec: hipGraph capture disabled (CPU-executed steps present)");
+        }
     });
 }
 
@@ -219,8 +387,8 @@ pub fn log_capture_disabled_once() {
 ///
 /// `rotate_x` must be `true` exactly when the launcher would self-rotate a `Raw`
 /// input for this dtype (i.e. `dtype_rotation_plan(w.dtype) == FwhtG256`), which
-/// [`RotationPlan`] is the single source of truth for; [`run_gemv`] derives it
-/// so no caller has to.
+/// [`RotationPlan`] is the single source of truth for; the dispatch seam derives
+/// it so no caller has to.
 pub fn run_host_mapped_gemv(
     gpu: &Gpu,
     w: &WeightRef,
@@ -228,27 +396,25 @@ pub fn run_host_mapped_gemv(
     rotate_input: bool,
     out: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    let q = host_mapped_quant(gpu, w)?;
-    let (m, k) = (w.m, w.k);
-    let bytes = gpu
-        .host_bytes(w.buf)
-        .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let (x_host, d2h_ns) = prepare_activation(gpu, w, x, rotate_input)?;
-    let mut y = vec![0.0f32; m];
-    let t1 = Instant::now();
-    gemv(q, bytes, m, k, &x_host, &mut y);
-    let gemv_ns = t1.elapsed().as_nanos() as u64;
-    let t2 = Instant::now();
-    upload_f32(gpu, out, &y)?;
-    let h2d_ns = t2.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(
-        q,
+    let plan = CpuStep {
+        w,
+        x,
+        rotate_input,
+        out,
+        residual: None,
+    };
+    let step_start = Instant::now();
+    let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    finish_step(
+        arm.q,
         w,
         rotate_input,
         false,
+        HostExec::Cpu,
+        step_start,
         StepTiming {
-            d2h_ns,
+            d2h_ns: arm.d2h_ns,
             gemv_ns,
             h2d_ns,
         },
@@ -268,7 +434,10 @@ pub fn run_host_mapped_gemv(
 ///   launcher *checks* that via the rotation tag; a CPU step cannot, which is
 ///   the one semantic gap this path has — see the module docs).
 /// * FWHT (`rotate_input`): unless the input arrived pre-rotated.
-fn prepare_activation(
+///
+/// `pub(crate)` because the pass-back's seeding probe reuses the exact activation
+/// transform the real step will apply, rather than re-deriving it.
+pub(crate) fn prepare_activation(
     gpu: &Gpu,
     w: &WeightRef,
     x: &GpuTensor,
@@ -286,6 +455,105 @@ fn prepare_activation(
     Ok((host, t0.elapsed().as_nanos() as u64))
 }
 
+/// The CPU arm of a host-executed step: every blocking device read already done
+/// ([`cpu_arm_prepare`]), the multiply and the blocking write-back still pending
+/// ([`cpu_arm_finish`]).
+///
+/// The two phases exist so a pass-back split can interleave a GPU launch
+/// *between* them: a blocking D2H issued after that launch would drain it, so the
+/// read must complete first and the write is the join (stream-ordered after the
+/// GPU arm on the same stream). `memory.offload_exec=cpu` runs the two back to
+/// back, which is the same sequence of device operations as the single-shot form
+/// it replaced.
+pub(crate) struct CpuArm<'a> {
+    /// The weight's CPU decoder.
+    pub(crate) q: CpuQuant,
+    /// Whether the activation was rotated (and AWQ-divided) — i.e. whether the
+    /// launcher would have self-rotated this input. Mirrored here so the
+    /// pass-back can hand it to [`finish_step`] without keeping the plan alive.
+    pub(crate) rotate_input: bool,
+    /// Elapsed time of the blocking reads: the activation, plus the accumulator
+    /// when the step is a residual form. The trace's and the scheduler's `d2h`.
+    pub(crate) d2h_ns: u64,
+    w: &'a WeightRef<'a>,
+    /// The row range this arm multiplies.
+    rows: Range<usize>,
+    /// Where the result is written: the step's `out`, or its `residual` for the
+    /// residual form (a residual step never writes `out` — see the GemvResidual
+    /// arms in `steps.rs`).
+    target: &'a GpuTensor,
+    /// The activation for `rows`, already rotated and AWQ-divided exactly as the
+    /// launcher's rotate step would have done.
+    x_host: Vec<f32>,
+    /// The accumulator read back for the residual form, *before* the multiply, so
+    /// a concurrently executing GPU arm cannot race this read.
+    acc_host: Option<Vec<f32>>,
+}
+
+/// Phase one of the CPU arm: perform every blocking device read for `rows` and
+/// return the arm. MUST complete before any GPU arm of the same step is
+/// enqueued, because the reads drain the stream.
+pub(crate) fn cpu_arm_prepare<'a>(
+    gpu: &Gpu,
+    cpu: &CpuStep<'a>,
+    rows: Range<usize>,
+) -> Result<CpuArm<'a>, DispatchError> {
+    let q = host_mapped_quant(gpu, cpu.w)?;
+    let t0 = Instant::now();
+    let (x_host, _) = prepare_activation(gpu, cpu.w, cpu.x, cpu.rotate_input)?;
+    let acc_host = match cpu.residual {
+        Some(acc) => Some(download_f32(
+            gpu,
+            &acc.sub_offset(rows.start, rows.len()),
+            rows.len(),
+        )?),
+        None => None,
+    };
+    Ok(CpuArm {
+        q,
+        rotate_input: cpu.rotate_input,
+        d2h_ns: t0.elapsed().as_nanos() as u64,
+        w: cpu.w,
+        rows,
+        target: cpu.residual.unwrap_or(cpu.out),
+        x_host,
+        acc_host,
+    })
+}
+
+/// Phase two of the CPU arm: the multiply over `rows`, the residual add when
+/// there is one, and the blocking write-back. Returns `(gemv_ns, h2d_ns)`.
+///
+/// The write-back is the join of a pass-back split: same stream as the GPU arm, so
+/// it waits for it, and the two arms' rows are disjoint, so nothing else is
+/// needed. For a split step `h2d_ns` therefore also carries the GPU arm's wait,
+/// which is the trace's `join` figure.
+pub(crate) fn cpu_arm_finish(gpu: &Gpu, arm: &CpuArm<'_>) -> Result<(u64, u64), DispatchError> {
+    let rows = arm.rows.clone();
+    let bytes = gpu
+        .host_bytes(arm.w.buf)
+        .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
+    let row_bytes = crate::families::gemv::weight_row_bytes(arm.w)
+        .ok_or_else(|| cpu_err("weight byte length is not a whole number of rows"))?;
+    let w_rows = &bytes[rows.start * row_bytes..];
+    let mut y = vec![0.0f32; rows.len()];
+    let t1 = Instant::now();
+    gemv(arm.q, w_rows, rows.len(), arm.w.k, &arm.x_host, &mut y);
+    let gemv_ns = t1.elapsed().as_nanos() as u64;
+    let t2 = Instant::now();
+    let target = arm.target.sub_offset(rows.start, rows.len());
+    match arm.acc_host.as_ref() {
+        Some(acc_host) => {
+            let mut acc = acc_host.clone();
+            residual_add(&mut acc, &y);
+            upload_f32(gpu, &target, &acc)?;
+        }
+        None => upload_f32(gpu, &target, &y)?,
+    }
+    let h2d_ns = t2.elapsed().as_nanos() as u64;
+    Ok((gemv_ns, h2d_ns))
+}
+
 /// `acc += W · x` on the CPU, over a host-mapped weight — the residual form the
 /// fused down-projection kernels use (`WithSwiGLUResidual`, `WithResidual`).
 ///
@@ -298,35 +566,70 @@ pub fn run_host_mapped_gemv_residual(
     x: &GpuTensor,
     acc: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    let q = host_mapped_quant(gpu, w)?;
-    let (m, k) = (w.m, w.k);
+    // The fused down-projection this splits always feeds the CPU path an
+    // unrotated activation (the SiLU output), so it rotates when the dtype says
+    // the weights were encoded post-rotation — the same rule `run_step` derives
+    // from a `Raw` input.
     let rotate_input = dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
-    let bytes = gpu
-        .host_bytes(w.buf)
-        .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let (x_host, d2h_ns) = prepare_activation(gpu, w, x, rotate_input)?;
-    let mut y = vec![0.0f32; m];
-    let t1 = Instant::now();
-    gemv(q, bytes, m, k, &x_host, &mut y);
-    let gemv_ns = t1.elapsed().as_nanos() as u64;
-    let t2 = Instant::now();
-    let mut acc_host = download_f32(gpu, acc, m)?;
-    residual_add(&mut acc_host, &y);
-    upload_f32(gpu, acc, &acc_host)?;
-    let h2d_ns = t2.elapsed().as_nanos() as u64;
-    CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-    trace_step(
-        q,
+    let plan = CpuStep {
+        w,
+        x,
+        rotate_input,
+        out: acc,
+        residual: Some(acc),
+    };
+    let step_start = Instant::now();
+    let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    finish_step(
+        arm.q,
         w,
         rotate_input,
         true,
+        HostExec::Cpu,
+        step_start,
         StepTiming {
-            d2h_ns,
+            d2h_ns: arm.d2h_ns,
             gemv_ns,
             h2d_ns,
         },
     );
     Ok(())
+}
+
+/// Close out an executed step: count it, charge a whole-CPU step's wall time to
+/// the GPU-idle account, and feed the per-shape trace. One call site per executed
+/// step, so the counters and the trace can never disagree about how many ran.
+///
+/// A pass-back split step is counted in [`SPLIT_STEPS`]/[`SPLIT_GPU_ROWS`]/
+/// [`SPLIT_WALL_NS`] instead of [`CPU_STEPS`]/[`CPU_STEP_WALL_NS`], because its
+/// wall contains real GPU work and would otherwise inflate the CPU-idle lower
+/// bound [`report_idle`] documents.
+///
+/// `pub(crate)` so the pass-back's split step reports through the same single
+/// call site.
+pub(crate) fn finish_step(
+    q: CpuQuant,
+    w: &WeightRef,
+    rotated: bool,
+    residual: bool,
+    exec: HostExec,
+    step_start: Instant,
+    timing: StepTiming,
+) {
+    match exec {
+        HostExec::Cpu => {
+            CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+            CPU_STEP_WALL_NS
+                .fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        HostExec::Split { gpu_rows } => {
+            SPLIT_STEPS.fetch_add(1, Ordering::Relaxed);
+            SPLIT_GPU_ROWS.fetch_add(gpu_rows as u64, Ordering::Relaxed);
+            SPLIT_WALL_NS.fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    trace_step(q, w, rotated, residual, exec, timing);
 }
 
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
@@ -350,27 +653,16 @@ fn host_mapped_quant(gpu: &Gpu, w: &WeightRef) -> Result<CpuQuant, DispatchError
     })
 }
 
-/// Rotation disposition of a step's input. The distinction is load-bearing:
-/// `Raw` means "the launcher would rotate this", `Prerotated` means someone
-/// already did — rotating a `Prerotated` input again is a silent
-/// $\mathcal{R}^2$ error that still looks like plausible activations.
-enum CpuInput<'a> {
-    Raw(&'a GpuTensor),
-    Prerotated(&'a GpuTensor),
-}
-
-impl<'a> CpuInput<'a> {
-    fn tensor(&self) -> &'a GpuTensor {
-        match self {
-            CpuInput::Raw(t) | CpuInput::Prerotated(t) => t,
-        }
-    }
-}
-
 /// A host-mapped weight step that the CPU can execute.
 pub(crate) struct CpuStep<'a> {
     w: &'a WeightRef<'a>,
-    input: CpuInput<'a>,
+    x: &'a GpuTensor,
+    /// Whether the activation must be FWHT-rotated (and AWQ-divided) before the
+    /// multiply. Load-bearing: `true` means "the launcher would rotate this",
+    /// `false` means someone already did — rotating a pre-rotated input again is
+    /// a silent $\mathcal{R}^2$ error that still looks like plausible
+    /// activations.
+    rotate_input: bool,
     out: &'a GpuTensor,
     /// `Some` for `Step::GemvResidual`, which accumulates in place into the
     /// residual (never into `out` — see the GemvResidual arms in `steps.rs`).
@@ -397,12 +689,17 @@ pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>
     if !gpu.host_located(w.buf) || cpu_quant_for(w.dtype).is_none() {
         return None;
     }
+    // Mirror `GemvFamily::run_input`: a `Raw` input is rotated by the launcher
+    // *and only when* the dtype's plan is `FwhtG256`; a `Prerotated` input is
+    // never touched again.
+    let rotate_input = matches!(input, GemvInput::Raw(_))
+        && dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
     Some(CpuStep {
         w,
-        input: match input {
-            GemvInput::Raw(t) => CpuInput::Raw(t),
-            GemvInput::Prerotated(t) => CpuInput::Prerotated(t),
+        x: match input {
+            GemvInput::Raw(t) | GemvInput::Prerotated(t) => t,
         },
+        rotate_input,
         out,
         residual,
     })
@@ -417,25 +714,27 @@ pub(crate) fn reads_host_mapped_weight(gpu: &Gpu, step: &Step) -> bool {
     }
 }
 
-/// Execute a planned CPU step.
+/// Execute a planned CPU step, whole (`memory.offload_exec=cpu`).
+///
+/// The order is the observable contract: D2H x, [D2H acc], gemv, [add], H2D.
 pub(crate) fn run_step(gpu: &Gpu, plan: &CpuStep) -> Result<(), DispatchError> {
-    match plan.residual {
-        // The fused down-projection this splits always feeds the CPU path an
-        // unrotated activation (the SiLU output), so it rotates when the dtype
-        // says the weights were encoded post-rotation.
-        Some(residual) => run_host_mapped_gemv_residual(gpu, plan.w, plan.input.tensor(), residual),
-        // Mirror `GemvFamily::run_input`: a `Raw` input is rotated by the
-        // launcher *and only when* the dtype's plan is FwhtG256; a `Prerotated`
-        // input is never touched again.
-        None => run_host_mapped_gemv(
-            gpu,
-            plan.w,
-            plan.input.tensor(),
-            matches!(plan.input, CpuInput::Raw(_))
-                && dtype_rotation_plan(plan.w.dtype) == RotationPlan::FwhtG256,
-            plan.out,
-        ),
-    }
+    let step_start = Instant::now();
+    let arm = cpu_arm_prepare(gpu, plan, 0..plan.w.m)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    finish_step(
+        arm.q,
+        plan.w,
+        plan.rotate_input,
+        plan.residual.is_some(),
+        HostExec::Cpu,
+        step_start,
+        StepTiming {
+            d2h_ns: arm.d2h_ns,
+            gemv_ns,
+            h2d_ns,
+        },
+    );
+    Ok(())
 }
 
 /// Count a host-mapped step that is about to be launched on the GPU anyway.
@@ -475,10 +774,14 @@ fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> 
 }
 
 /// One step's own wall-time split, handed to [`trace_step`].
-struct StepTiming {
-    d2h_ns: u64,
-    gemv_ns: u64,
-    h2d_ns: u64,
+///
+/// For a pass-back split step `h2d_ns` is the *join* (the blocking H2D, which
+/// waits for the concurrently launched GPU arm), and `gemv_ns` is the CPU arm's
+/// multiply — which is what the scheduler's `observe` samples.
+pub(crate) struct StepTiming {
+    pub(crate) d2h_ns: u64,
+    pub(crate) gemv_ns: u64,
+    pub(crate) h2d_ns: u64,
 }
 
 /// Per-shape step accounting under `HIPFIRE_CPU_EXEC_TRACE=1`: one line per
@@ -495,7 +798,23 @@ struct StepTiming {
 /// The counters are the coverage signal: `host-mapped steps still on GPU` must be
 /// 0 for a model the CPU covers, so a shape that silently never reaches the seam
 /// shows up as a number rather than as a mystery.
-fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool, timing: StepTiming) {
+///
+/// A pass-back shape prints its own line instead (`split: …`): for it `join` is
+/// the blocking H2D, `copy + max(0, gpu_ns - cpu_ns)`. What the scheduler's
+/// controller reads is the join's excess over the shape's own **no-wait floor**
+/// (the smallest join seen), so `gpu samples` on that line says how often the
+/// GPU rate its share rests on was actually observed: zero means the share is
+/// still being pushed up because every join so far sat at the floor, and
+/// `gpu≥GB/s` is then a lower bound that says nothing about the real rate (which
+/// is why it is printed as a bound).
+fn trace_step(
+    q: CpuQuant,
+    w: &WeightRef,
+    rotated: bool,
+    residual: bool,
+    exec: HostExec,
+    timing: StepTiming,
+) {
     if hipfire_config::developer_var("HIPFIRE_CPU_EXEC_TRACE").is_err() {
         return;
     }
@@ -504,18 +823,76 @@ fn trace_step(q: CpuQuant, w: &WeightRef, rotated: bool, residual: bool, timing:
         return;
     };
     let stats = shapes.entry(key).or_default();
+    if stats.calls == 0 {
+        stats.split = matches!(exec, HostExec::Split { .. });
+    }
     stats.calls += 1;
     stats.d2h_ns += timing.d2h_ns;
     stats.gemv_ns += timing.gemv_ns;
     stats.h2d_ns += timing.h2d_ns;
+    if let HostExec::Split { gpu_rows } = exec {
+        stats.split_gpu_rows += gpu_rows as u64;
+        stats.split_cpu_rows += (w.m - gpu_rows) as u64;
+    }
     let stats = *stats;
+    // The GPU-idle window report rides the *global* step count's doubling
+    // schedule, so it exists even for a spill whose every shape is new — and a
+    // pure pass-back run still has a global step count (the splits).
+    let (on_cpu, on_gpu) = cpu_exec_counters();
+    let (splits, _) = split_counters();
+    let total = on_cpu + splits;
+    if total.is_power_of_two() {
+        report_idle(total);
+    }
     if !stats.calls.is_power_of_two() {
         return;
     }
     let (m, k) = (w.m, w.k);
-    let (on_cpu, on_gpu) = cpu_exec_counters();
     // ns -> ms, averaged over *this shape's* calls so far.
     let per_ms = |ns: u64| ns as f64 / 1e6 / stats.calls as f64;
+    if stats.split {
+        // The CPU arm runs while the GPU arm streams the *same* host pages: `cpu`
+        // is the contended rate and `gpu≥` the lower bound the controller samples
+        // (see `offload_split`). bytes/ns is GB/s numerically.
+        let row_bytes = (w.buf.buf.size() / w.m.max(1)) as f64;
+        let cpu_arm_ns = (stats.d2h_ns + stats.gemv_ns).max(1) as f64;
+        let whole_ns = (stats.d2h_ns + stats.gemv_ns + stats.h2d_ns).max(1) as f64;
+        let cpu_gbs = stats.split_cpu_rows as f64 * row_bytes / cpu_arm_ns;
+        let gpu_gbs = stats.split_gpu_rows as f64 * row_bytes / whole_ns;
+        let (share, control) = match crate::offload_split::shape_state(w.dtype, w.k) {
+            Some(s) => (
+                format!("{:.3}", s.share),
+                format!(
+                    " (gpu samples {}, floor={}, last waited={}, target={}, {} applied, {} reopens{})",
+                    s.gpu_samples,
+                    s.min_join_ns
+                        .map(|ns| format!("{:.2}ms", ns as f64 / 1e6))
+                        .unwrap_or_else(|| "—".into()),
+                    s.last_waited,
+                    s.last_target
+                        .map(|t| format!("{t:.3}"))
+                        .unwrap_or_else(|| "—".into()),
+                    s.applied,
+                    s.reopens,
+                    if s.frozen { ", frozen" } else { "" },
+                ),
+            ),
+            None => ("n/a".to_string(), String::new()),
+        };
+        eprintln!(
+            "split: step gemv m={m} k={k} quant={q:?} gpu_rows={:.0}/{m} share={share}{control} \
+             rotated={rotated} residual={residual} awq={} | {} calls | {total} steps ({splits} \
+             split), {on_gpu} host-mapped steps still on GPU | mean per split step: \
+             d2h={:.2}ms gemv={:.2}ms join={:.2}ms | cpu={cpu_gbs:.1}GB/s gpu\u{2265}{gpu_gbs:.1}GB/s",
+            stats.split_gpu_rows as f64 / stats.calls as f64,
+            w.awq_scale.is_some(),
+            stats.calls,
+            per_ms(stats.d2h_ns),
+            per_ms(stats.gemv_ns),
+            per_ms(stats.h2d_ns),
+        );
+        return;
+    }
     eprintln!(
         "cpu exec: step gemv m={m} k={k} quant={q:?} rotated={rotated} residual={residual} \
          awq={} | {} calls | {on_cpu} steps on CPU, {on_gpu} host-mapped steps still on GPU | \

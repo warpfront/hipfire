@@ -8,6 +8,10 @@
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::{qsa_score, qsa_select::{self, Kind, Spec}};
 
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
+
 const ARCH: Arch = Arch::Gfx1151;
 /// The host target stamped into the committed bundles (trailing hyphen).
 const HOST: &str = "host-x86_64-unknown-linux-gnu-";
@@ -162,6 +166,11 @@ mod toolchain {
     /// wait/hazard/barrier/window analyses of the linked ELF, obligation-free.
     #[test]
     fn module_passes_certification_for_its_symbol() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
         let (emitted, text, _) = bf16();
         for e in &emitted { ledger_replay::replay_waits(&e.s_text, ARCH).unwrap(); }
         let dir = std::env::temp_dir().join(format!("hipfire-isa-qsa-select-bf16-cert-{}", std::process::id()));

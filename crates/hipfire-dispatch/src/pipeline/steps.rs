@@ -5,6 +5,7 @@
 //! fusion table (all per-op fallback).
 
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::ops::Range;
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
@@ -976,7 +977,13 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
             if moe {
                 hooks.before_moe(gpu)?;
             }
-            cpu_exec::run_step(gpu, &plan)?;
+            // `memory.offload_exec=passback` may split this step across both
+            // engines; `Ok(false)` (the mode is off, or this shape is not
+            // splittable) leaves it wholly to the CPU, which is `cpu` mode's own
+            // route — never `pcie`.
+            if !crate::offload_split::run(gpu, ctx, &steps[i])? {
+                cpu_exec::run_step(gpu, &plan)?;
+            }
             if moe {
                 hooks.after_moe(gpu)?;
             }
@@ -1231,49 +1238,114 @@ fn launch_fused_qkv_with_bias<'a>(
     )
 }
 
-/// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
-/// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
-fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
-    match step {
-        Step::Gemv {
-            w,
-            input: GemvInput::Raw(x),
-            out,
-        } => {
-            let gemv = GEMV.get_or_init(GemvFamily::new);
-            gemv.run_auto(ctx, gpu, w, x, out)
+/// A step's row-range launch failed for a structural reason (not a kernel error).
+fn row_err(msg: &str) -> DispatchError {
+    DispatchError::Hip(format!("row-split launch: {msg}"))
+}
+
+/// The views a row-restricted launch needs: the weight's byte range, and the
+/// output (plus the residual, for the residual form) element ranges. Owned here
+/// so the borrows they back live for the whole launch, and built once per call.
+struct RowViews {
+    w: GpuTensor,
+    out: GpuTensor,
+    residual: Option<GpuTensor>,
+}
+
+impl RowViews {
+    /// `rows` must be a sub-range of the weight's rows; the caller refuses any
+    /// weight whose byte length is not an exact `m * row_bytes` (padded strides),
+    /// because the view math below depends on it.
+    fn build(step: &Step, rows: Range<usize>) -> Result<Self, DispatchError> {
+        let (w, out, residual) = match step {
+            Step::Gemv { w, out, .. } => (*w, *out, None),
+            Step::GemvResidual {
+                w, residual, out, ..
+            } => (*w, *out, Some(*residual)),
+            _ => {
+                return Err(row_err(
+                    "only GEMV and GEMV-with-residual steps have independent output rows",
+                ))
+            }
+        };
+        let row_bytes = crate::families::gemv::weight_row_bytes(w)
+            .ok_or_else(|| row_err("weight byte length is not a whole number of rows"))?;
+        Ok(RowViews {
+            w: GpuTensor {
+                buf: w
+                    .buf
+                    .buf
+                    .byte_view(rows.start * row_bytes, rows.len() * row_bytes),
+                shape: vec![rows.len(), w.k],
+                dtype: w.buf.dtype,
+            },
+            out: out.sub_offset(rows.start, rows.len()),
+            residual: residual.map(|t| t.sub_offset(rows.start, rows.len())),
+        })
+    }
+}
+
+/// `w`'s metadata with a row view's buffer and row count: the weight as the GPU
+/// arm of a split step sees it. `m` must follow the view, not the whole tensor,
+/// and `row_stride` is 0 because the view starts exactly at a row boundary (the
+/// caller refuses a padded stride rather than trusting this).
+fn restricted_weight<'a>(w: &WeightRef<'a>, view: &'a GpuTensor) -> WeightRef<'a> {
+    let base: WeightRef<'a> = *w;
+    WeightRef {
+        buf: view,
+        m: view.shape[0],
+        row_stride: 0,
+        ..base
+    }
+}
+
+/// Launch one weight-reading step, optionally over a row range.
+///
+/// The four shapes here are the four `Gemv`/`GemvResidual` input forms: `Raw`
+/// (the family self-rotates) and `Prerotated` (the producer already rotated),
+/// each with and without an in-place residual accumulate. With `views: Some`,
+/// every one of them runs against the row-restricted twins of the weight, output
+/// and residual.
+fn launch_gemv<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    w: &WeightRef<'a>,
+    input: &GemvInput<'a>,
+    out: &'a GpuTensor,
+    residual: Option<&'a GpuTensor>,
+    views: Option<&'a RowViews>,
+) -> Result<(), DispatchError> {
+    let gemv = GEMV.get_or_init(GemvFamily::new);
+    // Shadow the step's tensors with the row views when there are any: `w_row`
+    // outlives this match so the borrow below is sound.
+    let w_row;
+    let (w, out, residual) = match views {
+        Some(v) => {
+            w_row = restricted_weight(w, &v.w);
+            (&w_row, &v.out, v.residual.as_ref())
         }
-        Step::Gemv {
-            w,
-            input: GemvInput::Prerotated(xr),
-            out,
-        } => {
-            let gemv = GEMV.get_or_init(GemvFamily::new);
-            gemv.run(
-                ctx,
-                gpu,
-                &GemvParams {
-                    w,
-                    x: xr,
-                    y: out,
-                    variant: GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-        }
-        Step::GemvResidual {
-            w,
-            input: GemvInput::Prerotated(xr),
-            residual,
-            out: _,
-        } => {
+        None => (w, out, residual),
+    };
+    match (input, residual) {
+        (GemvInput::Raw(x), None) => gemv.run_auto(ctx, gpu, w, x, out),
+        (GemvInput::Prerotated(xr), None) => gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w,
+                x: xr,
+                y: out,
+                variant: GemvVariant::Prerotated,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        ),
+        (GemvInput::Prerotated(xr), Some(residual)) => {
             // MQ-family with a fused residual kernel: writes `residual` in-place via
             // GemvVariant::WithResidual. `out` is NOT written — it is scratch for the
             // fallback path only (see the Raw arm below). Nothing downstream reads
             // `out` after this step in either qwen2 or llama decode paths.
-            let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run(
                 ctx,
                 gpu,
@@ -1288,19 +1360,25 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 },
             )
         }
-        Step::GemvResidual {
-            w,
-            input: GemvInput::Raw(x),
-            residual,
-            out,
-        } => {
+        (GemvInput::Raw(x), Some(residual)) => {
+            // A row-restricted raw-residual step would need a row-offset scratch and
+            // a row-offset accumulate for the non-fused fallback below; refuse rather
+            // than launch a whole-tensor add into a row view. (The pass-back's gate
+            // refuses this shape for the same reason — this is the belt to that
+            // brace.) `views == None` is the ordinary whole-tensor path.
+            if views.is_some() && KernelKey::for_gemv_residual(w.dtype).is_err() {
+                return Err(row_err(
+                    "GemvResidual with a Raw input and no fused residual kernel cannot be \
+                     row-restricted (its fallback scratch and accumulate are whole-tensor)",
+                ));
+            }
             // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), the
             // fallback path runs a plain GEMV then `residual += result`. `out` may
             // be used as scratch ONLY when it does not alias `residual`; when it
             // does (the common qwen35 o_proj / dn_out case where out == residual ==
             // &s.x), a dedicated persistent temp is used instead.
             // Nothing reads `out` after this step in any model decode path.
-            let gemv = GEMV.get_or_init(GemvFamily::new);
+            //
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
             // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
             // the `out` scratch + `residual += out` — reuses the pre-allocated `out`
@@ -1373,6 +1451,49 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 Ok(())
             }
         }
+    }
+}
+
+/// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
+/// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
+///
+/// This is [`launch_op_rows`] with no row restriction.
+fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
+    launch_op_rows(gpu, ctx, step, None)
+}
+
+/// Per-op fallback restricted to a range of the weight's output rows.
+///
+/// `None` passes every tensor exactly as `step` carries it, so an unrestricted
+/// launch is byte-identical to the pre-split path. `Some(r)` builds the views
+/// once — a byte view of the weight's rows `[r.start, r.end)` and `sub_offset`
+/// views of the output (and the residual, for the residual form) — then runs the
+/// same kernels. Every row-splittable GEMV kernel indexes its weight as
+/// `A + row*row_stride` from the passed base and writes `y[row]`, so a
+/// row-shifted base *is* a row-shifted launch: no kernel change and no new
+/// numerics.
+///
+/// Only [`Step::Gemv`] and [`Step::GemvResidual`] are splittable; every other
+/// step kind has coupled rows and is refused when a range is asked for (never at
+/// `None`, which is the ordinary path).
+pub(crate) fn launch_op_rows(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    step: &Step,
+    rows: Option<Range<usize>>,
+) -> Result<(), DispatchError> {
+    let views = match rows {
+        Some(r) => Some(RowViews::build(step, r)?),
+        None => None,
+    };
+    match step {
+        Step::Gemv { w, input, out } => launch_gemv(gpu, ctx, w, input, out, None, views.as_ref()),
+        Step::GemvResidual {
+            w,
+            input,
+            residual,
+            out,
+        } => launch_gemv(gpu, ctx, w, input, out, Some(residual), views.as_ref()),
         Step::RmsnormAutomatic {
             x,
             norm_weight,

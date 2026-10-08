@@ -114,6 +114,7 @@ impl ConfigState {
             Some("kv_cache"),
             Some("gpu_layer_budget"), // Offload
             Some("offload_exec"),     // Offload exec
+            Some("offload_passback_share"), // Pass-back GPU share
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
@@ -161,6 +162,7 @@ impl ConfigState {
             self.is_override("kv_cache"),                         // KV cache
             self.is_override("gpu_layer_budget"),                 // Offload
             self.is_override("offload_exec"),                     // Offload exec
+            self.is_override("offload_passback_share"),           // Pass-back GPU share
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
@@ -181,6 +183,7 @@ impl ConfigState {
             "kv_cache",            // KV cache
             "gpu_layer_budget",    // Offload
             "offload_exec",        // Offload exec
+            "offload_passback_share", // Pass-back GPU share
             "thinking",            // Thinking
             "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
@@ -273,11 +276,27 @@ impl ConfigState {
                 {
                     "" | "pcie" => "over PCIe".into(),
                     "cpu" => "on CPU".into(),
+                    "passback" => "passback (CPU + GPU)".into(),
                     // Only reachable if the schema's list grows: show it rather
                     // than mislabel it.
                     other => other.to_string(),
                 },
                 "Who multiplies a spilled layer's weights: the GPU over the link, or the CPU.",
+            ),
+            (
+                // The pass-back's modifier: read only by the mode above, which is
+                // why the row says so rather than pretending it is standalone.
+                "Pass-back GPU share",
+                match self
+                    .values
+                    .get("offload_passback_share")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                {
+                    "" | "auto" => "auto (scheduled)".into(),
+                    other => other.to_string(),
+                },
+                "Share of each spilled step's rows the GPU takes back, for the passback mode.",
             ),
             (
                 "Thinking",
@@ -504,6 +523,29 @@ mod tests {
         assert_eq!(row(&[]), "over PCIe");
         assert_eq!(row(&[("offload_exec", "pcie")]), "over PCIe");
         assert_eq!(row(&[("offload_exec", "cpu")]), "on CPU");
+        assert_eq!(
+            row(&[("offload_exec", "passback")]),
+            "passback (CPU + GPU)"
+        );
+    }
+
+    /// The pass-back share row: unset and `auto` both mean "the engine schedules
+    /// it", and a pinned number renders as itself.
+    #[test]
+    fn offload_passback_share_row_renders_scheduled_and_pinned() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "Pass-back GPU share")
+                .map(|(_, value, _)| value)
+                .expect("Pass-back GPU share row present")
+        };
+
+        assert_eq!(row(&[]), "auto (scheduled)");
+        assert_eq!(row(&[("offload_passback_share", "auto")]), "auto (scheduled)");
+        assert_eq!(row(&[("offload_passback_share", "0")]), "0");
+        assert_eq!(row(&[("offload_passback_share", "0.375")]), "0.375");
     }
 
     #[test]

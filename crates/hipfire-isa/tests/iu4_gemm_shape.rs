@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const MC: &str = "/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc";
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 /// Product points: tile, activation layout, hot-loop contract tile name.
 const POINTS: [(Tile, ALayout, &str); 3] = [(Tile::T128x128x8, ALayout::Token, "128x128x8"), (Tile::T128x128x8, ALayout::Slab, "128x128x8"),
     (Tile::T256x128x16, ALayout::Token, "256x128x16")];
@@ -43,7 +45,8 @@ fn check_counts(census: &std::collections::BTreeMap<String, u32>, counts: &Value
 }
 
 fn assemble(text: &str) -> Result<(), String> {
-    let mut child = Command::new(MC).args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1201", "-filetype=obj", "-o", "/dev/null"])
+    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
+    let mut child = Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1201", "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
@@ -93,6 +96,7 @@ fn emission_is_deterministic_and_loop_ledger_reaches_fixed_point() {
 
 #[test]
 fn every_module_assembles_with_zero_diagnostics() {
+    let _ = require_rocm_tool!("llvm-mc");
     for (tile, act, _) in POINTS {
         let (_, text, _) = iu4_gemm::emit_module(Fold::K128, tile, Cacc::One, act, Arch::Gfx1201).unwrap();
         assemble(&text).unwrap_or_else(|e| panic!("{tile:?} {act:?}: {e}"));
@@ -144,6 +148,8 @@ fn silu_region_is_the_hipcc_dag() {
 /// own K1 gate/up object (the region's parse-back from foreign bytes).
 #[test]
 fn silu_region_matches_fresh_hipcc_object() {
+    let bundler = require_rocm_tool!("clang-offload-bundler");
+    let objdump = require_rocm_tool!("llvm-objdump");
     let hipcc = "/opt/rocm/core-10.0/bin/hipcc";
     if !std::path::Path::new(hipcc).exists() { eprintln!("skip: no {hipcc}"); return }
     let root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
@@ -159,11 +165,11 @@ fn silu_region_matches_fresh_hipcc_object() {
     let status = Command::new(hipcc).args(["--genco", "--offload-arch=gfx1201", "-O3", "--no-offload-compress", "-o"])
         .arg(&bundle).arg(&src).status().unwrap();
     assert!(status.success());
-    let status = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/clang-offload-bundler")
+    let status = Command::new(&bundler)
         .args(["--type=o", "--unbundle", "--targets=hipv4-amdgcn-amd-amdhsa--gfx1201"])
         .arg(format!("--input={}", bundle.display())).arg(format!("--output={}", co.display())).status().unwrap();
     assert!(status.success());
-    let dis = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-objdump").args(["-d", "--mcpu=gfx1201"]).arg(&co).output().unwrap();
+    let dis = Command::new(&objdump).args(["-d", "--mcpu=gfx1201"]).arg(&co).output().unwrap();
     let listing = String::from_utf8(dis.stdout).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(region::slice_silu(&listing, "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3").unwrap(), region::golden_body());

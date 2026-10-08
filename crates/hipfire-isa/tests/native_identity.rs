@@ -23,6 +23,9 @@ use std::collections::BTreeMap;
 
 #[path = "support/native_compare.rs"]
 mod native_compare;
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 
 const ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
 /// The host entry spelling of the committed `.hxaco` bundles.
@@ -161,6 +164,11 @@ fn corpus() -> Vec<Unit> {
 
 #[test]
 fn native_code_objects_and_bundles_equal_the_rocm_oracle_for_every_symbol() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
+    let _ = require_rocm_tool!("clang-offload-bundler");
+    let _ = require_rocm_tool!("llvm-objdump");
+    let _ = require_rocm_tool!("llvm-readobj");
     let toolchain = Toolchain { host_target: HOST.into(), ..Toolchain::default() };
     let dir = std::env::temp_dir().join(format!("hipfire-native-identity-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

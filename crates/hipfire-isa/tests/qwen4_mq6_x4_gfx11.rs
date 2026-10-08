@@ -6,6 +6,9 @@
 //! W8 regions and W8 HC-write): exact twins of hipcc's `u3_b8_r8` entries.
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::qwen4_mq6_x4_gfx11::{self, Kind, Spec};
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 
 const ARCH: Arch = Arch::Gfx1151;
 
@@ -87,6 +90,8 @@ fn kernarg_abi_matches_hipcc_metadata() {
 /// what the builder emits today.
 #[test]
 fn committed_bundles_equal_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let module = Spec::module(ARCH);
     let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
@@ -94,16 +99,16 @@ fn committed_bundles_equal_fresh_emission() {
     assert!(text_section(&link(&text, ARCH.name(), &module)) == text_section(&committed), "{module}: fresh emission differs from the committed bundle");
 }
 
-const LLVM: &str = "/opt/rocm/core-10.0/lib/llvm/bin";
-
 fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
     use std::process::Command;
     let dir = std::env::temp_dir().join(format!("hipfire-isa-mq6x4g11-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (s, o, co) = (dir.join(format!("{stem}.s")), dir.join(format!("{stem}.o")), dir.join(format!("{stem}.co")));
     std::fs::write(&s, text).unwrap();
-    assert!(Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
-    assert!(Command::new(format!("{LLVM}/ld.lld")).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
+    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
+    let linker = rocm::rocm_tool("ld.lld").expect("ROCm ld.lld");
+    assert!(Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
+    assert!(Command::new(linker).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
     std::fs::read(co).unwrap()
 }
 
@@ -141,6 +146,11 @@ mod toolchain {
     /// obligation-free.
     #[test]
     fn modules_pass_certification_for_every_symbol() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
         let (emitted, text, _) = qwen4_mq6_x4_gfx11::emit_module(ARCH).unwrap();
         assert_eq!(emitted.len(), ENTRIES.len());
         for e in &emitted { ledger_replay::replay_waits(&e.s_text, ARCH).unwrap(); }

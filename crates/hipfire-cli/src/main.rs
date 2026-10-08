@@ -24,6 +24,7 @@ use hipfire_registry::{
     Sidecar,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::offload_calibrate::{CalibrateOptions, CalibrationReport};
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
 use saddle_core::kv::KvBackend;
@@ -118,6 +119,8 @@ pub(crate) enum Commands {
     Ps(OutputArgs),
     /// Benchmark a model through the native daemon protocol.
     Bench(BenchArgs),
+    /// Measure this host's GPU share for a split offload step.
+    OffloadBench(OffloadBenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
     Profile(ProfileArgs),
     /// Print build, source-checkout, and installed-daemon identity.
@@ -643,6 +646,29 @@ pub(crate) struct BenchArgs {
 }
 
 #[derive(Args, Debug)]
+struct OffloadBenchArgs {
+    /// Emit machine-readable JSON.
+    #[arg(short = 'j', long)]
+    json: bool,
+    /// Measure one format instead of the default matrix: a quant name (`mq4`,
+    /// `mq4g256v2`, …) or a `.hfq` wire quant_type number.
+    #[arg(long, value_name = "NAME|QT")]
+    format: Option<String>,
+    /// Activation width to measure at (default: the 9B trunk's hidden size).
+    #[arg(long, value_name = "N")]
+    k: Option<usize>,
+    /// Weight megabytes per format.
+    #[arg(long, value_name = "MB")]
+    buffer_mb: Option<usize>,
+    /// Timed reps per engine; the median is reported.
+    #[arg(long, value_name = "N")]
+    reps: Option<usize>,
+    /// Persist the recommended share (the median over the largest measurements).
+    #[arg(long)]
+    write: bool,
+}
+
+#[derive(Args, Debug)]
 struct ProfileArgs {
     model: Option<String>,
     #[arg(long)]
@@ -816,6 +842,7 @@ fn run() -> Result<()> {
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
@@ -2601,6 +2628,166 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         eprintln!("{}", format_run_stats(done.get("tokens").and_then(serde_json::Value::as_u64), &done));
     }
     let _ = engine.unload();
+    Ok(())
+}
+
+/// PIDs named by a live `~/.hipfire/daemon*.pid`.
+///
+/// Advisory by construction: it cannot prevent a daemon started mid-benchmark, but
+/// it stops the common case (a serve instance already running), which would make
+/// both engine rates meaningless. A real fix would move the measurement behind the
+/// daemon protocol, which is deliberately not done here.
+fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
+    let mut live = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&paths.root) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("daemon") || !name.ends_with(".pid") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(pid) = raw.trim().parse::<i32>() else {
+            continue;
+        };
+        // Safety: signal 0 only probes for existence and permission.
+        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+            live.push(pid);
+        }
+    }
+    live.sort_unstable();
+    live.dedup();
+    live
+}
+
+/// The share `offload-bench` recommends from a measurement matrix.
+///
+/// The recommendation comes from the largest measurements: a real spilled
+/// projection is MBs of weight bytes, and the matrix's smallest entry is where the
+/// copies and the launch overhead distort the balance most. Every format is
+/// measured over the same `buffer_mb` by construction, so "the largest" is usually
+/// the whole matrix — a *set* — and the **median** share over it is the honest
+/// single number (a singleton when `--format` pinned one format). Split out from
+/// the command so the tie behavior is pinned by a test rather than by
+/// `max_by_key`'s iteration order, which silently picked whichever format came
+/// last.
+fn recommended_share(reports: &[CalibrationReport]) -> Option<(String, f64)> {
+    let largest = reports.iter().map(|r| r.bytes).max()?;
+    let biggest: Vec<&CalibrationReport> =
+        reports.iter().filter(|r| r.bytes == largest).collect();
+    let mut shares: Vec<f64> = biggest.iter().map(|r| r.share).collect();
+    shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let label = if biggest.len() == 1 {
+        biggest[0].format.clone()
+    } else {
+        format!("the {} largest measured formats", biggest.len())
+    };
+    Some((label, shares[shares.len() / 2]))
+}
+
+/// `hipfire offload-bench`: measure this host's GPU share for a split offload step
+/// (`memory.offload_exec=passback`, `memory.offload_passback_share`).
+///
+/// A raw device benchmark — no model, no daemon — so it refuses while a daemon pid
+/// file names a live process.
+fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
+    let live = live_daemon_pids(paths);
+    if !live.is_empty() {
+        bail!(
+            "a hipfire daemon is live (pid {}); stop it first (`hipfire stop`) — offload-bench \
+             measures the device directly, and a concurrent daemon makes both engine rates \
+             meaningless",
+            live.iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut gpu = rdna_compute::Gpu::init()
+        .map_err(|e| anyhow!("offload-bench needs a GPU: {} [code {}]", e.message, e.code))?;
+    let opts = CalibrateOptions {
+        format: args.format.clone(),
+        k: args.k,
+        buffer_mb: args
+            .buffer_mb
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_BUFFER_MB),
+        reps: args
+            .reps
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_REPS),
+    };
+    let reports = hipfire_runtime::offload_calibrate::calibrate(&mut gpu, &opts)?;
+    let recommended = recommended_share(&reports);
+    if args.json {
+        let rows: Vec<serde_json::Value> = reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "format": r.format,
+                    "m": r.m,
+                    "k": r.k,
+                    "bytes": r.bytes,
+                    "cpu_bytes_per_s": r.cpu_bytes_per_s,
+                    "gpu_bytes_per_s": r.gpu_bytes_per_s,
+                    "share": r.share,
+                    "predicted_speedup": r.predicted_speedup,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "arch": gpu.arch,
+                "recommended": recommended
+                    .as_ref()
+                    .map(|(format, share)| serde_json::json!({ "format": format, "share": share })),
+                "formats": rows,
+            }))?
+        );
+    } else {
+        println!(
+            "arch {} — GPU share for a split offload step (memory.offload_exec=passback)",
+            gpu.arch
+        );
+        println!(
+            "{:<12} {:>8} {:>6} {:>8} {:>12} {:>12} {:>7} {:>9}",
+            "format", "m", "k", "MiB", "cpu GB/s", "gpu GB/s", "share", "speedup"
+        );
+        for r in &reports {
+            println!(
+                "{:<12} {:>8} {:>6} {:>8.1} {:>12.1} {:>12.1} {:>7.3} {:>8.2}x",
+                r.format,
+                r.m,
+                r.k,
+                r.bytes as f64 / (1 << 20) as f64,
+                r.cpu_bytes_per_s / 1e9,
+                r.gpu_bytes_per_s / 1e9,
+                r.share,
+                r.predicted_speedup,
+            );
+        }
+        if let Some((format, share)) = recommended.as_ref() {
+            println!();
+            println!("recommended for {format}: memory.offload_passback_share = {share:.3}");
+        }
+    }
+    if args.write {
+        let Some((_, share)) = recommended.as_ref() else {
+            bail!("offload-bench: nothing measured, nothing to write");
+        };
+        let mut loaded = load_global(&paths.config)?;
+        loaded
+            .layer
+            .set_cli("memory.offload_passback_share", &format!("{share:.3}"))?;
+        write_global_toml(&paths.config, &loaded.layer)?;
+        println!(
+            "wrote memory.offload_passback_share = {share:.3} to {}",
+            paths.config.config_toml.display()
+        );
+    }
     Ok(())
 }
 
@@ -8057,6 +8244,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "type": "string",
             "format": "kv-adaptive-policy",
         }),
+        ValueRule::PassbackShare => serde_json::json!({
+            "type": "string",
+            "format": "auto-or-share",
+        }),
         ValueRule::Deepseek4Placement => serde_json::json!({
             "type": "string",
             "format": "deepseek4-compute-placement",
@@ -8081,6 +8272,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableInteger { .. } => "integer|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::PassbackShare => "auto-or-share",
         ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
@@ -8265,6 +8457,79 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
             ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// `offload-bench` is a raw device benchmark: it must name a live daemon and
+    /// measure nothing. The predicate behind that refusal is pure filesystem +
+    /// `kill(pid, 0)`, so it is testable without a GPU or a real daemon — and it is
+    /// the only thing standing between a user and two engines sharing the device.
+    #[test]
+    fn live_daemon_pids_sees_live_pid_files_only() {
+        let paths = test_paths("offload-bench-pids");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // Our own pid is alive; a pid above the kernel's `pid_max` cannot be.
+        std::fs::write(paths.root.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"), "999999999\n")
+            .unwrap();
+        // Not pid files, and not a pid: ignored, never an error.
+        std::fs::write(paths.root.join("daemon.pid.bak"), "1\n").unwrap();
+        std::fs::write(paths.root.join("daemon-garbage.pid"), "not-a-pid\n").unwrap();
+        std::fs::write(paths.root.join("serve.pid"), format!("{}\n", std::process::id())).unwrap();
+
+        assert_eq!(live_daemon_pids(&paths), vec![std::process::id() as i32]);
+
+        // The same file naming a dead process is no longer a live daemon.
+        std::fs::write(paths.root.join("daemon.pid"), "999999999\n").unwrap();
+        assert!(live_daemon_pids(&paths).is_empty());
+
+        // A missing root is empty, not a panic.
+        let _ = std::fs::remove_dir_all(&paths.root);
+        assert!(live_daemon_pids(&paths).is_empty());
+    }
+
+    /// The recommendation a user pins: a singleton when one format was measured,
+    /// otherwise the **median** of the largest measurements. The tie is the point —
+    /// every format is measured over the same `buffer_mb`, so picking by
+    /// `max_by_key(bytes)` silently returned whichever format came last in the
+    /// matrix (q8_0), whose rate profile is not the model's.
+    #[test]
+    fn recommended_share_takes_the_median_of_the_largest() {
+        let report = |format: &str, bytes: usize, share: f64| CalibrationReport {
+            arch: "gfx1201".into(),
+            format: format.into(),
+            m: bytes / 2720,
+            k: 5120,
+            bytes,
+            cpu_bytes_per_s: 4.0e10,
+            gpu_bytes_per_s: 2.5e10,
+            share,
+            predicted_speedup: 1.5,
+        };
+
+        assert!(recommended_share(&[]).is_none());
+
+        // One pinned format: itself, named.
+        let one = vec![report("mq4g256", 201_328_960, 0.375)];
+        assert_eq!(recommended_share(&one), Some(("mq4g256".to_string(), 0.375)));
+
+        // A tie on size takes the median share of the tied set, and says so.
+        let tied = vec![
+            report("a", 100, 0.10),
+            report("b", 100, 0.20),
+            report("c", 100, 0.50),
+            report("small", 50, 0.99),
+        ];
+        assert_eq!(
+            recommended_share(&tied),
+            Some(("the 3 largest measured formats".to_string(), 0.20))
+        );
+
+        // A strictly larger entry wins outright, wherever it sits in the matrix.
+        let mixed = vec![report("small", 50, 0.99), report("big", 200, 0.30)];
+        assert_eq!(
+            recommended_share(&mixed),
+            Some(("big".to_string(), 0.30))
+        );
     }
 
     /// A minimal real HFQ container carrying `arch_id`, so the discovery

@@ -58,6 +58,20 @@ pub struct WeightRef<'a> {
 
 // ── Dispatch parameters ────────────────────────────────
 
+/// Bytes per weight row, or `None` when the tensor's byte length is not an exact
+/// multiple of its row count.
+///
+/// Every CPU-covered format stores exactly `m * row_bytes` bytes; the padded
+/// strides are the exception, and the row-split caller refuses those rather than
+/// trusting the divisor. This is the one place the split math derives a row
+/// stride from the allocation itself.
+pub(crate) fn weight_row_bytes(w: &WeightRef) -> Option<usize> {
+    if w.m == 0 || w.buf.buf.size() % w.m != 0 {
+        return None;
+    }
+    Some(w.buf.buf.size() / w.m)
+}
+
 pub struct GemvParams<'a> {
     pub w: &'a WeightRef<'a>,
     pub x: &'a GpuTensor,

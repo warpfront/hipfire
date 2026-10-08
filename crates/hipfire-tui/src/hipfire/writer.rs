@@ -137,6 +137,15 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "offload_exec",
         kind: FieldKind::Enum(hipfire_config::OFFLOAD_EXECS),
     },
+    // A free string rather than an enum: the share is `auto` or a *continuum*
+    // (0, 0.5], which a fixed list cannot express. The schema's `PassbackShare`
+    // rule is the validator, so a typed `0.6` is rejected by `write_value`.
+    FieldSpec {
+        key: "offload_passback_share",
+        kind: FieldKind::FreeStr {
+            require_existing_file: false,
+        },
+    },
     FieldSpec {
         key: "flash_mode",
         kind: FieldKind::Enum(FLASH_MODE),

@@ -8,6 +8,10 @@ use hipfire_isa::reg::Live;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
+
 #[test]
 fn k1_explicit_and_hidden_arguments_match_hipcc() {
     for (variant, size, first_hidden, dynamic_lds) in [
@@ -27,6 +31,7 @@ fn k1_explicit_and_hidden_arguments_match_hipcc() {
 
 #[test]
 fn all_96_k1_fold_packets_encode_on_gfx1201() {
+    let llvm_mc = require_rocm_tool!("llvm-mc");
     let mut plan = RegPlan::new(200, 48).unwrap();
     let cacc = std::array::from_fn(|i| {
         plan.v::<8>("cacc", (i * 8) as u8, Live::Whole).unwrap()
@@ -56,7 +61,7 @@ fn all_96_k1_fold_packets_encode_on_gfx1201() {
     for p in packets.iter().filter(|p| p.starts_with("v_dual_subrev_f32")) {
         assert_eq!(p.matches(", 0x4b400000, ").count(), 2, "{p}");
     }
-    let mut mc = Command::new("/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc")
+    let mut mc = Command::new(&llvm_mc)
         .args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1201", "-show-encoding"])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().expect("ROCm llvm-mc");

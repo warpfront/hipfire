@@ -14,7 +14,9 @@ use hipfire_isa::vopd::{Operand, VopdF32, VopdOp};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const LLVM: &str = "/opt/rocm/core-10.0/lib/llvm/bin";
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 
 fn probe(arch: Arch) -> Builder {
     let mut plan = RegPlan::new(16, 8).unwrap();
@@ -135,7 +137,8 @@ fn v2c_gate_up_trip_is_the_paired_set_fold_plus_up_scales() {
 }
 
 fn assemble(text: &str, arch: &str) {
-    let mut child = Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj", "-o", "/dev/null"])
+    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
+    let mut child = Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
@@ -144,6 +147,7 @@ fn assemble(text: &str, arch: &str) {
 
 #[test]
 fn v2c_module_assembles_for_gfx1100_with_zero_diagnostics() {
+    let _ = require_rocm_tool!("llvm-mc");
     assemble(&iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1, "gfx1100")
 }
 
@@ -153,6 +157,8 @@ fn v2c_module_assembles_for_gfx1100_with_zero_diagnostics() {
 #[test]
 fn gfx1100_silu_region_matches_fresh_hipcc_object() {
     use hipfire_isa::kernels::iu4_gemm::region;
+    let bundler = require_rocm_tool!("clang-offload-bundler");
+    let objdump = require_rocm_tool!("llvm-objdump");
     let hipcc = "/opt/rocm/core-10.0/bin/hipcc";
     if !std::path::Path::new(hipcc).exists() { eprintln!("skip: no {hipcc}"); return }
     let root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
@@ -162,10 +168,10 @@ fn gfx1100_silu_region_matches_fresh_hipcc_object() {
     let status = Command::new(hipcc).args(["--genco", "--offload-arch=gfx1100", "-O3", "--no-offload-compress", "-o"])
         .arg(&bundle).arg(format!("{root}/kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip")).status().unwrap();
     assert!(status.success());
-    let status = Command::new(format!("{LLVM}/clang-offload-bundler")).args(["--type=o", "--unbundle", "--targets=hipv4-amdgcn-amd-amdhsa--gfx1100"])
+    let status = Command::new(&bundler).args(["--type=o", "--unbundle", "--targets=hipv4-amdgcn-amd-amdhsa--gfx1100"])
         .arg(format!("--input={}", bundle.display())).arg(format!("--output={}", co.display())).status().unwrap();
     assert!(status.success());
-    let dis = Command::new(format!("{LLVM}/llvm-objdump")).args(["-d", "--mcpu=gfx1100"]).arg(&co).output().unwrap();
+    let dis = Command::new(&objdump).args(["-d", "--mcpu=gfx1100"]).arg(&co).output().unwrap();
     let listing = String::from_utf8(dis.stdout).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let slice = region::slice_silu_gfx11(&listing, "gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11").unwrap();
@@ -201,8 +207,10 @@ fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
     std::fs::create_dir_all(&dir).unwrap();
     let (s, o, co) = (dir.join(format!("{stem}.s")), dir.join(format!("{stem}.o")), dir.join(format!("{stem}.co")));
     std::fs::write(&s, text).unwrap();
-    assert!(Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
-    assert!(Command::new(format!("{LLVM}/ld.lld")).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
+    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
+    let linker = rocm::rocm_tool("ld.lld").expect("ROCm ld.lld");
+    assert!(Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
+    assert!(Command::new(linker).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
     std::fs::read(co).unwrap()
 }
 
@@ -211,6 +219,8 @@ fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
 /// `.text` of the committed bundles.
 #[test]
 fn committed_gfx1201_bundles_equal_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let token = iu4_gemm::emit_module(iu4_gemm::Fold::K128, iu4_gemm::Tile::T128x128x8, iu4_gemm::Cacc::One, iu4_gemm::ALayout::Token, Arch::Gfx1201).unwrap().1;
     let slab = iu4_gemm::emit_module(iu4_gemm::Fold::K128, iu4_gemm::Tile::T128x128x8, iu4_gemm::Cacc::One, iu4_gemm::ALayout::Slab, Arch::Gfx1201).unwrap().1;
@@ -259,12 +269,14 @@ fn v2b_fold_is_fully_vopd_paired_in_every_entry() {
 }
 
 #[test]
-fn v2b_module_assembles_for_gfx1151_with_zero_diagnostics() { assemble(&iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1, "gfx1151") }
+fn v2b_module_assembles_for_gfx1151_with_zero_diagnostics() { let _ = require_rocm_tool!("llvm-mc"); assemble(&iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1, "gfx1151") }
 
 /// The runtime embeds the certified gfx1151 bundle: it must be exactly what
 /// the builder emits today.
 #[test]
 fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2b::MODULE)).unwrap();
     let text = iu4_v2b::emit_module(Arch::Gfx1151).unwrap().1;
@@ -275,6 +287,8 @@ fn committed_gfx1151_v2b_bundle_equals_fresh_emission() {
 /// the builder emits today.
 #[test]
 fn committed_gfx1100_v2c_bundle_equals_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let committed = std::fs::read(format!("{root}/{}.hxaco", iu4_v2c::MODULE)).unwrap();
     let text = iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap().1;
@@ -292,6 +306,11 @@ mod toolchain {
     /// and M7's analyses of the linked ELF with no obligation.
     #[test]
     fn v2c_module_passes_gfx11_certification_for_every_symbol() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
         let (emitted, text, _) = iu4_v2c::module(Arch::Gfx1100, &iu4_v2c::Epi::ALL).unwrap();
         for e in &emitted { ledger_replay::replay_waits(&e.s_text, Arch::Gfx1100).unwrap(); }
         let dir = std::env::temp_dir().join(format!("hipfire-isa-v2c-{}", std::process::id()));
@@ -316,6 +335,11 @@ mod toolchain {
 
     #[test]
     fn v2b_entries_pass_gfx1151_certification_checks() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
         let (_, text, _) = iu4_v2b::emit_module(Arch::Gfx1151).unwrap();
         ledger_replay::replay_waits(&text, Arch::Gfx1151).unwrap();
         let dir = std::env::temp_dir().join(format!("hipfire-isa-v2b-{}", std::process::id()));
@@ -335,6 +359,7 @@ mod toolchain {
 
     #[test]
     fn gfx11_profile_rewrite_is_verified_and_hazard_neutral() {
+        let _ = require_rocm_tool!("llvm-mc");
         let e = v2c();
         let points = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/profile/v2c_set.points.json")).unwrap();
         let cfg: profile::Config = serde_json::from_str(&points).unwrap();

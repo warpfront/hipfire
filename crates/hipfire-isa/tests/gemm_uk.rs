@@ -3,6 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 use hipfire_isa::V;
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 use hipfire_isa::kernels::gemm_uk::{Chain, Iu4, FragmentLayout, Prefetch};
 #[cfg(feature = "toolchain")]
 use hipfire_isa::{Arch, Builder, KernelSpec, KernargLayout, RegPlan, reg::Live, kernels::gemm_uk::Iu8};
@@ -24,9 +27,9 @@ fn rejects_overlapping_independent_outputs_and_wrong_prefetch_distance() {
 #[cfg(feature = "toolchain")]
 #[test]
 fn iu8_chain_passes_builder_and_llvm_mc() {
-    use hipfire_isa::toolchain::Toolchain;
     use std::{fs, process::Command};
-    fn assembled<T: MmaIu4, const W: u8>(arch: Arch) where Iu8: hipfire_isa::kernels::gemm_uk::MmaKind<T, Input = V<W>> {
+    let llvm_mc = require_rocm_tool!("llvm-mc");
+    fn assembled<T: MmaIu4, const W: u8>(llvm_mc: &std::path::Path, arch: Arch) where Iu8: hipfire_isa::kernels::gemm_uk::MmaKind<T, Input = V<W>> {
     let mut regs = RegPlan::new(32, 8).unwrap();
     let a = regs.v::<W>("a", 0, Live::Whole).unwrap();
     let x = regs.v::<W>("x", 4, Live::Whole).unwrap();
@@ -49,13 +52,13 @@ fn iu8_chain_passes_builder_and_llvm_mc() {
     let object = dir.join("chain.o");
     fs::write(&source, e.s_text).unwrap();
     let cpu = format!("-mcpu={}", arch.name());
-    let output = Command::new(Toolchain::default().llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &cpu, "-filetype=obj"])
+    let output = Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &cpu, "-filetype=obj"])
         .arg(&source).arg("-o").arg(&object).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     fs::remove_dir_all(&dir).unwrap();
     assert!(output.status.success(), "{stderr}");
     }
-    assembled::<Gfx1100, 4>(Arch::Gfx1100);
-    assembled::<Gfx1151, 4>(Arch::Gfx1151);
-    assembled::<Gfx1201, 2>(Arch::Gfx1201);
+    assembled::<Gfx1100, 4>(&llvm_mc, Arch::Gfx1100);
+    assembled::<Gfx1151, 4>(&llvm_mc, Arch::Gfx1151);
+    assembled::<Gfx1201, 2>(&llvm_mc, Arch::Gfx1201);
 }

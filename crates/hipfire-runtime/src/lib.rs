@@ -57,6 +57,7 @@ pub mod loop_guard;
 pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
+pub mod offload_calibrate;
 pub mod paro;
 pub mod prefix;
 pub mod prefix_index;

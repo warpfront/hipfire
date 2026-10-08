@@ -73,10 +73,10 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "offload_exec",
         title: "Who multiplies a spilled layer",
-        summary: "Which engine executes the ops that read a spilled layer's weights: the GPU over PCIe, or the CPU.",
-        effect: "The CPU arm replaces a per-step read of every spilled weight over the link with a host-side GEMV, which is what makes a spill pay instead of costing. It is a per-step host sync (no hipGraph), and the GPU kernels are the faster engine once the bytes are resident.",
+        summary: "Which engine executes the ops that read a spilled layer's weights: the GPU over PCIe, the CPU, or both at once.",
+        effect: "The CPU arm replaces a per-step read of every spilled weight over the link with a host-side GEMV, which is what makes a spill pay instead of costing. It is a per-step host sync (no hipGraph), and the GPU kernels are the faster engine once the bytes are resident. The pass-back ('both') splits each step's output rows between the two engines, so the GPU does useful work during the CPU arm's host time.",
         default: "pcie",
-        when: "Leave on PCIe unless a spilled layer's per-step link read is the bottleneck; 'cpu' is the arm the CPU-exec offload path exists for.",
+        when: "Leave on PCIe unless a spilled layer's per-step link read is the bottleneck; 'cpu' is the arm the CPU-exec offload path exists for, and 'passback' is the arm for a host whose link and CPU can stream the same weight bytes concurrently.",
         note: Some("Decides who multiplies, never what is spilled: placement stays the 'GPU layers' row, and the KV cache stays in VRAM either way. Refused together with a retained-replay (Redline) backend, and unset/empty/unknown all fall back to pcie. Read once at load — changing it takes effect on the next serve/restart."),
         options: &[
             (
@@ -87,7 +87,21 @@ pub const KNOBS: &[KnobInfo] = &[
                 "cpu",
                 "'on CPU' — `memory.offload_exec = cpu`: the CPU executes those GEMVs from system RAM; the GPU gets the result back.",
             ),
+            (
+                "passback",
+                "'passback' — `memory.offload_exec = passback`: both do — the GPU takes a share of each step's output rows (see the 'Pass-back GPU share' row) while the CPU takes the rest, on the same weight bytes.",
+            ),
         ],
+    },
+    KnobInfo {
+        key: "offload_passback_share",
+        title: "Pass-back GPU share",
+        summary: "How much of a spilled step the GPU takes back, as a share of its output rows.",
+        effect: "Higher hands more of each step to the faster-per-byte engine (usually the link, on a narrow PCIe link) and shortens the CPU arm; lower does the reverse. Only meaningful when 'Who multiplies a spilled layer' is 'passback'.",
+        default: "auto",
+        when: "Leave on auto: the engine schedules the share from this host's own measured engine rates and refines it as it decodes. Pin a number only when a measurement disagrees — `hipfire offload-bench` reports this host's numbers.",
+        note: Some("0 disables the pass-back, so 'passback' then behaves exactly as 'cpu' (the same bytes, the same order) — the A/B baseline. Ignored unless the mode is 'passback'; a share set in another mode prints one informational line at load. Up to 0.5, because beyond half the rows the choice is better expressed by switching the mode to 'pcie'. Read once at load."),
+        options: &[],
     },
     KnobInfo {
         key: "kv_cache",

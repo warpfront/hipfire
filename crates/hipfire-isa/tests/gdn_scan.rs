@@ -3,9 +3,15 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! The authoring-only GDN scan must retire loads on both DOP paths.
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
+
 #[cfg(feature = "toolchain")]
 #[test]
 fn dop_paths_pass_real_object_wait_and_hazard_replay() {
+    let _llvm_mc = require_rocm_tool!("llvm-mc");
+    let _linker = require_rocm_tool!("ld.lld");
     use hipfire_isa::{kernels::gdn_scan, pm_check, toolchain::Toolchain, Arch};
     use std::process::Command;
     let emitted = gdn_scan::emit(Arch::Gfx1201).unwrap();

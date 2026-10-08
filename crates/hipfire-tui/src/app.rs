@@ -2427,6 +2427,19 @@ mod tests {
 
         // Cycling past the end wraps to the other value and back.
         app.handle_settings_key(key(KeyCode::Right));
+        assert_eq!(
+            app.settings_pending.as_ref().map(|p| p.value.as_str()),
+            Some("passback"),
+            "the third schema value must be reachable"
+        );
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.values.get("offload_exec").map(String::as_str),
+            Some("passback")
+        );
+        assert_eq!(app.config.easy_rows()[idx].1, "passback (CPU + GPU)");
+
+        app.handle_settings_key(key(KeyCode::Right));
         app.handle_settings_key(key(KeyCode::Enter));
         assert_eq!(
             app.config.values.get("offload_exec").map(String::as_str),

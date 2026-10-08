@@ -11,7 +11,9 @@ use hipfire_isa::kernels::iu4_v2b_a4::{self, Epi, Spec};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const LLVM: &str = "/opt/rocm/core-10.0/lib/llvm/bin";
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 
 fn twin(epi: Epi) -> hipfire_isa::Emitted { iu4_v2b_a4::emit(Spec { arch: Arch::Gfx1151, epi }).unwrap() }
 
@@ -47,8 +49,9 @@ fn m512_k_loop_census_per_k256() {
 
 #[test]
 fn m512_module_assembles_for_gfx1151_with_zero_diagnostics() {
+    let llvm_mc = require_rocm_tool!("llvm-mc");
     let text = iu4_v2b_a4::emit_module(Arch::Gfx1151).unwrap().1;
-    let mut child = Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1151", "-filetype=obj", "-o", "/dev/null"])
+    let mut child = Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1151", "-filetype=obj", "-o", "/dev/null"])
         .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
@@ -73,6 +76,11 @@ mod toolchain {
 
     #[test]
     fn m512_entries_pass_gfx1151_certification_checks() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
         let (_, text, _) = iu4_v2b_a4::emit_module(Arch::Gfx1151).unwrap();
         ledger_replay::replay_waits(&text, Arch::Gfx1151).unwrap();
         let dir = std::env::temp_dir().join(format!("hipfire-isa-v2b-a4-{}", std::process::id()));

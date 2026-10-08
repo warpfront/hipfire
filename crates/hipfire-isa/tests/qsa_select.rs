@@ -5,6 +5,9 @@
 //! QSA selector pair builder module (gfx1151): rows16 F32 score + top-k select.
 use hipfire_isa::Arch;
 use hipfire_isa::kernels::{qsa_score, qsa_select::{self, Kind, Spec}, qsa_topk};
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
 
 const ARCH: Arch = Arch::Gfx1151;
 
@@ -60,6 +63,8 @@ fn kernarg_layouts_match_the_hipcc_pair() {
 }
 #[test]
 fn committed_bundle_equals_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
     let module = qsa_select::module(ARCH);
     let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
@@ -67,16 +72,16 @@ fn committed_bundle_equals_fresh_emission() {
     assert!(text_section(&link(&text, ARCH.name(), &module)) == text_section(&committed), "{module}: fresh emission differs from the committed bundle");
 }
 
-const LLVM: &str = "/opt/rocm/core-10.0/lib/llvm/bin";
-
 fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
     use std::process::Command;
     let dir = std::env::temp_dir().join(format!("hipfire-isa-qsa-select-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (s, o, co) = (dir.join(format!("{stem}.s")), dir.join(format!("{stem}.o")), dir.join(format!("{stem}.co")));
     std::fs::write(&s, text).unwrap();
-    assert!(Command::new(format!("{LLVM}/llvm-mc")).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
-    assert!(Command::new(format!("{LLVM}/ld.lld")).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
+    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
+    let linker = rocm::rocm_tool("ld.lld").expect("ROCm ld.lld");
+    assert!(Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
+    assert!(Command::new(linker).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
     std::fs::read(co).unwrap()
 }
 
@@ -107,6 +112,11 @@ mod toolchain {
     /// obligation-free.
     #[test]
     fn module_passes_certification_for_every_symbol() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
         let (emitted, text, _) = qsa_select::emit_module(ARCH).unwrap();
         for e in &emitted { ledger_replay::replay_waits(&e.s_text, ARCH).unwrap(); }
         let dir = std::env::temp_dir().join(format!("hipfire-isa-qsa-select-cert-{}", std::process::id()));
