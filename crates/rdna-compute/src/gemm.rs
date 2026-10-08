@@ -14722,6 +14722,7 @@ impl Gpu {
             m_total,
             x_src_rows,
             None,
+            16,
         )
     }
 
@@ -14740,6 +14741,9 @@ impl Gpu {
         m_total: usize,
         x_src_rows: usize,
         gfx11_entry: Option<&'static str>,
+        // 16: one row tile per 32-lane block; 64: the gfx1151 `_x4` entry's
+        // four row tiles per 128-lane block.
+        rows_per_block: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Arch-selecting, like the MQ2/MQ3-Lloyd grouped sisters: gfx11 takes
@@ -14809,7 +14813,7 @@ impl Gpu {
             &mt_val as *const _ as *mut c_void,
         ];
 
-        let row_tiles = ((m + 15) / 16) as u32;
+        let row_tiles = m.div_ceil(rows_per_block) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let bytes =
             m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
@@ -14817,7 +14821,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, slot_tiles, 1],
-            [32, 1, 1],
+            [(2 * rows_per_block) as u32, 1, 1],
             0,
             &mut params,
             || {
@@ -44854,6 +44858,7 @@ impl Gpu {
             grouped_rows,
             x_src_rows,
             Some("gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out"),
+            16,
         )
     }
 
@@ -44881,6 +44886,9 @@ impl Gpu {
                 "SwiGLU gate/up epilogue needs m % 16 == 0",
             ));
         }
+        // gfx1151: four row tiles per workgroup share each multi-tile run's X
+        // through LDS (bitwise the per-wave entry).
+        let x4 = self.arch_caps.is_gfx1151() && m.is_multiple_of(64) && k.is_multiple_of(256);
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -44892,7 +44900,12 @@ impl Gpu {
             x_row_div,
             grouped_rows,
             x_src_rows,
-            Some("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"),
+            Some(if x4 {
+                "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4"
+            } else {
+                "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"
+            }),
+            if x4 { 64 } else { 16 },
         )
     }
 

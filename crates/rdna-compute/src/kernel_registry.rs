@@ -578,6 +578,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_delta_chunk_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_WMMA_SRC, ["gated_delta_chunk_gate_wmma"]);
         add!("gemm_mq4g128v2_moe_grouped_wmma_gfx1151", kernels::GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC, [
             "gemm_mq4g128v2_moe_grouped_wmma_gfx1151", "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out",
+            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out",
         ]);
         add!("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
             "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
@@ -973,6 +974,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemm_mq4g256v2_moe_grouped_wmma_k2", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
             "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
             "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
+        ]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out", "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4",
         ]);
         add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC, [
             "gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add",

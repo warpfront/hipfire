@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Qwen3.8-Flash-Next (Qwen4) on gfx1151: the F16 WMMA routed-expert GEMMs share X through LDS. Bytewise identical; pp8192 on the F16 MoE route 1,377.7 → 1,510.3 tok/s (+9.6 %).** The grouped gate/up SiLU GEMM runs four 16-row output tiles per workgroup (`gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4`, M % 64 == 0, K % 256 == 0) and the grouped down GEMM eight (`gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out`, M % 128 == 0). An expert run of several 16-slot tiles now reads each X chunk once per workgroup instead of once per wave, and a three-tile run no longer computes a masked fourth tile. Each tile's WMMA sequence, operands and epilogue are the per-wave kernel's. Only the F16 WMMA MoE route changes: the asymmetric `qwen3.8-flash-next.mq4` and `HIPFIRE_QWEN4_MOE_SYM_IU4=0`. The GPTQ3 default takes the symmetric IU4 route on gfx1151 and is unchanged, as is every other arch. Split out of #774 (fivetide).
+  - Identity (Strix Halo, `qwen4_moe_sym --mode check`, synthetic experts): the incumbent gate/up and down outputs, every live slot row in slot order, are byte-equal to beta `639907cc3` in 30 of 30 cases (routing one / all / skew × 512, 777, 1131, 2048 and 4096 tokens × seeds 7 and 11).
+  - Kernel speed (same tool, `--mode time --iters 30`, seed 7, incumbent envelope median, arms in base/slice/slice/base order, mean of each arm's two medians): `all` routing 10.07 → 8.38 ms at 1131 tokens and 29.49 → 19.52 ms at 4096; `skew` 9.96 → 9.30 ms at 1131 and 26.88 → 20.61 ms at 4096.
+  - End to end (Strix Halo, canonical `qwen3.8-flash-next-gptq3.mq4` with `HIPFIRE_QWEN4_MOE_SYM_IU4=0`, `hipfire bench --matrix --pp 8192 --ctx 128 --tg 32 --runs 2 --warmups 1`, six fresh processes in B/S/S/B/B/S order, fast-PPT-limited on both arms): pp8192 median 1,377.7 (range 1,373.5–1,383.0) → 1,510.3 tok/s (1,503.2–1,519.3); tg32 34.0–34.3 tok/s on both. Daemon md5 base `e6987237…` (beta `639907cc3`), slice `e093453b…`.
+  - serve_harness, greedy, same F16 route: a three-prompt battery of 730–1,880-token prompts (prompts-file md5 `638c23fd…`) is byte-identical to beta (`transcript_byte_identical=true`). On the default route (symmetric IU4, which this change does not touch), the stock battery passes 5/5 and the chain finishes every turn `stop`; chain turn 4 ends inside its reasoning, which is the known v0.4.1 issue.
+
 ## v0.4.1.1 — release draft
 
 Public release/tag: **v0.4.1.1**; Cargo workspace/package version: **0.4.1+patch.1**. Cargo build metadata does not give this patch higher SemVer precedence than 0.4.1. Managed installs select the public Git tag with `hipfire update --tag v0.4.1.1`; update resolves Git revisions, not a SemVer latest-release ranking.

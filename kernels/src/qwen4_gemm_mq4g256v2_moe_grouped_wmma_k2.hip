@@ -138,6 +138,11 @@ static __device__ __forceinline__ float moe_bf16_round_trip(float v) {
     return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
 }
 
+template <int NT, bool OUT_BF16, bool SILU>
+__device__ __forceinline__ void moe_grouped_wmma_k2_store(
+    const float8_t* acc, void* __restrict__ Y_grouped, int M, int m_total, int tid,
+    int row_start, int slot_start, int nlive);
+
 template <int NT, bool OUT_BF16, bool SILU = false>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
@@ -198,10 +203,18 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
             asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         }
     }
-    // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
-    // cross-half swap gives the low lane rows 0..7 and the high lane rows
-    // 8..15 of its column, stored as one 16-byte BF16 run (or two 16-byte
-    // F32 runs) instead of eight scattered 2-byte stores.
+    moe_grouped_wmma_k2_store<NT, OUT_BF16, SILU>(acc, Y_grouped, M, m_total, tid, row_start, slot_start, nlive);
+}
+
+// Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
+// cross-half swap gives the low lane rows 0..7 and the high lane rows 8..15
+// of its column, stored as one 16-byte BF16 run (or two 16-byte F32 runs)
+// instead of eight scattered 2-byte stores.  `tid` is the lane in the wave.
+template <int NT, bool OUT_BF16, bool SILU>
+__device__ __forceinline__ void moe_grouped_wmma_k2_store(
+    const float8_t* acc, void* __restrict__ Y_grouped, int M, int m_total, int tid,
+    int row_start, int slot_start, int nlive) {
+    const int lane = tid & 15;
     const int hi = tid >> 4;
 #pragma unroll
     for (int t = 0; t < NT; t++) {
@@ -435,3 +448,171 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out(MOE_W
                         Y_grouped, M, K, x_row_div, m_total);
 }
 #undef MOE_WMMA_ARGS
+
+#if defined(__gfx1151__)
+// Four row-tile waves (64 A rows) of one expert run share its X through
+// LDS, 64 K at a time: the per-wave entries re-read every tile's X from L2 in
+// each of M/16 waves.  Each wave stages its own 16 rows' current group
+// (single-buffered: it is only overwritten after the barrier that ends the
+// group).  The next chunk's X (and at a group boundary the next group's
+// weights) are loaded before the current chunk computes from LDS, so the
+// compute waits on no global load (vmcnt retires in order).  Every tile's
+// WMMA sequence, operands and epilogue are moe_grouped_wmma_k2_tiles', so
+// outputs are bitwise identical.
+// Grid [M / 64, m_total / 16], block 128.  M % 64 == 0, K % 256 == 0.
+template <int NT, bool OUT_BF16, bool SILU>
+__device__ __forceinline__ void moe_grouped_wmma_k2_tiles_x4(
+    const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
+    const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
+    int M, int K, int x_row_div, int m_total, int slot_start,
+    unsigned int* __restrict__ a_lds, _Float16* __restrict__ xs, int nlive) {
+    constexpr int WAVES = 4;
+    constexpr int XS = 72;                   // halves per staged slot row (64 + 8)
+    constexpr int NTH = 32 * WAVES;
+    constexpr int PIECES = NT * 16 * 8;      // 16 B pieces of a 64-K chunk's X
+    constexpr int PER = (PIECES + NTH - 1) / NTH;
+    const int tid = threadIdx.x;
+    const int wt = tid & 31;
+    const int lane = wt & 15;
+    const int row_start = (blockIdx.x * WAVES + (tid >> 5)) * 16;
+    const _Float16* src[PER];
+#pragma unroll
+    for (int i = 0; i < PER; i++) {
+        const int p = tid + NTH * i;
+        const int s = p >> 3;
+        const int slot_idx = slot_start + s;
+        src[i] = nullptr;
+        if (p < PIECES && (s >> 4) < nlive && slot_idx < m_total) {
+            const int flat = sorted_slot_index[slot_idx];
+            if (flat >= 0)
+                src[i] = X_src + (long long)((x_row_div > 1) ? (flat / x_row_div) : flat) * K + (p & 7) * 8;
+        }
+    }
+    uint4 xp[PER];
+    auto load_x = [&](int c) {
+#pragma unroll
+        for (int i = 0; i < PER; i++)
+            xp[i] = src[i] ? *(const uint4*)(src[i] + c * 64) : make_uint4(0, 0, 0, 0);
+    };
+    auto store_x = [&]() {
+#pragma unroll
+        for (int i = 0; i < PER; i++) {
+            const int p = tid + NTH * i;
+            if (p < PIECES) *(uint4*)(xs + (p >> 3) * XS + (p & 7) * 8) = xp[i];
+        }
+    };
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 136;
+    float8_t acc[NT];
+    for (int t = 0; t < NT; t++) acc[t] = float8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    const int rows_live = min(16, M - row_start);
+    auto weight_row = [&](int r) -> long long {
+        if (SILU)
+            return r < 8 ? row_start / 2 + r : M / 2 + row_start / 2 + r - 8;
+        return row_start + min(r, rows_live - 1);
+    };
+    unsigned long long pf[9];
+    auto load_group = [&](int g) {
+#pragma unroll
+        for (int i = 0; i < 9; i++) {
+            const int p = min(wt + 32 * i, 16 * 17 - 1);
+            const int r = p / 17, w = p - r * 17;
+            pf[i] = *(const unsigned long long*)(A + weight_row(r) * row_bytes + g * 136 + w * 8);
+        }
+    };
+    auto store_group = [&]() {
+#pragma unroll
+        for (int i = 0; i < 9; i++) {
+            const int p = min(wt + 32 * i, 16 * 17 - 1);
+            *(unsigned long long*)(a_lds + p * 2) = pf[i];
+        }
+    };
+    // LDS-only barriers: __syncthreads would also wait for the in-flight
+    // next-chunk global loads (WGP-mode workgroup fence).
+#define MOE_X4_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
+    load_group(0);
+    load_x(0);
+    store_group();
+    store_x();
+    MOE_X4_BARRIER();
+    const unsigned int* gw = a_lds + lane * 34;
+    const half16_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const int nchunks = K / 64;
+    for (int c = 0; c < nchunks; c++) {
+        const int cq = c & 3;
+        if (c + 1 < nchunks) {
+            if (cq == 3) load_group((c >> 2) + 1);
+            load_x(c + 1);
+        }
+        const unsigned int hdr = gw[cq >= 2 ? 1 : 0];
+        const _Float16 sc_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr & 0xFFFFu));
+        const _Float16 zp_h = __builtin_bit_cast(_Float16, (unsigned short)(hdr >> 16));
+#pragma unroll
+        for (int kq = 0; kq < 4; kq += 2) {
+            const int kt = cq * 4 + kq;
+            const half16_t a_a = dq_nibbles(gw[2 + 2 * kt], gw[3 + 2 * kt], sc_h, zp_h);
+            const half16_t a_b = dq_nibbles(gw[4 + 2 * kt], gw[5 + 2 * kt], sc_h, zp_h);
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                const _Float16* xr = xs + (t * 16 + lane) * XS;
+                const half16_t b_a = t < nlive ? *(const half16_t*)(xr + kq * 16) : zero_b;
+                const half16_t b_b = t < nlive ? *(const half16_t*)(xr + (kq + 1) * 16) : zero_b;
+                acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc[t]);
+                acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_b, b_b, acc[t]);
+            }
+        }
+        // WMMA has no memory chain: keep the WMMAs ahead of the barrier.
+#pragma unroll
+        for (int t = 0; t < NT; t++) asm volatile("" : "+v"(acc[t]));
+        if (c + 1 < nchunks) {
+            MOE_X4_BARRIER();  // every wave is done reading this chunk's X (and group)
+            if (cq == 3) store_group();
+            store_x();
+            MOE_X4_BARRIER();
+        }
+    }
+#undef MOE_X4_BARRIER
+    moe_grouped_wmma_k2_store<NT, OUT_BF16, SILU>(acc, Y_grouped, M, m_total, wt, row_start, slot_start, nlive);
+}
+
+// gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out with four row tiles per
+// workgroup: multi-tile runs share X (see above); single-tile runs, whose
+// X is one tile, keep the per-wave body (no barriers).  Both are bitwise
+// that entry's.  Grid [M / 64, m_total / 16], block 128.
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4(
+    const unsigned long long* __restrict__ expert_weight_ptrs,
+    const int* __restrict__ expert_tile_ids, const int* __restrict__ sorted_slot_index,
+    const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
+    int M, int K, int x_row_div, int m_total) {
+    const int tile_y = blockIdx.y;
+    const int slot_start = tile_y * 16;
+    if (slot_start >= m_total) return;
+    const int expert_id = expert_tile_ids[tile_y];
+    if (expert_id < 0) return;
+    int local = 0;
+    while (tile_y - local - 1 >= 0 && expert_tile_ids[tile_y - local - 1] == expert_id) ++local;
+    if (local % 4) return;
+    int run = 1;
+    while (run < 4 && (tile_y + run) * 16 < m_total && expert_tile_ids[tile_y + run] == expert_id) ++run;
+    const char* A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
+    // One LDS arena: the shared-X body takes four single-buffered weight
+    // slots plus the X chunk; the per-wave body two slots per wave.
+    __shared__ __align__(16) unsigned int lds[4 * 16 * 34 + 4 * 16 * 72 / 2];
+    const int wave = threadIdx.x >> 5;
+    if (run == 1) {
+        moe_grouped_wmma_k2_tiles<1, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total,
+                                                 threadIdx.x & 31, (blockIdx.x * 4 + wave) * 16, slot_start,
+                                                 lds + wave * 2 * 16 * 34, 1);
+        return;
+    }
+    unsigned int* my_lds = lds + wave * 16 * 34;
+    _Float16* xs = (_Float16*)(lds + 4 * 16 * 34);
+    if (run == 4)
+        moe_grouped_wmma_k2_tiles_x4<4, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, 4);
+    else if (run == 3)
+        moe_grouped_wmma_k2_tiles_x4<3, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, 3);
+    else
+        moe_grouped_wmma_k2_tiles_x4<2, true, true>(A, sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total, slot_start, my_lds, xs, 2);
+}
+#endif
