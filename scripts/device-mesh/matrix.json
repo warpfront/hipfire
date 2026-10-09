@@ -1920,45 +1920,88 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1",
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1",
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1"
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single qwen35_dense_single_route_oracle -- --ignored --exact --nocapture --test-threads=1",
+     "HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single qwen35_moe_single_route_oracle -- --ignored --exact --nocapture --test-threads=1",
+     "HIPFIRE_QWEN36_MOE_FIXTURE=$MODELS_DIR/qwen3.6-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single qwen35_moe_qwen36_single_route_oracle -- --ignored --exact --nocapture --test-threads=1"
     ],
     "negative": []
    },
    "fixtures": [
     "qwen3.8:27b-mq4-xt",
-    "ornith-1.5:35b-a3b-mq4r"
+    "ornith-1.5:35b-a3b-mq4r",
+    "qwen3.6:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1151",
+    "gfx1201"
+   ],
+   "id": "g1-route-oracles-nonllama-single",
+   "milestone": "G1",
+   "predicate": {
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 3
+   },
+   "probe": "existing",
+   "route": "single/route-oracles"
+  },
+  {
+   "commands": {
+    "positive": [
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --nocapture --test-threads=1",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --nocapture --test-threads=1"
+    ],
+    "negative": []
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
    ],
    "hosts": [
     "gfx1201"
    ],
    "id": "g1-route-oracles-nonllama",
    "milestone": "G1",
+   "note": "Physical PP2/TP2 vs single on two distinct GPUs. HIPFIRE_EMULATE_GPUS runs on one device are diagnostic only and never close this row.",
    "predicate": {
+    "forbid": [
+     "skip:"
+    ],
     "kind": "cargo",
-    "min_passed": 4
+    "min_passed": 2
    },
    "probe": "thin-driver",
-   "route": "single+pp+tp/route-oracles"
+   "route": "pp+tp/route-oracles"
   },
   {
-   "id": "g5-ep-route-oracles",
-   "milestone": "G5",
-   "route": "ep/route-oracles",
-   "probe": "none",
    "commands": {
-    "positive": [],
+    "positive": [
+     "HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_ep2_vs_single_oracle -- --ignored --exact --nocapture --test-threads=1",
+     "HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_ep4_vs_ep2_oracle -- --ignored --exact --nocapture --test-threads=1",
+     "HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_ep4_batch_step_recipe_oracle -- --ignored --exact --nocapture --test-threads=1"
+    ],
     "negative": []
    },
-   "fixtures": [],
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
    "hosts": [
     "gfx1201"
    ],
+   "id": "g5-ep-route-oracles",
+   "milestone": "G5",
+   "note": "Physical EP2 vs single and EP4 vs EP2 / EP4 batch lifecycle on four distinct gfx1201 GPUs, emulation off, default canonical peer transport (HIPFIRE_EP_PEER_ALLREDUCE / _DECODE unset). Strict byte-equal rank-0 logits since the G5 slot-order combine (27abd53e4). HIPFIRE_EMULATE_GPUS runs are diagnostic only and never close this row.",
    "predicate": {
-    "kind": "none"
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 3
    },
-   "note": "qwen35_ep2_vs_single_oracle and qwen35_ep4_vs_ep2_oracle exist on this head and are deliberately RED at 1e-3: sharded EP diverges from single by a top-k routing flip seeded by expert-parity vs slot-order f32 association (pos 17 / pos 2 on Q8 state; pos 5 on f32). Unchanged by canonical rooted reduce, EF residuals on multi, or f32 state. Pre-exists on master; daemon refuses MoE EP so no user exposure. Discharged by the G5 slot-order combine (G5-SLOT-COMBINE-PLAN.md)."
+   "probe": "existing",
+   "route": "ep/route-oracles"
   },
   {
    "commands": {

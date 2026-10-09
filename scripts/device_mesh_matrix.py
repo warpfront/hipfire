@@ -141,10 +141,14 @@ def parse_cargo(text):
     return {"summaries": "test result:" in text, "passed": sum(p for p, _ in counts),
             "failed": sum(f for _, f in counts)}
 
-def eval_cargo(text, minimum):
+def eval_cargo(text, minimum, forbid=()):
+    # `forbid` catches in-test early returns (e.g. "skip:" when a mesh cannot be
+    # stood up) that cargo still counts as passed; needs --nocapture to be visible.
     s = parse_cargo(text)
-    return (s["summaries"] and not s["failed"] and s["passed"] >= minimum,
-            "cargo: passed=%d failed=%d min=%d" % (s["passed"], s["failed"], minimum))
+    hit = next((m for m in forbid if m in text), "")
+    return (s["summaries"] and not s["failed"] and s["passed"] >= minimum and not hit,
+            "cargo: passed=%d failed=%d min=%d%s" % (s["passed"], s["failed"], minimum,
+                                                     " forbidden output %r" % hit if hit else ""))
 
 def degenerate_text(content):
     """A lifecycle row fails on DEGENERATE output, not on truncation.
@@ -607,7 +611,8 @@ def execute_row(ctx, row, out, timeout):
         if gap:
             return "hardware-blocked", "capability gap on this arch: %s" % gap, detail
     if kind == "cargo":
-        good, note = eval_cargo("\n".join(r["out"] for r in positives), pred.get("min_passed", 1))
+        good, note = eval_cargo("\n".join(r["out"] for r in positives), pred.get("min_passed", 1),
+                                pred.get("forbid", ()))
     elif kind == "serve":
         rows = []
         extend_outs(rows, positives)
@@ -700,6 +705,7 @@ def self_test():
     check("cargo-min-bound", not eval_cargo(SAMPLE_CARGO_PASS, 6)[0])
     check("cargo-fail", not eval_cargo(SAMPLE_CARGO_FAIL, 1)[0])
     check("cargo-no-summary", not eval_cargo("nothing here", 1)[0])
+    check("cargo-forbidden-output", not eval_cargo("skip: no mesh\n" + SAMPLE_CARGO_PASS, 5, ["skip:"])[0])
     check("cargo-not-bare-ok", parse_cargo("all ok folks")["passed"] == 0)
     check("serve-clean", eval_serve_rows(SAMPLE_SERVE_CLEAN, True)[0])
     check("serve-dirty-fails", not eval_serve_rows(SAMPLE_SERVE_DIRTY, True)[0])

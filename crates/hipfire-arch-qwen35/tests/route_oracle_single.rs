@@ -2,11 +2,14 @@
 // Copyright (c) 2026 alpineq
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! G1 single-route numerical/state oracle (`g1-route-oracles-nonllama`).
+//! G1 single-route numerical/state oracle (`g1-route-oracles-nonllama-single`).
 //!
-//! Two ignored, env-gated GPU tests — one per single-GPU Qwen35 route:
+//! Three ignored, env-gated GPU tests — one per single-GPU Qwen35 route cell:
 //!   * `qwen35_dense_single_route_oracle` on `HIPFIRE_QWEN35_FIXTURE` (dense 27B)
-//!   * `qwen35_moe_single_route_oracle` on `HIPFIRE_ORNITH_FIXTURE` (A3B MoE)
+//!   * `qwen35_moe_single_route_oracle` on `HIPFIRE_ORNITH_FIXTURE` (A3B MoE,
+//!     the G5 EP pin shared with `route_oracle_mesh.rs`)
+//!   * `qwen35_moe_qwen36_single_route_oracle` on `HIPFIRE_QWEN36_MOE_FIXTURE`
+//!     (registry `qwen3.6:35b-a3b-mq4r`, the G5 production MoE fixture)
 //!
 //! Structure follows the LLaMA template oracle
 //! (`crates/hipfire-arch-llama/src/carrier.rs`
@@ -31,6 +34,7 @@
 //!
 //!   HIPFIRE_QWEN35_FIXTURE=$HOME/.hipfire/models/qwen3.8-27b.mq4-xt \
 //!   HIPFIRE_ORNITH_FIXTURE=$HOME/.hipfire/models/ornith-1.5-35b-a3b.mq4r \
+//!   HIPFIRE_QWEN36_MOE_FIXTURE=$HOME/.hipfire/models/qwen3.6-35b-a3b.mq4r \
 //!   HIP_VISIBLE_DEVICES=0 flock -w 3600 /tmp/hipfire-gpu.lock \
 //!       cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single \
 //!           -- --ignored --test-threads=1
@@ -67,6 +71,9 @@ const DENSE_SIZE: u64 = 14_980_361_216;
 const DENSE_SHA256: &str = "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7";
 const MOE_SIZE: u64 = 18_700_570_368;
 const MOE_SHA256: &str = "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6";
+// `qwen3.6:35b-a3b-mq4r` per registry/v1.json (full-file sha256, verified on halo).
+const QWEN36_MOE_SIZE: u64 = 18_700_048_128;
+const QWEN36_MOE_SHA256: &str = "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428";
 
 fn fixture_or_skip(env: &str, def: &str, role: &str) -> Option<String> {
     let path = std::env::var(env).unwrap_or_else(|_| {
@@ -654,5 +661,21 @@ fn qwen35_moe_single_route_oracle() {
         true,
         MOE_SIZE,
         MOE_SHA256,
+    );
+}
+
+#[test]
+#[ignore]
+fn qwen35_moe_qwen36_single_route_oracle() {
+    let _guard = GPU_ORACLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_oracle(
+        "g1-single-oracle[moe-qwen3.6]",
+        "HIPFIRE_QWEN36_MOE_FIXTURE",
+        "qwen3.6-35b-a3b.mq4r",
+        true,
+        QWEN36_MOE_SIZE,
+        QWEN36_MOE_SHA256,
     );
 }
