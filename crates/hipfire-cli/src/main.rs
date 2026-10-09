@@ -12315,6 +12315,7 @@ mod tests {
                     vision_override: None,
                     tp: None,
                     continuous_batch_size: 1,
+                    vmm_batch: crate::serve::VmmBatchFlags::default(),
                     multi_slot_enabled: false,
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,

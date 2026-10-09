@@ -618,14 +618,39 @@ const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 /// call, while the process is still single-threaded. APUs ignore the first
 /// switch.
 ///
-/// Both switches are process-global, and together they slow other loads: on
-/// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
-/// 1.00-1.01 s. So they are set only in a process that loads a Qwen4 model,
-/// the one known to hold tens of GB of host memory the GPU reads:
-/// [`HipRuntime::load`] sets them in a process configured to host-map Qwen4
-/// experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), and a process about to load a
-/// Qwen4 model on a discrete GPU calls this before the runtime loads
-/// (`hipfire_loader::prepare_host_memory_for`).
+/// The two switches cover the two classes of userptr page, and they are priced
+/// very differently, so they are armed differently:
+///
+/// * `GPU_PINNED_MIN_XFER_SIZE` covers the **pageable copy source** — the
+///   mapped model file's page-cache pages, which clr otherwise pins in place
+///   for every large weight upload. That source exists on *every* weight load,
+///   on every architecture, so it is armed in every Linux process, by
+///   [`HipRuntime::load`] before the runtime is dlopen'd. Measured free on
+///   gfx1201 / Qwen3.8-27B MQ3-Pro (warm cache, three reps each): weight sweep
+///   1190-1198 ms armed vs 1204-1210 ms unarmed.
+/// * `HSA_USERPTR_FOR_PAGED_MEM=0` covers `hipHostMalloc` blocks, and it is
+///   the half that costs (same model and box: +8-11 % on the sweep; the commit
+///   that introduced the gate measured ~+20 % on H2), so it stays scoped to a
+///   process that loads a Qwen4 model, the one known to hold tens of GB of host
+///   memory the GPU reads: [`HipRuntime::load`] sets it in a process configured
+///   to host-map Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), and a
+///   process about to load a Qwen4 model on a discrete GPU calls this before
+///   the runtime loads (`hipfire_loader::prepare_host_memory_for`).
+///
+/// Neither name is a published interface. `GPU_PINNED_MIN_XFER_SIZE` is absent
+/// from HIP's own environment-variable reference and from AMD's env-var page
+/// (checked against ROCm 7.2), and `HSA_USERPTR_FOR_PAGED_MEM` is a libhsakmt
+/// knob; clr/libhsakmt read each once, at runtime initialization, so both are
+/// set before the runtime is dlopen'd. They are used here because the
+/// alternative is the stall described above (ROCm/rocm-systems#12528), and
+/// `f5731a506` relied on them first, for host-mapped Qwen4 experts.
+/// `docs/env-vars.md` records that provenance so neither reads as supported
+/// API.
+///
+/// Evidence: under an 8 GiB host-memory ballast, an unarmed 27B load stalls at
+/// a varying `loading layer N/64` on both a partial-GPU-offload and a
+/// fully-resident configuration; `GPU_PINNED_MIN_XFER_SIZE` alone loads 7/7.
+/// See the `fix/host-memory-reclaim-stall` branch commit for the full table.
 pub fn keep_host_memory_out_of_reclaim(reason: &str) {
     if !cfg!(target_os = "linux") {
         return;
@@ -643,6 +668,28 @@ pub fn keep_host_memory_out_of_reclaim(reason: &str) {
     if !set.is_empty() {
         eprintln!("[hip-bridge] {} ({reason}): host memory out of reclaim", set.join(" "));
     }
+}
+
+/// Arm clr's pageable-copy staging threshold (`GPU_PINNED_MIN_XFER_SIZE`) in
+/// every Linux process, before the HIP runtime is dlopen'd, unless the operator
+/// already set it. Separate from [`keep_host_memory_out_of_reclaim`] because
+/// this switch is priced free while the `HSA_USERPTR_FOR_PAGED_MEM` half is
+/// not, so the two are scoped differently. This is the tier that covers the
+/// mapped-file copy source on *every* HFQ load: [`HipRuntime::load`] is the one
+/// site every load path in every process reaches before its first weight copy,
+/// where `hipfire_loader::prepare_host_memory_for` runs earlier but only in a
+/// daemon started for a model.
+fn keep_pageable_copies_out_of_reclaim() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    if std::env::var_os(GPU_PINNED_MIN_XFER_SIZE).is_some() {
+        return;
+    }
+    std::env::set_var(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB);
+    eprintln!(
+        "[hip-bridge] {GPU_PINNED_MIN_XFER_SIZE}={STAGE_ALL_PAGEABLE_COPIES_MB}: pageable weight copies staged out of reclaim"
+    );
 }
 
 /// Places the routed experts of Qwen4 trunk layers at or past `N` in pinned,
@@ -667,6 +714,7 @@ impl HipRuntime {
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        keep_pageable_copies_out_of_reclaim();
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
         }

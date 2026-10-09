@@ -457,7 +457,8 @@ mod tests {
         assert!(emitted.s_text.contains("v_dual_mul_f32 v48, v41, v81 :: v_dual_mul_f32 v49, v51, v81"));
         assert!(emitted.s_text.contains("v_dual_fmac_f32 v48, v40, v80 :: v_dual_fmac_f32 v49, v50, v80"));
         let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1201).expect("native assemble");
-        let dir = std::path::PathBuf::from("/home/kaden/qcal/release-0.4.2/pm-decode-twins/xbatch-pm");
+        let dir = std::env::temp_dir()
+            .join(format!("hipfire-isa-xbatch-pm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("gemv_hfq4g256_xbatch_mq4v2.test.s"), &emitted.s_text).unwrap();
         let co = dir.join("gemv_hfq4g256_xbatch_mq4v2.test.co");

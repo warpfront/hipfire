@@ -3470,6 +3470,9 @@ mod tests {
         assert!(err.to_string().contains("no AMDGPU"), "{err}");
     }
 
+    // `4..3` below is the input under test: a reversed range must be rejected
+    // by the bounds check, not iterated. Hence the lint allow.
+    #[allow(clippy::reversed_empty_ranges)]
     #[test]
     fn subimage_bounds_are_relative_and_checked() {
         let image = CodeObjectBytes::from(ELF);
