@@ -1,0 +1,87 @@
+[
+  {
+    "scenario": "kv-cache-guide",
+    "A_decode_median": 61.5,
+    "B_decode_median": 61.85,
+    "speedup": 1.005691056910569,
+    "A_range": [
+      61.5,
+      63.8
+    ],
+    "B_range": [
+      61.6,
+      62.4
+    ],
+    "text_parity": true,
+    "tau_parity": true,
+    "cycles_parity": true
+  },
+  {
+    "scenario": "sglang-guide",
+    "A_decode_median": 59.45,
+    "B_decode_median": 59.6,
+    "speedup": 1.0025231286795626,
+    "A_range": [
+      59.4,
+      59.5
+    ],
+    "B_range": [
+      59.5,
+      59.6
+    ],
+    "text_parity": true,
+    "tau_parity": true,
+    "cycles_parity": true
+  },
+  {
+    "scenario": "open-story",
+    "A_decode_median": 30.4,
+    "B_decode_median": 30.5,
+    "speedup": 1.0032894736842106,
+    "A_range": [
+      30.4,
+      30.5
+    ],
+    "B_range": [
+      30.5,
+      30.5
+    ],
+    "text_parity": true,
+    "tau_parity": true,
+    "cycles_parity": true
+  },
+  {
+    "scenario": "snake-python",
+    "A_decode_median": 119.95,
+    "B_decode_median": 120.2,
+    "speedup": 1.0020842017507294,
+    "A_range": [
+      119.6,
+      120.3
+    ],
+    "B_range": [
+      119.8,
+      120.7
+    ],
+    "text_parity": true,
+    "tau_parity": true,
+    "cycles_parity": true
+  },
+  {
+    "scenario": "tetris-python",
+    "A_decode_median": 113.85,
+    "B_decode_median": 114.15,
+    "speedup": 1.0026350461133071,
+    "A_range": [
+      113.7,
+      114.0
+    ],
+    "B_range": [
+      114.0,
+      114.3
+    ],
+    "text_parity": true,
+    "tau_parity": true,
+    "cycles_parity": true
+  }
+]

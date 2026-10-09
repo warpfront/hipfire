@@ -542,6 +542,9 @@ pub struct FeatureFlags {
     pub fa_batch_fuse_off: bool,
     /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings.
     pub draft_collapse_off: bool,
+    pub draft_shared_qkv_rotation: bool,
+    pub draft_shared_ffn_rotation: bool,
+    pub draft_shared_ctx_kv_rotation: bool,
     /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
     pub ddtree_topk_direct_off: bool,
     /// S9: `HIPFIRE_MQ_PROLOGUE_FUSE_OFF=1` restores producer+GEMM pairs.
@@ -998,6 +1001,9 @@ impl FeatureFlags {
             gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
             fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
             draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
+            draft_shared_qkv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_QKV_ROTATION").unwrap_or(true),
+            draft_shared_ffn_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_FFN_ROTATION").unwrap_or(true),
+            draft_shared_ctx_kv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION").unwrap_or(true),
             ddtree_topk_direct_off: value("HIPFIRE_DDTREE_TOPK_DIRECT_OFF").ok().as_deref()
                 == Some("1"),
             mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
@@ -1400,6 +1406,9 @@ impl FeatureFlags {
             gdn_pre_fuse_off: false,
             fa_batch_fuse_off: false,
             draft_collapse_off: false,
+            draft_shared_qkv_rotation: true,
+            draft_shared_ffn_rotation: true,
+            draft_shared_ctx_kv_rotation: true,
             ddtree_topk_direct_off: false,
             mq_prologue_fuse_off: false,
             gdn_replay_ml_off: false,
@@ -1986,6 +1995,38 @@ mod tests {
         assert!(!f.gemma4_ple_branch_batched_prefill);
         assert!(!f.gemma4_ple_activation_fused_prefill);
         assert!(f.flash_attn_ck_lib.is_none());
+    }
+
+    #[test]
+    fn draft_shared_rotations_default_on() {
+        let flags = FeatureFlags::for_test("gfx1100");
+        assert!(flags.draft_shared_qkv_rotation);
+        assert!(flags.draft_shared_ffn_rotation);
+        assert!(flags.draft_shared_ctx_kv_rotation);
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        let flags = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(flags.draft_shared_qkv_rotation);
+        assert!(flags.draft_shared_ffn_rotation);
+        assert!(flags.draft_shared_ctx_kv_rotation);
+    }
+
+    #[test]
+    fn draft_shared_rotations_resolve_independently() {
+        for key in ["kernel.draft_shared_qkv_rotation", "kernel.draft_shared_ffn_rotation",
+                    "kernel.draft_shared_ctx_kv_rotation"] {
+            for (value, expected) in [("false", false), ("true", true)] {
+                let mut layer = ConfigLayer::default();
+                layer.set_cli(key, value).unwrap();
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser { path: "config.toml".into() }, layer,
+                }]).unwrap();
+                let process = ProcessConfig::from_resolved(&resolved).unwrap();
+                let flags = FeatureFlags::from_process_config("gfx1100", &process);
+                assert_eq!(flags.draft_shared_qkv_rotation, expected || !key.ends_with("shared_qkv_rotation"));
+                assert_eq!(flags.draft_shared_ffn_rotation, expected || !key.ends_with("shared_ffn_rotation"));
+                assert_eq!(flags.draft_shared_ctx_kv_rotation, expected || !key.ends_with("shared_ctx_kv_rotation"));
+            }
+        }
     }
 
     #[test]

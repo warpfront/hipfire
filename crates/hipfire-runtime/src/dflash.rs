@@ -2158,6 +2158,63 @@ fn gemm_dispatch_mq4_collapsed(
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
 /// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
 /// HFQ4-G256 GEMM kernel against the pre-rotated weights.
+enum SharedProjection {
+    Qkv,
+    Ffn,
+    ContextKv,
+}
+
+fn gemm_dispatch_shared<const N: usize>(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    projections: [(&WeightTensor, &GpuTensor); N],
+    batch: usize,
+    mq_x_rot: Option<&GpuTensor>,
+    mq_x_rot_f16: Option<&GpuTensor>,
+    family: SharedProjection,
+) -> HipResult<()> {
+    let enabled = match family {
+        SharedProjection::Qkv => gpu.flags.draft_shared_qkv_rotation,
+        SharedProjection::Ffn => gpu.flags.draft_shared_ffn_rotation,
+        SharedProjection::ContextKv => gpu.flags.draft_shared_ctx_kv_rotation,
+    };
+    let k = projections[0].0.k;
+    let eligible = enabled
+        && k > 0 && k % 256 == 0
+        && gpu.arch_caps.is_gfx1100()
+        && !gpu.replay.is_recording() && !gpu.graphs.capture_mode
+        && batch > 1 && batch <= 16
+        && !crate::config::get().draft_gemm_dump
+        && mq_x_rot.is_some_and(|s| s.shape[0] / k >= batch)
+        && mq_x_rot_f16.is_some_and(|s| s.shape[0] / k >= batch)
+        && projections.iter().all(|(w, _)|
+            w.gpu_dtype == DType::MQ4G256V2 && w.k == k && w.awq_scale.is_none());
+    if !eligible {
+        for (w, y) in projections {
+            gemm_dispatch(gpu, x, w, y, batch, mq_x_rot, mq_x_rot_f16)?;
+        }
+        return Ok(());
+    }
+    // All consumers use the same input and rotation contract; GEMMs stay unchanged.
+    match gpu.draft_collapse_mq4v2_route(k, batch, false) {
+        rdna_compute::dflash_draft_fusion::DraftCollapseV2::OverwriteKsplit { kw } => {
+            let rot = mq_x_rot_f16.unwrap().sub_offset(0, batch * k);
+            gpu.mq_rotate_x_f16_dflash(x, &rot, k, batch)?;
+            for (w, y) in projections {
+                gpu.gemm_mq4g256v2_overwrite_ksplit_lds_dflash(&w.buf, &rot, y, w.m, k, batch, kw)?;
+            }
+        }
+        rdna_compute::dflash_draft_fusion::DraftCollapseV2::Off => {
+            let rot = mq_x_rot.unwrap().sub_offset(0, batch * k);
+            crate::llama::rotate_x_mq_batched_for(gpu, projections[0].0, x, &rot, k, batch)?;
+            for (w, y) in projections {
+                gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot, y, w.m, k, batch)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn gemm_dispatch(
     gpu: &mut Gpu,
     x: &GpuTensor,
@@ -2599,23 +2656,14 @@ fn draft_ffn_layer(
         }
         gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
     }
-    gemm_dispatch(
+    gemm_dispatch_shared(
         gpu,
         &scratch.x_norm,
-        &layer.w_gate,
-        &scratch.gate,
+        [(&layer.w_gate, &scratch.gate), (&layer.w_up, &scratch.up)],
         b,
         scratch.mq_x_rot.as_ref(),
         scratch.mq_x_rot_f16.as_ref(),
-    )?;
-    gemm_dispatch(
-        gpu,
-        &scratch.x_norm,
-        &layer.w_up,
-        &scratch.up,
-        b,
-        scratch.mq_x_rot.as_ref(),
-        scratch.mq_x_rot_f16.as_ref(),
+        SharedProjection::Ffn,
     )?;
     gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
     gemm_dispatch(
@@ -3211,32 +3259,14 @@ pub fn draft_forward_opts(
         // Q and K/V noise (over the B block positions) must be computed
         // every cycle. K_ctx and V_ctx (over the L context positions)
         // are *incrementally* cached — see the per-layer block below.
-        gemm_dispatch(
+        gemm_dispatch_shared(
             gpu,
             qkv_src,
-            &layer.wq,
-            &scratch.q,
+            [(&layer.wq, &scratch.q), (&layer.wk, &scratch.k_noise), (&layer.wv, &scratch.v_noise)],
             b,
             scratch.mq_x_rot.as_ref(),
             scratch.mq_x_rot_f16.as_ref(),
-        )?;
-        gemm_dispatch(
-            gpu,
-            qkv_src,
-            &layer.wk,
-            &scratch.k_noise,
-            b,
-            scratch.mq_x_rot.as_ref(),
-            scratch.mq_x_rot_f16.as_ref(),
-        )?;
-        gemm_dispatch(
-            gpu,
-            qkv_src,
-            &layer.wv,
-            &scratch.v_noise,
-            b,
-            scratch.mq_x_rot.as_ref(),
-            scratch.mq_x_rot_f16.as_ref(),
+            SharedProjection::Qkv,
         )?;
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
@@ -3313,23 +3343,14 @@ pub fn draft_forward_opts(
                 let thp_slice = scratch.target_hidden_proj.sub_offset(p_slot * h, step * h);
                 let k_slot = k_cache_layer.sub_offset(c_slot * kvd, step * kvd);
                 let v_slot = v_cache_layer.sub_offset(c_slot * kvd, step * kvd);
-                gemm_dispatch(
+                gemm_dispatch_shared(
                     gpu,
                     &thp_slice,
-                    &layer.wk,
-                    &k_slot,
+                    [(&layer.wk, &k_slot), (&layer.wv, &v_slot)],
                     step,
                     scratch.mq_x_rot.as_ref(),
                     scratch.mq_x_rot_f16.as_ref(),
-                )?;
-                gemm_dispatch(
-                    gpu,
-                    &thp_slice,
-                    &layer.wv,
-                    &v_slot,
-                    step,
-                    scratch.mq_x_rot.as_ref(),
-                    scratch.mq_x_rot_f16.as_ref(),
+                    SharedProjection::ContextKv,
                 )?;
                 // Per-head RMSNorm on K delta rows only. batch = step × n_kv_heads.
                 gpu.rmsnorm_batched(
@@ -3628,23 +3649,14 @@ pub fn draft_forward_opts(
                 stride,
                 0,
             )?;
-            gemm_dispatch(
+            gemm_dispatch_shared(
                 gpu,
                 tmp,
-                &layer.w_gate,
-                &scratch.gate,
+                [(&layer.w_gate, &scratch.gate), (&layer.w_up, &scratch.up)],
                 b,
                 scratch.mq_x_rot.as_ref(),
                 scratch.mq_x_rot_f16.as_ref(),
-            )?;
-            gemm_dispatch(
-                gpu,
-                tmp,
-                &layer.w_up,
-                &scratch.up,
-                b,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
+                SharedProjection::Ffn,
             )?;
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
             // S7: w_down lands in dead conv_temp (last read by the gate/up

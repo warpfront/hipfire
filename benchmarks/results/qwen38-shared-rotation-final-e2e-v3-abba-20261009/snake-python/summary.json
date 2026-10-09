@@ -1,0 +1,17 @@
+{
+  "scenario": "snake-python",
+  "A_decode_median": 119.95,
+  "B_decode_median": 120.2,
+  "speedup": 1.0020842017507294,
+  "A_range": [
+    119.6,
+    120.3
+  ],
+  "B_range": [
+    119.8,
+    120.7
+  ],
+  "text_parity": true,
+  "tau_parity": true,
+  "cycles_parity": true
+}

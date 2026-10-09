@@ -1,0 +1,202 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/media/990Pro/hipfire/models/qwen3.8-27b.mq4-xts",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 16384,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 870671,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 28370,
+    "vram_total_mb": 46064,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 46016,
+  "max_seq": {
+    "effective": 16384,
+    "requested": 16384,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 8192,
+  "runs": 1,
+  "warmups": 2,
+  "batch": 1,
+  "prompt_tokens": 109,
+  "prompt_md5": "035249b80eeb0582dafe48118a4f2bdf",
+  "prompt_chars": 163,
+  "warnings": [
+    "prompt is 109 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card0",
+    "pci": "0000:9e:00.0",
+    "arch": "gfx1100",
+    "selected_by": "ROCR_VISIBLE_DEVICES=1",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 117,
+      "duration_s": 57.77,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 60.8,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 83.0
+          },
+          "junction": {
+            "max": 98.0
+          },
+          "mem": {
+            "max": 92.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 1995.1,
+            "min": 1087.0,
+            "max": 2227.0
+          },
+          "mclk": {
+            "avg": 1124.0,
+            "min": 1124.0,
+            "max": 1124.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 46064.0,
+        "vram_used_mib": 18110.2,
+        "vram_free_mib": 27953.8,
+        "gtt_total_mib": 112655.5,
+        "gtt_used_mib": 17.1,
+        "gtt_free_mib": 112638.4,
+        "mem_total_mib": 225310.9,
+        "mem_available_mib": 207526.6
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 30.4,
+    "mean": 30.4,
+    "min": 30.4,
+    "max": 30.4,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 583.7,
+    "mean": 583.7,
+    "min": 583.7,
+    "max": 583.7,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 30.3,
+    "mean": 30.3,
+    "min": 30.3,
+    "max": 30.3,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 186.8,
+    "mean": 186.8,
+    "min": 186.8,
+    "max": 186.8,
+    "stdev": 0.0
+  },
+  "spec_requested": "dflash",
+  "spec_route": [
+    "dflash"
+  ],
+  "spec_tau": [
+    0.68
+  ],
+  "run_events": [
+    {
+      "type": "done",
+      "id": "chatcmpl-978770-3",
+      "tokens": 1753,
+      "tok_s": 30.3,
+      "prefill_tokens": 109,
+      "prefill_ms": 186.8,
+      "prefill_tok_s": 583.7,
+      "decode_tok_s": 30.4,
+      "ttft_ms": 186.8,
+      "dflash": true,
+      "tau": 0.68,
+      "cycles": 1043,
+      "cached_tokens": 0,
+      "finish_reason": "stop",
+      "attempt_id": 1,
+      "bench_output": "# 雨后的第七日\n\n暴雨像是一头被困在玻璃罩里的野兽，整整七天，它用浑浊的爪子疯狂抓挠着这座城市的每一寸皮肤。\n\n当第八天的清晨，第一缕阳光刺破厚重的云层时，林远推开公寓的门，空气中弥漫着一种被彻底清洗过的、近乎无菌的冷冽味道。街道上空无一人，只有积水在倒映着灰白的天空。林远是一名档案修复师，他的工作是在时间的废墟里捡拾碎片，修补那些被虫蛀、被水浸、被遗忘的历史。他习惯了与沉默的纸张打交道，因此，当他在前往地铁站的路上，发现导航地图上多出了一条名为“静默巷”的街道时，他的第一反应是：系统故障。\n\n那条街道像一道黑色的伤疤，突兀地横亘在老城区与新城区之间。地图上显示它长三百米，尽头有一个红色的图标——邮局。\n\n林远停下脚步，盯着手机屏幕。周围是熟悉的梧桐树和斑驳的围墙，但地图上那条线所指向的位置，此刻正矗立着一栋他从未见过的红砖小楼。它安静地伫立在雨后的雾气中，仿佛已经在那里存在了百年，又仿佛刚刚从虚空中凝结而成。\n\n好奇心像一根细针，轻轻刺破了林远谨慎的防线。他绕开积水，走向那栋小楼。\n\n推开那扇沉重的木门，门轴发出令人牙酸的吱呀声。屋内没有灯光，却异常明亮，空气中漂浮着尘埃，在光柱中缓缓旋转。柜台后坐着一个老人，穿着旧式的灰色制服，正低头整理着一堆泛黄的信件。\n\n“你好。”林远试探着开口。\n\n老人抬起头，眼神浑浊却锐利，像是一口枯井。“你是新来的居民？还是……迷路的人？”\n\n“我是林远，住在这附近。”林远指了指窗外，“这条街……以前不在这里。”\n\n老人笑了笑，那笑容里带着一种令人不安的悲悯。“雨太大了，把时间冲乱了。有些东西被冲到了表面，有些东西则被埋得更深。这里是‘静默邮局’，专门处理那些寄往未来、却由过去的人写下的信。”\n\n林远感到一阵眩晕。他走近柜台，看到那些信件上并没有贴邮票，信封上只写着一个日期和一个名字。他随手拿起一封，信封上的字迹苍劲有力，日期是**2024年10月15日**——也就是今天。收件人写着：**林远**。\n\n“这不可能。”林远的手开始颤抖，“今天才刚过完暴雨，这封信……是谁写的？”\n\n“过去的人。”老人淡淡地说，“比如，十年前的你。”\n\n林远猛地后退一步，撞翻了柜台上的一个相框。相框里是一张黑白照片，照片中的男人年轻、意气风发，手里拿着一把吉他，背景是大学校园。那是林远自己，二十岁时的样子。\n\n“不，这不合逻辑。”林远的大脑飞速运转，试图用理性去拆解这个荒诞的场景，“时间不能倒流，信件也不能穿越。”\n\n“逻辑是干燥的，林远。”老人站起身，从柜台下拿出一本厚重的登记簿，“但情感是潮湿的。暴雨只是表象，真正冲刷我们的是那些未被说出口的话。这七天，你一直在逃避什么？”\n\n林远愣住了。这七天里，他确实一直在逃避。三天前，他收到了母亲去世的消息。母亲生前一直希望他放弃枯燥的档案工作，去追求音乐，去“活得像一阵风”。但他拒绝了，他选择了稳定、安全、可预测的生活。母亲在病床上最后对他说的话是：“小远，别把自己活成一份档案。”\n\n暴雨开始的那天，他把自己关在房间里，听着雨声，像是在听母亲心跳停止后的余音。\n\n“这封信……”林远的声音沙哑，“里面写了什么？”\n\n“你自己看。”\n\n林远颤抖着拆开信封。信纸已经泛黄，边缘有些卷曲，但字迹清晰。\n\n*小远：*\n\n*当你读到这封信时，你应该已经三十岁了。我知道你会拒绝我，你会说音乐是虚妄的，档案才是真实的。你会在母亲去世后，把自己埋进那些发黄的纸堆里，以为这样就能留住她。*\n\n*但你错了。你留住的不是她，而是你的恐惧。*\n\n*我写这封信，不是为了让你后悔，而是为了让你明白：有些路，错过了就是错过了。但有些声音，即使隔着时间，也能穿透暴雨，抵达你的耳朵。*\n\n*别修档案了，去修你的心。*\n\n*爱你的，林远（2014年）*\n\n林远感到一阵剧烈的恶心，仿佛胃里翻涌着酸水。这不是超自然现象，这是心理投射，是他在极度悲伤和压力下的幻觉。他猛地冲出邮局，冲进雨中——不，雨已经停了。他冲进阳光里，阳光刺得他睁不开眼。\n\n他跑回公寓，抓起手机，拨通了母亲的电话。号码是空号。他翻出母亲的遗物，那把吉他还放在角落里，积了一层薄灰。\n\n他拿起吉他，手指僵硬地拨动琴弦。一个音符，两个音符。声音干涩、刺耳，像是指甲划过黑板。\n\n他哭了。不是那种无声的流泪，而是嚎啕大哭，像是一个孩子。他想起母亲在病床上握着他手时的温度，想起自己拒绝她时的冷漠，想起这七天里，他对着雨声发呆的每一个瞬间。\n\n他意识到，那条“静默巷”并不是地图上的错误，而是他内心深处的裂缝。暴雨冲刷掉了城市的污垢，也冲刷掉了他伪装坚强的外壳。\n\n第二天，林远再次来到那栋红砖小楼。\n\n老人还在柜台后，但这次，他的眼神更加温和。\n\n“你明白了？”老人问。\n\n“我明白了。”林远说，“这不是信，是我自己写给自己的。是我在暴雨中，在绝望中，试图与过去的自己和解。”\n\n“不完全是。”老人摇摇头，“信是真的。时间不是线性的，林远。它是螺旋的。你在过去种下的因，会在未来结出果。那封信，是你未来的自己，在某个平静的午后，写给过去的你的。而你，现在读到了它。”\n\n林远沉默了。他看着柜台上的那些信件，每一封都代表着一个未完成的遗憾，一个未说出口的道歉，一个未实现的梦想。\n\n“我要怎么做？”林远问。\n\n“去修你的心。”老人说，“然后，把吉他弹响。”\n\n林远走出邮局，发现那条“静默巷”已经消失了。地图上，那里只是一片普通的空地，长满了野草。\n\n他回到公寓，拿起吉他。这一次，他没有试图演奏复杂的曲子，只是轻轻地哼唱了一首母亲生前最爱听的歌。声音依然不完美，依然有些颤抖，但它是真实的，是温暖的，是活的。\n\n窗外，阳光正好。城市恢复了往日的喧嚣，车流声、人声、鸟鸣声交织在一起。林远知道，那条街道不会再出现了，但那些信，那些未说出口的话，已经永远地留在了他的心里。\n\n他拿起电话，拨通了朋友的号码。\n\n“喂，老张，”林远说，声音平静而坚定，“我想辞职了。我想去学音乐。”\n\n电话那头沉默了片刻，然后传来一声大笑：“我就知道，你小子迟早会疯。”\n\n林远笑了。他挂断电话，走到窗前，看着这座城市。暴雨结束了，但生活才刚刚开始。\n\n他拿起那把吉他，走向门口。这一次，他没有回头。\n\n**尾声**\n\n一个月后，林远在一间小小的音乐工作室里，录制了一张名为《静默》的专辑。专辑的封面上，是一栋红砖小楼的素描，下面写着一行小字：\n\n*致所有在暴雨中迷路的人：*\n*有些信，永远无法送达，但它们从未被遗忘。*\n\n在专辑的最后一首曲目中，有一段清晰的雨声，然后是吉他声，最后是林远的声音，轻轻地哼唱着那首母亲最爱的歌。\n\n雨声渐弱，吉他声渐强，最终，一切归于寂静。\n\n但在那寂静中，仿佛有无数封信，正在穿越时间，缓缓抵达。"
+    }
+  ],
+  "samples": {
+    "decode": [
+      30.4
+    ],
+    "prefill": [
+      583.7
+    ],
+    "wall": [
+      30.3
+    ],
+    "ttft_ms": [
+      186.8
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

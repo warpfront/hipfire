@@ -2838,6 +2838,33 @@ pub static FIELDS: &[ConfigField] = &[
         "Keep native-BF16 calibration teachers in BF16 instead of widening to F32 (calibration only; shipped inference is unaffected)."
     ),
     process_bool_field!(
+        "kernel.draft_shared_qkv_rotation",
+        "draft_shared_qkv_rotation",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_DRAFT_SHARED_QKV_ROTATION",
+        "Reuse the MQ4V2 input rotation for eligible gfx1100 draft Q/K/V projections."
+    ),
+    process_bool_field!(
+        "kernel.draft_shared_ffn_rotation",
+        "draft_shared_ffn_rotation",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_DRAFT_SHARED_FFN_ROTATION",
+        "Reuse the MQ4V2 input rotation for eligible gfx1100 draft gate/up projections."
+    ),
+    process_bool_field!(
+        "kernel.draft_shared_ctx_kv_rotation",
+        "draft_shared_ctx_kv_rotation",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION",
+        "Reuse the MQ4V2 input rotation for eligible gfx1100 draft context K/V projections."
+    ),
+    process_bool_field!(
         "kernel.qkvza_split_tail",
         "qkvza_split_tail",
         Kernel,

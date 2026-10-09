@@ -1,0 +1,202 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/media/990Pro/hipfire/models/qwen3.8-27b.mq4-xts",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 16384,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 870671,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 28370,
+    "vram_total_mb": 46064,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 46016,
+  "max_seq": {
+    "effective": 16384,
+    "requested": 16384,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 8192,
+  "runs": 1,
+  "warmups": 2,
+  "batch": 1,
+  "prompt_tokens": 140,
+  "prompt_md5": "5aea5347ac9816119939c9a55aec4854",
+  "prompt_chars": 239,
+  "warnings": [
+    "prompt is 140 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card0",
+    "pci": "0000:9e:00.0",
+    "arch": "gfx1100",
+    "selected_by": "ROCR_VISIBLE_DEVICES=1",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 100,
+      "duration_s": 49.12,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 62.3,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 83.0
+          },
+          "junction": {
+            "max": 98.0
+          },
+          "mem": {
+            "max": 90.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2001.8,
+            "min": 901.0,
+            "max": 2239.0
+          },
+          "mclk": {
+            "avg": 1124.0,
+            "min": 1124.0,
+            "max": 1124.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 46064.0,
+        "vram_used_mib": 18098.4,
+        "vram_free_mib": 27965.6,
+        "gtt_total_mib": 112655.5,
+        "gtt_used_mib": 17.1,
+        "gtt_free_mib": 112638.4,
+        "mem_total_mib": 225310.9,
+        "mem_available_mib": 207322.6
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 113.9,
+    "mean": 113.9,
+    "min": 113.9,
+    "max": 113.9,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 555.7,
+    "mean": 555.7,
+    "min": 555.7,
+    "max": 555.7,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 113.3,
+    "mean": 113.3,
+    "min": 113.3,
+    "max": 113.3,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 251.9,
+    "mean": 251.9,
+    "min": 251.9,
+    "max": 251.9,
+    "stdev": 0.0
+  },
+  "spec_requested": "dflash",
+  "spec_route": [
+    "dflash"
+  ],
+  "spec_tau": [
+    5.54
+  ],
+  "run_events": [
+    {
+      "type": "done",
+      "id": "chatcmpl-986858-3",
+      "tokens": 5566,
+      "tok_s": 113.3,
+      "prefill_tokens": 140,
+      "prefill_ms": 251.9,
+      "prefill_tok_s": 555.7,
+      "decode_tok_s": 113.9,
+      "ttft_ms": 251.9,
+      "dflash": true,
+      "tau": 5.54,
+      "cycles": 851,
+      "cached_tokens": 0,
+      "finish_reason": "stop",
+      "attempt_id": 1,
+      "bench_output": "运行方法：安装 pygame (`pip install pygame`)，保存为 `tetris.py` 并执行 `python tetris.py`。\n关键设计：使用 7-bag 算法保证随机性；实现 SRS 旋转系统并包含基础 Wall Kick 表；通过状态机管理游戏、暂停和结束；Ghost Piece 用于预览落点；Hold 功能限制每块仅能使用一次。\n\n```python\nimport pygame\nimport random\nimport sys\n\n# 常量定义\nWIDTH, HEIGHT = 300, 600\nGRID_WIDTH, GRID_HEIGHT = 10, 20\nCELL_SIZE = 30\nSIDEBAR_WIDTH = 150\nTOTAL_WIDTH = WIDTH + SIDEBAR_WIDTH\n\n# 颜色定义\nCOLORS = {\n    'I': (0, 255, 255),\n    'O': (255, 255, 0),\n    'T': (128, 0, 128),\n    'S': (0, 255, 0),\n    'Z': (255, 0, 0),\n    'J': (0, 0, 255),\n    'L': (255, 165, 0)\n}\nBG_COLOR = (30, 30, 30)\nGRID_COLOR = (50, 50, 50)\nTEXT_COLOR = (255, 255, 255)\n\n# 方块形状定义 (x, y) 偏移量，基于 4x4 网格\nSHAPES = {\n    'I': [(0, 1), (1, 1), (2, 1), (3, 1)],\n    'O': [(1, 0), (2, 0), (1, 1), (2, 1)],\n    'T': [(1, 0), (0, 1), (1, 1), (2, 1)],\n    'S': [(1, 0), (2, 0), (0, 1), (1, 1)],\n    'Z': [(0, 0), (1, 0), (1, 1), (2, 1)],\n    'J': [(0, 0), (0, 1), (1, 1), (2, 1)],\n    'L': [(2, 0), (0, 1), (1, 1), (2, 1)]\n}\n\n# SRS Wall Kick 数据 (dx, dy)\n# 格式: { (from_rotation, to_rotation): [(dx, dy), ...] }\n# 注意: 这里的坐标系统 y 轴向下为正\nWALL_KICKS = {\n    # I 型\n    'I': {\n        (0, 1): [(0, 0), (-2, 0), (1, 0), (-2, -1), (1, 1)],\n        (1, 0): [(0, 0), (2, 0), (-1, 0), (2, 1), (-1, -1)],\n        (1, 2): [(0, 0), (-1, 0), (2, 0), (-1, 1), (2, -1)],\n        (2, 1): [(0, 0), (1, 0), (-2, 0), (1, -1), (-2, 1)],\n        (2, 3): [(0, 0), (2, 0), (-1, 0), (2, 1), (-1, -1)],\n        (3, 2): [(0, 0), (-2, 0), (1, 0), (-2, -1), (1, 1)],\n        (3, 0): [(0, 0), (1, 0), (-2, 0), (1, -1), (-2, 1)],\n        (0, 3): [(0, 0), (-1, 0), (2, 0), (-1, 1), (2, -1)]\n    },\n    # J, L, S, T, Z 型\n    'JLSTZ': {\n        (0, 1): [(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],\n        (1, 0): [(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],\n        (1, 2): [(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],\n        (2, 1): [(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],\n        (2, 3): [(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)],\n        (3, 2): [(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],\n        (3, 0): [(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],\n        (0, 3): [(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)]\n    }\n}\n\nclass Piece:\n    def __init__(self, shape_type, x, y):\n        self.type = shape_type\n        self.shape = SHAPES[shape_type]\n        self.x = x\n        self.y = y\n        self.rotation = 0\n\n    def get_cells(self):\n        return [(self.x + dx, self.y + dy) for dx, dy in self.shape]\n\n    def rotate(self, direction):\n        \"\"\"\n        direction: 1 for clockwise, -1 for counter-clockwise\n        Returns new rotation state or None if invalid (handled by kick logic in game)\n        \"\"\"\n        new_rotation = (self.rotation + direction) % 4\n        return new_rotation\n\n    def get_kick_table(self):\n        if self.type == 'I':\n            return WALL_KICKS['I']\n        elif self.type == 'O':\n            return {} # O piece doesn't rotate effectively\n        else:\n            return WALL_KICKS['JLSTZ']\n\nclass TetrisGame:\n    def __init__(self):\n        pygame.init()\n        self.screen = pygame.display.set_mode((TOTAL_WIDTH, HEIGHT))\n        pygame.display.set_caption(\"Tetris\")\n        self.clock = pygame.time.Clock()\n        \n        self.font = pygame.font.SysFont('Arial', 24)\n        self.small_font = pygame.font.SysFont('Arial', 18)\n        \n        self.reset_game()\n\n    def reset_game(self):\n        self.grid = [[None for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]\n        self.score = 0\n        self.level = 1\n        self.lines_cleared = 0\n        self.bag = []\n        self.next_queue = []\n        self.hold_piece = None\n        self.hold_used = False\n        self.current_piece = None\n        self.game_over = False\n        self.paused = False\n        \n        # 初始化 next queue\n        for _ in range(3):\n            self.next_queue.append(self.get_next_piece())\n        \n        self.spawn_piece()\n        self.drop_timer = 0\n        self.drop_interval = self.get_drop_interval()\n\n    def get_next_piece(self):\n        if not self.bag:\n            self.bag = list(SHAPES.keys())\n            random.shuffle(self.bag)\n        return self.bag.pop()\n\n    def spawn_piece(self):\n        if not self.next_queue:\n            self.next_queue.append(self.get_next_piece())\n        \n        shape_type = self.next_queue.pop(0)\n        self.next_queue.append(self.get_next_piece())\n        \n        # 初始位置: 居中上方\n        x = GRID_WIDTH // 2 - 2\n        y = 0\n        \n        self.current_piece = Piece(shape_type, x, y)\n        self.hold_used = False\n        \n        # 检查是否立即碰撞 (游戏结束)\n        if self.check_collision(self.current_piece.get_cells()):\n            self.game_over = True\n\n    def check_collision(self, cells):\n        for x, y in cells:\n            if x < 0 or x >= GRID_WIDTH or y >= GRID_HEIGHT:\n                return True\n            if y >= 0 and self.grid[y][x] is not None:\n                return True\n        return False\n\n    def get_ghost_y(self):\n        if not self.current_piece:\n            return 0\n        ghost_y = self.current_piece.y\n        while not self.check_collision([(x, ghost_y + dy) for x, dy in self.current_piece.get_cells()]):\n            ghost_y += 1\n        return ghost_y - 1\n\n    def move(self, dx, dy):\n        if not self.current_piece or self.game_over or self.paused:\n            return\n        new_cells = [(x + dx, y + dy) for x, y in self.current_piece.get_cells()]\n        if not self.check_collision(new_cells):\n            self.current_piece.x += dx\n            self.current_piece.y += dy\n            self.drop_timer = 0\n\n    def rotate_piece(self, direction):\n        if not self.current_piece or self.game_over or self.paused:\n            return\n        \n        if self.current_piece.type == 'O':\n            return # O piece doesn't rotate\n\n        old_rotation = self.current_piece.rotation\n        new_rotation = (old_rotation + direction) % 4\n        \n        # 获取旋转后的形状\n        # 我们需要模拟旋转后的坐标\n        # 标准 SRS 旋转逻辑:\n        # 0->1, 1->2, 2->3, 3->0\n        # 我们直接计算新坐标并尝试 kick\n        \n        # 获取 kick 表\n        kick_table = self.current_piece.get_kick_table()\n        key = (old_rotation, new_rotation)\n        \n        if key not in kick_table:\n            return\n\n        kicks = kick_table[key]\n        \n        # 尝试每个 kick\n        for dx, dy in kicks:\n            # 计算旋转后的基础坐标 (相对于中心)\n            # 这里简化处理：直接根据旋转状态生成新形状坐标\n            # 为了简化代码，我们预先定义旋转后的形状\n            new_shape = self.get_rotated_shape(self.current_piece.type, new_rotation)\n            \n            # 应用 kick 偏移\n            test_cells = [(self.current_piece.x + dx + sx, self.current_piece.y + dy + sy) for sx, sy in new_shape]\n            \n            if not self.check_collision(test_cells):\n                self.current_piece.x += dx\n                self.current_piece.y += dy\n                self.current_piece.rotation = new_rotation\n                self.current_piece.shape = new_shape\n                self.drop_timer = 0\n                return\n\n    def get_rotated_shape(self, shape_type, rotation):\n        \"\"\"\n        返回指定旋转状态下的形状坐标\n        基于 4x4 网格中心旋转\n        \"\"\"\n        # 原始形状\n        original = SHAPES[shape_type]\n        \n        # 旋转矩阵\n        # 0: 0 deg\n        # 1: 90 deg CW\n        # 2: 180 deg\n        # 3: 270 deg CW (90 CCW)\n        \n        # 对于 I 和 O，旋转逻辑特殊，但通常 SRS 使用 4x4 网格\n        # 这里我们使用通用的 4x4 网格旋转逻辑\n        # 中心点 (1.5, 1.5) 对于 4x4 网格\n        \n        rotated = []\n        for x, y in original:\n            if rotation == 0:\n                nx, ny = x, y\n            elif rotation == 1:\n                # 90 deg CW: (x, y) -> (3-y, x)\n                nx, ny = 3 - y, x\n            elif rotation == 2:\n                # 180 deg: (x, y) -> (3-x, 3-y)\n                nx, ny = 3 - x, 3 - y\n            elif rotation == 3:\n                # 270 deg CW: (x, y) -> (y, 3-x)\n                nx, ny = y, 3 - x\n            rotated.append((nx, ny))\n        \n        return rotated\n\n    def hard_drop(self):\n        if not self.current_piece or self.game_over or self.paused:\n            return\n        ghost_y = self.get_ghost_y()\n        self.current_piece.y = ghost_y\n        self.lock_piece()\n\n    def soft_drop(self):\n        if not self.current_piece or self.game_over or self.paused:\n            return\n        self.move(0, 1)\n        self.score += 1\n        self.drop_timer = 0\n\n    def lock_piece(self):\n        if not self.current_piece:\n            return\n        cells = self.current_piece.get_cells()\n        for x, y in cells:\n            if y >= 0:\n                self.grid[y][x] = self.current_piece.type\n        \n        self.clear_lines()\n        self.spawn_piece()\n\n    def clear_lines(self):\n        lines_cleared = 0\n        new_grid = []\n        for row in self.grid:\n            if all(cell is not None for cell in row):\n                lines_cleared += 1\n            else:\n                new_grid.append(row)\n        \n        # 添加空行到顶部\n        while len(new_grid) < GRID_HEIGHT:\n            new_grid.insert(0, [None for _ in range(GRID_WIDTH)])\n        \n        self.grid = new_grid\n        \n        if lines_cleared > 0:\n            self.lines_cleared += lines_cleared\n            # 计分: 100, 300, 500, 800 * level\n            points = [0, 100, 300, 500, 800]\n            self.score += points[lines_cleared] * self.level\n            \n            # 升级\n            self.level = self.lines_cleared // 10 + 1\n            self.drop_interval = self.get_drop_interval()\n\n    def get_drop_interval(self):\n        # 速度随等级增加\n        # 等级 1: 800ms, 每级减少 100ms, 最小 100ms\n        return max(100, 800 - (self.level - 1) * 100)\n\n    def hold(self):\n        if self.hold_used or self.game_over or self.paused:\n            return\n        if self.hold_piece is None:\n            self.hold_piece = self.current_piece.type\n            self.spawn_piece()\n        else:\n            temp = self.hold_piece\n            self.hold_piece = self.current_piece.type\n            self.current_piece = Piece(temp, GRID_WIDTH // 2 - 2, 0)\n            self.current_piece.rotation = 0\n            self.current_piece.shape = SHAPES[temp]\n            # 检查碰撞\n            if self.check_collision(self.current_piece.get_cells()):\n                self.game_over = True\n        self.hold_used = True\n\n    def update(self, dt):\n        if self.game_over or self.paused:\n            return\n        \n        self.drop_timer += dt\n        if self.drop_timer >= self.drop_interval:\n            self.move(0, 1)\n            self.drop_timer = 0\n\n    def draw_grid(self):\n        for y in range(GRID_HEIGHT):\n            for x in range(GRID_WIDTH):\n                if self.grid[y][x]:\n                    color = COLORS[self.grid[y][x]]\n                    pygame.draw.rect(self.screen, color, (x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE))\n                    pygame.draw.rect(self.screen, (0, 0, 0), (x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE), 1)\n\n    def draw_piece(self, piece, offset_y=0, alpha=255):\n        if not piece:\n            return\n        color = COLORS[piece.type]\n        cells = piece.get_cells()\n        for x, y in cells:\n            draw_y = y + offset_y\n            if draw_y >= 0:\n                rect = pygame.Rect(x * CELL_SIZE, draw_y * CELL_SIZE, CELL_SIZE, CELL_SIZE)\n                # 创建表面以支持透明度 (Ghost)\n                if alpha < 255:\n                    s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)\n                    s.fill((*color, alpha))\n                    self.screen.blit(s, rect)\n                else:\n                    pygame.draw.rect(self.screen, color, rect)\n                pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)\n\n    def draw_ghost(self):\n        if not self.current_piece:\n            return\n        ghost_y = self.get_ghost_y()\n        # 创建临时 piece 用于绘制\n        ghost_piece = Piece(self.current_piece.type, self.current_piece.x, ghost_y)\n        ghost_piece.shape = self.current_piece.shape\n        self.draw_piece(ghost_piece, alpha=100)\n\n    def draw_sidebar(self):\n        # 背景\n        pygame.draw.rect(self.screen, (40, 40, 40), (WIDTH, 0, SIDEBAR_WIDTH, HEIGHT))\n        \n        # 分数\n        score_text = self.font.render(f\"Score: {self.score}\", True, TEXT_COLOR)\n        self.screen.blit(score_text, (WIDTH + 10, 10))\n        \n        # 等级\n        level_text = self.font.render(f\"Level: {self.level}\", True, TEXT_COLOR)\n        self.screen.blit(level_text, (WIDTH + 10, 40))\n        \n        # 行数\n        lines_text = self.font.render(f\"Lines: {self.lines_cleared}\", True, TEXT_COLOR)\n        self.screen.blit(lines_text, (WIDTH + 10, 70))\n        \n        # Next Queue\n        next_title = self.font.render(\"Next:\", True, TEXT_COLOR)\n        self.screen.blit(next_title, (WIDTH + 10, 120))\n        \n        for i, shape_type in enumerate(self.next_queue):\n            # 绘制小方块\n            offset_x = WIDTH + 20\n            offset_y = 160 + i * 60\n            color = COLORS[shape_type]\n            shape = SHAPES[shape_type]\n            # 居中显示\n            min_x = min(x for x, y in shape)\n            max_x = max(x for x, y in shape)\n            min_y = min(y for x, y in shape)\n            max_y = max(y for x, y in shape)\n            w = max_x - min_x + 1\n            h = max_y - min_y + 1\n            center_x = offset_x + (w * 10) // 2\n            center_y = offset_y + (h * 10) // 2\n            \n            for x, y in shape:\n                rect = pygame.Rect(center_x - (w * 10) // 2 + (x - min_x) * 10, \n                                   center_y - (h * 10) // 2 + (y - min_y) * 10, \n                                   10, 10)\n                pygame.draw.rect(self.screen, color, rect)\n                pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)\n\n        # Hold\n        hold_title = self.font.render(\"Hold:\", True, TEXT_COLOR)\n        self.screen.blit(hold_title, (WIDTH + 10, 350))\n        \n        if self.hold_piece:\n            color = COLORS[self.hold_piece]\n            shape = SHAPES[self.hold_piece]\n            min_x = min(x for x, y in shape)\n            max_x = max(x for x, y in shape)\n            min_y = min(y for x, y in shape)\n            max_y = max(y for x, y in shape)\n            w = max_x - min_x + 1\n            h = max_y - min_y + 1\n            center_x = WIDTH + 20 + (w * 10) // 2\n            center_y = 390 + (h * 10) // 2\n            \n            for x, y in shape:\n                rect = pygame.Rect(center_x - (w * 10) // 2 + (x - min_x) * 10, \n                                   center_y - (h * 10) // 2 + (y - min_y) * 10, \n                                   10, 10)\n                pygame.draw.rect(self.screen, color, rect)\n                pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)\n        else:\n            pygame.draw.rect(self.screen, (60, 60, 60), (WIDTH + 20, 390, 40, 40))\n\n    def draw_grid_lines(self):\n        for x in range(GRID_WIDTH + 1):\n            pygame.draw.line(self.screen, GRID_COLOR, (x * CELL_SIZE, 0), (x * CELL_SIZE, HEIGHT))\n        for y in range(GRID_HEIGHT + 1):\n            pygame.draw.line(self.screen, GRID_COLOR, (0, y * CELL_SIZE), (WIDTH, y * CELL_SIZE))\n\n    def draw_overlay(self, text, subtext=\"\"):\n        overlay = pygame.Surface((TOTAL_WIDTH, HEIGHT), pygame.SRCALPHA)\n        overlay.fill((0, 0, 0, 150))\n        self.screen.blit(overlay, (0, 0))\n        \n        font_large = pygame.font.SysFont('Arial', 48)\n        font_small = pygame.font.SysFont('Arial', 24)\n        \n        text_surf = font_large.render(text, True, TEXT_COLOR)\n        subtext_surf = font_small.render(subtext, True, TEXT_COLOR)\n        \n        text_rect = text_surf.get_rect(center=(TOTAL_WIDTH // 2, HEIGHT // 2 - 20))\n        subtext_rect = subtext_surf.get_rect(center=(TOTAL_WIDTH // 2, HEIGHT // 2 + 30))\n        \n        self.screen.blit(text_surf, text_rect)\n        self.screen.blit(subtext_surf, subtext_rect)\n\n    def handle_events(self):\n        for event in pygame.event.get():\n            if event.type == pygame.QUIT:\n                pygame.quit()\n                sys.exit()\n            if event.type == pygame.KEYDOWN:\n                if self.game_over:\n                    if event.key == pygame.K_r:\n                        self.reset_game()\n                    continue\n                \n                if event.key == pygame.K_p:\n                    self.paused = not self.paused\n                    continue\n                \n                if self.paused:\n                    continue\n                \n                if event.key == pygame.K_LEFT:\n                    self.move(-1, 0)\n                elif event.key == pygame.K_RIGHT:\n                    self.move(1, 0)\n                elif event.key == pygame.K_DOWN:\n                    self.soft_drop()\n                elif event.key == pygame.K_UP:\n                    self.rotate_piece(1)\n                elif event.key == pygame.K_z:\n                    self.rotate_piece(-1)\n                elif event.key == pygame.K_SPACE:\n                    self.hard_drop()\n                elif event.key == pygame.K_c:\n                    self.hold()\n                elif event.key == pygame.K_r:\n                    self.reset_game()\n\n    def run(self):\n        while True:\n            dt = self.clock.tick(60)\n            self.handle_events()\n            self.update(dt)\n            \n            self.screen.fill(BG_COLOR)\n            \n            # 绘制棋盘\n            self.draw_grid_lines()\n            self.draw_grid()\n            \n            # 绘制 Ghost\n            if not self.game_over and not self.paused:\n                self.draw_ghost()\n            \n            # 绘制当前方块\n            if self.current_piece and not self.game_over and not self.paused:\n                self.draw_piece(self.current_piece)\n            \n            # 绘制侧边栏\n            self.draw_sidebar()\n            \n            # 覆盖层\n            if self.game_over:\n                self.draw_overlay(\"Game Over\", \"Press R to Restart\")\n            elif self.paused:\n                self.draw_overlay(\"Paused\", \"Press P to Resume\")\n            \n            pygame.display.flip()\n\nif __name__ == \"__main__\":\n    game = TetrisGame()\n    game.run()\n```"
+    }
+  ],
+  "samples": {
+    "decode": [
+      113.9
+    ],
+    "prefill": [
+      555.7
+    ],
+    "wall": [
+      113.3
+    ],
+    "ttft_ms": [
+      251.9
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}
