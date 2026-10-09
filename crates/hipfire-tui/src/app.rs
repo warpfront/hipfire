@@ -22,6 +22,7 @@ use crate::hipfire::{
     dashboard::{Dashboard, DashboardWorker},
     doctor::{self, DoctorReport},
     log_tail::{LogSnapshot, LogTailer},
+    metrics::MetricsView,
     model_actions::{self, PullEvent, RmOutcome},
     registry::{RegistryAction, RegistryState},
     serve_ctrl::{self, ServeAction, ServeOutcome},
@@ -144,6 +145,9 @@ pub struct App {
     /// UI thread ONLY reads this — it never calls fetch_dashboard / rocm-smi /
     /// HTTP synchronously, so a hung probe cannot block render or input.
     pub dashboard: Option<Dashboard>,
+    /// Latest Live metrics view from the worker's background `/metrics` scrape,
+    /// mirrored each frame while the Dashboard tab is shown.
+    pub live_metrics: MetricsView,
     /// Whether the `?` keybinding help overlay is currently open.
     pub show_help: bool,
     /// Per-frame tab-bar hit regions `[x_start, x_end)` -> tab, recomputed by
@@ -222,6 +226,7 @@ impl App {
             last_reload: "loaded hipfire state".into(),
             toast: None,
             dashboard: None,
+            live_metrics: MetricsView::Collecting,
             show_help: false,
             tab_hitboxes: Vec::new(),
             tab_row_y: 0,
@@ -487,6 +492,9 @@ impl App {
             // Home + System tabs render live data without any synchronous probe.
             self.status.overlay_live(&snap);
             self.dashboard = Some(snap);
+        }
+        if self.tab == Tab::Dashboard {
+            self.live_metrics = self.dashboard_worker.metrics();
         }
     }
 

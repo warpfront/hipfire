@@ -29,6 +29,7 @@ use std::{
 use serde_json::Value;
 
 use super::config::ConfigState;
+use super::metrics::{self, MetricsRing, MetricsView};
 
 /// Hard wall-clock bound on a single `rocm-smi` invocation. Even on the
 /// background thread a zombie / hung rocm-smi must not accumulate forever, so
@@ -846,14 +847,18 @@ const WORKER_REFRESH: Duration = Duration::from_millis(1500);
 /// while it is idle (Dashboard tab not focused).
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(150);
 
-/// Owns the background fetch thread. The UI thread NEVER calls
+/// Owns the background fetch threads. The UI thread NEVER calls
 /// [`fetch_dashboard`] / rocm-smi / HTTP directly; it only reads the latest
 /// snapshot via [`DashboardWorker::snapshot`]. The worker fetches on its own
 /// thread every [`WORKER_REFRESH`] while the Dashboard tab is active, writing
 /// the result into a shared `Arc<Mutex<Option<Dashboard>>>`, so a hung
 /// rocm-smi or slow HTTP probe can stall only the worker — never render/input.
+/// A second thread scrapes `/metrics` at the same cadence for the TUI's whole
+/// lifetime, so the Live metrics card has history the moment it opens.
 pub struct DashboardWorker {
     snapshot: Arc<Mutex<Option<Dashboard>>>,
+    /// Latest Live metrics view, published by the `/metrics` thread.
+    metrics: Arc<Mutex<MetricsView>>,
     /// Whether the Dashboard tab is currently focused. The worker only fetches
     /// when this is true (plus an immediate fetch when it flips on).
     active: Arc<AtomicBool>,
@@ -862,10 +867,11 @@ pub struct DashboardWorker {
     /// Live config snapshot the worker reads each cycle (host/port). Updated by
     /// the UI on reload so a port change is picked up without restarting.
     config: Arc<Mutex<ConfigState>>,
-    /// Signals the worker to exit; also wakes it via `wake`.
+    /// Signals both threads to exit; also wakes them via `wake`/`metrics_wake`.
     shutdown: Arc<AtomicBool>,
     wake: mpsc::Sender<()>,
-    handle: Option<thread::JoinHandle<()>>,
+    metrics_wake: mpsc::Sender<()>,
+    handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl DashboardWorker {
@@ -873,11 +879,13 @@ impl DashboardWorker {
     /// Dashboard tab is marked active via [`DashboardWorker::set_active`].
     pub fn spawn(config: ConfigState) -> Self {
         let snapshot = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(Mutex::new(MetricsView::Collecting));
         let active = Arc::new(AtomicBool::new(false));
         let force = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(Mutex::new(config));
         let (wake, wake_rx) = mpsc::channel::<()>();
+        let (metrics_wake, metrics_wake_rx) = mpsc::channel::<()>();
 
         let handle = {
             let snapshot = Arc::clone(&snapshot);
@@ -889,15 +897,23 @@ impl DashboardWorker {
                 worker_loop(snapshot, active, force, shutdown, config, wake_rx);
             })
         };
+        let metrics_handle = {
+            let metrics = Arc::clone(&metrics);
+            let shutdown = Arc::clone(&shutdown);
+            let config = Arc::clone(&config);
+            thread::spawn(move || metrics_loop(metrics, shutdown, config, metrics_wake_rx))
+        };
 
         Self {
             snapshot,
+            metrics,
             active,
             force,
             config,
             shutdown,
             wake,
-            handle: Some(handle),
+            metrics_wake,
+            handles: vec![handle, metrics_handle],
         }
     }
 
@@ -907,6 +923,14 @@ impl DashboardWorker {
         // Poison-tolerant: this runs on the UI thread every frame, so a worker
         // panic while holding the lock must NOT crash render — recover the guard.
         self.snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Latest Live metrics view (cheap clone; ~120-point series at most).
+    pub fn metrics(&self) -> MetricsView {
+        self.metrics
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -940,7 +964,8 @@ impl Drop for DashboardWorker {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.wake.send(());
-        if let Some(h) = self.handle.take() {
+        let _ = self.metrics_wake.send(());
+        for h in self.handles.drain(..) {
             let _ = h.join();
         }
     }
@@ -1001,6 +1026,41 @@ fn worker_loop(
         };
         // Drain a single wake (coalesces bursts) or time out.
         let _ = wake_rx.recv_timeout(wait);
+    }
+}
+
+/// Scrape `/metrics` every [`WORKER_REFRESH`] regardless of tab focus. Only
+/// this one short-timeout HTTP GET runs in the background; rocm-smi and the
+/// other probes stay focus-gated in [`worker_loop`].
+fn metrics_loop(
+    view: Arc<Mutex<MetricsView>>,
+    shutdown: Arc<AtomicBool>,
+    config: Arc<Mutex<ConfigState>>,
+    wake_rx: mpsc::Receiver<()>,
+) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(450)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut ring = MetricsRing::default();
+    while !shutdown.load(Ordering::SeqCst) {
+        let url = {
+            let cfg = config.lock().unwrap_or_else(|e| e.into_inner());
+            format!("http://{}:{}/metrics", cfg.probe_host(), cfg.port)
+        };
+        let scrape = match agent.get(&url).call() {
+            Ok(resp) if resp.status().as_u16() >= 400 => Err(MetricsView::Unavailable),
+            Ok(mut resp) => resp
+                .body_mut()
+                .read_to_string()
+                .map(|body| metrics::parse(&body))
+                .map_err(|_| MetricsView::Offline),
+            Err(_) => Err(MetricsView::Offline),
+        };
+        let next = ring.record(Instant::now(), scrape);
+        *view.lock().unwrap_or_else(|e| e.into_inner()) = next;
+        let _ = wake_rx.recv_timeout(WORKER_REFRESH);
     }
 }
 

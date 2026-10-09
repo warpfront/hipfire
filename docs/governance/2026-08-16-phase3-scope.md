@@ -112,7 +112,7 @@ Measured against what a serving platform is expected to expose:
 | capability | state |
 |---|---|
 | continuous batching, prefix cache, grammar, tool calling, TP/PP/EP, cancellation, admission control | present |
-| **metrics / Prometheus** | **absent** — no `/metrics` in any crate; `tracing::` in **3 of 430** source files |
+| **metrics / Prometheus** | **present** since this scope was written — serve `GET /metrics` (counters, TTFT/TPOT/latency/throughput histograms, serve gauges; see `docs/SERVE.md`). At writing: no `/metrics` in any crate; `tracing::` in **3 of 430** source files |
 | **logprobs** | **absent** — **0** occurrences tree-wide |
 | embeddings, reranking, LoRA-adapter serving | absent |
 | paged attention / block tables | absent by design — see below |

@@ -9,6 +9,7 @@ pub mod dashboard;
 pub mod doctor;
 pub mod knobs;
 pub mod log_tail;
+pub mod metrics;
 pub mod model_actions;
 pub mod profile_wizard;
 pub mod registry;

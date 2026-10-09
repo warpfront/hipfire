@@ -6,7 +6,9 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{
+        Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
+    },
     Frame,
 };
 
@@ -14,6 +16,7 @@ use crate::{
     app::{App, Tab},
     hipfire::dashboard::{LoadState, VramState},
     hipfire::knobs,
+    hipfire::metrics::MetricsView,
     hipfire::registry::ModelListItem,
 };
 
@@ -406,10 +409,15 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(8)])
+        .split(pad(area, 1, 0));
+    draw_live_metrics(frame, app, rows[1]);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(pad(area, 1, 0));
+        .split(rows[0]);
 
     // ── Serve panel ─────────────────────────────────────────────────────
     let mut serve_lines: Vec<Line> = Vec::new();
@@ -584,6 +592,97 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         None => {}
     }
     frame.render_widget(card("GPU (rocm-smi)", vram_lines), cols[1]);
+}
+
+/// "Live metrics" card: windowed rates and quantiles from the worker's
+/// background `/metrics` ring. Every row is one short line so narrow terminals
+/// truncate a row instead of reflowing the card.
+fn draw_live_metrics(frame: &mut Frame, app: &App, area: Rect) {
+    let outer = block("Live metrics");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let message = |text: &str, color: Color| {
+        Paragraph::new(Span::styled(text.to_string(), Style::default().fg(color)))
+    };
+    let m = match &app.live_metrics {
+        MetricsView::Live(m) => m,
+        MetricsView::Collecting => {
+            frame.render_widget(message("collecting…", MUTED), inner);
+            return;
+        }
+        MetricsView::Unavailable => {
+            frame.render_widget(message("metrics unavailable (older serve)", YELLOW), inner);
+            return;
+        }
+        MetricsView::Offline => {
+            frame.render_widget(message("serve offline", MUTED), inner);
+            return;
+        }
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    for (row, label, series, color) in [
+        (
+            rows[0],
+            format!("tok/s {:>8.1}", m.tok_s),
+            &m.tok_s_series,
+            GREEN,
+        ),
+        (
+            rows[1],
+            format!("req/s {:>8.2}", m.req_s),
+            &m.req_s_series,
+            ACCENT,
+        ),
+    ] {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(16), Constraint::Min(0)])
+            .split(row);
+        frame.render_widget(Paragraph::new(label), cols[0]);
+        // Sparkline draws from the first point; keep the newest that fit.
+        let tail = &series[series.len().saturating_sub(cols[1].width as usize)..];
+        frame.render_widget(
+            Sparkline::default()
+                .data(tail)
+                .style(Style::default().fg(color)),
+            cols[1],
+        );
+    }
+    let quantiles = |label: &str, q: Option<(f64, f64)>| match q {
+        Some((p50, p95)) => format!("{label}  p50 {p50:.0} ms · p95 {p95:.0} ms"),
+        None => format!("{label}  —"),
+    };
+    let mut extra = vec![format!("{} window", fmt_uptime(m.window_s as u64))];
+    if let Some(pct) = m.cache_hit_pct {
+        extra.insert(0, format!("cache hit {pct:.0}%"));
+    }
+    if let Some(tau) = m.tau {
+        extra.push(format!("tau {tau:.2}"));
+    }
+    let lines = vec![
+        Line::from(quantiles("TTFT", m.ttft_ms)),
+        Line::from(quantiles("TPOT", m.tpot_ms)),
+        Line::from(Span::styled(
+            format!(
+                "errors {:.1}/min · rejects {:.1}/min",
+                m.errors_per_min, m.rejects_per_min
+            ),
+            Style::default().fg(if m.errors_per_min + m.rejects_per_min > 0.0 {
+                YELLOW
+            } else {
+                TEXT
+            }),
+        )),
+        Line::from(Span::styled(extra.join(" · "), Style::default().fg(MUTED))),
+    ];
+    frame.render_widget(Paragraph::new(lines), rows[2]);
 }
 
 fn fmt_uptime(secs: u64) -> String {
@@ -1525,6 +1624,47 @@ mod render_tests {
             .expect("draw must not panic");
         let buf = terminal.backend().buffer().clone();
         buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn render_metrics(view: crate::hipfire::metrics::MetricsView, width: u16) -> String {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Dashboard;
+        app.live_metrics = view;
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn live_metrics_card_states() {
+        use crate::hipfire::metrics::{LiveMetrics, MetricsView};
+        let live = MetricsView::Live(LiveMetrics {
+            window_s: 180.0,
+            req_s: 0.33,
+            tok_s: 47.2,
+            errors_per_min: 0.0,
+            rejects_per_min: 0.0,
+            cache_hit_pct: Some(50.0),
+            ttft_ms: Some((62.5, 100.0)),
+            tpot_ms: None,
+            tau: Some(3.0),
+            tok_s_series: (0..119).collect(),
+            req_s_series: vec![0; 119],
+        });
+        let text = render_metrics(live.clone(), 110);
+        assert!(text.contains("Live metrics"));
+        assert!(text.contains("tok/s     47.2"));
+        assert!(text.contains("TTFT  p50 62 ms · p95 100 ms"));
+        assert!(text.contains("TPOT  —"));
+        assert!(text.contains("cache hit 50% · 3m 0s window · tau 3.00"));
+        // Narrow terminal: rows truncate instead of panicking or reflowing.
+        assert!(render_metrics(live, 40).contains("tok/s     47.2"));
+        assert!(render_metrics(MetricsView::Collecting, 110).contains("collecting…"));
+        assert!(render_metrics(MetricsView::Unavailable, 110)
+            .contains("metrics unavailable (older serve)"));
     }
 
     #[test]

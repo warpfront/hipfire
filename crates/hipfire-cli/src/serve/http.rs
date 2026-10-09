@@ -755,16 +755,14 @@ async fn handle_request(
             json_response(body, 200)
         }
         (Method::GET, "/metrics") => {
-            let (uptime, model) = {
+            let body = {
                 let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-                (meta.started.elapsed().as_secs(), meta.current_model.clone())
+                shared.metrics.render(
+                    &meta,
+                    shared.admission.inflight(),
+                    shared.admission.capacity(),
+                )
             };
-            let body = shared.metrics.render(
-                shared.admission.inflight(),
-                shared.admission.capacity(),
-                uptime,
-                model.as_deref(),
-            );
             let mut resp = Response::builder()
                 .status(200)
                 .header(
@@ -1027,6 +1025,7 @@ async fn handle_images_generations(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
 ) -> Result<Response<BoxBody>, String> {
+    let started = Instant::now();
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -1197,6 +1196,9 @@ async fn handle_images_generations(
         let mut meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
         meta.requests_served += 1;
     }
+    shared
+        .metrics
+        .observe_request(started.elapsed().as_secs_f64() * 1000.0);
     let response = serde_json::json!({
         "created": unix_timestamp(),
         "model": model_echo,
