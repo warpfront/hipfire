@@ -2205,8 +2205,14 @@ pub(crate) fn complete_request_attempt(
 
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
+        // A reasoning token is a generated token. Counting only `token` made
+        // TTFT on a thinking model the time to the first answer token, and TPOT
+        // would spread only the answer span over all of `done.tokens`.
         if first_token_at.get().is_none()
-            && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            && matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some("token" | "reasoning")
+            )
         {
             first_token_at.set(Some(attempt_started.elapsed()));
         }
@@ -2689,8 +2695,8 @@ pub(crate) fn complete_request_attempt(
     // Same payload the gateway already had; previously only `tok_s` survived, as a
     // scalar overwritten by the next request. Distributions are what make a stall
     // visible.
-    shared.metrics.observe_done(&done);
-    shared.metrics.observe_timing(
+    shared.metrics.observe_done(
+        &done,
         first_token_at.get().map(|d| d.as_secs_f64() * 1000.0),
         attempt_started.elapsed().as_secs_f64() * 1000.0,
     );

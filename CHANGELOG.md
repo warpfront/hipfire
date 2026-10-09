@@ -16,6 +16,7 @@
   `HIPFIRE_QWEN4_TOOL_ARG_REPLAY=0` opts out; only exact extensions of the active committed
   token record are accepted. Byte-identical echoes and retired-MTP guards remain
   unchanged; uncertain candidates retain the safe miss. No measured speed claim.
+- **Serve `/metrics` completes the gateway telemetry.** The decode and prefill tok/s histograms used the 10…60000 ms latency buckets; they now use `1 … 5000` tok/s buckets (bucket boundaries changed). New: `hipfire_prompt_tokens_total`, `hipfire_completion_tokens_total`, `hipfire_cached_prompt_tokens_total` (from the daemon `done` event, counted the same way as the response `usage`, and only when `done` carries the field), a `hipfire_time_per_output_token_milliseconds` histogram (gateway-measured `(latency − ttft) / (tokens − 1)`), a `hipfire_spec_tau` summary on speculative routes, `hipfire_retries_total` / `hipfire_retries_succeeded_total`, and the gauges `hipfire_engine_up`, `hipfire_model_loading`, `hipfire_context_capacity_tokens`. `hipfire_ttft_milliseconds` now stops at the first generated token, reasoning included; before, a thinking model recorded the time to the first answer token, or no sample when the answer never started. **Breaking for scrapers:** `hipfire_model_loaded` is replaced by `hipfire_model_info{model="…"} 1`, which has no sample while no model is resident. Successful `/v1/images/*` requests now count in `hipfire_requests_total` and request latency. Metric list in `docs/SERVE.md`.
 
 
 ## v0.4.1.1 — release draft

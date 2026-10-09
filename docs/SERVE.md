@@ -149,6 +149,7 @@ Implemented paths (anything else → `404`):
 | `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native`, `capabilities` |
 | `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
 | `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
+| `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
 | `GET` | `/ui`, `/ui/*` | Embedded chat UI (opt-in; see below) |
 
@@ -199,6 +200,38 @@ next load's clean-VMM check starts from zero owners in either swap direction.
 # Loopback example (safe default for local smoke):
 curl -s http://127.0.0.1:11435/health
 ```
+
+### `GET /metrics`
+
+Prometheus text format, read from gateway counters and `ServeMeta`, so a
+scrape never waits on a model load. Token counts, throughput and tau come
+from the daemon's `done` event and are recorded only when that event carries
+the field: a route that does not report one adds nothing, never a zero.
+TTFT, latency and TPOT are measured at the gateway.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `hipfire_requests_total` | counter | Completed chat and image requests |
+| `hipfire_requests_failed_total` | counter | Requests answered with an error, or whose stream ended in one |
+| `hipfire_admission_rejected_total` | counter | Requests refused by admission (queue full or wait timed out) |
+| `hipfire_prompt_tokens_total` | counter | `done.prompt_tokens` (`prefill_tokens + cached_tokens` if absent, as in `usage`) |
+| `hipfire_completion_tokens_total` | counter | `done.tokens` (`done.completion_tokens` if absent) |
+| `hipfire_cached_prompt_tokens_total` | counter | `done.cached_tokens` |
+| `hipfire_retries_total`, `hipfire_retries_succeeded_total` | counter | Transient-failure retries attempted / that then completed |
+| `hipfire_queue_depth`, `hipfire_queue_capacity` | gauge | Requests in flight or queued; admission capacity |
+| `hipfire_uptime_seconds` | gauge | Seconds since serve started |
+| `hipfire_engine_up` | gauge | 1 while the daemon is up, 0 while restarting or unhealthy |
+| `hipfire_model_loading` | gauge | 1 while a model load is in progress |
+| `hipfire_context_capacity_tokens` | gauge | Context the resident model was loaded with (0 when none) |
+| `hipfire_model_info{model="…"}` | gauge | 1 for the resident model; no sample when none is resident |
+| `hipfire_ttft_milliseconds` | histogram | Time to first generated token (reasoning included), chat requests |
+| `hipfire_request_latency_milliseconds` | histogram | Wall time, chat and image requests |
+| `hipfire_time_per_output_token_milliseconds` | histogram | `(latency − ttft) / (tokens − 1)`; requests with at least 2 tokens |
+| `hipfire_decode_tokens_per_second`, `hipfire_prefill_tokens_per_second` | histogram | `done.decode_tok_s` (`done.tok_s` if absent), `done.prefill_tok_s` |
+| `hipfire_spec_tau` | summary (`_sum`/`_count`) | `done.tau`, speculative routes only |
+
+Buckets: TTFT and latency `10 … 60000` ms; TPOT `2 … 500` ms; throughput
+`1 … 5000` tok/s.
 
 ### `POST /v1/chat/completions`
 
