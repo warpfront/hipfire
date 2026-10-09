@@ -1387,12 +1387,7 @@ impl Qwen4State {
             return Err(StateError::SnapshotBusy);
         }
         let [ple0, ple1] = self.ple_history.previous();
-        let mut words = vec![
-            self.model_id,
-            self.position as u64,
-            ple0.into(),
-            ple1.into(),
-        ];
+        let mut words = vec![0, self.position as u64, ple0.into(), ple1.into()];
         let mut marks = Vec::with_capacity(self.qsa.len());
         for layer in &self.qsa {
             let mark = layer.mark();
@@ -1413,8 +1408,8 @@ impl Qwen4State {
         Ok((meta_bytes(&words), self.session_layout(&marks)?))
     }
 
-    /// Byte length of a [`Self::session_parts`] meta: model id, position and
-    /// PLE context, then six words per QSA layer.
+    /// Byte length of a [`Self::session_parts`] meta: a reserved zero word,
+    /// position and PLE context, then six words per QSA layer.
     pub(crate) fn session_meta_bytes(&self) -> usize {
         8 * (4 + 6 * self.qsa.len())
     }
@@ -1426,7 +1421,7 @@ impl Qwen4State {
     ) -> Result<(usize, PleHistory, Vec<QsaMark>), StateError> {
         let words = meta_words(meta).ok_or(StateError::SnapshotShape)?;
         let to_u32 = |word: u64| u32::try_from(word).map_err(|_| StateError::SnapshotShape);
-        if words.len() * 8 != self.session_meta_bytes() || words[0] != self.model_id {
+        if words.len() * 8 != self.session_meta_bytes() {
             return Err(StateError::SnapshotShape);
         }
         let ple = PleHistory::from_previous(

@@ -25,8 +25,16 @@
 //! was captured. Restoring walks the chain from the root. Snapshots never
 //! depend on what the live state held before; a snapshot that still has
 //! children is pinned, so eviction only ever removes leaves.
+//!
+//! An optional disk tier ([`SessionCache::with_disk`]) keeps snapshots the
+//! device tier evicts (and every published snapshot at [`SessionCache::clear`])
+//! under its own byte budget, across restarts of the same build; a restore
+//! promotes them back. The parent of a device or pending snapshot is always
+//! on the device (I1); the parent of a disk snapshot is on the device or on
+//! disk (I2), so a chain's disk links are a suffix.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use hip_bridge::DeviceBuffer;
 use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
@@ -34,6 +42,8 @@ use rdna_compute::Gpu;
 
 use crate::checkpoint_pool::{prefix_fingerprint, CheckpointBlob, CheckpointPool};
 use crate::serve_contract::{CacheDomain, CheckpointId};
+
+mod disk;
 
 /// Byte alignment of each part inside a stored snapshot.
 const PART_ALIGN: usize = 256;
@@ -122,11 +132,12 @@ pub trait SessionState {
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 }
 
-/// Where a snapshot's bytes live. Storage tiers (host RAM, SSD, HDD) and
-/// streamed restores are added as variants here, so consumers and
-/// [`SessionState`] never change.
+/// Where a snapshot's bytes live: device memory (VRAM, or system RAM on
+/// UMA), or one file of the disk tier, `file_bytes` long (header plus
+/// payload, what the disk budget counts).
 enum SnapshotLocation {
     Device(DeviceBuffer),
+    Disk { path: PathBuf, file_bytes: u64 },
 }
 
 /// `(scoped domain, boundary, prefix fingerprint)`, the pool's key.
@@ -172,7 +183,10 @@ impl StoredSnapshot {
 
 impl CheckpointBlob for StoredSnapshot {
     fn bytes_len(&self) -> u64 {
-        self.bytes
+        match self.location {
+            SnapshotLocation::Device(_) => self.bytes,
+            SnapshotLocation::Disk { file_bytes, .. } => file_bytes,
+        }
     }
 }
 
@@ -194,6 +208,7 @@ pub struct SessionCache {
     /// listed here is pinned in the pool.
     children: HashMap<Key, usize>,
     turn: Option<Turn>,
+    disk: Option<disk::DiskTier>,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -208,10 +223,12 @@ fn layout(part_bytes: impl IntoIterator<Item = usize>) -> (Vec<usize>, usize) {
     (offsets, end)
 }
 
+/// Free a device snapshot's buffer; a disk snapshot is never passed here.
 fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
-    let SnapshotLocation::Device(buf) = snapshot.location;
-    if let Err(error) = gpu.hip.free(buf) {
-        eprintln!("  session cache: freeing a snapshot failed: {error}");
+    if let SnapshotLocation::Device(buf) = snapshot.location {
+        if let Err(error) = gpu.hip.free(buf) {
+            eprintln!("  session cache: freeing a snapshot failed: {error}");
+        }
     }
 }
 
@@ -236,7 +253,47 @@ impl SessionCache {
             release: Vec::new(),
             children: HashMap::new(),
             turn: None,
+            disk: None,
         }
+    }
+
+    /// Attach a disk tier in `dir` with `budget_bytes` (0 = none), bound to
+    /// this executable's build.
+    pub fn with_disk(self, dir: &Path, budget_bytes: u64) -> Self {
+        if budget_bytes == 0 {
+            return self;
+        }
+        match disk::build_digest() {
+            Ok(build) => self.with_disk_build(dir, budget_bytes, build),
+            Err(reason) => {
+                eprintln!("  session cache disk tier off: {reason}");
+                self
+            }
+        }
+    }
+
+    fn with_disk_build(mut self, dir: &Path, budget: u64, build: [u8; 32]) -> Self {
+        match disk::DiskTier::open(dir, budget, build) {
+            Ok(tier) => {
+                eprintln!(
+                    "  session cache disk tier: {} ({} MiB budget, {} snapshots / {} MiB indexed, {} other-build files)",
+                    dir.display(),
+                    budget >> 20,
+                    tier.pool.len(),
+                    tier.pool.total_bytes() >> 20,
+                    tier.foreign_files()
+                );
+                self.disk = Some(tier);
+            }
+            Err(reason) => eprintln!("  session cache disk tier off: {reason}"),
+        }
+        self
+    }
+
+    /// Published on the device or on disk.
+    fn present(&self, key: &Key) -> bool {
+        self.pool.contains(&key.0, key.1, key.2)
+            || self.disk.as_ref().is_some_and(|disk| disk.contains(key))
     }
 
     /// Longest cached prefix of `prompt` (always shorter than the prompt, so
@@ -253,10 +310,7 @@ impl SessionCache {
             .snapshot_boundaries(prompt, 0, prompt.len() - 1)
             .into_iter()
             .rev()
-            .find(|&p| {
-                self.pool
-                    .contains(&domain, p as u64, prefix_fingerprint(&prompt[..p]))
-            })
+            .find(|&p| self.present(&(domain.clone(), p as u64, prefix_fingerprint(&prompt[..p]))))
             .unwrap_or(0)
     }
 
@@ -293,6 +347,53 @@ impl SessionCache {
             self.unlink(parent);
         }
         free_buffer(gpu, snapshot);
+    }
+
+    /// A published device snapshot leaves the device tier: demote it to disk
+    /// when there is a disk tier (or drop its disk descendants when that
+    /// fails), then free it.
+    fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot) {
+        if let Some(parent) = &snapshot.parent {
+            self.unlink(parent);
+        }
+        if let Some(disk) = &mut self.disk {
+            if let Err(reason) = disk.demote(gpu, &key, &snapshot) {
+                eprintln!(
+                    "  session cache: dropped {}-token snapshot instead of demoting it ({reason})",
+                    key.1
+                );
+                disk.drop_descendants(&key);
+            }
+        }
+        free_buffer(gpu, snapshot);
+    }
+
+    /// Evict device snapshots until `bytes` more fit the budget (counting
+    /// pending snapshots) and the memory guard (counting `growth`).
+    fn make_room(&mut self, gpu: &mut Gpu, bytes: u64, growth: u64) -> Result<(), &'static str> {
+        let pending_bytes: u64 = self.pending.iter().map(|entry| entry.1.bytes).sum();
+        loop {
+            let over_budget =
+                self.pool.total_bytes() + pending_bytes + bytes > self.pool.max_bytes();
+            if !over_budget {
+                match memory_fits(gpu, bytes + growth) {
+                    Some(true) => return Ok(()),
+                    Some(false) => {}
+                    // Evicting cannot help a query that fails.
+                    None => return Err("memory query failed"),
+                }
+            }
+            match self.pool.pop_lru() {
+                Some((key, evicted)) => self.evict_device(gpu, key, evicted),
+                None => {
+                    return Err(if over_budget {
+                        "budget"
+                    } else {
+                        "memory guard"
+                    })
+                }
+            }
+        }
     }
 
     /// Unlink a snapshot that leaves the cache; free it at the next `begin`.
@@ -393,7 +494,9 @@ impl SessionCache {
         });
     }
 
-    /// Copy the snapshot of `prefix` and its ancestors into the live state.
+    /// Copy the snapshot of `prefix` and its ancestors into the live state,
+    /// promoting disk links to the device (or staging them in temporary
+    /// buffers when the device tier has no room).
     fn restore(
         &mut self,
         gpu: &mut Gpu,
@@ -402,12 +505,10 @@ impl SessionCache {
         domain: &CacheDomain,
         prefix: &[u32],
     ) -> Result<(), String> {
-        let missing = || {
-            format!(
-                "session cache: planned {}-token snapshot is no longer present",
-                prefix.len()
-            )
-        };
+        let missing = format!(
+            "session cache: planned {}-token snapshot is no longer present",
+            prefix.len()
+        );
         // Leaf first; each `get` refreshes that link's LRU stamp.
         let mut keys = vec![(
             domain.clone(),
@@ -416,18 +517,129 @@ impl SessionCache {
         )];
         loop {
             let key = keys.last().expect("non-empty chain");
-            let snapshot = self.pool.get(&key.0, key.1, key.2).ok_or_else(missing)?;
-            match snapshot.parent.clone() {
+            let parent = match self.pool.get(&key.0, key.1, key.2) {
+                Some(snapshot) => snapshot.parent.clone(),
+                None => self
+                    .disk
+                    .as_mut()
+                    .and_then(|disk| disk.get(key))
+                    .ok_or_else(|| missing.clone())?
+                    .parent
+                    .clone(),
+            };
+            match parent {
                 Some(parent) => keys.push(parent),
                 None => break,
             }
         }
-        let chain: Vec<&StoredSnapshot> = keys
+        keys.reverse();
+        let growth = state.growth_reserve_bytes();
+        if let Some(disk) = &mut self.disk {
+            for key in &keys {
+                if disk.contains(key) {
+                    disk.held.insert(key.clone());
+                    disk.pool.pin(&key.0, key.1, key.2);
+                }
+            }
+        }
+        let mut temps = Vec::new();
+        let result = self.restore_chain(gpu, state, route, &keys, growth, &missing, &mut temps);
+        if !temps.is_empty() {
+            let _ = gpu.hip.device_synchronize();
+            for (_, buf) in temps {
+                if let Err(error) = gpu.hip.free(buf) {
+                    eprintln!("  session cache: freeing a staging buffer failed: {error}");
+                }
+            }
+        }
+        if let Some(disk) = &mut self.disk {
+            for key in std::mem::take(&mut disk.held) {
+                disk.repin(&key);
+            }
+        }
+        result
+    }
+
+    /// Bring the disk links of the root-first chain `keys` to the device
+    /// (promoted, or staged into `temps`), then copy the chain into the
+    /// live state.
+    #[allow(clippy::too_many_arguments)]
+    fn restore_chain(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        route: SessionRoute,
+        keys: &[Key],
+        growth: u64,
+        missing: &str,
+        temps: &mut Vec<(Key, DeviceBuffer)>,
+    ) -> Result<(), String> {
+        let first_disk = keys
             .iter()
-            .rev()
-            .map(|key| self.pool.peek(&key.0, key.1, key.2).ok_or_else(missing))
+            .position(|key| !self.pool.contains(&key.0, key.1, key.2))
+            .unwrap_or(keys.len());
+        let mut promoting = true;
+        for (i, key) in keys.iter().enumerate().skip(first_disk) {
+            let disk = self
+                .disk
+                .as_ref()
+                .expect("a link off the device is on disk");
+            let snapshot = disk.peek(key).ok_or_else(|| missing.to_string())?;
+            let (bytes, parent) = (snapshot.bytes, snapshot.parent.clone());
+            if promoting {
+                if self.promote(gpu, key, bytes, parent.as_ref(), growth)? {
+                    continue;
+                }
+                promoting = false;
+            }
+            let disk = self
+                .disk
+                .as_mut()
+                .expect("a link off the device is on disk");
+            if temps.is_empty() {
+                let need: u64 = keys[i..]
+                    .iter()
+                    .filter_map(|key| disk.peek(key).map(|s| s.bytes))
+                    .sum();
+                if memory_fits(gpu, need + growth) != Some(true) {
+                    return Err("session cache: no memory to stage disk snapshot".into());
+                }
+            }
+            let buf = gpu
+                .bind_thread()
+                .and_then(|()| gpu.hip.malloc(bytes as usize))
+                .map_err(|e| format!("session cache: staging a disk snapshot failed: {e}"))?;
+            temps.push((key.clone(), buf));
+            let buf = &temps.last().expect("just pushed").1;
+            if let Err(error) = disk.load(gpu, key, buf) {
+                disk.drop_entry(key);
+                return Err(format!(
+                    "session cache: reading snapshot from disk failed: {error}"
+                ));
+            }
+        }
+
+        let chain: Vec<(&StoredSnapshot, &DeviceBuffer)> = keys
+            .iter()
+            .map(|key| {
+                if let Some((_, buf)) = temps.iter().find(|(temp, _)| temp == key) {
+                    let snapshot = self.disk.as_ref().and_then(|disk| disk.peek(key));
+                    return snapshot
+                        .map(|s| (s, buf))
+                        .ok_or_else(|| missing.to_string());
+                }
+                match self.pool.peek(&key.0, key.1, key.2) {
+                    Some(
+                        s @ StoredSnapshot {
+                            location: SnapshotLocation::Device(buf),
+                            ..
+                        },
+                    ) => Ok((s, buf)),
+                    _ => Err(missing.to_string()),
+                }
+            })
             .collect::<Result<_, _>>()?;
-        let leaf = *chain.last().expect("non-empty chain");
+        let (leaf, leaf_src) = *chain.last().expect("non-empty chain");
         let dst = state.restore_parts(gpu, route, &leaf.meta)?;
         let mismatch = || "session cache: snapshot layout mismatch".to_string();
         if dst.fixed.len() != leaf.fixed_bytes.len()
@@ -441,19 +653,17 @@ impl SessionCache {
             return Err(mismatch());
         }
         let mut regions = Vec::new();
-        let SnapshotLocation::Device(src) = &leaf.location;
         for (part, src_offset) in dst.fixed.iter().zip(leaf.offsets()) {
             regions.push(CopyRegion {
                 dst: part.buf,
                 dst_offset: part.offset,
-                src,
+                src: leaf_src,
                 src_offset,
                 bytes: part.bytes,
             });
         }
         let mut next = vec![0usize; dst.rows.len()];
-        for snapshot in &chain {
-            let SnapshotLocation::Device(src) = &snapshot.location;
+        for &(snapshot, src) in &chain {
             let offsets = snapshot.offsets();
             if snapshot.segments.len() != dst.rows.len() {
                 return Err(mismatch());
@@ -481,6 +691,71 @@ impl SessionCache {
         }
         copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
         state.finish_restore(gpu, route, &leaf.meta)
+    }
+
+    /// Move the held disk snapshot at `key` into the device tier. `Ok(false)`
+    /// when the device tier has no room for it (nothing changed); `Err` when
+    /// reading it failed (it and its disk descendants are dropped).
+    fn promote(
+        &mut self,
+        gpu: &mut Gpu,
+        key: &Key,
+        bytes: u64,
+        parent: Option<&Key>,
+        growth: u64,
+    ) -> Result<bool, String> {
+        if !self.pool.can_afford(key, bytes) {
+            return Ok(false);
+        }
+        // The parent is on the device (I2 for the first disk link, promoted
+        // for the rest); pinned before eviction runs.
+        if let Some(parent) = parent {
+            self.link(parent);
+        }
+        let buf = self.make_room(gpu, bytes, growth).ok().and_then(|()| {
+            gpu.bind_thread()
+                .and_then(|()| gpu.hip.malloc(bytes as usize))
+                .ok()
+        });
+        let Some(buf) = buf else {
+            if let Some(parent) = parent {
+                self.unlink(parent);
+            }
+            return Ok(false);
+        };
+        let disk = self.disk.as_mut().expect("promoting from disk");
+        if let Err(error) = disk.load(gpu, key, &buf) {
+            disk.drop_entry(key);
+            if let Some(parent) = parent {
+                self.unlink(parent);
+            }
+            if let Err(error) = gpu.hip.free(buf) {
+                eprintln!("  session cache: freeing a snapshot failed: {error}");
+            }
+            return Err(format!(
+                "session cache: reading snapshot from disk failed: {error}"
+            ));
+        }
+        disk.held.remove(key);
+        let stored = disk.peek(key).expect("held on disk");
+        let snapshot = StoredSnapshot {
+            location: SnapshotLocation::Device(buf),
+            parent: stored.parent.clone(),
+            fixed_bytes: stored.fixed_bytes.clone(),
+            segments: stored.segments.clone(),
+            meta: stored.meta.clone(),
+            bytes: stored.bytes,
+        };
+        disk.take(key);
+        let (domain, p, fp) = key.clone();
+        let (_, displaced) = self.pool.insert_unaligned(domain, p, fp, snapshot);
+        for snapshot in displaced {
+            self.retire(snapshot);
+        }
+        if self.children.contains_key(key) {
+            self.pool.pin(&key.0, key.1, key.2);
+        }
+        Ok(true)
     }
 
     /// The next position at which the prefill must stop and call
@@ -512,7 +787,7 @@ impl SessionCache {
         turn.boundaries.pop_front();
         let (domain, route, p) = (turn.domain.clone(), turn.route, prefix.len());
         let fp = prefix_fingerprint(prefix);
-        if self.pool.contains(&domain, p as u64, fp) {
+        if self.present(&(domain.clone(), p as u64, fp)) {
             return Ok(());
         }
         let growth = state.growth_reserve_bytes();
@@ -562,34 +837,7 @@ impl SessionCache {
         if let Some(parent) = &parent {
             self.link(parent);
         }
-        let pending_bytes: u64 = self.pending.iter().map(|entry| entry.1.bytes).sum();
-        let mut fits = Ok(());
-        loop {
-            let over_budget =
-                self.pool.total_bytes() + pending_bytes + bytes > self.pool.max_bytes();
-            if !over_budget {
-                match memory_fits(gpu, bytes + growth) {
-                    Some(true) => break,
-                    Some(false) => {}
-                    // Evicting cannot help a query that fails.
-                    None => {
-                        fits = Err("memory query failed");
-                        break;
-                    }
-                }
-            }
-            match self.pool.pop_lru() {
-                Some(evicted) => self.drop_snapshot(gpu, evicted),
-                None => {
-                    fits = Err(if over_budget {
-                        "budget"
-                    } else {
-                        "memory guard"
-                    });
-                    break;
-                }
-            }
-        }
+        let fits = self.make_room(gpu, bytes, growth);
         let dst = match fits.and_then(|()| {
             gpu.bind_thread()
                 .and_then(|()| gpu.hip.malloc(total))
@@ -659,6 +907,8 @@ impl SessionCache {
                 continue;
             }
             let (domain, p, fp) = key.clone();
+            // `at_boundary` already reserved room for every pending
+            // snapshot, so this insert evicts nothing.
             let (id, displaced) = self.pool.insert_unaligned(domain, p, fp, snapshot);
             if id == CheckpointId::NONE {
                 refused.insert(key);
@@ -677,8 +927,21 @@ impl SessionCache {
         self.pool.total_bytes()
     }
 
-    /// Free every snapshot.
+    /// Free every snapshot; with a disk tier attached, published snapshots
+    /// are demoted to disk instead of dropped.
     pub fn clear(&mut self, gpu: &mut Gpu) {
+        if self.disk.is_some() {
+            for snapshot in std::mem::take(&mut self.release) {
+                free_buffer(gpu, snapshot);
+            }
+            for (_, snapshot) in std::mem::take(&mut self.pending) {
+                self.drop_snapshot(gpu, snapshot);
+            }
+            // Leaves first: each demotion unpins its parent.
+            while let Some((key, snapshot)) = self.pool.pop_lru() {
+                self.evict_device(gpu, key, snapshot);
+            }
+        }
         let pooled = self.pool.drain_blobs();
         let pending = std::mem::take(&mut self.pending)
             .into_iter()
@@ -1078,7 +1341,9 @@ mod tests {
         let marker_end = m.len() + 10;
         assert_eq!(cache.next_boundary(), Some(marker_end));
         toy.advance(gpu, &live[..marker_end]);
-        cache.at_boundary(gpu, &mut toy, &live[..marker_end]).unwrap();
+        cache
+            .at_boundary(gpu, &mut toy, &live[..marker_end])
+            .unwrap();
         assert_eq!(cache.next_boundary(), None);
         toy.advance(gpu, &live);
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), 2 * STRIDE);
@@ -1087,6 +1352,76 @@ mod tests {
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), marker_end);
         assert_restores(&mut cache, gpu, &mut toy, &probe, marker_end);
         cache.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    #[test]
+    fn disk_tier_demotes_promotes_and_survives_reopen() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let fixed = gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap();
+        let rows = gpu
+            .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+            .unwrap();
+        let mut toy = Toy {
+            fixed,
+            rows,
+            position: 0,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let open = |build: u8| {
+            SessionCache::new(domain(), 2 * one).with_disk_build(
+                dir.path(),
+                64 * (one + 8192),
+                [build; 32],
+            )
+        };
+        let snaps = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().path().extension() == Some("snap".as_ref()))
+                .count()
+        };
+        let c = prompt(1, 2 * STRIDE + 5);
+        let d = prompt(2, 2 * STRIDE + 5);
+
+        // d's captures demote c's two snapshots (leaf first).
+        let mut cache = open(7);
+        assert!(cache.disk.is_some());
+        turn(&mut cache, gpu, &mut toy, &c, true);
+        turn(&mut cache, gpu, &mut toy, &d, true);
+        assert_eq!(snaps(), 2);
+        assert_eq!(cache.pool.len(), 2);
+
+        // Restoring c promotes both links, demoting d's.
+        assert_restores(&mut cache, gpu, &mut toy, &c, 2 * STRIDE);
+        assert_eq!(snaps(), 2);
+        let scoped = domain().scoped("toy");
+        let c2 = prefix_fingerprint(&c[..2 * STRIDE]);
+        assert!(cache.pool.contains(&scoped, 2 * STRIDE as u64, c2));
+
+        // clear demotes everything; a second process is locked out.
+        cache.clear(gpu);
+        assert_eq!(snaps(), 4);
+        assert!(open(7).disk.is_none());
+
+        // A reopened cache restores both chains exactly from disk.
+        drop(cache);
+        let mut cache = open(7);
+        assert_restores(&mut cache, gpu, &mut toy, &d, 2 * STRIDE);
+        assert_restores(&mut cache, gpu, &mut toy, &c, 2 * STRIDE);
+        cache.clear(gpu);
+        drop(cache);
+
+        // Another build never plans this build's files.
+        let other = open(8);
+        assert_eq!(other.plan(&toy, &c, SessionRoute::Ar), 0);
+        drop(other);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }

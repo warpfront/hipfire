@@ -1572,6 +1572,29 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SESSION_CACHE_BYTES",
         "Byte budget for reusable prefill snapshots (session cache; Flash-Next). 0 disables the cache."
     ),
+    process_field!(
+        "memory.session_cache_disk_bytes",
+        "session_cache_disk_bytes",
+        Memory,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 70368744177664
+        },
+        false,
+        "HIPFIRE_SESSION_CACHE_DISK_BYTES",
+        "Byte budget of the session cache's disk tier: snapshots evicted from memory are written to memory.session_cache_dir and restored on demand, surviving restarts. 0 disables it."
+    ),
+    process_field!(
+        "memory.session_cache_dir",
+        "session_cache_dir",
+        Memory,
+        DefaultValue::String(""),
+        ValueRule::String,
+        false,
+        "HIPFIRE_SESSION_CACHE_DIR",
+        "Directory of the session cache's disk tier; empty = $HIPFIRE_HOME/session-cache. One process uses it at a time."
+    ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
         "prompt_cache_unbounded",
@@ -6557,6 +6580,25 @@ pub mod memory {
         process_value("HIPFIRE_SESSION_CACHE_BYTES")
             .and_then(|value| value.parse().ok())
             .unwrap_or(8589934592)
+    }
+
+    /// Byte budget of the session cache's disk tier
+    /// (`memory.session_cache_disk_bytes`, compat env
+    /// `HIPFIRE_SESSION_CACHE_DISK_BYTES`); 0 disables it.
+    pub fn session_cache_disk_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_DISK_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Directory of the session cache's disk tier (`memory.session_cache_dir`,
+    /// compat env `HIPFIRE_SESSION_CACHE_DIR`); empty =
+    /// `$HIPFIRE_HOME/session-cache`.
+    pub fn session_cache_dir() -> std::path::PathBuf {
+        match process_value("HIPFIRE_SESSION_CACHE_DIR") {
+            Some(value) if !value.trim().is_empty() => super::expand_tilde(value.trim()),
+            _ => crate::ConfigPaths::discover().root.join("session-cache"),
+        }
     }
 
     /// Which engine executes the ops that read a spilled layer's weights

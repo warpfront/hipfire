@@ -779,10 +779,13 @@ impl Carrier for Qwen4Carrier {
                 chunk,
             )
             .unwrap_or(0);
-            bundle.attach_session_cache(hipfire_runtime::session_cache::SessionCache::new(
-                session_domain,
-                session_budget,
-            ));
+            bundle.attach_session_cache(
+                hipfire_runtime::session_cache::SessionCache::new(session_domain, session_budget)
+                    .with_disk(
+                        &hipfire_config::memory::session_cache_dir(),
+                        hipfire_config::memory::session_cache_disk_bytes(),
+                    ),
+            );
             eprintln!(
                 "  qwen4 session cache: {} MiB budget, {} MiB per {chunk}-token snapshot",
                 session_budget >> 20,

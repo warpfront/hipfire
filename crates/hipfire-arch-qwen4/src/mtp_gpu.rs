@@ -44,7 +44,8 @@ use std::fmt;
 const MTP_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
-/// Metadata words of an MTP head session snapshot: model id and the state mark.
+/// Metadata words of an MTP head session snapshot: a reserved zero word and
+/// the state mark.
 const MTP_SESSION_WORDS: usize = 7;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
@@ -1427,13 +1428,13 @@ impl MtpGpuState {
         ]
         .map(|value| value as u64);
         Ok((
-            [self.model_id].into_iter().chain(words).collect(),
+            [0].into_iter().chain(words).collect(),
             self.session_layout(&mark),
         ))
     }
 
     fn parse_session_mark(&self, words: &[u64]) -> Result<MtpStateMark, MtpGpuError> {
-        if words.len() != MTP_SESSION_WORDS || words[0] != self.model_id {
+        if words.len() != MTP_SESSION_WORDS {
             return Err(invalid("MTP session snapshot shape mismatch"));
         }
         let mark = MtpStateMark {
