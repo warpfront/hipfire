@@ -560,8 +560,12 @@ pub(crate) fn run_gguf_pipeline(
                     }
                 }
                 GgufFormat::Mq6V2 | GgufFormat::Mq5V2 | GgufFormat::Mq3V2 | GgufFormat::Mq2V2 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
+                    // GGUF shape[0] is the innermost (K) dim and k_dim % 256 == 0 is
+                    // guaranteed by the enclosing guard; rows = numel / K. (shape[1] is
+                    // the row count here and may not be 256-aligned, nor exist for
+                    // non-2D tensors, which would trip the encoder's K % 256 assert.)
+                    let k = k_dim as usize;
+                    let m = n_elements as usize / k;
                     let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                 }

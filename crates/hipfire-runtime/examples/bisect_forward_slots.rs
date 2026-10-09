@@ -24,22 +24,37 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::forward_slots::{forward_batch_slots_with_max_layer, SlotDescStaging};
+    use hipfire_arch_qwen35::forward_slots::{
+        forward_batch_slots_with_max_layer, SlotDescStaging, SlotKvTier,
+    };
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch,
     };
+    use hipfire_runtime::kv_backend::KvBackend;
+    use hipfire_runtime::kv_mode::{self, KvMode, SlotKvTierPlan};
+    use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
     use hipfire_runtime::slot_batch::SlotBatch;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::KvCache;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
     use rdna_compute::slot_pool::{SlotId, SlotPool};
     use rdna_compute::{DType, Gpu, GpuTensor};
     use std::path::Path;
 
     let model_path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: bisect_forward_slots <model.hf4>");
+        eprintln!(
+            "Usage: bisect_forward_slots <model.hf4> [kv-mode]  \
+             (kv-mode: q8|fwht2|fwht3|fwht4|bf16; default q8)"
+        );
         std::process::exit(1);
     });
+    let mode_name = std::env::args().nth(2).unwrap_or_else(|| "q8".to_string());
+    let kv_mode::ResolveResult { mode, warning } =
+        kv_mode::resolve(&mode_name, &kv_mode::QWEN35_SLOTS_POLICY);
+    assert!(
+        warning.is_none(),
+        "kv mode {mode_name:?} did not cleanly resolve: {warning:?}"
+    );
+    assert!(mode != KvMode::F16, "f16 has no sequential reference");
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("parse Qwen3.5 config");
@@ -48,7 +63,13 @@ fn main() {
         .iter()
         .filter(|t| **t == LayerType::FullAttention)
         .count();
-    let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
+    let plan = SlotKvTierPlan::resolve(mode, config.n_kv_heads, config.head_dim)
+        .unwrap_or_else(|e| panic!("kv mode {mode_name}: {e}"));
     let dim = config.dim;
 
     const PROMPT_LEN: usize = 5;
@@ -84,14 +105,34 @@ fn main() {
 
     for max_layer in 1..=config.n_layers {
         // ---- reference: fresh KvCache + DeltaNetState + scratch every time ----
-        let mut ref_kv = KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .expect("ref KvCache");
+        let mut ref_kv = if mode == KvMode::Q8 {
+            KvCache::new_gpu_q8(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .expect("ref KvCache")
+        } else {
+            // The SAME mode-generic constructor the sequential carrier uses
+            // (golden harness `run_reference_for_slot`), so the bf16/fwht
+            // reference is production-true; the legacy q8 constructor stays
+            // for the q8 baseline this harness was validated against.
+            <KvCache as KvCacheExt>::from_mode_with_backend(
+                mode,
+                KvBackend::Legacy,
+                KvTarget::Single(&mut gpu),
+                &KvDims {
+                    layers: KvLayers::Mask(is_kv_layer.clone()),
+                    n_kv_heads: config.n_kv_heads,
+                    head_dim: config.head_dim,
+                    max_seq: kv_seq,
+                    physical_cap: Some(kv_seq),
+                },
+            )
+            .expect("ref KvCache (mode-generic)")
+        };
         let mut ref_dn = DeltaNetState::new(&mut gpu, &config).expect("ref DeltaNetState");
         let ref_scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq)
             .expect("ref Qwen35Scratch");
@@ -129,21 +170,62 @@ fn main() {
         ref_pbs.free_gpu(&mut gpu);
 
         // ---- candidate: fresh SlotPool/arenas/DeltaNetState/scratch every time ----
-        let mut pool = SlotPool::new(1, CAP_TOKENS, per_pos_bytes).expect("SlotPool::new");
+        let mut pool = SlotPool::new_with_strides(
+            1,
+            CAP_TOKENS,
+            plan.k_bytes_per_pos,
+            plan.v_bytes_per_pos,
+        )
+        .expect("SlotPool::new_with_strides");
         let slot0 = pool.acquire().expect("acquire slot 0");
         assert_eq!(slot0.0, 0);
-        let arena_bytes = pool.arena_bytes();
+        let k_arena_bytes = pool.k_arena_bytes();
+        let v_arena_bytes = pool.v_arena_bytes();
         let k_arenas: Vec<GpuTensor> = (0..n_fa_layers)
-            .map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("k_arena"))
+            .map(|_| gpu.zeros(&[k_arena_bytes], DType::Raw).expect("k_arena"))
             .collect();
         let v_arenas: Vec<GpuTensor> = (0..n_fa_layers)
-            .map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("v_arena"))
+            .map(|_| gpu.zeros(&[v_arena_bytes], DType::Raw).expect("v_arena"))
             .collect();
         let mut dn_states =
             vec![DeltaNetState::new(&mut gpu, &config).expect("cand DeltaNetState")];
         let mut desc_staging =
             SlotDescStaging::new(&mut gpu, 1, PROMPT_LEN, 0).expect("SlotDescStaging");
-        let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+        let upload_f32 = |gpu: &mut Gpu, vals: &[f32]| -> GpuTensor {
+            let t = gpu
+                .alloc_tensor(&[vals.len()], DType::F32)
+                .expect("tier table alloc");
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            gpu.hip
+                .memcpy_htod(&t.buf, &bytes)
+                .expect("tier table upload");
+            t
+        };
+        let (cos, sin, s1, s2) = if let Some(len) = plan.givens_len {
+            let (c, si) = KvCache::gen_givens_angles(42, len);
+            (
+                Some(upload_f32(&mut gpu, &c)),
+                Some(upload_f32(&mut gpu, &si)),
+                None,
+                None,
+            )
+        } else if let Some(len) = plan.fwht_len {
+            (
+                None,
+                None,
+                Some(upload_f32(&mut gpu, &KvCache::gen_fwht_signs(42, len))),
+                Some(upload_f32(&mut gpu, &KvCache::gen_fwht_signs(1042, len))),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let kv_tier = SlotKvTier {
+            mode,
+            givens_cos: cos,
+            givens_sin: sin,
+            fwht_signs1: s1,
+            fwht_signs2: s2,
+        };
         let cand_pbs = PrefillBatchScratch::new(&mut gpu, &config, PROMPT_LEN)
             .expect("cand PrefillBatchScratch");
         let cand_scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, CAP_TOKENS)
@@ -185,6 +267,7 @@ fn main() {
             dn.free_gpu(&mut gpu);
         }
         desc_staging.free_gpu(&mut gpu);
+        kv_tier.free_gpu(&mut gpu);
         cand_pbs.free_gpu(&mut gpu);
         cand_scratch.free_gpu(&mut gpu);
         gpu.free_tensor(logits_out).expect("free logits_out");

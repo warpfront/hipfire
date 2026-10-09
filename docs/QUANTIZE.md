@@ -222,6 +222,25 @@ hipfire-quantize --input ./qwen3.8-27b --output qwen3.8-27b.mq4v2.base.hfq \
 #   --format mq2v2 --tier pro --fixed-tier lm_head:mq6v2,ssm_out:mq6v2
 ```
 
+### Multi-slot (`serve.multi_slot`) recipe admissibility
+
+The experimental multi-slot engine admits projections PER SITE, not per
+layer: a fused group (QKVZA / QKV / gate+up) keeps its fused launch when
+every member shares a container and otherwise falls back to per-weight
+plain GEMMs; residual roles (wo, w_down) and the lm_head dispatch on their
+own dtype. Admitted projection containers: `Q8_0`, `MQ4G256`/`HFQ4G256`,
+`MQ4G256V2`, `MQ4CG256`, `MQ6G256`/`HFQ6G256`, `MQ6G256V2`, `MQ5G256V2`,
+`MQ3G256`, `MQ3G256V2`, `MQ3G256Lloyd`, `MQ2G256V2` (the MQ3/MQ6-v1/Lloyd
+members are uniform-group-only — no plain per-projection key). lm_head adds
+`HFQ3G256` and `F16`. Every `--tier` and `--fixed-tier` recipe on this page
+that stays inside those containers loads on slots — including the mixed
+`--tier pro` body (MQ4G256V2 projections + Q8_0 wo/embed/lm_head/conv1d).
+Refused with named errors: Lloyd-V2 (qt52), PARO, E8/MFP4, G128-rotated
+containers, non-Q8 embeddings, fp32 DeltaNet state. AWQ sidecars are
+refused inside a mixed-dtype group (each scale needs its own rotated
+input). KV tiers: q8 (default), fwht{2,3,4}, bf16, f16 (slots-only), fp8 on
+gfx1201 — `--kv-k`/`--kv-v` splits are not slots-resolved.
+
 ### Vision-tower sidecar (`qwen3.8-27b-vision.hfq`)
 
 The Qwen3.8-27B vision tower ships as a shared sidecar (llama.cpp

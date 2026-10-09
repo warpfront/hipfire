@@ -88,10 +88,10 @@ pub fn vmm_executor_supports(
                 require_batchable_fullattn_layer(l, arch).map(drop)
             }
             (LayerWeights::DeltaNetMoe(l), LayerType::LinearAttention) => {
-                require_batchable_deltanet_moe_layer(l).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
+                require_batchable_deltanet_moe_layer(l, arch).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
             }
             (LayerWeights::FullAttnMoe(l), LayerType::FullAttention) => {
-                require_batchable_fullattn_moe_layer(l).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
+                require_batchable_fullattn_moe_layer(l, arch).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
             }
             _ => return Err(format!("VMM executor: layer {i} weight/type mismatch")),
         };

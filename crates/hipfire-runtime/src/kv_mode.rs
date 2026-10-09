@@ -337,8 +337,9 @@ fn normalize_qwen(raw: &str) -> Option<KvMode> {
 }
 
 /// [`normalize_qwen`] plus the three indivisible native presets, for the
-/// multi-slot site only: bf16/f16 have slot readers, and fp8 (none) takes
-/// [`resolve`]'s explicit-native carry-forward so the slot engine refuses it.
+/// multi-slot site only: bf16/f16 have slot readers, and fp8 resolves too
+/// (gfx1201-gated — see [`resolve_qwen35_slots`], which hard-errors an
+/// explicit fp8 off gfx1201 instead of letting the engine discover it).
 fn normalize_qwen_slots(raw: &str) -> Option<KvMode> {
     match raw.trim() {
         "fp8" => Some(Fp8),
@@ -478,21 +479,42 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 /// paged pools), so every rotated tier the sequential path accepts is
 /// accepted here too — plus the flat 2-byte native tiers bf16 and f16, which
 /// DO have slot readers (descriptor-aware `kv_cache_write_*` +
-/// `attention_flash_*_tile_batched` kernels). Only fp8 stays refused: it
-/// has no slot-reader support (fail closed) on this site.
-/// The DEFAULT stays q8 — deliberately NOT the sequential site's fwht3:
-/// the slots q8 path has production mileage on every fixture, and an
-/// operator who wants a rotated tier on the slots engine says so
-/// explicitly (`HIPFIRE_KV_MODE=fwht3` / config). "auto" therefore means
-/// q8 HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
+/// `attention_flash_*_tile_batched` kernels). fp8 is accepted at the string
+/// level on exact gfx1201 ONLY: the descriptor-aware fp8 writer/reader
+/// kernels exist there (`HIPFIRE_KV_FP8_E4M3` TU family), and
+/// [`resolve_qwen35_slots`] hard-errors the tier everywhere else. This
+/// policy stays arch-unaware by design — [`resolve`] is pure — so Fp8 in
+/// `accepted` can never leak into an auto selection: the DEFAULT stays q8 on
+/// EVERY arch (deliberately NOT the sequential site's fwht3, and NOT the
+/// sequential hfq site's gfx1201-fp8 auto: the slots q8 path has production
+/// mileage on every fixture, and an operator who wants a rotated or native
+/// tier on the slots engine says so explicitly). "auto" therefore means q8
+/// HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
 /// Names come from the shared Qwen table: `asymN`/`turboN` → FwhtN,
 /// `legacy-asymN` → AsymN.
 pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-slots",
     normalize_alias: normalize_qwen_slots,
-    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16],
+    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16, Fp8],
     default: Q8,
 };
+
+/// Strict, arch-aware qwen35 multi-slot resolution. `""`/`auto` is q8 on
+/// EVERY arch (the slots engine's shipped default — never fp8, mirroring
+/// the qwen35-pp convention); an explicit fp8 is honored only on exact
+/// gfx1201, where the descriptor-aware fp8 writer/reader kernels exist, and
+/// hard-errors everywhere else naming the arch and the fix (same shape as
+/// [`resolve_qwen4`]). Every other mode falls through to the pure
+/// [`resolve`] unchanged.
+pub fn resolve_qwen35_slots(raw: &str, arch: &str) -> Result<ResolveResult, String> {
+    let resolved = resolve(raw, &QWEN35_SLOTS_POLICY);
+    if resolved.mode == Fp8 && arch != "gfx1201" {
+        return Err(format!(
+            "qwen35 slots kv mode \"fp8\" needs gfx1201 (have {arch}); use q8 or auto"
+        ));
+    }
+    Ok(resolved)
+}
 
 /// Qwen4 (Flash-Next) QSA K/V. `bf16` is the exact reference state (F32
 /// K/V arenas, BF16-valued index keys); `fp8` stores K/V as E4M3 with one
@@ -1128,15 +1150,43 @@ mod tests {
             assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
             assert!(r.warning.is_none(), "{raw} must not warn");
         }
-        // fp8 alone stays refused (no slot readers): the single-string path
-        // carries the native forward WITH a warning so construction fails
-        // closed, and the pair path hard-errors instead of selecting an
-        // indivisible native tier.
+        // fp8 resolves cleanly at the STRING level (the descriptor-aware
+        // fp8 writer/reader kernels exist on gfx1201); the arch gate lives
+        // in resolve_qwen35_slots below, and auto stays q8 on every arch
+        // because the slots default is q8 — Fp8 in `accepted` can never
+        // become an auto selection.
         let r = resolve("fp8", p);
-        assert!(r.warning.is_some(), "fp8 must warn on the slots site");
-        assert!(
-            resolve_kv_pair("fp8", None, None, p, "gfx1201", true).is_err(),
-            "fp8 must error on the slots pair path"
+        assert_eq!(r.mode, KvMode::Fp8);
+        assert!(r.warning.is_none(), "fp8 must resolve cleanly on the slots site");
+        // Arch-parameterized gate: explicit fp8 on gfx1201 is honored, and
+        // every other arch hard-errors naming the arch and the fix.
+        let ok = resolve_qwen35_slots("fp8", "gfx1201").unwrap();
+        assert_eq!(ok.mode, KvMode::Fp8);
+        assert!(ok.warning.is_none());
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
+            let Err(error) = resolve_qwen35_slots("fp8", arch) else {
+                panic!("fp8 off gfx1201 must be refused on {arch}");
+            };
+            assert!(error.contains("fp8") && error.contains(arch), "{error}");
+            assert!(error.contains("gfx1201"), "{error}");
+        }
+        // auto/unset never select fp8, even on gfx1201 (slots default q8).
+        for raw in ["", "auto"] {
+            for arch in ["gfx1100", "gfx1201"] {
+                let r = resolve_qwen35_slots(raw, arch).unwrap();
+                assert_eq!(r.mode, KvMode::Q8, "{raw:?} on {arch} must stay q8");
+                assert!(r.warning.is_none());
+            }
+        }
+        // The pair path now honors fp8 too (it is in `accepted`): an
+        // indivisible native pair resolves on gfx1201. The slots site itself
+        // only consumes the single-string [`resolve`], so this is a
+        // policy-level statement, not a production route — and the arch gate
+        // in resolve_qwen35_slots applies identically either way.
+        assert_eq!(
+            resolve_kv_pair("fp8", None, None, p, "gfx1201", true).unwrap(),
+            KvPair::Native(Fp8),
+            "fp8 must resolve as an indivisible native pair once accepted"
         );
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Q8);
@@ -1162,8 +1212,8 @@ mod tests {
                 assert!(r.warning.is_some(), "site {} must WARN on {raw}", p.site);
             }
         }
-        // The slots site honors f16 and bf16 and carries fp8 forward (with a
-        // warning) so the slot engine refuses it.
+        // The slots site honors f16 and bf16 and fp8 (the latter
+        // gfx1201-gated by resolve_qwen35_slots, not by the string resolver).
         assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
         assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
         assert_eq!(resolve("fp8", &QWEN35_SLOTS_POLICY).mode, KvMode::Fp8);

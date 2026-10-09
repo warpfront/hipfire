@@ -100,10 +100,11 @@ pub struct EngineConfig {
     pub mtp_k: usize,
     /// Raw KV-mode string from the load request (`--kv-mode`). Empty = fall
     /// back to `HIPFIRE_KV_MODE` / config, resolved through the slots site
-    /// policy (full static ladder; q8 default). Native fp8/bf16 KV and any
-    /// unrecognized or warn-resolved value are rejected in `Rig::build` —
-    /// carried explicitly so a bypass of the daemon capability gate still
-    /// fails closed inside the engine thread.
+    /// policy (full static ladder + native bf16/f16; q8 default; fp8
+    /// gfx1201-only). Any unrecognized or warn-resolved value — and an
+    /// explicit fp8 off gfx1201 — is rejected in `Rig::build`, carried
+    /// explicitly so a bypass of the daemon capability gate still fails
+    /// closed inside the engine thread.
     pub kv_mode_raw: String,
     /// Effective `--kv-backend` for this load (`legacy` default). Slot
     /// arenas are fixed contiguous `SlotPool` allocations; `vmm` is rejected
@@ -699,17 +700,16 @@ impl Rig {
                 hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY.site
             ));
         }
-        // Native fp8 KV has no slot readers even when the site policy
-        // accepts it; storing foreign bytes under the slot layout is silent
-        // corruption — refuse before any GPU allocation. bf16/f16 ARE
-        // admitted: the descriptor-aware flat-2B writers and attend kernels
-        // exist for both.
-        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8) {
-            return Err(format!(
-                "experimental multi-slot does not admit kv_mode {kv_mode:?}; \
-                 fp8 KV is not admitted on slot arenas"
-            ));
-        }
+        // Native fp8 KV is admitted here only on exact gfx1201, where the
+        // descriptor-aware fp8 write/attend kernels exist. The arch gate
+        // sits right after `Gpu::init` below — that is the first point the
+        // resolved GPU arch is authoritative (the daemon capability gate
+        // already refused fp8 off gfx1201 before spawn; this is the
+        // fail-closed inner check). bf16/f16 are admitted on every arch:
+        // the descriptor-aware flat-2B writers and attend kernels exist for
+        // both. Storing bytes a tier's kernels cannot read is silent
+        // corruption — anything unadmittable must fail closed before an
+        // arena is allocated.
         // The tier's arena geometry: the K and V per-position strides DIFFER
         // on every rotated-K tier (packed K with a 4-byte per-head norm
         // header against Q8_0 V), and the pool, arenas, preflight math, and
@@ -851,6 +851,24 @@ impl Rig {
         // total come from the live device so gfx1100 is not over-admitted
         // against a hardcoded R9700 budget.
         let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
+        // Native fp8 KV admission gate (gfx1201-only): the descriptor-aware
+        // fp8 writer/reader kernels compile `#error` off gfx1201 (OCP E4M3FN
+        // cvt), so admitting the tier anywhere else fails at first kernel
+        // load at best and mis-reads cache bytes at worst. Fail closed here,
+        // naming the arch and the fix, before preflight or any arena exists.
+        //
+        // untested-hw: the gfx1201 fp8 slots path (write/attend kernels,
+        // tier plan, pool) was implemented from the q8 slots template; no
+        // gfx1201 host was available to exercise it.
+        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8)
+            && !gpu.arch_caps.is_gfx1201()
+        {
+            return Err(format!(
+                "experimental multi-slot kv_mode \"fp8\" needs gfx1201 (have {}); \
+                 use q8 or auto",
+                gpu.arch
+            ));
+        }
         let (vram_free, vram_total) = gpu
             .hip
             .get_vram_info()

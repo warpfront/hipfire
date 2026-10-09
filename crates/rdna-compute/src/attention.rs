@@ -2258,8 +2258,9 @@ impl Gpu {
     }
     /// Batched native fp8-E4M3 KV write (F slice, gfx1201-only): one wave per
     /// (head, batch row), grid [n_kv_heads, batch_size, 1], block [32,1,1].
-    /// Same 6-arg ABI as the kernel; no slot descriptors and no pair fold —
-    /// fp8 is contiguous, single-GPU, noslots. Capacity guard skips VMM
+    /// Legacy single-arena entry point — descriptor-less, no pair fold; the
+    /// kernel synthesises a zero-base descriptor so the addressing is the
+    /// pre-slot contiguous one, byte-identical. Capacity guard skips VMM
     /// owners (mapped prefix, not logical capacity).
     pub fn kv_cache_write_fp8_e4m3_batched(
         &mut self,
@@ -2270,53 +2271,91 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_fp8_e4m3_batched_slots(
+            dst, src, positions, n_kv_heads, head_dim, batch_size, None, None,
+        )
+    }
+
+    /// Multi-slot variant of [`Self::kv_cache_write_fp8_e4m3_batched`] — the
+    /// fp8 writer is descriptor-aware (same `kv_offset_for_k` row base as the
+    /// bf16 writer; `dst` selects the K or V arena, and the fp8 K/V strides
+    /// are equal so no separate V base is carried), letting one launch write
+    /// several independent sequences into disjoint KV slabs. Both `None` =
+    /// byte-identical to the plain variant.
+    ///
+    /// untested-hw: gfx1201-only path, implemented from the q8 slots template;
+    /// no gfx1201 host was available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_fp8_e4m3_batched_slots(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_fp8_e4m3_batched_slots: slot_descs and row_slot are \
+             both-or-neither. Passing only slot_descs silently pins every row to \
+             slot 0, writing every sequence's KV into slot 0's slab."
+        );
         self.bind_thread()?;
         let row = fp8_e4m3_row_bytes(n_kv_heads, head_dim);
-        check_native_kv_capacity(dst, 1, row, "kv_cache_write_fp8_e4m3_batched")?;
-        if !self
-            .functions
-            .contains_key("kv_cache_write_fp8_e4m3_batched")
-        {
-            let stripped = kernels::KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
-            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel(
-                "kv_cache_write_fp8_e4m3_batched",
-                &src,
-                "kv_cache_write_fp8_e4m3_batched",
-            )?;
-        }
-        let d = dst.buf.as_ptr();
+        check_native_kv_capacity(dst, 1, row, "kv_cache_write_fp8_e4m3_batched_slots")?;
+        // Descriptor launches (the slot engine) run the paged module;
+        // descriptor-less launches run the default module, whose source and
+        // JIT cache key are unchanged from before paging (same module bytes
+        // the sequential fp8 path always compiled).
+        let func = self.ensure_kv_slot_kernel(
+            "kv_cache_write_fp8_e4m3_batched",
+            "kv_cache_write_fp8_e4m3_batched_paged",
+            kernels::KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC,
+            slot_descs.is_some(),
+        )?;
+        let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
-        let nkv = n_kv_heads as i32;
-        let hd = head_dim as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
-            &d as *const _ as *mut c_void,
-            &s as *const _ as *mut c_void,
-            &p as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &bs as *const _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let bytes =
             crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "kv_write",
-            "kv_cache_write_fp8_e4m3_batched",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "kv_write", func, bytes);
         let kv_row_bytes = n_kv_heads * head_dim * 4;
-        let (s_base, p_base) = (s, p);
+        let (s_base, p_base, rs_base) = (s, p, rs_ptr);
         let mut result = Ok(());
         for (off, len) in row_launch_chunks(batch_size) {
             s = shift_row_ptr(s_base, off, kv_row_bytes);
             p = shift_row_ptr(p_base, off, 4);
+            rs_ptr = shift_row_ptr(rs_base, off, 4);
             bs = len as i32;
+            let desc_raw = desc_ptr; // alias for move into closure
+            let rs_raw = rs_ptr; // alias for move into closure
             result = self.launch_maybe_blob(
-                "kv_cache_write_fp8_e4m3_batched",
+                func,
                 [n_kv_heads as u32, len as u32, 1],
                 [32, 1, 1],
                 0,
@@ -2329,6 +2368,8 @@ impl Gpu {
                     b.push_i32(nkv);
                     b.push_i32(hd);
                     b.push_i32(bs);
+                    b.push_ptr(desc_raw);
+                    b.push_ptr(rs_raw);
                     b
                 },
             );
@@ -4181,6 +4222,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.attention_native_kv_batched_impl(
             "attention_fp8_e4m3_kv_batched",
+            "attention_fp8_e4m3_kv_batched_paged",
             kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC,
             fp8_e4m3_row_bytes(n_kv_heads, head_dim),
             "attention_fp8_e4m3_kv_batched",
@@ -4199,6 +4241,8 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
+            None,
+            None,
         )
     }
     /// Batched native flat-bf16 decode/prefill (F slice): same shape as the
@@ -4222,8 +4266,70 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        self.attention_bf16_kv_batched_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+            None,
+            None,
+        )
+    }
+    /// Multi-slot variant of [`Self::attention_bf16_kv_batched`] — the bf16
+    /// scalar kernel is descriptor-aware at source level (same TU as the q8
+    /// scalar with `HIPFIRE_KV_BF16=1`, carrying the `slot_descs`/`row_slot`
+    /// tail), so this only threads the arguments through the shared native
+    /// impl, exactly like `attention_q8_0_kv_batched_masked_slots`. Both
+    /// `None` = byte-identical to the plain variant. This is the kernel the
+    /// slots bf16 tier must run to stay bit-parity with the sequential
+    /// path's `AttnBf16KvBatchedMasked` — the windowed flash tile accumulates
+    /// in a different order and diverges past 6e-3 on some logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bf16_kv_batched_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "attention_bf16_kv_batched_slots: slot_descs and row_slot must be \
+             both Some or both None — the half-configured combination would \
+             silently pin every row to slot 0's descriptor"
+        );
+        assert!(
+            !(slot_descs.is_some() && tree_bias.is_some()),
+            "tree_bias combined with multi-slot descriptors has no defined \
+             contract and no coverage; tree-verify + multi-slot is \
+             deliberately out of SP1 scope"
+        );
         self.attention_native_kv_batched_impl(
             "attention_bf16_kv_batched",
+            "attention_bf16_kv_batched_paged",
             kernels::ATTENTION_BF16_KV_BATCHED_SRC,
             bf16_row_bytes(n_kv_heads, head_dim),
             "attention_bf16_kv_batched",
@@ -4242,16 +4348,23 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
+            slot_descs,
+            row_slot,
         )
     }
     /// Shared batched native-KV body (fp8 + bf16): mirrors
-    /// `attention_q8_0_kv_batched_masked_slots` with null slot descriptors.
-    /// The TU's `#include "kv_slot_desc.h"` is strip-and-prepended like the
-    /// Q8 sibling (runtime hipcc has no -I to kernels/src).
+    /// `attention_q8_0_kv_batched_masked_slots` — descriptor-less callers
+    /// keep the default module (source and JIT cache key unchanged), callers
+    /// with real slot descriptors run the paged module. The TU's
+    /// `#include "kv_slot_desc.h"` is strip-and-prepended either way (runtime
+    /// hipcc has no -I to kernels/src). fp8 passes null descriptors today
+    /// (noslots — its slots route is the flash tile); bf16 threads them
+    /// through for the slots tier.
     #[allow(clippy::too_many_arguments)]
     fn attention_native_kv_batched_impl(
         &mut self,
         kernel: &'static str,
+        paged_kernel: &'static str,
         src: &'static str,
         row_bytes: usize,
         profile_name: &'static str,
@@ -4270,15 +4383,25 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "{kernel}: slot_descs and row_slot must be both Some or both None"
+        );
         self.bind_thread()?;
-        check_native_kv_capacity(k_cache, max_seq, row_bytes, kernel)?;
-        check_native_kv_capacity(v_cache, max_seq, row_bytes, kernel)?;
-        if !self.functions.contains_key(kernel) {
-            let stripped = src.replace("#include \"kv_slot_desc.h\"", "");
-            let full_src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel(kernel, &full_src, kernel)?;
+        // Legacy (noslots) launches keep the strict logical-capacity guard. A
+        // descriptor launch addresses a slot pool's arenas, which admission
+        // sized to n_slots × cap rows — max_seq × row_bytes would misjudge
+        // that, so the check is skipped there (the q8 slots sibling runs no
+        // check for the same reason).
+        if slot_descs.is_none() {
+            check_native_kv_capacity(k_cache, max_seq, row_bytes, kernel)?;
+            check_native_kv_capacity(v_cache, max_seq, row_bytes, kernel)?;
         }
+        let func = self.ensure_kv_slot_kernel(kernel, paged_kernel, src, slot_descs.is_some())?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -4296,8 +4419,14 @@ impl Gpu {
         let mut sc = scale;
         let mut bs = block_start as i32;
         let mut bc = block_cols as i32;
-        let mut desc_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut rs_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -4325,7 +4454,7 @@ impl Gpu {
         let desc_raw = desc_ptr;
         let rs_raw = rs_ptr;
         let result = self.launch_maybe_blob(
-            kernel,
+            func,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -8988,6 +9117,68 @@ impl Gpu {
             /*force_wmma_grid=*/ false,
             None,
             None,
+        )
+    }
+
+    /// Multi-slot variant of [`Self::attention_flash_fp8_e4m3_tile_batched`]
+    /// — the fp8 tile kernel is descriptor-aware at source level (it is the
+    /// same TU as the q8 tile with `HIPFIRE_KV_FP8_E4M3=1` and carries the
+    /// full `slot_descs`/`row_slot` tail), so this only threads the arguments
+    /// through the shared launcher, exactly like the q8/bf16 slots siblings.
+    /// The gfx1201 VerifyAttn GQA shortcut is deliberately NOT taken here:
+    /// those twins have no descriptor parameters, so a descriptor launch must
+    /// always run the scalar tile.
+    ///
+    /// untested-hw: gfx1201-only path, implemented from the q8 slots template;
+    /// no gfx1201 host was available.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fp8_e4m3_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fp8_e4m3_tile_batched",
+            kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC,
+            "attention_flash_fp8_e4m3_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
         )
     }
 
@@ -23135,6 +23326,7 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
     Some(match func {
         "attention_flash_q8_0_tile_batched" => "attention_flash_q8_0_tile_batched_paged",
         "attention_flash_bf16_tile_batched" => "attention_flash_bf16_tile_batched_paged",
+        "attention_flash_fp8_e4m3_tile_batched" => "attention_flash_fp8_e4m3_tile_batched_paged",
         "attention_flash_f16_tile_batched" => "attention_flash_f16_tile_batched_paged",
         "attention_flash_asym2_tile_batched" => "attention_flash_asym2_tile_batched_paged",
         "attention_flash_asym3_tile_batched" => "attention_flash_asym3_tile_batched_paged",
@@ -23159,7 +23351,7 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
-        flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
+        flux_attn_route_name, kv_slot_paged_symbol, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
         q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
         replay_stable_tile_count,
     };
@@ -23418,6 +23610,7 @@ mod tests {
 #[cfg(test)]
 mod kv_slot_desc_port_tests {
     use crate::kernels;
+    use super::kv_slot_paged_symbol;
 
     /// Every tile-batched attention kernel the slots engine can route a
     /// non-q8 tier through MUST declare the trailing slot-addressing
@@ -23539,6 +23732,106 @@ mod kv_slot_desc_port_tests {
         assert!(
             src.contains("kv_offset_for_v(desc"),
             "kv_cache_write_q8_0_batched lost the V-base translation arm"
+        );
+    }
+
+    /// CPU-side ABI pin for the fp8 slots route (no GPU): the batched fp8
+    /// writer must carry the descriptor tail the slots launcher pushes
+    /// (8-arg ABI), translate its row through the descriptor helpers, and
+    /// keep the gfx1201 device gate. Dropping any of these silently
+    /// mis-addresses slot slabs or compiles the kernel on the wrong arch.
+    #[test]
+    fn fp8_batched_writer_is_descriptor_aware_and_gfx1201_gated() {
+        let src = kernels::KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC;
+        // The descriptor tail sits INSIDE the fp8 kernel's parameter list —
+        // check the tail right after the fp8 entry point, not anywhere in
+        // the TU (the q8 kernels above it carry their own).
+        let fp8_body = src
+            .split("kv_cache_write_fp8_e4m3_batched(")
+            .nth(1)
+            .expect("fp8 batched entry point present");
+        assert!(
+            fp8_body.contains("const KvSlotDesc* __restrict__ slot_descs")
+                && fp8_body.contains("const int* __restrict__ row_slot"),
+            "kv_cache_write_fp8_e4m3_batched lost the slot_descs/row_slot tail"
+        );
+        assert!(
+            fp8_body.contains("kv_offset_for_k(desc, pos, per_pos_bytes)"),
+            "fp8 batched writer must resolve its row base through the descriptor"
+        );
+        assert!(
+            src.contains("requires --offload-arch=gfx1201"),
+            "fp8 batched writer lost the gfx1201 #error gate"
+        );
+        // The fp8 row stride the writer and the tile agree on:
+        // Hkv*D codes + Hkv f16 scales. Saddle-core's SlotKvTierPlan fp8 arm
+        // and fp8_e4m3_row_bytes must match; pin the kernel-side formula.
+        assert!(
+            fp8_body.contains("n_kv_heads * (head_dim + 2)"),
+            "fp8 per_pos_bytes formula drifted (expected n_kv_heads * (head_dim + 2))"
+        );
+    }
+
+    /// The fp8 flash tile is the only fp8 slot READER: it must keep the
+    /// descriptor plumbing AND read V as fp8 with the same per-position
+    /// stride as K (the slots fp8 tier writes BOTH arenas fp8 — an fp8-K/
+    /// q8-V split would read garbage). Also pins its paged-symbol
+    /// registration: a descriptor launch through the shared flash launcher
+    /// fails closed without one.
+    #[test]
+    fn fp8_tile_is_descriptor_aware_reads_fp8_v_and_has_paged_symbol() {
+        let src = kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC;
+        let tile_body = src
+            .split("attention_flash_fp8_e4m3_tile_batched(")
+            .nth(1)
+            .expect("fp8 tile entry point present");
+        assert!(
+            tile_body.contains("const KvSlotDesc* __restrict__ slot_descs")
+                && tile_body.contains("const int* __restrict__ row_slot"),
+            "fp8 tile lost the slot_descs/row_slot tail"
+        );
+        assert!(
+            tile_body.contains("kv_offset_for_k(desc, t, per_pos_bytes)")
+                && tile_body.contains("kv_offset_for_v(desc, t, per_pos_bytes)"),
+            "fp8 tile must translate K and V rows through the descriptor"
+        );
+        // V is fp8 on this kernel: same per_pos_bytes for both arenas.
+        assert!(
+            tile_body.contains("per_pos_bytes = n_kv_heads * (head_dim + 2)"),
+            "fp8 tile per_pos_bytes formula drifted"
+        );
+        assert!(
+            tile_body.contains("hipfire_fp8_e4m3_to_f32_tile_b(vc[i])"),
+            "fp8 tile Phase D must decode V as fp8"
+        );
+        assert_eq!(
+            kv_slot_paged_symbol("attention_flash_fp8_e4m3_tile_batched"),
+            Some("attention_flash_fp8_e4m3_tile_batched_paged"),
+            "descriptor fp8 tile launches fail closed without a paged symbol"
+        );
+    }
+
+    /// The bf16 scalar kernel is the slots bf16 tier's parity reader (same
+    /// TU as the q8 scalar): it must keep the descriptor tail so
+    /// `attention_bf16_kv_batched_slots` can address slot slabs, and its
+    /// default module must stay byte-identical to the pre-slot sequential
+    /// source (strip-and-prepend reproduces the historical bytes).
+    #[test]
+    fn bf16_scalar_kv_batched_is_descriptor_aware() {
+        let src = kernels::ATTENTION_BF16_KV_BATCHED_SRC;
+        let bf16_body = src
+            .split("attention_bf16_kv_batched(")
+            .nth(1)
+            .expect("bf16 scalar entry point present");
+        assert!(
+            bf16_body.contains("const KvSlotDesc* __restrict__ slot_descs")
+                && bf16_body.contains("const int* __restrict__ row_slot"),
+            "attention_bf16_kv_batched lost the slot_descs/row_slot tail"
+        );
+        assert!(
+            bf16_body.contains("kv_offset_for_k(desc, t, per_pos_bytes)")
+                && bf16_body.contains("kv_offset_for_v(desc, t, per_pos_bytes)"),
+            "bf16 scalar kernel must translate K and V rows through the descriptor"
         );
     }
 }

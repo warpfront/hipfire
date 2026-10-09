@@ -1854,7 +1854,11 @@ fn discover_vl_sidecar(model_path: &str) -> Option<PathBuf> {
     hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
-pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
+/// Capability gate for an experimental multi-slot load, run before any GPU
+/// work. `gpu_arch` is the initialized GPU's arch string (the caller reads
+/// it off the live `Gpu`), so the fp8 admission is exact on every host —
+/// tests parameterize it by string instead of assuming the host's card.
+pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<String> {
     // continuous_batch_size
     if let Some(v) = msg
         .get("params")
@@ -1933,23 +1937,38 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
     // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
-    // fwht{2,3,4}) plus the flat 2-byte tiers bf16/f16; the per-load string
-    // must be one the slots policy accepts. Rejected here — loudly, before
-    // any GPU work — rather than silently downgraded to the q8 default by
-    // the engine-side resolve.
+    // fwht{2,3,4}) plus the flat 2-byte tiers bf16/f16; fp8 is admitted on
+    // exact gfx1201 only (descriptor-aware fp8 write/attend kernels exist
+    // there). Rejected here — loudly, before any GPU work — rather than
+    // silently downgraded to the q8 default or failed deep inside the
+    // engine thread. The arch comes from the caller's initialized GPU so
+    // this gate is exact on every host (tests parameterize it by string).
     if let Some(raw) = params
         .and_then(|p| p.get("kv_mode"))
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
     {
-        let resolved =
-            hipfire_runtime::kv_mode::resolve(raw, &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY);
-        if resolved.warning.is_some() {
-            return Some(format!(
-                "experimental multi-slot does not support kv_mode='{raw}' \
-                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16; 'auto'/unset \
-                 = q8)"
-            ));
+        let accepted_list = "q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16, \
+                             fp8 on gfx1201 only; 'auto'/unset = q8";
+        match hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch) {
+            // Arch gate (or any future hard error): refuse with the named
+            // message verbatim — it already names the arch and the fix.
+            Err(e) => {
+                return Some(format!(
+                    "experimental multi-slot refuses kv_mode='{raw}': {e} \
+                     (accepted: {accepted_list})"
+                ));
+            }
+            // Unrecognized / unaccepted string: the pure resolver fell back
+            // to the default WITH a warning — refuse here too, so a typo'd
+            // tier is a loud load error, not a silent q8 downgrade.
+            Ok(resolved) if resolved.warning.is_some() => {
+                return Some(format!(
+                    "experimental multi-slot does not support kv_mode='{raw}' \
+                     (accepted: {accepted_list})"
+                ));
+            }
+            Ok(_) => {}
         }
     }
     if let Some(v) = params
@@ -3110,15 +3129,15 @@ mod tests {
     #[test]
     fn load_caps_rejects_continuous_and_tp_pp() {
         let m = json!({"params": {"continuous_batch_size": 2}});
-        assert!(validate_load_caps(&m).is_some());
+        assert!(validate_load_caps(&m, "gfx1100").is_some());
         let m2 = json!({"params": {"tp": 2}});
-        assert!(validate_load_caps(&m2).is_some());
+        assert!(validate_load_caps(&m2, "gfx1100").is_some());
         let m3 = json!({"params": {"pp": 2}});
-        assert!(validate_load_caps(&m3).is_some());
+        assert!(validate_load_caps(&m3, "gfx1100").is_some());
         let m4 = json!({"params": {"drafter": "some.hfq"}});
-        assert!(validate_load_caps(&m4).is_some());
+        assert!(validate_load_caps(&m4, "gfx1100").is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});
-        assert!(validate_load_caps(&m5).is_some());
+        assert!(validate_load_caps(&m5, "gfx1100").is_some());
     }
 
     #[test]
@@ -3326,22 +3345,35 @@ mod tests {
             "ngram_draft": false,
             "cask": false
         }});
-        assert_eq!(validate_load_caps(&supported), None);
+        assert_eq!(validate_load_caps(&supported, "gfx1100"), None);
         // The full static KV ladder plus the flat 2-byte native tiers is
         // accepted (engine resolves it through the slots site policy); only
-        // strings the policy rejects — fp8 (no slot readers), garbage — are
-        // refused here, loudly, before any GPU work.
+        // strings the policy rejects — garbage — and fp8 off gfx1201 are
+        // refused here, loudly, before any GPU work. The gate is exact per
+        // arch string, not per host card, so these run on any CI machine.
         for kv in [
             "asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "bf16", "f16", "auto",
         ] {
             assert_eq!(
-                validate_load_caps(&json!({"params": {"kv_mode": kv}})),
+                validate_load_caps(&json!({"params": {"kv_mode": kv}}), "gfx1100"),
                 None,
                 "ladder tier {kv} must be accepted"
             );
         }
+        // fp8: gfx1201 admits, every other arch refuses with a named error.
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"kv_mode": "fp8"}}), "gfx1201"),
+            None,
+            "fp8 must be admitted on gfx1201"
+        );
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
+            let refused = validate_load_caps(&json!({"params": {"kv_mode": "fp8"}}), arch)
+                .expect("fp8 off gfx1201 must be refused");
+            assert!(refused.contains("fp8"), "{refused}");
+            assert!(refused.contains(arch), "{refused}");
+            assert!(refused.contains("gfx1201"), "{refused}");
+        }
         for params in [
-            json!({"kv_mode": "fp8"}),
             json!({"kv_mode": "garbage"}),
             json!({"kv_backend": "vmm"}),
             json!({"ngram_draft": true}),
@@ -3350,13 +3382,13 @@ mod tests {
             json!({"prefill_compression": "on"}),
         ] {
             assert!(
-                validate_load_caps(&json!({"params": params})).is_some(),
+                validate_load_caps(&json!({"params": params}), "gfx1201").is_some(),
                 "unsupported params passed: {params}"
             );
         }
         // MTP is now accepted in multi-slot (sequential per-slot path).
         assert_eq!(
-            validate_load_caps(&json!({"params": {"mtp_mode": "on"}})),
+            validate_load_caps(&json!({"params": {"mtp_mode": "on"}}), "gfx1100"),
             None,
             "mtp_mode on should be accepted in multi-slot"
         );
@@ -3370,7 +3402,7 @@ mod tests {
             json!({"draft": "/path/to/draft.hfq", "dflash_mode": "on"}),
         ] {
             assert_eq!(
-                validate_load_caps(&json!({"params": params})),
+                validate_load_caps(&json!({"params": params}), "gfx1100"),
                 None,
                 "dflash params must be accepted: {params}"
             );

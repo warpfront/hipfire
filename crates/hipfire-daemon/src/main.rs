@@ -1249,7 +1249,9 @@ fn main() {
                 if experimental_multi_slot {
                     // Experimental slot backend is an alternate model owner, not a batch-mode switch.
                     // Validate mutually exclusive knobs before any GPU work.
-                    if let Some(err) = slots::validate_load_caps(&msg) {
+                    // The initialized GPU's arch rides along so the KV gate
+                    // is exact (fp8 is gfx1201-only at this boundary).
+                    if let Some(err) = slots::validate_load_caps(&msg, &gpu.arch) {
                         emit_uncorrelated_error(
                             &mut stdout,
                             None,

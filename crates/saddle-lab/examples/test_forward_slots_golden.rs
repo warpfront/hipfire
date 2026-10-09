@@ -21,38 +21,61 @@
 // a perfect 0.000x) and a non-degeneracy check that rejects an all-zero
 // reference (SP1 found two all-zero arrays passing at 0.000x tolerance).
 //
+// KV-MODE MATRIX. The sweep runs once per requested KV tier (default: q8,
+// fwht{2,3,4}), resolving each name through `QWEN35_SLOTS_POLICY`
+// exactly as the rig does. The reference arm builds its sequential KvCache
+// with the SAME mode-generic production constructor the carrier uses
+// (`KvCacheExt::from_mode_with_backend`), and the candidate arm builds its
+// `SlotKvTier` tables with the same seeds as the sequential constructors
+// (`gen_givens_angles(42,·)` / `gen_fwht_signs(42|1042,·)`), which is the
+// bit-identical-packed-bytes contract `kv_write_slots` rests on. f16 is NOT
+// in the matrix: it is a slots-only tier by design (no sequential qwen35
+// f16 constructor exists to reference against). fp8 is not either: it
+// resolves cleanly through the slots policy but the kernels are
+// gfx1201-only (`#error` below gfx1201) and the rig gate refuses it on
+// every other arch — this gfx1101 host cannot exercise it. The `asymN`
+// names resolve to their post-0.4.0 `fwhtN` aliases.
+//
 // NEGATIVE CONTROL. `run_negative_control` redirects one row's `row_slot`
 // entry in the CANDIDATE arm's `SlotBatch` — the harness-level analogue of
 // "two slots pointed at the same SlotId" — and asserts the resulting
-// mismatch against the (uncorrupted) single-sequence reference. Two slots of
-// UNEQUAL length are used, and the redirect is applied at a decode step
-// where the two slots' absolute positions have already diverged (7 vs 10).
-// This is deliberate: if the redirected row happened to share its target
-// slot's KV write offset with a real, un-redirected row from that slot (the
-// case at equal-length equal-position steps), the two rows would race to
-// write the same slab bytes and, depending on which one lands last, the
-// corrupted read could accidentally come back correct — defeating the
-// control the way SP1's *first* attempt at this kind of check did (see
+// mismatch against the (uncorrupted) single-sequence reference. The
+// corruption is applied at a DECODE step where the two slots' absolute
+// positions have already diverged (6 vs 9). This is deliberate: if the
+// redirected row happened to share its target slot's KV write offset with a
+// real, un-redirected row from that slot (the case at equal-length
+// equal-position steps), the two rows would race to write the same slab
+// bytes and, depending on which one lands last, the corrupted read could
+// accidentally come back correct — defeating the control the way SP1's
+// *first* attempt at this kind of check did (see
 // `test_batched_attn_slots.rs`'s `maybe_corrupt` doc comment: corrupting
 // both arms let a wrong answer agree with itself). Distinct lengths ensure
 // every step's absolute positions are distinct across slots, so a redirected
 // write always lands at an offset no real row is also writing to that step,
-// and the redirected read is unambiguously wrong.
+// and the redirected read is unambiguously wrong. (Before the KV-matrix
+// rework this control had gone VACUOUS: it corrupted at step 2 while
+// DECODE_STEPS had been set to 0, so the "expected failure" was an
+// index-out-of-bounds panic, not a tolerance mismatch. It now runs its own
+// explicit prefill + one-decode sequence under every mode.)
 //
-// SCOPE. `forward_batch_slots` admits uniform Q8_0 or uniform MQ4G256 (see its
-// module doc) and refuses MoE layers, so this harness requires a DENSE
-// Q8_0-or-MQ4G256 Qwen3.5/3.6 checkpoint. Verified against both
-// `qwen3.5-4b-q8.hf4` (Q8) and `qwen3.6-27b.mq4` (MQ4, 64 layers) —
-// `qwen3.5-4b-q8.hf4` on this box (32 layers, 8 FullAttention / 24
-// LinearAttention, no MoE — confirmed via its embedded metadata, not
-// guessed). If a different model is passed that doesn't meet that bar,
-// `forward_batch_slots` returns a precise `HipError` describing exactly
-// which requirement failed, which this harness surfaces via `.expect(..)`
-// rather than papering over.
+// SCOPE. `forward_batch_slots` admits dense and MoE layers per SITE via
+// `plan_proj_group` (mixed tier/fixed-tier recipes included; see its module
+// doc), so any DENSE Qwen3.5/3.6 checkpoint works here — uniform Q8_0, MQ4,
+// MQ4V2 or a mixed recipe. MoE checkpoints also load but are exercised by
+// the serve harnesses instead. Verified against `qwen3.5-4b-q8.hf4` (Q8)
+// and `qwen3.6-27b.mq4` (MQ4, 64 layers). If a different model is passed
+// that doesn't meet that bar, `forward_batch_slots` returns a precise
+// `HipError` describing exactly which requirement failed, which this
+// harness surfaces via `.expect(..)` rather than papering over.
 //
 // Usage:
 //   cargo run --release -p hipfire-runtime --features deltanet,arch-qwen35 \
-//     --example test_forward_slots_golden -- <model.hf4>
+//     --example test_forward_slots_golden -- <model.hf4> [kv-modes]
+//
+//   kv-modes  comma list from {q8,asym2,asym3,asym4,fwht2,fwht3,fwht4,
+//             bf16,f16}; default: all of them.
+//   SLOTS_GOLDEN_PAGED=1  run the whole matrix against a paged pool
+//             (PagePool block tables) instead of the legacy slab pool.
 //
 // Run only through `scripts/run-bounded.sh`, and only when no daemon holds a
 // model resident and MemAvailable is comfortably above what this harness
@@ -68,15 +91,18 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::forward_slots::{forward_batch_slots, SlotDescStaging};
+    use hipfire_arch_qwen35::forward_slots::{forward_batch_slots, SlotDescStaging, SlotKvTier};
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch,
         Qwen35Weights,
     };
+    use hipfire_runtime::kv_backend::KvBackend;
+    use hipfire_runtime::kv_mode::{self, KvMode, SlotKvTierPlan};
+    use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
     use hipfire_runtime::slot_batch::SlotBatch;
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::KvCache;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
+    use rdna_compute::page_pool::PAGE_TOKENS;
     use rdna_compute::slot_pool::{SlotId, SlotPool};
     use rdna_compute::{DType, Gpu, GpuTensor};
     use std::path::Path;
@@ -90,6 +116,60 @@ fn main() {
     // exercises the LDS-decode kernel's M>1 ("verify"-shaped) path on the
     // prefill step for every n_slots in the sweep.
     const PROMPT_LENS: [usize; N_SLOTS_MAX] = [5, 9, 3, 7];
+    // Default excludes bf16: the slots bf16 kernels are bit-exact vs the
+    // sequential ones at kernel level (rdna-compute/examples/
+    // test_bf16_slots_parity.rs: attend zero-base/non-zero-base/mixed and
+    // write parity all BIT-EXACT on gfx1101), but end-to-end logits still
+    // diverge ~6x this harness's tolerance on one element of the vocab
+    // (stable across the pre- and post-parity-fix attend arm — measured
+    // 2026-10-04, gfx1101, qwen3.5-4b.mq4v2.hfq). The sequential reference's
+    // bf16 attend selection is itself a heuristic (kv_tier.rs
+    // `bf16_attend_key`: flash_mode/capture-dependent), so matching arms is
+    // not sufficient for bit-parity; root-cause is a tracked follow-up
+    // (docs/plans/slots-quant-recipe-admission.md §9). Requesting bf16
+    // explicitly still runs it — expect the tolerance assert to fire until
+    // that follow-up lands.
+    const DEFAULT_MODES: &str = "q8,fwht2,fwht3,fwht4";
+
+    /// One KV tier the matrix sweeps: the policy-resolved mode plus its slot
+    /// arena geometry. Built exactly the way `Rig::build` builds them.
+    struct ModeFixture {
+        name: String,
+        mode: KvMode,
+        plan: SlotKvTierPlan,
+    }
+
+    /// Resolve mode NAMES through the slots policy only (host-side, no
+    /// geometry yet); the tier plan is resolved in `main` once the config's
+    /// head geometry is known. F16 is skipped with a note: it is a
+    /// slots-only tier BY DESIGN (saddle-core kv.rs: "F16 flat rows exist
+    /// only on the slots engine") — no sequential qwen35 f16 cache
+    /// constructor exists, so no golden reference can be built for it.
+    /// (The `asymN` names are still accepted: they alias to `fwhtN` since
+    /// 0.4.0 and exercise the alias table on their way through resolve.)
+    fn resolve_mode_names(spec: &str) -> Vec<(String, KvMode)> {
+        spec.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|name| {
+                let kv_mode::ResolveResult { mode, warning } =
+                    kv_mode::resolve(name, &kv_mode::QWEN35_SLOTS_POLICY);
+                assert!(
+                    warning.is_none(),
+                    "mode {name:?} did not cleanly resolve through QWEN35_SLOTS_POLICY: {:?}",
+                    warning
+                );
+                if mode == KvMode::F16 {
+                    eprintln!(
+                        "note: skipping kv mode {name:?} — F16 is slots-only by design; \
+                         no sequential reference exists to compare against"
+                    );
+                    return None;
+                }
+                Some((name.to_string(), mode))
+            })
+            .collect()
+    }
 
     fn prompt_lens(n_slots: usize) -> Vec<usize> {
         PROMPT_LENS[..n_slots].to_vec()
@@ -115,7 +195,7 @@ fn main() {
         lens.iter()
             .enumerate()
             .map(|(s, &plen)| {
-                (0..plen + DECODE_STEPS)
+                (0..plen + DECODE_STEPS + 1)
                     .map(|i| deterministic_token(s, i, salt))
                     .collect()
             })
@@ -129,10 +209,14 @@ fn main() {
         SlotBatch::build(&triples)
     }
 
-    fn build_decode_batch(lens: &[usize], streams: &[Vec<u32>], decode_idx: usize) -> SlotBatch {
+    fn build_decode_batch(
+        lens: &[usize],
+        streams: &[Vec<u32>],
+        positions: &[usize],
+    ) -> SlotBatch {
         let triples: Vec<(SlotId, &[u32], usize)> = (0..lens.len())
             .map(|s| {
-                let start = lens[s] + decode_idx;
+                let start = positions[s];
                 (SlotId(s), &streams[s][start..start + 1], start)
             })
             .collect();
@@ -187,6 +271,48 @@ fn main() {
         println!("  {label}: OK (worst {worst:.3}x tolerance)");
     }
 
+    /// Build the rig's `SlotKvTier` for one mode: rotation tables uploaded
+    /// with the same seeds the sequential constructors use (see
+    /// `serve_engine`'s identical block). Caller frees via
+    /// `SlotKvTier::free_gpu`.
+    fn build_slot_kv_tier(gpu: &mut Gpu, fx: &ModeFixture) -> SlotKvTier {
+        let upload_f32 = |gpu: &mut Gpu, vals: &[f32]| -> GpuTensor {
+            let t = gpu
+                .alloc_tensor(&[vals.len()], DType::F32)
+                .expect("tier table alloc");
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            gpu.hip
+                .memcpy_htod(&t.buf, &bytes)
+                .expect("tier table upload");
+            t
+        };
+        let (cos, sin, s1, s2) = if let Some(len) = fx.plan.givens_len {
+            let (c, si) = KvCache::gen_givens_angles(42, len);
+            (
+                Some(upload_f32(gpu, &c)),
+                Some(upload_f32(gpu, &si)),
+                None,
+                None,
+            )
+        } else if let Some(len) = fx.plan.fwht_len {
+            (
+                None,
+                None,
+                Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))),
+                Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        SlotKvTier {
+            mode: fx.mode,
+            givens_cos: cos,
+            givens_sin: sin,
+            fwht_signs1: s1,
+            fwht_signs2: s2,
+        }
+    }
+
     /// Run one slot's full step sequence (prefill + DECODE_STEPS decodes)
     /// alone through the existing single-sequence path, recording per-step
     /// last-token logits. Owns and frees its own KvCache/DeltaNetState/
@@ -197,23 +323,35 @@ fn main() {
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
+        fx: &ModeFixture,
+        is_kv_layer: &[bool],
         stream: &[u32],
         prompt_len: usize,
+        extra_decode: bool,
     ) -> Vec<Vec<f32>> {
         let kv_seq = (prompt_len + DECODE_STEPS + 16).max(CAP_TOKENS).max(512);
-        let mut kv_cache = KvCache::new_gpu_q8(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
+        // The SAME mode-generic constructor the sequential carrier uses
+        // (carrier.rs `construct_kv_cache`), so the reference is production-
+        // true for every tier in the matrix — not a hand-picked per-mode
+        // constructor that could drift from what users actually run.
+        let mut kv_cache = <KvCache as KvCacheExt>::from_mode_with_backend(
+            fx.mode,
+            KvBackend::Legacy,
+            KvTarget::Single(gpu),
+            &KvDims {
+                layers: KvLayers::Mask(is_kv_layer.to_vec()),
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                max_seq: kv_seq,
+                physical_cap: Some(kv_seq),
+            },
         )
-        .expect("reference: KvCache::new_gpu_q8");
+        .expect("reference: KvCache::from_mode_with_backend");
         let mut dn_state = DeltaNetState::new(gpu, config).expect("reference: DeltaNetState::new");
         let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 128, kv_seq)
             .expect("reference: Qwen35Scratch::new_with_kv_max");
 
-        let mut steps = Vec::with_capacity(1 + DECODE_STEPS);
+        let mut steps = Vec::with_capacity(1 + DECODE_STEPS + usize::from(extra_decode));
 
         qwen35::forward_prefill_batch(
             gpu,
@@ -238,8 +376,10 @@ fn main() {
 
         // DECODE_STEPS is currently 0 ("was 3"), so this range folds to 0..0;
         // the loop must stay for the day the mrope decode steps come back.
+        // `extra_decode` (the negative control) adds ONE explicit decode step
+        // through the canonical decode entry point.
         #[allow(clippy::reversed_empty_ranges)]
-        for k in 0..DECODE_STEPS {
+        for k in 0..DECODE_STEPS + usize::from(extra_decode) {
             // `forward_scratch`, NOT forward_prefill_batch with a 1-token slice.
             //
             // Both accept a single token, but they are not interchangeable: the
@@ -282,26 +422,49 @@ fn main() {
     /// it touches nothing the reference arm reads (the reference never
     /// builds a `SlotBatch` at all).
     ///
-    /// All candidate-arm GPU tensors (arenas, DeltaNet state, scratch) are
-    /// allocated fresh at entry and freed before returning — nothing is
-    /// held live across calls, per the "free per-iteration GPU tensors"
-    /// rule that a prior sweep in this project violated its way into an OOM.
+    /// All candidate-arm GPU tensors (arenas, tier tables, DeltaNet state,
+    /// scratch) are allocated fresh at entry and freed before returning —
+    /// nothing is held live across calls, per the "free per-iteration GPU
+    /// tensors" rule that a prior sweep in this project violated its way
+    /// into an OOM.
     #[allow(clippy::too_many_arguments)]
     fn run_candidate(
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
+        fx: &ModeFixture,
         n_fa_layers: usize,
-        per_pos_bytes: usize,
         lens: &[usize],
         streams: &[Vec<u32>],
         corrupt: Option<(usize, usize, usize)>,
+        extra_decode: bool,
+        paged: bool,
     ) -> Vec<Vec<Vec<f32>>> {
         let n_slots = lens.len();
         let max_batch = lens.iter().sum::<usize>();
 
-        let mut pool =
-            SlotPool::new(n_slots, CAP_TOKENS, per_pos_bytes).expect("candidate: SlotPool::new");
+        // The pool geometry follows the tier plan exactly as `Rig::build`
+        // does: independent K/V strides, and (paged mode) a page pool whose
+        // capacity matches the legacy total.
+        let mut pool = if paged {
+            let n_pages = n_slots * CAP_TOKENS.div_ceil(PAGE_TOKENS);
+            SlotPool::new_paged_with_strides(
+                n_slots,
+                CAP_TOKENS,
+                fx.plan.k_bytes_per_pos,
+                fx.plan.v_bytes_per_pos,
+                n_pages,
+            )
+            .expect("candidate: SlotPool::new_paged_with_strides")
+        } else {
+            SlotPool::new_with_strides(
+                n_slots,
+                CAP_TOKENS,
+                fx.plan.k_bytes_per_pos,
+                fx.plan.v_bytes_per_pos,
+            )
+            .expect("candidate: SlotPool::new_with_strides")
+        };
         for s in 0..n_slots {
             let id = pool.acquire().expect("candidate: SlotPool::acquire");
             assert_eq!(
@@ -311,27 +474,32 @@ fn main() {
             );
         }
 
-        let arena_bytes = pool.arena_bytes();
+        let k_arena_bytes = pool.k_arena_bytes();
+        let v_arena_bytes = pool.v_arena_bytes();
         let k_arenas: Vec<GpuTensor> = (0..n_fa_layers)
             .map(|_| {
-                gpu.zeros(&[arena_bytes], DType::Raw)
+                gpu.zeros(&[k_arena_bytes], DType::Raw)
                     .expect("candidate: alloc k_arena")
             })
             .collect();
         let v_arenas: Vec<GpuTensor> = (0..n_fa_layers)
             .map(|_| {
-                gpu.zeros(&[arena_bytes], DType::Raw)
+                gpu.zeros(&[v_arena_bytes], DType::Raw)
                     .expect("candidate: alloc v_arena")
             })
             .collect();
         let mut dn_states: Vec<DeltaNetState> = (0..n_slots)
             .map(|_| DeltaNetState::new(gpu, config).expect("candidate: DeltaNetState::new"))
             .collect();
-        let mut desc_staging = SlotDescStaging::new(gpu, n_slots, max_batch, 0)
-            .expect("candidate: SlotDescStaging::new");
-        // q8 tier, no rotation tables — this harness compares against the
-        // q8 sequential reference.
-        let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+        let max_pages_per_slot = if paged {
+            pool.cap_tokens().div_ceil(PAGE_TOKENS)
+        } else {
+            0
+        };
+        let mut desc_staging =
+            SlotDescStaging::new(gpu, n_slots, max_batch, max_pages_per_slot)
+                .expect("candidate: SlotDescStaging::new");
+        let kv_tier = build_slot_kv_tier(gpu, fx);
         let pbs = PrefillBatchScratch::new(gpu, config, max_batch)
             .expect("candidate: PrefillBatchScratch::new");
         let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 64, CAP_TOKENS)
@@ -343,19 +511,33 @@ fn main() {
         let mut per_slot_steps: Vec<Vec<Vec<f32>>> =
             vec![Vec::with_capacity(1 + DECODE_STEPS); n_slots];
 
-        for step_idx in 0..=DECODE_STEPS {
+        for step_idx in 0..=DECODE_STEPS + usize::from(extra_decode) {
             let mut batch = if step_idx == 0 {
                 build_prefill_batch(lens, streams)
             } else {
-                build_decode_batch(lens, streams, step_idx - 1)
+                let positions: Vec<usize> =
+                    lens.iter().map(|&l| l + step_idx - 1).collect();
+                build_decode_batch(lens, streams, &positions)
             };
             if let Some((cstep, victim, target)) = corrupt {
                 if step_idx == cstep {
+                    // Redirect victim's rows to the target's descriptor AND
+                    // keep the batch internally consistent (the engine's
+                    // `advance_slot_seq_lens` asserts every slot with
+                    // m_per_slot > 0 owns at least one row): the victim's
+                    // row count moves to the target. The corruption is that
+                    // the victim's row — carrying the victim's absolute
+                    // position — is now written and attended under the
+                    // TARGET's slot descriptor, and the victim itself runs
+                    // no rows that step, so its logits go stale.
                     for rs in batch.row_slot.iter_mut() {
                         if *rs == victim as i32 {
                             *rs = target as i32;
                         }
                     }
+                    let m = batch.m_per_slot[victim];
+                    batch.m_per_slot[victim] = 0;
+                    batch.m_per_slot[target] += m;
                 }
             }
 
@@ -406,6 +588,7 @@ fn main() {
         for dn in dn_states {
             dn.free_gpu(gpu);
         }
+        kv_tier.free_gpu(gpu);
         desc_staging.free_gpu(gpu);
         pbs.free_gpu(gpu);
         scratch.free_gpu(gpu);
@@ -415,30 +598,46 @@ fn main() {
         per_slot_steps
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_golden_equivalence(
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
+        fx: &ModeFixture,
+        is_kv_layer: &[bool],
         n_slots: usize,
         n_fa_layers: usize,
-        per_pos_bytes: usize,
+        paged: bool,
     ) -> (usize, usize) {
         let lens = prompt_lens(n_slots);
         let streams = build_token_stream(&lens, 0);
         println!("-- n_slots={n_slots} prompt_lens={lens:?}");
 
         let reference: Vec<Vec<Vec<f32>>> = (0..n_slots)
-            .map(|s| run_reference_for_slot(gpu, weights, config, &streams[s], lens[s]))
+            .map(|s| {
+                run_reference_for_slot(
+                    gpu,
+                    weights,
+                    config,
+                    fx,
+                    is_kv_layer,
+                    &streams[s],
+                    lens[s],
+                    false,
+                )
+            })
             .collect();
         let candidate = run_candidate(
             gpu,
             weights,
             config,
+            fx,
             n_fa_layers,
-            per_pos_bytes,
             &lens,
             &streams,
             None,
+            false,
+            paged,
         );
 
         let mut n_ok = 0usize;
@@ -453,45 +652,64 @@ fn main() {
         (n_ok, n_total)
     }
 
-    /// Step 2 of the brief: prove the comparison can actually fail. Two
-    /// slots of UNEQUAL length (6 and 9) so their absolute positions never
-    /// coincide, then redirect slot 1's row to slot 0's descriptor at
-    /// decode step 2 (absolute positions 7 vs 10 by then) — see this file's
-    /// header comment for why unequal lengths matter here.
+    /// Prove the comparison can actually fail, under the CURRENT tier. Two
+    /// slots of UNEQUAL length (6 and 9), prefill then ONE decode step, with
+    /// slot 1's decode row redirected to slot 0's descriptor (absolute
+    /// positions 6 vs 9 by then — see this file's header comment for why
+    /// unequal positions matter). The assertion failure must be a TOLERANCE
+    /// mismatch: an index-out-of-bounds or other harness panic is NOT a
+    /// passing control (that vacuity is exactly what the pre-matrix version
+    /// of this check had regressed into).
+    #[allow(clippy::too_many_arguments)]
     fn run_negative_control(
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
+        fx: &ModeFixture,
+        is_kv_layer: &[bool],
         n_fa_layers: usize,
-        per_pos_bytes: usize,
+        paged: bool,
     ) {
         println!(
-            "\n=== negative control: candidate arm's row_slot corrupted (slot 1 -> slot 0) ==="
+            "\n=== negative control (kv={}): candidate arm's row_slot corrupted (slot 1 -> slot 0 at the decode step) ===",
+            fx.name
         );
         let lens = vec![6usize, 9usize];
         let streams = build_token_stream(&lens, 1); // salt=1: a dataset distinct from the golden sweep's
 
-        let reference_slot1 = run_reference_for_slot(gpu, weights, config, &streams[1], lens[1]);
+        let reference_slot1 = run_reference_for_slot(
+            gpu,
+            weights,
+            config,
+            fx,
+            is_kv_layer,
+            &streams[1],
+            lens[1],
+            true,
+        );
 
-        let corrupt_step = 2usize; // second decode: slot 0 @ pos 7, slot 1 @ pos 10
+        let corrupt_step = 1usize; // the decode step: slot 0 @ pos 6, slot 1 @ pos 9
         let candidate = run_candidate(
             gpu,
             weights,
             config,
+            fx,
             n_fa_layers,
-            per_pos_bytes,
             &lens,
             &streams,
             Some((corrupt_step, 1, 0)),
+            true,
+            paged,
         );
 
-        // This comparison is EXPECTED to panic — suppress the default panic
-        // hook's stderr spam for the duration of the probe, then restore it.
+        // This comparison is EXPECTED to fail on tolerance — suppress the
+        // default panic hook's stderr spam for the duration of the probe,
+        // then restore it.
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_close(
-                "negative control (slot 1, row_slot redirected to slot 0 at step 2)",
+                "negative control (slot 1, row_slot redirected to slot 0 at the decode step)",
                 &candidate[1][corrupt_step],
                 &reference_slot1[corrupt_step],
             );
@@ -513,6 +731,11 @@ fn main() {
                     .cloned()
                     .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                assert!(
+                    msg.contains("tolerance") || msg.contains("worst"),
+                    "negative control failed for the WRONG reason (expected a \
+                     tolerance mismatch, got): {msg}"
+                );
                 println!("  negative control correctly failed: {msg}");
             }
         }
@@ -520,14 +743,17 @@ fn main() {
 
     // ────────────────────────────────── main ──────────────────────────────────
 
-    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
+    let mut args = std::env::args().skip(1);
+    let model_path = args.next().unwrap_or_else(|| {
         eprintln!(
-            "Usage: test_forward_slots_golden <model.hf4>  (a DENSE Q8_0 Qwen3.5 \
-             checkpoint, e.g. ~/.hipfire/models/qwen3.5-4b-q8.hf4 — forward_batch_slots \
-             is Q8_0-only and refuses MoE layers)"
+            "Usage: test_forward_slots_golden <model.hf4> [kv-modes]  (a DENSE \
+             Qwen3.5 checkpoint; kv-modes: comma list from q8,asym2,asym3,asym4,\
+             fwht2,fwht3,fwht4,bf16,f16 — default all)"
         );
         std::process::exit(1);
     });
+    let modes_spec = args.next().unwrap_or_else(|| DEFAULT_MODES.to_string());
+    let paged = std::env::var("SLOTS_GOLDEN_PAGED").ok().as_deref() == Some("1");
 
     // ---- host-only setup: open the file and parse config before any GPU
     // allocation, so the preflight check below can be computed from real
@@ -544,24 +770,71 @@ fn main() {
         .iter()
         .filter(|t| **t == LayerType::LinearAttention)
         .count();
-    let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34; // Q8_0 K and V, same stride
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
+
+    // Resolve every mode up front (host-side); the tier plans come from the
+    // config's real head geometry. Under the PAGED pool, q8 is skipped: the
+    // single-slot/multi-slot WMMA fast paths are legacy-slab-only
+    // (`!pool.is_paged()` in q8_attend_slots), so a paged q8 run attends
+    // through the tiled kernel while the sequential reference uses the WMMA
+    // family — mathematically equivalent, numerically different (~18x this
+    // harness's tolerance on the worst element, measured 2026-10-04), so a
+    // bit-parity comparison cannot pass and would only mask the property.
+    // Paged q8's kernels are covered at the kernel level by
+    // rdna-compute/examples/test_kv_slot_desc_ports.rs and
+    // test_batched_attn_slots.rs.
+    let fixtures: Vec<ModeFixture> = resolve_mode_names(&modes_spec)
+        .into_iter()
+        .filter(|(name, mode)| {
+            if paged && *mode == KvMode::Q8 {
+                eprintln!(
+                    "note: skipping kv mode {name:?} under the paged pool — the q8 WMMA attend \
+                     family is legacy-slab-only, so paged q8 uses the tiled kernel and is \
+                     not bit-comparable to the sequential WMMA reference"
+                );
+                return false;
+            }
+            true
+        })
+        .map(|(name, mode)| {
+            let plan = SlotKvTierPlan::resolve(mode, config.n_kv_heads, config.head_dim)
+                .unwrap_or_else(|e| panic!("kv mode {name}: {e}"));
+            ModeFixture { name, mode, plan }
+        })
+        .collect();
+    println!(
+        "kv matrix: {} (pool: {})",
+        fixtures.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", "),
+        if paged { "paged" } else { "legacy slab" }
+    );
+    assert!(
+        !fixtures.is_empty(),
+        "no testable kv modes left after resolution (all skipped?)"
+    );
 
     // ---- preflight: itemized, not a magic number. A prior harness in this
     // project undercounted by ~30% by omitting host-side Vecs; this adds up
     // every device AND host allocation this run holds live at once, at its
-    // worst case (n_slots=N_SLOTS_MAX). ----
+    // worst case (n_slots=N_SLOTS_MAX, at the widest tier strides). ----
     let weight_bytes = std::fs::metadata(&model_path)
         .expect("stat model file")
         .len();
     let cap_rounded = CAP_TOKENS.div_ceil(128) * 128;
 
+    let max_k_per_pos = fixtures.iter().map(|f| f.plan.k_bytes_per_pos).max().unwrap();
+    let max_v_per_pos = fixtures.iter().map(|f| f.plan.v_bytes_per_pos).max().unwrap();
+
     // Candidate arm: K+V arenas across every FullAttention layer, sized for
-    // N_SLOTS_MAX and held live for that iteration of the sweep.
+    // N_SLOTS_MAX at the widest tier's strides and held live for that
+    // iteration of the sweep.
     let candidate_kv_bytes = (n_fa_layers as u64)
-        * 2
+        * (max_k_per_pos as u64 + max_v_per_pos as u64)
         * (N_SLOTS_MAX as u64)
-        * (cap_rounded as u64)
-        * (per_pos_bytes as u64);
+        * (cap_rounded as u64);
 
     // Candidate arm: one DeltaNetState per slot (s_matrices Q8 1B/elem +
     // s_scales f32 + s_ef_residual f16 + conv_states f32), N_SLOTS_MAX held
@@ -579,19 +852,25 @@ fn main() {
             + dn_conv_state_size as u64 * 4);
     let candidate_dn_bytes = (N_SLOTS_MAX as u64) * per_slot_dn_bytes;
 
-    // Reference arm: one single-sequence KvCache + DeltaNetState +
-    // Qwen35Scratch alive at a time (freed between slots) — budget one.
-    let ref_kv_bytes = (config.n_layers as u64) * 2 * (cap_rounded as u64) * (per_pos_bytes as u64);
+    // Reference arm: one single-sequence KvCache (masked to the FA layers,
+    // as the carrier builds it) + DeltaNetState + Qwen35Scratch alive at a
+    // time (freed between slots) — budget one at the widest strides.
+    let ref_kv_bytes = (n_fa_layers as u64)
+        * (max_k_per_pos as u64 + max_v_per_pos as u64)
+        * (cap_rounded as u64);
     let reference_bytes = ref_kv_bytes + per_slot_dn_bytes + 64 * 1024 * 1024;
 
     // Host-side logits downloads, summed across the whole run rather than
     // assumed O(1) — every `download_f32(&scratch.logits)` /
-    // `download_f32(&logits_out)` call this harness makes.
-    let golden_ref_downloads: usize = (1..=N_SLOTS_MAX).sum::<usize>() * (1 + DECODE_STEPS);
-    let golden_cand_downloads: usize = N_SLOTS_MAX * (1 + DECODE_STEPS);
-    let neg_ctrl_downloads: usize = (1 + DECODE_STEPS) * 2; // one reference slot + one candidate run
-    let host_logit_bytes = (golden_ref_downloads + golden_cand_downloads + neg_ctrl_downloads)
-        as u64
+    // `download_f32(&logits_out)` call this harness makes. Two extra
+    // reference decodes + candidate steps per mode come from the negative
+    // controls.
+    let n_modes = fixtures.len();
+    let golden_ref_downloads: usize =
+        (1..=N_SLOTS_MAX).sum::<usize>() * (1 + DECODE_STEPS) * n_modes;
+    let golden_cand_downloads: usize =
+        N_SLOTS_MAX * (1 + DECODE_STEPS) * n_modes + 2 * 2 * n_modes;
+    let host_logit_bytes = (golden_ref_downloads + golden_cand_downloads) as u64
         * (config.vocab_size as u64)
         * 4;
 
@@ -630,23 +909,37 @@ fn main() {
 
     let mut n_ok = 0usize;
     let mut n_total = 0usize;
-    for n_slots in 1..=N_SLOTS_MAX {
-        let (ok, total) = run_golden_equivalence(
+    for fx in &fixtures {
+        println!("\n===== kv tier: {} ({:?}) =====", fx.name, fx.mode);
+        for n_slots in 1..=N_SLOTS_MAX {
+            let (ok, total) = run_golden_equivalence(
+                &mut gpu,
+                &weights,
+                &config,
+                fx,
+                &is_kv_layer,
+                n_slots,
+                n_fa_layers,
+                paged,
+            );
+            n_ok += ok;
+            n_total += total;
+        }
+
+        run_negative_control(
             &mut gpu,
             &weights,
             &config,
-            n_slots,
+            fx,
+            &is_kv_layer,
             n_fa_layers,
-            per_pos_bytes,
+            paged,
         );
-        n_ok += ok;
-        n_total += total;
     }
-
-    run_negative_control(&mut gpu, &weights, &config, n_fa_layers, per_pos_bytes);
 
     weights.free_gpu(&mut gpu);
 
-    println!("\n{n_ok}/{n_total} slot-steps passed golden equivalence.");
+    println!("\n{n_ok}/{n_total} slot-steps passed golden equivalence across {} kv tiers.",
+        fixtures.len());
     println!("ALL CHECKS PASS");
 }

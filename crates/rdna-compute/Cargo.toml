@@ -845,6 +845,10 @@ name = "test_kv_slot_desc_ports"
 required-features = ["lab"]
 
 [[example]]
+name = "test_bf16_slots_parity"
+required-features = ["lab"]
+
+[[example]]
 name = "vit_qtiled_parity_probe"
 required-features = ["lab"]
 

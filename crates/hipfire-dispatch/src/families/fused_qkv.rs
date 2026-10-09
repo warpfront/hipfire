@@ -10,6 +10,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// Select the fused gate/up kernel key for a packed weight container.
 pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
     match dtype {
+        DType::Q8_0 => KernelKey::FusedGateUpQ8_0,
         // qt=15/qt=8 share the 200 B/group 6-bit container. The MoE shared
         // expert prefill (AWQ A3B layers 0/1/38/39) reaches this with MQ6G256;
         // the HFQ4 default below read it at the 136 B stride and the whole
@@ -21,6 +22,9 @@ pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedGateUpHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedGateUpHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedGateUpMq3G256Lloyd,
         // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
         DType::MQ4G256V2Lloyd => panic!(
             "fused_gate_up_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"

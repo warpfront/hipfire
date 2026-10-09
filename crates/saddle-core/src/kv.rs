@@ -36,7 +36,10 @@ pub enum KvMode {
     /// row (`[Hkv x D codes][Hkv f16 scales]`, 1032 bytes/row/side at
     /// Hkv=4/D=256). K/V pair is indivisible: fp8 on both sides.
     /// Legacy-backend, single-GPU, Qwen dense H24/Hkv4/D256 only;
-    /// no VMM / adaptive / compaction / slots support.
+    /// no VMM / adaptive / compaction support. Slots support is
+    /// gfx1201-gated: descriptor-aware fp8 write/attend kernels exist for
+    /// the slot engine (head_dim 256 only), and every non-gfx1201 entry
+    /// point fails closed with a named error before any allocation.
     Fp8,
 }
 
@@ -382,10 +385,12 @@ pub struct SlotKvTierPlan {
 }
 
 impl SlotKvTierPlan {
-    /// Resolve the plan for `mode` (+ static Q8 V, the multi-slot ladder).
-    /// Geometry gates mirror the contiguous `new_gpu_*_filtered`
-    /// constructors: asym3/fwht3 need head_dim 256, the other rotated tiers
-    /// need 128 or 256, every packed tier needs head_dim divisible by 32.
+    /// Resolve the plan for `mode` (static Q8 V on the rotated tiers, fp8 V
+    /// on the fp8 tier — the multi-slot ladder). Geometry gates mirror the
+    /// contiguous `new_gpu_*_filtered` constructors: asym3/fwht3 need
+    /// head_dim 256, the other rotated tiers need 128 or 256, every packed
+    /// tier needs head_dim divisible by 32, and fp8 needs the kernels' fixed
+    /// 256 (32 lanes × 8 dims per head).
     pub fn resolve(mode: KvMode, n_kv_heads: usize, head_dim: usize) -> HipResult<Self> {
         if n_kv_heads == 0 {
             return Err(hip_bridge::HipError::new(
@@ -447,14 +452,26 @@ impl SlotKvTierPlan {
                 quant_gate("asym4", head_dim == 128 || head_dim == 256)?;
                 4 + head_dim / 2
             }
-            // Native fp8 has no slot-reader support on the slot engine:
-            // refuse the tier plan so the site cannot describe a layout it
-            // cannot serve (the policy gate refuses fp8 before this too).
+            // Native fp8-E4M3: one byte per element plus one f16 scale per KV
+            // head, stored inline at the end of each token row
+            // (`[Hkv*D codes][Hkv f16 scales]` — `n_kv_heads*(head_dim+2)`
+            // bytes/pos/side, matching `fp8_e4m3_row_bytes`). Both arenas are
+            // fp8 (K and V strides EQUAL — the tile kernel decodes V with the
+            // same per-pos stride as K), so the pool's descriptors carry one
+            // slab base per side and both write launches resolve the shared
+            // K base. The fp8 writer/reader kernels' fixed geometry reads
+            // exactly 32 lanes × 8 dims per head, so head_dim must be 256 —
+            // the only shape the sequential fp8 path admits too. Admission is
+            // gfx1201-only (OCP E4M3FN cvt); the policy/engine gates enforce
+            // the arch before this geometry is ever allocated.
             KvMode::Fp8 => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "KV mode fp8 has no slot-reader support on the slot engine",
-                ));
+                if head_dim != 256 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("fp8 slot KV requires head_dim 256 (got {head_dim})"),
+                    ));
+                }
+                head_dim + 2
             }
         };
         let k_bytes_per_pos = match mode {
@@ -466,8 +483,12 @@ impl SlotKvTierPlan {
                 .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
         };
         let v_bytes_per_pos = match mode {
-            // Flat tiers store V exactly like K.
-            KvMode::Bf16 | KvMode::F16 => k_bytes_per_pos,
+            // Flat tiers store V exactly like K. fp8 is not flat, but its K
+            // and V rows share the same `[Hkv*D codes][Hkv f16 scales]`
+            // layout (the fp8 tile decodes V with K's per-pos stride), so V
+            // takes K's stride too — NOT the static Q8_0 V the rotated
+            // tiers use.
+            KvMode::Bf16 | KvMode::F16 | KvMode::Fp8 => k_bytes_per_pos,
             _ => {
                 // Static multi-slot ladder stores V at Q8_0 — the same
                 // per-head layout the asym/fwht constructors allocate.
@@ -6444,6 +6465,40 @@ mod slot_kv_plan_tests {
         assert!(err.contains("f16"), "{err}");
     }
 
+    /// fp8 stores BOTH arenas in the `[Hkv*D codes][Hkv f16 scales]` row
+    /// layout (the fp8 tile decodes V with K's per-pos stride), so K and V
+    /// strides are EQUAL and no rotation table exists. Hkv=4/D=256 →
+    /// 4*258 = 1032 B/pos/side, the same number `fp8_e4m3_row_bytes`
+    /// computes on the kernel side.
+    #[test]
+    fn fp8_is_scale_inline_strided_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::Fp8, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 258);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+        // The stride scales with Hkv at the fixed D256 the kernels pin.
+        let p8 = SlotKvTierPlan::resolve(KvMode::Fp8, 8, 256).unwrap();
+        assert_eq!(p8.k_bytes_per_pos, 8 * 258);
+        assert_eq!(p8.v_bytes_per_pos, p8.k_bytes_per_pos);
+    }
+
+    /// The fp8 write/read kernels read exactly 32 lanes × 8 dims per head,
+    /// so head_dim must be 256 — anything else is refused with a named
+    /// error instead of describing a layout no kernel can serve.
+    #[test]
+    fn fp8_head_dim_gate_is_256_only() {
+        for hd in [64usize, 128, 512] {
+            let err = SlotKvTierPlan::resolve(KvMode::Fp8, 4, hd)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fp8"), "hd={hd}: {err}");
+            assert!(err.contains("256"), "hd={hd}: {err}");
+        }
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 4, 256).is_ok());
+    }
+
     #[test]
     fn rotation_tables_match_tier_family() {
         for m in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
@@ -6477,9 +6532,9 @@ mod slot_kv_plan_tests {
         for m in [KvMode::Q8, KvMode::Asym3, KvMode::Fwht4] {
             assert!(SlotKvTierPlan::resolve(m, 2, 100).is_err(), "{m:?} @100");
         }
-        // fp8 is native-only on the slot engine: no slot reader exists, so
-        // the plan refuses it fail-closed like the sentinel.
-        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 2, 256).is_err());
+        // fp8 is pinned to the kernels' fixed 32x8/head geometry: 256 only
+        // (see fp8_head_dim_gate_is_256_only for the named-error shape).
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 2, 128).is_err());
         // Zero heads refused.
         assert!(SlotKvTierPlan::resolve(KvMode::Q8, 0, 256).is_err());
     }

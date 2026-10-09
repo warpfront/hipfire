@@ -164,9 +164,18 @@ extern "C" __global__ void kv_cache_write_q8_0_independent_masked(
 
 #ifdef HIPFIRE_KV_FP8_E4M3
 // Batched native E4M3FN KV write. Counterpart of kv_cache_write_fp8_e4m3
-// for prefill batching — one wave per (head, batch row). Contiguous
-// `positions[]` destinations; slot/independent addressing is not enabled
-// for fp8. Same scale/code rule as the single writer.
+// for prefill batching — one wave per (head, batch row). Descriptor-aware
+// like the q8_0 batched kernel above: with real slot descriptors the row
+// base resolves through the descriptor selected by row_slot[bid], letting
+// one launch serve several independent sequences; a null descriptor pair
+// synthesises a zero-base legacy descriptor, byte-identical to the
+// pre-slot contiguous kernel. `kv_offset_for_k` serves BOTH the K and the
+// V launch (mirroring kv_cache_write_bf16_batched): `dst` already selects
+// the arena, and the fp8 K/V strides are equal (both sides store the same
+// `[Hkv*D codes][Hkv f16 scales]` row), so no separate V base is carried.
+// Fixed geometry: exactly 32 lanes × 8 dims per head, so head_dim must be
+// 256 — admission refuses anything else before this kernel is reachable.
+// Same scale/code rule as the single writer.
 //
 // Grid: [n_kv_heads, batch_size, 1]. Block: [32, 1, 1].
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
@@ -178,13 +187,24 @@ extern "C" __global__ void kv_cache_write_fp8_e4m3_batched(
     const int* __restrict__ positions,    // [batch_size]
     int n_kv_heads,
     int head_dim,
-    int batch_size
+    int batch_size,
+    const KvSlotDesc* __restrict__ slot_descs,  // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot            // [batch_size] or nullptr = legacy
 ) {
     const int head = blockIdx.x;
     const int bid = blockIdx.y;
     if (bid >= batch_size) return;
     if (head >= n_kv_heads) return;
     const int tid = threadIdx.x;
+
+    // One code path for both modes: in legacy mode we synthesise a zero-base
+    // descriptor, so the row address below is unchanged and the output is
+    // bitwise identical to the pre-slot kernel.
+    const int slot = (row_slot != nullptr) ? row_slot[bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(0, 0);
+    const int per_pos_bytes = n_kv_heads * (head_dim + 2);
 
     const int kv_dim = n_kv_heads * head_dim;
     float v[8];
@@ -217,12 +237,12 @@ extern "C" __global__ void kv_cache_write_fp8_e4m3_batched(
     w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[6] / sf, v[7] / sf, w1, true);
 
     const int pos = positions[bid];
-    const size_t stride = (size_t)n_kv_heads * (head_dim + 2);
-    unsigned char* codes = dst + (size_t)pos * stride + (size_t)head * head_dim + tid * 8;
+    unsigned char* row = dst + kv_offset_for_k(desc, pos, per_pos_bytes);
+    unsigned char* codes = row + (size_t)head * head_dim + tid * 8;
     __builtin_memcpy(codes + 0, &w0, 4);
     __builtin_memcpy(codes + 4, &w1, 4);
     if (tid == 0)
-        *((_Float16*)(dst + (size_t)pos * stride + (size_t)n_kv_heads * head_dim + (size_t)head * 2)) = s16;
+        *((_Float16*)(row + (size_t)n_kv_heads * head_dim + (size_t)head * 2)) = s16;
 }
 #endif
 

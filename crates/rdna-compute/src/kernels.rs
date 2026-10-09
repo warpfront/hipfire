@@ -7316,7 +7316,11 @@ pub const KV_CACHE_WRITE_FP8_E4M3_SRC: &str = concat!(
 /// Batched twin: `kv_cache_write_fp8_e4m3_batched`, grid [n_kv_heads,
 /// batch_size, 1]. Same TU as [`KV_CACHE_WRITE_Q8_0_BATCHED_SRC`]; launchers
 /// strip-and-prepend `KV_SLOT_DESC_H` exactly like the Q8 sibling because
-/// the runtime hipcc compile has no -I to kernels/src.
+/// the runtime hipcc compile has no -I to kernels/src. The kernel is
+/// descriptor-aware (8-arg ABI: `slot_descs`/`row_slot` tail) so the slot
+/// engine launches it through `ensure_kv_slot_kernel` exactly like the Q8
+/// writer; descriptor-less callers pass nulls for byte-identical legacy
+/// addressing.
 pub const KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC: &str = concat!(
     "#define HIPFIRE_KV_FP8_E4M3 1\n",
     include_str!("../../../kernels/src/kv_cache_write_q8_0_batched.hip")
