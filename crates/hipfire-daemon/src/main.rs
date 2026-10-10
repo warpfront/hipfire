@@ -2493,16 +2493,11 @@ fn main() {
                         batch_scheduler = staged_batch_scheduler;
                         vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // arch_id 13 (gemma4) is intentionally ABSENT: hipfire_generate::dense::generate_gemma4 has
-                        // no LCP prefix-cache block and always cold-prefills the full
-                        // Jinja-rendered prompt. Enabling the cache would corrupt KV
-                        // slot offsets after turn 1 (stale prefix reuse). Wire when
-                        // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
-                        // Qwen4 (16) only with its attached session cache
-                        // (`ArchModel::session_cache_attached`).
+                        // Gemma 4 (13) and Qwen4 (16) only with their attached
+                        // session cache (`ArchModel::session_cache_attached`).
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            16 => m.state.as_deref().is_some_and(|state| state.session_cache_attached()),
+                            13 | 16 => m.state.as_deref().is_some_and(|state| state.session_cache_attached()),
                             _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);

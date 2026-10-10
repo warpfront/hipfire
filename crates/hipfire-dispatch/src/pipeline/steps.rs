@@ -105,6 +105,18 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
+    /// Sandwich-norm attention sublayer.
+    SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
+    /// Sandwich-norm gated MLP sublayer.
+    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
+    /// Parallel dense + routed-expert MLP sublayer.
+    ParallelMoeMlp(crate::pipeline::sandwich::ParallelMoeMlpOp<'a>),
+    /// Sandwich-norm per-layer-input branch.
+    PerLayerInput(crate::pipeline::sandwich::PerLayerInputOp<'a>),
+    /// In-place scalar multiply.
+    Scale(crate::pipeline::sandwich::ScaleOp<'a>),
+    /// In-place final-logit soft cap.
+    Softcap(crate::pipeline::sandwich::SoftcapOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -136,7 +148,13 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
-        | Step::MoeStage(..) => None,
+        | Step::MoeStage(..)
+        | Step::SandwichAttention(_)
+        | Step::SandwichMlp(_)
+        | Step::ParallelMoeMlp(_)
+        | Step::PerLayerInput(_)
+        | Step::Scale(_)
+        | Step::Softcap(_) => None,
     }
 }
 
@@ -924,12 +942,13 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                             && read.input.buf.as_ptr() == write.output.buf.as_ptr()
                             && read.rows == write.rows =>
                     {
-                        paired_hyper_write(steps, i + 4, read).filter(|(_, next_write)| {
-                            crate::pipeline::layer_ops::hyper_read_prenorm_applies(
-                                gpu, read, next_write,
-                            )
-                        })
-                        .map(|(j, next_write)| (j, read, next_write))
+                        paired_hyper_write(steps, i + 4, read)
+                            .filter(|(_, next_write)| {
+                                crate::pipeline::layer_ops::hyper_read_prenorm_applies(
+                                    gpu, read, next_write,
+                                )
+                            })
+                            .map(|(j, next_write)| (j, read, next_write))
                     }
                     _ => None,
                 };
@@ -1486,6 +1505,16 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
+        Step::SandwichAttention(op) => {
+            crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
+        }
+        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
+        Step::ParallelMoeMlp(op) => {
+            crate::pipeline::sandwich::execute_parallel_moe_mlp(gpu, ctx, op)
+        }
+        Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
+        Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
+        Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

@@ -397,6 +397,36 @@ fn q8_decode_attn_gqa_gfx1151_admitted(
         && hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA", true)
 }
 
+/// gfx1151 Q8_0 decode attention for the Gemma 4 26B-A4B shapes through a
+/// GQA-shared, 8-wave tile (`attention_flash_q8_0_tile_gqa_gemma.gfx1151.hip`):
+/// head_dim 256 with GQA group 2 (sliding layers) and head_dim 512 with group
+/// 8 (full layers), tile 128, any window. Same partials as the reference tile
+/// and the same reduce, not bit-identical (different summation order).
+/// `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the reference tile.
+fn q8_decode_attn_gqa_gemma_gfx1151(
+    gpu: &Gpu,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> Option<&'static str> {
+    if !gpu.arch_caps.is_gfx1151()
+        || tile_size != 128
+        || n_kv_heads == 0
+        || !hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA", true)
+    {
+        return None;
+    }
+    match (head_dim, n_heads / n_kv_heads, n_heads % n_kv_heads) {
+        (256, 2, 0) => Some("attention_flash_q8_0_tile_gqa_d256g2_gfx1151"),
+        (512, 8, 0) => Some("attention_flash_q8_0_tile_gqa_d512g8_gfx1151"),
+        _ => None,
+    }
+}
+
+/// Grid-y cap of the Gemma GQA tile; its workgroups loop over the tiles.
+const Q8_DECODE_GQA_GEMMA_GRID_Y_CAP: usize = 64;
+
 /// Kernel pair of a GQA-shared decode attention route: a 13-arg tile with one
 /// 256-thread workgroup per (kv head, tile) and a 7-arg head-dim-split reduce.
 struct DecodeGqaPair {
@@ -9243,6 +9273,100 @@ impl Gpu {
     /// method). Used by cohere2moe's `sliding_attention` layers so context beyond
     /// `sliding_window` clips correctly instead of running full-causal (degraded).
     #[allow(clippy::too_many_arguments)]
+    /// Whether [`Self::attention_q8_0_prefill_gqa_wmma`] admits this shape.
+    pub fn attention_q8_0_prefill_gqa_wmma_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> bool {
+        // Measured on gfx1151 only; the kernel is gfx11 wave32 WMMA.
+        self.arch_caps.is_gfx1151()
+            && matches!(head_dim, 256 | 512)
+            && n_kv_heads > 0
+            && n_heads % n_kv_heads == 0
+            && matches!(n_heads / n_kv_heads, 1 | 2 | 4 | 8 | 16)
+            && hipfire_config::developer_bool("HIPFIRE_Q8_PREFILL_GQA_WMMA", true)
+    }
+
+    /// Causal attention of `batch` consecutive query rows (`positions`, i32,
+    /// increasing) over a position-indexed Q8_0 KV cache, GQA-shared, on
+    /// gfx11 WMMA (see `attention_q8_0_prefill_gqa_wmma.gfx11.hip`).
+    /// `window > 0` limits each row to its last `window` keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_prefill_gqa_wmma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch: usize,
+        window: i32,
+    ) -> HipResult<()> {
+        if !self.attention_q8_0_prefill_gqa_wmma_admitted(n_heads, n_kv_heads, head_dim) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_prefill_gqa_wmma: unsupported shape heads={n_heads} kv={n_kv_heads} hd={head_dim} on {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        let func = if head_dim == 256 {
+            "attention_q8_0_prefill_gqa_wmma_d256"
+        } else {
+            "attention_q8_0_prefill_gqa_wmma_d512"
+        };
+        self.ensure_kernel(
+            "attention_q8_0_prefill_gqa_wmma",
+            kernels::ATTENTION_Q8_0_PREFILL_GQA_WMMA_GFX11_SRC,
+            func,
+        )?;
+        let g = n_heads / n_kv_heads;
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let b = batch as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let wn = window;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &b as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &wn as *const _ as *mut c_void,
+        ];
+        let grid = [(batch * g).div_ceil(16) as u32, n_kv_heads as u32, 1];
+        self.launch_maybe_blob(func, grid, [128, 1, 1], 0, &mut params, || {
+            let mut kb = hip_bridge::KernargBlob::new();
+            kb.push_ptr(qp);
+            kb.push_ptr(kp);
+            kb.push_ptr(vp);
+            kb.push_ptr(op);
+            kb.push_ptr(pp);
+            kb.push_i32(nh);
+            kb.push_i32(nkv);
+            kb.push_i32(b);
+            kb.push_f32(sc);
+            kb.push_i32(wn);
+            kb
+        })
+    }
+
     pub fn attention_flash_q8_0_batched_masked_windowed(
         &mut self,
         q: &GpuTensor,
@@ -9539,21 +9663,34 @@ impl Gpu {
         }
 
         // ── Tile kernel ──
+        let gemma_gqa = if output_gate.is_none() {
+            q8_decode_attn_gqa_gemma_gfx1151(self, n_heads, n_kv_heads, head_dim, tile_size)
+        } else {
+            None
+        };
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
                 == Ok("1");
-        let (tile_module, tile_src) = if gfx1151_tile_dpp {
+        let (tile_module, tile_src, tile_fn) = if let Some(func) = gemma_gqa {
+            (
+                "attention_flash_q8_0_tile_gqa_gemma_gfx1151",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC,
+                func,
+            )
+        } else if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC,
+                "attention_flash_q8_0_tile",
             )
         } else {
             (
                 "attention_flash_q8_0_tile",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                "attention_flash_q8_0_tile",
             )
         };
-        self.ensure_kernel(tile_module, tile_src, "attention_flash_q8_0_tile")?;
+        self.ensure_kernel(tile_module, tile_src, tile_fn)?;
         {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let q_ptr = q.buf.as_ptr();
@@ -9569,8 +9706,18 @@ impl Gpu {
             let ts = tile_size as i32;
             let wn = window;
             let es = effective_seq_arg;
-            let grid = [n_heads as u32, launch_tiles as u32, 1];
-            let shared = ((tile_size + head_dim) * 4) as u32;
+            // The GQA route runs one 256-thread workgroup per (kv head,
+            // tile) and loops over tiles, so its grid is capped.
+            let (grid, block, shared) = if gemma_gqa.is_some() {
+                let y = launch_tiles.min(Q8_DECODE_GQA_GEMMA_GRID_Y_CAP) as u32;
+                ([n_kv_heads as u32, y, 1], [256, 1, 1], 0)
+            } else {
+                (
+                    [n_heads as u32, launch_tiles as u32, 1],
+                    [32, 1, 1],
+                    ((tile_size + head_dim) * 4) as u32,
+                )
+            };
             let mut params: Vec<*mut c_void> = vec![
                 &q_ptr as *const _ as *mut c_void,
                 &k_ptr as *const _ as *mut c_void,
@@ -9587,9 +9734,9 @@ impl Gpu {
                 &es as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob_position_grid(
-                "attention_flash_q8_0_tile",
+                tile_fn,
                 grid,
-                [32, 1, 1],
+                block,
                 shared,
                 &mut params,
                 1,

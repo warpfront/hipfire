@@ -8,7 +8,7 @@ Runs HF reference on CPU float32 with forward hooks to capture per-layer
 intermediate tensors: post-attn hidden, post-FFN hidden, MoE branch
 intermediates (router logits, topk indices, expert outputs).
 
-Compares against hipfire's HIPFIRE_GEMMA4_DUMP=1 output.
+Compares against hipfire's per-layer hidden states (`dump_gemma4_hidden_states` example).
 
 Usage:
   # Quick test with short prompt

@@ -29,7 +29,8 @@ use hipfire_runtime::sampler::{
     apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
 use hipfire_runtime::session_cache::{
-    SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout,
+    stride_boundaries, SessionCache, SessionDriver, SessionRoute, SessionState, SnapshotParts,
+    StateLayout,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -82,112 +83,24 @@ impl AttachedWeightStore {
     }
 }
 
-/// Host record of the committed live state: the consumed history it holds and
-/// the route that produced it. A live continuation is *session-exact* (its
-/// state descends from decode, as in a continuous conversation), not
-/// cold-exact, so it is only resumed in place and never captured into the
-/// cross-session snapshot cache, except by message-end snapshots
-/// (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`), which live in their own `/turns` scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Qwen4LiveRecord {
-    tokens: Vec<u32>,
-    route: SessionRoute,
-}
-
-/// `Some(L)` when the live state recorded in `record` can serve `prompt` on
-/// `route`: it holds exactly `L = record.tokens.len()` tokens (`0 < L <
-/// prompt.len()`, so at least the last prompt token is computed), those tokens
-/// are `prompt[..L]`, no verify row capture is armed, the target is exactly at
-/// `L` and, for native MTP, so is the head (a retired head lags and cannot
-/// continue). Plain data, so the decision runs without a GPU.
-fn live_start(
-    record: Option<&Qwen4LiveRecord>,
-    prompt: &[u32],
+/// Where every owner of `route` sits when the live state can continue in
+/// place: the target position, for native MTP only when the head sits there
+/// too (a retired head lags, a missing one cannot continue), and never while
+/// a verify row capture is armed. Plain data, so it runs without a GPU.
+fn live_position(
     route: SessionRoute,
     target_position: usize,
     head_position: Option<usize>,
     row_capture_armed: bool,
 ) -> Option<usize> {
-    let record = record?;
-    let end = record.tokens.len();
-    (record.route == route
-        && end > 0
-        && end < prompt.len()
-        && prompt[..end] == record.tokens[..]
-        && !row_capture_armed
-        && target_position == end
-        && (route == SessionRoute::Ar || head_position == Some(end)))
-    .then_some(end)
-}
-
-/// Whether the state left by the turn that began with `turn_prompt` on `route`
-/// is the live state after `consumed`, the full host history the client
-/// committed: `consumed` extends the turn's prompt, the target is exactly at
-/// its end (and for native MTP so is the head) and no row capture is armed.
-/// An empty `consumed` (unrepaired terminal) is never live.
-fn live_after_commit(
-    turn_prompt: &[u32],
-    route: SessionRoute,
-    consumed: &[u32],
-    target_position: usize,
-    head_position: Option<usize>,
-    row_capture_armed: bool,
-) -> bool {
-    let prompt_len = turn_prompt.len();
-    prompt_len > 0
-        && consumed.len() >= prompt_len
-        && consumed[..prompt_len] == *turn_prompt
-        && !row_capture_armed
-        && target_position == consumed.len()
-        && (route == SessionRoute::Ar || head_position == Some(consumed.len()))
-}
-
-/// Prompt tokens the next prefill skips: the live state when it reaches at
-/// least as far as the longest cached snapshot (a tie prefers live: no copy),
-/// else that snapshot.
-fn plan_start(snapshot: usize, live: Option<usize>) -> usize {
-    match live {
-        Some(live) if live >= snapshot => live,
-        _ => snapshot,
-    }
+    (!row_capture_armed
+        && (route == SessionRoute::Ar || head_position == Some(target_position)))
+    .then_some(target_position)
 }
 
 /// Environment flag that adds message-end snapshot boundaries (P1b), read once
 /// when the bundle is assembled. Off by default.
 const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
-
-/// Positions just after every `im_end` token of `prompt` (a message end:
-/// user, tool, system or assistant) in `(after, up_to]`, ascending.
-fn message_end_boundaries(prompt: &[u32], im_end: u32, after: usize, up_to: usize) -> Vec<usize> {
-    let end = up_to.min(prompt.len());
-    if after >= end {
-        return Vec::new();
-    }
-    (after..end)
-        .filter(|&i| prompt[i] == im_end)
-        .map(|i| i + 1)
-        .collect()
-}
-
-/// Ascending, deduplicated snapshot boundaries in `(after, up_to]`: multiples
-/// of `chunk`, plus message ends when `im_end` is `Some`.
-fn session_boundaries(
-    chunk: usize,
-    prompt: &[u32],
-    im_end: Option<u32>,
-    after: usize,
-    up_to: usize,
-) -> Vec<usize> {
-    let mut boundaries: Vec<usize> = (after / chunk + 1..=up_to / chunk)
-        .map(|k| k * chunk)
-        .collect();
-    if let Some(im_end) = im_end {
-        boundaries.extend(message_end_boundaries(prompt, im_end, after, up_to));
-        boundaries.sort_unstable();
-        boundaries.dedup();
-    }
-    boundaries
-}
 
 /// Published Qwen4 architecture owner.
 pub struct Qwen4Bundle {
@@ -218,16 +131,11 @@ pub struct Qwen4Bundle {
     /// Staging of the GPU penalty prepass (`apply_penalty_table`), allocated
     /// by the first penalized row and kept until unload.
     penalty_stage: Option<PenaltyTableStage>,
-    /// Prefill snapshot cache shared by every session (`attach_session_cache`);
-    /// `None` = off.
-    session: Option<SessionCache>,
-    /// Committed live state kept for a continuation of the same conversation
-    /// (`session_commit_live`); `None` = none. Cleared by `reset`,
-    /// `session_clear`, `session_commit` and `session_begin` (it is consumed
-    /// while a request is in flight).
-    live: Option<Qwen4LiveRecord>,
-    /// Prompt and route of the request in flight (set by `session_begin`).
-    turn: Option<(Vec<u32>, SessionRoute)>,
+    /// Prefill snapshot cache shared by every session plus this
+    /// conversation's committed live state (`attach_session_cache`); `None` =
+    /// off. Message-end snapshots of a live continuation live in their own
+    /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
+    session: Option<SessionDriver>,
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
     turn_snapshots: bool,
@@ -340,7 +248,7 @@ impl SessionState for Qwen4Bundle {
         let Some(chunk) = self.spec_chunk_rows() else {
             return Vec::new();
         };
-        session_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
+        stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
     }
 
     fn snapshot_parts(
@@ -419,11 +327,16 @@ impl SessionState for Qwen4Bundle {
         .map_err(|e| e.to_string())
     }
 
-    fn growth_reserve_bytes(&self, gpu: &Gpu) -> u64 {
-        let through = self
-            .turn
-            .as_ref()
-            .map_or(self.state.position, |(prompt, _)| prompt.len());
+    fn live_position(&self, route: SessionRoute) -> Option<usize> {
+        live_position(
+            route,
+            self.state.position,
+            self.mtp.as_ref().map(Qwen4MtpGpu::position),
+            self.state.row_capture_armed,
+        )
+    }
+
+    fn growth_reserve_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
         let (context, gather) = self.context_growth_bytes(gpu, through);
         context.saturating_add(gather)
     }
@@ -548,8 +461,6 @@ impl Qwen4Bundle {
             spec_host_top1: Vec::new(),
             penalty_stage: None,
             session: None,
-            live: None,
-            turn: None,
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
             turn_end_token: None,
             state_format,
@@ -1761,8 +1672,9 @@ impl Qwen4Bundle {
 
     /// Reset every owner for a cold prefill.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        self.live = None;
-        self.turn = None;
+        if let Some(session) = self.session.as_mut() {
+            session.forget_live();
+        }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
         if let Some(mtp) = self.mtp.as_mut() {
@@ -1835,55 +1747,35 @@ impl Qwen4Bundle {
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
     /// then restores and captures whole-chunk snapshots through it.
     pub fn attach_session_cache(&mut self, cache: SessionCache) {
-        self.session = Some(cache);
+        self.session = Some(SessionDriver::new(cache));
     }
 
     /// The attached session cache, if any.
     pub fn session_cache(&self) -> Option<&SessionCache> {
-        self.session.as_ref()
+        self.session.as_ref().map(SessionDriver::cache)
     }
 
     /// Drop every session snapshot, pending ones included, releasing their
-    /// device buffers. No-op without a cache.
+    /// device buffers, and the live state. No-op without a cache.
     pub fn session_clear(&mut self, gpu: &mut Gpu) {
-        self.live = None;
-        self.turn = None;
-        if let Some(cache) = self.session.as_mut() {
-            cache.clear(gpu);
+        if let Some(session) = self.session.as_mut() {
+            session.clear(gpu);
         }
     }
 
-    /// Run `f` with the cache taken out, so it can drive `self` as its
+    /// Run `f` with the driver taken out, so it can drive `self` as its
     /// [`SessionState`]. `None` without a cache.
-    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionCache, &mut Self) -> R) -> Option<R> {
-        let mut cache = self.session.take()?;
-        let result = f(&mut cache, self);
-        self.session = Some(cache);
+    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionDriver, &mut Self) -> R) -> Option<R> {
+        let mut session = self.session.take()?;
+        let result = f(&mut session, self);
+        self.session = Some(session);
         Some(result)
     }
 
-    /// The live state's end when it can serve `prompt` on `route` now.
-    fn live_hit(&self, prompt: &[u32], route: SessionRoute) -> Option<usize> {
-        live_start(
-            self.live.as_ref(),
-            prompt,
-            route,
-            self.state.position,
-            self.mtp.as_ref().map(Qwen4MtpGpu::position),
-            self.state.row_capture_armed,
-        )
-    }
-
-    /// Start a prefill of `prompt` on `route` that skips `reused` tokens:
-    /// - live: `reused` is the end of the committed live state (this
-    ///   conversation's previous turn); every owner and position is kept, no
-    ///   snapshot is restored, and nothing is captured unless message-end
-    ///   snapshots are active (then the boundaries above `reused` are, in the
-    ///   `/turns` scope);
-    /// - snapshot: restore the `reused`-token snapshot the cache planned;
-    /// - `reused == 0`: cold start.
-    ///
-    /// The live record is consumed while the request is in flight.
+    /// Start a prefill of `prompt` on `route` that skips `reused` tokens
+    /// ([`SessionDriver::begin`]): a live continuation of this conversation's
+    /// previous turn, a snapshot restore, or a cold start. Message-end
+    /// boundaries of a live continuation are captured when active.
     pub(crate) fn session_begin(
         &mut self,
         gpu: &mut Gpu,
@@ -1893,37 +1785,20 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
-        let live = reused > 0
-            && self.session.is_some()
-            && self.live_hit(prompt, route) == Some(reused);
-        self.live = None;
-        self.turn = None;
         let capture = self.turn_snapshots_active();
-        let result = if live {
+        match self.with_session(|session, bundle| {
+            session.begin(gpu, bundle, prompt, route, reused, capture)
+        }) {
             // The kept state continues, so request-local PLE work from the
             // previous request must not publish into it.
-            self.invalidate_ple_epoch().map(|()| {
-                self.with_session(|cache, bundle| {
-                    cache.begin_live(gpu, bundle, prompt, route, reused, capture)
-                });
-            })
-        } else {
-            match self
-                .with_session(|cache, bundle| cache.begin(gpu, bundle, prompt, route, reused))
-            {
-                Some(result) => result.map_err(BundleError::Forward),
-                None if reused == 0 => self.reset(gpu),
-                None => Err(BundleError::Forward(format!(
-                    "Qwen4 session cache is not attached; cannot reuse {reused} tokens"
-                ))),
-            }
-        };
-        if result.is_ok() {
-            self.turn = Some((prompt.to_vec(), route));
-        } else {
-            self.live = None;
+            Some(Ok(true)) => self.invalidate_ple_epoch(),
+            Some(Ok(false)) => Ok(()),
+            Some(Err(error)) => Err(BundleError::Forward(error)),
+            None if reused == 0 => self.reset(gpu),
+            None => Err(BundleError::Forward(format!(
+                "Qwen4 session cache is not attached; cannot reuse {reused} tokens"
+            ))),
         }
-        result
     }
 
     /// Next absolute position the running prefill must stop at and report.
@@ -1937,7 +1812,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         prefix: &[u32],
     ) -> Result<(), BundleError> {
-        self.with_session(|cache, bundle| cache.at_boundary(gpu, bundle, prefix))
+        self.with_session(|session, bundle| session.at_boundary(gpu, bundle, prefix))
             .unwrap_or(Ok(()))
             .map_err(BundleError::Forward)
     }
@@ -2299,20 +2174,15 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
-        self.session.as_ref().map_or(0, |cache| {
-            plan_start(
-                cache.plan(self, prompt, route),
-                self.live_hit(prompt, route),
-            )
-        })
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.plan(self, prompt, route))
     }
 
     fn session_commit(&mut self) {
-        if let Some(cache) = self.session.as_mut() {
-            cache.commit();
+        if let Some(session) = self.session.as_mut() {
+            session.commit();
         }
-        self.live = None;
-        self.turn = None;
     }
 
     /// Publish as [`Self::session_commit`] and keep the live state when
@@ -2322,23 +2192,10 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     /// decode lineage); the snapshots just published stay cold-exact because a
     /// live turn captures none unless message-end snapshots are active.
     fn session_commit_live(&mut self, consumed: &[u32]) {
-        let Some(cache) = self.session.as_mut() else {
-            self.live = None;
-            self.turn = None;
-            return;
-        };
-        cache.commit();
-        let position = self.state.position;
-        let head = self.mtp.as_ref().map(Qwen4MtpGpu::position);
-        let armed = self.state.row_capture_armed;
-        self.live = self.turn.take().and_then(|(prompt, route)| {
-            live_after_commit(&prompt, route, consumed, position, head, armed).then(|| {
-                Qwen4LiveRecord {
-                    tokens: consumed.to_vec(),
-                    route,
-                }
-            })
-        });
+        if let Some(mut session) = self.session.take() {
+            session.commit_live(self, consumed);
+            self.session = Some(session);
+        }
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
@@ -2666,173 +2523,19 @@ mod tests {
     const AR: SessionRoute = SessionRoute::Ar;
     const MTP: SessionRoute = SessionRoute::Mtp;
 
-    fn record(tokens: &[u32], route: SessionRoute) -> Qwen4LiveRecord {
-        Qwen4LiveRecord {
-            tokens: tokens.to_vec(),
-            route,
-        }
-    }
-
-    const END: u32 = 7;
-
     #[test]
-    fn message_end_boundaries_follow_every_im_end() {
-        // None.
-        assert!(message_end_boundaries(&[1, 2, 3], END, 0, 3).is_empty());
-        assert!(message_end_boundaries(&[], END, 0, 0).is_empty());
-        // Several: the position just after each im_end.
-        let prompt = [1, END, 2, 3, END, 4, END];
-        assert_eq!(message_end_boundaries(&prompt, END, 0, 7), [2, 5, 7]);
-        // `after` is exclusive, `up_to` inclusive.
-        assert_eq!(message_end_boundaries(&prompt, END, 2, 7), [5, 7]);
-        assert_eq!(message_end_boundaries(&prompt, END, 1, 7), [2, 5, 7]);
-        assert_eq!(message_end_boundaries(&prompt, END, 0, 5), [2, 5]);
-        assert_eq!(message_end_boundaries(&prompt, END, 0, 4), [2]);
-        assert_eq!(message_end_boundaries(&prompt, END, 5, 7), [7]);
-        assert!(message_end_boundaries(&prompt, END, 7, 7).is_empty());
-        assert!(message_end_boundaries(&prompt, END, 3, 4).is_empty());
-        // Consecutive im_end tokens each end a message.
-        assert_eq!(message_end_boundaries(&[END, END, 1, END], END, 0, 4), [1, 2, 4]);
-        // im_end at the last position ends at the prompt length.
-        assert_eq!(message_end_boundaries(&[1, 2, END], END, 0, 3), [3]);
-        // `up_to` beyond the prompt never reads past it.
-        assert_eq!(message_end_boundaries(&[1, END], END, 0, 9), [2]);
-    }
-
-    #[test]
-    fn session_boundaries_union_chunks_and_message_ends() {
-        let mut prompt = vec![1u32; 20];
-        prompt[2] = END; // ends at 3
-        prompt[7] = END; // ends at 8: a chunk multiple
-        prompt[13] = END; // ends at 14
-        // Chunk multiples only without a token (flag off or token unknown).
-        assert_eq!(session_boundaries(4, &prompt, None, 0, 20), [4, 8, 12, 16, 20]);
-        // Union, sorted and deduplicated (8 is both).
-        assert_eq!(
-            session_boundaries(4, &prompt, Some(END), 0, 20),
-            [3, 4, 8, 12, 14, 16, 20]
-        );
-        // The `(after, up_to]` window applies to both sources.
-        assert_eq!(session_boundaries(4, &prompt, Some(END), 3, 14), [4, 8, 12, 14]);
-        assert_eq!(session_boundaries(4, &prompt, None, 3, 14), [4, 8, 12]);
-        // Message ends below one chunk are boundaries on their own.
-        assert_eq!(session_boundaries(64, &prompt, Some(END), 0, 20), [3, 8, 14]);
-        assert!(session_boundaries(64, &prompt, None, 0, 20).is_empty());
-        // A prompt without the token matches the chunk-only schedule.
-        assert_eq!(
-            session_boundaries(4, &[1; 20], Some(END), 0, 20),
-            session_boundaries(4, &[1; 20], None, 0, 20)
-        );
-    }
-
-    #[test]
-    fn live_start_requires_a_strict_extension_of_the_record() {
-        let rec = record(&[1, 2, 3], AR);
-        let at = |prompt: &[u32]| live_start(Some(&rec), prompt, AR, 3, None, false);
-        assert_eq!(at(&[1, 2, 3, 4]), Some(3));
-        assert_eq!(at(&[1, 2, 3, 4, 5, 6]), Some(3));
-        // Diverges inside the record.
-        assert_eq!(at(&[1, 9, 3, 4]), None);
-        assert_eq!(at(&[9, 2, 3, 4]), None);
-        // L == prompt.len() leaves no suffix; a shorter prompt is no extension.
-        assert_eq!(at(&[1, 2, 3]), None);
-        assert_eq!(at(&[1, 2]), None);
-        assert_eq!(at(&[]), None);
-        // No record, or an empty one (L == 0).
-        assert_eq!(live_start(None, &[1, 2, 3, 4], AR, 3, None, false), None);
-        let empty = record(&[], AR);
-        assert_eq!(live_start(Some(&empty), &[1, 2], AR, 0, None, false), None);
-    }
-
-    #[test]
-    fn live_start_checks_route_positions_and_row_capture() {
-        let prompt = [1, 2, 3, 4];
-        let ar = record(&[1, 2, 3], AR);
-        let mtp = record(&[1, 2, 3], MTP);
-        // Route mismatch, both ways.
-        assert_eq!(live_start(Some(&ar), &prompt, MTP, 3, Some(3), false), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, AR, 3, Some(3), false), None);
-        // Target moved off the record's end.
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 2, None, false), None);
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 4, None, false), None);
-        // A verify row capture in flight.
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 3, None, true), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(3), true), None);
-        // AR ignores the head; MTP needs it exactly at L (floor retirement
-        // leaves it behind, a missing head cannot continue).
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 3, Some(1), false), Some(3));
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(3), false), Some(3));
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(2), false), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(4), false), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, None, false), None);
-    }
-
-    #[test]
-    fn live_after_commit_needs_consumed_to_extend_the_turn_prompt() {
-        let prompt = [1, 2, 3];
-        let commit = |consumed: &[u32], pos: usize| {
-            live_after_commit(&prompt, AR, consumed, pos, None, false)
-        };
-        assert!(commit(&[1, 2, 3, 7, 8], 5));
-        // Nothing generated: consumed == prompt.
-        assert!(commit(&[1, 2, 3], 3));
-        // Unrepaired terminal: the host history is empty.
-        assert!(!commit(&[], 0));
-        assert!(!commit(&[], 3));
-        // Shorter than the prompt, or not extending it.
-        assert!(!commit(&[1, 2], 2));
-        assert!(!commit(&[1, 9, 3, 7], 4));
-        // Device position not at the end of the consumed history.
-        assert!(!commit(&[1, 2, 3, 7, 8], 4));
-        assert!(!commit(&[1, 2, 3, 7, 8], 6));
-        // A turn without a prompt is never live.
-        assert!(!live_after_commit(&[], AR, &[1], 1, None, false));
-    }
-
-    #[test]
-    fn live_after_commit_checks_head_and_row_capture() {
-        let prompt = [1, 2, 3];
-        let consumed = [1, 2, 3, 7, 8];
-        assert!(live_after_commit(&prompt, MTP, &consumed, 5, Some(5), false));
-        // Floor retirement left the head behind (or absent).
-        assert!(!live_after_commit(&prompt, MTP, &consumed, 5, Some(3), false));
-        assert!(!live_after_commit(&prompt, MTP, &consumed, 5, None, false));
-        // AR does not care about the head.
-        assert!(live_after_commit(&prompt, AR, &consumed, 5, Some(3), false));
-        assert!(live_after_commit(&prompt, AR, &consumed, 5, None, false));
-        // Row capture armed.
-        assert!(!live_after_commit(&prompt, AR, &consumed, 5, None, true));
-        assert!(!live_after_commit(&prompt, MTP, &consumed, 5, Some(5), true));
-    }
-
-    #[test]
-    fn plan_prefers_live_on_a_tie_and_the_longer_source_otherwise() {
-        // No live state: the snapshot (or a miss).
-        assert_eq!(plan_start(4096, None), 4096);
-        assert_eq!(plan_start(0, None), 0);
-        // Live alone.
-        assert_eq!(plan_start(0, Some(300)), 300);
-        // Tie prefers live (no restore copy).
-        assert_eq!(plan_start(4096, Some(4096)), 4096);
-        // The longer source wins either way.
-        assert_eq!(plan_start(4096, Some(9000)), 9000);
-        assert_eq!(plan_start(8192, Some(300)), 8192);
-    }
-
-    #[test]
-    fn live_hit_then_commit_round_trips_through_the_pure_helpers() {
-        // Turn 1: cold prompt of 3, decode two tokens, commit.
-        let turn1 = [1u32, 2, 3];
-        let consumed1 = [1u32, 2, 3, 7, 8];
-        assert!(live_after_commit(&turn1, AR, &consumed1, 5, None, false));
-        let rec = record(&consumed1, AR);
-        // Turn 2 re-renders the history and appends the next user turn.
-        let turn2 = [1u32, 2, 3, 7, 8, 11, 12];
-        let start = live_start(Some(&rec), &turn2, AR, 5, None, false);
-        assert_eq!(start, Some(5));
-        assert_eq!(plan_start(0, start), 5);
-        // A re-rendered history that rewrote the assistant turn diverges.
-        let rewritten = [1u32, 2, 3, 70, 8, 11, 12];
-        assert_eq!(live_start(Some(&rec), &rewritten, AR, 5, None, false), None);
+    fn live_position_checks_the_head_and_row_capture() {
+        // AR continues at the target and ignores the head.
+        assert_eq!(live_position(AR, 3, None, false), Some(3));
+        assert_eq!(live_position(AR, 3, Some(1), false), Some(3));
+        // MTP needs the head exactly at the target (floor retirement leaves
+        // it behind, a missing head cannot continue).
+        assert_eq!(live_position(MTP, 3, Some(3), false), Some(3));
+        assert_eq!(live_position(MTP, 3, Some(2), false), None);
+        assert_eq!(live_position(MTP, 3, Some(4), false), None);
+        assert_eq!(live_position(MTP, 3, None, false), None);
+        // A verify row capture in flight never continues.
+        assert_eq!(live_position(AR, 3, None, true), None);
+        assert_eq!(live_position(MTP, 3, Some(3), true), None);
     }
 }

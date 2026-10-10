@@ -34,7 +34,7 @@
 
 hipfire-arch-qwen35        partial   184   191   migrate last; MTP routed MoE now dispatch-layer owned; +10 = DFlash fp16-X GEMM entries (S3/S4 launch fusion); -20 = MQ v2 lm_head match deduped in speculative.rs; +7 = MQ4-Lloyd (qt=52) FP8-LUT prefill arms (gemm_*_fp8_lloyd) pending registry keys with LUT plumbing (gfx11 MMQ-LUT PR); +15 = MQ4-Lloyd gfx11 MMQ-LUT prefill arms (gemm_*_mmq_lloyd), same registry-key debt as the FP8-LUT arms; +40 = speculation-decode additions recorded by the SCS hygiene pass (was carried unrecorded on the beta integration base); +1 from the SCS port PR series (landed with the SCS fold); +2 landed on beta since this ledger was frozen (recorded on rebase, not new debt); -5 = sealed MoE prefill moved into dispatch (PR #755 via #774); +4 = gfx1151 A4-fusion gate/up + down-sidecar arms (gemm_gate_up_silu_a4_*, gemm_*_iu4_down_prepared) beside the Iu4H direct calls they mirror, same registry-key debt
 hipfire-arch-deepseek4     debt       19     0   cheapest full conversion; no registry use to reconcile
-hipfire-arch-gemma4        partial    17     4
+hipfire-arch-gemma4        debt        1     0   -15 = Gemma 4 layers run as hipfire-dispatch sandwich Steps (#813); -1 = spec verify lm_head keeps only the scalar Q8 GEMM (the env-gated chunked branch is gone); the 1 left is that lm_head (forward.rs)
 hipfire-arch-lfm2moe       debt       17     0   cheapest full conversion; no registry use to reconcile
 hipfire-arch-minimax       debt       12     0
 hipfire-arch-muse-glimmer  partial    12    17

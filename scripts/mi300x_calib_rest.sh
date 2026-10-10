@@ -27,10 +27,6 @@ export HIPFIRE_NORMALIZE_PROMPT=0
 export HIPFIRE_GRAPH=0
 export HIPFIRE_GRAPH_MOE=0
 export HIPFIRE_CALIB_BF16=1
-# gemma4 gates its batched/WMMA prefill behind these; without them it silently
-# drops to per-token GEMV (lowered.rs:42-53). Harmless for the other arches.
-export HIPFIRE_BATCHED_PREFILL=1
-export HIPFIRE_WMMA_PREFILL=1
 
 for m in lfm2.5-350m lfm2.5-1.2b gemma4-12b muse-glimmer; do
   T="$WORK/$m.teacher.bf16.hfq"

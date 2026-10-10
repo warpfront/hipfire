@@ -365,11 +365,12 @@ never inherit fp8. Registry Qwen cards leave mode as `auto` (a registry
 `default_kv_mode = "q8"` is not lowered into config).
 
 **Non-Qwen families:** Maple keeps BF16/BF16 (registry and direct-path
-auto; explicit `--kv-mode q8` still works). Gemma4 eager stays Q8/Q8.
-Gemma4 lowered keeps the sliding Q8 ring; its full-attention tier follows
-`kv_cache`: `auto`/`q8` → Q8 on every arch (no lowered Gemma4 attend site
-admits native FP8), `legacy-asym3` → the previous Givens Asym3 K + Q8 V,
-`fp8`/`bf16` → load error, anything else → Q8 with a warning. llama HFQ,
+auto; explicit `--kv-mode q8` still works). Gemma4 keeps its sliding tier
+Q8 on every variant; its full-attention tier follows `kv_cache`: `auto`/`q8`
+→ Q8 on every arch (no Gemma4 attend site admits native FP8),
+`legacy-asym3` → the previous Givens Asym3 K + Q8 V,
+`fp8`/`bf16` → load error, anything else → Q8 with a warning. Only Q8/Q8
+loads take batched prefill and the session cache. llama HFQ,
 MiniMax and LFM2-MoE resolve `auto` to q8. DeepSeek4 keeps its F32
 compressor default (or explicit F16); V is not independently selectable
 there. Other carriers keep their existing site policy (llama, MiniMax and

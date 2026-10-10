@@ -10,11 +10,10 @@
 //! format that `eval_hipfire_gemma4` consumes.
 //!
 //! Differences from the qwen35 arm, all gemma4-architectural:
-//!   * forward is `hipfire_arch_gemma4::lowered::forward_scratch` with the
-//!     dual KV (sliding F32 `new_gpu` + full asym3 `new_gpu_asym3`) exactly
-//!     as `gemma4_oracle.rs` (the HF-parity-validated config). The KV setup
-//!     is IDENTICAL between this ref builder and the candidate eval, so KV
-//!     noise cancels and the KLD isolates weight precision.
+//!   * forward is `hipfire_arch_gemma4::forward::decode_step` with Q8 KV on
+//!     both tiers. The KV setup is IDENTICAL between this ref builder and the
+//!     candidate eval, so KV noise cancels and the KLD isolates weight
+//!     precision.
 //!   * gemma has add_bos=true: each n_ctx chunk is materialized as
 //!     [BOS] + (n_ctx-1) corpus tokens (llama-perplexity add_bos semantics).
 //!     The materialized chunk tokens (BOS included) are what's written to the
@@ -31,9 +30,8 @@
 //!       --output <name>-f32-native.kldref.bin [--max-chunks N]
 
 fn main() {
-    use hipfire_arch_gemma4::lowered::{self as gemma4, Gemma4Scratch};
+    use hipfire_arch_gemma4::{forward, Gemma4Config, Gemma4State, Gemma4Weights};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::KvCache;
     use std::cmp::Ordering;
     use std::fs::File;
     use std::io::{BufWriter, Write};
@@ -100,8 +98,8 @@ fn main() {
     }
 
     // -------- load oracle model + tokenizer --------
-    let mut hfq = HfqFile::open(&model).expect("open oracle model");
-    let config = gemma4::config_from_hfq(&hfq).expect("read config");
+    let hfq = HfqFile::open(&model).expect("open oracle model");
+    let config = Gemma4Config::from_hfq(&hfq).expect("read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -110,7 +108,7 @@ fn main() {
         gpu.arch,
         model.display()
     );
-    let weights = gemma4::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+    let weights = Gemma4Weights::load(&hfq, &config, &mut gpu).expect("load weights");
     eprintln!(
         "loaded {} layers, vocab={}, n_ctx={}, top_k={}, bos={}",
         config.n_layers, config.vocab_size, n_ctx, top_k, config.bos_token
@@ -163,31 +161,10 @@ fn main() {
         out.write_all(&t.to_le_bytes()).unwrap();
     }
 
-    // -------- scratch + dual KV (gemma4_oracle config: sliding F32, full asym3) --------
+    // -------- state: Q8 KV on both tiers (the unified state has no F32 KV
+    // tier; the forward refuses F32 cache writes) --------
     let kv_max = n_ctx + 16;
-    let scratch = Gemma4Scratch::new(&mut gpu, &config, kv_max).expect("scratch");
-    gemma4::init_scratch_constants(&mut gpu, &scratch, config.full_head_dim)
-        .expect("init_scratch_constants");
-    let mut kv_sliding = KvCache::new_gpu(
-        &mut gpu,
-        config.n_layers,
-        config.sliding_n_kv_heads,
-        config.sliding_head_dim,
-        kv_max,
-    )
-    .expect("kv sliding alloc");
-    // FULL KV = F32, NOT asym3: on gfx942/CDNA the asym3 full-KV path is
-    // catastrophically wrong (grows with depth; PPL 3826 at 512 ctx) while
-    // F32 full-KV is HF-EXACT (top-5 logits match HF to 1e-4 at 128 ids,
-    // 2026-06-10). F32 both sides also removes the shared KV-noise floor.
-    let mut kv_full = KvCache::new_gpu(
-        &mut gpu,
-        config.n_layers,
-        config.full_n_kv_heads,
-        config.full_head_dim,
-        kv_max,
-    )
-    .expect("kv full alloc");
+    let mut state = Gemma4State::new_with_max_seq(&mut gpu, &config, kv_max).expect("state");
 
     // -------- per-chunk forward + top-K reduce --------
     let k = top_k;
@@ -203,21 +180,18 @@ fn main() {
         // eval relies on; gemma4 has no recurrent state to reset).
         let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
         for pos in 0..(n_ctx - 1) {
-            gemma4::forward_scratch(
-                &mut gpu,
-                &weights,
+            let cand_logits = forward::decode_step(
                 &config,
+                &weights,
+                &mut state,
+                &mut gpu,
                 chunk[pos],
-                pos,
-                &mut kv_sliding,
-                &mut kv_full,
-                &scratch,
+                pos as u32,
             )
-            .expect("forward_scratch");
+            .expect("decode_step");
             if pos < scoring_start {
                 continue;
             }
-            let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
             let cand_logits = &cand_logits[..config.vocab_size.min(cand_logits.len())];
 
             // Convert logits -> full log-prob vector (fp64 log-softmax).

@@ -412,7 +412,7 @@ pub const HFQ_Q8_ONLY_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
-/// Gemma4 lowered full-attention tier. Names use the shared Qwen table, so
+/// Gemma4 full-attention tier. Names use the shared Qwen table, so
 /// bare `asym3`/`turbo3` mean FWHT (no hd512 FWHT tier here → q8 + warn) and
 /// the legacy Givens tier needs the explicit `legacy-asym3` opt-out.
 /// `fp8`/`bf16` are carried forward so the carrier fails closed on them.
@@ -425,14 +425,14 @@ fn normalize_gemma4(raw: &str) -> Option<KvMode> {
     }
 }
 
-/// Gemma4 lowered carrier, full-attention tier (the sliding tier is
-/// always the q8 ring). `auto` follows the shared policy: fp8 only where the
-/// site admits Fp8, else q8. Fp8 is not admitted: every lowered Gemma4 attend
-/// site builds its tier plan with `quant_fp8: false`, and the batched full
-/// prefill uses the windowed Q8 plan, which refuses fp8. So `auto` is q8 on
-/// every arch; `legacy-asym3` restores the previous Givens asym3 tier.
-pub const GEMMA4_LOWERED_FULL_POLICY: KvModePolicy = KvModePolicy {
-    site: "gemma4-lowered-full",
+/// Gemma4 carrier, full-attention tier (the sliding tier is always q8).
+/// `auto` follows the shared policy: fp8 only where the site admits Fp8, else
+/// q8. Fp8 is not admitted: every Gemma4 attend site builds its tier plan
+/// with `quant_fp8: false`, and the batched prefill uses the Q8 plan, which
+/// refuses fp8. So `auto` is q8 on every arch; `legacy-asym3` restores the
+/// previous Givens asym3 tier.
+pub const GEMMA4_FULL_POLICY: KvModePolicy = KvModePolicy {
+    site: "gemma4-full",
     normalize_alias: normalize_gemma4,
     accepted: &[Q8, Asym3],
     default: Q8,
@@ -1272,8 +1272,8 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_lowered_full_policy() {
-        let p = &GEMMA4_LOWERED_FULL_POLICY;
+    fn gemma4_full_policy() {
+        let p = &GEMMA4_FULL_POLICY;
         for raw in ["", "auto", "q8"] {
             let r = resolve(raw, p);
             assert_eq!(r.mode, Q8, "{raw:?}");

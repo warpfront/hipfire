@@ -4,71 +4,16 @@
 
 //! Gemma 4 carrier bundle loader — HFQ path.
 //!
-//! Verbatim relocation of the model-loading work from
-//! `hipfire-loader/src/carriers.rs::Gemma4Carrier::load`. The loader retains
-//! `LoadedModel` assembly, `SourceMeta`/`resolve_source_meta`, chat-template
-//! and tokenizer handling, `Gemma4EagleState` side-car load, and
-//! `spec_build::build_speculator`. This module owns the GPU bundle construction
-//! (lowered vs eager decision, weight/state/KV allocation) with error strings
-//! byte-identical to the prior inline block.
+//! The loader retains `LoadedModel` assembly, `SourceMeta`/`resolve_source_meta`,
+//! chat-template and tokenizer handling, the session cache attach and the
+//! EAGLE speculator (`crate::mtp::Gemma4Drafter`). This module owns the GPU bundle
+//! construction: config admission, weights, state and both KV caches, for
+//! every Gemma 4 variant (dense, E-series, MoE).
 
+use crate::bundle::Gemma4Bundle;
 use crate::config::Gemma4Config;
-use crate::gemma4::{Gemma4State, Gemma4Weights};
-use crate::lowered;
-use hipfire_runtime::llama::KvCache;
+use crate::gemma4::{FullKvTier, Gemma4State, Gemma4Weights};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
-use rdna_compute::Gpu;
-
-// ─── Helpers moved verbatim from carriers.rs ─────────────────────────────
-
-/// Route selection shared by the carrier load path and source admission.
-pub fn gemma4_use_lowered(
-    enable_moe_block: bool,
-    want_batched: bool,
-    has_drafter: bool,
-    is_e_series: bool,
-) -> bool {
-    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
-}
-
-/// Pure context admission for Gemma 4. Refuses the lowered route when
-/// `max_seq < 128`. Eager loads are unrestricted (no eager assert exists).
-///
-/// Callers compute `use_lowered` via [`gemma4_use_lowered`] / source probes so
-/// the refusal string is byte-identical at admission and carrier layers.
-pub fn gemma4_context_admission(max_seq: usize, use_lowered: bool) -> Result<(), String> {
-    if use_lowered && max_seq < 128 {
-        return Err(format!(
-            "gemma4 lowered path requires max_seq >= 128 (got {max_seq})"
-        ));
-    }
-    Ok(())
-}
-
-/// Mirror carrier route selection from an already-open HFQ source + env gates.
-/// `has_drafter` is the EAGLE `params.drafter` presence (not DFlash draft).
-pub fn gemma4_source_uses_lowered(hfq: &hipfire_runtime::hfq::HfqFile, has_drafter: bool) -> bool {
-    let lowered_cfg = lowered::config_from_hfq(hfq);
-    let want_batched = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
-    let Some(lcfg) = &lowered_cfg else {
-        return false;
-    };
-    let lowered_is_moe = lcfg.enable_moe_block;
-    let is_e_series = if lowered_is_moe {
-        false
-    } else {
-        match Gemma4Config::from_hfq(hfq) {
-            Ok(cfg) => cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0,
-            Err(_) => false,
-        }
-    };
-    gemma4_use_lowered(
-        lcfg.enable_moe_block,
-        want_batched,
-        has_drafter,
-        is_e_series,
-    )
-}
 
 fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
     if is_e_series && has_drafter {
@@ -80,101 +25,41 @@ fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result
     Ok(())
 }
 
-// ─── Bundle types ─────────────────────────────────────────────────────────
-
-pub struct Gemma4EagerBundle {
-    pub config: Gemma4Config,
-    pub weights: Gemma4Weights,
-    pub state: Gemma4State,
-}
-
-pub struct Gemma4LoweredBundle {
-    pub config: lowered::Gemma4Config,
-    pub weights: lowered::Gemma4Weights,
-    pub scratch: lowered::Gemma4Scratch,
-    pub kv_sliding: KvCache,
-    pub kv_full: KvCache,
-}
-
-pub enum Gemma4Bundle {
-    Eager(Gemma4EagerBundle),
-    Lowered(Gemma4LoweredBundle),
-}
-
-fn lowered_kv_layer_counts(layer_types: &[lowered::LayerType]) -> (usize, usize) {
-    layer_types
-        .iter()
-        .fold((0, 0), |(sliding, full), layer_type| match layer_type {
-            lowered::LayerType::Sliding => (sliding + 1, full),
-            lowered::LayerType::Full => (sliding, full + 1),
+/// Refuse MoE checkpoints whose expert formats have no indexed device kernel
+/// pair (the routed-expert step is capture-safe and never falls back to a
+/// host loop).
+fn unsupported_expert_formats(weights: &Gemma4Weights) -> Option<String> {
+    weights.layers.iter().find_map(|layer| {
+        let moe = layer.moe()?;
+        let (gate_up, down) = (moe.gate_up_dtype, moe.down_dtype);
+        (!hipfire_dispatch::pipeline::sandwich::RoutedExperts::supports(gate_up, down)).then(|| {
+            format!(
+                "gemma4 MoE: expert formats gate_up={gate_up:?} down={down:?} have no indexed \
+                 kernel; requantize experts to MQ4G256(V2)/MQ6G256/HFQ4G256/HFQ6G256/Q8_0 gate_up with \
+                 Q8_0/HFQ4G128 down"
+            )
         })
+    })
 }
 
-/// Preserve the primary operation error; append cleanup failure context when present.
-fn append_cleanup_context(op_err: String, cleanup: Result<(), String>) -> String {
-    match cleanup {
-        Ok(()) => op_err,
-        Err(c) => format!("{op_err}; cleanup also failed: {c}"),
-    }
-}
-
-fn free_lowered_weights(weights: lowered::Gemma4Weights, gpu: &mut Gpu) {
-    weights.free_gpu(gpu);
-}
-
-fn free_lowered_scratch_and_weights(
-    scratch: lowered::Gemma4Scratch,
-    weights: lowered::Gemma4Weights,
-    gpu: &mut Gpu,
-) {
-    scratch.free_gpu(gpu);
-    free_lowered_weights(weights, gpu);
-}
-
-fn free_lowered_sliding_scratch_weights(
-    kv_sliding: KvCache,
-    scratch: lowered::Gemma4Scratch,
-    weights: lowered::Gemma4Weights,
-    gpu: &mut Gpu,
-) -> Result<(), String> {
-    let mut first: Option<String> = None;
-    if let Err(e) = kv_sliding.free_gpu(gpu) {
-        first = Some(e.to_string());
-    }
-    scratch.free_gpu(gpu);
-    free_lowered_weights(weights, gpu);
-    match first {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// Resolve the lowered full-attention KV tier from the raw `kv_cache` value
-/// through [`GEMMA4_LOWERED_FULL_POLICY`](hipfire_runtime::kv_mode::GEMMA4_LOWERED_FULL_POLICY):
+/// Resolve the full-attention KV tier from the raw `kv_cache` value through
+/// [`GEMMA4_FULL_POLICY`](hipfire_runtime::kv_mode::GEMMA4_FULL_POLICY):
 /// `auto`/`q8` → Q8, `legacy-asym3` → the previous Givens asym3 tier.
 /// Unsupported names fall back to Q8 with the returned warning; fp8/bf16 fail
-/// closed (no Gemma4 lowered attend site admits a native tier).
-fn resolve_lowered_full_kv_mode(
-    mode_raw: &str,
-) -> Result<(hipfire_runtime::kv_mode::KvMode, Option<&'static str>), String> {
+/// closed (no Gemma4 attend site admits a native tier).
+fn resolve_full_kv_tier(mode_raw: &str) -> Result<(FullKvTier, Option<&'static str>), String> {
     use hipfire_runtime::kv_mode::{self, KvMode};
-    let rr = kv_mode::resolve(mode_raw, &kv_mode::GEMMA4_LOWERED_FULL_POLICY);
+    let rr = kv_mode::resolve(mode_raw, &kv_mode::GEMMA4_FULL_POLICY);
     match rr.mode {
-        KvMode::Q8 | KvMode::Asym3 => Ok((rr.mode, rr.warning)),
+        KvMode::Q8 => Ok((FullKvTier::Q8, rr.warning)),
+        KvMode::Asym3 => Ok((FullKvTier::LegacyAsym3, rr.warning)),
         other => Err(format!(
-            "gemma4 (lowered): kv_cache={mode_raw} ({other:?}) has no full-attention KV tier; use auto, q8 or legacy-asym3"
+            "gemma4: kv_cache={mode_raw} ({other:?}) has no full-attention KV tier; use auto, q8 or legacy-asym3"
         )),
     }
 }
 
-// ─── Bundle load ──────────────────────────────────────────────────────────
-
 /// Build the Gemma 4 GPU bundle from an HFQ source.
-///
-/// `ModelSource::Dir` returns the same error string the carrier previously
-/// emitted inline. HFQ path is verbatim: lowered/eager selection,
-/// `want_batched` env gate, E-series validation, weight/state/KV allocation,
-/// and the preserved `eprintln!` diagnostics for the chosen path.
 pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4Bundle, String> {
     if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Legacy {
         return Err("gemma4: sliding/full KV owners require legacy backend".into());
@@ -185,278 +70,76 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
             return Err("gemma4: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 13) or add config_from_source to hipfire-arch-gemma4".into());
         }
     };
-
-    // ── Lowered vs eager selection (MoE or batched prefill opt-in) ──
-    // Arch-13 MoE (26B-A4B `enable_moe_block`) must go through `lowered`, which
-    // carries the parallel-MoE branch. We also route DENSE models through
-    // `lowered` when the operator opts into batched/WMMA prefill — that path
-    // lives only in `lowered::forward_prefill_batch`. E2B/E4B stay on eager
-    // because lowered does not implement PLE, KV sharing, or E2B's double-wide
-    // shared-layer FFN. EAGLE spec-decode (`params.drafter`) requires the eager
-    // `Gemma4State`, so a drafter request always wins and keeps the eager path
-    // (batched prefill opt-in is ignored when a drafter is present).
-    let lowered_cfg = lowered::config_from_hfq(&hfq);
-    let want_batched = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
-    let lowered_is_moe = lowered_cfg
-        .as_ref()
-        .is_some_and(|lcfg| lcfg.enable_moe_block);
-    let eager_config = if lowered_is_moe {
-        None
-    } else {
-        Some(Gemma4Config::from_hfq(&hfq)?)
-    };
-    let is_e_series = eager_config
-        .as_ref()
-        .is_some_and(|cfg| cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0);
-    if is_e_series {
-        eager_config.as_ref().unwrap().e_series_variant()?;
-    }
-    gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
-    let use_lowered = if let Some(lcfg) = &lowered_cfg {
-        gemma4_use_lowered(
-            lcfg.enable_moe_block,
-            want_batched,
-            ctx.gemma4_drafter_path.is_some(),
-            is_e_series,
-        )
-    } else {
-        false
-    };
-    // Refuse before any device allocation so direct-carrier callers match
-    // source-admission refusal (prior model / pool state stay untouched).
-    gemma4_context_admission(ctx.max_seq, use_lowered)?;
-    // The lowered/MoE path is served: `generate_gemma4_lowered` in
-    // hipfire-generate handles `Gemma4Lowered` models end to end, so a
-    // `use_lowered` selection proceeds directly to weight/scratch/KV upload.
-    if use_lowered {
-        let lcfg = lowered_cfg.unwrap();
-        // Pure CPU: resolve the full-attention tier before any device upload.
-        let mode_raw = ctx
-            .kv_mode_override
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
-        let (full_kv_mode, full_kv_warning) = resolve_lowered_full_kv_mode(&mode_raw)?;
-        if let Some(w) = full_kv_warning {
-            eprintln!(
-                "  KV cache: {w} (site {})",
-                hipfire_runtime::kv_mode::GEMMA4_LOWERED_FULL_POLICY.site
-            );
-        }
-        let full_kv_label = match full_kv_mode {
-            hipfire_runtime::kv_mode::KvMode::Asym3 => "legacy-asym3",
-            _ => "q8",
-        };
-        let (n_sliding_layers, n_full_layers) = lowered_kv_layer_counts(&lcfg.layer_types);
-        let mut hfq2 = hfq;
-        // Construction order: weights → scratch → constants → sliding KV → full KV.
-        // On any later error free every completed earlier owner in reverse.
-        let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
-            .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-        let scratch = match lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, ctx.max_seq) {
-            Ok(v) => v,
-            Err(e) => {
-                free_lowered_weights(weights, ctx.gpu);
-                return Err(format!("gemma4 (lowered) scratch: {e:?}"));
-            }
-        };
-        if let Err(e) = lowered::init_scratch_constants(ctx.gpu, &scratch, lcfg.full_head_dim) {
-            free_lowered_scratch_and_weights(scratch, weights, ctx.gpu);
-            return Err(format!("gemma4 (lowered) init_scratch_constants: {e:?}"));
-        }
-        // Physical ring is min(window, max_seq); logical full/scratch stay max_seq.
-        let sliding_cap = lcfg.sliding_window.min(ctx.max_seq);
-        let kv_sliding = match KvCache::new_gpu_q8_capped(
-            ctx.gpu,
-            n_sliding_layers,
-            lcfg.sliding_n_kv_heads,
-            lcfg.sliding_head_dim,
-            ctx.max_seq,
-            sliding_cap,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                free_lowered_scratch_and_weights(scratch, weights, ctx.gpu);
-                return Err(format!(
-                    "gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"
-                ));
-            }
-        };
-        // Full tier: q8 by default, legacy Givens asym3 on explicit opt-out.
-        // Logical limit is max_seq (no ring).
-        let kv_full_alloc = if full_kv_mode == hipfire_runtime::kv_mode::KvMode::Asym3 {
-            KvCache::new_gpu_asym3_gemma4(
-                ctx.gpu,
-                n_full_layers,
-                lcfg.full_n_kv_heads,
-                lcfg.full_head_dim,
-                ctx.max_seq,
-            )
-        } else {
-            KvCache::new_gpu_q8(
-                ctx.gpu,
-                n_full_layers,
-                lcfg.full_n_kv_heads,
-                lcfg.full_head_dim,
-                ctx.max_seq,
-            )
-        };
-        let kv_full = match kv_full_alloc {
-            Ok(v) => v,
-            Err(e) => {
-                let cleanup =
-                    free_lowered_sliding_scratch_weights(kv_sliding, scratch, weights, ctx.gpu);
-                return Err(append_cleanup_context(
-                    format!("gemma4 (lowered) full KV alloc ({full_kv_label}): {e:?}"),
-                    cleanup,
-                ));
-            }
-        };
-        eprintln!(
-            "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {full_kv_label} KV; kv_cache={mode_raw})",
-            lcfg.enable_moe_block, want_batched,
-        );
-        return Ok(Gemma4Bundle::Lowered(Gemma4LoweredBundle {
-            config: lcfg,
-            weights,
-            scratch,
-            kv_sliding,
-            kv_full,
-        }));
-    }
-    // ── Eager dense / E-series path ──
-    let config = match eager_config {
-        Some(c) => c,
-        None => Gemma4Config::from_hfq(&hfq)?,
-    };
+    let config = Gemma4Config::from_hfq(&hfq)?;
+    let is_e_series = config.hidden_size_per_layer_input != 0 || config.num_kv_shared_layers != 0;
     if is_e_series {
         eprintln!(
-            "  gemma4 E-series eager path: {:?} (PLE + shared KV)",
+            "  gemma4 E-series: {:?} (PLE + shared KV)",
             config.e_series_variant()?
         );
     }
-    let weights = Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
-    let state = Gemma4State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-        .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
-    let _ = &weights;
-    Ok(Gemma4Bundle::Eager(Gemma4EagerBundle {
-        config,
-        weights,
-        state,
-    }))
-}
+    gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
 
-// Alias for task's naming convention if callers use `load_bundle`.
-pub use load_gemma4_bundle as load_bundle;
+    // Pure CPU: resolve the full-attention tier before any device upload.
+    let mode_raw = ctx
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+    let (tier, warning) = resolve_full_kv_tier(&mode_raw)?;
+    if let Some(w) = warning {
+        eprintln!(
+            "  KV cache: {w} (site {})",
+            hipfire_runtime::kv_mode::GEMMA4_FULL_POLICY.site
+        );
+    }
+
+    let weights = Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
+    if let Some(e) = unsupported_expert_formats(&weights) {
+        weights.free_gpu(ctx.gpu);
+        return Err(e);
+    }
+    let state = match Gemma4State::new_with_full_tier(ctx.gpu, &config, ctx.max_seq, tier) {
+        Ok(state) => state,
+        Err(e) => {
+            weights.free_gpu(ctx.gpu);
+            return Err(format!("gemma4: state: {e}"));
+        }
+    };
+    eprintln!(
+        "  gemma4: {} (sliding q8 + full {tier:?} KV; kv_cache={mode_raw})",
+        if config.enable_moe_block {
+            "moe"
+        } else {
+            "dense"
+        }
+    );
+    Ok(Gemma4Bundle::new(config, weights, state, ctx.gpu))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn lowered_full_kv_mode_follows_kv_cache() {
-        use hipfire_runtime::kv_mode::KvMode;
+    fn full_kv_tier_follows_kv_cache() {
         for raw in ["", "auto", "q8"] {
-            assert_eq!(resolve_lowered_full_kv_mode(raw), Ok((KvMode::Q8, None)), "{raw:?}");
+            assert_eq!(
+                resolve_full_kv_tier(raw),
+                Ok((FullKvTier::Q8, None)),
+                "{raw:?}"
+            );
         }
         assert_eq!(
-            resolve_lowered_full_kv_mode("legacy-asym3"),
-            Ok((KvMode::Asym3, None))
+            resolve_full_kv_tier("legacy-asym3"),
+            Ok((FullKvTier::LegacyAsym3, None))
         );
         // Bare asym3 is the Qwen FWHT alias: no hd512 FWHT tier, so q8 + warning.
-        let (mode, warning) = resolve_lowered_full_kv_mode("asym3").unwrap();
-        assert_eq!(mode, KvMode::Q8);
+        let (tier, warning) = resolve_full_kv_tier("asym3").unwrap();
+        assert_eq!(tier, FullKvTier::Q8);
         assert!(warning.is_some());
         // Native presets fail closed instead of silently becoming q8.
-        assert!(resolve_lowered_full_kv_mode("fp8").is_err());
-        assert!(resolve_lowered_full_kv_mode("bf16").is_err());
-    }
-
-    #[test]
-    fn lowered_kv_counts_follow_attention_layer_types() {
-        let layer_types = (0..48)
-            .map(|layer_idx| {
-                if (layer_idx + 1) % 6 == 0 {
-                    lowered::LayerType::Full
-                } else {
-                    lowered::LayerType::Sliding
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(lowered_kv_layer_counts(&layer_types), (40, 8));
-    }
-
-    #[test]
-    fn scratch_geometry_uses_single_max_seq_authority() {
-        // No HIPFIRE_KV_SEQ env var should affect geometry; both partials
-        // and KV are sized from the same ctx.max_seq. Verify the pure helpers
-        // that the loader now uses.
-        let max_seq_small = 32768usize;
-        let max_seq_large = 131072usize;
-        let n_heads = 32usize;
-        let full_hd = 512usize;
-        let s_small = lowered::gemma4_flash_partials_len(max_seq_small, n_heads, full_hd);
-        let s_large = lowered::gemma4_flash_partials_len(max_seq_large, n_heads, full_hd);
-        assert_eq!(s_small, 4_210_688);
-        assert_eq!(s_large, 16_842_752);
-        assert_eq!(s_large, 4 * s_small);
-        let pb_small = lowered::gemma4_pb_flash_partials_len(max_seq_small, n_heads, full_hd);
-        let pb_large = lowered::gemma4_pb_flash_partials_len(max_seq_large, n_heads, full_hd);
-        assert_eq!(pb_small, 128 * s_small);
-        assert_eq!(pb_large, 128 * s_large);
-        assert_eq!(pb_large, 2_155_872_256);
-    }
-
-    #[test]
-    fn scratch_geometry_has_no_env_mismatch() {
-        // Simulate that an old env var could earlier cause mismatch between
-        // KV (ctx.max_seq) and scratch (HIPFIRE_KV_SEQ). After the fix both
-        // derive from the same max_seq, so the arithmetic must be identical
-        // for any max_seq value, including 131072 without GPU alloc.
-        for &max_seq in &[8192usize, 32768, 65536, 131072] {
-            let n_heads = 32;
-            let hd = 512;
-            let tiles = max_seq.div_ceil(lowered::GEMMA4_FLASH_TILE);
-            let expected = n_heads * tiles * (2 + hd);
-            assert_eq!(
-                lowered::gemma4_flash_partials_len(max_seq, n_heads, hd),
-                expected
-            );
-            assert_eq!(
-                lowered::gemma4_pb_flash_partials_len(max_seq, n_heads, hd),
-                lowered::GEMMA4_MAX_PREFILL_BATCH * expected
-            );
-        }
-    }
-
-    #[test]
-    fn context_admission_refuses_lowered_below_floor() {
-        assert!(gemma4_context_admission(64, true).is_err());
-        assert!(gemma4_context_admission(127, true).is_err());
-        assert!(gemma4_context_admission(128, true).is_ok());
-        assert!(gemma4_context_admission(512, true).is_ok());
-    }
-
-    #[test]
-    fn context_admission_eager_exempt_at_any_seq() {
-        // Eager has no min-context assert; small contexts stay admitted.
-        assert!(gemma4_context_admission(1, false).is_ok());
-        assert!(gemma4_context_admission(64, false).is_ok());
-        assert!(gemma4_context_admission(127, false).is_ok());
-        assert!(gemma4_context_admission(128, false).is_ok());
-    }
-
-    #[test]
-    fn use_lowered_route_matrix() {
-        // MoE always lowered.
-        assert!(gemma4_use_lowered(true, false, false, false));
-        assert!(gemma4_use_lowered(true, true, true, true));
-        // Dense batched opt-in, no drafter, not E-series.
-        assert!(gemma4_use_lowered(false, true, false, false));
-        // Drafter or E-series keep eager even with batched opt-in.
-        assert!(!gemma4_use_lowered(false, true, true, false));
-        assert!(!gemma4_use_lowered(false, true, false, true));
-        // No batched / no MoE → eager.
-        assert!(!gemma4_use_lowered(false, false, false, false));
+        assert!(resolve_full_kv_tier("fp8").is_err());
+        assert!(resolve_full_kv_tier("bf16").is_err());
     }
 }

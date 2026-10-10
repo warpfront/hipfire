@@ -37,7 +37,87 @@
 - **GDN replay route no longer depends on memory pressure (exactness fix):** the gfx1201 multi-layer GDN tape replay (and the D8 snapshot-source tables) armed lazily at a tape's first accept, and an allocation failure there silently moved that tape to the per-layer replay for life, which commits different DeltaNet bytes on the production model. `GdnTape::new_for_config` now arms the tables when the tape is built (`GdnTape::new_for_dflash` adds the D8 tables), so an allocation failure refuses the lane or request at provision with a logged error; an admitted replay never falls back. The replay's q/k/v/out scratch is now a `Gpu`-owned map keyed by scratch shape (layers, rows, value width): every armed tape of one shape shares one refcounted buffer, released when no tape or replay graph references it and drained on model unload, so eager arming costs a lane only its pointer tables instead of ~75 MB on the 27B. The serve engine's batched verify tape, which is repaired per layer and never replayed, is built with `GdnTape::new_capture_only`. `HIPFIRE_GDN_REPLAY_ML_OFF=1` stays an explicit diagnostic opt-in and is documented as not byte-identical. `GpuPool::alloc` now returns its free lists to HIP and retries once when `hipMalloc` runs out of memory (freed scratch parked in the pool is invisible to HIP; 9 GiB in the reproduction). `DeltaNetSnapshot::new_for` frees partial buffers on a mid-way failure, and `take_dn_checkpoint` logs a skipped checkpoint and frees the snapshot when its save fails. Open: the per-layer `replay_gdn_inner` is still not byte-identical to the multi-layer replay.
 - **VMM maps reclaim pooled memory:** `hipMemCreate` cannot see buffers parked in `GpuPool` either (12.6–13.7 GiB pooled with 0.1–1.4 GiB reported free in the 4-lane MTP state oracle, which failed its 32K lanes with `hipMemCreate: out of memory`). A whole-segment VMM map (`alloc_vmm_tensor`, `grow_vmm_tensor`) that runs out of memory now returns the pool to HIP and retries once; a granule map (`grow_vmm_tensor_granules`, prefix forks), whose failure aborts its arena, returns the pool first when HIP's free figure cannot cover it plus 64 MiB. Both log a `GpuPool: VMM map ...` line.
 - **Removed config keys warn instead of failing the load:** 0.4.1 removed `kernel.mw16` (shipped in 0.3.1 and 0.4.0) from the schema outright, so a `config.toml` that still set it made every command fail with `unknown configuration key 'kernel.mw16'`. Removed keys that shipped now live in `hipfire_config::RETIRED_CONFIG_KEYS`; through their deprecation window (`kernel.mw16`: until 0.5.0) the load drops them and run/serve/chat and `hipfire config show` print `warning: ignored kernel.mw16 in <file>: removed in 0.4.1 (…)`. Keys that never shipped (such as `kernel.gfx11_iu4_swizzle`, which only existed on an experiment branch) and typos still fail the load. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).
-
+- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
+  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
+  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
+  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
+  run the same program with `rows > 1`. The Gemma 4 super-op path and its
+  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
+  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
+    byte-identical, logits included; EAGLE tau is unchanged.
+  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
+    kernels. Greedy text stays coherent and can diverge late.
+  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
+    through the same program (`forward::forward_prefill_batch`, 256-row
+    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
+    collector, so any architecture on these steps calibrates without
+    per-architecture taps. Gemma calibration and KLD numbers move: the tools
+    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed.
+  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM,PROJ}` developer
+    switches are removed; the fused routes are always on. The debug switches
+    `HIPFIRE_GEMMA4_{BASELINE_ATTN,ATTN_VERIFY,GEMM_VERIFY}` and
+    `HIPFIRE_MOE_{BYPASS,BUCKETED}` are removed with their hand-written paths.
+  - The 26B-A4B loads MQ4G256V2 weights and runs MQ4G256V2 and MQ6G256 routed
+    experts on the indexed kernels, which is what the current quantizer emits
+    for it. A MoE checkpoint whose expert formats have no indexed kernel pair
+    now refuses to load instead of running a host-side expert loop, and so
+    does one whose HFQ4-G128 expert `down_proj` (K = 704) was packed across
+    rows by a quantizer before `b4846285e`; both produced garbage. Requantize
+    such files.
+- Gemma 4 runs on one weight stack: the 26B-A4B MoE loads through the same
+  config, weights, state and forward as the 12B and E-series, and the separate
+  `lowered.rs` stack is gone. Its sliding cache is position-indexed like the
+  12B's (no 1024-row ring), so batched prefill (default on gfx1100/gfx1151/gfx1201)
+  now reaches the 26B on Q8/Q8 loads.
+  Its hipGraph decode is off when expert `down_proj` is Q8_0, whose atomic
+  sum is not replay-exact. Text on the q8-experts and requantized MQ4 26B
+  fixtures is unchanged from the previous stack.
+- Gemma 4 joins the engine session cache (`memory.session_cache_bytes`):
+  prefill snapshots the Q8 KV rows every 1024 prompt tokens and continues the
+  previous turn's live state in place when the new prompt extends it. A
+  repeated long prompt restores the snapshot instead of re-prefilling it.
+  Each request now starts from its own prompt; previously a Gemma 4 request
+  continued the previous request's KV in the same process until the context
+  filled, so its output depended on what ran before it. The route-generic
+  live/plan/begin/commit logic moved from Qwen4 into
+  `hipfire_runtime::session_cache::SessionDriver`, which Qwen4 and Gemma 4
+  both use.
+- Gemma 4 EAGLE (`params.drafter`, opt-in `HIPFIRE_GEMMA4_EAGLE=1`) runs on
+  the generic speculative seams: `Gemma4Drafter` is an `MtpDrafter` behind
+  `MtpSpeculator`, the bundle is a `SpecTarget`, `GemmaSpecEmit` routes the
+  thought channel, and `generate_spec` drives the loop. The inline EAGLE loop
+  and `speculative.rs` are deleted, along with the `infer_gemma4_spec` example.
+  The draft head is one step list ending in the engine `DraftHead`. The first
+  token now comes from prefill, and each window pairs its seed with the hidden
+  that predicted it, so per-prompt tau moves slightly. Batched verify is not
+  bitwise-equal to single-row decode, so greedy EAGLE can leave the AR stream
+  where two logits are nearly tied. Measured on gfx1151: one of five fixture
+  prompts at a 0.021-logit margin.
+- Gemma 4 prefills in 256-row batches by default on gfx1151
+  (`HIPFIRE_GEMMA4_PREFILL_BATCH` overrides; gfx1100/gfx1201 keep 64, other
+  architectures stay per-token). On gfx1151 the batched rows:
+  - route the 26B-A4B's experts sorted by expert: one scatter, a grouped WMMA
+    gate/up (MQ4G256V2, MQ6G256) and a grouped HFQ4-G128 down per batch, so
+    each expert's weights are read once per batch. The router stays an
+    F32-activation Q8 GEMV: the F16 WMMA GEMM moves router logits by ~1e-3
+    and flips near-tied experts;
+  - project MQ4G256V2 weights through WMMA (previously one GEMV per row) and
+    Q8 weights through the 4-warp 64x64 WMMA tile;
+  - attend with a GQA-shared WMMA flash kernel, sliding window included
+    (`HIPFIRE_Q8_PREFILL_GQA_WMMA=0` restores the tile kernels);
+  - compute the LM head on the last chunk only.
+  Greedy continuations differ from per-token prefill only by reduction order:
+  the reference continuation's NLL moves by at most 0.02 nats/token across
+  12B, E2B, E4B and both 26B fixtures.
+- Gemma 4 26B-A4B long-context decode: flash-decode tiles that lie wholly
+  below the sliding window exit without reading V, and the Q8 reduce skips
+  them and loads tile partials eight at a time (both bit-exact, for every
+  model on these kernels). On gfx1151 the Gemma decode shapes (head_dim 256 /
+  GQA 2, head_dim 512 / GQA 8) run a GQA-shared 8-wave tile
+  (`HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the reference tile),
+  and the HFQ4-G128 routed down kernel computes eight rows per workgroup
+  with all eight experts' loads in flight.
 
 ## v0.4.1.1 — release draft
 

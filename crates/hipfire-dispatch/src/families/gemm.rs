@@ -317,7 +317,7 @@ impl GemmFamily {
 
         // Calibration tap. This is the batched chokepoint for every arch that
         // migrated off `llama::weight_gemm` onto dispatcher-entry keys —
-        // gemma4 (`lowered.rs:173`), muse-glimmer (`forward.rs:80`) and
+        // gemma4 (the dispatch sandwich projections), muse-glimmer (`forward.rs:80`) and
         // qwen35's migrated prefill sites. Without it those arches capture
         // NOTHING on the batched path, because `weight_gemm`'s tap never runs
         // for them. `batch_size` is the real row count, so one prefill call

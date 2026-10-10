@@ -7870,6 +7870,12 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC: &str 
 /// GQA group 6, tile 128, window 0. gfx1151 only.
 pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa.gfx1151.hip");
+/// Gemma 4 26B-A4B GQA-shared Q8_0 decode flash tiles
+/// (`attention_flash_q8_0_tile_gqa_d256g2_gfx1151`, `..._d512g8_gfx1151`): same
+/// 13-arg ABI and partials as [`ATTENTION_FLASH_Q8_0_TILE_SRC`], any window.
+/// gfx1151 only.
+pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa_gemma.gfx1151.hip");
 /// gfx1151 twin of [`ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC`]
 /// (`attention_flash_reduce_dsplit_gfx1151`): byte-identical to
 /// `attention_flash_q8_0_reduce` on the same partials, one workgroup per
@@ -9735,6 +9741,16 @@ pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip");
 pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_residual_scaled_k8_indexed.hip");
+/// Grouped (sorted-by-expert, 16-slot tiles) HFQ4-G128 MoE down projection.
+pub const GEMV_HFQ4G128_MOE_DOWN_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_grouped.hip");
+/// GQA-shared Q8_0 prefill attention on gfx11 wave32 WMMA, optional sliding
+/// window (`attention_q8_0_prefill_gqa_wmma_d256` / `_d512`).
+pub const ATTENTION_Q8_0_PREFILL_GQA_WMMA_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_prefill_gqa_wmma.gfx11.hip");
+/// gfx11 wave32-WMMA twin of [`GEMV_HFQ4G128_MOE_DOWN_GROUPED_SRC`] (F16 X).
+pub const GEMM_HFQ4G128_MOE_DOWN_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g128_moe_down_grouped_wmma.hip");
 
 // ─── Gemma 4 hd512 attention + KV write kernels ─────────────────────────
 // (ROPE_PARTIAL_HALVED_SRC / LOGIT_SOFTCAP_SRC already defined above.)

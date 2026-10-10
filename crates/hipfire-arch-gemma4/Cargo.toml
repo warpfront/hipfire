@@ -49,10 +49,6 @@ name = "hfq4_gemm_parity"
 required-features = ["lab"]
 
 [[example]]
-name = "infer_gemma4_spec"
-required-features = ["lab"]
-
-[[example]]
 name = "prefill_parity_gemma4"
 required-features = ["lab"]
 

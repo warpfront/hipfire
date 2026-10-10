@@ -622,73 +622,10 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
     }
 }
 
-/// `ArchModel` for the three bundles the loader defines itself.
+/// `ArchModel` for the bundle the loader defines itself.
 ///
-/// `Gemma4Bundle`, `Gemma4LoweredBundle` and `Deepseek4HeterogeneousBundle` are
-/// declared here rather than in their arch crates, so — orphan rule — the impls
-/// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
-/// freeing less leaks, freeing more double-frees.
-impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
-    fn dim(&self) -> usize {
-        self.config.dim
-    }
-    fn n_layers(&self) -> usize {
-        self.config.n_layers
-    }
-    fn vocab_size(&self) -> usize {
-        self.config.vocab_size
-    }
-    fn arch_key(&self) -> &'static str {
-        "gemma4"
-    }
-    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
-        None
-    }
-    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
-        // Mirrors daemon reset arms (main.rs:3336 / 3387): `bundle.state.reset()`.
-        self.state.reset();
-        Ok(())
-    }
-    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
-        let b = *self;
-        if let Some(eagle) = b.eagle {
-            eagle.spec_scratch.free(gpu);
-            eagle.drafter_scratch.free_gpu(gpu);
-            eagle.drafter_weights.free_gpu(gpu);
-        }
-        b.state.free_gpu(gpu);
-        b.weights.free_gpu(gpu);
-    }
-}
-
-impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
-    fn dim(&self) -> usize {
-        self.config.dim
-    }
-    fn n_layers(&self) -> usize {
-        self.config.n_layers
-    }
-    fn vocab_size(&self) -> usize {
-        self.config.vocab_size
-    }
-    fn arch_key(&self) -> &'static str {
-        "gemma4"
-    }
-    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
-        // Two caches (q8 sliding + q8/legacy-asym3 full) and no basis for preferring
-        // one, so expose neither rather than silently picking.
-        None
-    }
-    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
-        let b = *self;
-        // Reverse of lowered load construction: full → sliding → scratch → weights.
-        let _ = b.kv_full.free_gpu(gpu);
-        let _ = b.kv_sliding.free_gpu(gpu);
-        b.scratch.free_gpu(gpu);
-        b.weights.free_gpu(gpu);
-    }
-}
-
+/// `Deepseek4HeterogeneousBundle` is declared here rather than in its arch
+/// crate, so — orphan rule — the impl must be here too.
 impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
     fn dim(&self) -> usize {
         self.model.config.hidden_size
@@ -740,57 +677,11 @@ pub use minimax::MiniMaxBundle;
 /// Field-identical to the prior loader-local struct.
 pub use cohere2moe::Cohere2MoeBundle;
 
-/// Gemma 4 EAGLE speculative-decode scratch state (arch-22 drafter riding an
-/// arch-13 target). Populated only when `LoadCtx::gemma4_drafter_path` is
-/// `Some`. The drafter has NO KV cache of its own — it queries the target's
-/// KV at a constant position, so the only per-session state is the target's
-/// `Gemma4State` plus this scratch. Mirrors the PR's `Gemma4EagleState`.
-pub struct Gemma4EagleState {
-    pub drafter_config: gemma4::drafter::Gemma4DrafterConfig,
-    pub drafter_weights: gemma4::drafter::Gemma4DrafterWeights,
-    pub drafter_scratch: gemma4::drafter::Gemma4DrafterScratch,
-    /// Reusable seed/draft/verify hidden buffers for `spec_step_gemma4_eagle`,
-    /// sized for `draft_len` at load time.
-    pub spec_scratch: gemma4::speculative::Gemma4SpecScratch,
-    /// Drafts per round (verify block = draft_len + 1).
-    pub draft_len: usize,
-}
-
-/// Gemma 4 dense text (arch_id=13) GPU bundle — eager dense path. Re-exported
-/// from the arch crate, which owns config/weights/state so `impl SpecTarget`
-/// can live there when needed. The `eagle` field holds the optional EAGLE
-/// drafter state (arch-22) when `gemma4_drafter_path` was supplied; `None`
-/// is AR-only. This keeps one `ModelState::Gemma4` variant for the dense
-/// path, matching beta's pattern for other arches.
-pub struct Gemma4Bundle {
-    pub config: gemma4::config::Gemma4Config,
-    pub weights: gemma4::gemma4::Gemma4Weights,
-    pub state: gemma4::gemma4::Gemma4State,
-    pub eos_tok: u32,
-    pub eagle: Option<Gemma4EagleState>,
-}
-
-/// Lowered / MoE Gemma 4 execution bundle (arch_id=13 26B-A4B + opt-in
-/// batched/WMMA dense prefill). Uses `lowered::{Gemma4Config, Gemma4Weights,
-/// Gemma4Scratch}` plus TWO `hipfire_runtime::llama::KvCache`s (q8
-/// ring-buffered sliding + full tier from `kv_cache`: q8, or legacy asym3 on
-/// `legacy-asym3`) and `eos_tok`. Mutually exclusive
-/// with `Gemma4Bundle` (eager) via the `ModelState` enum — a given
-/// `LoadedModel` populates exactly one of the two variants.
-/// Chose second `ModelState` variant over enum-inside-bundle to keep
-/// `Gemma4Bundle`'s struct shape stable for the existing eager AR path that
-/// `Gemma4Generate` already matches as `Some(ModelState::Gemma4(bundle))`.
-pub struct Gemma4LoweredBundle {
-    pub config: gemma4::lowered::Gemma4Config,
-    pub weights: gemma4::lowered::Gemma4Weights,
-    pub scratch: gemma4::lowered::Gemma4Scratch,
-    pub kv_sliding: llama::KvCache,
-    pub kv_full: llama::KvCache,
-    pub eos_tok: u32,
-}
+/// Gemma 4 (arch_id=13) GPU bundle, owned by its arch crate (which also
+/// implements `ArchModel` for it).
+pub use gemma4::Gemma4Bundle;
 
 /// Muse Glimmer 30B dense text (arch_id=14) GPU bundle — eager dense path.
-/// Mirrors Gemma4Bundle exactly (per cross-agent contract).
 pub struct MuseGlimmerBundle {
     pub config: glimmer::config::GlimmerConfig,
     pub weights: glimmer::glimmer::GlimmerWeights,
@@ -978,12 +869,6 @@ pub fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     }
 }
 
-/// Env opt-in for the gemma4 batched/WMMA prefill
-/// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`).
-pub fn gemma4_batched_prefill_optin(_gpu: &Gpu) -> bool {
-    gemma4::lowered::batched_prefill_enabled() || gemma4::lowered::wmma_prefill_enabled()
-}
-
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
 pub struct LoadedModel {
@@ -1164,12 +1049,6 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4Bundle>())
-    }
-
-    pub fn gemma4_lowered_mut(&mut self) -> Option<&mut Gemma4LoweredBundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4LoweredBundle>())
     }
 
     pub fn muse_glimmer(&self) -> Option<&MuseGlimmerBundle> {
@@ -1972,7 +1851,10 @@ fn resolve_qwen35_mtp_head(
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
-) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Vec<String>,
+) {
     use hipfire_arch_qwen35::mtp_head;
     let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
     let sidecar = sidecar.unwrap_or_else(|| trunk_path.with_extension("mtp"));
@@ -4528,7 +4410,9 @@ fn load_model_tp_qwen35_dense(
             } else {
                 errors.join("; ")
             };
-            return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
+            return Err(format!(
+                "MTP head required (mtp=on) but not loaded: {reason}"
+            ));
         }
         head
     } else {
@@ -5125,9 +5009,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);

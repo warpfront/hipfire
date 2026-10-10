@@ -875,3 +875,7 @@ required-features = ["lab"]
 [[example]]
 name = "cb_rows_twins_gate"
 required-features = ["deltanet"]
+
+[[example]]
+name = "gemma4_kernel_f64_check"
+required-features = ["lab"]

@@ -472,6 +472,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     }
     if arch == "gfx1151" {
         add!("attention_flash_q8_0_tile_gqa_gfx1151", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC, ["attention_flash_q8_0_tile_gqa_gfx1151"]);
+        add!("attention_flash_q8_0_tile_gqa_gemma_gfx1151", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC, ["attention_flash_q8_0_tile_gqa_d256g2_gfx1151", "attention_flash_q8_0_tile_gqa_d512g8_gfx1151"]);
         add!("attention_flash_reduce_dsplit_gfx1151", kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1151_SRC, ["attention_flash_reduce_dsplit_gfx1151"]);
         add!("attention_q8_0_fa2_gqa_gfx1151", kernels::ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC, ["attention_fa2_q_preconvert_gfx1151", "attention_q8_0_fa2_gqa_gfx1151"]);
         add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]);
@@ -1792,7 +1793,10 @@ mod tests {
         // gained the fold's batched Phase-1a behind `HIPFIRE_RMSNORM_FOLD` +
         // `HIPFIRE_RMSNORM_P1A_BATCHED` (gfx1151 `_fold_b8`); their
         // preprocessed source is unchanged on gfx1100/gfx1151/gfx1201.
-        const REPINNED_SINCE_P0: [&str; 14] = [
+        const REPINNED_SINCE_P0: [&str; 17] = [
+            "attention_flash_fp8_e4m3_tile",
+            "attention_flash_q8_0_reduce",
+            "attention_flash_q8_0_tile",
             "conv1d_silu_split_qknorm_b256",
             "fused_qk_l2_norm_scale",
             "fused_rmsnorm_mq_rotate",

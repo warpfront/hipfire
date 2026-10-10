@@ -193,6 +193,31 @@ impl AttentionFamily {
         })
     }
 
+    /// Attend against an already-populated cache without writing the current
+    /// row: KV-shared layers and draft heads read another layer's cache.
+    pub fn run_attend_only(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        plan: &crate::families::kv_tier::KvTierPlan,
+        io: &AttnParams,
+    ) -> Result<(), DispatchError> {
+        let shape = ShapeInfo {
+            batch_size: plan.batch_size,
+            head_dim: io.head_dim,
+            m: if plan.batch_size > 1 {
+                io.max_ctx_len
+            } else {
+                io.pos + 1
+            },
+            is_tree: io.tree_bias.is_some(),
+        };
+        let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
+        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io).map_err(|error| {
+            DispatchError::Hip(format!("attention {:?}: {error}", plan.attend_key))
+        })
+    }
+
     /// Full-attention entry point (no KV cache — vision / DFlash cross-attention).
     /// Resolves under the given key (AttnFullF16 / AttnFullF32 / causal variants)
     /// and dispatches on the resolved variant's `tile`. The caller is responsible
@@ -2138,7 +2163,8 @@ fn dispatch_attend(
                     && (64..=8192).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
-                    && io.max_ctx_len
+                    && io
+                        .max_ctx_len
                         .checked_mul(4 * (256 / 32) * 34)
                         .is_some_and(|bytes| {
                             io.k_cache.buf.size() >= bytes && io.v_cache.buf.size() >= bytes

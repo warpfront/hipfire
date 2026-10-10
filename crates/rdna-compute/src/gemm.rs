@@ -29231,12 +29231,14 @@ impl Gpu {
             kernels::GEMM_Q8_0_WMMA_4W_SRC,
             "gemm_q8_0_wmma_4w",
         )?;
-        // Stage F32 → F16 input if needed.
+        // Stage F32 → F16 input if needed. Uncached: callers reuse one
+        // activation buffer with new contents per layer, which the
+        // pointer-keyed `ensure_fp16_x` would hand back stale.
         let xp_owned = x.buf.as_ptr();
         let mut xp = if matches!(x.dtype, DType::F16) {
             xp_owned
         } else {
-            self.ensure_fp16_x(x, batch_size * k)?
+            self.convert_fp16_x_uncached(x, batch_size * k)?
         };
 
         let mut a_p = a.buf.as_ptr();
@@ -31556,7 +31558,9 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+        // Eight rows per 256-thread workgroup, one wave per row.
+        let grid = [m.div_ceil(8) as u32, 1, 1];
+        self.launch_maybe_blob(KERNEL, grid, [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(pp);
             b.push_ptr(ip);
@@ -31564,6 +31568,78 @@ impl Gpu {
             b.push_ptr(sp);
             b.push_ptr(hp);
             b.push_ptr(rp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+    /// Grouped HFQ4-G128 MoE down: `y[r, :] = per_expert_scale[e] * W_e ·
+    /// act[sorted_slots[r]]` for every grouped row `r` of the 16-slot tiles
+    /// `tile_ids` (the `moe_scatter_fused_k8` layout); padding rows are not
+    /// written. `m_total` is a multiple of 16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g128_moe_down_grouped(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        tile_ids: &GpuTensor,
+        sorted_slots: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        act: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        m_total: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // gfx1151: wave32 WMMA (F16 activations); the scalar kernel elsewhere.
+        let wmma = self.arch_caps.is_gfx1151() && k % 16 == 0;
+        let (kernel, src, grid, block): (&str, &str, [u32; 3], u32) = if wmma {
+            (
+                "gemm_hfq4g128_moe_down_grouped_wmma",
+                kernels::GEMM_HFQ4G128_MOE_DOWN_GROUPED_WMMA_SRC,
+                [m.div_ceil(16) as u32, (m_total / 16) as u32, 1],
+                32,
+            )
+        } else {
+            (
+                "gemv_hfq4g128_moe_down_grouped",
+                kernels::GEMV_HFQ4G128_MOE_DOWN_GROUPED_SRC,
+                [m.div_ceil(8) as u32, (m_total / 16) as u32, 1],
+                256,
+            )
+        };
+        self.ensure_kernel(kernel, src, kernel)?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = tile_ids.buf.as_ptr();
+        let sp = sorted_slots.buf.as_ptr();
+        let ep = per_expert_scale.buf.as_ptr();
+        // Uncached: one activation buffer is reused with new contents per layer.
+        let ap = if wmma {
+            self.convert_fp16_x_uncached(act, act.numel())?
+        } else {
+            act.buf.as_ptr()
+        };
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(kernel, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(ep);
+            b.push_ptr(ap);
+            b.push_ptr(yp);
             b.push_i32(m_val);
             b.push_i32(k_val);
             b

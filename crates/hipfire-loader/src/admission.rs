@@ -147,7 +147,6 @@ pub struct SourceAdmissionOptions {
     pub pflash: bool,
 }
 
-
 /// Return whether a per-load adaptive-KV value requests the active controller.
 /// The CLI schema default is `Some("off")`, which must remain ordinary AR.
 /// Empty values are also inactive because daemon normalization drops them.
@@ -1308,12 +1307,6 @@ pub fn admit_source_with_options(
                 ));
             }
         }
-        // Gemma 4 lowered min-context: refuse before teardown/alloc so a
-        // small max_seq leaves the prior model serving. Eager stays exempt.
-        if matches!(arch_id, 13 | 22) {
-            let use_lowered = hipfire_arch_gemma4::gemma4_source_uses_lowered(hfq, false);
-            hipfire_arch_gemma4::gemma4_context_admission(effective_seq, use_lowered)?;
-        }
     }
     // Head overlay (`params.head`): validated AND attached to the retained
     // base here, so the admitted source is already effective and loading
@@ -1571,10 +1564,26 @@ mod tests {
         assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 0));
         // Host-mapped experts: `auto` keeps AR off gfx1201, an explicit `on`
         // keeps MTP everywhere, and gfx1201 keeps the head under `auto`.
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1100", 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1201", 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1201", 21));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1100",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1201",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1201",
+            21
+        ));
     }
 
     mod qwen4_ddtree_admission {
@@ -2066,21 +2075,48 @@ mod tests {
             }
             assert_eq!(r(None, Some("lloyd3"), 5, 1), Some("lloyd3"));
             assert_eq!(r(None, Some("lloyd3"), 6, 1), Some("lloyd3"));
-            assert_eq!(r(Some("q8"), Some("lloyd3"), 5, 1), Some("q8"), "typed wins");
-            assert_eq!(r(Some(""), Some("lloyd3"), 5, 1), Some("lloyd3"), "empty typed = unset");
-            assert_eq!(r(None, Some("lloyd3"), 1, 1), None, "non-qwen35 ignores env");
+            assert_eq!(
+                r(Some("q8"), Some("lloyd3"), 5, 1),
+                Some("q8"),
+                "typed wins"
+            );
+            assert_eq!(
+                r(Some(""), Some("lloyd3"), 5, 1),
+                Some("lloyd3"),
+                "empty typed = unset"
+            );
+            assert_eq!(
+                r(None, Some("lloyd3"), 1, 1),
+                None,
+                "non-qwen35 ignores env"
+            );
             assert_eq!(r(None, Some("lloyd3"), 5, 2), None, "EP ignores env");
 
             let trunk = write_hfq("kv-v-once", 5, false);
             let admit = |kv_mode, kv_v| {
                 super::super::admit_source(
-                    trunk.to_str().unwrap(), 1, 1, KvBackendRequest::Automatic, None,
-                    "gfx1100", None, "auto", None, 4096,
-                    KvBackendHints { kv_mode: Some(kv_mode), kv_v, ..KvBackendHints::without_device() },
+                    trunk.to_str().unwrap(),
+                    1,
+                    1,
+                    KvBackendRequest::Automatic,
+                    None,
+                    "gfx1100",
+                    None,
+                    "auto",
+                    None,
+                    4096,
+                    KvBackendHints {
+                        kv_mode: Some(kv_mode),
+                        kv_v,
+                        ..KvBackendHints::without_device()
+                    },
                 )
                 .map(|a| a.kv_v)
             };
-            assert_eq!(admit("fwht3", Some("lloyd3")).unwrap().as_deref(), Some("lloyd3"));
+            assert_eq!(
+                admit("fwht3", Some("lloyd3")).unwrap().as_deref(),
+                Some("lloyd3")
+            );
             assert_eq!(admit("q8", Some("q8")).unwrap().as_deref(), Some("q8"));
             // The pair is validated at admission, before the resident model is
             // touched — not first discovered by the carrier.

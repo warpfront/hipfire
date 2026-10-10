@@ -2,10 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt, Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Gemma 4 dense text plus strictly admitted E2B/E4B text variants for hipfire.
-//!
-//! A DENSE 12B port of the Gemma 4 architecture. Distinguishing features vs a
-//! plain pre-norm transformer:
+//! Gemma 4 text models for hipfire: the dense 12B, the strictly admitted
+//! E2B/E4B variants and the 26B-A4B MoE, on one weight stack and one layer
+//! program. Distinguishing features vs a plain pre-norm transformer:
 //!   - **Hybrid attention**: 5 sliding-window layers (head_dim 256, window
 //!     1024, RoPE θ=10000 full rotate-half) per 1 full layer (head_dim 512,
 //!     partial proportional RoPE θ=1e6 over the first 25% of head_dim). The
@@ -19,33 +18,34 @@
 //!   - **gelu_pytorch_tanh** SwiGLU MLP; **embed scaled by √hidden_size**;
 //!     **tied LM head**; **final logit softcap** `tanh(x/30)*30`.
 //!
-//! DROPPED from the broader Gemma 4 family (the dense 12B uses none of these):
-//! MoE blocks, the E-series per-layer-embedding / KV-sharing-layer /
-//! double-wide-MLP machinery, and vision/audio.
+//!   - **E-series**: per-layer embeddings, KV-sharing layers, double-wide MLP.
+//!   - **MoE** (26B-A4B): routed experts in parallel with every dense FFN.
+//!
+//! Vision/audio towers are out of scope.
 //!
 //! arch_id = 13 (see docs/architecture-ids.md). Reuses existing kernels:
 //! `rope_f32` / `rope_partial_halved_f32`, `attention_q8_0_kv_swa`,
 //! `gelu_tanh_f32`, `logit_softcap_f32`, plus the shared GEMV path.
 
 pub mod arch;
+pub mod bundle;
 pub mod carrier;
 pub mod config;
 pub mod drafter;
+pub mod emit;
 pub mod forward;
 pub mod gemma4;
-pub mod lowered;
-pub mod speculative;
-pub use carrier::{
-    gemma4_context_admission, gemma4_source_uses_lowered, gemma4_use_lowered, load_gemma4_bundle,
-    Gemma4Bundle, Gemma4EagerBundle, Gemma4LoweredBundle,
-};
+pub mod mtp;
+mod program;
+pub use bundle::Gemma4Bundle;
+pub use carrier::load_gemma4_bundle;
 
 pub use arch::{Gemma4, ARCH_ID};
 pub use config::{Gemma4Config, LayerType, RopeType};
 pub use drafter::{
-    drafter_step, drafter_step_from_concat, DrafterLayerWeights, DrafterStepOut,
-    Gemma4DrafterConfig, Gemma4DrafterScratch, Gemma4DrafterWeights, DRAFTER_ARCH_ID,
+    draft_step, drafter_step_from_concat, DrafterLayerWeights, DrafterStepOut, Gemma4DrafterConfig,
+    Gemma4DrafterScratch, Gemma4DrafterWeights, DRAFTER_ARCH_ID,
 };
 pub use forward::{forward_batch, forward_batch_spec};
 pub use gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
-pub use speculative::{spec_step_gemma4_eagle, Gemma4SpecScratch, SpecStepOut};
+pub use mtp::Gemma4Drafter;

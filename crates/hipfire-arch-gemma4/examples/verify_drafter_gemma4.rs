@@ -21,7 +21,7 @@
 //!      validated arch-13 target only reaches ~0.88 min-cos by layer 5 at this
 //!      tiny random-weight scale). Without `--inject-hf` the drafter consumes
 //!      hipfire's own (drifted) target hidden+KV — a looser, end-to-end check.
-//!   4. Run `drafter_step` for N steps, mirroring the HF candidate generator:
+//!   4. Run `draft_step` for N steps, mirroring the HF candidate generator:
 //!      step 0 → prev = last prompt token, hidden = target last-hidden;
 //!      step i>0 → prev = prev step argmax, hidden = prev step post_proj.
 //!      The drafter reads the target's LAST sliding + LAST full KV slot directly
@@ -44,8 +44,8 @@ fn main() {
 fn main() {
     use hipfire_arch_gemma4::config::Gemma4Config;
     use hipfire_arch_gemma4::drafter::{
-        drafter_step, drafter_step_from_concat, Gemma4DrafterConfig, Gemma4DrafterScratch,
-        Gemma4DrafterWeights,
+        draft_step, drafter_step_from_concat, DrafterStepOut, Gemma4DrafterConfig,
+        Gemma4DrafterScratch, Gemma4DrafterWeights,
     };
     use hipfire_arch_gemma4::forward::decode_step;
     use hipfire_arch_gemma4::gemma4::{Gemma4State, Gemma4Weights};
@@ -219,10 +219,14 @@ fn main() {
         dcfg.backbone_hidden, dcfg.vocab_size, dcfg.final_logit_softcapping,
         dcfg.num_centroids, dcfg.centroid_top_k,
     );
-    assert_eq!(dcfg.backbone_hidden, tcfg.dim, "drafter backbone must equal target hidden");
+    assert_eq!(
+        dcfg.backbone_hidden, tcfg.dim,
+        "drafter backbone must equal target hidden"
+    );
     let drafter_weights =
         Gemma4DrafterWeights::load(&drafter_hfq, &dcfg, &mut gpu).expect("drafter weights");
-    let mut dscratch = Gemma4DrafterScratch::new(&mut gpu, &dcfg).expect("drafter scratch");
+    let mut dscratch =
+        Gemma4DrafterScratch::new(&mut gpu, &dcfg, &drafter_weights).expect("drafter scratch");
 
     // ── Run the target to populate its KV caches ──
     let max_seq = n_ctx + 8;
@@ -246,9 +250,7 @@ fn main() {
     };
 
     let tcos = cosine(&target_normed, &target_last_hidden_hf);
-    eprintln!(
-        "[sanity] hipfire target normed-final-hidden vs HF cosine = {tcos:.6}"
-    );
+    eprintln!("[sanity] hipfire target normed-final-hidden vs HF cosine = {tcos:.6}");
 
     // ── Optional: inject HF-exact KV into the target's last slots ──
     if inject_hf {
@@ -269,10 +271,22 @@ fn main() {
                         std::slice::from_raw_parts(ph.as_ptr() as *const u8, 4)
                     })
                     .expect("pos htod");
-                gpu.kv_cache_write_q8_0(&tstate.kv_sliding.k_gpu[s_slot], &kt, &pos_buf, n_kv_s, hd_s)
-                    .expect("inject sliding k");
-                gpu.kv_cache_write_q8_0(&tstate.kv_sliding.v_gpu[s_slot], &vt, &pos_buf, n_kv_s, hd_s)
-                    .expect("inject sliding v");
+                gpu.kv_cache_write_q8_0(
+                    &tstate.kv_sliding.k_gpu[s_slot],
+                    &kt,
+                    &pos_buf,
+                    n_kv_s,
+                    hd_s,
+                )
+                .expect("inject sliding k");
+                gpu.kv_cache_write_q8_0(
+                    &tstate.kv_sliding.v_gpu[s_slot],
+                    &vt,
+                    &pos_buf,
+                    n_kv_s,
+                    hd_s,
+                )
+                .expect("inject sliding v");
             }
             // full K/V
             {
@@ -301,7 +315,11 @@ fn main() {
     } else {
         target_normed.clone()
     };
-    let mut hidden_backbone = gpu.upload_f32(&step0_hidden, &[bb]).expect("upload step0 hidden");
+    let mut hidden_backbone = gpu
+        .upload_f32(&step0_hidden, &[bb])
+        .expect("upload step0 hidden");
+    // The step-0 hidden half stays on device across steps unless re-injected.
+    let mut stage_hidden = true;
 
     // ── Drafter loop ──
     let last_prompt_token = *tokens.last().unwrap();
@@ -325,6 +343,7 @@ fn main() {
             hidden_backbone = gpu
                 .upload_f32(&o.pre_in_hidden, &[bb])
                 .expect("upload hf hidden");
+            stage_hidden = true;
         } else if !inject_pre_in && prev_token != o.prev_token {
             eprintln!(
                 "[warn] step {step}: hipfire prev_token {prev_token} != oracle {} — feeding hipfire's",
@@ -337,6 +356,7 @@ fn main() {
                 &drafter_weights,
                 &dcfg,
                 &mut dscratch,
+                &target_weights,
                 &tstate,
                 &tcfg,
                 &o.pre_in,
@@ -344,7 +364,13 @@ fn main() {
             )
             .expect("drafter_step_from_concat")
         } else {
-            drafter_step(
+            if stage_hidden {
+                dscratch
+                    .begin_round(&mut gpu, &hidden_backbone, query_pos)
+                    .expect("begin_round");
+                stage_hidden = false;
+            }
+            let argmax = draft_step(
                 &mut gpu,
                 &drafter_weights,
                 &dcfg,
@@ -353,10 +379,19 @@ fn main() {
                 &tstate,
                 &tcfg,
                 prev_token,
-                &hidden_backbone,
                 query_pos,
             )
-            .expect("drafter_step")
+            .expect("draft_step");
+            DrafterStepOut {
+                argmax,
+                post_proj_hidden: gpu
+                    .download_f32(&dscratch.concat.sub_offset(bb, bb))
+                    .expect("download post_proj"),
+                normed_hidden: gpu.download_f32(&dscratch.normed).expect("download normed"),
+                logits: gpu
+                    .download_f32(dscratch.head.logits())
+                    .expect("download logits"),
+            }
         };
 
         let _ = &o.pre_out;
@@ -379,19 +414,12 @@ fn main() {
         );
 
         prev_token = out.argmax;
-        hidden_backbone = gpu
-            .upload_f32(&out.post_proj_hidden, &[bb])
-            .expect("upload next hidden");
     }
 
     // Gate: per-step isolation requires EVERY step ≥0.99; the realistic
     // feedback chain only requires step 0 (drift downstream is corrected by the
     // target's verify — the drafter affects acceptance τ, not correctness).
-    let overall = if feedback {
-        step0_pass
-    } else {
-        all_pass
-    };
+    let overall = if feedback { step0_pass } else { all_pass };
     println!(
         "\n=== OVERALL ({mode}): {} ===",
         if overall { "PASS" } else { "FAIL" }

@@ -574,8 +574,7 @@ fn project_rotated(
         // dequantised weights to F16. The trunk is Q8 precisely because these
         // projections write straight into the residual stream, and decode reads
         // them with the F32 `gemv_q8_0` — an F16-rounded prefill would also
-        // disagree with decode. Same reasoning as gemma4's `lowered` path, which
-        // maps Q8_0 to `GemmQ8_0BatchedF32Chunked` for the same reason.
+        // disagree with decode.
         (DType::Q8_0, true) => {
             gpu.gemm_q8_0_batched_f32_chunked(weight.buf, x, output, weight.m, weight.k, rows)
         }
@@ -3048,6 +3047,8 @@ enum EmbeddingPath {
     Mq4V2,
     Bf16,
     Q8,
+    Hfq4G256,
+    Hfq4G128,
 }
 
 fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
@@ -3055,6 +3056,8 @@ fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
         DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
         DType::BF16 => Some(EmbeddingPath::Bf16),
         DType::Q8_0 => Some(EmbeddingPath::Q8),
+        DType::HFQ4G256 => Some(EmbeddingPath::Hfq4G256),
+        DType::HFQ4G128 => Some(EmbeddingPath::Hfq4G128),
         _ => None,
     }
 }
@@ -3100,6 +3103,12 @@ pub fn execute_embedding(gpu: &mut Gpu, op: &EmbeddingOp<'_>) -> Result<(), Disp
             gpu.embedding_lookup_bf16_batched(table, output, ids, op.rows, op.dim)
         }
         EmbeddingPath::Q8 => gpu.embedding_lookup_q8_batched(table, output, ids, op.rows, op.dim),
+        EmbeddingPath::Hfq4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(table, output, ids, op.rows, op.dim)
+        }
+        EmbeddingPath::Hfq4G128 => {
+            gpu.embedding_lookup_hfq4g128_batched(table, output, ids, op.rows, op.dim)
+        }
     })
 }
 

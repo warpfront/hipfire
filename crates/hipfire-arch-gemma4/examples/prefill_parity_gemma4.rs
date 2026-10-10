@@ -2,20 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Batched-vs-per-token prefill parity harness for the gemma4 lowered path.
+//! Batched-vs-per-token prefill parity harness for Gemma 4.
 //!
-//! Runs the SAME prompt through (A) per-token `forward_scratch` and
-//! (B) `forward_prefill_batch` with fresh KV each, compares prefill logits
+//! Runs the SAME prompt through (A) per-token `decode_step` and
+//! (B) `forward_prefill_batch` over all but the last token plus one
+//! `decode_step`, with fresh state each; compares the prompt's last logits
 //! (max-abs diff, argmax) and an N-token greedy continuation (per-token decode
-//! from both prefill states). Uses Q8 KV for both attention tiers, matching
-//! the daemon's explicit `--kv-mode q8` route.
+//! from both prefill states).
 //!
 //! Usage:
 //!   prefill_parity_gemma4 --model <hfq> [--prompt <text>] [--decode N]
-//!
-//! Env: HIPFIRE_GEMMA4_DUMP=1 + HIPFIRE_BATCHED_PREFILL / HIPFIRE_WMMA_PREFILL
-//! affect only the lowered internals (run_prefill_gemm WMMA arm); this harness
-//! calls forward_prefill_batch unconditionally for run B.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -24,9 +20,8 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_gemma4::lowered;
+    use hipfire_arch_gemma4::{forward, Gemma4Config, Gemma4State, Gemma4Weights};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::KvCache;
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::path::PathBuf;
 
@@ -64,23 +59,17 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("arch = {}", gpu.arch);
-    let mut hfq = HfqFile::open(&model).expect("open model");
-    let cfg = lowered::config_from_hfq(&hfq).expect("lowered config");
+    let hfq = HfqFile::open(&model).expect("open model");
+    let cfg = Gemma4Config::from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
-    let weights = lowered::load_weights(&mut hfq, &cfg, &mut gpu).expect("weights");
+    let weights = Gemma4Weights::load(&hfq, &cfg, &mut gpu).expect("weights");
     let mut ids = tok.encode(&prompt);
     if ids.first() != Some(&cfg.bos_token) {
         ids.insert(0, cfg.bos_token);
     }
     let max_seq = (ids.len() + decode_n + 16).max(cfg.sliding_window + 1);
-    let scratch = lowered::Gemma4Scratch::new(&mut gpu, &cfg, max_seq).expect("scratch");
-    lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim).expect("scratch consts");
 
-    eprintln!(
-        "prompt tokens = {} (chunk={})",
-        ids.len(),
-        scratch.max_prefill_batch
-    );
+    eprintln!("prompt tokens = {}", ids.len());
 
     let fnv = |bytes: &[u8]| -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -103,68 +92,26 @@ fn main() {
     };
 
     let mut run = |label: &str, batched: bool| -> (Vec<f32>, Vec<u32>) {
-        let mut kv_sliding = KvCache::new_gpu_q8_capped(
-            &mut gpu,
-            cfg.n_layers,
-            cfg.sliding_n_kv_heads,
-            cfg.sliding_head_dim,
-            max_seq,
-            cfg.sliding_window,
-        )
-        .expect("kv sliding");
-        let mut kv_full = KvCache::new_gpu_q8(
-            &mut gpu,
-            cfg.n_layers,
-            cfg.full_n_kv_heads,
-            cfg.full_head_dim,
-            max_seq,
-        )
-        .expect("kv full");
+        let mut state = Gemma4State::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state");
         let t0 = std::time::Instant::now();
         if batched {
-            let chunk = std::env::var("HIPFIRE_PREFILL_CHUNK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(scratch.max_prefill_batch)
-                .max(1);
-            let mut off = 0usize;
-            while off < ids.len() {
-                let end = (off + chunk).min(ids.len());
-                lowered::forward_prefill_batch(
-                    &mut gpu,
-                    &weights,
-                    &cfg,
-                    &ids[off..end],
-                    off,
-                    &mut kv_sliding,
-                    &mut kv_full,
-                    &scratch,
-                )
+            let last = ids.len() - 1;
+            forward::forward_prefill_batch(&cfg, &weights, &mut state, &mut gpu, &ids[..last], 0)
                 .expect("batched prefill");
-                off = end;
-            }
+            forward::decode_step(&cfg, &weights, &mut state, &mut gpu, ids[last], last as u32)
+                .expect("last prompt token");
         } else {
             for (p, &t) in ids.iter().enumerate() {
-                lowered::forward_scratch(
-                    &mut gpu,
-                    &weights,
-                    &cfg,
-                    t,
-                    p,
-                    &mut kv_sliding,
-                    &mut kv_full,
-                    &scratch,
-                )
-                .expect("per-token prefill");
+                forward::decode_step(&cfg, &weights, &mut state, &mut gpu, t, p as u32)
+                    .expect("per-token prefill");
             }
         }
-        let _ = gpu.download_f32(&scratch.logits);
         eprintln!(
             "[{label}] prefill {} tok in {:.3}s",
             ids.len(),
             t0.elapsed().as_secs_f64()
         );
-        let logits = gpu.download_f32(&scratch.logits).expect("logits dl");
+        let logits = gpu.download_f32(&state.logits).expect("logits dl");
         assert!(
             logits.iter().all(|v| v.is_finite()),
             "non-finite {label} logits"
@@ -183,25 +130,14 @@ fn main() {
         let mut next = am as u32;
         for _ in 0..decode_n {
             cont.push(next);
-            lowered::forward_scratch(
-                &mut gpu,
-                &weights,
-                &cfg,
-                next,
-                pos,
-                &mut kv_sliding,
-                &mut kv_full,
-                &scratch,
-            )
-            .expect("decode");
-            let l = gpu.download_f32(&scratch.logits).expect("dl");
+            let l = forward::decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32)
+                .expect("decode");
             next = argmax(&l).0 as u32;
             pos += 1;
         }
         eprintln!("[{label}] cont ids:  {:?}", cont);
         eprintln!("[{label}] cont text: {:?}", tok.decode(&cont));
-        kv_sliding.free_gpu(&mut gpu).expect("free sliding KV");
-        kv_full.free_gpu(&mut gpu).expect("free full KV");
+        state.free_gpu(&mut gpu);
         (logits, cont)
     };
 

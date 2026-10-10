@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Gemma 4 dense (text-only) config.
+//! Gemma 4 text config: dense 12B, E2B/E4B, and the 26B-A4B MoE.
 //!
-//! Parsed from the HFQ `metadata_json.config.text_config.*` envelope. Stage-1
-//! is dense text-only: MoE and multimodal towers are out of scope, while dense
-//! Gemma4 features such as KV sharing, double-wide MLP layers, and per-layer
-//! inputs are represented in the config so the forward path can opt in safely.
+//! Parsed from the HFQ `metadata_json.config.text_config.*` envelope. KV
+//! sharing, double-wide MLP layers, per-layer inputs and the parallel MoE
+//! block are all represented here so one weight stack and forward serve every
+//! variant. Multimodal towers remain out of scope.
 
 // ─── Layer / RoPE types ─────────────────────────────────────────────────
 
@@ -86,6 +86,13 @@ pub struct Gemma4Config {
     // KV sharing. Layers at or after `n_layers - num_kv_shared_layers` reuse
     // the last non-shared layer of the same attention type for K/V.
     pub num_kv_shared_layers: usize,
+
+    // MoE (26B-A4B). When set, every layer runs routed experts in parallel
+    // with its dense FFN; the two outputs meet before the post-FFN norm.
+    pub enable_moe_block: bool,
+    pub moe_intermediate_size: usize,
+    pub num_experts: usize,
+    pub top_k_experts: usize,
 
     // Output
     pub final_logit_softcapping: f32, // 30.0 — tanh(x/30)*30
@@ -210,6 +217,18 @@ impl Gemma4Config {
         let vocab_size_per_layer_input =
             getu(tc, "vocab_size_per_layer_input").unwrap_or(vocab_size as u64) as usize;
         let num_kv_shared_layers = getu(tc, "num_kv_shared_layers").unwrap_or(0) as usize;
+        let enable_moe_block = getb(tc, "enable_moe_block").unwrap_or(false);
+        let moe_intermediate_size = getu(tc, "moe_intermediate_size").unwrap_or(0) as usize;
+        let num_experts = getu(tc, "num_experts").unwrap_or(0) as usize;
+        let top_k_experts = getu(tc, "top_k_experts").unwrap_or(0) as usize;
+        if enable_moe_block
+            && (moe_intermediate_size == 0 || num_experts == 0 || top_k_experts == 0)
+        {
+            return Err(format!(
+                "gemma4: enable_moe_block needs nonzero moe_intermediate_size/num_experts/top_k_experts \
+                 (got {moe_intermediate_size}/{num_experts}/{top_k_experts})"
+            ));
+        }
 
         let final_logit_softcapping = getf(tc, "final_logit_softcapping").unwrap_or(0.0) as f32;
         let tie_word_embeddings = getb(tc, "tie_word_embeddings")
@@ -270,6 +289,10 @@ impl Gemma4Config {
             hidden_size_per_layer_input,
             vocab_size_per_layer_input,
             num_kv_shared_layers,
+            enable_moe_block,
+            moe_intermediate_size,
+            num_experts,
+            top_k_experts,
             final_logit_softcapping,
             tie_word_embeddings,
             embed_scale,
@@ -553,6 +576,10 @@ mod tests {
             hidden_size_per_layer_input: 256,
             vocab_size_per_layer_input: 262144,
             num_kv_shared_layers: 20,
+            enable_moe_block: false,
+            moe_intermediate_size: 0,
+            num_experts: 0,
+            top_k_experts: 0,
             final_logit_softcapping: 30.0,
             tie_word_embeddings: true,
             embed_scale: (1536.0f32).sqrt(),

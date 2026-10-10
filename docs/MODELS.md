@@ -217,9 +217,8 @@ Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) wit
 > `gemma4:` tags so that no registry row can point at a 404. See the report at
 > the bottom of this section for the exact repos/files to publish.
 
-**Architecture ground truth** (`crates/hipfire-arch-gemma4/src/config.rs`,
-`crates/hipfire-arch-gemma4/src/lowered.rs`, and
-`crates/hipfire-arch-gemma4/src/gemma4.rs`):
+**Architecture ground truth** (`crates/hipfire-arch-gemma4/src/config.rs`
+and `crates/hipfire-arch-gemma4/src/gemma4.rs`):
 
 - **Hybrid 5:1 sliding:global** — every 6th layer is global (full) attention.
   The per-layer `layer_types` array is authoritative; on the 12B dense text
@@ -237,7 +236,7 @@ Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) wit
   weight-less, implemented with a ones-filled scratch buffer).
 - **KV head counts (variant-dependent):** 12B text — `num_attention_heads = 16`,
   `num_key_value_heads = 8` (sliding) and `num_global_key_value_heads` defaults
-  to sliding when absent; 31B target (per `lowered.rs` comments) — `n_heads = 32`,
+  to sliding when absent; 31B target — `n_heads = 32`,
   `sliding_n_kv_heads = 16`, `full_n_kv_heads = 4`, `sliding_head_dim = 256`,
   `full_head_dim = 512`, `hidden_dim = 21504`. The 12B `hidden_dim` is
   `intermediate_size = 15360`, `dim = 3840`.

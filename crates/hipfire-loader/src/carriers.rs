@@ -2966,25 +2966,6 @@ impl Carrier for MapleCarrier {
 
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
-fn gemma4_use_lowered(
-    enable_moe_block: bool,
-    want_batched: bool,
-    has_drafter: bool,
-    is_e_series: bool,
-) -> bool {
-    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
-}
-
-fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
-    if is_e_series && has_drafter {
-        return Err(
-            "gemma4: E2B/E4B EAGLE spec-decode is not yet supported; load the E-series target without params.drafter"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
 pub struct Gemma4Carrier;
 impl Carrier for Gemma4Carrier {
     fn name(&self) -> &'static str {
@@ -2992,16 +2973,22 @@ impl Carrier for Gemma4Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        Err("gemma4: spec decode not yet wired (AR-only)".into())
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Gemma4Bundle>())
+        {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
+            _ => Err("gemma4: spec target state mismatch".into()),
+        }
     }
     fn make_spec_emitter<'a>(
         &self,
-        _ctx: SpecEmitCtx<'a>,
+        ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
-        Err("gemma4: spec emitter not yet wired".into())
+        Ok(Box::new(hipfire_arch_gemma4::emit::GemmaSpecEmit::new(ctx)))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 13 = gemma4_text (primary), 22 = gemma4_unified_assistant (EAGLE drafter sidecar).
@@ -3057,33 +3044,14 @@ impl Carrier for Gemma4Carrier {
                     tok,
                     i as u32,
                 ) {
-                    *prefill_err = Some(format!("gemma4 eager bench prefill failed: {error:?}"));
+                    *prefill_err = Some(format!("gemma4 bench prefill failed: {error:?}"));
                     return Some(false);
                 }
             }
             return Some(true);
         }
 
-        if let Some(bundle) = m.gemma4_lowered_mut() {
-            for (i, &tok) in synthetic.iter().enumerate() {
-                if let Err(error) = hipfire_arch_gemma4::lowered::forward_scratch(
-                    gpu,
-                    &bundle.weights,
-                    &bundle.config,
-                    tok,
-                    i,
-                    &mut bundle.kv_sliding,
-                    &mut bundle.kv_full,
-                    &bundle.scratch,
-                ) {
-                    *prefill_err = Some(format!("gemma4 lowered bench prefill failed: {error:?}"));
-                    return Some(false);
-                }
-            }
-            return Some(true);
-        }
-
-        *prefill_err = Some("gemma4 bench prefill missing eager/lowered state".into());
+        *prefill_err = Some("gemma4 bench prefill missing state".into());
         Some(false)
     }
     fn bench_decode_prime(
@@ -3122,34 +3090,14 @@ impl Carrier for Gemma4Carrier {
                     token,
                     (context + i) as u32,
                 ) {
-                    *decode_err = Some(format!("gemma4 eager bench decode failed: {error:?}"));
+                    *decode_err = Some(format!("gemma4 bench decode failed: {error:?}"));
                     return Some(false);
                 }
             }
             return Some(true);
         }
 
-        if let Some(bundle) = m.gemma4_lowered_mut() {
-            for i in 0..iterations {
-                let token = 101 + (i as u32 % 1000);
-                if let Err(error) = hipfire_arch_gemma4::lowered::forward_scratch(
-                    gpu,
-                    &bundle.weights,
-                    &bundle.config,
-                    token,
-                    context + i,
-                    &mut bundle.kv_sliding,
-                    &mut bundle.kv_full,
-                    &bundle.scratch,
-                ) {
-                    *decode_err = Some(format!("gemma4 lowered bench decode failed: {error:?}"));
-                    return Some(false);
-                }
-            }
-            return Some(true);
-        }
-
-        *decode_err = Some("gemma4 bench decode missing eager/lowered state".into());
+        *decode_err = Some("gemma4 bench decode missing state".into());
         Some(false)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
@@ -3161,175 +3109,75 @@ impl Carrier for Gemma4Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        let bundle = hipfire_arch_gemma4::load_gemma4_bundle(src, ctx)?;
-        match bundle {
-            hipfire_arch_gemma4::Gemma4Bundle::Lowered(l) => {
-                let eos_tok = resolve_eos_tok(
-                    &meta.tokenizer,
-                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
-                );
-                let speculator = crate::spec_build::build_speculator(
-                    meta.arch_id,
-                    None,
-                    None,
-                    true,
-                    ctx.max_seq,
-                    ctx.spec,
-                );
-                Ok(LoadedModel {
-                    state: Some(Box::new(crate::Gemma4LoweredBundle {
-                        config: l.config,
-                        weights: l.weights,
-                        scratch: l.scratch,
-                        kv_sliding: l.kv_sliding,
-                        kv_full: l.kv_full,
-                        eos_tok,
-                    })),
-                    speculator,
-                    ..LoadedModel::skeleton(
-                        meta.arch_id,
-                        meta.tokenizer,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                        ctx.path.to_string(),
-                        meta.chat_template,
-                    )
-                })
-            }
-            hipfire_arch_gemma4::Gemma4Bundle::Eager(e) => {
-                let eos_tok = resolve_eos_tok(
-                    &meta.tokenizer,
-                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
-                );
-                let _ = &e.weights;
-                // Optional EAGLE drafter (arch-22) — populated only when
-                // `gemma4_drafter_path` is Some. Validates draft_len 1..=5,
-                // arch_id 22, and backbone_hidden == target dim. On failure
-                // logs and falls back to AR-only (mirrors PR's contract) to
-                // avoid hard failing a valid target model due to a bad sidecar.
-                let eagle = if let Some(dp) = ctx.gemma4_drafter_path {
-                    let draft_len = crate::gemma4_eagle_spec_len(Some(ctx.gemma4_draft_len as u64))
-                        .map_err(|e| format!("gemma4 drafter spec_len: {e}"))?;
-                    match load_gemma4_eagle_state(dp, draft_len, &e.config, &e.weights, ctx.gpu) {
-                        Ok(st) => {
-                            eprintln!(
-                                "  gemma4 EAGLE drafter loaded: {} (layers={}, hidden={}, draft_len={})",
-                                dp, st.drafter_config.n_layers, st.drafter_config.hidden, st.draft_len,
-                            );
-                            Some(st)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  gemma4 EAGLE drafter load failed ({}): {} — falling back to AR only",
-                                dp, e
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let speculator = crate::spec_build::build_speculator(
-                    meta.arch_id,
-                    None,
-                    None,
-                    true,
-                    ctx.max_seq,
-                    ctx.spec,
-                );
-                Ok(LoadedModel {
-                    state: Some(Box::new(crate::Gemma4Bundle {
-                        config: e.config,
-                        weights: e.weights,
-                        state: e.state,
-                        eos_tok,
-                        eagle,
-                    })),
-                    speculator,
-                    ..LoadedModel::skeleton(
-                        meta.arch_id,
-                        meta.tokenizer,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                        ctx.path.to_string(),
-                        meta.chat_template,
-                    )
-                })
+        let session_domain = match &src {
+            ModelSource::Hfq(hfq) => Some(hipfire_runtime::serve_contract::CacheDomain::for_model(
+                hfq,
+                &meta.tokenizer,
+                meta.chat_template.as_deref(),
+                "gemma4",
+                ctx.gpu.device_id,
+            )),
+            ModelSource::Dir(_) => None,
+        };
+        let mut bundle = hipfire_arch_gemma4::load_gemma4_bundle(src, ctx)?;
+        let session_budget = hipfire_config::memory::session_cache_bytes();
+        let snapshots = hipfire_runtime::session_cache::SessionState::snapshot_scope(
+            &bundle,
+            hipfire_runtime::session_cache::SessionRoute::Ar,
+        )
+        .is_some();
+        if let Some(domain) = session_domain.filter(|_| session_budget > 0 && snapshots) {
+            bundle.attach_session_cache(hipfire_runtime::session_cache::SessionCache::new(
+                domain,
+                session_budget,
+            ));
+            eprintln!(
+                "  gemma4 session cache: {} MiB budget, {} MiB per {}-token snapshot",
+                session_budget >> 20,
+                bundle.session_snapshot_bytes() >> 20,
+                hipfire_arch_gemma4::bundle::SESSION_STRIDE,
+            );
+        }
+        bundle.eos_tok = resolve_eos_tok(
+            &meta.tokenizer,
+            &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+        );
+        // Optional EAGLE drafter (arch-22) as the request speculator. A bad
+        // sidecar logs and leaves the target AR-only.
+        let mut speculator = None;
+        if let Some(dp) = ctx.gemma4_drafter_path {
+            let draft_len = crate::gemma4_eagle_spec_len(Some(ctx.gemma4_draft_len as u64))
+                .map_err(|e| format!("gemma4 drafter spec_len: {e}"))?;
+            match hipfire_arch_gemma4::Gemma4Drafter::load(dp, draft_len, &bundle, ctx.gpu) {
+                Ok(drafter) => {
+                    eprintln!(
+                        "  gemma4 EAGLE drafter loaded: {} (layers={}, hidden={}, draft_len={draft_len})",
+                        dp,
+                        drafter.config().n_layers,
+                        drafter.config().hidden,
+                    );
+                    speculator = Some(Box::new(hipfire_runtime::spec::MtpSpeculator::new(drafter))
+                        as Box<dyn hipfire_runtime::spec::Speculator>);
+                }
+                Err(e) => eprintln!(
+                    "  gemma4 EAGLE drafter load failed ({}): {} — falling back to AR only",
+                    dp, e
+                ),
             }
         }
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
     }
-}
-
-fn load_gemma4_eagle_state(
-    drafter_path: &str,
-    draft_len: usize,
-    target_cfg: &hipfire_arch_gemma4::config::Gemma4Config,
-    target_weights: &hipfire_arch_gemma4::gemma4::Gemma4Weights,
-    gpu: &mut rdna_compute::Gpu,
-) -> Result<crate::Gemma4EagleState, String> {
-    use std::path::Path;
-    let dhfq = hipfire_runtime::hfq::HfqFile::open(Path::new(drafter_path))
-        .map_err(|e| format!("open gemma4 drafter: {e}"))?;
-    if dhfq.arch_id != 22 {
-        return Err(format!(
-            "gemma4 EAGLE drafter must be arch_id=22 (gemma4_unified_assistant); got arch_id={} — a DFlash draft goes in params.draft on qwen3.5 targets, not params.drafter",
-            dhfq.arch_id
-        ));
-    }
-    let dcfg = hipfire_arch_gemma4::drafter::Gemma4DrafterConfig::from_hfq(&dhfq)?;
-    if dcfg.backbone_hidden != target_cfg.dim {
-        return Err(format!(
-            "drafter backbone_hidden ({}) != target hidden ({}) — this drafter was trained against a different target width",
-            dcfg.backbone_hidden, target_cfg.dim
-        ));
-    }
-    let drafter_weights =
-        hipfire_arch_gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
-    let drafter_scratch = hipfire_arch_gemma4::drafter::Gemma4DrafterScratch::new(gpu, &dcfg)
-        .map_err(|e| format!("gemma4 drafter scratch: {e}"))?;
-    let spec_scratch =
-        hipfire_arch_gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)
-            .map_err(|e| format!("gemma4 spec scratch: {e}"))?;
-    // Prime the batched verify path (b=1 then real block size) on disposable
-    // throwaway states — mirrors PR's warmup to ensure kernels are compiled.
-    let warm_b = draft_len + 1;
-    {
-        let mut warm =
-            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
-                .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
-        let _ = hipfire_arch_gemma4::forward::forward_batch(
-            target_cfg,
-            target_weights,
-            &mut warm,
-            gpu,
-            &[target_cfg.bos_token],
-            0,
-        );
-        let _ = gpu.hip.device_synchronize();
-        warm.free_gpu(gpu);
-    }
-    {
-        let mut warm =
-            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
-                .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
-        let _ = hipfire_arch_gemma4::forward::forward_batch(
-            target_cfg,
-            target_weights,
-            &mut warm,
-            gpu,
-            &vec![target_cfg.bos_token; warm_b],
-            0,
-        );
-        let _ = gpu.hip.device_synchronize();
-        warm.free_gpu(gpu);
-    }
-    Ok(crate::Gemma4EagleState {
-        drafter_config: dcfg,
-        drafter_weights,
-        drafter_scratch,
-        spec_scratch,
-        draft_len,
-    })
 }
 
 // ─── MuseGlimmerCarrier ────────────────────────────────────────────────
@@ -3900,30 +3748,6 @@ impl Carrier for FluxDiffusionCarrier {
             supports_images: false,
             reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
-    }
-}
-
-#[cfg(test)]
-mod gemma4_route_tests {
-    use super::{gemma4_use_lowered, gemma4_validate_drafter_route};
-
-    #[test]
-    fn e_series_never_enters_dense_lowered_prefill() {
-        assert!(!gemma4_use_lowered(false, true, false, true));
-    }
-
-    #[test]
-    fn dense_opt_in_and_moe_keep_existing_routes() {
-        assert!(gemma4_use_lowered(false, true, false, false));
-        assert!(!gemma4_use_lowered(false, true, true, false));
-        assert!(gemma4_use_lowered(true, false, false, false));
-    }
-
-    #[test]
-    fn e_series_drafter_fails_closed() {
-        assert!(gemma4_validate_drafter_route(true, true).is_err());
-        assert!(gemma4_validate_drafter_route(true, false).is_ok());
-        assert!(gemma4_validate_drafter_route(false, true).is_ok());
     }
 }
 

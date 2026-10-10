@@ -112,6 +112,17 @@ __global__ void attention_flash_q8_0_tile(
     const int tile_end = min(tile_start + tile_size, seq_len);
     if (tile_start >= seq_len) return;
     const int tile_len = tile_end - tile_start;
+    // A tile wholly below the window contributes nothing: publish an empty
+    // partial (sum 0, which the reduce skips) instead of streaming its V rows
+    // with zero weights. Same output as the full pass.
+    if (tile_end <= win_lo) {
+        if (threadIdx.x == 0) {
+            float* pe = partials + (h * ((max_seq + tile_size - 1) / tile_size) + tile_id) * (2 + head_dim);
+            pe[0] = -1e30f;
+            pe[1] = 0.0f;
+        }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;

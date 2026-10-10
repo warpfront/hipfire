@@ -537,11 +537,10 @@ fn main() {
         );
         let _ = Path::new("/dev/null");
     } else if is_gemma {
-        // -------- gemma4 (arch 13) — q8 KV, sub-chunk 128, forward_prefill_batch --------
-        use hipfire_arch_gemma4::lowered::{self, Gemma4Scratch};
-        use hipfire_runtime::llama::KvCache;
+        // -------- gemma4 (arch 13) — q8 KV, per-token decode --------
+        use hipfire_arch_gemma4::{forward, Gemma4Config, Gemma4State, Gemma4Weights};
 
-        let cfg = lowered::config_from_hfq(&hfq).expect("gemma4 config_from_hfq");
+        let cfg = Gemma4Config::from_hfq(&hfq).expect("gemma4 config");
         eprintln!(
             "gemma4 arch=13 n_layers={} dim={} vocab={} hidden={} n_ctx={} top_k={}",
             cfg.n_layers, cfg.dim, cfg.vocab_size, cfg.hidden_dim, n_ctx, top_k
@@ -550,7 +549,7 @@ fn main() {
             eprintln!("gemma4 MoE (26B-A4B) not supported for BF16 KLD dense reference; refusing.");
             std::process::exit(1);
         }
-        let weights = lowered::load_weights(&mut hfq, &cfg, &mut gpu).expect("gemma4 load_weights");
+        let weights = Gemma4Weights::load(&hfq, &cfg, &mut gpu).expect("gemma4 load_weights");
         eprintln!("gemma4 loaded {} layers", cfg.n_layers);
 
         if let Some(parent) = output.parent() {
@@ -574,25 +573,8 @@ fn main() {
         }
 
         let kv_max = n_ctx + 16;
-        let scratch = Gemma4Scratch::new(&mut gpu, &cfg, kv_max).expect("gemma4 scratch");
-        lowered::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
-            .expect("gemma4 init_scratch_constants");
-        let mut kv_sliding = KvCache::new_gpu_q8(
-            &mut gpu,
-            cfg.n_layers,
-            cfg.sliding_n_kv_heads,
-            cfg.sliding_head_dim,
-            kv_max,
-        )
-        .expect("gemma sliding q8 kv");
-        let mut kv_full = KvCache::new_gpu_q8(
-            &mut gpu,
-            cfg.n_layers,
-            cfg.full_n_kv_heads,
-            cfg.full_head_dim,
-            kv_max,
-        )
-        .expect("gemma full q8 kv");
+        let mut state =
+            Gemma4State::new_with_max_seq(&mut gpu, &cfg, kv_max).expect("gemma4 state");
         // An F32 cache would error with `no implementation for KvWriteF32` — proven in calib_sweep.
 
         let k = top_k;
@@ -603,35 +585,27 @@ fn main() {
         let mut scored_done = 0usize;
 
         for c in 0..n_chunk {
-            kv_sliding
+            state
+                .kv_sliding
                 .clear_gpu(&mut gpu)
                 .expect("gemma kv sliding clear");
-            kv_full.clear_gpu(&mut gpu).expect("gemma kv full clear");
+            state.kv_full.clear_gpu(&mut gpu).expect("gemma kv full clear");
             let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
             // Per-token decode for the entire chunk, matching qwen35's proven
-            // per-token loop and calib_sweep's correctness reference (forward_scratch
-            // via Gemma4Bindings, not the batched prefill). The previous
-            // hybrid (batched prefill for prefix + per-token for scored window)
-            // left KV/position state misaligned at the 256 boundary — see
-            // lowered.rs forward_prefill_batch_v2 (batched Q/K/V + batched full
-            // attention) vs forward_scratch_inner_lowered (per-token). Using
-            // the single per-token path eliminates the boundary class.
+            // per-token loop.
             for pos in 0..(n_ctx - 1) {
-                lowered::forward_scratch(
-                    &mut gpu,
-                    &weights,
+                let cand_logits = forward::decode_step(
                     &cfg,
+                    &weights,
+                    &mut state,
+                    &mut gpu,
                     chunk[pos],
-                    pos,
-                    &mut kv_sliding,
-                    &mut kv_full,
-                    &scratch,
+                    pos as u32,
                 )
-                .expect("gemma forward_scratch");
+                .expect("gemma decode_step");
                 if pos < scoring_start {
                     continue;
                 }
-                let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
                 let actual_next = chunk[pos + 1] as usize;
                 write_scored_position(
                     &cand_logits,

@@ -288,7 +288,7 @@ fn redline_append_mapped(
 
 fn redline_gemma4_snapshot(
     gpu: &rdna_compute::Gpu,
-    bundle: &hipfire_loader::Gemma4LoweredBundle,
+    bundle: &hipfire_loader::Gemma4Bundle,
     _position: usize,
 ) -> Result<RedlineGemma4Snapshot, String> {
     fn append_kv(
@@ -317,8 +317,9 @@ fn redline_gemma4_snapshot(
         Ok(())
     }
 
+    let state = &bundle.state;
     let mut logits = Vec::new();
-    redline_append_buffer(gpu, &mut logits, &bundle.scratch.logits.buf)?;
+    redline_append_buffer(gpu, &mut logits, &state.logits.buf)?;
     let mut sliding_kv = Vec::new();
     let mut sliding_kv_regions = Vec::new();
     append_kv(
@@ -326,7 +327,7 @@ fn redline_gemma4_snapshot(
         &mut sliding_kv,
         &mut sliding_kv_regions,
         "sliding",
-        &bundle.kv_sliding,
+        &state.kv_sliding,
     )?;
     let mut full_kv = Vec::new();
     let mut full_kv_regions = Vec::new();
@@ -335,84 +336,59 @@ fn redline_gemma4_snapshot(
         &mut full_kv,
         &mut full_kv_regions,
         "full",
-        &bundle.kv_full,
+        &state.kv_full,
     )?;
-    macro_rules! snapshot_buffer {
-        ($buffer:expr) => {{
-            let mut bytes = Vec::new();
-            redline_append_buffer(gpu, &mut bytes, $buffer)?;
-            bytes
-        }};
-    }
+    let snapshot = |tensor: Option<&rdna_compute::GpuTensor>| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        if let Some(tensor) = tensor {
+            redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
+        }
+        Ok(bytes)
+    };
+    let moe = state.moe.as_ref();
     Ok(RedlineGemma4Snapshot {
         logits,
         sliding_kv,
         full_kv,
         sliding_kv_regions,
         full_kv_regions,
-        scratch_x: snapshot_buffer!(&bundle.scratch.x.buf),
-        scratch_tmp: snapshot_buffer!(&bundle.scratch.tmp.buf),
-        scratch_q: snapshot_buffer!(&bundle.scratch.q.buf),
-        scratch_k: snapshot_buffer!(&bundle.scratch.k.buf),
-        scratch_v: snapshot_buffer!(&bundle.scratch.v.buf),
-        scratch_attn_out: snapshot_buffer!(&bundle.scratch.attn_out.buf),
-        scratch_residual: snapshot_buffer!(&bundle.scratch.residual.buf),
-        scratch_moe_cur_mlp: snapshot_buffer!(&bundle.scratch.moe_cur_mlp.buf),
-        scratch_moe_cur_moe: snapshot_buffer!(&bundle.scratch.moe_cur_moe.buf),
-        scratch_gate_ffn: snapshot_buffer!(&bundle.scratch.gate_ffn.buf),
-        scratch_up_ffn: snapshot_buffer!(&bundle.scratch.up_ffn.buf),
-        scratch_ffn_hidden: snapshot_buffer!(&bundle.scratch.ffn_hidden.buf),
-        scratch_ffn_out: snapshot_buffer!(&bundle.scratch.ffn_out.buf),
+        scratch_x: snapshot(Some(&state.x))?,
+        scratch_tmp: snapshot(Some(&state.tmp))?,
+        scratch_q: snapshot(Some(&state.q))?,
+        scratch_k: snapshot(Some(&state.k))?,
+        scratch_v: snapshot(Some(&state.v))?,
+        scratch_attn_out: snapshot(Some(&state.attn_out))?,
+        scratch_residual: snapshot(Some(&state.residual))?,
+        scratch_moe_cur_mlp: snapshot(moe.map(|m| &m.cur_mlp))?,
+        scratch_moe_cur_moe: snapshot(moe.map(|m| &m.cur_moe))?,
+        scratch_gate_ffn: snapshot(Some(&state.gate_ffn))?,
+        scratch_up_ffn: snapshot(Some(&state.up_ffn))?,
+        scratch_ffn_hidden: snapshot(Some(&state.ffn_hidden))?,
+        scratch_ffn_out: snapshot(Some(&state.ffn_out))?,
     })
 }
 
 fn redline_reset_gemma4(
     gpu: &mut rdna_compute::Gpu,
-    bundle: &mut hipfire_loader::Gemma4LoweredBundle,
+    bundle: &mut hipfire_loader::Gemma4Bundle,
 ) -> Result<(), String> {
-    bundle
+    let state = &mut bundle.state;
+    state
         .kv_sliding
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
-    bundle
+    state
         .kv_full
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
-    bundle.kv_sliding.compact_offset = 0;
-    bundle.kv_full.compact_offset = 0;
+    state.kv_sliding.compact_offset = 0;
+    state.kv_full.compact_offset = 0;
     // The three oracle arms must begin with identical scratch as well as KV.
-    // Reset the complete lowered scratch surface so inactive and tail lanes
-    // are deterministic across the HIP, kernarg-blob, and retained arms.
-    for buffer in [
-        &bundle.scratch.x.buf,
-        &bundle.scratch.residual.buf,
-        &bundle.scratch.tmp.buf,
-        &bundle.scratch.q.buf,
-        &bundle.scratch.k.buf,
-        &bundle.scratch.v.buf,
-        &bundle.scratch.attn_out.buf,
-        &bundle.scratch.gate_ffn.buf,
-        &bundle.scratch.up_ffn.buf,
-        &bundle.scratch.ffn_hidden.buf,
-        &bundle.scratch.ffn_out.buf,
-        &bundle.scratch.logits.buf,
-        &bundle.scratch.flash_partials.buf,
-        &bundle.scratch.moe_cur_mlp.buf,
-        &bundle.scratch.moe_pre2.buf,
-        &bundle.scratch.moe_router_in.buf,
-        &bundle.scratch.moe_router_logits.buf,
-        &bundle.scratch.moe_topk_indices.buf,
-        &bundle.scratch.moe_topk_weights.buf,
-        &bundle.scratch.moe_cur_moe.buf,
-        &bundle.scratch.moe_expert_gate_up.buf,
-        &bundle.scratch.moe_expert_hidden.buf,
-        &bundle.scratch.moe_expert_out.buf,
-        &bundle.scratch.moe_pre2_rot.buf,
-        &bundle.scratch.moe_expert_gate_batch.buf,
-        &bundle.scratch.moe_expert_up_batch.buf,
-    ] {
+    // Reset the complete scratch surface so inactive and tail lanes are
+    // deterministic across the HIP, kernarg-blob, and retained arms.
+    for tensor in state.scratch_tensors() {
         gpu.hip
-            .memset(buffer, 0, buffer.size())
+            .memset(&tensor.buf, 0, tensor.buf.size())
             .map_err(|error| error.to_string())?;
     }
     gpu.invalidate_graph_state();
@@ -423,67 +399,41 @@ fn redline_reset_gemma4(
 
 fn redline_prime_gemma4(
     gpu: &mut rdna_compute::Gpu,
-    bundle: &mut hipfire_loader::Gemma4LoweredBundle,
+    bundle: &mut hipfire_loader::Gemma4Bundle,
     context: usize,
 ) -> Result<(), String> {
     for i in 0..context {
-        hipfire_arch_gemma4::lowered::forward_scratch(
-            gpu,
-            &bundle.weights,
+        hipfire_arch_gemma4::forward::decode_step(
             &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
             10 + (i as u32 % 1000),
-            i,
-            &mut bundle.kv_sliding,
-            &mut bundle.kv_full,
-            &bundle.scratch,
-        )
-        .map_err(|error| error.to_string())?;
+            i as u32,
+        )?;
     }
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
 }
 
+/// Stage `token`'s embedding and `position` exactly as a decode step does,
+/// outside the recorded body.
 fn redline_prepare_gemma4(
     gpu: &mut rdna_compute::Gpu,
-    bundle: &hipfire_loader::Gemma4LoweredBundle,
+    bundle: &mut hipfire_loader::Gemma4Bundle,
     token: u32,
     position: usize,
 ) -> Result<(), String> {
-    use hipfire_runtime::llama::EmbeddingFormat;
-
-    match bundle.weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        EmbeddingFormat::F32 => gpu.embedding_lookup(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        _ => return Err("unsupported Gemma4 Redline embedding format".into()),
-    }
-    .map_err(|error| error.to_string())?;
-    gpu.scale_f32(&bundle.scratch.x, bundle.config.embed_scale)
-        .map_err(|error| error.to_string())?;
+    hipfire_arch_gemma4::forward::prepare_token(
+        &bundle.config,
+        &bundle.weights,
+        &mut bundle.state,
+        gpu,
+        token,
+    )?;
     gpu.hip
-        .memcpy_htod(&bundle.scratch.pos_buf, &(position as i32).to_ne_bytes())
+        .memcpy_htod(&bundle.state.pos_buf.buf, &(position as i32).to_ne_bytes())
         .map_err(|error| error.to_string())
 }
 
@@ -4209,8 +4159,8 @@ fn redline_shadow_gemma4(
 
     let replay_arm = (|| -> Result<(RedlineGemma4Snapshot, f64, f64), String> {
         let bundle = loaded
-            .gemma4_lowered_mut()
-            .ok_or("Gemma4 Redline shadow requires lowered state")?;
+            .gemma4_mut()
+            .ok_or("Gemma4 Redline shadow requires Gemma 4 state")?;
         redline_reset_gemma4(gpu, bundle)?;
         redline_prime_gemma4(gpu, bundle, context)?;
         let started = Instant::now();
@@ -4256,8 +4206,8 @@ fn redline_shadow_gemma4(
 
     let blob_snapshot = (|| -> Result<RedlineGemma4Snapshot, String> {
         let bundle = loaded
-            .gemma4_lowered_mut()
-            .ok_or("Gemma4 Redline blob oracle requires lowered state")?;
+            .gemma4_mut()
+            .ok_or("Gemma4 Redline blob oracle requires Gemma 4 state")?;
         redline_reset_gemma4(gpu, bundle)?;
         redline_prime_gemma4(gpu, bundle, context)?;
         for i in 0..iterations {
@@ -4273,24 +4223,21 @@ fn redline_shadow_gemma4(
 
     let hip_arm = (|| -> Result<(RedlineGemma4Snapshot, f64), String> {
         let bundle = loaded
-            .gemma4_lowered_mut()
-            .ok_or("Gemma4 Redline HIP oracle requires lowered state")?;
+            .gemma4_mut()
+            .ok_or("Gemma4 Redline HIP oracle requires Gemma 4 state")?;
         redline_reset_gemma4(gpu, bundle)?;
         redline_prime_gemma4(gpu, bundle, context)?;
         let started = Instant::now();
         for i in 0..iterations {
             redline_prepare_gemma4(gpu, bundle, 101 + (i as u32 % 1000), position(i))?;
-            hipfire_arch_gemma4::lowered::forward_scratch(
-                gpu,
-                &bundle.weights,
+            hipfire_arch_gemma4::forward::decode_step(
                 &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
                 101 + (i as u32 % 1000),
-                position(i),
-                &mut bundle.kv_sliding,
-                &mut bundle.kv_full,
-                &bundle.scratch,
-            )
-            .map_err(|error| error.to_string())?;
+                position(i) as u32,
+            )?;
         }
         gpu.hip
             .device_synchronize()
@@ -4389,7 +4336,7 @@ pub fn handle_redline_shadow(
         loaded.pp == 1
             && loaded.ep.is_none()
             && loaded.state.as_ref().is_some_and(|state| {
-                (state.as_ref() as &dyn Any).is::<hipfire_loader::Gemma4LoweredBundle>()
+                (state.as_ref() as &dyn Any).is::<hipfire_loader::Gemma4Bundle>()
             })
     }) {
         let loaded = model.as_mut().expect("Gemma4 retained route checked");

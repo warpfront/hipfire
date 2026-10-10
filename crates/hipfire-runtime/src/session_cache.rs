@@ -19,6 +19,12 @@
 //! [`SessionCache::begin_live`], which arms boundaries only when asked to
 //! capture.
 //!
+//! [`SessionDriver`] is what an architecture's bundle holds: the cache plus
+//! the committed live state of the current conversation. It plans the longer
+//! of the live state and a cached snapshot, starts each prefill as a live
+//! continuation, a restore or a cold start, and keeps the live state after a
+//! committed turn whose consumed history extends the turn's prompt.
+//!
 //! Snapshots are deltas: one stores the fixed (overwritten-in-place) state
 //! whole, but of each append-only [`RowStream`] only the rows above its
 //! parent, the deepest snapshot of the same prefix that was present when it
@@ -116,10 +122,14 @@ pub trait SessionState {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String>;
+    /// The position every owner of `route` sits at when the live state can
+    /// continue in place; `None` when it cannot (an owner lags, or verify
+    /// state is armed).
+    fn live_position(&self, route: SessionRoute) -> Option<usize>;
     /// Device bytes the live state may still map or allocate before it
-    /// reaches the end of the prompt in flight (the cache leaves them free:
-    /// it never takes memory the context needs).
-    fn growth_reserve_bytes(&self, gpu: &Gpu) -> u64;
+    /// holds `through` tokens, the end of the prompt in flight (the cache
+    /// leaves them free: it never takes memory the context needs).
+    fn growth_reserve_bytes(&self, gpu: &Gpu, through: usize) -> u64;
     /// Cold-start the live state.
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 }
@@ -182,6 +192,8 @@ struct Turn {
     domain: CacheDomain,
     route: SessionRoute,
     boundaries: VecDeque<usize>,
+    /// Length of the prompt in flight.
+    end: usize,
 }
 
 pub struct SessionCache {
@@ -346,6 +358,7 @@ impl SessionCache {
                 .into(),
             domain,
             route,
+            end: prompt.len(),
         });
         Ok(())
     }
@@ -394,6 +407,7 @@ impl SessionCache {
                 .into(),
             domain: self.domain.scoped(&scope),
             route,
+            end: prompt.len(),
         });
     }
 
@@ -514,12 +528,12 @@ impl SessionCache {
             ));
         }
         turn.boundaries.pop_front();
-        let (domain, route, p) = (turn.domain.clone(), turn.route, prefix.len());
+        let (domain, route, p, end) = (turn.domain.clone(), turn.route, prefix.len(), turn.end);
         let fp = prefix_fingerprint(prefix);
         if self.pool.contains(&domain, p as u64, fp) {
             return Ok(());
         }
-        let growth = state.growth_reserve_bytes(gpu);
+        let growth = state.growth_reserve_bytes(gpu, end);
         let ancestors: Vec<Key> = state
             .snapshot_boundaries(prefix, 0, p - 1)
             .into_iter()
@@ -738,6 +752,216 @@ impl SessionCache {
     }
 }
 
+/// Ascending snapshot boundaries in `(after, up_to]`: multiples of `stride`,
+/// plus the position after every `turn_end` token of `prompt` (message ends)
+/// when it is `Some`.
+pub fn stride_boundaries(
+    stride: usize,
+    prompt: &[u32],
+    turn_end: Option<u32>,
+    after: usize,
+    up_to: usize,
+) -> Vec<usize> {
+    let mut boundaries: Vec<usize> = (after / stride + 1..=up_to / stride)
+        .map(|k| k * stride)
+        .collect();
+    if let Some(turn_end) = turn_end {
+        let end = up_to.min(prompt.len());
+        boundaries.extend(
+            (after.min(end)..end)
+                .filter(|&i| prompt[i] == turn_end)
+                .map(|i| i + 1),
+        );
+        boundaries.sort_unstable();
+        boundaries.dedup();
+    }
+    boundaries
+}
+
+/// Host record of the committed live state: the consumed history it holds and
+/// the route that produced it. A live continuation is *session-exact* (its
+/// state descends from decode, as in a continuous conversation), not
+/// cold-exact, so it is only resumed in place and never captured into the
+/// cross-session cache, except by boundaries the architecture scopes apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveRecord {
+    tokens: Vec<u32>,
+    route: SessionRoute,
+}
+
+/// `Some(L)` when the live state in `record` can serve `prompt` on `route`:
+/// it holds exactly `L = record.tokens.len()` tokens (`0 < L < prompt.len()`,
+/// so at least the last prompt token is computed), those tokens are
+/// `prompt[..L]`, and every owner sits at `L`.
+fn live_start(
+    record: Option<&LiveRecord>,
+    prompt: &[u32],
+    route: SessionRoute,
+    live_position: Option<usize>,
+) -> Option<usize> {
+    let record = record?;
+    let end = record.tokens.len();
+    (record.route == route
+        && end > 0
+        && end < prompt.len()
+        && prompt[..end] == record.tokens[..]
+        && live_position == Some(end))
+    .then_some(end)
+}
+
+/// Whether the state left by the turn that began with `turn_prompt` is the
+/// live state after `consumed`, the full host history the client committed:
+/// `consumed` extends the turn's prompt and every owner sits at its end. An
+/// empty `consumed` (unrepaired terminal) is never live.
+fn live_after_commit(turn_prompt: &[u32], consumed: &[u32], live_position: Option<usize>) -> bool {
+    let prompt_len = turn_prompt.len();
+    prompt_len > 0
+        && consumed.len() >= prompt_len
+        && consumed[..prompt_len] == *turn_prompt
+        && live_position == Some(consumed.len())
+}
+
+/// Prompt tokens the next prefill skips: the live state when it reaches at
+/// least as far as the longest cached snapshot (a tie prefers live: no copy),
+/// else that snapshot.
+fn plan_start(snapshot: usize, live: Option<usize>) -> usize {
+    match live {
+        Some(live) if live >= snapshot => live,
+        _ => snapshot,
+    }
+}
+
+/// The session machinery an architecture's bundle holds: the shared snapshot
+/// cache plus the committed live state of the current conversation.
+pub struct SessionDriver {
+    cache: SessionCache,
+    /// Committed live state kept for a continuation of the same conversation;
+    /// consumed while a request is in flight.
+    live: Option<LiveRecord>,
+    /// Prompt and route of the request in flight.
+    turn: Option<(Vec<u32>, SessionRoute)>,
+}
+
+impl SessionDriver {
+    pub fn new(cache: SessionCache) -> Self {
+        Self {
+            cache,
+            live: None,
+            turn: None,
+        }
+    }
+
+    pub fn cache(&self) -> &SessionCache {
+        &self.cache
+    }
+
+    /// [`SessionCache::release_for`].
+    pub fn release_for(&mut self, gpu: &mut Gpu, need: u64) -> u64 {
+        self.cache.release_for(gpu, need)
+    }
+
+    fn live_hit(
+        &self,
+        state: &dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+    ) -> Option<usize> {
+        live_start(
+            self.live.as_ref(),
+            prompt,
+            route,
+            state.live_position(route),
+        )
+    }
+
+    /// Prompt tokens the next prefill of `prompt` on `route` can skip: the
+    /// longer of the live state and a cached snapshot; 0 on a miss.
+    pub fn plan(&self, state: &dyn SessionState, prompt: &[u32], route: SessionRoute) -> usize {
+        plan_start(
+            self.cache.plan(state, prompt, route),
+            self.live_hit(state, prompt, route),
+        )
+    }
+
+    /// Start a prefill of `prompt` on `route` that skips the `reused` tokens
+    /// [`Self::plan`] returned:
+    /// - live: `reused` is the end of the committed live state; every owner
+    ///   is kept, nothing is restored, and boundaries above `reused` are
+    ///   captured only with `capture_live`;
+    /// - snapshot: restore the `reused`-token snapshot;
+    /// - `reused == 0`: cold start.
+    ///
+    /// Returns whether the prefill continues the live state.
+    pub fn begin(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+        capture_live: bool,
+    ) -> Result<bool, String> {
+        let live = reused > 0 && self.live_hit(state, prompt, route) == Some(reused);
+        self.live = None;
+        self.turn = None;
+        if live {
+            self.cache
+                .begin_live(gpu, state, prompt, route, reused, capture_live);
+        } else {
+            self.cache.begin(gpu, state, prompt, route, reused)?;
+        }
+        self.turn = Some((prompt.to_vec(), route));
+        Ok(live)
+    }
+
+    /// The next position the running prefill must stop at and report.
+    pub fn next_boundary(&self) -> Option<usize> {
+        self.cache.next_boundary()
+    }
+
+    /// Report that every owner consumed exactly `prefix` (the boundary).
+    pub fn at_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prefix: &[u32],
+    ) -> Result<(), String> {
+        self.cache.at_boundary(gpu, state, prefix)
+    }
+
+    /// Publish this turn's snapshots and drop the live state.
+    pub fn commit(&mut self) {
+        self.cache.commit();
+        self.forget_live();
+    }
+
+    /// Publish this turn's snapshots and keep the live state when `consumed`
+    /// (the host history the client committed) extends this turn's prompt and
+    /// every owner sits exactly at its end. The next turn of the conversation
+    /// then prefills only the suffix in place.
+    pub fn commit_live(&mut self, state: &dyn SessionState, consumed: &[u32]) {
+        self.cache.commit();
+        self.live = self.turn.take().and_then(|(prompt, route)| {
+            live_after_commit(&prompt, consumed, state.live_position(route)).then(|| LiveRecord {
+                tokens: consumed.to_vec(),
+                route,
+            })
+        });
+    }
+
+    /// Forget the live state (the owners were reset).
+    pub fn forget_live(&mut self) {
+        self.live = None;
+        self.turn = None;
+    }
+
+    /// Drop every snapshot, pending ones included, and the live state.
+    pub fn clear(&mut self, gpu: &mut Gpu) {
+        self.forget_live();
+        self.cache.clear(gpu);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,7 +1065,10 @@ mod tests {
             self.position = u64::from_le_bytes(meta.try_into().unwrap()) as usize;
             Ok(())
         }
-        fn growth_reserve_bytes(&self, _gpu: &Gpu) -> u64 {
+        fn live_position(&self, _route: SessionRoute) -> Option<usize> {
+            Some(self.position)
+        }
+        fn growth_reserve_bytes(&self, _gpu: &Gpu, _through: usize) -> u64 {
             0
         }
         fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -1130,6 +1357,142 @@ mod tests {
         assert_eq!(cache.plan(&toy, &probe, SessionRoute::Ar), marker_end);
         assert_restores(&mut cache, gpu, &mut toy, &probe, marker_end);
         cache.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    const AR: SessionRoute = SessionRoute::Ar;
+    const MTP: SessionRoute = SessionRoute::Mtp;
+    const END: u32 = 7;
+
+    fn record(tokens: &[u32], route: SessionRoute) -> LiveRecord {
+        LiveRecord {
+            tokens: tokens.to_vec(),
+            route,
+        }
+    }
+
+    #[test]
+    fn stride_boundaries_union_strides_and_message_ends() {
+        let mut prompt = vec![1u32; 20];
+        prompt[2] = END; // ends at 3
+        prompt[7] = END; // ends at 8: a stride multiple
+        prompt[13] = END; // ends at 14
+        assert_eq!(stride_boundaries(4, &prompt, None, 0, 20), [4, 8, 12, 16, 20]);
+        // Union, sorted and deduplicated (8 is both).
+        assert_eq!(
+            stride_boundaries(4, &prompt, Some(END), 0, 20),
+            [3, 4, 8, 12, 14, 16, 20]
+        );
+        // `after` is exclusive and `up_to` inclusive for both sources.
+        assert_eq!(stride_boundaries(4, &prompt, Some(END), 3, 14), [4, 8, 12, 14]);
+        assert_eq!(stride_boundaries(4, &prompt, None, 3, 14), [4, 8, 12]);
+        // Message ends below one stride are boundaries on their own.
+        assert_eq!(stride_boundaries(64, &prompt, Some(END), 0, 20), [3, 8, 14]);
+        assert!(stride_boundaries(64, &prompt, None, 0, 20).is_empty());
+        // Consecutive ends each count; `up_to` past the prompt never reads past it.
+        assert_eq!(stride_boundaries(64, &[END, END, 1, END], Some(END), 0, 9), [1, 2, 4]);
+    }
+
+    #[test]
+    fn live_start_requires_a_strict_extension_at_the_owner_position() {
+        let rec = record(&[1, 2, 3], AR);
+        let at = |prompt: &[u32]| live_start(Some(&rec), prompt, AR, Some(3));
+        assert_eq!(at(&[1, 2, 3, 4]), Some(3));
+        assert_eq!(at(&[1, 2, 3, 4, 5, 6]), Some(3));
+        // Diverges inside the record.
+        assert_eq!(at(&[1, 9, 3, 4]), None);
+        // L == prompt.len() leaves no suffix; a shorter prompt is no extension.
+        assert_eq!(at(&[1, 2, 3]), None);
+        assert_eq!(at(&[1, 2]), None);
+        // No record, an empty one, another route, or owners off the end.
+        assert_eq!(live_start(None, &[1, 2, 3, 4], AR, Some(3)), None);
+        assert_eq!(live_start(Some(&record(&[], AR)), &[1, 2], AR, Some(0)), None);
+        assert_eq!(live_start(Some(&rec), &[1, 2, 3, 4], MTP, Some(3)), None);
+        assert_eq!(live_start(Some(&rec), &[1, 2, 3, 4], AR, Some(2)), None);
+        assert_eq!(live_start(Some(&rec), &[1, 2, 3, 4], AR, None), None);
+    }
+
+    #[test]
+    fn live_after_commit_needs_consumed_to_extend_the_turn_prompt() {
+        let prompt = [1, 2, 3];
+        let commit = |consumed: &[u32], pos: usize| live_after_commit(&prompt, consumed, Some(pos));
+        assert!(commit(&[1, 2, 3, 7, 8], 5));
+        // Nothing generated: consumed == prompt.
+        assert!(commit(&[1, 2, 3], 3));
+        // Unrepaired terminal: the host history is empty.
+        assert!(!commit(&[], 0));
+        // Shorter than the prompt, or not extending it.
+        assert!(!commit(&[1, 2], 2));
+        assert!(!commit(&[1, 9, 3, 7], 4));
+        // Owners not at the end of the consumed history, or unable to continue.
+        assert!(!commit(&[1, 2, 3, 7, 8], 4));
+        assert!(!live_after_commit(&prompt, &[1, 2, 3, 7], None));
+        // A turn without a prompt is never live.
+        assert!(!live_after_commit(&[], &[1], Some(1)));
+    }
+
+    #[test]
+    fn plan_prefers_live_on_a_tie_and_the_longer_source_otherwise() {
+        assert_eq!(plan_start(4096, None), 4096);
+        assert_eq!(plan_start(0, None), 0);
+        assert_eq!(plan_start(0, Some(300)), 300);
+        assert_eq!(plan_start(4096, Some(4096)), 4096);
+        assert_eq!(plan_start(4096, Some(9000)), 9000);
+        assert_eq!(plan_start(8192, Some(300)), 8192);
+    }
+
+    #[test]
+    fn driver_continues_live_state_and_restores_snapshots() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let fixed = gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap();
+        let rows = gpu
+            .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+            .unwrap();
+        let mut toy = Toy {
+            fixed,
+            rows,
+            position: 0,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 8 * one));
+        let prefill = |driver: &mut SessionDriver, toy: &mut Toy, gpu: &mut Gpu, p: &[u32]| {
+            let reused = driver.plan(toy, p, AR);
+            let live = driver.begin(gpu, toy, p, AR, reused, false).unwrap();
+            while let Some(b) = driver.next_boundary() {
+                toy.advance(gpu, &p[..b]);
+                driver.at_boundary(gpu, toy, &p[..b]).unwrap();
+            }
+            toy.advance(gpu, p);
+            (reused, live)
+        };
+        // Turn 1, cold; the decoded tail extends the state, commit keeps it live.
+        let turn1 = prompt(1, STRIDE + 5);
+        assert_eq!(prefill(&mut driver, &mut toy, gpu, &turn1), (0, false));
+        let mut consumed = turn1.clone();
+        consumed.extend([11, 12]);
+        toy.advance(gpu, &consumed);
+        driver.commit_live(&toy, &consumed);
+        // Turn 2 extends the consumed history: continue in place.
+        let mut turn2 = consumed.clone();
+        turn2.extend(prompt(2, 9));
+        assert_eq!(
+            prefill(&mut driver, &mut toy, gpu, &turn2),
+            (consumed.len(), true)
+        );
+        assert_eq!(toy.bytes(gpu), (fixed_of(&turn2), rows_of(&turn2)));
+        // A plain commit drops the live state: another conversation sharing
+        // turn 1's first stride restores the snapshot.
+        driver.commit();
+        let mut other = turn1[..STRIDE].to_vec();
+        other.extend(prompt(3, 4));
+        assert_eq!(prefill(&mut driver, &mut toy, gpu, &other), (STRIDE, false));
+        assert_eq!(toy.bytes(gpu), (fixed_of(&other), rows_of(&other)));
+        driver.clear(gpu);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }

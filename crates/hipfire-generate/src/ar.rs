@@ -2448,37 +2448,6 @@ pub fn generate(
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
-            // The loader publishes one of two mutually-exclusive Gemma4 states:
-            // eager dense (ModelState::Gemma4) and lowered/MoE
-            // (ModelState::Gemma4Lowered). Lowered models are served by
-            // generate_gemma4_lowered below; eager models continue through
-            // generate_gemma4.
-            if m.gemma4_lowered_mut().is_some() {
-                crate::dense::generate_gemma4_lowered(
-                    m,
-                    gpu,
-                    stdout,
-                    id,
-                    prompt,
-                    system_prompt,
-                    temp,
-                    top_p,
-                    top_k,
-                    min_p,
-                    max_tokens,
-                    repeat_penalty,
-                    repeat_window,
-                    presence_penalty,
-                    frequency_penalty,
-                    max_think_tokens,
-                    enable_thinking,
-                    tools,
-                    messages_history,
-                    logprobs_top_k,
-                    request_seed,
-                );
-                return;
-            }
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
@@ -2487,15 +2456,7 @@ pub fn generate(
                 pflash_cfg,
                 think_mode,
                 user_explicit_sampling,
-                top_k,
-                min_p,
                 cactus_delta,
-            );
-            let _ = (
-                repeat_penalty,
-                repeat_window,
-                presence_penalty,
-                frequency_penalty,
             );
             crate::dense::generate_gemma4(
                 m,
@@ -2504,8 +2465,18 @@ pub fn generate(
                 id,
                 prompt,
                 system_prompt,
-                temp,
-                top_p,
+                SamplerConfig {
+                    temperature: temp,
+                    top_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    blocked_tokens: Vec::new(),
+                    top_k,
+                    min_p,
+                },
+                request_seed,
                 max_tokens,
                 max_think_tokens,
                 enable_thinking,
