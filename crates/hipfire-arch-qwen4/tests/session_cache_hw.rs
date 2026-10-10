@@ -179,10 +179,10 @@ struct Loaded {
 }
 
 /// Load the model named by `HIPFIRE_SESSION_CACHE_MODEL` and attach the
-/// forward and an unbounded session cache. `turn_snapshots` sets message-end
-/// snapshots explicitly, whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the
-/// `<|im_end|>` token is still the caller's `set_turn_end_token`).
-fn load(turn_snapshots: bool) -> Loaded {
+/// forward and a session cache of `budget` bytes. `turn_snapshots` sets
+/// message-end snapshots explicitly, whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS`
+/// says (the `<|im_end|>` token is still the caller's `set_turn_end_token`).
+fn load(turn_snapshots: bool, budget: u64) -> Loaded {
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
@@ -234,7 +234,7 @@ fn load(turn_snapshots: bool) -> Loaded {
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
     bundle.attach_forward(&mut gpu, MAX_SEQ).expect("forward");
-    bundle.attach_session_cache(SessionCache::new(domain, u64::MAX >> 1));
+    bundle.attach_session_cache(SessionCache::new(domain, budget));
     Loaded {
         bundle,
         gpu,
@@ -255,7 +255,7 @@ fn restored_prefill_matches_cold_on_flash_next() {
         vocab,
         backend,
         ..
-    } = load(false);
+    } = load(false, u64::MAX >> 1);
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let a = prompt(0xa, 3 * chunk + 300);
@@ -317,6 +317,56 @@ fn restored_prefill_matches_cold_on_flash_next() {
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
 
+/// The resident snapshot alone, as for a 192K prompt past an 8 GiB pool: with
+/// a budget no pool snapshot fits, a prompt sharing three chunks with the
+/// previous one restores them over the rows the live state still holds
+/// (rows above them belong to another prompt) and must match its cold
+/// prefill byte for byte, on AR and on native MTP.
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn resident_restore_matches_cold_on_flash_next() {
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        vocab,
+        ..
+    } = load(false, 1);
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let a = prompt(0xa, 3 * chunk + 300);
+    let mut a2 = a[..3 * chunk + 100].to_vec();
+    a2.extend(prompt(0xc, 150));
+
+    let cold = run(&mut bundle, &mut gpu, &logits, &a2, 0);
+    run(&mut bundle, &mut gpu, &logits, &a, 0);
+    assert_eq!(stored_bytes(&bundle), 0, "no pool snapshot fits the budget");
+    let reused = bundle.session_plan(&a2, SessionRoute::Ar);
+    assert_eq!(reused, 3 * chunk, "plan must offer the resident snapshot");
+    let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, &a2, reused);
+    assert_same_state("AR resident", &cold.0, &digests);
+    assert!(
+        warm_logits == cold.1,
+        "AR resident: restored final logits differ from cold"
+    );
+    assert_eq!(warm_ids, cold.2, "AR resident");
+    // A reset outside the cache rewrites the live rows' meaning: dropped.
+    bundle.reset(&mut gpu).expect("reset");
+    assert_eq!(bundle.session_plan(&a2, SessionRoute::Ar), 0);
+
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let cold = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, 0);
+    run_mtp(&mut bundle, &mut gpu, &mut drafter, &a, 0);
+    let reused = bundle.session_plan(&a2, SessionRoute::Mtp);
+    assert_eq!(reused, 3 * chunk, "MTP plan must offer the resident snapshot");
+    let (digests, seed) = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, reused);
+    assert_same_state("MTP resident", &cold.0, &digests);
+    assert_eq!(seed, cold.1, "MTP resident seed");
+
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
 /// P1b: message-end snapshots (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`, forced on through
 /// `set_turn_snapshots`). A prompt with two message ends below one chunk is
 /// prefilled cold and committed; a second prompt extending the first message
@@ -335,7 +385,7 @@ fn message_end_snapshots_restore_on_flash_next() {
         tokenizer,
         vocab,
         ..
-    } = load(true);
+    } = load(true, u64::MAX >> 1);
     let im_end = tokenizer
         .special_token_id("<|im_end|>")
         .expect("tokenizer has <|im_end|>");

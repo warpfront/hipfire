@@ -1763,6 +1763,10 @@ impl Qwen4Bundle {
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
         self.live = None;
         self.turn = None;
+        // `None` while the cache itself resets (it drives `self` then).
+        if let Some(cache) = self.session.as_mut() {
+            cache.live_state_reset();
+        }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
         if let Some(mtp) = self.mtp.as_mut() {
