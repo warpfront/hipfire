@@ -965,16 +965,20 @@ fn configured_tool(variable: &str, root: &Path, name: &str) -> PathBuf {
     if let Some(path) = env::var_os(variable) {
         return path.into();
     }
-    for candidate in [
-        root.join("lib/llvm/bin").join(name),
-        root.join("llvm/bin").join(name),
-        root.join("bin").join(name),
-    ] {
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    name.into()
+    tool_under_root(root, name, env::consts::EXE_SUFFIX).unwrap_or_else(|| name.into())
+}
+
+/// The Windows HIP SDK ships `bin\llvm-objdump.exe`; missing it falls back to a PATH LLVM without amdgpu.
+fn tool_under_root(root: &Path, name: &str, exe_suffix: &str) -> Option<PathBuf> {
+    ["lib/llvm/bin", "llvm/bin", "bin"]
+        .into_iter()
+        .flat_map(|dir| {
+            let dir = root.join(dir);
+            let suffixed =
+                (!exe_suffix.is_empty()).then(|| dir.join(format!("{name}{exe_suffix}")));
+            std::iter::once(dir.join(name)).chain(suffixed)
+        })
+        .find(|candidate| candidate.is_file())
 }
 
 fn checked_output(command: &mut Command, label: &str) -> Result<Output> {
@@ -1722,6 +1726,35 @@ amdhsa.kernels:
     }
 
     #[test]
+    fn inspection_tools_resolve_with_the_host_executable_suffix() {
+        let root = env::temp_dir().join(format!(
+            "radiowave-tool-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/llvm-objdump.exe"), "").unwrap();
+
+        assert_eq!(
+            tool_under_root(&root, "llvm-objdump", ".exe"),
+            Some(root.join("bin").join("llvm-objdump.exe"))
+        );
+        assert_eq!(tool_under_root(&root, "llvm-objdump", ""), None);
+
+        fs::create_dir_all(root.join("lib/llvm/bin")).unwrap();
+        fs::write(root.join("lib/llvm/bin/llvm-objdump"), "").unwrap();
+        assert_eq!(
+            tool_under_root(&root, "llvm-objdump", ".exe"),
+            Some(root.join("lib/llvm/bin").join("llvm-objdump"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn compile_request_preserves_fast_math_unless_explicitly_disabled() {
         let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1151");
         let default_args = compile_args(
@@ -1864,9 +1897,9 @@ amdhsa.kernels:
     #[test]
     fn schema_five_preserves_custom_provenance_and_rejects_failed_oracle() {
         let code = b"verified custom code object";
-        let mut manifest: CompileManifest = serde_json::from_str(
-            &certification_manifest(code, MutableReadCache::VmemOnly)
-        ).unwrap();
+        let mut manifest: CompileManifest =
+            serde_json::from_str(&certification_manifest(code, MutableReadCache::VmemOnly))
+                .unwrap();
         manifest.schema_version = 5;
         manifest.peacemaker = Some(PeacemakerRecord {
             arm: PeacemakerArm::CustomIsa,
@@ -1888,8 +1921,12 @@ amdhsa.kernels:
             shape_contract: serde_json::json!({"symbol": "consumer"}),
             shape_result: serde_json::json!({"vopd_packets": 96}),
             oracle_receipt: Some(OracleReceipt {
-                suite: "G1".into(), fixtures_sha256: "fixture".into(), cases: 34,
-                differing_bits: 0, device_uuid: "device".into(), date: "2026-09-25".into(),
+                suite: "G1".into(),
+                fixtures_sha256: "fixture".into(),
+                cases: 34,
+                differing_bits: 0,
+                device_uuid: "device".into(),
+                date: "2026-09-25".into(),
             }),
         });
         let encoded = serde_json::to_string(&manifest).unwrap();
@@ -1898,9 +1935,17 @@ amdhsa.kernels:
         assert_eq!(provenance.arm, PeacemakerArm::CustomIsa);
         assert_eq!(provenance.tools[0].argv[1], "-mcpu=gfx1201");
         assert_eq!(provenance.oracle_receipt.as_ref().unwrap().cases, 34);
-        manifest.peacemaker.as_mut().unwrap().oracle_receipt.as_mut().unwrap().differing_bits = 1;
-        assert!(CodeObjectCertification::from_json(
-            code, &serde_json::to_string(&manifest).unwrap()
-        ).is_err());
+        manifest
+            .peacemaker
+            .as_mut()
+            .unwrap()
+            .oracle_receipt
+            .as_mut()
+            .unwrap()
+            .differing_bits = 1;
+        assert!(
+            CodeObjectCertification::from_json(code, &serde_json::to_string(&manifest).unwrap())
+                .is_err()
+        );
     }
 }
