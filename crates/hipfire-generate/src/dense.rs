@@ -135,7 +135,6 @@ pub fn dense_fail_closed_error(
     emit_fail_closed_error(stdout, Some(id), message, "internal", false, &ep);
 }
 
-
 /// Speculative wire terminal after `Deepseek4Emit::finish` + length known.
 /// Length always suppresses call release and cache; malformed is error XOR done.
 #[derive(Debug, Clone, PartialEq)]
@@ -448,11 +447,8 @@ pub fn generate_deepseek4_spec(
     // panic). Mirrors the bespoke ds4 pre-prefill guard — generate_spec's own
     // guard checks ctx_capacity (max_position_embeddings), which for ds4 can far
     // exceed physical_cap, so keep this explicit one.
-    let max_tokens = crate::common::fit_max_tokens(
-        max_tokens,
-        plan.start_pos + suffix.len(),
-        m.physical_cap,
-    );
+    let max_tokens =
+        crate::common::fit_max_tokens(max_tokens, plan.start_pos + suffix.len(), m.physical_cap);
     if plan
         .start_pos
         .saturating_add(suffix.len())
@@ -523,7 +519,14 @@ pub fn generate_deepseek4_spec(
                         // the cache-miss teardown above already mutated GPU
                         // state, so roll back instead of panicking.
                         let ep = production_fail_closed_rollback(m, gpu, None, None);
-                        emit_fail_closed_error(stdout, Some(id), "tokenizer not loaded", "internal", false, &ep);
+                        emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            "tokenizer not loaded",
+                            "internal",
+                            false,
+                            &ep,
+                        );
                         return;
                     }
                 }
@@ -851,7 +854,14 @@ pub fn generate_deepseek4(
         None => {
             // Pre-mutation validation (no GPU work yet): bare correlated error,
             // never a panic. A missing PBS is a load-time invariant violation.
-            emit_active_attempt_error(stdout, Some(id), "deepseek4_pbs missing on arch_id=9 generate", "internal", false, false);
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "deepseek4_pbs missing on arch_id=9 generate",
+                "internal",
+                false,
+                false,
+            );
             let _ = stdout.flush();
             return;
         }
@@ -1108,7 +1118,14 @@ pub fn generate_deepseek4(
             // silently, then emit one correlated terminal (which claims the
             // wire transaction). Never a bare error on dirty state.
             let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(stdout, Some(id), &format!("deepseek4prefill failed: {e:?}"), "internal", false, &ep);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("deepseek4prefill failed: {e:?}"),
+                "internal",
+                false,
+                &ep,
+            );
             return;
         }
     };
@@ -1413,13 +1430,24 @@ pub fn generate_deepseek4(
                     // Post-gen_start operation failure: complete rollback +
                     // one correlated fail-closed error (no `done`, no cache).
                     let ep = production_fail_closed_rollback(m, gpu, None, None);
-                    emit_fail_closed_error(stdout, Some(id), &format!("deepseek4decode failed: {e:?}"), "internal", false, &ep);
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &format!("deepseek4decode failed: {e:?}"),
+                        "internal",
+                        false,
+                        &ep,
+                    );
                     return;
                 }
             }
         }
         // Flush any buffered partial markers / content.
-        for ev in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
+        for ev in parser
+            .feed(&text_stream.flush())
+            .into_iter()
+            .chain(parser.finish())
+        {
             absorb_event(&ev);
             emit_stream_event(stdout, id, ev);
         }
@@ -1757,8 +1785,7 @@ pub fn generate_deepseek4_heterogeneous(
                     return;
                 }
                 Err(error) => {
-                    let message =
-                        format!("deepseek4 heterogeneous prefill failed: {error}");
+                    let message = format!("deepseek4 heterogeneous prefill failed: {error}");
                     ds4_heterogeneous_fail_closed_error(
                         &mut bundle.model,
                         &mut m.seq_pos,
@@ -1842,7 +1869,14 @@ pub fn generate_deepseek4_heterogeneous(
                 rolled_back: false,
                 context: Some("heterogeneous rollback failed: state missing".to_string()),
             };
-            emit_fail_closed_error(stdout, Some(id), "deepseek4 heterogeneous state disappeared", "internal", false, &ep);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "deepseek4 heterogeneous state disappeared",
+                "internal",
+                false,
+                &ep,
+            );
             return;
         };
         match bundle
@@ -1862,8 +1896,7 @@ pub fn generate_deepseek4_heterogeneous(
                 return;
             }
             Err(error) => {
-                let message =
-                    format!("deepseek4 heterogeneous decode failed: {error}");
+                let message = format!("deepseek4 heterogeneous decode failed: {error}");
                 ds4_heterogeneous_fail_closed_error(
                     &mut bundle.model,
                     &mut m.seq_pos,
@@ -1881,7 +1914,11 @@ pub fn generate_deepseek4_heterogeneous(
         }
         next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
     }
-    for event in parser.feed(&text_stream.flush()).into_iter().chain(parser.finish()) {
+    for event in parser
+        .feed(&text_stream.flush())
+        .into_iter()
+        .chain(parser.finish())
+    {
         ds4_absorb_stream_event(
             &event,
             &mut emit_text_buf,
@@ -1957,7 +1994,14 @@ pub fn generate_deepseek4_heterogeneous(
                 rolled_back: false,
                 context: Some("heterogeneous rollback failed: state missing".to_string()),
             };
-            emit_fail_closed_error(stdout, Some(id), "deepseek4 heterogeneous state disappeared on abort", "internal", false, &ep);
+            emit_fail_closed_error(
+                stdout,
+                Some(id),
+                "deepseek4 heterogeneous state disappeared on abort",
+                "internal",
+                false,
+                &ep,
+            );
             return;
         };
         ds4_heterogeneous_client_abort(
@@ -3027,7 +3071,12 @@ pub fn generate_gemma4(
         }
     }
     let tail = text_stream.flush();
-    for ev in gemma_router.push(&tail).0.into_iter().chain(gemma_router.flush()) {
+    for ev in gemma_router
+        .push(&tail)
+        .0
+        .into_iter()
+        .chain(gemma_router.flush())
+    {
         match ev {
             GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
             GemmaEmit::Token(text) => {
@@ -6613,7 +6662,12 @@ pub fn generate_muse_glimmer(
         }
         // Flush any trailing incomplete channel text
         let tail = text_stream.flush();
-        for ev in harmony_router.push(&tail).0.into_iter().chain(harmony_router.flush()) {
+        for ev in harmony_router
+            .push(&tail)
+            .0
+            .into_iter()
+            .chain(harmony_router.flush())
+        {
             match ev {
                 GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                 GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
@@ -6981,7 +7035,13 @@ pub fn generate_lfm2moe(
     // one correlated terminal), never continue prefill on dirty state.
     let turn_reset = m.lfm2moe_mut().unwrap().state.reset(gpu);
     if let Err(e) = turn_reset {
-        dense_fail_closed_error(m, gpu, stdout, id, &format!("lfm2moe turn reset failed: {e:?}"));
+        dense_fail_closed_error(
+            m,
+            gpu,
+            stdout,
+            id,
+            &format!("lfm2moe turn reset failed: {e:?}"),
+        );
         return;
     }
     m.seq_pos = 0;
@@ -7105,7 +7165,13 @@ pub fn generate_lfm2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                dense_fail_closed_error(m, gpu, stdout, id, &format!("lfm2moe decode failed: {e:?}"));
+                dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("lfm2moe decode failed: {e:?}"),
+                );
                 return;
             }
         }
@@ -7592,7 +7658,13 @@ pub fn generate_minimax(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                dense_fail_closed_error(m, gpu, stdout, id, &format!("minimax decode failed: {e:?}"));
+                dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("minimax decode failed: {e:?}"),
+                );
                 return;
             }
         }
@@ -7819,6 +7891,16 @@ pub fn generate_cohere2moe(
         let _ = stdout.flush();
         return;
     }
+
+    // Open the stream contract before any token or post-validation terminal:
+    // the CLI fail-closes on any event that precedes `gen_start` (same fix as
+    // DS4 and lfm2moe). The optional `<think>` opener below stays in-band text.
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::CohereAr),
+        stdout,
+        id,
+        false,
+    );
 
     let eos_tok = m.cohere2moe().unwrap().eos_tok;
 
@@ -8315,7 +8397,13 @@ pub fn generate_cohere2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                dense_fail_closed_error(m, gpu, stdout, id, &format!("cohere2moe decode failed: {e:?}"));
+                dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("cohere2moe decode failed: {e:?}"),
+                );
                 return;
             }
         }
