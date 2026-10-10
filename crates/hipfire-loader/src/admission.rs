@@ -15,6 +15,7 @@ use crate::Carrier;
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::kv_mode::{KvMode, VMode};
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 fn qwen4_vision_tensor_name(name: &str) -> bool {
     [
@@ -90,6 +91,47 @@ pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String
         ),
         None => "WARNING HIPFIRE_KV_BACKEND=legacy: explicitly selected legacy KV storage (--kv-backend legacy or memory.kv_backend); inspect before benchmarking or filing a PR.".to_string(),
     })
+}
+
+/// Admitted gfx11 Qwen3.5-family VMM KV combinations.
+///
+/// Q8 retains the existing gfx1100/gfx1151 and multi-rank admission. Modern
+/// FWHT K tiers paired with Q8/Lloyd V use the same static row layouts as their
+/// legacy-storage owners, but are admitted only on exact gfx1100 TP1: extending
+/// this predicate must not accidentally promote TP2 or gfx1151 without separate
+/// lifecycle proof. Deprecated Givens `legacy-asym*` remains fail-closed.
+fn qwen35_gfx11_vmm_supported(
+    gpu_arch: &str,
+    arch_id: u32,
+    tp: usize,
+    mode_raw: &str,
+    k_raw: Option<&str>,
+    v_raw: Option<&str>,
+) -> bool {
+    if !matches!(gpu_arch, "gfx1100" | "gfx1151") || !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let requested_k = k_raw
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(mode_raw)
+        .trim();
+    if matches!(requested_k, "" | "auto" | "q8") {
+        return v_raw.is_none_or(|value| matches!(value.trim(), "" | "q8"));
+    }
+    if gpu_arch != "gfx1100" || tp != 1 {
+        return false;
+    }
+    let Ok(k) = hipfire_runtime::kv_mode::parse_qwen_k_name(requested_k) else {
+        return false;
+    };
+    let requested_v = v_raw
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("q8");
+    let Ok(v) = hipfire_runtime::kv_mode::parse_qwen_v_name(requested_v) else {
+        return false;
+    };
+    matches!(k, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+        && matches!(v, VMode::Q8 | VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4)
 }
 
 #[derive(Clone, Copy)]
@@ -1173,15 +1215,16 @@ pub fn admit_source_with_options(
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
-        && !(matches!(gpu_arch, "gfx1100" | "gfx1151")
-            && matches!(arch_id, 5 | 6)
-            && matches!(
-                hints
-                    .kv_mode
-                    .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
-                    .trim(),
-                "" | "auto" | "q8"
-            ))
+        && !qwen35_gfx11_vmm_supported(
+            gpu_arch,
+            arch_id,
+            tp,
+            hints
+                .kv_mode
+                .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()),
+            hints.kv_k,
+            hints.kv_v,
+        )
     {
         Some(format!(
             "device {gpu_arch} has no certified VMM KV path for the selected mode"
@@ -1466,6 +1509,85 @@ pub fn admit_source_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfx1100_qwen35_vmm_admits_fwht_split_matrix_only_on_tp1() {
+        for mode in [
+            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2",
+            "turbo3", "turbo4",
+        ] {
+            assert!(qwen35_gfx11_vmm_supported(
+                "gfx1100", 5, 1, mode, None, None
+            ));
+            assert!(qwen35_gfx11_vmm_supported(
+                "gfx1100", 6, 1, mode, None, None
+            ));
+            assert!(!qwen35_gfx11_vmm_supported(
+                "gfx1100", 5, 2, mode, None, None
+            ));
+        }
+        for k in ["fwht2", "fwht3", "fwht4"] {
+            for v in ["lloyd2", "lloyd3", "lloyd4"] {
+                assert!(qwen35_gfx11_vmm_supported(
+                    "gfx1100",
+                    5,
+                    1,
+                    k,
+                    None,
+                    Some(v)
+                ));
+            }
+        }
+        for k in ["legacy-asym2", "legacy-asym3", "legacy-asym4"] {
+            for v in ["q8", "lloyd3"] {
+                assert!(!qwen35_gfx11_vmm_supported(
+                    "gfx1100",
+                    5,
+                    1,
+                    k,
+                    None,
+                    Some(v)
+                ));
+            }
+        }
+        assert!(qwen35_gfx11_vmm_supported(
+            "gfx1100",
+            5,
+            1,
+            "q8",
+            Some("fwht3"),
+            Some("q8")
+        ));
+    }
+
+    #[test]
+    fn gfx11_qwen35_vmm_preserves_q8_matrix_and_other_refusals() {
+        for arch in ["gfx1100", "gfx1151"] {
+            for arch_id in [5, 6] {
+                assert!(qwen35_gfx11_vmm_supported(
+                    arch, arch_id, 2, "q8", None, None
+                ));
+            }
+        }
+        assert!(!qwen35_gfx11_vmm_supported(
+            "gfx1100",
+            5,
+            1,
+            "q8",
+            None,
+            Some("lloyd3")
+        ));
+        assert!(!qwen35_gfx11_vmm_supported(
+            "gfx1151", 5, 1, "fwht3", None, None
+        ));
+        assert!(!qwen35_gfx11_vmm_supported(
+            "gfx1100", 9, 1, "fwht3", None, None
+        ));
+        assert!(qwen35_gfx11_vmm_supported(
+            "gfx1100", 5, 1, "fwht4", None, None
+        ));
+    }
+
     fn admit_source(
         path: &str,
         tp: usize,
