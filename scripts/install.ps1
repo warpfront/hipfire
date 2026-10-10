@@ -152,6 +152,15 @@ try {
             $GpuArch = "gfx1201"
         } elseif ($GpuName -match "9060|RX 9[0-9]{3}") {
             $GpuArch = "gfx1200"
+        # Integrated Radeon names carry no family; map them by APU: Phoenix/Hawk Point, Strix Point, Strix Halo, Krackan.
+        } elseif ($GpuName -match "\b(780|760|740)M\b") {
+            $GpuArch = "gfx1103"
+        } elseif ($GpuName -match "\b(890|880)M\b") {
+            $GpuArch = "gfx1150"
+        } elseif ($GpuName -match "\b80[4-6]0S\b") {
+            $GpuArch = "gfx1151"
+        } elseif ($GpuName -match "\b(860|840|820)M\b") {
+            $GpuArch = "gfx1152"
         }
     } else {
         Write-Host "  WARNING: No AMD/Radeon GPU found in Win32_VideoController." -ForegroundColor Yellow
@@ -162,7 +171,8 @@ try {
 
 if ($GpuArch -eq "unknown") {
     Write-Host "  WARNING: Could not detect GPU architecture." -ForegroundColor Yellow
-    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070)"
+    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070),"
+    Write-Host "             gfx1103 (Radeon 780M), gfx1150 (Radeon 890M), gfx1151 (Radeon 8060S), gfx1152 (Radeon 860M)"
     $GpuArch = Read-Host "  Enter your GPU arch [or Enter to skip]"
     if ([string]::IsNullOrWhiteSpace($GpuArch)) { $GpuArch = "unknown" }
 }
