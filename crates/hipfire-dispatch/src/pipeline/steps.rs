@@ -105,6 +105,15 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
+    /// Hybrid decoder gated-DeltaNet linear-attention sublayer.
+    #[cfg(feature = "deltanet")]
+    DeltaNetMixer(crate::pipeline::hybrid::DeltaNetMixerOp<'a>),
+    /// Hybrid decoder gated full-attention sublayer.
+    #[cfg(feature = "deltanet")]
+    GatedAttention(crate::pipeline::hybrid::GatedAttentionOp<'a>),
+    /// Dense SwiGLU FFN sublayer.
+    #[cfg(feature = "deltanet")]
+    SwigluFfn(crate::pipeline::hybrid::SwigluFfnOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -137,6 +146,8 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
         | Step::MoeStage(..) => None,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(_) | Step::GatedAttention(_) | Step::SwigluFfn(_) => None,
     }
 }
 
@@ -924,12 +935,13 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                             && read.input.buf.as_ptr() == write.output.buf.as_ptr()
                             && read.rows == write.rows =>
                     {
-                        paired_hyper_write(steps, i + 4, read).filter(|(_, next_write)| {
-                            crate::pipeline::layer_ops::hyper_read_prenorm_applies(
-                                gpu, read, next_write,
-                            )
-                        })
-                        .map(|(j, next_write)| (j, read, next_write))
+                        paired_hyper_write(steps, i + 4, read)
+                            .filter(|(_, next_write)| {
+                                crate::pipeline::layer_ops::hyper_read_prenorm_applies(
+                                    gpu, read, next_write,
+                                )
+                            })
+                            .map(|(j, next_write)| (j, read, next_write))
                     }
                     _ => None,
                 };
@@ -1486,6 +1498,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(op) => crate::pipeline::hybrid::execute_deltanet_mixer(gpu, ctx, op),
+        #[cfg(feature = "deltanet")]
+        Step::GatedAttention(op) => crate::pipeline::hybrid::execute_gated_attention(gpu, ctx, op),
+        #[cfg(feature = "deltanet")]
+        Step::SwigluFfn(op) => crate::pipeline::hybrid::execute_swiglu_ffn(gpu, ctx, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

@@ -43,7 +43,18 @@
 - **GDN replay route no longer depends on memory pressure (exactness fix):** the gfx1201 multi-layer GDN tape replay (and the D8 snapshot-source tables) armed lazily at a tape's first accept, and an allocation failure there silently moved that tape to the per-layer replay for life, which commits different DeltaNet bytes on the production model. `GdnTape::new_for_config` now arms the tables when the tape is built (`GdnTape::new_for_dflash` adds the D8 tables), so an allocation failure refuses the lane or request at provision with a logged error; an admitted replay never falls back. The replay's q/k/v/out scratch is now a `Gpu`-owned map keyed by scratch shape (layers, rows, value width): every armed tape of one shape shares one refcounted buffer, released when no tape or replay graph references it and drained on model unload, so eager arming costs a lane only its pointer tables instead of ~75 MB on the 27B. The serve engine's batched verify tape, which is repaired per layer and never replayed, is built with `GdnTape::new_capture_only`. `HIPFIRE_GDN_REPLAY_ML_OFF=1` stays an explicit diagnostic opt-in and is documented as not byte-identical. `GpuPool::alloc` now returns its free lists to HIP and retries once when `hipMalloc` runs out of memory (freed scratch parked in the pool is invisible to HIP; 9 GiB in the reproduction). `DeltaNetSnapshot::new_for` frees partial buffers on a mid-way failure, and `take_dn_checkpoint` logs a skipped checkpoint and frees the snapshot when its save fails. Open: the per-layer `replay_gdn_inner` is still not byte-identical to the multi-layer replay.
 - **VMM maps reclaim pooled memory:** `hipMemCreate` cannot see buffers parked in `GpuPool` either (12.6–13.7 GiB pooled with 0.1–1.4 GiB reported free in the 4-lane MTP state oracle, which failed its 32K lanes with `hipMemCreate: out of memory`). A whole-segment VMM map (`alloc_vmm_tensor`, `grow_vmm_tensor`) that runs out of memory now returns the pool to HIP and retries once; a granule map (`grow_vmm_tensor_granules`, prefix forks), whose failure aborts its arena, returns the pool first when HIP's free figure cannot cover it plus 64 MiB. Both log a `GpuPool: VMM map ...` line.
 - **Removed config keys warn instead of failing the load:** 0.4.1 removed `kernel.mw16` (shipped in 0.3.1 and 0.4.0) from the schema outright, so a `config.toml` that still set it made every command fail with `unknown configuration key 'kernel.mw16'`. Removed keys that shipped now live in `hipfire_config::RETIRED_CONFIG_KEYS`; through their deprecation window (`kernel.mw16`: until 0.5.0) the load drops them and run/serve/chat and `hipfire config show` print `warning: ignored kernel.mw16 in <file>: removed in 0.4.1 (…)`. Keys that never shipped (such as `kernel.gfx11_iu4_swizzle`, which only existed on an experiment branch) and typos still fail the load. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).
-
+- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
+  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
+  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
+  steps now uses the same step program as plain decode, so the qwen35
+  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
+  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
+  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
+  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
+    token 3).
+  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
+    late.
+  - Qwen3.8-27B vision answers are byte-identical.
 
 ## v0.4.1.1 — release draft
 
