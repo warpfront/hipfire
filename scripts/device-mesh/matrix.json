@@ -19,6 +19,54 @@
   "hardware-blocked"
  ],
  "evidence_policy": "issue warpfront/hipfire#666: exact base/producer commits, fixture identities (model sha256, prompt md5, binary md5s, GPU/ROCm/RCCL ids), positive + negative probe commands, disposition.",
+ "fixture_lock": {
+  "_note": "Every model file a row consumes, keyed by file name under HIPFIRE_MODELS_DIR. The runner hashes each one before the row runs and files hardware-blocked on any size/sha256 mismatch or unlisted file. Fetch with: hf download <repo> <file> --revision <rev> --local-dir \"$HIPFIRE_MODELS_DIR\". Do not use `hipfire pull` for qwen3.8-27b.mq4-xt: the registry tag now resolves to the re-issued 14987185152-byte upload (80e7c624...), not these bytes.",
+  "deepseek-v4-flash-0731-dspark.mq2r": {
+   "sha256": "bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e",
+   "size_bytes": 5788397278,
+   "source": "https://huggingface.co/hipfire-models/deepseek-v4-flash-0731/resolve/584fb6b143e7031e8b8703df7355b408d733f494/deepseek-v4-flash-0731-dspark.mq2r"
+  },
+  "dots-ocr.q8.hfq": {
+   "sha256": "eec256b12ec11b118422cb49fbfd49b14c653374af8bc31b08a2a3b1b6f5b268",
+   "size_bytes": 4420477952,
+   "source": "https://huggingface.co/hipfire-models/dots.ocr/resolve/c73581867937b7ab61257d0c6a5293ecbe2684a9/dots-ocr.q8.hfq"
+  },
+  "lfm2.5-1.2b.mq4": {
+   "sha256": "a7aeba879560e90f19a92479d5fbc578fa7ba99fc3de343b9f0d189738d56533",
+   "size_bytes": 698641072,
+   "source": "https://huggingface.co/hipfire-models/LFM2.5-1.2B/resolve/925450193fe1cc66b9130ee1939b5f97651fb1fc/lfm2.5-1.2b.mq4"
+  },
+  "ornith-1.5-35b-a3b.mq4r": {
+   "sha256": "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6",
+   "size_bytes": 18700570368,
+   "source": "https://huggingface.co/hipfire-models/ornith-1.5-35b-a3b/resolve/6cac51031c4bc6fb0135ef8af97be749666b453d/ornith-1.5-35b-a3b.mq4r"
+  },
+  "qwen3-0.6b.hf4": {
+   "sha256": "7760b19dfb940f8b33078eb524602b4f2b5e6825c6e10c466e6e99bcfc133838",
+   "size_bytes": 436006912,
+   "source": "https://huggingface.co/hipfire-models/qwen3-0.6b/resolve/6073b04be007df33136a5a161733f3281e62ee10/qwen3-0.6b.hf4"
+  },
+  "qwen3.6-35b-a3b.mq4r": {
+   "sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
+   "size_bytes": 18700048128,
+   "source": "https://huggingface.co/hipfire-models/qwen3.6-35b-a3b/resolve/605b30ea0d5c0a8bb93d7a30e43494402e6f663a/qwen3.6-35b-a3b.mq4r"
+  },
+  "qwen3.8-27b-vision.hfq": {
+   "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+   "size_bytes": 927611840,
+   "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/7396d1af35c3484378a6603d93ed4a8c97237a6c/qwen3.8-27b-vision.hfq"
+  },
+  "qwen3.8-27b.mq4-xt": {
+   "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
+   "size_bytes": 14980361216,
+   "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/7396d1af35c3484378a6603d93ed4a8c97237a6c/qwen3.8-27b.mq4-xt"
+  },
+  "qwen38-27b-dflash-mq4.hfq": {
+   "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
+   "size_bytes": 1209603072,
+   "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/7396d1af35c3484378a6603d93ed4a8c97237a6c/qwen38-27b-dflash-mq4.hfq"
+  }
+ },
  "notes": [
   "Runner inventory only: never claims a row passes without executing it on hardware.",
   "probe=existing reuses an in-tree harness/test. probe=thin-driver executes the daemon JSONL protocol directly (G1/G2 load-preservation rows). probe=none has no existing probe and is reported as 'no existing probe'.",
@@ -1410,7 +1458,7 @@
      "cargo test -p hipfire-arch-llama --locked --lib production_awq_sidecar_selects_legacy_loader -- --test-threads=1 # AWQ sidecars stay on the legacy loader (retained route)"
     ],
     "positive": [
-     "G3_FIXTURE=$MODEL cargo test -p hipfire-arch-llama --locked --lib carrier::tests::pinned_fixture_manifest_legacy_parity_oracle -- --exact --test-threads=1"
+     "G3_FIXTURE=$MODEL cargo test -p hipfire-arch-llama --locked --lib carrier::tests::pinned_fixture_manifest_legacy_parity_oracle -- --exact --test-threads=1 --nocapture"
     ]
    },
    "env": {
@@ -1431,11 +1479,57 @@
     "min_passed": 1
    },
    "predicate": {
+    "forbid": [
+     "skipping"
+    ],
     "kind": "cargo",
-    "min_passed": 1
+    "min_passed": 1,
+    "require": [
+     "g3-oracle: PASS"
+    ]
    },
    "probe": "existing",
    "route": "single/manifest-vs-legacy-parity-oracle"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "G3_FIXTURE=$MODEL cargo test -p hipfire-arch-llama --locked --lib carrier::tests::pinned_fixture_lifecycle_fault_retry_reload -- --exact --test-threads=1 --nocapture",
+     "G3_FIXTURE=$MODEL cargo test -p hipfire-arch-llama --locked --lib carrier::tests::pinned_fixture_repeated_load_unload_cycles_leak_nothing -- --exact --test-threads=1 --nocapture"
+    ]
+   },
+   "env": {
+    "G3_FIXTURE": "$MODEL"
+   },
+   "fixtures": [
+    "qwen3:0.6b"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g3-pinned-lifecycle",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "the deterministic post-upload fault inside the lifecycle test is the negative: rollback returns every resident store allocation, then an immediate retry decodes identically"
+   },
+   "note": "#666 G3 production load/reset/unload/immediate-reload/fault-recovery clause on the pinned fixture, through the manifest route and the sole ArchModel::free_gpu owner. These tests also run unpinned inside g3-llama-carrier-unit, where an absent fixture skips silently; this row gates them on the locked bytes.",
+   "predicate": {
+    "forbid": [
+     "skipping"
+    ],
+    "kind": "cargo",
+    "min_passed": 2,
+    "require": [
+     "g3-lifecycle: PASS",
+     "g3-cycles: PASS"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/manifest-lifecycle-fault-retry-reload"
   },
   {
    "commands": {
@@ -1546,11 +1640,11 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_DSPARK_FIXTURE=/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r cargo test -p hipfire-arch-deepseek4 --locked dspark_after_ -- --ignored --test-threads=1"
+     "HIPFIRE_DSPARK_FIXTURE=$MODELS_DIR/deepseek-v4-flash-0731-dspark.mq2r cargo test -p hipfire-arch-deepseek4 --locked dspark_after_ -- --ignored --test-threads=1"
     ]
    },
    "env": {
-    "HIPFIRE_DSPARK_FIXTURE": "/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r"
+    "HIPFIRE_DSPARK_FIXTURE": "$MODELS_DIR/deepseek-v4-flash-0731-dspark.mq2r"
    },
    "fixtures": [
     "ornith-1.5:35b-a3b-mq4r"
@@ -1573,14 +1667,14 @@
    "probe": "existing",
    "route": "single/dspark-staged-construction-rollback",
    "fixture_files": [
-    "/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r"
+    "$MODELS_DIR/deepseek-v4-flash-0731-dspark.mq2r"
    ]
   },
   {
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_QWEN35_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODEL HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
     ]
    },
    "env": {
@@ -1612,7 +1706,7 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=/home/kaden/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=$MODELS_DIR/qwen38-27b-dflash-mq4.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
     ],
     "negative": [
      "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
@@ -1643,14 +1737,14 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1 --nocapture"
     ]
    },
    "env": {
     "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
     "HIPFIRE_HAVE_2_GPU": "1",
     "HIPFIRE_PP_DEVICES": "0,1",
-    "HIPFIRE_PP_RESET_MODEL": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "HIPFIRE_PP_RESET_MODEL": "$MODELS_DIR/qwen3.8-27b.mq4-xt",
     "HIPFIRE_RESET_ROUNDS": "1"
    },
    "fixtures": [
@@ -1665,9 +1759,16 @@
     "kind": "none",
     "note": "fault rounds are the negative of the clean baseline inside the test"
    },
+   "note": "#666 G4.7 physical PP and the PP half of G4.9: pp:2 routes every generate through generate_mesh_carrier (GenerationRoute::PipelineParallel). The test pins HIP_VISIBLE_DEVICES to HIPFIRE_PP_DEVICES, i.e. physical GPUs 0,1.",
    "predicate": {
+    "forbid": [
+     "skip:"
+    ],
     "kind": "cargo",
-    "min_passed": 1
+    "min_passed": 1,
+    "require": [
+     "pp_qwen35_reset_rolls_back_and_recovers ok"
+    ]
    },
    "probe": "existing",
    "route": "pp/text-reset-attested-rollback"
@@ -1705,21 +1806,21 @@
    "probe": "existing",
    "route": "single/dense-route-rollback",
    "fixture_files": [
-    "/home/kaden/.hipfire/models/lfm2.5-1.2b.mq4"
+    "$MODELS_DIR/lfm2.5-1.2b.mq4"
    ]
   },
   {
    "commands": {
     "positive": [
-     "HIPFIRE_VISION_FIXTURE=\"/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=/home/kaden/.hipfire/models/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
+     "HIPFIRE_VISION_FIXTURE=\"$MODELS_DIR/qwen3.8-27b.mq4-xt,$MODELS_DIR/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=$MODELS_DIR/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
     ],
     "negative": [
      "cargo test -p hipfire-generate --locked --test vision_lifecycle_tests vision_fixture_pair_rejects -- --test-threads=1"
     ]
    },
    "env": {
-    "HIPFIRE_VISION_FIXTURE": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq",
-    "HIPFIRE_DOTS_OCR_FIXTURE": "/home/kaden/.hipfire/models/dots-ocr.q8.hfq"
+    "HIPFIRE_VISION_FIXTURE": "$MODELS_DIR/qwen3.8-27b.mq4-xt,$MODELS_DIR/qwen3.8-27b-vision.hfq",
+    "HIPFIRE_DOTS_OCR_FIXTURE": "$MODELS_DIR/dots-ocr.q8.hfq"
    },
    "fixtures": [
     "qwen3.8:27b-mq4-xt"
@@ -1742,8 +1843,8 @@
    "probe": "existing",
    "route": "single/vision-ocr-lifecycle",
    "fixture_files": [
-    "/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq",
-    "/home/kaden/.hipfire/models/dots-ocr.q8.hfq"
+    "$MODELS_DIR/qwen3.8-27b-vision.hfq",
+    "$MODELS_DIR/dots-ocr.q8.hfq"
    ],
    "timeout": 2000
   },
@@ -1920,9 +2021,7 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1",
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1",
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1"
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
     ],
     "negative": []
    },
@@ -1931,34 +2030,213 @@
     "ornith-1.5:35b-a3b-mq4r"
    ],
    "hosts": [
-    "gfx1201"
+    "gfx1201",
+    "gfx1100",
+    "gfx1151"
    ],
    "id": "g1-route-oracles-nonllama",
    "milestone": "G1",
+   "note": "Single-route cells (Qwen35 dense + MoE, fresh load A vs B, bitwise). The PP/TP mesh cells are g1-route-oracles-mesh; the EP cell is g5-ep2-vs-single-physical.",
    "predicate": {
+    "forbid": [
+     "skip:"
+    ],
     "kind": "cargo",
-    "min_passed": 4
+    "min_passed": 2,
+    "require": [
+     "g1-single-oracle[dense]: PASS",
+     "g1-single-oracle[moe]: PASS"
+    ]
    },
-   "probe": "thin-driver",
-   "route": "single+pp+tp/route-oracles"
+   "probe": "existing",
+   "route": "single/route-oracles"
   },
   {
-   "id": "g5-ep-route-oracles",
-   "milestone": "G5",
-   "route": "ep/route-oracles",
-   "probe": "none",
    "commands": {
-    "positive": [],
-    "negative": []
+    "negative": [],
+    "positive": [
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture"
+    ]
    },
-   "fixtures": [],
-   "hosts": [
-    "gfx1201"
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_HAVE_2_GPU": "1",
+    "HIPFIRE_TP_USE_RCCL": "0"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
    ],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g1-route-oracles-mesh",
+   "milestone": "G1",
+   "note": "Physical PP2/TP2 mesh-vs-single cells on two distinct GPUs (dense 27B, bounded relations documented in route_oracle_mesh.rs). HIPFIRE_TP_USE_RCCL=0 makes any RCCL fallback a hard error, so a pass is peer-path evidence only, never RCCL proof.",
    "predicate": {
-    "kind": "none"
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 2,
+    "require": [
+     "qwen35-pp2-oracle: PASS",
+     "qwen35-tp2-oracle: PASS"
+    ]
    },
-   "note": "qwen35_ep2_vs_single_oracle and qwen35_ep4_vs_ep2_oracle exist on this head and are deliberately RED at 1e-3: sharded EP diverges from single by a top-k routing flip seeded by expert-parity vs slot-order f32 association (pos 17 / pos 2 on Q8 state; pos 5 on f32). Unchanged by canonical rooted reduce, EF residuals on multi, or f32 state. Pre-exists on master; daemon refuses MoE EP so no user exposure. Discharged by the G5 slot-order combine (G5-SLOT-COMBINE-PLAN.md)."
+   "probe": "existing",
+   "route": "pp+tp/mesh-vs-single-oracles"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_ep2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture"
+    ]
+   },
+   "env": {
+    "HIPFIRE_AR_GRAPH": "0",
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_EP_PEER_ALLREDUCE": "1",
+    "HIPFIRE_EP_PEER_ALLREDUCE_DECODE": "1",
+    "HIPFIRE_GRAPH": "0",
+    "HIPFIRE_HAVE_2_GPU": "1",
+    "HIPFIRE_TP_USE_RCCL": "0"
+   },
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g5-ep2-vs-single-physical",
+   "milestone": "G5",
+   "note": "#666 G5 physical EP2 (also the G1 EP cell): same command and peer transport selectors as the #755 emulated run, with emulation off and two distinct GPUs. Complete rank-0 logits byte-equal to single at every committed position plus in-mesh route/residual agreement; no tolerance. HIPFIRE_TP_USE_RCCL=0: RCCL can never stand in for the peer path.",
+   "predicate": {
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 1,
+    "require": [
+     "qwen35-ep2-oracle: PASS"
+    ]
+   },
+   "probe": "existing",
+   "route": "ep2/mesh-vs-single-oracle"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_ep4_ -- --ignored --test-threads=1 --nocapture"
+    ]
+   },
+   "env": {
+    "HIPFIRE_AR_GRAPH": "0",
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_EP_PEER_ALLREDUCE": "1",
+    "HIPFIRE_EP_PEER_ALLREDUCE_DECODE": "1",
+    "HIPFIRE_GRAPH": "0",
+    "HIPFIRE_HAVE_2_GPU": "1",
+    "HIPFIRE_TP_USE_RCCL": "0"
+   },
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "multi-gpu-4"
+   ],
+   "id": "g5-ep4-physical",
+   "milestone": "G5",
+   "note": "#666 G5 physical EP4: qwen35_ep4_vs_ep2_oracle (byte-equal EP2/EP4 rank-0 logits) and qwen35_ep4_batch_step_recipe_oracle (receipt, sampling/RNG, inactive-lane, reset, invalid-receipt, unload). The batch oracle requires four distinct gfx1201 devices and prints skip: otherwise.",
+   "predicate": {
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 2,
+    "require": [
+     "qwen35-ep4-vs-ep2-oracle: PASS"
+    ]
+   },
+   "probe": "existing",
+   "route": "ep4/mesh-oracles-and-batch-lifecycle"
+  },
+  {
+   "commands": {
+    "negative": [
+     "hipfire run --temp 0 --kv-mode q8 --max-tokens 64 /nonexistent-a3b.mq4r \"Write a one-sentence greeting.\"  # expect nonzero fail-closed exit"
+    ],
+    "positive": [
+     "hipfire run --temp 0 --kv-mode q8 --max-tokens 64 qwen3.6:35b-a3b-mq4r \"Write a one-sentence greeting.\"",
+     "hipfire run --temp 0 --kv-mode q8 --max-tokens 64 qwen3.6:35b-a3b-mq4r \"Write a one-sentence greeting.\"  # immediate reload: byte-identical decode expected"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.6:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g5-production-sealed-moe-run",
+   "milestone": "G5",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "note": "#666 G5 production sealed-MoE route on the locked A3B fixture: load, prefill, decode with decoded text, unload, immediate reload byte-identical.",
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "run_reload_equal",
+    "min_chars": 1
+   },
+   "probe": "existing",
+   "prompt": "Write a one-sentence greeting.",
+   "route": "single/sealed-moe-production-generate-reload"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_QWEN35_A3B_RESET_MODEL=$MODEL HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35_sealed_moe_expert_mutation_rolls_back_and_recovers -- --ignored --exact --test-threads=1 --nocapture"
+    ]
+   },
+   "fixtures": [
+    "qwen3.6:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g5-production-sealed-moe-fault",
+   "milestone": "G5",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "the injected post-expert-mutation fault is the negative: one rolled-back error terminal, clean state snapshot, retry equal to a fresh daemon, unload"
+   },
+   "predicate": {
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 1,
+    "require": [
+     "single_qwen35_sealed_moe_expert_mutation_rolls_back_and_recovers ok"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/sealed-moe-fault-rollback"
   },
   {
    "commands": {
@@ -2091,12 +2369,31 @@
    ],
    "id": "g4-mesh-injected-failures",
    "milestone": "G4.9",
-   "note": "#666 G4.9 requires injected prefill/forward/logit failures on generate_mesh_carrier with per-device graph/KV reset and next-request parity on distinct peer-accessible GPUs. No existing mesh-carrier fault-injection probe.",
+   "note": "#666 G4.9 TP half: injected prefill/forward/logit failures on the dense TP mesh carrier, per-device graph/KV reset, next-request parity and bounded multi-cycle unload VRAM on distinct peer-accessible GPUs. No probe exists for TP; the PP half runs in g4-reset-pp.",
    "predicate": {
     "kind": "none"
    },
    "probe": "none",
-   "route": "tp+pp/mesh-carrier-fault-injection"
+   "route": "tp/mesh-carrier-fault-injection"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": []
+   },
+   "fixtures": [],
+   "hosts": [
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g15-vision-mesh",
+   "milestone": "G15",
+   "note": "#666 vision PP/TP campaign. No product route exists: a Qwen3.5/3.6 VL HFQ at pp>1 loads text-only (docs/multi-gpu.md), and there is no vision TP/PP probe. Stays rerun-required until G15 lands a route and its oracle.",
+   "predicate": {
+    "kind": "none"
+   },
+   "probe": "none",
+   "route": "pp+tp/vision-mesh"
   }
  ],
  "version": 1

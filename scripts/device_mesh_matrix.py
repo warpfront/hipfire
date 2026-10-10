@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -131,6 +132,7 @@ def platform_probe():
             "hipcc": best_effort(["hipcc", "--version"]),
             "driver": best_effort(["rocm-smi", "--showdriverversion"]),
             "pci_ids": best_effort(["rocm-smi", "--showid"]),
+            "topology": best_effort(["rocm-smi", "--showtopo"], 4000),
             "rccl": "\n".join(l for l in ldconfig.splitlines() if "rccl" in l.lower())[:500] or "unavailable"}
 
 def has_gpu():
@@ -222,6 +224,17 @@ def eval_run_text(text, min_chars, forbid=FORBID_RUN):
     hit = [m for m in forbid if m in text]
     good = len(text.strip()) >= min_chars and not hit
     return good, "run: chars=%d min=%d forbidden=%s" % (len(text.strip()), min_chars, hit)
+
+def eval_markers(text, pred, note):
+    """Env-gated tests return early with a `skip:` line and cargo still counts
+    them as passed, so `test result: ok` alone cannot prove a GPU oracle ran.
+    Rows name the line a real run prints (`require`) and the line a vacuous
+    one prints (`forbid`); both need `--nocapture` to reach the output."""
+    missing = [m for m in pred.get("require", []) if m not in text]
+    hit = [m for m in pred.get("forbid", []) if m in text]
+    if missing or hit:
+        return False, "%s; required output missing %s, forbidden output present %s" % (note, missing, hit)
+    return True, note
 
 def event_text(events):
     parts = []
@@ -506,16 +519,46 @@ def prompt_identity(ctx, row, mapping):
                 except OSError:
                     pass
     return ""
-def fixture_identity(ctx, row):
-    pairs = [(t, ctx["fixture_paths"].get(t, "")) for t in row.get("fixtures", [])]
-    pairs += [(os.path.basename(p), p) for p in row.get("fixture_files", [])]
+def row_fixture_paths(ctx, row, mapping):
+    """Every model file a row consumes: declared tags, `fixture_files`, and
+    fixtures carried inline as an env prefix (HIPFIRE_*_FIXTURE=/path[,/path]).
+    Inline fixtures are just as host-dependent as declared ones: on a host
+    without that sidecar the command runs and reports zero tests, which is
+    indistinguishable from a broken filter. A path may be a directory
+    (HIPFIRE_DENSE_FIXTURE points at the model store, not one file)."""
+    paths = [ctx["fixture_paths"].get(t, "") for t in row.get("fixtures", [])]
+    paths += subst(row.get("fixture_files", []), mapping)
+    for cmd in row.get("commands", {}).get("positive", []):
+        for assign in re.findall(r'HIPFIRE_(?:\w*FIXTURE|DFLASH_DRAFT|\w*RESET_MODEL)="?([^"\s]+)"?', subst(cmd, mapping)):
+            paths += [p for p in assign.split(",") if p.startswith("/")]
+    return list(dict.fromkeys(paths))
+
+def fixture_lock_error(path, lock, digests):
+    """Receipts from different hosts are comparable only if they read the same
+    bytes. Same-named files drift (qwen3.8-27b.mq4-xt was re-issued upstream
+    with the same name), so the catalogue locks size and sha256 per file."""
+    entry = lock.get(os.path.basename(path))
+    if not entry:
+        return "%s is not in the catalogue fixture_lock" % path
+    size = os.path.getsize(path)
+    if size != entry["size_bytes"]:
+        return "%s is %d bytes, lock says %d" % (path, size, entry["size_bytes"])
+    digest = sha256_cached(path, digests)
+    if digest != entry["sha256"]:
+        return "%s sha256 %s, lock says %s (fetch: %s)" % (path, digest, entry["sha256"], entry.get("source", "?"))
+    return ""
+
+def fixture_identity(ctx, row, mapping):
+    tags = {ctx["fixture_paths"].get(t, ""): t for t in row.get("fixtures", [])}
     out = []
-    for tag, path in pairs:
+    for path in row_fixture_paths(ctx, row, mapping):
+        if os.path.isdir(path):
+            continue
         try:
             size = os.path.getsize(path)
         except OSError:
             size = -1
-        out.append({"tag": tag, "file": path, "size_bytes": size,
+        out.append({"tag": tags.get(path, os.path.basename(path)), "file": path, "size_bytes": size,
                     "sha256": sha256_cached(path, ctx["digests"]) if size >= 0 else "missing"})
     return out
 
@@ -527,6 +570,17 @@ def extend_outs(rows, results):
             rows.extend(data if isinstance(data, list) else [])
         except (TypeError, OSError, ValueError):
             pass
+
+def save_logs(out, row_id, kind, results):
+    """Receipts keep a 2000-char tail; #666 evidence needs the complete output."""
+    paths = []
+    for i, res in enumerate(r for r in results if isinstance(r, dict) and "out" in r):
+        path = os.path.join(out, "logs", "%s-%s-%d.log" % (row_id, kind, i))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("$ %s\n%s" % (res.get("cmd", ""), res["out"]))
+        paths.append(path)
+    return paths
 
 def run_negatives(ctx, row, mapping, env, timeout):
     pred = row.get("negative_predicate") or {}
@@ -556,19 +610,14 @@ def execute_row(ctx, row, out, timeout):
         return "rerun-required", "no existing probe: %s" % row.get("note", ""), detail
     if needs_gpu(row) and not has_gpu():
         return "hardware-blocked", "no HIP GPU (/dev/kfd and /dev/dri absent)", detail
-    paths = [ctx["fixture_paths"].get(t, "") for t in row.get("fixtures", [])] + row.get("fixture_files", [])
-    # Rows that carry their fixture inline as an env prefix (HIPFIRE_*_FIXTURE=
-    # /path[,/path]) are just as host-dependent as a declared fixture: on a host
-    # without that sidecar the command runs and reports zero tests, which is
-    # indistinguishable from a broken filter. Gate on the paths themselves.
-    for cmd in row.get("commands", {}).get("positive", []):
-        for assign in re.findall(r'HIPFIRE_(?:\w*FIXTURE|DFLASH_DRAFT|\w*RESET_MODEL)="?([^"\s]+)"?', subst(cmd, mapping)):
-            paths += [p for p in assign.split(",") if p.startswith("/")]
-    # A fixture may legitimately be a directory (HIPFIRE_DENSE_FIXTURE points at
-    # the model store, not one file).
+    paths = row_fixture_paths(ctx, row, mapping)
     missing = [p for p in paths if not (os.path.isfile(p) or os.path.isdir(p))]
     if missing:
         return "hardware-blocked", "fixtures absent: %s" % missing, detail
+    unlocked = [e for e in (fixture_lock_error(p, ctx["fixture_lock"], ctx["digests"])
+                            for p in paths if os.path.isfile(p)) if e]
+    if unlocked:
+        return "hardware-blocked", "fixture lock: %s" % "; ".join(unlocked), detail
     if row.get("positive_session") and mapping["$MODEL"]:
         link = os.path.join(out, "%s-alt.mq4" % row["id"])
         try:
@@ -589,6 +638,7 @@ def execute_row(ctx, row, out, timeout):
                 break
     for cmd in row.get("commands", {}).get("positive", []):
         positives += [r for r in [exec_probe(sub, cmd, timeout)] if "skipped" not in r]
+    detail["logs"] = save_logs(out, row["id"], "positive", positives)
     broken = next((s["broken"] for s in sessions if s.get("broken")), "")
     if broken:
         return "failed", "session driver: %s" % broken, detail
@@ -642,11 +692,14 @@ def execute_row(ctx, row, out, timeout):
         good, note = eval_wire(sessions, kind, pred)
     else:
         return "failed", "unknown predicate %s" % kind, detail
+    if good:
+        good, note = eval_markers("\n".join(r.get("out", "") for r in positives), pred, note)
     detail["positive_note"] = note
     if not good:
         return "failed", "positive: %s" % note, detail
     if row.get("negative_session") or row.get("commands", {}).get("negative"):
-        (ngood, nnote), _ = run_negatives(ctx, row, mapping, env, timeout)
+        (ngood, nnote), negatives = run_negatives(ctx, row, mapping, env, timeout)
+        detail["logs"] += save_logs(out, row["id"], "negative", negatives)
         detail["negative_note"] = nnote
         if not ngood:
             return "failed", "negative: %s" % nnote, detail
@@ -661,7 +714,7 @@ def make_receipt(ctx, row, out, disposition, note, detail, elapsed):
                "git": ctx["git"], "platform": ctx["platform"],
                "binaries": {"hipfire": ctx["cli_bin"], "hipfire_md5": ctx["cli_md5"],
                             "daemon": ctx["daemon_bin"], "daemon_md5": ctx["daemon_md5"]},
-               "fixtures": fixture_identity(ctx, row), "prompt_md5": prompt_identity(ctx, row, mapping),
+               "fixtures": fixture_identity(ctx, row, mapping), "prompt_md5": prompt_identity(ctx, row, mapping),
                "commands": row.get("commands", {}), "predicate": row.get("predicate", {}),
                "negative_predicate": row.get("negative_predicate", {}),
                "result": {"elapsed_s": elapsed, "note": note, "detail": detail},
@@ -785,6 +838,38 @@ def self_test():
     check("wire-race-unknown-id-terminal-fails",
           not eval_wire([race_variant(extra_terminal={"type": "done", "id": "rx", "tokens": 1})],
                         "wire_exactly_one_terminal", race_pred)[0])
+    # Anti-vacuity markers: an env-gated early return still reads "1 passed".
+    skip_out = "skip: qwen35-ep2-oracle needs HIPFIRE_HAVE_2_GPU=1\n" + SAMPLE_CARGO_PASS
+    marker_pred = {"require": ["qwen35-ep2-oracle: PASS"], "forbid": ["skip:"]}
+    check("markers-skip-fails", eval_cargo(skip_out, 1)[0] and not eval_markers(skip_out, marker_pred, "")[0])
+    check("markers-real-run-passes",
+          eval_markers("qwen35-ep2-oracle: PASS — 27 committed positions\n", marker_pred, "")[0])
+    # Fixture lock: exact bytes pass; same name with other bytes, or an
+    # unlisted file, is blocked before any command runs.
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = os.path.join(tmp, "fixture.bin")
+        with open(fixture, "wb") as fh:
+            fh.write(b"pinned bytes")
+        lock = {"fixture.bin": {"size_bytes": 12, "sha256": hashlib.sha256(b"pinned bytes").hexdigest()}}
+        check("lock-exact-passes", fixture_lock_error(fixture, lock, {}) == "")
+        with open(fixture, "wb") as fh:
+            fh.write(b"pinned bytez")
+        check("lock-same-size-other-bytes-blocked", "sha256" in fixture_lock_error(fixture, lock, {}))
+        check("lock-unlisted-blocked", "not in" in fixture_lock_error(fixture, {}, {}))
+    # Every file any catalogue row consumes must be locked, or that row can
+    # only ever report hardware-blocked.
+    root = repo_root()
+    catalogue = load_catalogue(root)
+    static = {"daemon_bin": "", "cli_bin": "",
+              "fixture_paths": {t: resolve_fixture(root, t) for r in catalogue["rows"] for t in r.get("fixtures", [])}}
+    unlocked = set()
+    for row in catalogue["rows"]:
+        mapping = row_mapping(static, row, "$OUT")
+        for path in row_fixture_paths(static, row, mapping):
+            if path not in (mapping["$MODEL_DIR"], mapping["$MODELS_DIR"]) and \
+                    os.path.basename(path) not in catalogue.get("fixture_lock", {}):
+                unlocked.add("%s:%s" % (row["id"], path))
+    check("catalogue-fixtures-locked%s" % (" %s" % sorted(unlocked) if unlocked else ""), not unlocked)
     for name, ok in checks:
         print("   [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if all(ok for _, ok in checks) else "FAILED", len(checks)))
@@ -802,7 +887,8 @@ def main(argv=None):
     if args.self_test:
         return self_test()
     root = repo_root()
-    rows = load_catalogue(root)["rows"]
+    catalogue = load_catalogue(root)
+    rows = catalogue["rows"]
     if args.only:
         rows = [r for r in rows if r["id"] == args.only]
         if not rows:
@@ -814,7 +900,8 @@ def main(argv=None):
     out = os.path.abspath(args.out) if args.out else os.path.join(root, ".matrix-out")
     ctx = {"cli_bin": cli_bin, "daemon_bin": daemon_bin, "git": git_identity(root), "platform": platform_probe(),
            "fixture_paths": {}, "cli_md5": md5_file(cli_bin) if cli_bin else "missing",
-           "daemon_md5": md5_file(daemon_bin) if daemon_bin else "missing", "digests": {}}
+           "daemon_md5": md5_file(daemon_bin) if daemon_bin else "missing", "digests": {},
+           "fixture_lock": catalogue.get("fixture_lock", {})}
     for tag in {t for r in rows for t in r.get("fixtures", [])}:
         ctx["fixture_paths"][tag] = resolve_fixture(root, tag)
     if args.plan:
@@ -826,22 +913,38 @@ def main(argv=None):
     # GPU answered. A wrong HIP_VISIBLE_DEVICES index silently files a whole run
     # under the wrong architecture (observed: a "gfx1151" run that actually ran
     # on an 8 GB gfx1010 and OOMed). Ask the daemon which device it opened.
+    # A multi-gpu-N class must also see N distinct physical GPUs with emulation
+    # off: HIPFIRE_EMULATE_GPUS aliases logical ranks onto one device, and
+    # emulation never closes a distinct-GPU row. Each listed device is probed
+    # on its own so the receipt names every arch that answered.
     if args.host_class and daemon_bin:
-        # The daemon initializes HIP lazily, on the first message: an immediate
-        # EOF prints no banner. A ping is the cheapest thing that opens device 0.
-        probe = run_cmd(["sh", "-c", 'printf \'{"type":"ping"}\\n\' | "$0"', daemon_bin], {}, 120)
-        seen = re.findall(r"GPU dev \d+: (gfx\w+)", probe.get("out", ""))
-        if not seen:
-            print("cannot determine GPU arch from %s; refusing to file mislabeled evidence"
-                  % daemon_bin, file=sys.stderr)
+        mesh = re.fullmatch(r"multi-gpu-(\d+)", args.host_class)
+        visible = list(dict.fromkeys(d.strip() for d in os.environ.get("HIP_VISIBLE_DEVICES", "").split(",") if d.strip()))
+        if mesh and (os.environ.get("HIPFIRE_EMULATE_GPUS") or len(visible) < int(mesh.group(1))):
+            print("host-class %s needs HIP_VISIBLE_DEVICES naming %s distinct GPUs (got %r) and "
+                  "HIPFIRE_EMULATE_GPUS unset (got %r)"
+                  % (args.host_class, mesh.group(1), os.environ.get("HIP_VISIBLE_DEVICES", ""),
+                     os.environ.get("HIPFIRE_EMULATE_GPUS", "")), file=sys.stderr)
             return 2
-        if seen[0] != args.host_class:
+        archs = []
+        for dev in (visible if mesh else [None]):
+            # The daemon initializes HIP lazily, on the first message: an immediate
+            # EOF prints no banner. A ping is the cheapest thing that opens device 0.
+            probe = run_cmd(["sh", "-c", 'printf \'{"type":"ping"}\\n\' | "$0"', daemon_bin],
+                            {"HIP_VISIBLE_DEVICES": dev} if dev is not None else {}, 120)
+            seen = re.findall(r"GPU dev \d+: (gfx\w+)", probe.get("out", ""))
+            if not seen:
+                print("cannot determine GPU arch from %s (HIP_VISIBLE_DEVICES=%r); refusing to file "
+                      "mislabeled evidence" % (daemon_bin, dev), file=sys.stderr)
+                return 2
+            archs.append(seen[0])
+        if not mesh and archs[0] != args.host_class:
             print("host-class mismatch: --host-class %s but device 0 is %s "
                   "(check HIP_VISIBLE_DEVICES=%r)"
-                  % (args.host_class, seen[0], os.environ.get("HIP_VISIBLE_DEVICES", "")),
+                  % (args.host_class, archs[0], os.environ.get("HIP_VISIBLE_DEVICES", "")),
                   file=sys.stderr)
             return 2
-        ctx["platform"]["gpu_arch_verified"] = seen[0]
+        ctx["platform"]["gpu_arch_verified"] = ",".join(archs)
     os.makedirs(os.path.join(out, "receipts"), exist_ok=True)
     ctx["digests"], cache_path = load_digest_cache(out)
     summary = {"schema": "device-mesh-matrix-summary-v1", "produced_utc": datetime.now(timezone.utc).isoformat(),
