@@ -508,12 +508,16 @@ __device__ __forceinline__ void fa2_fill_softmax_pv(
 }
 #endif
 
-// Shared workgroup body (direct only: writes normalized O to `out`).
+// Shared workgroup body. PARTIAL=false writes normalized O to `out`;
+// PARTIAL=true writes one LSE scalar plus 256 normalized output values for
+// each (query, head, split). `split` owns a disjoint range of the live KT32
+// tiles derived from positions[], so every split scans only useful KV rows.
 // `kv_h` selects the KV head (blockIdx.y); `q_base` the 16-position tile
 // (blockIdx.x). Q arrives f16 pre-converted row-major [batch, 24, 256]
 // (see attention_fa2_q_preconvert_gfx11); the body never touches f32 Q.
 // Causal bounds come from positions[] (mailbox-reduced to gmin/gmax);
 // the tile loop clamps to the derived seq_len.
+template <bool PARTIAL>
 __device__ __forceinline__ void fa2_gqa_body(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
@@ -523,7 +527,9 @@ __device__ __forceinline__ void fa2_gqa_body(
     int batch_size,
     float scale_attn,
     int kv_h,
-    int q_base)
+    int q_base,
+    int split,
+    int n_splits)
 {
     constexpr int KT = HIPFIRE_FA2_KT;
     constexpr int KT_SUBS = KT / 16;
@@ -610,6 +616,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[LDS_DWORDS - 2]);
     const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[LDS_DWORDS - 1]);
     const int seq_len = gmax + 1;
+    const int tiles_total = (seq_len + KT - 1) / KT;
+    const int tiles_per_split = (tiles_total + n_splits - 1) / n_splits;
+    const int tile0 = split * tiles_per_split;
+    const int tile1 = min(tile0 + tiles_per_split, tiles_total);
 #if !FA2_FILL
     // The mailbox dwords are the V plane's last two, and the tile loop's
     // first V fill (Transition 2) writes them. Without this barrier a wave
@@ -631,9 +641,9 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
         for (int s = 0; s < FA2_FILL_HV; ++s)
 #if FA2_R3
-            fa2_fill_v_load(v_cache, 0, seq_len, kv_blk, fa2_r3_vslot(hl, s),
+            fa2_fill_v_load(v_cache, tile0 * KT, seq_len, kv_blk, fa2_r3_vslot(hl, s),
 #else
-            fa2_fill_v_load(v_cache, 0, seq_len, kv_blk, hl + s * FA2_FILL_HT,
+            fa2_fill_v_load(v_cache, tile0 * KT, seq_len, kv_blk, hl + s * FA2_FILL_HT,
 #endif
                             rv_s[s], rv_u + s * 4);
     }
@@ -641,15 +651,13 @@ __device__ __forceinline__ void fa2_gqa_body(
     {
         uint32_t su;
         uint32_t uc[8];
-        fa2_fill_k_load(k_cache, 0, seq_len, kv_blk, tid, su, uc);
+        fa2_fill_k_load(k_cache, tile0 * KT, seq_len, kv_blk, tid, su, uc);
         fa2_fill_k_store(Kdw, tid, su, uc);
     }
     __syncthreads();
     if (fill_compute) {
-        for (int tile = 0; ; ++tile) {
+        for (int tile = tile0; tile < tile1; ++tile) {
             const int ktile = tile * KT;
-            if (ktile >= seq_len)
-                break;
             const bool do0 = ktile <= gmax;
             const bool do1 = ktile + 16 <= gmax;
             float8_t sacc0, sacc1;
@@ -681,11 +689,9 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
         uint32_t rk_s[FA2_FILL_HK];
         uint32_t rk_u[FA2_FILL_HK * 8];
-        for (int tile = 0; ; ++tile) {
+        for (int tile = tile0; tile < tile1; ++tile) {
             const int ktile = tile * KT;
-            if (ktile >= seq_len)
-                break;
-            const bool next = ktile + KT < seq_len;
+            const bool next = tile + 1 < tile1;
             if (next) {
 #pragma unroll
                 for (int t = 0; t < FA2_FILL_HK; ++t)
@@ -740,10 +746,8 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
 #endif
     // ---- Transitions 2-4: KT tiles ----
-    for (int tile = 0; ; ++tile) {
+    for (int tile = tile0; tile < tile1; ++tile) {
         const int ktile = tile * KT;
-        if (ktile >= seq_len)
-            break;
 #if HIPFIRE_FA2_KT == 32
         // F6: tiles after the first consume the raw bytes prefetched into
         // registers during the previous tile's compute phase (see below);
@@ -751,7 +755,7 @@ __device__ __forceinline__ void fa2_gqa_body(
         // divergence. tile > 0 implies the prefetch ran: the previous
         // iteration saw ktile_prev + KT < seq_len, else this iteration
         // would have broken out above.
-        const bool have_pf = (tile > 0);
+        const bool have_pf = (tile > tile0);
 #else
         constexpr bool have_pf = false;
 #endif
@@ -966,7 +970,7 @@ __device__ __forceinline__ void fa2_gqa_body(
         // sched_barrier (and never an asm memory clobber) is used.
         {
             const int ktile_next = ktile + KT;
-            if (ktile_next < seq_len) {
+            if (tile + 1 < tile1) {
 #if HIPFIRE_FA2_KMODE == 3
 #pragma unroll 1
                 for (int t = 0; t < KT_KITERS; ++t) {
@@ -1378,23 +1382,45 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
 #endif
 
-    // ---- Transition 4: completion (direct epilogue) ----
+    // ---- Transition 4: completion ----
     // Ofr[dc][j] at lane (ml,half) = O[query=ml][dim=dc*16+2*j+half]:
     // the pair covers every output dimension exactly once (even/odd
     // split), and the pair-local l_val normalizes. Each valid
     // out[query,head,dim] has exactly one writer.
     if (compute) {
-        if (qok_ml) {
+        if (!PARTIAL) {
+            if (qok_ml) {
+                const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+                // 32-bit row base (whole O tensor < 10 MiB).
+                const unsigned bo =
+                    (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned bd = bo + (unsigned)(dc * 16 + half);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        out[bd + (unsigned)(j * 2)] = Ofr[dc][j] * inv;
+                }
+            }
+        } else if (qok_ml) {
+            const unsigned records =
+                (unsigned)batch_size * 24u * (unsigned)n_splits;
+            float* lse = out;
+            float* oacc = out + records;
+            const unsigned record =
+                ((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                    * (unsigned)n_splits + (unsigned)split;
             const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
-            // 32-bit row base (whole O tensor < 10 MiB).
-            const unsigned bo =
-                (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+            if (half == 0)
+                lse[record] = l_val > 0.0f
+                    ? m_old + __logf(l_val)
+                    : -INFINITY;
+            float* rec = oacc + record * 256u;
 #pragma unroll
             for (int dc = 0; dc < 16; ++dc) {
-                const unsigned bd = bo + (unsigned)(dc * 16 + half);
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
-                    out[bd + (unsigned)(j * 2)] = Ofr[dc][j] * inv;
+                    rec[(unsigned)(dc * 16 + j * 2 + half)] = Ofr[dc][j] * inv;
             }
         }
     }
@@ -1514,9 +1540,80 @@ extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void HIP
 #endif
     if (q_base >= batch_size)
         return;
-    fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,
-                 scale_attn, kv_h, q_base);
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 1);
 }
+
+#if HIPFIRE_FA2_KMODE == 0 && FA2_R3
+extern "C" __global__ __launch_bounds__(256, 1) void attention_q8_0_fa2_gqa_partial_gfx1100(
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    int n_splits)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const unsigned lin = blockIdx.x + gridDim.x * blockIdx.y;
+    const int kv_h = (int)(lin & 3u);
+    const int q_base = (int)(gridDim.x - 1u - (lin >> 2)) * 16;
+    if (q_base >= batch_size)
+        return;
+    const int split = blockIdx.z;
+    if (split >= n_splits)
+        return;
+    fa2_gqa_body<true>(q16, k_cache, v_cache, partials, positions, batch_size,
+                       scale_attn, kv_h, q_base, split, n_splits);
+}
+
+extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_gfx1100(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int batch_size,
+    int n_heads,
+    int head_dim,
+    int n_splits)
+{
+    if (n_heads != 24 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int rec = blockIdx.x * 8 + wave;
+    if (rec >= batch_size * n_heads)
+        return;
+    const long long records =
+        (long long)batch_size * n_heads * n_splits;
+    const float* lse = partials;
+    const float* oacc = partials + records;
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s)
+        m = fmaxf(m, lse[(long long)rec * n_splits + s]);
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const long long record = (long long)rec * n_splits + s;
+            const float split_lse = lse[record];
+            const float w = isfinite(split_lse) ? __expf(split_lse - m) : 0.0f;
+            den += w;
+            num += w * oacc[record * head_dim + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            den > 0.0f ? num / den : 0.0f;
+    }
+}
+#endif
 
 // ---- KMODE=3 entry: fwht3 K, pre-rotated + pre-converted f16 Q ----
 // K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
@@ -1547,7 +1644,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
     const int q_base = blockIdx.x * 8;
     if (q_base >= batch_size)
         return;
-    fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,
-                 scale_attn, kv_h, q_base);
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 1);
 }
 #endif

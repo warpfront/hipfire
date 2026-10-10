@@ -667,6 +667,7 @@ pub fn forward_prefill_batch_multi(
                         false,
                         false,
                         false,
+                        false,
                     );
                     batch_chunk_full_attn_prepare(
                         gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, &ctx, sem, None,

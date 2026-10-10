@@ -103,6 +103,22 @@ pub struct MaskEmbedOverride<'a> {
 pub enum DflashFusionCtx {
     Off,
     ChainVerify,
+    /// Linear-chain verify whose exact model/KV/context envelope admits the
+    /// gfx1100 FA2 split-KV route. This only widens capture-safe auxiliary
+    /// kernels; ordinary eager ChainVerify behavior is otherwise unchanged.
+    ChainVerifySplit,
+}
+
+impl DflashFusionCtx {
+    #[inline]
+    pub const fn is_chain_verify(self) -> bool {
+        matches!(self, Self::ChainVerify | Self::ChainVerifySplit)
+    }
+
+    #[inline]
+    pub const fn split_verify_active(self) -> bool {
+        matches!(self, Self::ChainVerifySplit)
+    }
 }
 
 #[derive(Clone, Copy)]

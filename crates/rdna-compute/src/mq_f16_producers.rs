@@ -23,9 +23,10 @@
 //!   `fp16_x_source_ptr`.
 //!
 //! Route contract (mirrored by the prefill hook predicate): exact gfx1100,
-//! `DflashFusionCtx::ChainVerify`, N<=16, MQ4G256V2 weights, graph-off and
-//! no active replay recording, `HIPFIRE_MQ_F16_PROJECTION_OFF != 1`. Every
-//! failed predicate runs the pre-change path; these entries return
+//! `DflashFusionCtx::ChainVerify`, N<=16, MQ4G256V2 weights, and
+//! `HIPFIRE_MQ_F16_PROJECTION_OFF != 1`. HipGraph/replay recording requires
+//! the fixed-grid gfx1100 split-verifier experiment. Every failed predicate
+//! runs the pre-change path; these entries return
 //! `Err` on a non-gfx1100 arch or non-F16 input rather than silently
 //! falling back. New kernels use `launch_maybe_blob` with the inline
 //! `KernargBlob` builder (capture-safe ABI, same as the baselines).
@@ -228,9 +229,10 @@ impl Gpu {
     /// accounting) except `xp` is the validated F16 pointer — no
     /// `ensure_fp16_x`, no `fp16_x_source_ptr` traffic. The MMQ/BT perf
     /// policies of the base launcher are intentionally absent: callers
-    /// guarantee the exact route (gfx1100, N<=16, graph-off, no recording),
-    /// where the base launcher itself falls through to this same base
-    /// kernel. Calibration taps mirror the `FusedQkvzaMq4G256V2` run-arm.
+    /// guarantee the exact route (gfx1100, N<=16), where the base launcher
+    /// itself falls through to this same base kernel. Capture/recording is
+    /// admitted only by the fixed-grid split-verifier route. Calibration taps
+    /// mirror the `FusedQkvzaMq4G256V2` run-arm.
     pub fn gemm_qkvza_mq4g256v2_wmma_f16(
         &mut self,
         a_qkv: &GpuTensor,
@@ -454,8 +456,10 @@ impl Gpu {
     /// copy of the `gemm_gate_up_mq4g256v2_wmma` path with the validated F16
     /// pointer. Exact-gfx1100 eager HIP defaults to RAW-slab ldsstage when
     /// eligible (HIPFIRE_GATEUP_LDSSTAGE default-on, 1<=N<=16, K%512==0; `=0`
-    /// historical base); capture/replay keep base symbol/block32. Taps mirror
-    /// the `FusedGateUpMq4G256V2` run-arm.
+    /// historical base). Capture/replay use the same LDS-stage symbol only for
+    /// the fixed-grid gfx1100 split-verifier experiment; every other recorded
+    /// route keeps the historical base symbol/block32. Taps mirror the
+    /// `FusedGateUpMq4G256V2` run-arm.
     pub fn gemm_gate_up_mq4g256v2_wmma_f16(
         &mut self,
         a_gate: &GpuTensor,
@@ -467,6 +471,7 @@ impl Gpu {
         up_m: usize,
         k: usize,
         batch_size: usize,
+        split_verify_capture: bool,
     ) -> HipResult<()> {
         if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
@@ -484,8 +489,12 @@ impl Gpu {
         self.maybe_capture_activation(a_up, x_f16, batch_size, k);
         self.bind_thread()?;
         // Same guarded tuple as gemm_gate_up_mq4g256v2_wmma small-N eager HIP.
-        let (kname, ksrc, block_x) = if !self.replay.is_recording()
-            && !self.graphs.capture_mode
+        // The fixed-grid split-verifier experiment also supplies replay resource
+        // contracts for this exact launch, so its capture must preserve the eager
+        // reduction route instead of silently switching to the base kernel.
+        let recording = self.replay.is_recording() || self.graphs.capture_mode;
+        let recording_supported = !recording || split_verify_capture;
+        let (kname, ksrc, block_x) = if recording_supported
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && (1..=16).contains(&batch_size)

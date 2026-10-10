@@ -527,6 +527,7 @@ fn main() {
                         up_m,
                         k,
                         n,
+                        false,
                     )
                     .expect("new gate_up gemm");
                     gpu.hip.device_synchronize().expect("sync gate_up");

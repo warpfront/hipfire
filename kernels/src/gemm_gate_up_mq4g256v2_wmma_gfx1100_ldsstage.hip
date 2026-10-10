@@ -2,7 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Default for eligible exact-gfx1100 eager HIP launches; capture keeps base.
+// Default for eligible exact-gfx1100 eager HIP launches. The fixed-grid
+// split-verifier route may also retain this symbol under HipGraph/PM4 capture
+// once its resource and kernarg contracts are registered.
 //
 // gfx1100 (RDNA3) RAW-slab LDS-stage gate+up for MQ4G256V2 (qt=44), DFlash
 // N<=16 tier. Composes:

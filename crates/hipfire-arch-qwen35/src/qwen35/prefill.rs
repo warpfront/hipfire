@@ -40,6 +40,10 @@ use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::context::DispatchWorkload;
 use hipfire_dispatch::families::attention::AttnParams;
+use hipfire_dispatch::families::attention::Gfx1100SplitVerifyModel;
+use hipfire_dispatch::families::attention::Gfx1100SplitVerifyRoute;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_admitted as dispatch_gfx1100_split_verify_admitted;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_min_ctx as dispatch_gfx1100_split_verify_min_ctx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
@@ -333,7 +337,9 @@ fn packed_mq4_down_admitted(
     down: (DType, usize, usize),
     hidden_dim: usize,
 ) -> bool {
-    packed_admitted && separate && residual
+    packed_admitted
+        && separate
+        && residual
         && down.0 == DType::MQ4G256
         && (down.1, down.2) == (5120, 17408)
         && hidden_dim == down.2
@@ -354,18 +360,32 @@ fn try_packed_mq4_down(
         !pbs.lean && gpu.packed_mq4_admitted(down.m, down.k, n),
         h_source == FfnGateOutput::Separate,
         matches!(epilogue, BatchEpilogue::Residual),
-        (down.gpu_dtype, down.m, down.k), hidden_dim,
+        (down.gpu_dtype, down.m, down.k),
+        hidden_dim,
     ) {
         return Ok(false);
     }
     gpu.flush_residual_fold()?;
     fused_silu_mul_rotate_mq_batched_for(
-        gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
-        &pbs.ffn_hidden_batch, hidden_dim, n,
+        gpu,
+        down,
+        &pbs.gate_ffn_batch,
+        &pbs.up_batch,
+        &pbs.ffn_hidden_batch,
+        hidden_dim,
+        n,
     )?;
-    run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
-        &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
-        down.m, down.k, n)?;
+    run_residual_gemm_key(
+        gpu,
+        hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+        &down.buf,
+        down.gpu_dtype,
+        &pbs.ffn_hidden_batch,
+        &pbs.x_batch,
+        down.m,
+        down.k,
+        n,
+    )?;
     Ok(true)
 }
 
@@ -409,22 +429,34 @@ fn try_packed_mq4_ffn_gate_up(
     }
     gpu.flush_residual_fold()?;
     let separate_awq_inputs = gate.awq_scale.is_some() || up.awq_scale.is_some();
-    for (index, (weight, output)) in [
-        (gate, &pbs.gate_ffn_batch),
-        (up, &pbs.up_batch),
-    ].into_iter().enumerate() {
+    for (index, (weight, output)) in [(gate, &pbs.gate_ffn_batch), (up, &pbs.up_batch)]
+        .into_iter()
+        .enumerate()
+    {
         // Sidecars are per-weight and may differ (or exist on only one side).
         // Reuse the rotated input only when neither projection carries AWQ.
         if index == 0 || separate_awq_inputs {
             fused_rmsnorm_rotate_mq_batched_for(
-                gpu, &pbs.x_batch, norm, weight, &pbs.x_rot_batch,
-                weight.k, config.norm_eps, n,
+                gpu,
+                &pbs.x_batch,
+                norm,
+                weight,
+                &pbs.x_rot_batch,
+                weight.k,
+                config.norm_eps,
+                n,
             )?;
         }
         run_plain_gemm_key(
-            gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
-            &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
-            weight.m, weight.k, n,
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+            &weight.buf,
+            weight.gpu_dtype,
+            &pbs.x_rot_batch,
+            output,
+            weight.m,
+            weight.k,
+            n,
         )?;
     }
     Ok(true)
@@ -1562,7 +1594,9 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
 
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
-        .ok().as_deref() == Some("1")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Separately admitted native MQ4 route: no V2 producer or lean PBS contract.
@@ -1575,7 +1609,9 @@ fn native_mq4_widened_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
 }
 
 fn native_mq4_widened_flags_admitted(
-    arch: &str, flags: &rdna_compute::FeatureFlags, screen: bool,
+    arch: &str,
+    flags: &rdna_compute::FeatureFlags,
+    screen: bool,
 ) -> bool {
     arch == "gfx1100"
         && !flags.fp16_disabled
@@ -1944,9 +1980,17 @@ pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> O
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
     let packed = hipfire_config::developer_var("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     if arch == "gfx1100" && (native_mq4_widened_requested() || packed) {
-        base.checked_add(native_mq4_projection_deficit(config, WIDENED_COMMIT_ROWS, 0, 0, 0)?)
+        base.checked_add(native_mq4_projection_deficit(
+            config,
+            WIDENED_COMMIT_ROWS,
+            0,
+            0,
+            0,
+        )?)
     } else {
         Some(base)
     }
@@ -1962,11 +2006,18 @@ fn native_mq4_projection_deficit(
     live_f16: usize,
     live_partials: usize,
 ) -> Option<usize> {
-    let mmq = config.hidden_dim.checked_add(127)?.checked_div(128)?
-        .checked_mul(144)?.checked_mul(rows)?;
+    let mmq = config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(144)?
+        .checked_mul(rows)?;
     let tail = rows.min(127);
     let f16 = tail.checked_mul(config.hidden_dim)?.checked_mul(2)?;
-    let partials = tail.checked_mul(config.dim)?.checked_mul(4)?.checked_mul(4)?;
+    let partials = tail
+        .checked_mul(config.dim)?
+        .checked_mul(4)?
+        .checked_mul(4)?;
     mmq.saturating_sub(live_mmq)
         .checked_add(f16.saturating_sub(live_f16))?
         .checked_add(partials.saturating_sub(live_partials))
@@ -2132,11 +2183,13 @@ fn memory_admitted_rung(
         .unwrap_or(usize::MAX);
         let projection_deficit = if native_mq4 {
             native_mq4_projection_deficit(
-                config, rung,
+                config,
+                rung,
                 gpu.scratch.q8_1_mmq_x_scratch_bytes,
                 gpu.scratch.fp16_x_scratch_bytes,
                 gpu.scratch.ksplit_det_partials_bytes,
-            ).unwrap_or(usize::MAX)
+            )
+            .unwrap_or(usize::MAX)
         } else if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
@@ -2222,7 +2275,13 @@ fn ordinary_prefill_chunk_limit_with_cache(
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
     let mut admitted = memory_admitted_rung(
-        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached,
+        gpu,
+        config,
+        kv_cache,
+        perf,
+        lean,
+        native_mq4_widened_route(gpu, weights),
+        cached,
     )?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
@@ -5529,19 +5588,23 @@ pub(crate) fn batch_chunk_upload_positions(
 /// S3-f16-projection-inputs: exact-route gate for the FP16 projection-input
 /// fast path (all four `batch_chunk_*` projection hooks below).
 ///
-/// All predicates are cheap field reads — no env/lock/JIT in the cycle (the
-/// kill switch resolves once at `FeatureFlags` init). Every failed predicate
-/// runs the pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
+/// All ordinary-path predicates are cheap field reads. Capture/recording is
+/// admitted only together with the exact-gfx1100 split-verifier experiment:
+/// that route owns fixed, preallocated F16 sidecars and records every producer
+/// and consumer through the blob funnel. Every failed predicate runs the
+/// pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
-    matches!(fusion, DflashFusionCtx::ChainVerify)
+    let recording = gpu.graphs.capture_mode || gpu.replay.is_recording();
+    let recording_supported = !recording
+        || (fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n));
+    fusion.is_chain_verify()
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
         && n <= 16
         && dim % 256 == 0
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording()
+        && recording_supported
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6249,7 +6312,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // (kill switch, non-sequential batch, non-GQA route, tape absence or
     // overflow, ineligible shapes/arch) runs the pre-change sequence below
     // launch-for-launch.
-    if fusion == DflashFusionCtx::ChainVerify
+    if fusion.is_chain_verify()
         && !gpu.flags.gdn_pre_fuse_off
         && matches!(batch_semantics, BatchSemantics::Sequential)
         && config.linear_num_key_heads < n_v_heads
@@ -6503,7 +6566,7 @@ fn s4_residual_fast(
     epilogue: &BatchEpilogue<'_>,
     n: usize,
 ) -> bool {
-    fusion == DflashFusionCtx::ChainVerify
+    fusion.is_chain_verify()
         && !gpu.flags.mq_f16_residual_off
         && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
@@ -7409,7 +7472,13 @@ fn batch_chunk_delta_net_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -7441,6 +7510,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 layer.w_up.m,
                 layer.w_gate.k,
                 n,
+                fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n),
             )
             .map(|()| FfnGateOutput::Separate);
     }
@@ -8713,7 +8783,7 @@ fn batch_chunk_full_attn_prepare(
     let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
-    let fa_prep_fused_ok = (fusion == DflashFusionCtx::ChainVerify
+    let fa_prep_fused_ok = (fusion.is_chain_verify()
         || (fusion == DflashFusionCtx::Off
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true)))
         && gpu.arch_caps.is_gfx1100()
@@ -9170,6 +9240,48 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
     }
 }
 
+/// Scalar adapter from Qwen model state into the dispatch-owned split-verifier
+/// admission contract. The predicate itself intentionally stays out of the
+/// arch prefill body so declarative Steps can reuse it without semantic drift.
+fn gfx1100_split_verify_model<'a>(
+    gpu: &'a Gpu,
+    config: &Qwen35Config,
+) -> Gfx1100SplitVerifyModel<'a> {
+    Gfx1100SplitVerifyModel {
+        arch: gpu.arch_caps.arch(),
+        verify_attn: gpu.flags.verify_attn,
+        split_verify: gpu.flags.gfx1100_fa2_split_verify,
+        num_experts: config.num_experts,
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        resolved_min_ctx: fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+    }
+}
+
+#[doc(hidden)]
+pub fn gfx1100_split_verify_min_ctx(gpu: &Gpu, config: &Qwen35Config) -> Option<usize> {
+    dispatch_gfx1100_split_verify_min_ctx(&gfx1100_split_verify_model(gpu, config))
+}
+
+#[doc(hidden)]
+pub fn gfx1100_split_verify_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    quant_q8: bool,
+    batch_size: usize,
+    logical_ctx_len: usize,
+    flash_partials_numel: usize,
+) -> bool {
+    dispatch_gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+        model: gfx1100_split_verify_model(gpu, config),
+        quant_q8,
+        batch_size,
+        logical_ctx_len,
+        flash_partials_numel,
+    })
+}
+
 /// Opt-in gfx1201 split-KV packed-Q8 verifier: `HIPFIRE_GFX12_FA2_SPLIT_VERIFY`
 /// (`1`/`on`/`true`) enables it, `HIPFIRE_GFX12_FA2_SPLIT_COUNT` picks the
 /// split count (`2`, `4` or `8`; default `8`; anything else fails closed to
@@ -9206,6 +9318,7 @@ fn q8_multirow_attn_admitted(
     is_independent: bool,
     capture_mode: bool,
     replay_recording: bool,
+    capture_safe_fixed_grid: bool,
 ) -> bool {
     matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
@@ -9214,8 +9327,7 @@ fn q8_multirow_attn_admitted(
         && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
         && !is_tree
         && !is_independent
-        && !capture_mode
-        && !replay_recording
+        && ((!capture_mode && !replay_recording) || capture_safe_fixed_grid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9485,7 +9597,7 @@ fn batch_chunk_fa_attend(
             }
             _ => {}
         }
-        if gpu.attention_flash_q8_0_rows_masked(
+        if gpu.attention_flash_q8_0_rows_masked_logical(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
@@ -9495,8 +9607,17 @@ fn batch_chunk_fa_attend(
             config.n_kv_heads,
             config.head_dim,
             max_ctx_len,
+            start_pos + n,
             n,
             &s.flash_partials,
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8,
+                n,
+                start_pos + n,
+                s.flash_partials.numel(),
+            ),
         )? {
             return Ok(());
         }
@@ -9665,7 +9786,7 @@ fn batch_chunk_fa_attend_a4(
 fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &Qwen35Config, fusion: DflashFusionCtx, n: usize) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
-        && fusion != DflashFusionCtx::ChainVerify
+        && !fusion.is_chain_verify()
         && !gpu.flags.rope_interleaved_legacy
         && !hipfire_runtime::triattn::tap_enabled()
         && config.head_dim == 256
@@ -9895,7 +10016,13 @@ fn batch_chunk_full_attn_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -9926,6 +10053,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 layer.w_up.m,
                 layer.w_gate.k,
                 n,
+                fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n),
             )
             .map(|()| FfnGateOutput::Separate);
     }
@@ -12754,6 +12882,14 @@ fn forward_prefill_chunk_pair(
             false,
             multirow_common.4,
             multirow_common.5,
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8,
+                n,
+                max_ctx,
+                s.flash_partials.numel(),
+            ),
         )
     };
     let multirow_c = multirow_admitted(max_ctx_c);
@@ -13433,8 +13569,11 @@ pub(crate) fn forward_batch_chunk_impl(
     // and re-scans the whole KV once per row, so a small verify block over a
     // long context pays the scan n times (202 vs 103 ms at 33k). The layer's
     // GEMMs stay batched either way — only the attend step switches to the
-    // multi-row tile. Its tile grid is sized from the live logical context on
-    // the host, so a captured replay would keep the first cycle's tile count.
+    // multi-row tile. The incumbent tile grid is sized from the live logical
+    // context and therefore stays out of capture. The gfx1100 split-KV route
+    // uses fixed S=8 geometry and is admitted only inside its exact default-on
+    // gfx1100 envelope (with parent and route-specific opt-outs);
+    // the launcher independently rejects every other captured shape.
     let fa_attn_multirow = q8_multirow_attn_admitted(
         gpu.arch_caps.arch(),
         kv_cache.quant_q8,
@@ -13446,6 +13585,14 @@ pub(crate) fn forward_batch_chunk_impl(
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
+        gfx1100_split_verify_admitted(
+            gpu,
+            config,
+            kv_cache.quant_q8,
+            n,
+            start_pos + n,
+            s.flash_partials.numel(),
+        ),
     );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
@@ -14381,13 +14528,21 @@ mod tests {
         ] {
             assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
             assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
-            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(
+                true, rejected, rejected, 256
+            ));
         }
     }
 
     #[test]
     fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
-        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        assert!(!packed_mq4_down_admitted(
+            true,
+            true,
+            true,
+            (DType::MQ4G256V2, 5120, 17408),
+            17408
+        ));
         for dtype in [DType::MQ4G256] {
             let shape = (dtype, 5120, 17408);
             assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
@@ -14395,10 +14550,27 @@ mod tests {
             assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 2560, 17408),
+                17408
+            ));
         }
-        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        for dtype in [
+            DType::MQ4G256V2Lloyd,
+            DType::MQ4G256Lloyd,
+            DType::HFQ4G256,
+            DType::Q8_0,
+        ] {
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 5120, 17408),
+                17408
+            ));
         }
     }
 
@@ -14414,6 +14586,7 @@ mod tests {
                         n,
                         4097,
                         Some(4096),
+                        false,
                         false,
                         false,
                         false,
@@ -14447,6 +14620,7 @@ mod tests {
                 is_independent,
                 capture_mode,
                 replay_recording,
+                false,
             )
         };
         assert!(!admitted(
@@ -14558,12 +14732,62 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
+                false,
             ));
         }
+    }
+
+    #[test]
+    fn q8_multirow_attn_allows_only_explicit_fixed_grid_capture() {
+        assert!(q8_multirow_attn_admitted(
+            "gfx1100",
+            true,
+            256,
+            16,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(!q8_multirow_attn_admitted(
+            "gfx1100",
+            true,
+            256,
+            16,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+            true,
+            false,
+        ));
     }
 
     #[test]
@@ -16142,22 +16366,42 @@ mod tests {
     fn native_mq4_wide_rejects_unaudited_dispatch_overrides() {
         let make = || rdna_compute::FeatureFlags::for_test("gfx1100");
         assert!(native_mq4_widened_flags_admitted("gfx1100", &make(), false));
-        assert!(!native_mq4_widened_flags_admitted("gfx1201", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1201",
+            &make(),
+            false
+        ));
         assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
         let mut variants = Vec::new();
-        let mut f = make(); f.fp16_disabled = true; variants.push(f);
-        let mut f = make(); f.rocblas_all_archs = true; variants.push(f);
-        let mut f = make(); f.gemv_dp4a = Some(true); variants.push(f);
-        let mut f = make(); f.mmq_override = Some(false); variants.push(f);
-        let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
-        let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
-        let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
+        let mut f = make();
+        f.fp16_disabled = true;
+        variants.push(f);
+        let mut f = make();
+        f.rocblas_all_archs = true;
+        variants.push(f);
+        let mut f = make();
+        f.gemv_dp4a = Some(true);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_override = Some(false);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_min_batch = Some(2048);
+        variants.push(f);
+        let mut f = make();
+        f.qkvza_split_tail = true;
+        variants.push(f);
+        let mut f = make();
+        f.wo_wmma_variant = Some("k4".into());
+        variants.push(f);
         // Packed FFN shares the budgeted MMQ slot and keeps native tails.
         let mut packed = make();
         packed.packed_mq4_prefill = true;
         assert!(native_mq4_widened_flags_admitted("gfx1100", &packed, false));
         packed.mmq_override = Some(false);
-        assert!(!native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1100", &packed, false
+        ));
         for f in variants {
             assert!(!native_mq4_widened_flags_admitted("gfx1100", &f, false));
         }
@@ -16170,14 +16414,27 @@ mod tests {
         let f16 = 127 * 17408 * 2;
         let partials = 127 * 5120 * 4 * 4;
         assert_eq!(mmq, 153 * 1024 * 1024);
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
-                   Some(mmq + f16 + partials));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq, f16, partials), Some(0));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials), Some(f16));
-        assert_eq!(native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0), None);
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
+            Some(mmq + f16 + partials)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq, f16, partials),
+            Some(0)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials),
+            Some(f16)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0),
+            None
+        );
         for rows in [512, 1024, 2048, 4096, 8192] {
-            assert_eq!(native_mq4_projection_deficit(&config, rows, 0, 0, 0),
-                       Some(rows * 19584 + f16 + partials));
+            assert_eq!(
+                native_mq4_projection_deficit(&config, rows, 0, 0, 0),
+                Some(rows * 19584 + f16 + partials)
+            );
         }
     }
 

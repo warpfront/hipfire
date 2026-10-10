@@ -224,6 +224,11 @@ pub enum DflashVerifyRoute {
 pub struct DflashVerifyPm4 {
     phase: DflashVerifyPm4Phase,
     controller: Option<ReplayController>,
+    /// Do not build or submit the retained tape below this logical context.
+    /// The gfx1100 split-KV route wins only after 4K; deferring capture keeps
+    /// the short-context shipping kernel in place and guarantees that the
+    /// recorded body actually contains the split partial + merge pair.
+    min_context: usize,
     binding: Option<DflashVerifyBinding>,
     identity: Option<PreparedReplayIdentity>,
     /// First calibration recording and the position it was taken at.
@@ -239,6 +244,7 @@ impl DflashVerifyPm4 {
                 reason: reason.into(),
             },
             controller: None,
+            min_context: 0,
             binding: None,
             identity: None,
             calibration: None,
@@ -249,9 +255,17 @@ impl DflashVerifyPm4 {
     /// Admitted route with a dedicated manual-PM4 controller. Allocates no GPU
     /// resource until the first capture.
     pub fn armed() -> Self {
+        Self::armed_after_context(0)
+    }
+
+    /// Arm a route that remains on ordinary HIP until `start_pos + batch`
+    /// exceeds `min_context`. Once prepared, later short-context requests also
+    /// stay on HIP while the long-context tape remains ready for reuse.
+    pub fn armed_after_context(min_context: usize) -> Self {
         Self {
             phase: DflashVerifyPm4Phase::Armed,
             controller: Some(ReplayController::new_manual_pm4()),
+            min_context,
             binding: None,
             identity: None,
             calibration: None,
@@ -298,6 +312,10 @@ impl DflashVerifyPm4 {
     /// completion (a failed replay poisons or quarantines instead).
     pub fn plan_route(&mut self, window: &DflashVerifyWindow<'_>) -> DflashVerifyRoute {
         if !self.phase.is_live() {
+            self.note_hip_window(window);
+            return DflashVerifyRoute::HipAuto;
+        }
+        if window.position.saturating_add(window.batch) <= self.min_context {
             self.note_hip_window(window);
             return DflashVerifyRoute::HipAuto;
         }
@@ -543,6 +561,7 @@ impl DflashVerifyPm4 {
         serde_json::json!({
             "phase": self.phase.label(),
             "reason": self.phase.reason(),
+            "min_context": self.min_context,
             "binding": self.binding,
             "kv_mode": "q8",
             "dn_state_quant": "q8",
@@ -658,6 +677,23 @@ mod tests {
         assert_eq!(route.counters().replays, 1);
         assert_eq!(route.counters().first_replay_position, Some(32));
         assert_eq!(route.counters().last_replay_position, Some(32));
+    }
+
+    #[test]
+    fn minimum_context_defers_capture_without_changing_phase() {
+        let bound = binding(1, 8192);
+        let mut route = DflashVerifyPm4::armed_after_context(4096);
+        assert_eq!(
+            route.plan_route(&window(&bound, 16, 4080)),
+            DflashVerifyRoute::HipAuto
+        );
+        assert_eq!(*route.phase(), DflashVerifyPm4Phase::Armed);
+        assert_eq!(route.counters().full_hip, 1);
+        assert_eq!(
+            route.plan_route(&window(&bound, 16, 4081)),
+            DflashVerifyRoute::PrimeDirect
+        );
+        assert_eq!(route.counters().prime_windows, 1);
     }
 
     #[test]

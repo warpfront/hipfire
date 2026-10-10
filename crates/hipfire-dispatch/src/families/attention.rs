@@ -113,6 +113,62 @@ fn native_asym4_wmma_eligible(
         .is_some_and(|required| partials_numel >= required)
 }
 
+/// Model- and policy-owned inputs for the exact-gfx1100 split-KV verifier.
+///
+/// This predicate lives in the dispatch layer so declarative Qwen programs and
+/// the current arch adapter share one fail-closed route contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gfx1100SplitVerifyModel<'a> {
+    pub arch: &'a str,
+    pub verify_attn: bool,
+    pub split_verify: bool,
+    pub num_experts: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// Resolved `HIPFIRE_FA_PERTOKEN_MIN_CTX`; `None` disables the route.
+    pub resolved_min_ctx: Option<usize>,
+}
+
+/// Full runtime inputs for the exact-gfx1100 split-KV verifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gfx1100SplitVerifyRoute<'a> {
+    pub model: Gfx1100SplitVerifyModel<'a>,
+    pub quant_q8: bool,
+    pub batch_size: usize,
+    pub logical_ctx_len: usize,
+    pub flash_partials_numel: usize,
+}
+
+/// Return the effective split-verifier crossover when the model/policy
+/// envelope is admitted. Developer overrides below the measured crossover are
+/// clamped so capture cannot arm a pre-crossover split-only tape.
+pub fn gfx1100_split_verify_min_ctx(model: &Gfx1100SplitVerifyModel<'_>) -> Option<usize> {
+    (model.arch == "gfx1100"
+        && model.verify_attn
+        && model.split_verify
+        && model.num_experts == 0
+        && model.n_heads == 24
+        && model.n_kv_heads == 4
+        && model.head_dim == 256)
+        .then(|| model.resolved_min_ctx.map(|threshold| threshold.max(4_096)))
+        .flatten()
+}
+
+/// Exact product admission for the gfx1100 Q8 FA2 split-KV verifier.
+pub fn gfx1100_split_verify_admitted(route: &Gfx1100SplitVerifyRoute<'_>) -> bool {
+    route.quant_q8
+        && (4..=32).contains(&route.batch_size)
+        && rdna_compute::attention::gfx1100_q8_fa2_split_partials_len(
+            route.batch_size,
+            route.model.n_heads,
+            route.model.head_dim,
+        )
+        .is_some_and(|need| route.flash_partials_numel >= need)
+        && gfx1100_split_verify_min_ctx(&route.model)
+            .is_some_and(|threshold| route.logical_ctx_len > threshold)
+}
+
 pub struct AttentionFamily {
     registry: KernelRegistry,
 }
@@ -2699,6 +2755,106 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gfx1100_split_model() -> Gfx1100SplitVerifyModel<'static> {
+        Gfx1100SplitVerifyModel {
+            arch: "gfx1100",
+            verify_attn: true,
+            split_verify: true,
+            num_experts: 0,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            resolved_min_ctx: Some(4_096),
+        }
+    }
+
+    #[test]
+    fn gfx1100_split_verify_model_envelope_is_fail_closed() {
+        assert_eq!(
+            gfx1100_split_verify_min_ctx(&gfx1100_split_model()),
+            Some(4_096)
+        );
+        for model in [
+            Gfx1100SplitVerifyModel {
+                arch: "gfx1151",
+                ..gfx1100_split_model()
+            },
+            Gfx1100SplitVerifyModel {
+                verify_attn: false,
+                ..gfx1100_split_model()
+            },
+            Gfx1100SplitVerifyModel {
+                split_verify: false,
+                ..gfx1100_split_model()
+            },
+            Gfx1100SplitVerifyModel {
+                num_experts: 128,
+                ..gfx1100_split_model()
+            },
+            Gfx1100SplitVerifyModel {
+                n_heads: 32,
+                ..gfx1100_split_model()
+            },
+        ] {
+            assert_eq!(gfx1100_split_verify_min_ctx(&model), None, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn gfx1100_split_verify_threshold_clamps_to_measured_crossover() {
+        assert_eq!(
+            gfx1100_split_verify_min_ctx(&Gfx1100SplitVerifyModel {
+                resolved_min_ctx: Some(1),
+                ..gfx1100_split_model()
+            }),
+            Some(4_096)
+        );
+        assert_eq!(
+            gfx1100_split_verify_min_ctx(&Gfx1100SplitVerifyModel {
+                resolved_min_ctx: Some(8_192),
+                ..gfx1100_split_model()
+            }),
+            Some(8_192)
+        );
+        assert_eq!(
+            gfx1100_split_verify_min_ctx(&Gfx1100SplitVerifyModel {
+                resolved_min_ctx: None,
+                ..gfx1100_split_model()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn gfx1100_split_verify_route_checks_q8_batch_context_and_workspace() {
+        let need = rdna_compute::attention::gfx1100_q8_fa2_split_partials_len(16, 24, 256)
+            .expect("fixed production shape");
+        let admitted = Gfx1100SplitVerifyRoute {
+            model: gfx1100_split_model(),
+            quant_q8: true,
+            batch_size: 16,
+            logical_ctx_len: 4_097,
+            flash_partials_numel: need,
+        };
+        assert!(gfx1100_split_verify_admitted(&admitted));
+        assert!(!gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+            quant_q8: false,
+            ..admitted
+        }));
+        assert!(!gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+            batch_size: 3,
+            ..admitted
+        }));
+        assert!(!gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+            logical_ctx_len: 4_096,
+            ..admitted
+        }));
+        assert!(!gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+            flash_partials_numel: need - 1,
+            ..admitted
+        }));
+    }
 
     #[test]
     fn ck_packed_prefill_requires_exact_contiguous_prefix_extent() {

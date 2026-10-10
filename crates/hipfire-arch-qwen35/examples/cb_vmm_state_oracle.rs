@@ -4303,7 +4303,21 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         kv.quant_q8 && !kv.quant_fwht && !kv.quant_asym2 && !kv.quant_asym3 && !kv.quant_asym4 && matches!(kv.v_mode, hipfire_runtime::llama::VMode::Q8)
     };
     let draft_str = draft_path.to_str().ok_or("--dflash-draft is not UTF-8")?;
-    let df = load_dflash_state(draft_str, ctx_cap, &slot.config, &slot.dn_state, &mut gpu, None, None, false, &slot.weights, kv_q8, true, false)?;
+    let df = load_dflash_state(
+        draft_str,
+        ctx_cap,
+        &slot.config,
+        &slot.dn_state,
+        &mut gpu,
+        None,
+        None,
+        false,
+        &slot.weights,
+        kv_q8,
+        slot.scratch.flash_partials.numel(),
+        true,
+        false,
+    )?;
     eprintln!("gate0: DFlash draft loaded: layers={} hidden={} block={}", df.draft_config.n_layers, df.draft_config.hidden, df.draft_config.block_size);
     let mut d: Box<dyn Speculator> = build_dflash_speculator(df, true, false);
     let block = d.block_size();

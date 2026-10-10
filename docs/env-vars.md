@@ -239,6 +239,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_GFX11_Q8_FA2_WIDE` | Whole-chunk Q8/Q8 FA2 prefill (B 64..8192, above 512 aligned to 512; Qwen NH24/NKV4/HD256) — **auto ON on exact gfx1100 and exact gfx1151** (`kernel.gfx11_q8_fa2_wide`, experimental); other arches off; `=0` opts out. Requires `kernel.gfx11_fa2_prefill`. gfx1151 was enabled deliberately in commit `ae9c5cf9d12a5a63ae60630637d22d00a4fc964e` through the exact-gfx1151 FA2 twin (`HIPFIRE_GFX1151_FA2_TWIN`: CU mode, heaviest q-tiles first) with the same arithmetic, byte-identical output. Evidence (Strix Halo, H2 layer; unreleased [`CHANGELOG.md`](../CHANGELOG.md) entry): pp8192 ABBA +2.13 %, BAAB +2.11 %, captured layer −27.5 % / −29.7 %, KLD pins unchanged. |
 | `HIPFIRE_FA2_FILL` | Warp-specialized K/V fill in that FA2 kernel on gfx1100/gfx1151 (bit-exact; helper waves dequantize the next K/V tile while compute waves run QK/PV) — default ON; `=0` restores the all-wave per-tile fill |
 | `HIPFIRE_GFX1100_FA2_R3` | Exact-gfx1100 variant of that FA2 fill body (bit-exact; CU mode, bank-conflict-free helper plane stores, O rescale skipped when alpha is exactly 1, heaviest q tiles first; symbols `attention_q8_0_fa2_gqa_gfx1100` / `attention_fa2_q_preconvert_gfx1100`) — default ON; `=0` restores the shared gfx11 body |
+| `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | Default **on** only on exact gfx1100 (`kernel.gfx1100_fa2_split_verify`); `0` opts out. Replaces the Q8 DFlash verifier's eager R4/R8 attention with the FA2 split-KV S8 route only for dense Qwen H24/NKV4/HD256 sequential batches 4..32 once the **live logical context** exceeds `HIPFIRE_FA_PERTOKEN_MIN_CTX` (4,096 by default; smaller non-zero overrides are clamped to the measured 4,096 crossover for this route). `HIPFIRE_VERIFY_ATTN=0` remains the parent opt-out. HipGraph/retained recording additionally require the compiler-free precompiled kernel set, fully materialized fixed-address Q16 scratch, and enough `flash_partials` capacity for the S8 record layout; a deliberately small `HIPFIRE_FLASH_PARTIALS_BATCH` therefore fails closed to the established batched route. The Redline/PM4 product admission remains B=16 and inherits its existing single-GPU/state guards. |
 | `HIPFIRE_GFX1151_FA2_TWIN` | Exact-gfx1151 twin of that FA2 fill kernel (CU mode, heaviest q-tile first, conflict-free helper V stores; bit-exact) — default ON; `=0` restores the gfx11 module |
 | `HIPFIRE_PM_DECODE` | Oracle-accepted PeaceMaker twins of the five W1 decode projection modules (QKVZA, QKV, gate/up, multirow-r2, residual MQ4v2) — **auto ON on exact gfx1201** (`kernel.pm_decode`); `=0` restores the hipcc modules, which stay in the pack. Embedded images are digest-pinned and refused on mismatch; outputs are byte-identical (27B retained PM4/graph traces, MTP state, KLD pins). Other arches ignore it. |
 | `HIPFIRE_GFX12_FA2_PREFILL` | GQA-fused FA2 prefill on exact gfx1201 (same Qwen NH24/NKV4/HD256 envelope) — default ON (`kernel.gfx12_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
@@ -569,7 +570,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1463
+**Count:** 1464
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1119,6 +1120,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1100_FA2_R3` | crates/rdna-compute/src/attention.rs | developer |
+| `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX1100_FA_PREP` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_GFX1100_GATED_NORM_V2` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_MQ4V2_NINEPATH_RPB8` | crates/hipfire-runtime/examples/mq4v2_fused_parity.rs | harness |

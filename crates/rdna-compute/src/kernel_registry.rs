@@ -439,7 +439,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC, ["attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100"]);
         add!("attention_flash_q8_0_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC), ["attention_flash_q8_0_tile_batched"]);
         add!("attention_flash_q8_0_tile_gqa_gfx1100", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, ["attention_flash_q8_0_tile_gqa_gfx1100"]);
-        add!("attention_q8_0_fa2_gqa_gfx1100", q8_fa2_gqa_gfx1100_source(), ["attention_fa2_q_preconvert_gfx1100", "attention_q8_0_fa2_gqa_gfx1100"]);
+        add!("attention_q8_0_fa2_gqa_gfx1100", q8_fa2_gqa_gfx1100_source(), ["attention_fa2_q_preconvert_gfx1100", "attention_q8_0_fa2_gqa_gfx1100", "attention_q8_0_fa2_gqa_partial_gfx1100", "attention_q8_0_fa2_gqa_merge_gfx1100"]);
         add!("conv1d_silu_split_qknorm_b256_scalar_prep", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC, ["conv1d_silu_split_qknorm_b256_scalar_prep"]);
         add!("dflash_gdn_pre_gfx1100", crate::dflash_gdn_pre::DFLASH_GDN_PRE_GFX1100_SRC, ["dflash_gdn_pre_capture_gfx1100", "dflash_gdn_pre_replay_gfx1100"]);
         add!("dflash_hidden_commit5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
@@ -1699,6 +1699,27 @@ mod tests {
         );
         for arch in ["gfx1151", "gfx1201", "gfx906", "gfx942"] {
             assert!(!entries(arch, "").unwrap().iter().any(|entry| entry.module == module));
+        }
+    }
+
+    #[test]
+    fn gfx1100_fa2_split_verifier_is_compiler_free_packaged() {
+        let entry = lookup("gfx1100", "attention_q8_0_fa2_gqa_gfx1100", "").unwrap();
+        for symbol in [
+            "attention_fa2_q_preconvert_gfx1100",
+            "attention_q8_0_fa2_gqa_gfx1100",
+            "attention_q8_0_fa2_gqa_partial_gfx1100",
+            "attention_q8_0_fa2_gqa_merge_gfx1100",
+        ] {
+            assert!(entry.symbols.contains(&symbol), "missing {symbol}");
+        }
+        for arch in ["gfx1151", "gfx1201"] {
+            let symbols = entries(arch, "")
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.module == "attention_q8_0_fa2_gqa_gfx1100")
+                .map(|candidate| candidate.symbols);
+            assert!(symbols.is_none(), "{arch} packaged gfx1100 split verifier");
         }
     }
 

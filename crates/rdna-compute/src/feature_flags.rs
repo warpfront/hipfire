@@ -417,6 +417,11 @@ pub struct FeatureFlags {
     /// and `attention_q8_0_flash_prefill_wmma`. Byte-identical output; any
     /// byte difference kills it.
     pub verify_attn: bool,
+    /// Exact-gfx1100 FA2 split-KV implementation of VerifyAttn
+    /// (`HIPFIRE_GFX1100_FA2_SPLIT_VERIFY`,
+    /// `kernel.gfx1100_fa2_split_verify`). Default ON only on exact gfx1100;
+    /// the stable [`Self::verify_attn`] switch remains the parent opt-out.
+    pub gfx1100_fa2_split_verify: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
     pub gfx12_fa_prep_fused: bool,
@@ -927,6 +932,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
+            gfx1100_fa2_split_verify: parse_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY")
+                .unwrap_or(arch == "gfx1100"),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
@@ -1389,6 +1396,7 @@ impl FeatureFlags {
             attn_qresident: false,
             attn_qresident_v2: false,
             verify_attn: false,
+            gfx1100_fa2_split_verify: false,
             gfx12_fa_prep_fused: false,
             gfx12_fa_prep_fp8q: false,
             gfx11_q8_fa2_wide: false,
@@ -1849,6 +1857,56 @@ mod tests {
             assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
         }
     }
+
+    #[test]
+    fn gfx1100_split_verify_defaults_only_on_exact_arch_and_keeps_two_opt_outs() {
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(gfx1100.verify_attn);
+        assert!(gfx1100.gfx1100_fa2_split_verify);
+        for arch in ["gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            assert!(
+                !FeatureFlags::from_process_config(arch, &process).gfx1100_fa2_split_verify,
+                "arch={arch}"
+            );
+        }
+
+        let mut parent_off = ConfigLayer::default();
+        parent_off.set_cli("kernel.verify_attn", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer: parent_off,
+        }])
+        .unwrap();
+        let flags = FeatureFlags::from_process_config(
+            "gfx1100",
+            &ProcessConfig::from_resolved(&resolved).unwrap(),
+        );
+        assert!(!flags.verify_attn);
+        assert!(flags.gfx1100_fa2_split_verify);
+
+        let mut split_off = ConfigLayer::default();
+        split_off
+            .set_cli("kernel.gfx1100_fa2_split_verify", "false")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer: split_off,
+        }])
+        .unwrap();
+        let flags = FeatureFlags::from_process_config(
+            "gfx1100",
+            &ProcessConfig::from_resolved(&resolved).unwrap(),
+        );
+        assert!(flags.verify_attn);
+        assert!(!flags.gfx1100_fa2_split_verify);
+    }
+
     #[test]
     fn gfx12_silu_quant_fused_default_on_gfx1201_with_opt_out() {
         // Default process policy: the exact-gfx1201 silu+quant fusion admits
