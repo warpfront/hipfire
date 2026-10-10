@@ -730,6 +730,9 @@ pub(crate) struct ServeArgs {
     /// KV storage backend for models loaded by this service (`legacy` or `vmm`).
     #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
     kv_backend: Option<String>,
+    /// Context length for models loaded by this service.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Vision-tower sidecar wired into every model load (`params["vision"]`);
     /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
     /// skipped while `vision_mode=off`.
@@ -3026,6 +3029,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_k: None,
             kv_v: None,
             kv_backend: None,
+            max_seq: None,
             vision: None,
             idle_timeout: None,
             tp: None,
@@ -3517,8 +3521,8 @@ fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
         .map_err(|err| err.to_string())
 }
 
-/// Clap value parser for `bench --max-seq`: the `memory.max_seq` schema field
-/// parses and bounds it, so the flag and the config key accept the same values.
+/// Clap value parser for `--max-seq`: the `memory.max_seq` schema field parses
+/// and bounds it, so serve/bench flags and the config key accept the same values.
 fn parse_max_seq_arg(raw: &str) -> std::result::Result<u64, String> {
     match field("memory.max_seq")
         .expect("schema field")
@@ -12467,6 +12471,7 @@ mod tests {
                     kv_k_override: None,
                     kv_v_override: None,
                     kv_backend_override: None,
+                    max_seq_override: None,
                     vision_override: None,
                     tp: None,
                     continuous_batch_size: 1,
@@ -12710,6 +12715,32 @@ mod tests {
             .all(|g| g["max_tokens_fit"] == serde_json::json!(true)));
         assert_eq!(generates[2]["max_tokens"], serde_json::json!(100));
         assert!(generates[2].get("max_tokens_fit").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_max_seq_override_reaches_model_load() {
+        let h = Task11HttpHarness::spawn("max-seq-override");
+        h.shared.runtime.lock().unwrap().max_seq_override = Some(65_536);
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+
+        let second_model = "t11-fixture-max-seq-override-second.hfq";
+        fs::write(h.paths.models.join(second_model), b"task11-dummy-model").unwrap();
+        let mut second_body = h.base_body("t11-stop-text", false);
+        second_body["model"] = serde_json::json!(second_model);
+        let (status, _, text) = post_status(h.port(), &second_body);
+        assert_eq!(status, 200, "{text}");
+
+        let log = h.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(loads.len(), 2);
+        assert!(
+            loads
+                .iter()
+                .all(|load| load["params"]["max_seq"] == 65_536)
+        );
     }
 
     /// A request may not load a file outside the installed models, nor start
