@@ -22,9 +22,16 @@
 //! Snapshots are deltas: one stores the fixed (overwritten-in-place) state
 //! whole, but of each append-only [`RowStream`] only the rows above its
 //! parent, the deepest snapshot of the same prefix that was present when it
-//! was captured. Restoring walks the chain from the root. Snapshots never
-//! depend on what the live state held before; a snapshot that still has
-//! children is pinned, so eviction only ever removes leaves.
+//! was captured. Restoring walks the chain from the root. Pool snapshots
+//! never depend on what the live state held before; a snapshot that still
+//! has children is pinned, so eviction only ever removes leaves.
+//!
+//! Besides the pool, the cache keeps one *resident* snapshot: the fixed parts
+//! at the deepest boundary of the last committed prefill, whose rows the live
+//! row streams themselves still hold. It serves that lineage at any depth
+//! without copying a row, also past the budget, and is dropped as soon as
+//! anything else restores or resets the live state (an owner that resets
+//! outside the cache reports it through [`SessionCache::live_state_reset`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -184,6 +191,16 @@ struct Turn {
     boundaries: VecDeque<usize>,
 }
 
+/// Fixed parts of the live state at boundary `key.1`; the live row streams
+/// still hold its `rows`, so a restore copies the fixed parts only.
+struct Resident {
+    key: Key,
+    buf: DeviceBuffer,
+    fixed_bytes: Vec<usize>,
+    rows: Vec<usize>,
+    meta: Vec<u8>,
+}
+
 pub struct SessionCache {
     pool: CheckpointPool<StoredSnapshot>,
     domain: CacheDomain,
@@ -196,6 +213,12 @@ pub struct SessionCache {
     /// listed here is pinned in the pool.
     children: HashMap<Key, usize>,
     turn: Option<Turn>,
+    /// The published resident snapshot (module docs).
+    resident: Option<Resident>,
+    /// This turn's deepest boundary, published as `resident` by `commit`.
+    resident_pending: Option<Resident>,
+    /// Displaced resident buffers; freed at the next `begin`/`clear`.
+    release_bufs: Vec<DeviceBuffer>,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -210,11 +233,46 @@ fn layout(part_bytes: impl IntoIterator<Item = usize>) -> (Vec<usize>, usize) {
     (offsets, end)
 }
 
-fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
-    let SnapshotLocation::Device(buf) = snapshot.location;
+fn free_device(gpu: &mut Gpu, buf: DeviceBuffer) {
     if let Err(error) = gpu.hip.free(buf) {
         eprintln!("  session cache: freeing a snapshot failed: {error}");
     }
+}
+
+fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
+    let SnapshotLocation::Device(buf) = snapshot.location;
+    free_device(gpu, buf);
+}
+
+/// Copy `resident`'s fixed parts over the live state, whose row streams must
+/// still hold its rows.
+fn restore_resident(
+    gpu: &mut Gpu,
+    state: &mut dyn SessionState,
+    route: SessionRoute,
+    resident: &Resident,
+) -> Result<(), String> {
+    let dst = state.restore_parts(gpu, route, &resident.meta)?;
+    let fixed = dst.fixed.iter().map(|part| part.bytes);
+    let rows = dst.rows.iter().map(|stream| stream.rows);
+    if !fixed.eq(resident.fixed_bytes.iter().copied()) || !rows.eq(resident.rows.iter().copied())
+    {
+        return Err("session cache: resident snapshot layout mismatch".to_string());
+    }
+    let regions: Vec<CopyRegion<'_>> = dst
+        .fixed
+        .iter()
+        .zip(layout(resident.fixed_bytes.iter().copied()).0)
+        .map(|(part, src_offset)| CopyRegion {
+            dst: part.buf,
+            dst_offset: part.offset,
+            src: &resident.buf,
+            src_offset,
+            bytes: part.bytes,
+        })
+        .collect();
+    copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
+    state.finish_restore(gpu, route, &resident.meta)
 }
 
 /// Whether `need` more device bytes leave the guard's headroom free, in the
@@ -240,6 +298,9 @@ impl SessionCache {
             release: Vec::new(),
             children: HashMap::new(),
             turn: None,
+            resident: None,
+            resident_pending: None,
+            release_bufs: Vec::new(),
         }
     }
 
@@ -253,15 +314,26 @@ impl SessionCache {
             return 0;
         }
         let domain = self.domain.scoped(&scope);
+        let resident = self
+            .resident
+            .as_ref()
+            .map(|resident| &resident.key)
+            .filter(|(d, p, fp)| {
+                let p = *p as usize;
+                *d == domain && p < prompt.len() && *fp == prefix_fingerprint(&prompt[..p])
+            })
+            .map_or(0, |key| key.1 as usize);
+        // Only a strictly deeper pool snapshot beats the resident one (no row
+        // copy, see `begin`); each probe hashes its whole prefix.
         state
-            .snapshot_boundaries(prompt, 0, prompt.len() - 1)
+            .snapshot_boundaries(prompt, resident, prompt.len() - 1)
             .into_iter()
             .rev()
             .find(|&p| {
                 self.pool
                     .contains(&domain, p as u64, prefix_fingerprint(&prompt[..p]))
             })
-            .unwrap_or(0)
+            .unwrap_or(resident)
     }
 
     /// A published or pending snapshot.
@@ -307,6 +379,42 @@ impl SessionCache {
         self.release.push(snapshot);
     }
 
+    /// Drop the resident snapshot: the live rows are about to change.
+    fn drop_resident(&mut self, gpu: &mut Gpu) {
+        if let Some(resident) = self.resident.take() {
+            free_device(gpu, resident.buf);
+        }
+    }
+
+    /// The live state was reset outside the cache: its rows no longer back
+    /// the resident snapshot.
+    pub fn live_state_reset(&mut self) {
+        for resident in [self.resident.take(), self.resident_pending.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.release_bufs.push(resident.buf);
+        }
+    }
+
+    /// Bookkeeping head of every turn: free displaced buffers and drop the
+    /// previous turn's uncommitted captures.
+    fn start_turn(&mut self, gpu: &mut Gpu) {
+        for snapshot in std::mem::take(&mut self.release) {
+            free_buffer(gpu, snapshot);
+        }
+        for buf in std::mem::take(&mut self.release_bufs) {
+            free_device(gpu, buf);
+        }
+        for (_, snapshot) in std::mem::take(&mut self.pending) {
+            self.drop_snapshot(gpu, snapshot);
+        }
+        if let Some(resident) = self.resident_pending.take() {
+            free_device(gpu, resident.buf);
+        }
+        self.turn = None;
+    }
+
     /// Start a prefill of `prompt`: restore the `reused`-token snapshot
     /// [`Self::plan`] returned (or cold-start the state for 0) and arm the
     /// boundaries this prefill crosses.
@@ -318,26 +426,36 @@ impl SessionCache {
         route: SessionRoute,
         reused: usize,
     ) -> Result<(), String> {
-        for snapshot in std::mem::take(&mut self.release) {
-            free_buffer(gpu, snapshot);
-        }
-        for (_, snapshot) in std::mem::take(&mut self.pending) {
-            self.drop_snapshot(gpu, snapshot);
-        }
-        self.turn = None;
+        self.start_turn(gpu);
         let Some(scope) = state.snapshot_scope(route) else {
             if reused > 0 {
                 return Err(format!(
                     "session cache: route {route:?} has no snapshot scope"
                 ));
             }
+            self.drop_resident(gpu);
             return state.reset(gpu);
         };
         let domain = self.domain.scoped(&scope);
-        if reused == 0 {
-            state.reset(gpu)?;
-        } else if let Err(error) = self.restore(gpu, state, route, &domain, &prompt[..reused]) {
+        let key = (
+            domain.clone(),
+            reused as u64,
+            prefix_fingerprint(&prompt[..reused]),
+        );
+        // Anything but the resident snapshot itself rewrites the live rows.
+        if reused == 0 || self.resident.as_ref().is_none_or(|r| r.key != key) {
+            self.drop_resident(gpu);
+        }
+        let restored = if reused == 0 {
+            state.reset(gpu)
+        } else if let Some(resident) = &self.resident {
+            restore_resident(gpu, state, route, resident)
+        } else {
+            self.restore(gpu, state, route, &domain, &prompt[..reused])
+        };
+        if let Err(error) = restored {
             let _ = state.reset(gpu);
+            self.drop_resident(gpu);
             return Err(error);
         }
         self.turn = Some(Turn {
@@ -353,7 +471,8 @@ impl SessionCache {
     /// Start a prefill that continues the live state in place: the caller
     /// keeps every owner as it is (no reset, no restore) and prefills only the
     /// suffix. Does the bookkeeping head of [`Self::begin`] (frees displaced
-    /// buffers, drops uncommitted snapshots).
+    /// buffers, drops uncommitted snapshots). The resident snapshot stays: a
+    /// continuation only appends rows above it.
     ///
     /// With `capture == false` it arms no boundary, so
     /// [`Self::next_boundary`] is `None` and nothing is captured this turn: a
@@ -375,13 +494,7 @@ impl SessionCache {
         reused: usize,
         capture: bool,
     ) {
-        for snapshot in std::mem::take(&mut self.release) {
-            free_buffer(gpu, snapshot);
-        }
-        for (_, snapshot) in std::mem::take(&mut self.pending) {
-            self.drop_snapshot(gpu, snapshot);
-        }
-        self.turn = None;
+        self.start_turn(gpu);
         if !capture {
             return;
         }
@@ -495,7 +608,8 @@ impl SessionCache {
 
     /// The live state reached `prefix.len()`, the boundary
     /// [`Self::next_boundary`] returned; capture it (pending until commit) as
-    /// a delta over the deepest snapshot of a shorter prefix still present.
+    /// a delta over the deepest snapshot of a shorter prefix still present,
+    /// and as this turn's resident snapshot.
     pub fn at_boundary(
         &mut self,
         gpu: &mut Gpu,
@@ -516,17 +630,23 @@ impl SessionCache {
         turn.boundaries.pop_front();
         let (domain, route, p) = (turn.domain.clone(), turn.route, prefix.len());
         let fp = prefix_fingerprint(prefix);
-        if self.pool.contains(&domain, p as u64, fp) {
+        let in_pool = self.pool.contains(&domain, p as u64, fp);
+        let growth = state.growth_reserve_bytes(gpu);
+        let ancestors: Vec<Key> = if in_pool {
+            Vec::new()
+        } else {
+            state
+                .snapshot_boundaries(prefix, 0, p - 1)
+                .into_iter()
+                .rev()
+                .map(|b| (domain.clone(), b as u64, prefix_fingerprint(&prefix[..b])))
+                .collect()
+        };
+        let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
+        self.capture_resident(gpu, (domain.clone(), p as u64, fp), &meta, &live, growth)?;
+        if in_pool {
             return Ok(());
         }
-        let growth = state.growth_reserve_bytes(gpu);
-        let ancestors: Vec<Key> = state
-            .snapshot_boundaries(prefix, 0, p - 1)
-            .into_iter()
-            .rev()
-            .map(|b| (domain.clone(), b as u64, prefix_fingerprint(&prefix[..b])))
-            .collect();
-        let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
         // The parent's segment ends are this capture's starts; a parent whose
         // streams do not line up is ignored (rows from 0).
         let parent = ancestors.into_iter().find_map(|key| {
@@ -647,6 +767,61 @@ impl SessionCache {
         Ok(())
     }
 
+    /// Copy the fixed parts of `live` (at boundary `key.1`) into this turn's
+    /// resident snapshot, reusing its buffer. A capture the memory guard
+    /// refuses is skipped and leaves the previous boundary's.
+    fn capture_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        key: Key,
+        meta: &[u8],
+        live: &StateLayout<'_>,
+        growth: u64,
+    ) -> Result<(), String> {
+        let fixed_bytes: Vec<usize> = live.fixed.iter().map(|part| part.bytes).collect();
+        let (offsets, total) = layout(fixed_bytes.iter().copied());
+        let buf = match self.resident_pending.take() {
+            Some(resident) if resident.buf.size() == total => resident.buf,
+            previous => {
+                if memory_fits(gpu, total as u64 + growth) != Some(true) {
+                    eprintln!("  session cache: skipped {}-token resident snapshot (memory guard)", key.1);
+                    self.resident_pending = previous;
+                    return Ok(());
+                }
+                if let Some(resident) = previous {
+                    free_device(gpu, resident.buf);
+                }
+                gpu.bind_thread()
+                    .and_then(|()| gpu.hip.malloc(total))
+                    .map_err(|e| format!("session cache: resident snapshot allocation: {e}"))?
+            }
+        };
+        let regions: Vec<CopyRegion<'_>> = live
+            .fixed
+            .iter()
+            .zip(offsets)
+            .map(|(part, dst_offset)| CopyRegion {
+                dst: &buf,
+                dst_offset,
+                src: part.buf,
+                src_offset: part.offset,
+                bytes: part.bytes,
+            })
+            .collect();
+        if let Err(error) = copy_regions(gpu, &regions) {
+            free_device(gpu, buf);
+            return Err(format!("session cache: resident snapshot copy failed: {error}"));
+        }
+        self.resident_pending = Some(Resident {
+            key,
+            buf,
+            fixed_bytes,
+            rows: live.rows.iter().map(|stream| stream.rows).collect(),
+            meta: meta.to_vec(),
+        });
+        Ok(())
+    }
+
     /// Publish this turn's snapshots, parents before children. Uncommitted
     /// snapshots are dropped by the next [`Self::begin`], so a failed turn
     /// never publishes state.
@@ -673,6 +848,11 @@ impl SessionCache {
                 self.retire(snapshot);
             }
         }
+        if let Some(resident) = self.resident_pending.take() {
+            if let Some(displaced) = self.resident.replace(resident) {
+                self.release_bufs.push(displaced.buf);
+            }
+        }
         self.turn = None;
     }
 
@@ -694,6 +874,15 @@ impl SessionCache {
         {
             free_buffer(gpu, snapshot);
         }
+        for resident in [self.resident.take(), self.resident_pending.take()]
+            .into_iter()
+            .flatten()
+        {
+            free_device(gpu, resident.buf);
+        }
+        for buf in std::mem::take(&mut self.release_bufs) {
+            free_device(gpu, buf);
+        }
         self.children.clear();
         self.turn = None;
     }
@@ -710,6 +899,11 @@ impl SessionCache {
             // A failed query cannot be helped by evicting.
             if memory_fits(gpu, need) != Some(false) {
                 break;
+            }
+            if let Some(buf) = self.release_bufs.pop() {
+                freed += buf.size() as u64;
+                free_device(gpu, buf);
+                continue;
             }
             let snapshot = match self.release.pop() {
                 Some(snapshot) => {
@@ -1002,11 +1196,60 @@ mod tests {
         assert_eq!(cache.children.values().sum::<usize>(), 2);
         cache.clear(gpu);
 
-        // A snapshot larger than the whole budget is skipped, nothing published.
+        // A snapshot larger than the whole budget is skipped, nothing pooled.
         let mut tiny = SessionCache::new(domain(), one - 1);
         turn(&mut tiny, gpu, &mut toy, &a, true);
-        assert_eq!(tiny.plan(&toy, &a, SessionRoute::Ar), 0);
+        assert_eq!(tiny.stored_bytes(), 0);
         assert!(tiny.children.is_empty());
+        tiny.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    #[test]
+    fn resident_snapshot_serves_the_live_rows_until_they_change() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let fixed = gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap();
+        let rows = gpu
+            .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+            .unwrap();
+        let mut toy = Toy {
+            fixed,
+            rows,
+            position: 0,
+        };
+        // No pool snapshot fits the budget; only the resident one serves.
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut cache = SessionCache::new(domain(), one - 1);
+        let a = prompt(1, 3 * STRIDE + 5);
+        let mut branch = a[..3 * STRIDE + 2].to_vec();
+        branch.extend(prompt(2, 9));
+
+        // Uncommitted it is invisible; committed, the deepest boundary
+        // restores exactly over the live rows.
+        turn(&mut cache, gpu, &mut toy, &a, false);
+        assert_eq!(cache.plan(&toy, &branch, SessionRoute::Ar), 0);
+        turn(&mut cache, gpu, &mut toy, &a, true);
+        assert_eq!(cache.stored_bytes(), 0);
+        assert_restores(&mut cache, gpu, &mut toy, &branch, 3 * STRIDE);
+        // A turn that starts from it keeps it.
+        assert_eq!(turn(&mut cache, gpu, &mut toy, &branch, true), 3 * STRIDE);
+        assert_eq!(cache.plan(&toy, &a, SessionRoute::Ar), 3 * STRIDE);
+
+        // A cold turn of another prompt rewrites the live rows: dropped, and
+        // that turn's deepest boundary takes its place.
+        let c = prompt(3, STRIDE + 3);
+        turn(&mut cache, gpu, &mut toy, &c, true);
+        assert_eq!(cache.plan(&toy, &branch, SessionRoute::Ar), 0);
+        assert_eq!(cache.plan(&toy, &c, SessionRoute::Ar), STRIDE);
+        // So does a reset outside the cache.
+        cache.live_state_reset();
+        assert_eq!(cache.plan(&toy, &c, SessionRoute::Ar), 0);
+        cache.clear(gpu);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }
