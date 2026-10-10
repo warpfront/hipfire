@@ -888,6 +888,30 @@ pub(crate) enum ResidualVerifyTier {
     Base,
 }
 
+/// Default MQ3-Lloyd mb4 (4x batch-tile) admission — the `HIPFIRE_MQ3_MB4`
+/// override dominates. Pure so CPU tests can pin the table.
+///
+/// gfx1100 bands measured 2026-10-09 on RX 7900 XTX, `qwen3.5-4b.mq3`
+/// (product bench, fresh-process interleaved arms): the 4x fanout loses
+/// below batch 64 (pp32 -12.3% forced), wins +17.1% at pp64 on the
+/// rows >= 4096 projections, and the residual kernel (rows 2560 < 4096)
+/// wins +7.4% forced at batch 128, is neutral at 256 (-0.9%) and loses at
+/// >= 512 (-8.8%). Other RDNA3 parts keep the historical
+/// batch >= 128 && rows >= 4096 floor pending their own measurement; the
+/// HFQ3-G256 (non-Lloyd) family keeps it too for the same reason.
+fn mq3_lloyd_mb4_default(arch: &str, arch_supports: bool, batch_size: usize, rows: usize) -> bool {
+    if !arch_supports {
+        return false;
+    }
+    if arch == "gfx1100" {
+        if rows >= 4096 {
+            return batch_size >= 64;
+        }
+        return (128..=191).contains(&batch_size);
+    }
+    batch_size >= 128 && rows >= 4096
+}
+
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
@@ -2262,7 +2286,7 @@ impl Gpu {
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
-            None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, batch_size, m),
         };
         if use_mb4 {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
@@ -2413,8 +2437,8 @@ impl Gpu {
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_qkvza_mq3g256_lloyd_wmma_mb4(
@@ -2620,8 +2644,8 @@ impl Gpu {
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_qkv_mq3g256_lloyd_wmma_mb4(
@@ -2802,8 +2826,8 @@ impl Gpu {
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_gate_up_mq3g256_lloyd_wmma_mb4(
@@ -4374,7 +4398,6 @@ impl Gpu {
         }
         result
     }
-
     /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
     /// and alpha scalars. The projection FMAs and reduction are identical to
     /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the
@@ -12443,84 +12466,92 @@ impl Gpu {
         let variant_override = self.flags.gate_up_variant.clone();
         // (kernel_name, kernel_src, m_tile, block_threads). m_tile is the
         // per-block row count; block_threads is the wave/block size.
-        let (kernel_name, kernel_src, m_tile, block_threads) = match variant_override.as_deref() {
-            Some("ldsx") => (
-                "gemm_gate_up_hfq4g256_wmma_ldsx",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
-                16,
-                32,
-            ),
-            // k4 = 4-tile pipeline (more in-flight B loads for better BW
-            // utilization). Opt-in default-off; bench-measured 2026-05-21.
-            Some("k4") => (
-                "gemm_gate_up_hfq4g256_wmma_k4",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
-                16,
-                32,
-            ),
-            // ldscoop = cooperative LDS weight staging for coalesced DRAM
-            // loads. All 32 threads load one row's weights at a time
-            // (128-byte coalesced cache lines), staged in LDS for the
-            // WMMA loop. Targets the 32% peak BW seen in base kernel.
-            Some("ldscoop") => (
-                "gemm_gate_up_hfq4g256_wmma_ldscoop",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
-                16,
-                32,
-            ),
-            // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
-            // Halves grid in M; both waves share the same X tile so
-            // L0/L1 cache absorbs the second wave's loads cheaply.
-            Some("2tile") => (
-                "gemm_gate_up_hfq4g256_wmma_2tile",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
-                32,
-                64,
-            ),
-            _ => {
-                let def = if self.arch_caps.is_rdna3p5() {
-                    // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
-                    // ldscoop_nosync variant wins here. gfx1152 previously fell
-                    // through to the RDNA4 `else` ldscoop arm because the old
-                    // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
-                    // not match "gfx1152" — that was a misroute, now fixed by
-                    // gating on the is_rdna3p5 capability molecule.
-                    (
-                        "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
-                        16,
-                        32,
-                    )
-                } else if self.arch_caps.is_rdna3_dgpu() {
-                    // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
-                    // overhead exceeds its coalescing gain here. Falsified in
-                    // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
-                    // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
-                    // on the 27B DFlash batched-verify gate_up the ldscoop variant
-                    // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
-                    // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
-                    // e3232034 ("ldscoop on others") tuned the default for gfx1151
-                    // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
-                    // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
-                    // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
-                    // its own measurement on hiptrx/gfx1201.
-                    (
-                        "gemm_gate_up_hfq4g256_wmma",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
-                        16,
-                        32,
-                    )
-                } else {
-                    (
-                        "gemm_gate_up_hfq4g256_wmma_ldscoop",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
-                        16,
-                        32,
-                    )
-                };
-                def
-            }
-        };
+        let (kernel_name, kernel_src, m_tile, block_threads, n_tile) =
+            match variant_override.as_deref() {
+                Some("ldsx") => (
+                    "gemm_gate_up_hfq4g256_wmma_ldsx",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // k4 = 4-tile pipeline (more in-flight B loads for better BW
+                // utilization). Opt-in default-off; bench-measured 2026-05-21.
+                Some("k4") => (
+                    "gemm_gate_up_hfq4g256_wmma_k4",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // ldscoop = cooperative LDS weight staging for coalesced DRAM
+                // loads. All 32 threads load one row's weights at a time
+                // (128-byte coalesced cache lines), staged in LDS for the
+                // WMMA loop. Targets the 32% peak BW seen in base kernel.
+                Some("ldscoop") => (
+                    "gemm_gate_up_hfq4g256_wmma_ldscoop",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
+                // Halves grid in M; both waves share the same X tile so
+                // L0/L1 cache absorbs the second wave's loads cheaply.
+                Some("2tile") => (
+                    "gemm_gate_up_hfq4g256_wmma_2tile",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
+                    32,
+                    64,
+                    16,
+                ),
+                _ => {
+                    let def = if self.arch_caps.is_rdna3p5() {
+                        // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
+                        // ldscoop_nosync variant wins here. gfx1152 previously fell
+                        // through to the RDNA4 `else` ldscoop arm because the old
+                        // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
+                        // not match "gfx1152" — that was a misroute, now fixed by
+                        // gating on the is_rdna3p5 capability molecule.
+                        (
+                            "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    } else if self.arch_caps.is_rdna3_dgpu() {
+                        // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
+                        // overhead exceeds its coalescing gain here. Falsified in
+                        // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
+                        // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
+                        // on the 27B DFlash batched-verify gate_up the ldscoop variant
+                        // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
+                        // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
+                        // e3232034 ("ldscoop on others") tuned the default for gfx1151
+                        // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
+                        // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
+                        // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
+                        // its own measurement on hiptrx/gfx1201.
+                        (
+                            "gemm_gate_up_hfq4g256_wmma",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    } else {
+                        (
+                            "gemm_gate_up_hfq4g256_wmma_ldscoop",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    };
+                    def
+                }
+            };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -12548,7 +12579,7 @@ impl Gpu {
 
         let total_m = gate_m + up_m;
         let row_tiles = (total_m + m_tile - 1) / m_tile;
-        let batch_tiles = (batch_size + 15) / 16;
+        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
@@ -21768,21 +21799,25 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const K_SPLITS: u32 = 4;
-        self.ensure_kernel(
+        // (The batch-tiled B=2 / 2-split variants that used to be selected here
+        // were removed 2026-10-09 with the rest of the v1-only surface: their
+        // kernels are HFQ4-G256-only, and Magnum V2 dtypes take the
+        // `gemm_mq4g256v2_residual_wmma` family, which already ships its own
+        // batch-tiled arms upstream.)
+        let (kname, ksrc, n_tile, k_splits, fin_name, fin_src) = (
             "gemm_hfq4g256_residual_wmma_ksplit_det",
             kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-        )?;
-        self.ensure_kernel(
+            16,
+            4u32,
             "gemm_ksplit_det_finalize",
             kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
-            "gemm_ksplit_det_finalize",
-        )?;
+        );
+        self.ensure_kernel(kname, ksrc, kname)?;
+        self.ensure_kernel(fin_name, fin_src, fin_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        // Partials scratch: [K_SPLITS][batch_size][M] fp32.
+        // Partials scratch: [k_splits][batch_size][M] fp32.
         let n_cells = batch_size * m;
-        let partials_ptr = self.ensure_ksplit_det_partials(K_SPLITS as usize * n_cells * 4)?;
+        let partials_ptr = self.ensure_ksplit_det_partials(k_splits as usize * n_cells * 4)?;
 
         // ── Phase 1: per-split partials (plain store, no atomic) ──
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -21800,18 +21835,13 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
         let row_tiles = ((m + 15) / 16) as u32;
-        let batch_tiles = ((batch_size + 15) / 16) as u32;
+        let batch_tiles = ((batch_size + n_tile - 1) / n_tile) as u32;
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         self.launch_maybe_blob(
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-            [row_tiles, batch_tiles, K_SPLITS],
+            kname,
+            [row_tiles, batch_tiles, k_splits],
             [32, 1, 1],
             0,
             &mut params1,
@@ -21843,7 +21873,7 @@ impl Gpu {
         ];
         let fin_grid = ((n_cells + 255) / 256) as u32;
         let r = self.launch_maybe_blob(
-            "gemm_ksplit_det_finalize",
+            fin_name,
             [fin_grid, 1, 1],
             [256, 1, 1],
             0,
@@ -26765,7 +26795,9 @@ impl Gpu {
             &um as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
+        let gu_bytes = (gate_m + up_m) * (k / 256) * 136 + k * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, gu_bytes);
+        let r = self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ag);
             b.push_ptr(au);
@@ -26776,7 +26808,11 @@ impl Gpu {
             b.push_i32(um);
             b.push_i32(kv);
             b
-        })
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        r
     }
 
     /// Fused gate+up for Q8_0 weights: two Q8 GEMVs in one launch.

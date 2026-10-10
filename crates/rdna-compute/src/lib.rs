@@ -30,7 +30,7 @@ pub mod grouped_ops;
 pub mod hc_row_fold;
 pub mod kernel_pack;
 pub mod kernel_registry;
-mod kernels;
+pub mod kernels;
 pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;

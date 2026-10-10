@@ -1109,6 +1109,12 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_g12dec\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1100 AWQ wavegrid twin (`HIPFIRE_AWQ_NORM_WAVEGRID`, kept opt-in after a
+/// null result): K/256 workgroups × wave32 spread the FWHT groups across CUs
+/// so the reduction and rotation overlap VRAM latency instead of serializing
+/// on one workgroup.
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip");
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
@@ -8119,6 +8125,13 @@ pub fn qwen36_27b_fa_prep_gfx1201_src() -> &'static str {
         std::sync::LazyLock::new(|| qwen36_27b_fa_prep_body("qwen36_27b_fa_prep_gfx1201"));
     &SRC
 }
+
+/// gfx1100 FA prep with a folded Q8_0 KV-cache epilogue (own translation unit,
+/// see the kernel header). Replaces one `kv_cache_write_q8_0_pair` launch per
+/// full-attention layer; cache bytes are bit-identical to the pair writer.
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_KVWRITE_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_kvwrite.gfx1100.hip");
 
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision

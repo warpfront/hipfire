@@ -295,6 +295,9 @@ pub struct ScratchState {
     /// Zeroed head-pair arrival counters of the fused GDN step's rotation
     /// epilogue (each launch leaves them zero).
     pub gdn_pair_counters: Option<DeviceBuffer>,
+    /// Persistent gfx1100 AWQ RMSNorm wavegrid state: 256 f32 per-thread
+    /// partials, one f32 RMS, three u32 epoch counters, padded to 2048 bytes.
+    pub mq_rmsnorm_awq_wavegrid_scratch: Option<DeviceBuffer>,
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
@@ -1042,6 +1045,23 @@ impl ScratchState {
             let scratch = hip.malloc(64)?;
             hip.memset(&scratch, 0, 64)?;
             self.mq_rmsnorm_wavegrid_scratch = Some(scratch);
+        }
+        Ok(())
+    }
+
+    /// Lazily allocate and zero the persistent gfx1100 AWQ RMSNorm wavegrid
+    /// state: 256 f32 per-thread partials, one f32 RMS, three u32 epoch
+    /// counters, padded to 2048 bytes.
+    pub fn ensure_mq_rmsnorm_awq_wavegrid_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.mq_rmsnorm_awq_wavegrid_scratch.is_none() {
+            let scratch = hip.malloc(2048)?;
+            hip.memset(&scratch, 0, 2048)?;
+            self.mq_rmsnorm_awq_wavegrid_scratch = Some(scratch);
         }
         Ok(())
     }

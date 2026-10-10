@@ -2958,6 +2958,78 @@ impl WeightSource for HfqSource<'_> {
             output.lloyd_lut_f16 = Some(f16);
             output.lloyd_lut_c16 = Some(c16);
         }
+        // Dev lever: requantize a Q8_0 (typically tied-embedding) output to
+        // HFQ4G256 so the logits GEMV reads ~half the bytes. The embedding
+        // table keeps its original buffer; only this projection switches.
+        static LM_HEAD_HFQ: std::sync::LazyLock<Option<&'static str>> =
+            std::sync::LazyLock::new(|| {
+                if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ2")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq2")
+                } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ3")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq3")
+                } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ4")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq4")
+                } else {
+                    None
+                }
+            });
+        let lm_head_hfq_mode = *LM_HEAD_HFQ;
+        if output.gpu_dtype == DType::Q8_0 {
+            match lm_head_hfq_mode {
+                Some("hfq2") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ2G256 (HIPFIRE_LM_HEAD_HFQ2=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq2g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ2G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
+                Some("hfq3") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ3G256 (HIPFIRE_LM_HEAD_HFQ3=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq3g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ3G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
+                Some("hfq4") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ4G256 (HIPFIRE_LM_HEAD_HFQ4=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq4g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ4G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
+                _ => {}
+            }
+        }
         Ok((output, aliases))
     }
 

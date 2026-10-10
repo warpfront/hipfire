@@ -14,6 +14,19 @@
 0.8b_mq4_gen_tok_s=365.6
 0.8b_mq4_pp128_prefill_tok_s=4672.5
 
+# 4B MQ4 rows. The 2026-08-23 campaign re-capture (pp32 1014.0 -> 1843.5,
+# gen 178.0 -> 192.4, pp128 -> 2691.7) was WITHDRAWN on 2026-10-09: the
+# 1843.5 pp32 floor is not reproducible outside the capture environment —
+# a clean ROCm 7.15 container on the same gfx1100 (RX 7900 XTX) reads
+# 1663.4 on the campaign branch tip and 1601.0 on master, i.e. the branch is
+# +3.9% over master but still below the committed floor, so the gate (and the
+# pre-commit hook that runs it) fails on the branch itself. The campaign
+# commit also notes that delta conflates ~6 months of master-side prefill
+# work with this branch's BT2 arms. The branch's measured 4B improvement is
+# recorded in docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md
+# instead. Re-capture on the reference machine with
+#   scripts/speed-gate.sh --fast --update-baselines
+# if the tighter floor is wanted.
 4b_mq4_pp32_prefill_tok_s=1014.0
 4b_mq4_gen_tok_s=178.0
 4b_mq4_pp128_prefill_tok_s=2004.3

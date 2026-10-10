@@ -165,6 +165,18 @@ name = "bench_qwen35_mq4"
 required-features = []
 
 [[example]]
+name = "probe_awq_wavegrid"
+required-features = ["deltanet"]
+
+[[example]]
+name = "probe_fa_prep"
+required-features = ["deltanet"]
+
+[[example]]
+name = "probe_fa_kvwrite"
+required-features = ["deltanet"]
+
+[[example]]
 name = "dflash_spec_demo"
 required-features = []
 

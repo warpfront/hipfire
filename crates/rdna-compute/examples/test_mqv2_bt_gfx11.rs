@@ -816,11 +816,15 @@ fn main() {
         eprintln!("SKIP: arch {arch} is not exact gfx1100 or gfx1151");
         return;
     }
-    // Exact gfx1100 forbids MQ3 runtime; gfx1151 covers bits3.
-    let include_bits3 = is_gfx1151;
+    // Exact gfx1100 historically forbade MQ3 runtime and left bits3 screened
+    // on gfx1151 only. HIPFIRE_MQV2_BT_SCREEN_BITS3=1 opts the gfx1100 raw-bit
+    // screen in so the quarantine can be re-measured on the part itself
+    // instead of inherited from gfx1151/gfx1201 results.
+    let include_bits3 = is_gfx1151
+        || (is_gfx1100 && std::env::var("HIPFIRE_MQV2_BT_SCREEN_BITS3").as_deref() == Ok("1"));
     eprintln!("arch {arch} confirmed — MQ{{2,3,5,6}}V2 gfx11 multi-BT raw-bit parity");
-    if is_gfx1100 {
-        eprintln!("gfx1100: skipping bits3 (MQ3) — covered on gfx1151 only");
+    if is_gfx1100 && !include_bits3 {
+        eprintln!("gfx1100: skipping bits3 (MQ3) — covered on gfx1151 only (set HIPFIRE_MQV2_BT_SCREEN_BITS3=1 to screen it here)");
     }
     eprintln!(
         "shapes: qkvza=({QKVZA_QKV_M},{QKVZA_Z_M},{QKVZA_BETA_M},{QKVZA_ALPHA_M}) qkv=({QKV_Q_M},{QKV_K_M},{QKV_V_M}) gate_up=({GATE_M},{UP_M}) residual={RESID_M} K={K} N={{128,256}}"

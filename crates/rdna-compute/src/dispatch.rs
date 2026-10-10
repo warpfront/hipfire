@@ -1811,6 +1811,7 @@ impl Gpu {
                 argmax_host: None,
                 prerotated: None,
                 gdn_pair_counters: None,
+                mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,

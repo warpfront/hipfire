@@ -2407,7 +2407,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, false,
                 )?;
 
                 if !fused_epilogue {
@@ -2732,7 +2732,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, false,
                 )?;
 
                 if !fused_epilogue {
@@ -4199,6 +4199,7 @@ fn qwen35_fa_epilogue_route_supported(
 }
 
 /// KV cache write + attention dispatch. Inline from original.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -4208,6 +4209,7 @@ pub(crate) fn kv_cache_attention_dispatch(
     wo: &WeightTensor,
     layer_idx: usize,
     pos: usize,
+    kv_write_prewritten: bool,
 ) -> HipResult<bool> {
     let plan = KvTierPlan::derive(KvTierInputs {
         pos,
@@ -4260,6 +4262,20 @@ pub(crate) fn kv_cache_attention_dispatch(
         },
         output: &s.fa_attn_out,
     };
+    if kv_write_prewritten {
+        // The prep kernel's folded epilogue already wrote the Q8_0 K/V cache
+        // rows for this token; dispatch attention only. The fold gate
+        // guarantees the q8 write/attend route and a single decode token.
+        debug_assert!(q8_route && plan.batch_size == 1);
+        use hipfire_dispatch::families::attention::AttentionFamily;
+        static ATTENTION: std::sync::OnceLock<AttentionFamily> = std::sync::OnceLock::new();
+        let res = ATTENTION
+            .get_or_init(AttentionFamily::new)
+            .run_attend_only(ctx, gpu, &plan, &io);
+        return res
+            .map(|_| fused_epilogue)
+            .map_err(|e| HipError::new(0, &e.to_string()));
+    }
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))?;
     Ok(fused_epilogue)
@@ -4525,8 +4541,17 @@ fn dense_tp_attention_partial(
         n_rot,
         config.rope_theta,
     )?;
-    let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, kv_layer_idx, pos)?;
+    let fused_epilogue = kv_cache_attention_dispatch(
+        &ctx,
+        gpu,
+        kv_cache,
+        s,
+        config,
+        &layer.wo,
+        kv_layer_idx,
+        pos,
+        false,
+    )?;
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     }
@@ -6445,6 +6470,14 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 };
                 let tap_enabled = hipfire_runtime::triattn::tap_enabled();
                 let fused_prep = qwen35_fa_prep_enabled(gpu, config) && !tap_enabled;
+                // Fold the Q8_0 KV write into the prep epilogue (default OFF,
+                // HIPFIRE_FA_KVWRITE_FOLD=1). Requires the non-compact decode
+                // route: pos_buf must hold the physical position when the
+                // folded writer reads it, and the pair-writer restore below
+                // would race nothing but change what the fold sees.
+                let kvwrite_fold = fused_prep
+                    && self.kv_cache.compact_offset == 0
+                    && qwen35_fa_kvwrite_fold_enabled(gpu, config);
                 if !fused_prep {
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
@@ -6479,19 +6512,38 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 if fused_prep {
-                    gpu.qwen35_fa_prep_gfx1100(
-                        &s.fa_q_full,
-                        &s.fa_q,
-                        &s.fa_gate,
-                        &s.fa_k,
-                        q_norm,
-                        k_norm,
-                        &s.pos_buf,
-                        config.norm_eps,
-                        config.rope_theta,
-                        config.n_heads,
-                        config.n_kv_heads,
-                    )?;
+                    if kvwrite_fold {
+                        gpu.qwen35_fa_prep_kvwrite_gfx1100(
+                            &s.fa_q_full,
+                            &s.fa_q,
+                            &s.fa_gate,
+                            &s.fa_k,
+                            &s.fa_v,
+                            &self.kv_cache.k_gpu[self.layer_idx],
+                            &self.kv_cache.v_gpu[self.layer_idx],
+                            q_norm,
+                            k_norm,
+                            &s.pos_buf,
+                            config.norm_eps,
+                            config.rope_theta,
+                            config.n_heads,
+                            config.n_kv_heads,
+                        )?;
+                    } else {
+                        gpu.qwen35_fa_prep_gfx1100(
+                            &s.fa_q_full,
+                            &s.fa_q,
+                            &s.fa_gate,
+                            &s.fa_k,
+                            q_norm,
+                            k_norm,
+                            &s.pos_buf,
+                            config.norm_eps,
+                            config.rope_theta,
+                            config.n_heads,
+                            config.n_kv_heads,
+                        )?;
+                    }
                 } else {
                     gpu.rope_partial_interleaved_f32(
                         &s.fa_q,
@@ -6517,6 +6569,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     wo,
                     self.layer_idx,
                     self.pos,
+                    kvwrite_fold,
                 )?;
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -6998,6 +7051,21 @@ fn gfx1201_state_fusions_enabled(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx1201()
 }
 
+/// Experimental gate: run the gfx1100-certified campaign fusions on a gfx1101
+/// device (same RDNA3 ISA, same wave32 WMMA; kernels compile for the runtime
+/// arch via --offload-arch). Set HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1. NOT a
+/// certified path — diagnostic A/B only.
+fn gfx1101_campaign_gates_enabled(gpu: &Gpu) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gpu.arch_caps.is_gfx1101()
+        && *ENABLED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX1101_GFX1100_CAMPAIGN")
+                .ok()
+                .as_deref()
+                == Some("1")
+        })
+}
+
 fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
     config.dim == 2_048
         && config.n_heads == 16
@@ -7095,6 +7163,11 @@ fn gated_norm_mq_rotate_enabled(
         || gfx1201_state_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
+        // Qwen3.5-4B (gfx1100): same DeltaNet head geometry (32 v-heads x
+        // 128), dim 2560. The kernel is grid-agnostic in n_heads (2 heads per
+        // 64-thread block); the dim term only scopes certification.
+        // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
+        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu)) && config.dim == 2_560 && n_v_heads == 32)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
             && super::config::qwen36_27b_dense_shape(config, n_v_heads));
     enabled
@@ -7105,6 +7178,26 @@ fn gated_norm_mq_rotate_enabled(
             wo.gpu_dtype,
             DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
         )
+}
+
+/// Fold the single-token Q8_0 KV-cache write into the FA-prep epilogue on the
+/// certified gfx1100 Qwen3.5-4B shape (16Q/4K, head_dim 256). Removes one
+/// `kv_cache_write_q8_0_pair` launch per full-attention layer; cache bytes are
+/// bit-identical to the pair writer. Default OFF — set
+/// `HIPFIRE_FA_KVWRITE_FOLD=1` to enable.
+fn qwen35_fa_kvwrite_fold_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FA_KVWRITE_FOLD")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    enabled
+        && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
+        && config.n_heads == 16
+        && config.n_kv_heads == 4
+        && config.head_dim == 256
 }
 
 /// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and
@@ -7129,6 +7222,12 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
+        // Qwen3.5-4B (gfx1100): 16Q/4K, head_dim 256, n_rot 64. The kernel
+        // derives K workgroups from the grid (head_slot - NQ) and the host
+        // launches NQ + n_kv workgroups, so 4 K heads need no kernel change.
+        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
+            && config.n_heads == 16
+            && config.n_kv_heads == 4)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -7158,6 +7257,13 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
+        // Qwen3.5-4B (gfx1100): 16Q/4K. The reduce kernel is per-Q-head
+        // (grid = n_heads) and the tile pass is shared with the non-gated
+        // flash path 4B already runs, so 4 K heads need no kernel change.
+        // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
+        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
+            && config.n_heads == 16
+            && config.n_kv_heads == 4)
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -7201,7 +7307,7 @@ fn qkvza_scalar_prep_enabled(
     });
     let dtype = wqkv.gpu_dtype;
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
         && gdn_compact2_enabled(gpu, config, n_v_heads, quant)
         && wqkv.k == 2_048
         && w_beta.m == n_v_heads
@@ -7234,12 +7340,17 @@ fn conv_scalar_prep_enabled(
             // A/B/B/A measured 35.376->35.657 tok/s (+0.79%) and
             // 28.105->27.891 ms p50 (-0.76%). The fused route deletes
             // 48 dispatches/token and stayed exact for 1,025 greedy tokens.
-            super::config::qwen36_27b_dense_shape(config, n_v_heads)
+            // 2026-08-21: default extended to every gfx1100 shape passing
+            // the structural checks below — the kernel is fully
+            // shape-parameterized (runtime k_dim/v_dim/heads, adaptive
+            // grid). Qwen3.5-4B certified: greedy text parity (500/600 tok)
+            // + 3 fresh-process E2E pairs.
+            true
         }
     };
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
         && n_v_heads <= 256
         && shape.as_deref().is_none_or(|v| v == "b256")
         && conv_qknorm_enabled(gpu, config, quant)
@@ -7249,6 +7360,7 @@ fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: StateQuant) -> b
     let mode = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM").ok();
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
         || gpu.arch_caps.arch() == "gfx1100"
+        || gfx1101_campaign_gates_enabled(gpu)
         || gfx1151_radiowave_fusions_enabled(gpu))
         && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_key_head_dim == 128
