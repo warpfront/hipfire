@@ -314,16 +314,6 @@ impl SessionCache {
             return 0;
         }
         let domain = self.domain.scoped(&scope);
-        let pooled = state
-            .snapshot_boundaries(prompt, 0, prompt.len() - 1)
-            .into_iter()
-            .rev()
-            .find(|&p| {
-                self.pool
-                    .contains(&domain, p as u64, prefix_fingerprint(&prompt[..p]))
-            })
-            .unwrap_or(0);
-        // A tie prefers the resident snapshot (no row copy, see `begin`).
         let resident = self
             .resident
             .as_ref()
@@ -333,7 +323,17 @@ impl SessionCache {
                 *d == domain && p < prompt.len() && *fp == prefix_fingerprint(&prompt[..p])
             })
             .map_or(0, |key| key.1 as usize);
-        pooled.max(resident)
+        // Only a strictly deeper pool snapshot beats the resident one (no row
+        // copy, see `begin`); each probe hashes its whole prefix.
+        state
+            .snapshot_boundaries(prompt, resident, prompt.len() - 1)
+            .into_iter()
+            .rev()
+            .find(|&p| {
+                self.pool
+                    .contains(&domain, p as u64, prefix_fingerprint(&prompt[..p]))
+            })
+            .unwrap_or(resident)
     }
 
     /// A published or pending snapshot.
