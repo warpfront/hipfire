@@ -4255,7 +4255,8 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// N >= 2048 (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps hipcc).
 /// SHA-256 3af58382793bddf8ab25d9c8ec7ced94e8444a55cf2c47ad77b815ba91104500
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
-pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
+pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
 /// Certified builder module of the gfx1151 Flash-Next lane-step row kernels
 /// (`hipfire-isa emit --kernel qwen4_lane_rows --arch gfx1151`, M7
 /// obligation-free): four multi-column (1..=8 activation columns) GEMVs that
@@ -4267,10 +4268,12 @@ pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen
 /// `fn_lane_pm_rows`, gfx1151 default on, `0` kills it).
 /// SHA-256 pin: [`QWEN4_LANE_ROWS_PM_GFX1151_SHA256`]
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
-pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco");
+pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco");
 /// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
-pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
+pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
+    "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
 /// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
 /// `crates/hipfire-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
 /// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
@@ -4282,7 +4285,8 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe
 /// unfused HC write.
 /// SHA-256 8281105b382654e560297af5732caff8da1198706abbc2c1f2e3f145b569574c
 /// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
-pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
+pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
 /// Certified builder modules of the few-row MQ4G256V2 projection kernel
 /// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (`hipfire-isa emit --kernel
 /// mq4_rows_x4 --arch gfx{1151,1201}`): MTP verify (2..=8 activation rows) of four
@@ -4292,11 +4296,13 @@ pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen
 /// (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
 /// SHA-256 bf9d23d10ca351835f1c5983f43889d5360ffa1d1866a0ca902d07e4d830184c
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1151.hxaco`).
-pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
+pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
 /// The gfx1201 image of [`MQ4_ROWS_X4_PM_GFX1151`].
 /// SHA-256 eb9f5700257e353bee5105d28129f0df9dbfb73ecdf4a312b85b374c1a7433aa
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
-pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
+pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1151's fused Flash-Next shared-expert gate/up
 /// (`hipfire-isa emit --kernel qwen4_shared_gu_gfx11 --epi all --arch gfx1151`, M7
 /// obligation-free): one launch of `qwen4_shared_gu_pm_gfx1151_{w8,w4}` replaces the
@@ -4308,7 +4314,8 @@ pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_r
 /// the chain).
 /// SHA-256 9509a2cdda96981bfbaa85bdda228a589bf4c2c0fd61cdb9bce8ea55f727acb1
 /// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
-pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
+pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with

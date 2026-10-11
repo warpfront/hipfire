@@ -333,7 +333,9 @@ fn packed_mq4_down_admitted(
     down: (DType, usize, usize),
     hidden_dim: usize,
 ) -> bool {
-    packed_admitted && separate && residual
+    packed_admitted
+        && separate
+        && residual
         && down.0 == DType::MQ4G256
         && (down.1, down.2) == (5120, 17408)
         && hidden_dim == down.2
@@ -354,18 +356,32 @@ fn try_packed_mq4_down(
         !pbs.lean && gpu.packed_mq4_admitted(down.m, down.k, n),
         h_source == FfnGateOutput::Separate,
         matches!(epilogue, BatchEpilogue::Residual),
-        (down.gpu_dtype, down.m, down.k), hidden_dim,
+        (down.gpu_dtype, down.m, down.k),
+        hidden_dim,
     ) {
         return Ok(false);
     }
     gpu.flush_residual_fold()?;
     fused_silu_mul_rotate_mq_batched_for(
-        gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
-        &pbs.ffn_hidden_batch, hidden_dim, n,
+        gpu,
+        down,
+        &pbs.gate_ffn_batch,
+        &pbs.up_batch,
+        &pbs.ffn_hidden_batch,
+        hidden_dim,
+        n,
     )?;
-    run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
-        &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
-        down.m, down.k, n)?;
+    run_residual_gemm_key(
+        gpu,
+        hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+        &down.buf,
+        down.gpu_dtype,
+        &pbs.ffn_hidden_batch,
+        &pbs.x_batch,
+        down.m,
+        down.k,
+        n,
+    )?;
     Ok(true)
 }
 
@@ -409,22 +425,34 @@ fn try_packed_mq4_ffn_gate_up(
     }
     gpu.flush_residual_fold()?;
     let separate_awq_inputs = gate.awq_scale.is_some() || up.awq_scale.is_some();
-    for (index, (weight, output)) in [
-        (gate, &pbs.gate_ffn_batch),
-        (up, &pbs.up_batch),
-    ].into_iter().enumerate() {
+    for (index, (weight, output)) in [(gate, &pbs.gate_ffn_batch), (up, &pbs.up_batch)]
+        .into_iter()
+        .enumerate()
+    {
         // Sidecars are per-weight and may differ (or exist on only one side).
         // Reuse the rotated input only when neither projection carries AWQ.
         if index == 0 || separate_awq_inputs {
             fused_rmsnorm_rotate_mq_batched_for(
-                gpu, &pbs.x_batch, norm, weight, &pbs.x_rot_batch,
-                weight.k, config.norm_eps, n,
+                gpu,
+                &pbs.x_batch,
+                norm,
+                weight,
+                &pbs.x_rot_batch,
+                weight.k,
+                config.norm_eps,
+                n,
             )?;
         }
         run_plain_gemm_key(
-            gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
-            &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
-            weight.m, weight.k, n,
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+            &weight.buf,
+            weight.gpu_dtype,
+            &pbs.x_rot_batch,
+            output,
+            weight.m,
+            weight.k,
+            n,
         )?;
     }
     Ok(true)
@@ -586,9 +614,7 @@ fn fp8_stream_consumer_takes_fp8(
     }
     match consumer {
         Fp8StreamConsumer::Qkvza => flags.gfx12_mq4v2_fp8_qkvza,
-        Fp8StreamConsumer::GateUp => {
-            flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma
-        }
+        Fp8StreamConsumer::GateUp => flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma,
         Fp8StreamConsumer::Qkv => flags.gfx12_mq4v2_fp8_qkv,
         Fp8StreamConsumer::Residual => flags.gfx12_mq4v2_fp8_resid,
     }
@@ -1148,7 +1174,8 @@ pub(crate) fn fp8_verify_target(
     config: &Qwen35Config,
     kv: &llama::KvCache,
 ) -> Fp8VerifyTarget {
-    let kv_batched = kv.quant_fp8 || kv.quant_q8 || kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2;
+    let kv_batched =
+        kv.quant_fp8 || kv.quant_q8 || kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2;
     if kv_batched && multi::multi_chunk_dense_mq4v2_target(weights, config) {
         Fp8VerifyTarget::Eligible
     } else {
@@ -1664,7 +1691,9 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
 
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
-        .ok().as_deref() == Some("1")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Separately admitted native MQ4 route: no V2 producer or lean PBS contract.
@@ -1677,7 +1706,9 @@ fn native_mq4_widened_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
 }
 
 fn native_mq4_widened_flags_admitted(
-    arch: &str, flags: &rdna_compute::FeatureFlags, screen: bool,
+    arch: &str,
+    flags: &rdna_compute::FeatureFlags,
+    screen: bool,
 ) -> bool {
     arch == "gfx1100"
         && !flags.fp16_disabled
@@ -2046,9 +2077,17 @@ pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> O
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
     let packed = hipfire_config::developer_var("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     if arch == "gfx1100" && (native_mq4_widened_requested() || packed) {
-        base.checked_add(native_mq4_projection_deficit(config, WIDENED_COMMIT_ROWS, 0, 0, 0)?)
+        base.checked_add(native_mq4_projection_deficit(
+            config,
+            WIDENED_COMMIT_ROWS,
+            0,
+            0,
+            0,
+        )?)
     } else {
         Some(base)
     }
@@ -2064,11 +2103,18 @@ fn native_mq4_projection_deficit(
     live_f16: usize,
     live_partials: usize,
 ) -> Option<usize> {
-    let mmq = config.hidden_dim.checked_add(127)?.checked_div(128)?
-        .checked_mul(144)?.checked_mul(rows)?;
+    let mmq = config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(144)?
+        .checked_mul(rows)?;
     let tail = rows.min(127);
     let f16 = tail.checked_mul(config.hidden_dim)?.checked_mul(2)?;
-    let partials = tail.checked_mul(config.dim)?.checked_mul(4)?.checked_mul(4)?;
+    let partials = tail
+        .checked_mul(config.dim)?
+        .checked_mul(4)?
+        .checked_mul(4)?;
     mmq.saturating_sub(live_mmq)
         .checked_add(f16.saturating_sub(live_f16))?
         .checked_add(partials.saturating_sub(live_partials))
@@ -2250,11 +2296,13 @@ fn memory_admitted_rung(
         .unwrap_or(usize::MAX);
         let projection_deficit = if native_mq4 {
             native_mq4_projection_deficit(
-                config, rung,
+                config,
+                rung,
                 gpu.scratch.q8_1_mmq_x_scratch_bytes,
                 gpu.scratch.fp16_x_scratch_bytes,
                 gpu.scratch.ksplit_det_partials_bytes,
-            ).unwrap_or(usize::MAX)
+            )
+            .unwrap_or(usize::MAX)
         } else if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
@@ -2337,7 +2385,16 @@ pub fn ordinary_prefill_chunk_limit_deducting(
     kv_cache: &llama::KvCache,
     free_deduction: usize,
 ) -> HipResult<usize> {
-    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, None, None, free_deduction)
+    ordinary_prefill_chunk_limit_with_cache(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        None,
+        None,
+        free_deduction,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2360,7 +2417,14 @@ fn ordinary_prefill_chunk_limit_with_cache(
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
     let mut admitted = memory_admitted_rung(
-        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached, free_deduction,
+        gpu,
+        config,
+        kv_cache,
+        perf,
+        lean,
+        native_mq4_widened_route(gpu, weights),
+        cached,
+        free_deduction,
     )?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
@@ -7562,7 +7626,13 @@ fn batch_chunk_delta_net_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -9823,7 +9893,12 @@ fn batch_chunk_fa_attend_a4(
 /// switch clear, never DFlash chain verify, GQA 24/4 HD256 with a 64-wide
 /// rotary. Shared by [`batch_chunk_full_attn_attn`] and the multi-request
 /// chunk, which evaluates it per request with that request's `fusion`/`n`.
-fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &Qwen35Config, fusion: DflashFusionCtx, n: usize) -> bool {
+fn gfx12_fa_prep_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
         && fusion != DflashFusionCtx::ChainVerify
@@ -10065,7 +10140,13 @@ fn batch_chunk_full_attn_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -13656,10 +13737,12 @@ pub(crate) fn forward_batch_chunk_impl(
     // fallback arms never reach a `*VerifyExact` key).
     if gpu.fp8_verify_scope
         && (!fa_batched_ok
-            || weights
-                .layers
-                .iter()
-                .any(|l| matches!(l, LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_))))
+            || weights.layers.iter().any(|l| {
+                matches!(
+                    l,
+                    LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+                )
+            }))
     {
         return Err(HipError::new(
             0,
@@ -14613,16 +14696,27 @@ mod tests {
         on.gfx12_mq4v2_fp8_qkv = true;
         on.gfx12_mq4v2_fp8_resid = true;
         for (consumer, dtypes) in families {
-            assert!(fp8_stream_consumer_takes_fp8(&on, consumer, dtypes), "{consumer:?}");
+            assert!(
+                fp8_stream_consumer_takes_fp8(&on, consumer, dtypes),
+                "{consumer:?}"
+            );
         }
         // gate/up under the LDS-stage WMMA has no FP8 prepared consumer.
         on.hfq4g256_ldsstage_wmma = true;
         assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, U]));
         assert!(fp8_stream_consumer_takes_fp8(&on, Residual, &[U]));
         // Mixed, non-MQ4v2, or empty weight sets never admit a producer.
-        assert!(!fp8_stream_consumer_takes_fp8(&on, Qkvza, &[U, U, U, DType::Q8_0]));
+        assert!(!fp8_stream_consumer_takes_fp8(
+            &on,
+            Qkvza,
+            &[U, U, U, DType::Q8_0]
+        ));
         assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, L]));
-        assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[DType::MQ4G256]));
+        assert!(!fp8_stream_consumer_takes_fp8(
+            &on,
+            Residual,
+            &[DType::MQ4G256]
+        ));
         assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[]));
     }
 
@@ -14653,13 +14747,21 @@ mod tests {
         ] {
             assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
             assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
-            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(
+                true, rejected, rejected, 256
+            ));
         }
     }
 
     #[test]
     fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
-        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        assert!(!packed_mq4_down_admitted(
+            true,
+            true,
+            true,
+            (DType::MQ4G256V2, 5120, 17408),
+            17408
+        ));
         for dtype in [DType::MQ4G256] {
             let shape = (dtype, 5120, 17408);
             assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
@@ -14667,10 +14769,27 @@ mod tests {
             assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 2560, 17408),
+                17408
+            ));
         }
-        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        for dtype in [
+            DType::MQ4G256V2Lloyd,
+            DType::MQ4G256Lloyd,
+            DType::HFQ4G256,
+            DType::Q8_0,
+        ] {
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 5120, 17408),
+                17408
+            ));
         }
     }
 
@@ -14830,10 +14949,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }
@@ -16414,22 +16551,42 @@ mod tests {
     fn native_mq4_wide_rejects_unaudited_dispatch_overrides() {
         let make = || rdna_compute::FeatureFlags::for_test("gfx1100");
         assert!(native_mq4_widened_flags_admitted("gfx1100", &make(), false));
-        assert!(!native_mq4_widened_flags_admitted("gfx1201", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1201",
+            &make(),
+            false
+        ));
         assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
         let mut variants = Vec::new();
-        let mut f = make(); f.fp16_disabled = true; variants.push(f);
-        let mut f = make(); f.rocblas_all_archs = true; variants.push(f);
-        let mut f = make(); f.gemv_dp4a = Some(true); variants.push(f);
-        let mut f = make(); f.mmq_override = Some(false); variants.push(f);
-        let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
-        let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
-        let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
+        let mut f = make();
+        f.fp16_disabled = true;
+        variants.push(f);
+        let mut f = make();
+        f.rocblas_all_archs = true;
+        variants.push(f);
+        let mut f = make();
+        f.gemv_dp4a = Some(true);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_override = Some(false);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_min_batch = Some(2048);
+        variants.push(f);
+        let mut f = make();
+        f.qkvza_split_tail = true;
+        variants.push(f);
+        let mut f = make();
+        f.wo_wmma_variant = Some("k4".into());
+        variants.push(f);
         // Packed FFN shares the budgeted MMQ slot and keeps native tails.
         let mut packed = make();
         packed.packed_mq4_prefill = true;
         assert!(native_mq4_widened_flags_admitted("gfx1100", &packed, false));
         packed.mmq_override = Some(false);
-        assert!(!native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1100", &packed, false
+        ));
         for f in variants {
             assert!(!native_mq4_widened_flags_admitted("gfx1100", &f, false));
         }
@@ -16442,14 +16599,27 @@ mod tests {
         let f16 = 127 * 17408 * 2;
         let partials = 127 * 5120 * 4 * 4;
         assert_eq!(mmq, 153 * 1024 * 1024);
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
-                   Some(mmq + f16 + partials));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq, f16, partials), Some(0));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials), Some(f16));
-        assert_eq!(native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0), None);
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
+            Some(mmq + f16 + partials)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq, f16, partials),
+            Some(0)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials),
+            Some(f16)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0),
+            None
+        );
         for rows in [512, 1024, 2048, 4096, 8192] {
-            assert_eq!(native_mq4_projection_deficit(&config, rows, 0, 0, 0),
-                       Some(rows * 19584 + f16 + partials));
+            assert_eq!(
+                native_mq4_projection_deficit(&config, rows, 0, 0, 0),
+                Some(rows * 19584 + f16 + partials)
+            );
         }
     }
 

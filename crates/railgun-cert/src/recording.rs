@@ -213,16 +213,14 @@ fn lex(src: &str) -> Vec<Tok> {
                 i += if b[i] == b'\\' { 2 } else { 1 };
             }
             i += 1;
-        } else if (c == b'r' || (c == b'b' && b.get(i + 1) == Some(&b'r')))
-            && {
-                let s = if c == b'b' { i + 2 } else { i + 1 };
-                let mut j = s;
-                while b.get(j) == Some(&b'#') {
-                    j += 1;
-                }
-                b.get(j) == Some(&b'"') && (j > s || c == b'r' || c == b'b')
+        } else if (c == b'r' || (c == b'b' && b.get(i + 1) == Some(&b'r'))) && {
+            let s = if c == b'b' { i + 2 } else { i + 1 };
+            let mut j = s;
+            while b.get(j) == Some(&b'#') {
+                j += 1;
             }
-        {
+            b.get(j) == Some(&b'"') && (j > s || c == b'r' || c == b'b')
+        } {
             let s = if c == b'b' { i + 2 } else { i + 1 };
             let mut j = s;
             while b.get(j) == Some(&b'#') {
@@ -231,7 +229,14 @@ fn lex(src: &str) -> Vec<Tok> {
             let hashes = j - s;
             i = j + 1;
             while i < b.len() {
-                if b[i] == b'"' && b[i + 1..].iter().take(hashes).filter(|&&h| h == b'#').count() == hashes {
+                if b[i] == b'"'
+                    && b[i + 1..]
+                        .iter()
+                        .take(hashes)
+                        .filter(|&&h| h == b'#')
+                        .count()
+                        == hashes
+                {
                     i += 1 + hashes;
                     break;
                 }
@@ -253,7 +258,10 @@ fn lex(src: &str) -> Vec<Tok> {
                 i += 1;
             }
         } else if c.is_ascii_digit() {
-            while i < b.len() && (ident_cont(b[i]) || b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+            while i < b.len()
+                && (ident_cont(b[i])
+                    || b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
+            {
                 i += 1;
             }
         } else if ident_start(c) {
@@ -286,7 +294,12 @@ fn predicate_at(t: &[Tok], i: usize) -> Option<Predicate> {
     let name = ident(t.get(i))?;
     let prev = i.checked_sub(1).and_then(|p| t.get(p));
     let is_def = ident(prev) == Some("fn");
-    let replay_method = || punct(prev, '.') && i >= 2 && ident(t.get(i - 2)) == Some("replay") && punct(t.get(i + 1), '(');
+    let replay_method = || {
+        punct(prev, '.')
+            && i >= 2
+            && ident(t.get(i - 2)) == Some("replay")
+            && punct(t.get(i + 1), '(')
+    };
     match name {
         "is_recording" | "should_auto_finalize_capture" if !is_def => Some(Predicate::IsRecording),
         "replay_recording" | "redline_recording" => Some(Predicate::IsRecording),
@@ -320,7 +333,13 @@ pub fn scan_file(src: &str) -> BTreeMap<String, u32> {
     let mut i = 0;
     while i < t.len() {
         match &t[i] {
-            Tok::Punct('#') if punct(t.get(i + 1), '[') && ident(t.get(i + 2)) == Some("cfg") && punct(t.get(i + 3), '(') && ident(t.get(i + 4)) == Some("test") && punct(t.get(i + 5), ')') => {
+            Tok::Punct('#')
+                if punct(t.get(i + 1), '[')
+                    && ident(t.get(i + 2)) == Some("cfg")
+                    && punct(t.get(i + 3), '(')
+                    && ident(t.get(i + 4)) == Some("test")
+                    && punct(t.get(i + 5), ')') =>
+            {
                 pending_test = true;
                 i += 6;
                 continue;
@@ -346,10 +365,17 @@ pub fn scan_file(src: &str) -> BTreeMap<String, u32> {
             }
             Tok::Punct('{') => {
                 depth += 1;
-                let fn_here = pending_fn.take().filter(|(_, n)| *n == nest).map(|(name, _)| name);
+                let fn_here = pending_fn
+                    .take()
+                    .filter(|(_, n)| *n == nest)
+                    .map(|(name, _)| name);
                 let item_here = pending_item.take().is_some();
                 if fn_here.is_some() || item_here || pending_test {
-                    stack.push(Frame { name: fn_here, test: std::mem::take(&mut pending_test), depth });
+                    stack.push(Frame {
+                        name: fn_here,
+                        test: std::mem::take(&mut pending_test),
+                        depth,
+                    });
                 }
             }
             Tok::Punct('}') => {
@@ -403,7 +429,11 @@ pub fn scan_sources(crates_dir: &Path) -> std::io::Result<BTreeMap<(String, Stri
     }
     let mut out = BTreeMap::new();
     for file in files {
-        let rel = file.strip_prefix(crates_dir).unwrap_or(&file).to_string_lossy().replace('\\', "/");
+        let rel = file
+            .strip_prefix(crates_dir)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
         for (function, n) in scan_file(&std::fs::read_to_string(&file)?) {
             out.insert((rel.clone(), function), n);
         }
@@ -419,7 +449,10 @@ pub fn decision(id: &str) -> Option<&'static Decision> {
 
 /// `(file, function) → occurrences` as the inventory declares them.
 pub fn inventory_counts() -> BTreeMap<(String, String), u32> {
-    SITES.iter().map(|s| ((s.file.to_owned(), s.function.to_owned()), s.occurrences)).collect()
+    SITES
+        .iter()
+        .map(|s| ((s.file.to_owned(), s.function.to_owned()), s.occurrences))
+        .collect()
 }
 
 /// Differences between a scan and the inventory, one line each; empty when
@@ -436,7 +469,9 @@ pub fn check(scanned: &BTreeMap<(String, String), u32>) -> Vec<String> {
     }
     for (file, function) in declared.keys() {
         if !scanned.contains_key(&(file.clone(), function.clone())) {
-            out.push(format!("stale SITES row: {file} :: {function} no longer consults recording state"));
+            out.push(format!(
+                "stale SITES row: {file} :: {function} no longer consults recording state"
+            ));
         }
     }
     out
@@ -456,13 +491,22 @@ pub struct RecordingDependentDecision {
 pub fn recording_dependent_decisions(program: Program) -> Vec<RecordingDependentDecision> {
     DECISIONS
         .iter()
-        .flat_map(|d| d.reaches.iter().filter(move |r| r.program == program).map(move |r| (d, r)))
+        .flat_map(|d| {
+            d.reaches
+                .iter()
+                .filter(move |r| r.program == program)
+                .map(move |r| (d, r))
+        })
         .map(|(d, r)| RecordingDependentDecision {
             id: d.id,
             verdict: d.verdict,
             domain: r.domain,
             seen_by: r.seen_by,
-            sites: SITES.iter().filter(|s| s.decisions.contains(&d.id)).map(|s| format!("{}::{}", s.file, s.function)).collect(),
+            sites: SITES
+                .iter()
+                .filter(|s| s.decisions.contains(&d.id))
+                .map(|s| format!("{}::{}", s.file, s.function))
+                .collect(),
         })
         .collect()
 }
@@ -471,7 +515,10 @@ pub fn recording_dependent_decisions(program: Program) -> Vec<RecordingDependent
 /// them. Each entry carries the refusing decisions and their domains.
 pub fn refused_default_programs() -> BTreeMap<Program, Vec<(&'static str, &'static str)>> {
     let mut out: BTreeMap<Program, Vec<(&'static str, &'static str)>> = BTreeMap::new();
-    for d in DECISIONS.iter().filter(|d| d.verdict == Verdict::NotEquivalent) {
+    for d in DECISIONS
+        .iter()
+        .filter(|d| d.verdict == Verdict::NotEquivalent)
+    {
         for r in d.reaches {
             out.entry(r.program).or_default().push((d.id, r.domain));
         }
@@ -481,7 +528,10 @@ pub fn refused_default_programs() -> BTreeMap<Program, Vec<(&'static str, &'stat
 
 /// Declared pre-program launches of `program` ([`PreProgramLaunch`]).
 pub fn pre_program_launches(program: Program) -> Vec<&'static PreProgramLaunch> {
-    PRE_PROGRAM_LAUNCHES.iter().filter(|l| l.programs.contains(&program)).collect()
+    PRE_PROGRAM_LAUNCHES
+        .iter()
+        .filter(|l| l.programs.contains(&program))
+        .collect()
 }
 
 pub fn inventory_json() -> serde_json::Value {
@@ -519,9 +569,34 @@ pub fn inventory_markdown() -> String {
     s.push_str("| # | decision | predicates | condition (location) | effect | switches | verdict | evidence | reaches (program: domain [seen by]) | sites |\n");
     s.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
     for (n, d) in DECISIONS.iter().enumerate() {
-        let preds: Vec<String> = d.predicates.iter().map(|p| serde_json::to_value(p).unwrap().as_str().unwrap().to_owned()).collect();
-        let reaches: Vec<String> = d.reaches.iter().map(|r| format!("{}: {} [{}]", serde_json::to_value(r.program).unwrap().as_str().unwrap(), r.domain, r.seen_by)).collect();
-        let sites: Vec<String> = SITES.iter().filter(|x| x.decisions.contains(&d.id)).map(|x| format!("`{}::{}`×{}", x.file, x.function, x.occurrences)).collect();
+        let preds: Vec<String> = d
+            .predicates
+            .iter()
+            .map(|p| {
+                serde_json::to_value(p)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let reaches: Vec<String> = d
+            .reaches
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {} [{}]",
+                    serde_json::to_value(r.program).unwrap().as_str().unwrap(),
+                    r.domain,
+                    r.seen_by
+                )
+            })
+            .collect();
+        let sites: Vec<String> = SITES
+            .iter()
+            .filter(|x| x.decisions.contains(&d.id))
+            .map(|x| format!("`{}::{}`×{}", x.file, x.function, x.occurrences))
+            .collect();
         s.push_str(&format!(
             "| {} | `{}` | {} | {} | {} | {} | **{}** | {} | {} | {} |\n",
             n + 1,
@@ -532,7 +607,11 @@ pub fn inventory_markdown() -> String {
             md_cell(d.switches),
             serde_json::to_value(d.verdict).unwrap().as_str().unwrap(),
             md_cell(d.evidence),
-            if reaches.is_empty() { "none".to_owned() } else { md_cell(&reaches.join("; ")) },
+            if reaches.is_empty() {
+                "none".to_owned()
+            } else {
+                md_cell(&reaches.join("; "))
+            },
             sites.join("<br>"),
         ));
     }
@@ -541,11 +620,20 @@ pub fn inventory_markdown() -> String {
 
 /// `railgun-cert recording-inventory json|markdown|scan|check [CRATES_DIR]`.
 pub fn cli(args: &[std::path::PathBuf]) -> Result<(), String> {
-    let mode = args.first().and_then(|a| a.to_str()).ok_or("usage: railgun-cert recording-inventory json|markdown|scan|check [CRATES_DIR]")?;
-    let crates_dir = args.get(1).cloned().unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
+    let mode = args
+        .first()
+        .and_then(|a| a.to_str())
+        .ok_or("usage: railgun-cert recording-inventory json|markdown|scan|check [CRATES_DIR]")?;
+    let crates_dir = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
     match mode {
         "json" => {
-            println!("{}", serde_json::to_string_pretty(&inventory_json()).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inventory_json()).map_err(|e| e.to_string())?
+            );
             Ok(())
         }
         "markdown" => {
@@ -563,7 +651,11 @@ pub fn cli(args: &[std::path::PathBuf]) -> Result<(), String> {
             for p in &problems {
                 eprintln!("{p}");
             }
-            if problems.is_empty() { Ok(()) } else { Err(format!("{} inventory mismatch(es)", problems.len())) }
+            if problems.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} inventory mismatch(es)", problems.len()))
+            }
         }
         other => Err(format!("unknown recording-inventory mode {other}")),
     }
@@ -587,7 +679,11 @@ use Program::*;
 use Verdict::*;
 
 const fn reach(program: Program, domain: &'static str, seen_by: &'static str) -> Reach {
-    Reach { program, domain, seen_by }
+    Reach {
+        program,
+        domain,
+        seen_by,
+    }
 }
 
 pub const DECISIONS: &[Decision] = &[
@@ -1148,260 +1244,1552 @@ pub const DECISIONS: &[Decision] = &[
     },
 ];
 pub const SITES: &[Site] = &[
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_mixed", occurrences: 16, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_swa_only", occurrences: 3, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "compressor_forward_impl", occurrences: 1, decisions: &["ds4-gfx942-compressor-sentinel-gate"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "decode_step_heterogeneous", occurrences: 4, decisions: &["eager-only-refusals"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "decode_step_with_graph", occurrences: 2, decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "ds4_moe_block_core", occurrences: 2, decisions: &["ds4-gfx942-ffn-overlap", "replay-enabled-process-route"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "dspark_requires_typed_device_copy", occurrences: 2, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "forward_prefill_batch_chunk_impl", occurrences: 3, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "dspark_verify_forward", occurrences: 2, decisions: &["dspark-capture-safe-verify-body", "graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "redline_dspark_verify_direct", occurrences: 2, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "redline_dspark_verify_pm4", occurrences: 1, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "forward_prefill_batch_v2", occurrences: 6, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "forward_scratch", occurrences: 3, decisions: &["graph-capture-lifecycle", "replay-recorder-lifecycle"] },
-    Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "full_layer_decode_impl", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "run_attend", occurrences: 4, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-gemma4/src/lowered.rs", function: "sliding_layer_decode_impl", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-lfm2moe/src/forward.rs", function: "decode_step", occurrences: 1, decisions: &["replay-enabled-process-route"] },
-    Site { file: "hipfire-arch-lfm2moe/src/forward.rs", function: "decode_step_with_retained_replay", occurrences: 3, decisions: &["replay-recorder-lifecycle"] },
-    Site { file: "hipfire-arch-llama/src/arch.rs", function: "forward_scratch_layers", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-qwen2/src/qwen2.rs", function: "attend_plan", occurrences: 1, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-qwen35/src/dflash_cb.rs", function: "dflash_cb_verify", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "hipfire-arch-qwen35/src/mtp_spec.rs", function: "abort_mtp_proposal_graph_capture", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/mtp_spec.rs", function: "begin_mtp_proposal_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/mtp_spec.rs", function: "end_mtp_proposal_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/ep_batch.rs", function: "forward_scratch_layers_multi", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "dense_tp_abort_captures", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "dense_tp_drop_graphs", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "forward_scratch", occurrences: 2, decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "forward_scratch_dense_tp", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "kv_cache_attention_dispatch", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "execute_fa_attend_step", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "fa_pair_merge_admitted", occurrences: 4, decisions: &["gfx1151-fa-pair-merge"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "forward_batch_chunk_impl", occurrences: 5, decisions: &["q8-multirow-verify-attention", "captured-batch-attention-physical-cap", "captured-verify-attention-physical-cap", "gdn-chunk-scan"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "forward_prefill_batch_with_pbs_opts_inner", occurrences: 4, decisions: &["widened-prefill-batching", "gfx1151-fa-pair-merge"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "forward_prefill_chunk_pair", occurrences: 2, decisions: &["q8-multirow-verify-attention"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "mq_f16_projection_fast_route", occurrences: 2, decisions: &["gfx1100-f16-projection-fast-route"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "q8_multirow_attn_admitted", occurrences: 4, decisions: &["q8-multirow-verify-attention"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs", function: "attn_fp8_twin_eligible", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs", function: "forward_prefill_batch_multi", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "hipfire-arch-qwen35/src/arch.rs", function: "load_weights", occurrences: 1, decisions: &["replay-enabled-process-route"] },
-    Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "replay_gdn", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "rides_ordinary_prefill", occurrences: 2, decisions: &["widened-prefill-batching", "gdn-chunk-scan"] },
-    Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "verify_dflash_block_inner_body", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 8, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse", "qwen4-ple-async-upload"] },
-    Site { file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs", function: "forward_lanes_scoped", occurrences: 1, decisions: &["qwen4-ple-async-upload"] },
-    Site { file: "hipfire-arch-qwen4/src/ple_stage.rs", function: "ple_async_upload", occurrences: 2, decisions: &["qwen4-ple-async-upload"] },
-    Site { file: "hipfire-arch-qwen4/src/mtp_gpu.rs", function: "ensure_mapped_capacity", occurrences: 1, decisions: &["eager-only-refusals"] },
-    Site { file: "hipfire-arch-qwen4/src/state.rs", function: "ensure_mapped_capacity", occurrences: 3, decisions: &["eager-only-refusals"] },
-    Site { file: "hipfire-daemon/src/main.rs", function: "main", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-dispatch-tests/src/llama.rs", function: "tier_inputs_base", occurrences: 1, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-dispatch/src/families/kv_tier.rs", function: "<item>", occurrences: 1, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-dispatch/src/families/kv_tier.rs", function: "bf16_attend_key", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-dispatch/src/families/kv_tier.rs", function: "derive", occurrences: 5, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-dispatch/src/families/kv_tier.rs", function: "fp8_attend_key", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-dispatch/src/families/kv_tier.rs", function: "q8_attend_key", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-dispatch/src/pipeline/layer_ops.rs", function: "hyper_read_pairs_write", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "hipfire-dispatch/src/pipeline/layer_ops.rs", function: "execute_grouped_depthwise", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "hipfire-dispatch/src/pipeline/mod.rs", function: "dump_hidden_localize", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-dispatch/src/pipeline/moe_program.rs", function: "absorbs_clear", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "hipfire-dispatch/src/pipeline/sealed_moe.rs", function: "validate_for_gpu", occurrences: 1, decisions: &["eager-only-refusals"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_bench_decode_deepseek4", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_bench_decode_lfm2moe", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_greedy_trace", occurrences: 2, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_qwen4_replay_failure", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_run_dspark_direct_arm", occurrences: 2, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_shadow_dspark_verify_pm4", occurrences: 12, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-generate/src/redline.rs", function: "redline_shadow_qwen4", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
-    Site { file: "hipfire-runtime/src/dflash.rs", function: "abort_draft_ffn_graph_capture", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-runtime/src/dflash.rs", function: "begin_draft_ffn_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-runtime/src/dflash.rs", function: "draft_ffn_layer", occurrences: 3, decisions: &["dflash-draft-graph-safe-body"] },
-    Site { file: "hipfire-runtime/src/dflash.rs", function: "end_draft_ffn_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "hipfire-runtime/src/llama.rs", function: "forward_prefill_chunk", occurrences: 3, decisions: &["captured-batch-attention-physical-cap", "kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-runtime/src/llama.rs", function: "tier_inputs", occurrences: 1, decisions: &["kv-tier-capture-forces-flash"] },
-    Site { file: "hipfire-runtime/src/multi_gpu.rs", function: "barrier_rank_streams_reuse", occurrences: 1, decisions: &["tp-graph-capture-barrier"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_fa2_gqa_rotated_k_gfx11", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_asym2", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_asym3_impl", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_asym4", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_bf16_windowed", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_fp8_e4m3_tile", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_fwht2", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_fwht3", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_fwht4", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_q8_0_rows_masked", occurrences: 1, decisions: &["q8-multirow-verify-attention"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_q8_0_windowed_impl", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_q8_0_fa2_gqa_gfx11", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_q8_0_flash_prefill_wmma", occurrences: 2, decisions: &["fa2-prefill-attention"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_verify_wmma_with", occurrences: 1, decisions: &["verify-attention-wmma-gqa"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "gfx1100_asym3_q8_pair_enabled", occurrences: 1, decisions: &["gfx1100-asym3-q8-pair-write"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "gfx12_q8_fa2_prefill_admitted", occurrences: 2, decisions: &["fa2-prefill-attention"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "launch_verify_gqa", occurrences: 1, decisions: &["verify-attention-wmma-gqa"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "replay_stable_tile_count", occurrences: 4, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/dflash_draft_fusion.rs", function: "draft_collapse_mq4v2_route", occurrences: 2, decisions: &["dflash-gfx1100-fusions"] },
-    Site { file: "rdna-compute/src/dflash_hidden_scatter.rs", function: "dflash_hidden_commit5_applicable", occurrences: 2, decisions: &["dflash-gfx1100-fusions"] },
-    Site { file: "rdna-compute/src/dflash_hidden_scatter.rs", function: "dflash_hidden_scatter5_try", occurrences: 2, decisions: &["dflash-gfx1100-fusions"] },
-    Site { file: "rdna-compute/src/dflash_state_copy.rs", function: "dflash_state_bulk_copy_gfx1100_on_stream", occurrences: 1, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "a8_prefill_active", occurrences: 2, decisions: &["prefill-producer-fusions"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "convert_fp16_x_uncached", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "ensure_fp16_x", occurrences: 3, decisions: &["fp16-fp8-x-conversion-cache"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "ensure_fp8_x", occurrences: 3, decisions: &["fp16-fp8-x-conversion-cache"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "ensure_int4_mmq_x", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "ensure_int8_mmq_x", occurrences: 1, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "ensure_q8_1_mmq_x", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "ensure_q8_1_mmq_x128", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "fp8_stream_active", occurrences: 2, decisions: &["prefill-producer-fusions"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "init_with_device", occurrences: 3, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "invalidate_for_kv_mode_switch", occurrences: 2, decisions: &["capture-safe-invalidation"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "invalidate_for_scratch_growth", occurrences: 2, decisions: &["capture-safe-invalidation"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "iu4_gfx11_producer_quant_fused_active", occurrences: 2, decisions: &["prefill-producer-fusions"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "iu4_producer_quant_fused_active", occurrences: 2, decisions: &["prefill-producer-fusions"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "iu4_producer_sidecar_active", occurrences: 2, decisions: &["prefill-producer-fusions"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "iu4_silu_quant_fused_active", occurrences: 2, decisions: &["prefill-producer-fusions"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "launch_blob_recorded", occurrences: 3, decisions: &["launch-funnel-blob-path"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "launch_maybe_blob_bound", occurrences: 4, decisions: &["launch-funnel-blob-path"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "memcpy_dtoh_auto", occurrences: 1, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "memcpy_htod_auto", occurrences: 1, decisions: &["memcpy-htod-auto"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "mmq_screen_weight", occurrences: 2, decisions: &["mmq-screen-skipped-under-capture"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "prepare_mq4v2_fp8_x", occurrences: 6, decisions: &["eager-only-refusals", "scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "refuse_vmm_prefix_op_while_armed", occurrences: 4, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/dispatch.rs", function: "refuse_qsa_gather_growth_while_armed", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "<item>", occurrences: 2, decisions: &["flash-attn-ck-prefill"] },
-    Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "select_packed_prefill_capabilities", occurrences: 2, decisions: &["flash-attn-ck-prefill"] },
-    Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "try_flash_attn_ck_q8_d256_prefill", occurrences: 6, decisions: &["flash-attn-ck-prefill"] },
-    Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "try_flash_attn_ck_transformed_prefill_impl", occurrences: 6, decisions: &["flash-attn-ck-prefill"] },
-    Site { file: "rdna-compute/src/fn_gdn_dense.rs", function: "applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "fp8_f2_row_active", occurrences: 2, decisions: &["gfx1201-fp8-f2-row-route"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "fp8_f2_row_launch", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "pad_f32_batch_to_128", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_hfq4g256", occurrences: 2, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_hfq4g256_mmq_gfx906_prequant", occurrences: 2, decisions: &["gfx906-mmq-debug-assert"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2", occurrences: 4, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_hfq6g256", occurrences: 1, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_mq2g256v2_wmma_gfx11", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_gate_up_mq4g256v2_wmma", occurrences: 6, decisions: &["gfx11-mqv2-prefill-projection-routes", "gfx1100-mq4v2-verify-tier"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256", occurrences: 2, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256_mmq_set_gfx906", occurrences: 2, decisions: &["gfx906-mmq-debug-assert"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256_residual", occurrences: 3, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2", occurrences: 4, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq6g256_batched_lmhead", occurrences: 1, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_hfq6g256_residual", occurrences: 1, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq2g256v2_residual_wmma_gfx11", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq4g256v2_mmq_prequant_iu4", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq4g256v2_residual_wmma", occurrences: 5, decisions: &["gfx11-mqv2-prefill-projection-routes", "gfx1100-mq4v2-verify-tier"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq4g256", occurrences: 2, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq4g256_mmq_gfx906", occurrences: 2, decisions: &["gfx906-mmq-debug-assert"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2", occurrences: 6, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_hfq6g256", occurrences: 1, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_mq2g256v2_wmma_gfx11", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_mq2g256v2_wmma_gfx12", occurrences: 2, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_mq4g256v2_wmma", occurrences: 4, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_mq5g256v2_wmma_gfx12", occurrences: 2, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkv_mq6g256v2_wmma_gfx12", occurrences: 2, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_hfq4g256", occurrences: 3, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2", occurrences: 4, decisions: &["gfx12-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_hfq6g256", occurrences: 1, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_mq2g256v2_wmma_gfx11", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_qkvza_mq4g256v2_wmma", occurrences: 4, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "iu4_v2_tile", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "rocblas_gemm_mfp4e8_soa_prefill_auto", occurrences: 1, decisions: &["gfx906-cdna3-prefill-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "try_gemm_gate_up_mqv2_gfx11_reuse", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "try_gemm_mqv2_residual_gfx11_reuse", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "try_gemm_qkv_mqv2_gfx11_reuse", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "try_gemm_qkvza_mqv2_gfx11_reuse", occurrences: 2, decisions: &["gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm_fp8_verify.rs", function: "fp8_verify_pack_x", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/gemm_vt.rs", function: "gfx12_verify_bt_active", occurrences: 2, decisions: &["gfx12-mq4v2-verify-tile-route"] },
-    Site { file: "rdna-compute/src/gemma4_ext.rs", function: "attention_flash_asym3_hd512", occurrences: 2, decisions: &["asym-attention-tile-grid-capture-only"] },
-    Site { file: "rdna-compute/src/gemma4_ext.rs", function: "attention_flash_fwht3_hd512", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "fused_rmsnorm_rotate_mq_fp8_gfx12_batched", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "fused_silu_rotate_mq_fp8_gfx12_batched_impl", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "gated_norm_rotate_mq_fp8_gfx12_batched", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "rotate_quantize_x_mq8", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "rotate_x_mq_128", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "rotate_x_mq_awq", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "rotate_x_mq_awq_batched", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "rotate_x_mq_dual_fp8", occurrences: 3, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/gemv.rs", function: "rotate_x_mq_fp8_gfx12_batched", occurrences: 2, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "<item>", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "abort_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "begin_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "begin_graph_capture_relaxed", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "begin_replay_graph_capture", occurrences: 5, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "begin_verify_graph_capture", occurrences: 5, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "end_graph_capture", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "end_graph_capture_segment", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "end_replay_graph_capture", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "end_verify_graph_capture", occurrences: 2, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "holds_captured_graph_state", occurrences: 3, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "replay_graph_destroy_all", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/graph.rs", function: "verify_graph_destroy_all", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
-    Site { file: "rdna-compute/src/lane_rows_pm.rs", function: "lane_rows_pm_enabled", occurrences: 2, decisions: &["qwen4-lane-rows-pm"] },
-    Site { file: "rdna-compute/src/mq_f16_producers.rs", function: "gemm_gate_up_mq4g256v2_wmma_f16", occurrences: 2, decisions: &["gfx1100-mq4v2-verify-tier"] },
-    Site { file: "rdna-compute/src/packed_mq4.rs", function: "packed_mq4_admitted", occurrences: 2, decisions: &["packed-mq4-prefill"] },
-    Site { file: "rdna-compute/src/replay.rs", function: "begin_g0_observation", occurrences: 1, decisions: &["g0-observation"] },
-    Site { file: "rdna-compute/src/replay.rs", function: "retained_body_active", occurrences: 1, decisions: &["replay-recorder-lifecycle"] },
-    Site { file: "rdna-compute/src/replay.rs", function: "record_hip_launch_typed_bound", occurrences: 1, decisions: &["launch-funnel-blob-path"] },
-    Site { file: "rdna-compute/src/replay.rs", function: "record_hip_launch_with_accesses", occurrences: 1, decisions: &["launch-funnel-blob-path"] },
-    Site { file: "rdna-compute/src/replay.rs", function: "should_auto_finalize_capture", occurrences: 1, decisions: &["replay-recorder-lifecycle"] },
-    Site { file: "rdna-compute/src/rows_batched.rs", function: "stage_rows_table", occurrences: 1, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "convert_fp16_x_uncached", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "ensure_fp16_x", occurrences: 4, decisions: &["fp16-fp8-x-conversion-cache"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "ensure_fp8_x", occurrences: 4, decisions: &["fp16-fp8-x-conversion-cache"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "ensure_int4_mmq_x", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "ensure_int8_mmq_x", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "ensure_q8_1_mmq_x", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "ensure_q8_1_mmq_x128", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "launch_maybe_blob", occurrences: 5, decisions: &["launch-funnel-blob-path"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "pack_fp8_verify_rows", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "prepare_mq4v2_fp8_x", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "prepare_mq4v2_fp8_x_f32", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "prepare_mq4v2_fp8_x_impl", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_quantize_x_mq8", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_x_mq", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_x_mq_128", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_x_mq_awq", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_x_mq_awq_batched", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_x_mq_batched", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "rotate_x_mq_dual_fp8", occurrences: 2, decisions: &["scratch-launch-plumbing"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "scratch_growth_invalidates", occurrences: 2, decisions: &["capture-safe-invalidation"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "scratch_must_convert", occurrences: 4, decisions: &["fp16-fp8-x-conversion-cache"] },
-    Site { file: "rdna-compute/src/scratch.rs", function: "use_blob_path", occurrences: 4, decisions: &["launch-funnel-blob-path"] },
-    Site { file: "rdna-compute/src/select_regrid.rs", function: "select_regrid_enabled", occurrences: 1, decisions: &["select-regrid-row-selectors"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "gated_delta_chunk_route", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_attention_batch_impl", occurrences: 2, decisions: &["qwen4-indexed-attention-lds-bound"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_batch_impl", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_fused", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_batch_pm_arm", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_dense_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
-    Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_gathered_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
-    Site { file: "rdna-compute/src/verify_twins.rs", function: "stage_attention_fp8_e4m3_kv_batched_segs", occurrences: 1, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_f16_windowed", occurrences: 2, decisions: &["attention-tile-grid-superset"] },
-    Site { file: "rdna-compute/src/dflash_gdn_replay.rs", function: "gdn_replay_ml_eligible", occurrences: 1, decisions: &["dflash-gdn-replay-multilayer"] },
-    Site { file: "rdna-compute/src/dflash_gdn_replay.rs", function: "dflash_gdn_replay_scratch_order", occurrences: 3, decisions: &["eager-only-refusals"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq6g256v2_hcw_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_bf16_xf16_f16_wmma", occurrences: 4, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "hc_down_tile_selected", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq4g256v2_xf16_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "qwen4_trunk_iu4_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/hc_row_fold.rs", function: "hc_row_fold_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/moe.rs", function: "moe_router_softmax_top10_f32", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq6g256v2_xf16_applies", occurrences: 2, decisions: &["gfx12-mqv2-prefill-projection-routes", "gfx11-mqv2-prefill-projection-routes"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "qwen4_bf16_streams", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
-    Site { file: "rdna-compute/src/gemm.rs", function: "qwen4_f16_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
-    Site { file: "saddle-core/src/kv.rs", function: "grow_vmm_tensors", occurrences: 1, decisions: &["eager-only-refusals"] },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "attention_block_batched_mixed",
+        occurrences: 16,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "attention_block_batched_swa_only",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "compressor_forward_impl",
+        occurrences: 1,
+        decisions: &["ds4-gfx942-compressor-sentinel-gate"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "decode_step_heterogeneous",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "decode_step_with_graph",
+        occurrences: 2,
+        decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "ds4_moe_block_core",
+        occurrences: 2,
+        decisions: &["ds4-gfx942-ffn-overlap", "replay-enabled-process-route"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "dspark_requires_typed_device_copy",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "forward_prefill_batch_chunk_impl",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/spec_impl.rs",
+        function: "dspark_verify_forward",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body", "graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/spec_impl.rs",
+        function: "redline_dspark_verify_direct",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/spec_impl.rs",
+        function: "redline_dspark_verify_pm4",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/lowered.rs",
+        function: "forward_prefill_batch_v2",
+        occurrences: 6,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/lowered.rs",
+        function: "forward_scratch",
+        occurrences: 3,
+        decisions: &["graph-capture-lifecycle", "replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/lowered.rs",
+        function: "full_layer_decode_impl",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/lowered.rs",
+        function: "run_attend",
+        occurrences: 4,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/lowered.rs",
+        function: "sliding_layer_decode_impl",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-lfm2moe/src/forward.rs",
+        function: "decode_step",
+        occurrences: 1,
+        decisions: &["replay-enabled-process-route"],
+    },
+    Site {
+        file: "hipfire-arch-lfm2moe/src/forward.rs",
+        function: "decode_step_with_retained_replay",
+        occurrences: 3,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-llama/src/arch.rs",
+        function: "forward_scratch_layers",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen2/src/qwen2.rs",
+        function: "attend_plan",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_cb.rs",
+        function: "dflash_cb_verify",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "abort_mtp_proposal_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "begin_mtp_proposal_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "end_mtp_proposal_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/ep_batch.rs",
+        function: "forward_scratch_layers_multi",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "dense_tp_abort_captures",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "dense_tp_drop_graphs",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "forward_scratch",
+        occurrences: 2,
+        decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "forward_scratch_dense_tp",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "kv_cache_attention_dispatch",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "execute_fa_attend_step",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "fa_pair_merge_admitted",
+        occurrences: 4,
+        decisions: &["gfx1151-fa-pair-merge"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_batch_chunk_impl",
+        occurrences: 5,
+        decisions: &[
+            "q8-multirow-verify-attention",
+            "captured-batch-attention-physical-cap",
+            "captured-verify-attention-physical-cap",
+            "gdn-chunk-scan",
+        ],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_prefill_batch_with_pbs_opts_inner",
+        occurrences: 4,
+        decisions: &["widened-prefill-batching", "gfx1151-fa-pair-merge"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_prefill_chunk_pair",
+        occurrences: 2,
+        decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "mq_f16_projection_fast_route",
+        occurrences: 2,
+        decisions: &["gfx1100-f16-projection-fast-route"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "q8_multirow_attn_admitted",
+        occurrences: 4,
+        decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs",
+        function: "attn_fp8_twin_eligible",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs",
+        function: "forward_prefill_batch_multi",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/arch.rs",
+        function: "load_weights",
+        occurrences: 1,
+        decisions: &["replay-enabled-process-route"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "replay_gdn",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "rides_ordinary_prefill",
+        occurrences: 2,
+        decisions: &["widened-prefill-batching", "gdn-chunk-scan"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "verify_dflash_block_inner_body",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "forward_chunk_scoped",
+        occurrences: 8,
+        decisions: &[
+            "replay-recorder-lifecycle",
+            "qwen4-g2-expert-stage",
+            "qwen4-prefill-token-id-reuse",
+            "qwen4-ple-async-upload",
+        ],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
+        function: "forward_lanes_scoped",
+        occurrences: 1,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/ple_stage.rs",
+        function: "ple_async_upload",
+        occurrences: 2,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/mtp_gpu.rs",
+        function: "ensure_mapped_capacity",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/state.rs",
+        function: "ensure_mapped_capacity",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-daemon/src/main.rs",
+        function: "main",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-dispatch-tests/src/llama.rs",
+        function: "tier_inputs_base",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "bf16_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "derive",
+        occurrences: 5,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "fp8_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "q8_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "hyper_read_pairs_write",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "execute_grouped_depthwise",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mod.rs",
+        function: "dump_hidden_localize",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "absorbs_clear",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/sealed_moe.rs",
+        function: "validate_for_gpu",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_bench_decode_deepseek4",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_bench_decode_lfm2moe",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_greedy_trace",
+        occurrences: 2,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_qwen4_replay_failure",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_run_dspark_direct_arm",
+        occurrences: 2,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_shadow_dspark_verify_pm4",
+        occurrences: 12,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_shadow_qwen4",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "abort_draft_ffn_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "begin_draft_ffn_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "draft_ffn_layer",
+        occurrences: 3,
+        decisions: &["dflash-draft-graph-safe-body"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "end_draft_ffn_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/llama.rs",
+        function: "forward_prefill_chunk",
+        occurrences: 3,
+        decisions: &[
+            "captured-batch-attention-physical-cap",
+            "kv-tier-capture-forces-flash",
+        ],
+    },
+    Site {
+        file: "hipfire-runtime/src/llama.rs",
+        function: "tier_inputs",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu.rs",
+        function: "barrier_rank_streams_reuse",
+        occurrences: 1,
+        decisions: &["tp-graph-capture-barrier"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_fa2_gqa_rotated_k_gfx11",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_asym2",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_asym3_impl",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_asym4",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_bf16_windowed",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fp8_e4m3_tile",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht2",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht3",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht4",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_q8_0_rows_masked",
+        occurrences: 1,
+        decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_q8_0_windowed_impl",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_q8_0_fa2_gqa_gfx11",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_q8_0_flash_prefill_wmma",
+        occurrences: 2,
+        decisions: &["fa2-prefill-attention"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_verify_wmma_with",
+        occurrences: 1,
+        decisions: &["verify-attention-wmma-gqa"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "gfx1100_asym3_q8_pair_enabled",
+        occurrences: 1,
+        decisions: &["gfx1100-asym3-q8-pair-write"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "gfx12_q8_fa2_prefill_admitted",
+        occurrences: 2,
+        decisions: &["fa2-prefill-attention"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "launch_verify_gqa",
+        occurrences: 1,
+        decisions: &["verify-attention-wmma-gqa"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "replay_stable_tile_count",
+        occurrences: 4,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_draft_fusion.rs",
+        function: "draft_collapse_mq4v2_route",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_hidden_scatter.rs",
+        function: "dflash_hidden_commit5_applicable",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_hidden_scatter.rs",
+        function: "dflash_hidden_scatter5_try",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_state_copy.rs",
+        function: "dflash_state_bulk_copy_gfx1100_on_stream",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "a8_prefill_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "convert_fp16_x_uncached",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp16_x",
+        occurrences: 3,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp8_x",
+        occurrences: 3,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_int4_mmq_x",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_int8_mmq_x",
+        occurrences: 1,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_q8_1_mmq_x",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_q8_1_mmq_x128",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "fp8_stream_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "init_with_device",
+        occurrences: 3,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "invalidate_for_kv_mode_switch",
+        occurrences: 2,
+        decisions: &["capture-safe-invalidation"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "invalidate_for_scratch_growth",
+        occurrences: 2,
+        decisions: &["capture-safe-invalidation"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_gfx11_producer_quant_fused_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_producer_quant_fused_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_producer_sidecar_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_silu_quant_fused_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "launch_blob_recorded",
+        occurrences: 3,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "launch_maybe_blob_bound",
+        occurrences: 4,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "memcpy_dtoh_auto",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "memcpy_htod_auto",
+        occurrences: 1,
+        decisions: &["memcpy-htod-auto"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "mmq_screen_weight",
+        occurrences: 2,
+        decisions: &["mmq-screen-skipped-under-capture"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "prepare_mq4v2_fp8_x",
+        occurrences: 6,
+        decisions: &["eager-only-refusals", "scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "refuse_vmm_prefix_op_while_armed",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "refuse_qsa_gather_growth_while_armed",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "<item>",
+        occurrences: 2,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "select_packed_prefill_capabilities",
+        occurrences: 2,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "try_flash_attn_ck_q8_d256_prefill",
+        occurrences: 6,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "try_flash_attn_ck_transformed_prefill_impl",
+        occurrences: 6,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/fn_gdn_dense.rs",
+        function: "applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "fp8_f2_row_active",
+        occurrences: 2,
+        decisions: &["gfx1201-fp8-f2-row-route"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "fp8_f2_row_launch",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "pad_f32_batch_to_128",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256",
+        occurrences: 2,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_mmq_gfx906_prequant",
+        occurrences: 2,
+        decisions: &["gfx906-mmq-debug-assert"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2",
+        occurrences: 4,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq6g256",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_mq2g256v2_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_mq4g256v2_wmma",
+        occurrences: 6,
+        decisions: &[
+            "gfx11-mqv2-prefill-projection-routes",
+            "gfx1100-mq4v2-verify-tier",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256",
+        occurrences: 2,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_mmq_set_gfx906",
+        occurrences: 2,
+        decisions: &["gfx906-mmq-debug-assert"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual",
+        occurrences: 3,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2",
+        occurrences: 4,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq6g256_batched_lmhead",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq6g256_residual",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq2g256v2_residual_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_mmq_prequant_iu4",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_residual_wmma",
+        occurrences: 5,
+        decisions: &[
+            "gfx11-mqv2-prefill-projection-routes",
+            "gfx1100-mq4v2-verify-tier",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256",
+        occurrences: 2,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_mmq_gfx906",
+        occurrences: 2,
+        decisions: &["gfx906-mmq-debug-assert"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2",
+        occurrences: 6,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq6g256",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq2g256v2_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq2g256v2_wmma_gfx12",
+        occurrences: 2,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq4g256v2_wmma",
+        occurrences: 4,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq5g256v2_wmma_gfx12",
+        occurrences: 2,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq6g256v2_wmma_gfx12",
+        occurrences: 2,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256",
+        occurrences: 3,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2",
+        occurrences: 4,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq6g256",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_mq2g256v2_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_mq4g256v2_wmma",
+        occurrences: 4,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "iu4_v2_tile",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "rocblas_gemm_mfp4e8_soa_prefill_auto",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_gate_up_mqv2_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_mqv2_residual_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_qkv_mqv2_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_qkvza_mqv2_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_fp8_verify.rs",
+        function: "fp8_verify_pack_x",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_vt.rs",
+        function: "gfx12_verify_bt_active",
+        occurrences: 2,
+        decisions: &["gfx12-mq4v2-verify-tile-route"],
+    },
+    Site {
+        file: "rdna-compute/src/gemma4_ext.rs",
+        function: "attention_flash_asym3_hd512",
+        occurrences: 2,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/gemma4_ext.rs",
+        function: "attention_flash_fwht3_hd512",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "fused_rmsnorm_rotate_mq_fp8_gfx12_batched",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "fused_silu_rotate_mq_fp8_gfx12_batched_impl",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "gated_norm_rotate_mq_fp8_gfx12_batched",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_quantize_x_mq8",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_128",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_awq",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_awq_batched",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_dual_fp8",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_fp8_gfx12_batched",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "<item>",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "abort_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_graph_capture_relaxed",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_replay_graph_capture",
+        occurrences: 5,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_verify_graph_capture",
+        occurrences: 5,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_graph_capture_segment",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_replay_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_verify_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "holds_captured_graph_state",
+        occurrences: 3,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "replay_graph_destroy_all",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "verify_graph_destroy_all",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/lane_rows_pm.rs",
+        function: "lane_rows_pm_enabled",
+        occurrences: 2,
+        decisions: &["qwen4-lane-rows-pm"],
+    },
+    Site {
+        file: "rdna-compute/src/mq_f16_producers.rs",
+        function: "gemm_gate_up_mq4g256v2_wmma_f16",
+        occurrences: 2,
+        decisions: &["gfx1100-mq4v2-verify-tier"],
+    },
+    Site {
+        file: "rdna-compute/src/packed_mq4.rs",
+        function: "packed_mq4_admitted",
+        occurrences: 2,
+        decisions: &["packed-mq4-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "begin_g0_observation",
+        occurrences: 1,
+        decisions: &["g0-observation"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "retained_body_active",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "record_hip_launch_typed_bound",
+        occurrences: 1,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "record_hip_launch_with_accesses",
+        occurrences: 1,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "should_auto_finalize_capture",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/rows_batched.rs",
+        function: "stage_rows_table",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "convert_fp16_x_uncached",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp16_x",
+        occurrences: 4,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp8_x",
+        occurrences: 4,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_int4_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_int8_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_q8_1_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_q8_1_mmq_x128",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "launch_maybe_blob",
+        occurrences: 5,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "pack_fp8_verify_rows",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "prepare_mq4v2_fp8_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "prepare_mq4v2_fp8_x_f32",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "prepare_mq4v2_fp8_x_impl",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_quantize_x_mq8",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_128",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_awq",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_awq_batched",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_batched",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_dual_fp8",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "scratch_growth_invalidates",
+        occurrences: 2,
+        decisions: &["capture-safe-invalidation"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "scratch_must_convert",
+        occurrences: 4,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "use_blob_path",
+        occurrences: 4,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/select_regrid.rs",
+        function: "select_regrid_enabled",
+        occurrences: 1,
+        decisions: &["select-regrid-row-selectors"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "gated_delta_chunk_route",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_attention_batch_impl",
+        occurrences: 2,
+        decisions: &["qwen4-indexed-attention-lds-bound"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_batch_impl",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_fused",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_batch_pm_arm",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_dense_wmma_applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_gathered_wmma_applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/verify_twins.rs",
+        function: "stage_attention_fp8_e4m3_kv_batched_segs",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_f16_windowed",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_gdn_replay.rs",
+        function: "gdn_replay_ml_eligible",
+        occurrences: 1,
+        decisions: &["dflash-gdn-replay-multilayer"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_gdn_replay.rs",
+        function: "dflash_gdn_replay_scratch_order",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq6g256v2_hcw_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_bf16_xf16_f16_wmma",
+        occurrences: 4,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "hc_down_tile_selected",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_xf16_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_trunk_iu4_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/hc_row_fold.rs",
+        function: "hc_row_fold_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_router_softmax_top10_f32",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq6g256v2_xf16_applies",
+        occurrences: 2,
+        decisions: &[
+            "gfx12-mqv2-prefill-projection-routes",
+            "gfx11-mqv2-prefill-projection-routes",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_bf16_streams",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_f16_wmma_applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "saddle-core/src/kv.rs",
+        function: "grow_vmm_tensors",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
 ];
 
 // Line numbers at `7454b5f64` (railgun/m2).
@@ -1430,7 +2818,11 @@ mod tests {
     fn every_recording_predicate_in_the_tree_has_an_inventory_row() {
         let scanned = scan_sources(&crates_dir()).unwrap();
         let problems = check(&scanned);
-        assert!(problems.is_empty(), "recording inventory out of date:\n{}", problems.join("\n"));
+        assert!(
+            problems.is_empty(),
+            "recording inventory out of date:\n{}",
+            problems.join("\n")
+        );
     }
 
     #[test]
@@ -1438,28 +2830,55 @@ mod tests {
         let mut ids = std::collections::BTreeSet::new();
         for d in DECISIONS {
             assert!(ids.insert(d.id), "duplicate decision {}", d.id);
-            assert!(SITES.iter().any(|s| s.decisions.contains(&d.id)), "decision {} has no site", d.id);
+            assert!(
+                SITES.iter().any(|s| s.decisions.contains(&d.id)),
+                "decision {} has no site",
+                d.id
+            );
             assert!(!d.evidence.is_empty(), "decision {} has no evidence", d.id);
             match d.verdict {
                 // An invariant decision by definition changes nothing a
                 // program could observe, so it cannot reach one.
-                Verdict::Invariant => assert!(d.reaches.is_empty(), "invariant {} reaches a program", d.id),
+                Verdict::Invariant => {
+                    assert!(d.reaches.is_empty(), "invariant {} reaches a program", d.id)
+                }
                 Verdict::ByteExact | Verdict::NotEquivalent => {
-                    assert!(matches!(d.effect, Effect::KernelSelection | Effect::LaunchShape), "{} verdict needs a selection/shape effect", d.id)
+                    assert!(
+                        matches!(d.effect, Effect::KernelSelection | Effect::LaunchShape),
+                        "{} verdict needs a selection/shape effect",
+                        d.id
+                    )
                 }
             }
         }
         for s in SITES {
             assert!(!s.decisions.is_empty());
             for id in s.decisions {
-                assert!(decision(id).is_some(), "{}::{} names unknown decision {id}", s.file, s.function);
+                assert!(
+                    decision(id).is_some(),
+                    "{}::{} names unknown decision {id}",
+                    s.file,
+                    s.function
+                );
             }
         }
         let mut launch_ids = std::collections::BTreeSet::new();
         for l in PRE_PROGRAM_LAUNCHES {
-            assert!(launch_ids.insert(l.id), "duplicate pre-program launch {}", l.id);
-            assert!(l.per_forward > 0 && !l.programs.is_empty(), "{} declares no launch", l.id);
-            assert!(!l.site.is_empty() && !l.evidence.is_empty(), "{} has no site or evidence", l.id);
+            assert!(
+                launch_ids.insert(l.id),
+                "duplicate pre-program launch {}",
+                l.id
+            );
+            assert!(
+                l.per_forward > 0 && !l.programs.is_empty(),
+                "{} declares no launch",
+                l.id
+            );
+            assert!(
+                !l.site.is_empty() && !l.evidence.is_empty(),
+                "{} has no site or evidence",
+                l.id
+            );
         }
     }
 

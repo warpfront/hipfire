@@ -3748,8 +3748,7 @@ impl ConfigLayer {
     }
 
     pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
-        let key =
-            canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
+        let key = canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
         Ok(self.values.remove(&key))
     }
 
@@ -6035,7 +6034,13 @@ mod tests {
             let err = ConfigLayer::default()
                 .set_cli("kernel.mw16", "true")
                 .unwrap_err();
-            assert!(matches!(err, ConfigError::RetiredKey { key: "kernel.mw16", .. }));
+            assert!(matches!(
+                err,
+                ConfigError::RetiredKey {
+                    key: "kernel.mw16",
+                    ..
+                }
+            ));
             assert!(err.to_string().contains("removed in 0.4.1"), "{err}");
             assert!(matches!(
                 ConfigLayer::default().set_cli("mw16", "true"),
