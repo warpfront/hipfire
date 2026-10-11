@@ -7763,6 +7763,26 @@ pub const ATTENTION_FA2_GQA_FWHT4K_LLOYD4V_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
 
+/// gfx1151 twin of [`ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC`]: the Q16 /
+/// warp-specialized fill / CU-mode build of
+/// [`ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC`] with fwht4 K fill helpers
+/// (`attention_q8_0_fa2_gqa_fwht4k_gfx1151`, preconvert
+/// `attention_fa2_q_preconvert_fwht4_gfx1151`).
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 4\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1151.hip")
+);
+
+/// gfx1151 twin with fwht4 K and lloyd4 V fill helpers
+/// (`attention_fa2_gqa_fwht4k_lloyd4v_gfx1151`, output un-rotated by
+/// `attention_fa2_out_inverse_fwht4_gfx1151`).
+pub const ATTENTION_FA2_GQA_FWHT4K_LLOYD4V_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 4\n#define HIPFIRE_FA2_VMODE 4\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1151.hip")
+);
+
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
 /// softmax state `[m,l,O_unnormalized]` per query/head instead of normalized O.

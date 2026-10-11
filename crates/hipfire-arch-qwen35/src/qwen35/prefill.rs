@@ -2167,6 +2167,24 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
     }
     Ok(())
 }
+
+/// KV tiers of the whole-chunk gfx11 FA2 prefill (`kernel.gfx11_q8_fa2_wide`):
+/// Q8/Q8 on the VMM backend (gfx1100, gfx1151), and fwht4 K with lloyd4 or
+/// Q8 V on exact gfx1151, whose FA2 body is the gfx1151 twin (legacy KV:
+/// fwht4 has no VMM path; the capacity checks at each ingress bound the
+/// prefix by the buffer).
+fn fa2_wide_kv_tier(gpu: &Gpu, kv_cache: &llama::KvCache) -> bool {
+    let v_mode_bits = kv_cache.tier_inputs().v_mode_bits;
+    (matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+        && kv_cache.quant_q8
+        && !kv_cache.quant_fp8
+        && v_mode_bits == 8
+        && kv_cache.uses_vmm_backend())
+        || (gpu.arch == "gfx1151"
+            && kv_cache.quant_asym4
+            && kv_cache.quant_fwht
+            && matches!(v_mode_bits, 4 | 8))
+}
 ///
 /// Per-device capacity admission: largest performance-admitted rung
 /// `<= perf_rows` whose projected PBS bytes, projection-prelude deficit,
@@ -2207,11 +2225,7 @@ fn memory_admitted_rung(
     // incumbent 512-row Q16 scratch. Charge each candidate rung separately.
     let wide_q16_selectable = gpu.flags.gfx11_q8_fa2_wide
         && gpu.flags.gfx11_fa2_prefill
-        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
-        && kv_cache.uses_vmm_backend()
-        && kv_cache.quant_q8
-        && !kv_cache.quant_fp8
-        && kv_cache.tier_inputs().v_mode_bits == 8
+        && fa2_wide_kv_tier(gpu, kv_cache)
         && config.n_heads == 24
         && config.n_kv_heads == 4
         && config.head_dim == 256;
@@ -9457,16 +9471,13 @@ fn batch_chunk_fa_attend(
             )?;
             return Ok(());
         }
-        // Whole-chunk Q8/Q8 writes all positions before one causal FA2
-        // launch. Keep all exceptions on the unchanged segmented path: an
-        // alternate backend or variant cannot safely receive B>512 here.
-        let q8_wide_runs = gpu.flags.gfx11_q8_fa2_wide
+        // Whole-chunk Q8/Q8 (or gfx1151 fwht4, see fa2_wide_kv_tier) writes
+        // all positions before one causal FA2 launch. Keep all exceptions on
+        // the unchanged segmented path: an alternate backend or variant
+        // cannot safely receive B>512 here.
+        let wide_runs = gpu.flags.gfx11_q8_fa2_wide
             && gpu.flags.gfx11_fa2_prefill
-            && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
-            && kv_cache.quant_q8
-            && !kv_cache.quant_fp8
-            && kv_cache.tier_inputs().v_mode_bits == 8
-            && kv_cache.uses_vmm_backend()
+            && fa2_wide_kv_tier(gpu, kv_cache)
             && !gpu.flash_attn_ck_loaded()
             && !matches!(
                 hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
@@ -9491,7 +9502,7 @@ fn batch_chunk_fa_attend(
             && start_pos.checked_add(n) == Some(max_ctx_len)
             && max_ctx_len <= kv_cache.physical_cap
             && tree_verify.is_none();
-        if q8_wide_runs {
+        if wide_runs {
             execute_fa_attend_step(
                 gpu,
                 config,
@@ -13672,8 +13683,12 @@ pub(crate) fn forward_batch_chunk_impl(
         // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
         && (gpu.flags.iu4_prefill_enabled()
             || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
-        // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its supported Q8 KV tier.
-        && (kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8))
+        // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its Q8 and
+        // fwht4 KV tiers (the scan reads no KV; the tier only names the
+        // configurations whose prefill was measured with it).
+        && (kv_cache.quant_fp8
+            || (gpu.arch != "gfx1201"
+                && (kv_cache.quant_q8 || (kv_cache.quant_asym4 && kv_cache.quant_fwht))))
         && dn_state.quant == StateQuant::Q8
         && !dn_state.s_matrices.is_empty()
         && dn_state.s_matrices.len() == dn_state.s_scales.len()

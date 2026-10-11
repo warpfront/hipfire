@@ -433,6 +433,21 @@ fn fwht4_attn_gqa_gfx1151_admitted(
 /// Grid-y cap of the fwht4 GQA tiles (same reason as [`DecodeGqaPair`]).
 const FWHT4_GQA_GRID_Y_CAP: usize = 512;
 
+/// One rotated-K gfx11 FA2 prefill module: body symbol (= module key) and
+/// source, its rotating Q pre-convert, the optional in-place inverse
+/// FWHT-256 of a lloyd-V module, the sign-table width it reads, and query
+/// rows per workgroup (8: gfx11 body, 128 threads; 16: gfx1151 twin, 256).
+struct RotatedKFa2 {
+    module: &'static str,
+    src: &'static str,
+    preconvert: &'static str,
+    inverse: Option<&'static str>,
+    min_signs: usize,
+    q_rows: usize,
+    /// Admits the whole-chunk batches of `kernel.gfx11_q8_fa2_wide` (<= 8192).
+    wide: bool,
+}
+
 /// Kernel pair of a GQA-shared decode attention route: a 13-arg tile with one
 /// 256-thread workgroup per (kv head, tile) and a 7-arg head-dim-split reduce.
 struct DecodeGqaPair {
@@ -7664,11 +7679,15 @@ impl Gpu {
         // function cache is keyed by symbol, and the Q8 module's KMODE=0
         // build compiles the rotation out.
         self.attention_fa2_gqa_rotated_k_gfx11(
-            "attention_q8_0_fa2_gqa_fwht3k_gfx11",
-            kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC,
-            "attention_fa2_q_preconvert_fwht3_gfx11",
-            false,
-            256,
+            &RotatedKFa2 {
+                module: "attention_q8_0_fa2_gqa_fwht3k_gfx11",
+                src: kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC,
+                preconvert: "attention_fa2_q_preconvert_fwht3_gfx11",
+                inverse: None,
+                min_signs: 256,
+                q_rows: 8,
+                wide: false,
+            },
             q,
             k_cache,
             v_cache,
@@ -7686,10 +7705,12 @@ impl Gpu {
 
     /// gfx11 FA2 prefill with fwht4 K (`HIPFIRE_FA2_KMODE=4`): same contract
     /// as [`Self::attention_q8_0_fa2_gqa_fwht3k_gfx11`] (pre-rotated f16 Q
-    /// scratch, 8-position/128-thread body), Q rotated per 128-dim half like
-    /// the fwht4 K write. `v_mode_bits` 8 = Q8_0 V; 4 = lloyd4 V, whose
-    /// rotated output is un-rotated in place by
-    /// `attention_fa2_out_inverse_fwht4_gfx11` after the body.
+    /// scratch), Q rotated per 128-dim half like the fwht4 K write.
+    /// `v_mode_bits` 8 = Q8_0 V; 4 = lloyd4 V, whose rotated output is
+    /// un-rotated in place after the body. On exact gfx1151 the body is the
+    /// Q8 twin's (16 positions, warp-specialized fill, CU mode) with fwht4
+    /// fill helpers, under the Q8 route's opt-outs (`HIPFIRE_FA2_FILL=0`,
+    /// `HIPFIRE_GFX1151_FA2_TWIN=0` select the 8-position gfx11 body).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_fa2_gqa_fwht4k_gfx11(
         &mut self,
@@ -7707,17 +7728,46 @@ impl Gpu {
         batch_size: usize,
         v_mode_bits: i32,
     ) -> HipResult<()> {
-        let (module, src, inverse_v) = match v_mode_bits {
-            V_MODE_Q8 => (
-                "attention_q8_0_fa2_gqa_fwht4k_gfx11",
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC,
-                false,
-            ),
-            4 => (
-                "attention_fa2_gqa_fwht4k_lloyd4v_gfx11",
-                kernels::ATTENTION_FA2_GQA_FWHT4K_LLOYD4V_GFX11_SRC,
-                true,
-            ),
+        let twin = self.arch == "gfx1151"
+            && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true)
+            && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
+        let m = match (v_mode_bits, twin) {
+            (V_MODE_Q8, false) => RotatedKFa2 {
+                module: "attention_q8_0_fa2_gqa_fwht4k_gfx11",
+                src: kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC,
+                preconvert: "attention_fa2_q_preconvert_fwht4_gfx11",
+                inverse: None,
+                min_signs: 128,
+                q_rows: 8,
+                wide: true,
+            },
+            (4, false) => RotatedKFa2 {
+                module: "attention_fa2_gqa_fwht4k_lloyd4v_gfx11",
+                src: kernels::ATTENTION_FA2_GQA_FWHT4K_LLOYD4V_GFX11_SRC,
+                preconvert: "attention_fa2_q_preconvert_fwht4_gfx11",
+                inverse: Some("attention_fa2_out_inverse_fwht4_gfx11"),
+                min_signs: 256,
+                q_rows: 8,
+                wide: true,
+            },
+            (V_MODE_Q8, true) => RotatedKFa2 {
+                module: "attention_q8_0_fa2_gqa_fwht4k_gfx1151",
+                src: kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX1151_SRC,
+                preconvert: "attention_fa2_q_preconvert_fwht4_gfx1151",
+                inverse: None,
+                min_signs: 128,
+                q_rows: 16,
+                wide: true,
+            },
+            (4, true) => RotatedKFa2 {
+                module: "attention_fa2_gqa_fwht4k_lloyd4v_gfx1151",
+                src: kernels::ATTENTION_FA2_GQA_FWHT4K_LLOYD4V_GFX1151_SRC,
+                preconvert: "attention_fa2_q_preconvert_fwht4_gfx1151",
+                inverse: Some("attention_fa2_out_inverse_fwht4_gfx1151"),
+                min_signs: 256,
+                q_rows: 16,
+                wide: true,
+            },
             _ => {
                 return Err(hip_bridge::HipError::new(
                     0,
@@ -7728,13 +7778,7 @@ impl Gpu {
             }
         };
         self.attention_fa2_gqa_rotated_k_gfx11(
-            module,
-            src,
-            "attention_fa2_q_preconvert_fwht4_gfx11",
-            inverse_v,
-            // fwht4 K rotates per 128-dim half; only lloyd V's inverse
-            // FWHT-256 needs the 256-wide tables.
-            if inverse_v { 256 } else { 128 },
+            &m,
             q,
             k_cache,
             v_cache,
@@ -7750,18 +7794,11 @@ impl Gpu {
         )
     }
 
-    /// Shared launcher of the rotated-K gfx11 FA2 modules (fwht3, fwht4):
-    /// `module` is both the module key and the body symbol, `preconvert` the
-    /// module's rotating Q pre-convert symbol; `inverse_v` follows the body
-    /// with the in-place inverse FWHT-256 of a lloyd-V module.
+    /// Shared launcher of the rotated-K gfx11 FA2 modules (fwht3, fwht4).
     #[allow(clippy::too_many_arguments)]
     fn attention_fa2_gqa_rotated_k_gfx11(
         &mut self,
-        module: &'static str,
-        module_src: &'static str,
-        preconvert: &'static str,
-        inverse_v: bool,
-        min_signs: usize,
+        m: &RotatedKFa2,
         q: &GpuTensor,
         k_cache: &GpuTensor,
         v_cache: &GpuTensor,
@@ -7775,6 +7812,8 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let module = m.module;
+        let min_signs = m.min_signs;
         self.bind_thread()?;
         if !matches!(
             self.arch.as_str(),
@@ -7797,10 +7836,18 @@ impl Gpu {
         // F2 production envelope: exact gfx1151 allows N1024 on the direct
         // launcher (F1-oracle-proven bit-exact vs two N512 halves); the F2
         // pair path reaches this kernel through the widened dispatch arm.
-        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+        // The fwht4 modules also take the
+        // whole-chunk route's batches (`kernel.gfx11_q8_fa2_wide`, <= 8192),
+        // like the Q8 launcher.
+        let narrow_max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
             1024
         } else {
             512
+        };
+        let max_fa2_batch = if m.wide && self.flags.gfx11_q8_fa2_wide {
+            8192
+        } else {
+            narrow_max_fa2_batch
         };
         if batch_size == 0 || batch_size > max_fa2_batch {
             return Err(hip_bridge::HipError::new(
@@ -7843,16 +7890,31 @@ impl Gpu {
         // F4b: the body takes pre-rotated + pre-converted f16 Q (same kernarg
         // list as the Q8 entry — no signs); the rotation lives in the
         // module's own pre-convert symbol.
-        if !self.functions.contains_key(module) || !self.functions.contains_key(preconvert) {
-            let src = format!("#define HIPFIRE_FA2_KT 32\n{module_src}");
+        if !self.functions.contains_key(module) || !self.functions.contains_key(m.preconvert) {
+            let src = format!("#define HIPFIRE_FA2_KT 32\n{}", m.src);
             self.ensure_kernel(module, &src, module)?;
-            self.ensure_kernel(module, &src, preconvert)?;
-            if inverse_v {
-                self.ensure_kernel(module, &src, "attention_fa2_out_inverse_fwht4_gfx11")?;
+            self.ensure_kernel(module, &src, m.preconvert)?;
+            if let Some(inverse) = m.inverse {
+                self.ensure_kernel(module, &src, inverse)?;
             }
         }
         // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Wide-only batches must find their scratch pre-grown under graph
+        // capture / recording (as in the Q8 launcher).
+        if batch_size > narrow_max_fa2_batch
+            && (self.graphs.capture_mode || self.replay.is_recording())
+            && crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                need_q16_bytes,
+            )
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "wide gfx11 FA2 Q16 scratch must be grown before graph capture/recording",
+            ));
+        }
         // Same pre-growth invalidation contract as above.
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_q16_scratch_bytes,
@@ -7864,7 +7926,7 @@ impl Gpu {
         let q16_ptr = self
             .scratch
             .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = batch_size.div_ceil(m.q_rows) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -7905,7 +7967,7 @@ impl Gpu {
         // is the shared Q8 pack (q16 reuses the old f32 Q slot: offset 0,
         // same size); the signs travel only to the pre-convert launch.
         self.launch_fa2_q_preconvert_gfx11(
-            preconvert,
+            m.preconvert,
             q.buf.as_ptr(),
             q16_ptr,
             signs1.buf.as_ptr(),
@@ -7916,7 +7978,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [if m.q_rows == 16 { 256 } else { 128 }, 1, 1],
             32768,
             &mut params,
             || {
@@ -7925,8 +7987,8 @@ impl Gpu {
                 )
             },
         );
-        let result = match result {
-            Ok(()) if inverse_v => {
+        let result = match (result, m.inverse) {
+            (Ok(()), Some(inverse)) => {
                 let s1_ptr = signs1.buf.as_ptr();
                 let s2_ptr = signs2.buf.as_ptr();
                 let mut inv_params: Vec<*mut c_void> = vec![
@@ -7936,7 +7998,7 @@ impl Gpu {
                     &bs as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
-                    "attention_fa2_out_inverse_fwht4_gfx11",
+                    inverse,
                     [(batch_size * n_heads).div_ceil(4) as u32, 1, 1],
                     [128, 1, 1],
                     0,
@@ -7951,7 +8013,7 @@ impl Gpu {
                     },
                 )
             }
-            r => r,
+            (r, _) => r,
         };
         if let Some(t) = timer {
             t.finish(&self.hip);

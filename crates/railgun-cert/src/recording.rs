@@ -682,7 +682,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "eager-only-refusals",
         predicates: &[IsRecording, CaptureMode, ReplayEnabled, GraphSlotCapturing],
-        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199)",
+        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908, and the same guard in the rotated-K fwht4 launcher attention_fa2_gqa_rotated_k_gfx11), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199)",
         effect: Refusal,
         switches: "error before any launch; the admission predicate that routes to the eager-only entry is inventoried at the caller",
         kernels: &[],
@@ -1222,6 +1222,7 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-runtime/src/llama.rs", function: "forward_prefill_chunk", occurrences: 3, decisions: &["captured-batch-attention-physical-cap", "kv-tier-capture-forces-flash"] },
     Site { file: "hipfire-runtime/src/llama.rs", function: "tier_inputs", occurrences: 1, decisions: &["kv-tier-capture-forces-flash"] },
     Site { file: "hipfire-runtime/src/multi_gpu.rs", function: "barrier_rank_streams_reuse", occurrences: 1, decisions: &["tp-graph-capture-barrier"] },
+    Site { file: "rdna-compute/src/attention.rs", function: "attention_fa2_gqa_rotated_k_gfx11", occurrences: 2, decisions: &["eager-only-refusals"] },
     Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_asym2", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },
     Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_asym3_impl", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },
     Site { file: "rdna-compute/src/attention.rs", function: "attention_flash_asym4", occurrences: 1, decisions: &["asym-attention-tile-grid-capture-only"] },

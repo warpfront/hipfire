@@ -1707,13 +1707,21 @@ fn dispatch_attend(
                 // gfx1151 FA2 prefill with fwht4 K (Q8_0 or lloyd4 V; default
                 // on, `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). Same admission
                 // as the fwht3 gfx11 arm below the asym3 key, plus the V mode;
-                // lloyd4 V is un-rotated after the body by the launcher.
+                // lloyd4 V is un-rotated after the body by the launcher. The
+                // whole-chunk prefill (`kernel.gfx11_q8_fa2_wide`) also sends
+                // causal chunks of up to 8192 rows (multiples of 512) ending
+                // at max_ctx_len.
+                let wide_chunk = gpu.flags.gfx11_q8_fa2_wide
+                    && (64..=8192).contains(&io.batch_size)
+                    && io.batch_size.is_multiple_of(512)
+                    && io.pos.checked_add(io.batch_size) == Some(io.max_ctx_len)
+                    && io.max_ctx_len <= io.physical_cap;
                 if gpu.flags.gfx11_fa2_prefill
                     && gpu.arch == "gfx1151"
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
-                    && gpu.fa2_gfx11_batch_admitted(io.batch_size)
+                    && (gpu.fa2_gfx11_batch_admitted(io.batch_size) || wide_chunk)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
                     && matches!(plan.v_mode_bits, 4 | 8)
