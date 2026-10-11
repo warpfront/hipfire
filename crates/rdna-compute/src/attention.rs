@@ -154,7 +154,11 @@ pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
 #[derive(Clone, Copy)]
 enum QresidentOut<'a> {
     F32(&'a GpuTensor),
-    A4Slab { qgate: &'a GpuTensor, awq: &'a GpuTensor, x_i4: &'a GpuTensor },
+    A4Slab {
+        qgate: &'a GpuTensor,
+        awq: &'a GpuTensor,
+        x_i4: &'a GpuTensor,
+    },
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -305,14 +309,15 @@ pub struct VmmFlashDecodePlan {
 /// byte-identical), then append the row wrappers. Fails if the entry
 /// signature is not found, so a body change cannot silently miscompile.
 pub fn vmm_rows_source(body: &str, kernel: &str, define: &str) -> HipResult<String> {
-    let missing = || {
-        hip_bridge::HipError::new(0, &format!("vmm_rows_source: entry `{kernel}` not found"))
-    };
+    let missing =
+        || hip_bridge::HipError::new(0, &format!("vmm_rows_source: entry `{kernel}` not found"));
     let sig = format!("__global__ void {kernel}(");
     let at = body.find(&sig).ok_or_else(missing)?;
     let ext = body[..at].rfind("extern \"C\"").ok_or_else(missing)?;
     let between = body[ext + "extern \"C\"".len()..at].trim();
-    if !(between.is_empty() || (between.starts_with("__launch_bounds__(") && between.ends_with(')'))) {
+    if !(between.is_empty()
+        || (between.starts_with("__launch_bounds__(") && between.ends_with(')')))
+    {
         return Err(missing());
     }
     Ok(format!(
@@ -396,6 +401,37 @@ fn q8_decode_attn_gqa_gfx1151_admitted(
         && tile_size == 128
         && hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA", true)
 }
+
+/// gfx1151 fwht4-K attention through the GQA-shared tiles
+/// (`attention_flash_fwht4_gqa*_gfx1151`): one 256-thread workgroup per
+/// (kv head, 128-key tile, row group) reads the tile once for its six q heads
+/// (and, in verify, for 4 lloyd4-V or 2 Q8_0-V rows), then a tile-parallel
+/// reduce. Same partials layout as `attention_flash_fwht4_tile{,_batched}`;
+/// not byte-identical (Q.K in f16 dot2, different summation order).
+/// Geometry is compile-time: head_dim 256, GQA group 6, tile 128, V lloyd4
+/// or Q8_0. `flag` names the route's opt-out
+/// (`HIPFIRE_GFX1151_FWHT4_DECODE_ATTN_GQA` for decode,
+/// `HIPFIRE_GFX1151_FWHT4_VERIFY_ATTN_ROWS` for the batched/verify path).
+fn fwht4_attn_gqa_gfx1151_admitted(
+    gpu: &Gpu,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+    v_mode_bits: i32,
+    flag: &str,
+) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && head_dim == 256
+        && n_kv_heads > 0
+        && n_heads == 6 * n_kv_heads
+        && tile_size == 128
+        && (v_mode_bits == V_MODE_Q8 || v_mode_bits == 4)
+        && hipfire_config::developer_bool(flag, true)
+}
+
+/// Grid-y cap of the fwht4 GQA tiles (same reason as [`DecodeGqaPair`]).
+const FWHT4_GQA_GRID_Y_CAP: usize = 512;
 
 /// Kernel pair of a GQA-shared decode attention route: a 13-arg tile with one
 /// 256-thread workgroup per (kv head, tile) and a 7-arg head-dim-split reduce.
@@ -597,7 +633,10 @@ const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
     module: "attention_verify_wmma_gfx1151",
     src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
     qk: "attention_verify_wmma_qk_gfx1151",
-    pv: ["attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151"],
+    pv: [
+        "attention_verify_wmma_pv1s_d4_gfx1151",
+        "attention_verify_wmma_pv2_d2_gfx1151",
+    ],
 };
 
 fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
@@ -658,7 +697,11 @@ pub struct VerifyWmmaGeometry {
 
 impl Default for VerifyWmmaGeometry {
     fn default() -> Self {
-        Self { packed: true, qk_waves: 160, pv: None }
+        Self {
+            packed: true,
+            qk_waves: 160,
+            pv: None,
+        }
     }
 }
 
@@ -3861,7 +3904,9 @@ impl Gpu {
         if batch_size == 0 {
             return Ok(());
         }
-        let block_size = (max_ctx_len.max(head_dim) as u32).next_power_of_two().min(256);
+        let block_size = (max_ctx_len.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
         let shared_bytes = (max_ctx_len + block_size as usize + head_dim) * 4;
         if shared_bytes > ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES {
             return Err(hip_bridge::HipError::new(
@@ -3972,11 +4017,17 @@ impl Gpu {
         model_max_seq: usize,
         max_ctx: usize,
     ) -> HipResult<VmmFlashDecodePlan> {
-        let refuse = |why: &str| Err(hip_bridge::HipError::new(0, &format!("VMM flash decode refused: {why}")));
+        let refuse = |why: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM flash decode refused: {why}"),
+            ))
+        };
         if max_ctx == 0 || max_ctx > model_max_seq {
             return refuse(&format!("max_ctx {max_ctx} outside 1..={model_max_seq}"));
         }
-        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, model_max_seq);
+        let tile_size =
+            q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, model_max_seq);
         let route = match format {
             VmmKvFormat::Fp8E4M3 => {
                 if !fp8_decode_attn_gqa_admitted(self, n_heads, n_kv_heads, head_dim, tile_size) {
@@ -3986,10 +4037,13 @@ impl Gpu {
             }
             VmmKvFormat::Q8 => {
                 let gfx1151_dpp = self.arch_caps.is_gfx1151()
-                    && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
+                    && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP")
+                        .as_deref()
                         == Ok("1");
                 if gfx1151_dpp
-                    || q8_decode_attn_gqa_gfx1151_admitted(self, n_heads, n_kv_heads, head_dim, tile_size, 0)
+                    || q8_decode_attn_gqa_gfx1151_admitted(
+                        self, n_heads, n_kv_heads, head_dim, tile_size, 0,
+                    )
                 {
                     return refuse("singleton q8 decode uses a gfx1151 route without a VMM twin");
                 }
@@ -4031,7 +4085,10 @@ impl Gpu {
             return Ok(());
         }
         if rows > u16::MAX as usize {
-            return Err(hip_bridge::HipError::new(0, "attention_flash_decode_vmm: rows exceed grid.z"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_flash_decode_vmm: rows exceed grid.z",
+            ));
         }
         if partials.byte_size() < rows * plan.partial_floats_per_row * 4 {
             return Err(hip_bridge::HipError::new(
@@ -4045,29 +4102,37 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
-        let (tile_fn, tile_body_fn, tile_src, tile_def, reduce_fn, reduce_body_fn, reduce_src, reduce_def) =
-            match plan.route {
-                VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
-                    "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
-                    "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
-                    kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
-                    "VMM_ROWS_FP8_GQA_TILE",
-                    "attention_flash_reduce_dsplit_gfx1201_vmm",
-                    "attention_flash_reduce_dsplit_gfx1201",
-                    kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
-                    "VMM_ROWS_DSPLIT_REDUCE",
-                ),
-                VmmFlashDecodeRoute::Q8Generic => (
-                    "attention_flash_q8_0_tile_vmm",
-                    "attention_flash_q8_0_tile",
-                    kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
-                    "VMM_ROWS_Q8_TILE",
-                    "attention_flash_q8_0_reduce_vmm",
-                    "attention_flash_q8_0_reduce",
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                    "VMM_ROWS_Q8_REDUCE",
-                ),
-            };
+        let (
+            tile_fn,
+            tile_body_fn,
+            tile_src,
+            tile_def,
+            reduce_fn,
+            reduce_body_fn,
+            reduce_src,
+            reduce_def,
+        ) = match plan.route {
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
+                "VMM_ROWS_FP8_GQA_TILE",
+                "attention_flash_reduce_dsplit_gfx1201_vmm",
+                "attention_flash_reduce_dsplit_gfx1201",
+                kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC,
+                "VMM_ROWS_DSPLIT_REDUCE",
+            ),
+            VmmFlashDecodeRoute::Q8Generic => (
+                "attention_flash_q8_0_tile_vmm",
+                "attention_flash_q8_0_tile",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                "VMM_ROWS_Q8_TILE",
+                "attention_flash_q8_0_reduce_vmm",
+                "attention_flash_q8_0_reduce",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                "VMM_ROWS_Q8_REDUCE",
+            ),
+        };
         for (func, body_fn, src, def) in [
             (tile_fn, tile_body_fn, tile_src, tile_def),
             (reduce_fn, reduce_body_fn, reduce_src, reduce_def),
@@ -4094,7 +4159,11 @@ impl Gpu {
         let mt = plan.max_tiles as i32;
         let (tile_grid, tile_block, tile_shared) = match plan.route {
             VmmFlashDecodeRoute::Fp8GqaGfx1201 => (
-                [n_kv_heads as u32, plan.max_tiles.min(FP8_DECODE_GQA_GFX1201.grid_y_cap) as u32, rows as u32],
+                [
+                    n_kv_heads as u32,
+                    plan.max_tiles.min(FP8_DECODE_GQA_GFX1201.grid_y_cap) as u32,
+                    rows as u32,
+                ],
                 [256, 1, 1],
                 0u32,
             ),
@@ -4117,24 +4186,36 @@ impl Gpu {
             &d_ptr as *const _ as *mut c_void,
             &rs_ptr as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(tile_fn, tile_grid, tile_block, tile_shared, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(q_ptr);
-            b.push_ptr(p_ptr);
-            b.push_ptr(pos_ptr);
-            b.push_i32(nh);
-            b.push_i32(nkv);
-            b.push_i32(hd);
-            b.push_i32(ms);
-            b.push_f32(sc);
-            b.push_i32(tsi);
-            b.push_ptr(d_ptr);
-            b.push_ptr(rs_ptr);
-            b
-        })?;
+        self.launch_maybe_blob(
+            tile_fn,
+            tile_grid,
+            tile_block,
+            tile_shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(tsi);
+                b.push_ptr(d_ptr);
+                b.push_ptr(rs_ptr);
+                b
+            },
+        )?;
         let (reduce_grid, reduce_shared) = match plan.route {
-            VmmFlashDecodeRoute::Fp8GqaGfx1201 => ([n_heads as u32, (head_dim / 32) as u32, rows as u32], 0u32),
-            VmmFlashDecodeRoute::Q8Generic => ([n_heads as u32, 1, rows as u32], (plan.max_tiles * 4) as u32),
+            VmmFlashDecodeRoute::Fp8GqaGfx1201 => {
+                ([n_heads as u32, (head_dim / 32) as u32, rows as u32], 0u32)
+            }
+            VmmFlashDecodeRoute::Q8Generic => (
+                [n_heads as u32, 1, rows as u32],
+                (plan.max_tiles * 4) as u32,
+            ),
         };
         let mut params: Vec<*mut c_void> = vec![
             &p_ptr as *const _ as *mut c_void,
@@ -4145,17 +4226,24 @@ impl Gpu {
             &tsi as *const _ as *mut c_void,
             &mt as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(reduce_fn, reduce_grid, [256, 1, 1], reduce_shared, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(p_ptr);
-            b.push_ptr(o_ptr);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_ptr(pos_ptr);
-            b.push_i32(tsi);
-            b.push_i32(mt);
-            b
-        })
+        self.launch_maybe_blob(
+            reduce_fn,
+            reduce_grid,
+            [256, 1, 1],
+            reduce_shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(tsi);
+                b.push_i32(mt);
+                b
+            },
+        )
     }
     /// Batched native fp8-E4M3 decode/prefill (F slice, gfx1201-only): same
     /// 15-arg ABI, grid [n_heads,batch_size,1] and LDS as
@@ -4907,7 +4995,11 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC, false)
                 }
             );
-            let module = if multi_slot { format!("{module}_paged") } else { module };
+            let module = if multi_slot {
+                format!("{module}_paged")
+            } else {
+                module
+            };
             self.ensure_kernel(&module, &src, func)?;
         }
 
@@ -5103,8 +5195,11 @@ impl Gpu {
     /// would synchronize, free and malloc mid-capture). A cold capture keeps
     /// the incumbent route instead of failing the capture.
     fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
-        self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
-            && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
+        self.functions
+            .contains_key("attention_q8_0_fa2_gqa_gfx1201")
+            && self
+                .functions
+                .contains_key("attention_fa2_q_preconvert_gfx1201")
             && !crate::scratch::scratch_will_grow(
                 self.scratch.fa2_q16_scratch_bytes,
                 self.scratch.fa2_q16_scratch.is_some(),
@@ -5388,7 +5483,11 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernel_src, false)
                 }
             );
-            let module = if multi_slot { format!("{module}_paged") } else { module };
+            let module = if multi_slot {
+                format!("{module}_paged")
+            } else {
+                module
+            };
             self.ensure_kernel(&module, &src, func)?;
         }
         const M_TILE: usize = 16;
@@ -6463,8 +6562,18 @@ impl Gpu {
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
-            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            QRESIDENT_V2_LDS_BYTES,
+            true,
+            q,
+            k_cache,
+            v_cache,
+            QresidentOut::F32(out),
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
         )
     }
 
@@ -6493,18 +6602,28 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if q.dtype != crate::DType::Raw
-            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
-        {
-            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        if q.dtype != crate::DType::Raw || q.buf.size() < batch_size * n_heads * (head_dim + 4) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Q8 resident attention requires Raw codes and scales",
+            ));
         }
         self.ensure_mq_signs()?;
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC,
-            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache,
-            QresidentOut::A4Slab { qgate, awq, x_i4 }, positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            QRESIDENT_V2_LDS_BYTES,
+            true,
+            q,
+            k_cache,
+            v_cache,
+            QresidentOut::A4Slab { qgate, awq, x_i4 },
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
         )
     }
 
@@ -7370,11 +7489,20 @@ impl Gpu {
             && self.arch == "gfx1151"
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
         let (module, preconvert) = if r3 {
-            ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
+            (
+                "attention_q8_0_fa2_gqa_gfx1100",
+                "attention_fa2_q_preconvert_gfx1100",
+            )
         } else if twin {
-            ("attention_q8_0_fa2_gqa_gfx1151", "attention_fa2_q_preconvert_gfx1151")
+            (
+                "attention_q8_0_fa2_gqa_gfx1151",
+                "attention_fa2_q_preconvert_gfx1151",
+            )
         } else {
-            ("attention_q8_0_fa2_gqa_gfx11", "attention_fa2_q_preconvert_gfx11")
+            (
+                "attention_q8_0_fa2_gqa_gfx11",
+                "attention_fa2_q_preconvert_gfx11",
+            )
         };
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
@@ -7532,6 +7660,121 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // The symbol MUST differ from the Q8 pre-convert symbol: the
+        // function cache is keyed by symbol, and the Q8 module's KMODE=0
+        // build compiles the rotation out.
+        self.attention_fa2_gqa_rotated_k_gfx11(
+            "attention_q8_0_fa2_gqa_fwht3k_gfx11",
+            kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC,
+            "attention_fa2_q_preconvert_fwht3_gfx11",
+            false,
+            256,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            signs1,
+            signs2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+        )
+    }
+
+    /// gfx11 FA2 prefill with fwht4 K (`HIPFIRE_FA2_KMODE=4`): same contract
+    /// as [`Self::attention_q8_0_fa2_gqa_fwht3k_gfx11`] (pre-rotated f16 Q
+    /// scratch, 8-position/128-thread body), Q rotated per 128-dim half like
+    /// the fwht4 K write. `v_mode_bits` 8 = Q8_0 V; 4 = lloyd4 V, whose
+    /// rotated output is un-rotated in place by
+    /// `attention_fa2_out_inverse_fwht4_gfx11` after the body.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fa2_gqa_fwht4k_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        v_mode_bits: i32,
+    ) -> HipResult<()> {
+        let (module, src, inverse_v) = match v_mode_bits {
+            V_MODE_Q8 => (
+                "attention_q8_0_fa2_gqa_fwht4k_gfx11",
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_GFX11_SRC,
+                false,
+            ),
+            4 => (
+                "attention_fa2_gqa_fwht4k_lloyd4v_gfx11",
+                kernels::ATTENTION_FA2_GQA_FWHT4K_LLOYD4V_GFX11_SRC,
+                true,
+            ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "attention_fa2_gqa_fwht4k_gfx11: v_mode_bits {v_mode_bits} unsupported"
+                    ),
+                ))
+            }
+        };
+        self.attention_fa2_gqa_rotated_k_gfx11(
+            module,
+            src,
+            "attention_fa2_q_preconvert_fwht4_gfx11",
+            inverse_v,
+            // fwht4 K rotates per 128-dim half; only lloyd V's inverse
+            // FWHT-256 needs the 256-wide tables.
+            if inverse_v { 256 } else { 128 },
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            signs1,
+            signs2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+        )
+    }
+
+    /// Shared launcher of the rotated-K gfx11 FA2 modules (fwht3, fwht4):
+    /// `module` is both the module key and the body symbol, `preconvert` the
+    /// module's rotating Q pre-convert symbol; `inverse_v` follows the body
+    /// with the in-place inverse FWHT-256 of a lloyd-V module.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_fa2_gqa_rotated_k_gfx11(
+        &mut self,
+        module: &'static str,
+        module_src: &'static str,
+        preconvert: &'static str,
+        inverse_v: bool,
+        min_signs: usize,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if !matches!(
             self.arch.as_str(),
@@ -7539,17 +7782,14 @@ impl Gpu {
         ) {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires a gfx11 arch, got {}",
-                    self.arch
-                ),
+                &format!("{module} requires a gfx11 arch, got {}", self.arch),
             ));
         }
         if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires H24/KV4/D256, got \
+                    "{module} requires H24/KV4/D256, got \
                      H{n_heads}/KV{n_kv_heads}/D{head_dim}"
                 ),
             ));
@@ -7565,18 +7805,14 @@ impl Gpu {
         if batch_size == 0 || batch_size > max_fa2_batch {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
-                ),
+                &format!("{module} requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"),
             ));
         }
         let max_fa2_ctx = self.fa2_gfx11_max_ctx();
         if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
-                ),
+                &format!("{module} requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"),
             ));
         }
         let need_qo = batch_size * n_heads * head_dim;
@@ -7584,7 +7820,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 capacity mismatch: \
+                    "{module} capacity mismatch: \
                      q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
                     q.numel(),
                     out.numel(),
@@ -7592,33 +7828,28 @@ impl Gpu {
                 ),
             ));
         }
-        if signs1.numel() < 256 || signs2.numel() < 256 {
+        if signs1.numel() < min_signs || signs2.numel() < min_signs {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 256-element sign tables, got \
+                    "{module} requires {min_signs}-element sign tables, got \
                      {} and {}",
                     signs1.numel(),
                     signs2.numel()
                 ),
             ));
         }
-        let module = "attention_q8_0_fa2_gqa_fwht3k_gfx11";
         // KT32 pinned (see the Q8 launcher): KT64 path removed.
         // F4b: the body takes pre-rotated + pre-converted f16 Q (same kernarg
-        // list as the Q8 entry — no signs); the rotation moved to the
-        // fwht3 pre-convert symbol, resolved out of this module's (KMODE=3)
-        // source. The symbol MUST differ from the Q8 pre-convert symbol: the
-        // function cache is keyed by symbol, and the Q8 module's KMODE=0
-        // build compiles the rotation out.
-        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht3_gfx11";
-        if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
-            let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC
-            );
+        // list as the Q8 entry — no signs); the rotation lives in the
+        // module's own pre-convert symbol.
+        if !self.functions.contains_key(module) || !self.functions.contains_key(preconvert) {
+            let src = format!("#define HIPFIRE_FA2_KT 32\n{module_src}");
             self.ensure_kernel(module, &src, module)?;
-            self.ensure_kernel(module, &src, PRECONVERT)?;
+            self.ensure_kernel(module, &src, preconvert)?;
+            if inverse_v {
+                self.ensure_kernel(module, &src, "attention_fa2_out_inverse_fwht4_gfx11")?;
+            }
         }
         // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
@@ -7667,19 +7898,14 @@ impl Gpu {
             head_dim,
             max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            "attention_q8_0_fa2_gqa_fwht3k_gfx11",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", module, bytes);
         // F4b: pre-convert (rotate + cast) f32 Q -> f16 scratch on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid. The body blob ABI
         // is the shared Q8 pack (q16 reuses the old f32 Q slot: offset 0,
         // same size); the signs travel only to the pre-convert launch.
         self.launch_fa2_q_preconvert_gfx11(
-            PRECONVERT,
+            preconvert,
             q.buf.as_ptr(),
             q16_ptr,
             signs1.buf.as_ptr(),
@@ -7699,6 +7925,34 @@ impl Gpu {
                 )
             },
         );
+        let result = match result {
+            Ok(()) if inverse_v => {
+                let s1_ptr = signs1.buf.as_ptr();
+                let s2_ptr = signs2.buf.as_ptr();
+                let mut inv_params: Vec<*mut c_void> = vec![
+                    &out_ptr as *const _ as *mut c_void,
+                    &s1_ptr as *const _ as *mut c_void,
+                    &s2_ptr as *const _ as *mut c_void,
+                    &bs as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    "attention_fa2_out_inverse_fwht4_gfx11",
+                    [(batch_size * n_heads).div_ceil(4) as u32, 1, 1],
+                    [128, 1, 1],
+                    0,
+                    &mut inv_params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(out_ptr);
+                        b.push_ptr(s1_ptr);
+                        b.push_ptr(s2_ptr);
+                        b.push_i32(bs);
+                        b
+                    },
+                )
+            }
+            r => r,
+        };
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8741,8 +8995,15 @@ impl Gpu {
         let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
         // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
         let qk_block = (32 * nf.max(4)) as u32;
-        let qk_splits = geom.qk_waves.div_ceil(row_groups * n_kv_heads * nf).clamp(1, t_stride);
-        let pv = geom.pv.unwrap_or(if nf >= 4 { VerifyWmmaPv::Chunk2Whole2 } else { VerifyWmmaPv::Chunk1Split4 });
+        let qk_splits = geom
+            .qk_waves
+            .div_ceil(row_groups * n_kv_heads * nf)
+            .clamp(1, t_stride);
+        let pv = geom.pv.unwrap_or(if nf >= 4 {
+            VerifyWmmaPv::Chunk2Whole2
+        } else {
+            VerifyWmmaPv::Chunk1Split4
+        });
         let pv_chunks = pv.chunks();
         // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
         let pv_block = (32 * nf.max(pv_chunks)) as u32;
@@ -10021,7 +10282,11 @@ impl Gpu {
                 ),
             ));
         }
-        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, TILE)?;
+        self.ensure_kernel(
+            TILE,
+            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+            TILE,
+        )?;
         self.ensure_kernel(
             REDUCE,
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -11526,11 +11791,74 @@ impl Gpu {
             )?;
         }
 
+        // gfx1151 fwht4: the GQA-shared multi-row tile and its tile-parallel
+        // reduce replace the per-(row, q head) batched tile + reduce below.
+        let fwht4_rows = (!use_wmma_grid
+            && slot_descs.is_none()
+            && tree_bias.is_none()
+            && block_cols == 0
+            && tile_func_name == "attention_flash_fwht4_tile_batched"
+            && fwht4_attn_gqa_gfx1151_admitted(
+                self,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                tile_size,
+                v_mode_bits,
+                "HIPFIRE_GFX1151_FWHT4_VERIFY_ATTN_ROWS",
+            ))
+        .then_some(if v_mode_bits == V_MODE_Q8 {
+            ("attention_flash_fwht4_gqa_rows2_q8v_gfx1151", 2)
+        } else {
+            ("attention_flash_fwht4_gqa_rows4_l4_gfx1151", 4)
+        });
+
         let q_dim = n_heads * head_dim;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut offset = 0usize;
         while offset < batch_size {
             let chunk = (batch_size - offset).min(sub_batch);
+            if let Some((tile, rows)) = fwht4_rows {
+                let q_ptr =
+                    unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let grid = [
+                    n_kv_heads as u32,
+                    max_tiles.min(FWHT4_GQA_GRID_Y_CAP) as u32,
+                    chunk.div_ceil(rows) as u32,
+                ];
+                self.launch_fwht4_gqa(
+                    tile,
+                    q_ptr,
+                    k_cache,
+                    v_cache,
+                    partials,
+                    positions.buf.as_ptr(),
+                    cos_theta,
+                    sin_theta,
+                    n_heads,
+                    n_kv_heads,
+                    max_tiles,
+                    grid,
+                    offset,
+                    chunk,
+                )?;
+                let o_ptr =
+                    unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                self.launch_fwht4_gqa_reduce(
+                    v_mode_bits,
+                    partials,
+                    o_ptr,
+                    positions.buf.as_ptr(),
+                    cos_theta,
+                    sin_theta,
+                    n_heads,
+                    max_tiles,
+                    offset,
+                    chunk,
+                )?;
+                offset += chunk;
+                continue;
+            }
             {
                 let q_ptr =
                     unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
@@ -14011,6 +14339,51 @@ impl Gpu {
             self.replay.is_recording(),
         );
 
+        if fwht4_attn_gqa_gfx1151_admitted(
+            self,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            TILE_SIZE,
+            v_mode_bits,
+            "HIPFIRE_GFX1151_FWHT4_DECODE_ATTN_GQA",
+        ) {
+            let tile = if v_mode_bits == V_MODE_Q8 {
+                "attention_flash_fwht4_gqa_q8v_gfx1151"
+            } else {
+                "attention_flash_fwht4_gqa_l4_gfx1151"
+            };
+            let grid_y = launch_tiles.min(FWHT4_GQA_GRID_Y_CAP) as u32;
+            self.launch_fwht4_gqa(
+                tile,
+                q.buf.as_ptr(),
+                k_cache,
+                v_cache,
+                partials,
+                pos_buf.as_ptr(),
+                signs1,
+                signs2,
+                n_heads,
+                n_kv_heads,
+                max_tiles,
+                [n_kv_heads as u32, grid_y, 1],
+                0,
+                1,
+            )?;
+            return self.launch_fwht4_gqa_reduce(
+                v_mode_bits,
+                partials,
+                out.buf.as_ptr(),
+                pos_buf.as_ptr(),
+                signs1,
+                signs2,
+                n_heads,
+                max_tiles,
+                0,
+                1,
+            );
+        }
+
         self.ensure_givens4_kernel(
             "attention_flash_fwht4_tile",
             kernels::ATTENTION_FLASH_FWHT4_TILE_SRC,
@@ -14091,6 +14464,151 @@ impl Gpu {
             v_mode_bits,
         )?;
         Ok(())
+    }
+
+    /// One launch of an `attention_flash_fwht4_gqa*_gfx1151` tile (13-arg
+    /// ABI, see the kernel source). `q` points at the launch's first row;
+    /// `positions[batch_offset + row]` is that row's last attended position.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_fwht4_gqa(
+        &mut self,
+        tile: &'static str,
+        q_ptr: *mut c_void,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        partials: &GpuTensor,
+        pos_ptr: *mut c_void,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        max_tiles: usize,
+        grid: [u32; 3],
+        batch_offset: usize,
+        n_rows: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel(
+            "attention_flash_fwht4_gqa_gfx1151",
+            kernels::ATTENTION_FLASH_FWHT4_GQA_GFX1151_SRC,
+            tile,
+        )?;
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let s1_ptr = signs1.buf.as_ptr();
+        let s2_ptr = signs2.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let mt = max_tiles as i32;
+        let sc = 1.0f32 / 16.0;
+        let bo = batch_offset as i32;
+        let nr = n_rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void,
+            &p_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &bo as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "attention", tile, 0);
+        let r = self.launch_maybe_blob(tile, grid, [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(q_ptr);
+            b.push_ptr(k_ptr);
+            b.push_ptr(v_ptr);
+            b.push_ptr(p_ptr);
+            b.push_ptr(pos_ptr);
+            b.push_ptr(s1_ptr);
+            b.push_ptr(s2_ptr);
+            b.push_i32(nh);
+            b.push_i32(nkv);
+            b.push_i32(mt);
+            b.push_f32(sc);
+            b.push_i32(bo);
+            b.push_i32(nr);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        r
+    }
+
+    /// Cross-tile reduce of [`Self::launch_fwht4_gqa`] partials
+    /// (`attention_flash_fwht4_gqa_reduce_{l4,q8v}_gfx1151`): one 256-thread
+    /// workgroup per (head, row). `out` points at the launch's first row.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_fwht4_gqa_reduce(
+        &mut self,
+        v_mode_bits: i32,
+        partials: &GpuTensor,
+        o_ptr: *mut c_void,
+        pos_ptr: *mut c_void,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        max_tiles: usize,
+        batch_offset: usize,
+        n_rows: usize,
+    ) -> HipResult<()> {
+        let reduce = if v_mode_bits == V_MODE_Q8 {
+            "attention_flash_fwht4_gqa_reduce_q8v_gfx1151"
+        } else {
+            "attention_flash_fwht4_gqa_reduce_l4_gfx1151"
+        };
+        self.ensure_givens4_kernel(
+            "attention_flash_fwht4_gqa_gfx1151",
+            kernels::ATTENTION_FLASH_FWHT4_GQA_GFX1151_SRC,
+            reduce,
+        )?;
+        let p_ptr = partials.buf.as_ptr();
+        let s1_ptr = signs1.buf.as_ptr();
+        let s2_ptr = signs2.buf.as_ptr();
+        let nh = n_heads as i32;
+        let mt = max_tiles as i32;
+        let bo = batch_offset as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+            &bo as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "attention", reduce, 0);
+        let r = self.launch_maybe_blob(
+            reduce,
+            [n_heads as u32, n_rows as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(mt);
+                b.push_i32(bo);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        r
     }
 
     /// Flash attention for asym2 KV (K at rotated 2-bit, V at Q8_0 normal space).
@@ -15761,7 +16279,6 @@ impl Gpu {
             row_slot,
         )
     }
-
 
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
@@ -23127,7 +23644,6 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b.push_f32(scale);
     b
 }
-
 
 /// `*_paged` symbol of a descriptor-aware kernel launched through the
 /// givens4/turbo assembler, or `None` when the kernel has no paged variant.
