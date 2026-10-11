@@ -11,15 +11,16 @@ use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
-use super::prefill::HiddenCapture;
 use super::prefill::moe_grouped_m_total_max;
 use super::prefill::run_plain_gemm_key;
+use super::prefill::HiddenCapture;
 use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+pub(crate) use hipfire_dispatch::pipeline::batched_attention::{valid_lane_mask, BatchSemantics};
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
@@ -1522,29 +1523,6 @@ impl PrefillBatchScratch {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum BatchSemantics<'a> {
-    Sequential,
-    Independent {
-        positions: &'a [usize],
-        lane_capacity: usize,
-        active_mask: u64,
-    },
-}
-
-impl BatchSemantics<'_> {
-    #[inline]
-    pub(crate) fn is_independent(self) -> bool {
-        matches!(self, Self::Independent { .. })
-    }
-    #[inline]
-    pub(crate) fn active_mask(self) -> Option<u64> {
-        match self {
-            Self::Independent { active_mask, .. } => Some(active_mask),
-            Self::Sequential => None,
-        }
-    }
-}
 /// EP tick input residency: decode `pbs` per rank and `seed_pbs` are separate
 /// allocations. `prefill_lane` correctly uses `seed_pbs` with `false,false`
 /// and has no bearing on `forward_tick`'s per-rank decode `pbs`, which has
@@ -1554,18 +1532,6 @@ impl BatchSemantics<'_> {
 #[inline]
 pub(crate) fn ep_tick_inputs_prepared(layer_idx: usize) -> bool {
     layer_idx != 0
-}
-
-/// Central lane helpers — single source for max_batch bounds and shifts.
-pub(crate) fn valid_lane_mask(max_batch: usize) -> HipResult<u64> {
-    if max_batch == 0 || max_batch > 64 {
-        return Err(HipError::new(0, "valid_lane_mask: max_batch must be 1..64"));
-    }
-    if max_batch >= 64 {
-        Ok(u64::MAX)
-    } else {
-        Ok((1u64 << max_batch) - 1)
-    }
 }
 
 /// Active-lane mask to honour for a batch, or `None` when every row is live.
