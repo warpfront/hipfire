@@ -415,10 +415,11 @@ fn finish_hfq_experts_packed(
     raws: Vec<RawExpertPayload>,
     hidden: usize,
     moe_inter: usize,
+    target: MemoryTarget,
 ) -> Result<(Vec<ExpertWeights>, Vec<GpuTensor>), String> {
     if raws.is_empty() {
         return Err(format!(
-            "lfm2moe: layer {layer} host expert placement with zero experts"
+            "lfm2moe: layer {layer} packed expert load with zero experts"
         ));
     }
     // Uniformity is structural on this arch (every expert of a layer shares
@@ -447,9 +448,12 @@ fn finish_hfq_experts_packed(
             ));
         }
     }
-    // qt 16 (BF16) experts under host placement: the default arm widens BF16
-    // to F32 (a byte-length transform a view cannot express). A quantized
-    // expert never carries qt 16, so refuse rather than half-place.
+    // qt 16 (BF16) experts cannot be packed: the decode path widens BF16 to
+    // F32, a byte-length transform a `byte_view` cannot express. A BF16
+    // checkpoint is a calibration teacher rather than a product artifact, and
+    // only the resident tier can express it (per-expert widening), so a host
+    // placement refuses rather than silently placing it on the device inside
+    // an offloaded layer.
     if gate_up_qt == 16 || down_qt == 16 {
         return Err(format!(
             "lfm2moe: layer {layer} carries BF16 (qt 16) routed experts, which have no \
@@ -471,12 +475,10 @@ fn finish_hfq_experts_packed(
         gu_blob.extend_from_slice(&raw.gate_up);
         dn_blob.extend_from_slice(&raw.down);
     }
-    let gu_owner = gpu
-        .upload_raw_host_mapped(&gu_blob, &[gu_blob.len()])
-        .map_err(|e| format!("lfm2moe: host pack gate_up L{layer}: {e:?}"))?;
-    let dn_owner = gpu
-        .upload_raw_host_mapped(&dn_blob, &[dn_blob.len()])
-        .map_err(|e| format!("lfm2moe: host pack down L{layer}: {e:?}"))?;
+    let gu_owner = upload_raw_for_target(gpu, &gu_blob, &[gu_blob.len()], target)
+        .map_err(|e| format!("lfm2moe: pack gate_up L{layer}: {e:?}"))?;
+    let dn_owner = upload_raw_for_target(gpu, &dn_blob, &[dn_blob.len()], target)
+        .map_err(|e| format!("lfm2moe: pack down L{layer}: {e:?}"))?;
 
     let mut experts = Vec::with_capacity(raws.len());
     for raw in by_slot {
@@ -862,6 +864,18 @@ impl Lfm2MoeWeights {
             // router/bias/norms) and, separately, its routed experts.
             let layer_target = memory_target(placement.layer(l));
             let expert_target = expert_memory_target(placement.experts(l));
+            if std::env::var("HIPFIRE_LFM2_LOAD_TRACE").is_ok_and(|v| v != "0") {
+                let free_mib = gpu
+                    .hip
+                    .get_vram_info()
+                    .map(|(free, _)| free as u64 >> 20)
+                    .unwrap_or(0);
+                eprintln!(
+                    "lfm2moe load trace: layer {l} start  layer={layer_target:?} \
+                     expert={expert_target:?}  free_vram={free_mib} MiB  host_mapped={}",
+                    gpu.host_mapped_count()
+                );
+            }
             let operator_norm = load_f32(
                 hfq,
                 gpu,
@@ -1057,10 +1071,13 @@ impl Lfm2MoeWeights {
                 // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
                 // Iterate compact slots `0..n_exp`; `e` = the ORIGINAL expert
                 // index loaded into slot (slot==e on the no-keep identity path).
-                // Payloads are collected raw first, then materialized either as
-                // per-expert device uploads (the resident path) or as two packed
-                // host-mapped blobs with Borrowed per-expert views (the spilled
-                // path — finish_hfq_experts_packed).
+                // Payloads are collected raw first, then materialized as packed
+                // per-layer blobs with `Borrowed` per-expert views
+                // (`finish_hfq_experts_packed`) — for the device tier as well as
+                // the host tier, so the placement census matches what is really
+                // allocated. BF16 (qt 16) is the one exception: its decode
+                // widens to F32, which a view cannot express, so it keeps the
+                // per-expert path and stays resident.
                 let mut raws: Vec<RawExpertPayload> = Vec::with_capacity(n_exp);
                 if hfq.has_overlay() {
                     // Overlay offsets belong to a second file. Preserve the
@@ -1145,31 +1162,52 @@ impl Lfm2MoeWeights {
                         chunk_start = chunk_end;
                     }
                 }
-                let (experts, expert_blob_owners) = match expert_target {
-                    MemoryTarget::Device => {
-                        let mut experts = Vec::with_capacity(n_exp);
-                        for raw in raws {
-                            experts.push(finish_hfq_expert(
-                                hfq,
-                                gpu,
-                                &p,
-                                l,
-                                raw.source_expert,
-                                raw.slot,
-                                raw.gate_up_qt,
-                                &raw.gate_up,
-                                raw.down_qt,
-                                &raw.down,
-                                hidden,
-                                moe_inter,
-                                MemoryTarget::Device,
-                            )?);
-                        }
-                        (experts, Vec::new())
+                // Pack whenever the payload is view-expressible; fall back to
+                // the per-expert path only for BF16 experts (the decode widens
+                // them to F32, so they cannot be a byte view) — and only on the
+                // resident tier, since a host-placed layer must not silently
+                // leave its experts in VRAM.
+                let is_bf16_experts = raws
+                    .first()
+                    .is_some_and(|raw| raw.gate_up_qt == 16 || raw.down_qt == 16);
+                let (experts, expert_blob_owners) = if is_bf16_experts {
+                    if expert_target == MemoryTarget::HostMapped {
+                        return Err(format!(
+                            "lfm2moe: layer {l} carries BF16 (qt 16) routed experts, which have \
+                             no packed host placement; quantize the experts or keep this layer \
+                             resident"
+                        ));
                     }
-                    MemoryTarget::HostMapped => {
-                        finish_hfq_experts_packed(hfq, gpu, &p, l, raws, hidden, moe_inter)?
+                    let mut experts = Vec::with_capacity(n_exp);
+                    for raw in raws {
+                        experts.push(finish_hfq_expert(
+                            hfq,
+                            gpu,
+                            &p,
+                            l,
+                            raw.source_expert,
+                            raw.slot,
+                            raw.gate_up_qt,
+                            &raw.gate_up,
+                            raw.down_qt,
+                            &raw.down,
+                            hidden,
+                            moe_inter,
+                            MemoryTarget::Device,
+                        )?);
                     }
+                    (experts, Vec::new())
+                } else {
+                    finish_hfq_experts_packed(
+                        hfq,
+                        gpu,
+                        &p,
+                        l,
+                        raws,
+                        hidden,
+                        moe_inter,
+                        expert_target,
+                    )?
                 };
 
                 let gu_bytes: Vec<u8> = experts
@@ -1248,12 +1286,40 @@ fn lfm2_is_routed_expert_weight(name: &str) -> bool {
     name.contains(".feed_forward.experts.")
 }
 
+/// Runtime bytes one GLOBAL tensor costs on the device.
+///
+/// The census must model what the loader ALLOCATES, not what the file STORES,
+/// because the placement search trusts it. `always_resident` counted at its
+/// stored size was ~1.13 GiB short on the 24B-A2B: its `embed_tokens` ships as
+/// MQ4G256V2 (132.8 MiB) but the loader (a) dequantizes qt 1/16/44 to a **F32**
+/// gather table (128000 x 2048 x 4 = 1000 MiB) and (b) loads the same tensor a
+/// second time as the tied `lm_head` in its stored dtype. The plan therefore
+/// believed it had ~1.1 GiB more room than existed and over-placed, which
+/// OOM'd at layer 37 of 40 — measured, gfx1101.
+///
+/// Per-layer tensors need no such correction: the loader reads them raw
+/// (`load_wt`), and the only expansion there is norms (`load_f32`, hidden x 4
+/// versus ~hidden stored bytes — kilobytes per layer, absorbed by the
+/// placement slack).
+fn lfm2_global_runtime_bytes(name: &str, quant_type: u8, stored: u64, cfg: &Lfm2MoeConfig) -> u64 {
+    if name == "model.embed_tokens.weight" {
+        let table = match quant_type {
+            1 | 16 | 44 => (cfg.vocab_size as u64).saturating_mul(cfg.hidden_size as u64) * 4,
+            _ => stored,
+        };
+        // + the tied lm_head, loaded a second time from the same tensor.
+        return table.saturating_add(stored);
+    }
+    stored
+}
+
 /// Per-layer byte census for partial offload, built from the HFQ tensor
 /// index: `non_expert[l]` = everything layer `l` owns except its routed
 /// experts (mixer, norms, dense FFN, router, expert_bias, AWQ sidecars);
 /// `expert[l]` = its routed-expert payload; `always_resident` = the tied
 /// embed/lm_head, the final norm, and any non-layer tensor. Mirrors
-/// `qwen35_layer_bytes`.
+/// `qwen35_layer_bytes`, plus the loader-faithful globals correction in
+/// [`lfm2_global_runtime_bytes`].
 pub fn lfm2_layer_bytes(
     hfq: &HfqFile,
     cfg: &Lfm2MoeConfig,
@@ -1272,7 +1338,10 @@ pub fn lfm2_layer_bytes(
                     non_expert[layer] += bytes;
                 }
             }
-            _ => always_resident += bytes,
+            _ => {
+                always_resident +=
+                    lfm2_global_runtime_bytes(&info.name, info.quant_type, bytes, cfg);
+            }
         }
     }
     hipfire_runtime::offload::LayerBytes {

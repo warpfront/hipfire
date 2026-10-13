@@ -116,22 +116,28 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
 
 /// Resolve partial GPU offload before the first allocation.
 ///
-/// Returns `None` when both budgets are `Full` — the unset default, and the
-/// zero-diff path: no measured capacity, no admission, no refusal, byte
-/// output identical to the pre-offload loader.
+/// Takes the load facts explicitly rather than a `LoadCtx`, so the sequential
+/// carrier and the parity tests run the same policy on the same numbers — a
+/// test that re-derived the capacity model would validate its own arithmetic,
+/// not this one.
 ///
-/// Eligibility is `hipfire_config::memory::spill_support` over this load's
-/// own facts (arch 11, tp 1 — the tp>1 routes never reach this carrier —
-/// pp 1 — refused at the top of `load_lfm2moe_bundle` — no EP on this
-/// route, no paged experts, the config's REAP keep-map, and the VL tower
-/// probe). A configured spill on an unspillable path was already refused at
-/// admission (`partial_offload_refusal`); the defensive arm below permits
-/// only a fully resident placement that fits, otherwise refusing before
-/// allocation.
-fn resolve_lfm2_partial_offload(
+/// Returns `None` when both budgets are `Full` — the unset default, and the
+/// zero-diff path: no measured capacity, no admission, no refusal, byte output
+/// identical to the pre-offload loader.
+///
+/// Eligibility is `hipfire_config::memory::spill_support` over this load's own
+/// facts (arch 11, tp 1 — the tp>1 routes never reach this carrier — pp 1 —
+/// refused at the top of `load_lfm2moe_bundle` — no EP on this route, no paged
+/// experts, the config's REAP keep-map, and the VL tower probe). A configured
+/// spill on an unspillable path was already refused at admission
+/// (`partial_offload_refusal`); the defensive arm below permits only a fully
+/// resident placement that fits, otherwise refusing before allocation.
+pub fn resolve_partial_offload(
     hfq: &hipfire_runtime::hfq::HfqFile,
     config: &Lfm2MoeConfig,
-    ctx: &LoadCtx,
+    free_vram: u64,
+    max_seq: usize,
+    draft_bytes: u64,
 ) -> Result<Option<Placement>, String> {
     use hipfire_config::memory::{
         effective_offload_budgets, offload_exec, spill_support, OffloadBudget, OffloadExec,
@@ -151,7 +157,7 @@ fn resolve_lfm2_partial_offload(
         lfm2_has_vision_tower(hfq),
     );
     if let SpillSupport::Refused(refusal) = support {
-        return fail_closed_or_resident(hfq, config, ctx, refusal);
+        return fail_closed_or_resident(hfq, config, refusal, free_vram, max_seq, draft_bytes);
     }
     // `memory.offload_exec` decides WHO multiplies a spilled layer's weights.
     // Only `pcie` is implemented for arch 11: this crate's dense projections
@@ -167,7 +173,7 @@ fn resolve_lfm2_partial_offload(
             offload_exec()
         ));
     }
-    let capacity = lfm2_placement_capacity(hfq, config, ctx)?;
+    let capacity = lfm2_placement_capacity(hfq, config, free_vram, max_seq, draft_bytes)?;
     let placement = offload::resolve_placement(
         &capacity.layer_bytes,
         &capacity.inputs,
@@ -175,6 +181,27 @@ fn resolve_lfm2_partial_offload(
         offload::Orientation::SuffixResident,
     )?;
     Ok(Some(placement))
+}
+
+/// The carrier's entry point: read the load facts off the `LoadCtx` and hand
+/// them to [`resolve_partial_offload`].
+fn resolve_lfm2_partial_offload(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    config: &Lfm2MoeConfig,
+    ctx: &LoadCtx,
+) -> Result<Option<Placement>, String> {
+    let free_vram = ctx
+        .gpu
+        .hip
+        .get_vram_info()
+        .map_err(|e| format!("lfm2moe: pre-weight VRAM query: {e}"))?
+        .0 as u64;
+    let draft_bytes = ctx
+        .draft_path
+        .map(std::path::Path::new)
+        .map(draft_file_reserve_bytes)
+        .unwrap_or(0);
+    resolve_partial_offload(hfq, config, free_vram, ctx.max_seq, draft_bytes)
 }
 
 /// Whether this trunk carries the LFM2-VL vision tower: the same two facts
@@ -196,30 +223,44 @@ struct Lfm2PlacementCapacity {
 /// The census + every measured claim on device memory, mirroring the Qwen3.5
 /// carrier's `placement_capacity_inputs`:
 ///
-/// * free VRAM, read now;
+/// * the caller's measured free VRAM;
 /// * the KV reservation this load will allocate right after the weights
 ///   (`Lfm2MoeState::new_with_max_seq` builds a flat Q8 cache over
-///   `num_attention_layers()` layers of `ctx.max_seq` rows — the stride comes
+///   `num_attention_layers()` layers of `max_seq` rows — the stride comes
 ///   from the same `SlotKvTierPlan` the packed layouts describe, so census and
 ///   allocation cannot drift);
 /// * prefill floor 0 (`prefill_floor_absent` — this arch has no prefill
 ///   sizing model; the shortfall stays visible in the capacity line rather
 ///   than hidden);
-/// * a device-resident DFlash draft (`ctx.draft_path`), charged by file size
-///   the way Qwen3.5 charges its sidecars;
+/// * a device-resident DFlash draft, charged by file size the way Qwen3.5
+///   charges its sidecars;
 /// * 128 MiB slack for the state scratch, conv-state rings, expert pointer
 ///   tables and logits row nobody sizes.
+/// Device bytes held back from the placement budget beyond the KV reservation.
+///
+/// The placement search may spend `free_vram - kv - prefill - draft - slack`.
+/// `free_vram` is `hipMemGetInfo`, which on this card **over-reports what is
+/// actually allocatable**: `host_offload_headroom` measured `free=11012 MB`
+/// against `control headroom: 10240 MB` on gfx1101 — a 772 MiB gap from
+/// fragmentation/reserved pages that a 1 GiB-step `hipMalloc` ladder cannot
+/// touch. A placement sized against the reported figure therefore over-places
+/// and the model cannot then allocate its own state (observed: the 24B-A2B
+/// loaded every weight and OOM'd in the KV cache with 100 MiB reported free).
+///
+/// 1 GiB covers the measured gap with margin for the state scratch
+/// (`Lfm2MoeState`: hidden/attention/FFN buffers, vocab logits row, conv-state
+/// rings) and the expert pointer tables. It is deliberately a fixed
+/// per-load reserve rather than a fraction: the gap is a property of the
+/// device, not of the model.
+const LFM2_PLACEMENT_SLACK_BYTES: u64 = 1 << 30;
+
 fn lfm2_placement_capacity(
     hfq: &hipfire_runtime::hfq::HfqFile,
     config: &Lfm2MoeConfig,
-    ctx: &LoadCtx,
+    free_vram: u64,
+    max_seq: usize,
+    draft_bytes: u64,
 ) -> Result<Lfm2PlacementCapacity, String> {
-    let free_vram = ctx
-        .gpu
-        .hip
-        .get_vram_info()
-        .map_err(|e| format!("lfm2moe: pre-weight VRAM query: {e}"))?
-        .0 as u64;
     // The state resolves KV through `HFQ_Q8_ONLY_POLICY` → Q8; resolve the
     // same way here instead of hard-coding one tier's stride.
     let mode =
@@ -232,12 +273,7 @@ fn lfm2_placement_capacity(
     .map_err(|e| format!("lfm2moe: KV tier plan: {}", e.message))?;
     let n_attn = config.num_attention_layers().max(1);
     let stride = (tier.k_bytes_per_pos + tier.v_bytes_per_pos) as u64 * n_attn as u64;
-    let kv = offload::kv_reserve(stride, ctx.max_seq).ok_or("lfm2moe: KV reservation overflow")?;
-    let draft_bytes = ctx
-        .draft_path
-        .map(std::path::Path::new)
-        .map(draft_file_reserve_bytes)
-        .unwrap_or(0);
+    let kv = offload::kv_reserve(stride, max_seq).ok_or("lfm2moe: KV reservation overflow")?;
     let layer_bytes = lfm2_layer_bytes(hfq, config);
     let inputs = offload::CapacityInputs {
         free_vram,
@@ -247,7 +283,7 @@ fn lfm2_placement_capacity(
         prefill_floor: 0,
         prefill_floor_absent: true,
         draft_bytes,
-        slack: 128u64 << 20,
+        slack: LFM2_PLACEMENT_SLACK_BYTES,
     };
     Ok(Lfm2PlacementCapacity {
         layer_bytes,
@@ -273,11 +309,13 @@ fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
 fn fail_closed_or_resident(
     hfq: &hipfire_runtime::hfq::HfqFile,
     config: &Lfm2MoeConfig,
-    ctx: &LoadCtx,
     refusal: hipfire_config::memory::SpillRefusal,
+    free_vram: u64,
+    max_seq: usize,
+    draft_bytes: u64,
 ) -> Result<Option<Placement>, String> {
     use hipfire_config::memory::{OffloadBudget, SpillRefusal};
-    let capacity = lfm2_placement_capacity(hfq, config, ctx)?;
+    let capacity = lfm2_placement_capacity(hfq, config, free_vram, max_seq, draft_bytes)?;
     let weight_room = offload::weight_capacity(
         capacity.inputs.free_vram,
         capacity.inputs.kv_bytes,

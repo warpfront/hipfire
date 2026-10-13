@@ -213,6 +213,60 @@ Flash-Next trunk-overlay **loading** is pinned in the client, not declared in th
 
 Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) with `repeat_penalty` 1.05 — applied by the CLI resolver. Do not treat a registry `sampling` field as active defaults.
 
+### LFM2.5-24B-A2B — loadable, **no published artifact, and blocked on an open MoE defect**
+
+`LiquidAI/LFM2.5-24B-A2B` (40 layers, 64 experts top-4, hidden 2048, 128k vocab,
+`conv_L_cache` 3, `num_dense_layers` 2, `use_expert_bias` true) loads on arch 11.
+There is **no registry tag and no `hipfire pull` target**: no artifact has been
+published, so add nothing to `registry/models.json` until one is.
+
+Recipe that works today (local, `--format mq4`):
+
+```bash
+hipfire-quantize --input <LFM2.5-24B-A2B dir> \
+                 --output ~/.hipfire/models/lfm2.5-24b-a2b.mq4 --format mq4
+# 12,758,948,048 B output: experts + dense projections MQ4G256, embedding
+# MQ4G256V2, 38 expert_bias tensors F32, norms Q8F16.
+```
+
+Because the model is ~98% routed experts by bytes (11.6 GiB of 12.7 GiB), it does
+not fit VRAM on a 12 GB card (or a 16 GB one) whole; it needs the partial-offload
+expert tier:
+
+```bash
+HIPFIRE_GPU_LAYER_BUDGET=auto HIPFIRE_MOE_EXPERT_BUDGET=auto \
+  hipfire run ~/.hipfire/models/lfm2.5-24b-a2b.mq4 "..."
+# measured on gfx1101 (12.9 GB): "routed experts host on 13 layers ... device
+# weights 9781 MiB of 9947 MiB available", 3366 MiB pinned host RAM.
+```
+
+**Verified on this branch** (gfx1101, HIP 7.16): the 24B-A2B loads and generates
+through the production `run` path with that placement; a spill changes no
+numerics — greedy decode is byte-identical across placements on the fixtures
+where a non-degenerate comparison is possible (see
+`crates/hipfire-arch-lfm2moe/tests/offload_parity.rs`: 2.6B dense and 8B-A1B MoE
+both match a resident baseline byte-for-byte, whole-layer and routed-expert
+tiers, with a prompt-variety guard that rejects a saturated oracle).
+
+**Open blocker — LFM2.5 MoE output is incoherent, and it is NOT this branch.**
+On gfx1101, LFM2.5 **MoE** models emit degenerate text while the LFM2.5 **dense**
+2.6B is coherent (it answers a code prompt normally). Reproduced with the
+**registry-published** `lfm2.5:8b-a1b` artifact (sha256 `07da9942…4148`) on
+**pristine `upstream/beta`** (`d40c3301a`), which returns the byte-identical
+garbage `" ' -- -- -- -- -- -- ' "` — so the defect predates and is independent
+of the offload work, the expert-packing change, and any local quantization. The
+24B-A2B shows the same class of degeneration (`confuse confuse confuse identify
+purpose purpose …` with temp 0.1 / rep 1.05; all five probed prompts saturate to
+1–3 distinct tokens under greedy). Treat every LFM2.5 **MoE** coherence claim as
+blocked until that defect is found; do not describe the 24B as production-ready
+on the strength of "it loads and emits tokens".
+
+Known limitation to state plainly: a parity test cannot detect a defect that is
+*consistent* across placements — a wrong expert read that is wrong the same way
+in both arms passes any placement A/B. That is why the pre-existing-MoE check
+above was run against pristine beta with the published artifact rather than
+inferred from the parity suite.
+
 ### Gemma4 (registry — no published artifact yet)
 
 > **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.** The
