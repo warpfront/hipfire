@@ -32,8 +32,8 @@ use crate::reap_overlay;
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use hipfire_quantize::vision_sidecar::{
-    VisionDtype, is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix,
-    resolve_vision_prefix, vision_dtype,
+    is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix, resolve_vision_prefix,
+    vision_dtype, VisionDtype,
 };
 use hipfire_runtime::hfq::{HfqFile as RuntimeHfqFile, HfqTensorInfo};
 
@@ -124,11 +124,9 @@ struct MainQuantState<'a> {
     spill: &'a mut Option<TensorSpill>,
 }
 
-
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ2V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
-
 
 fn quantize_mq4g256v2_selected(
     weights: &[f32],
@@ -325,10 +323,10 @@ fn export_mq4v2_final_codes(
                 record.name
             )
         })?;
-        let m = u32::try_from(record.m)
-            .map_err(|_| format!("{}: M does not fit u32", record.name))?;
-        let k = u32::try_from(record.k)
-            .map_err(|_| format!("{}: K does not fit u32", record.name))?;
+        let m =
+            u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
+        let k =
+            u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
         let expected_bytes = record
             .m
             .checked_mul(record.k)
@@ -451,13 +449,9 @@ fn export_mq4v2_final_codes(
             .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
         for mapped in &records {
             let record = mapped.as_record();
-            let packed = pack_mq4g256v2_from_f16_grid(
-                record.m,
-                record.k,
-                record.d_z_f16,
-                record.codes_u8,
-            )
-            .map_err(|error| format!("{}: {error}", record.name))?;
+            let packed =
+                pack_mq4g256v2_from_f16_grid(record.m, record.k, record.d_z_f16, record.codes_u8)
+                    .map_err(|error| format!("{}: {error}", record.name))?;
             let tensor = by_name[record.name];
             if packed.len() != tensor.data_size {
                 return Err(format!(
@@ -520,72 +514,123 @@ fn export_mqn_final_codes(
         _ => return Err(format!("unsupported final-code qt={qt}")),
     };
     if !input.is_file() {
-        return Err(format!("--input must be an HFQ file, got {}", input.display()));
+        return Err(format!(
+            "--input must be an HFQ file, got {}",
+            input.display()
+        ));
     }
     let canonical = std::fs::canonicalize(input)
         .map_err(|error| format!("canonicalize input {}: {error}", input.display()))?;
-    if output.exists()
-        && std::fs::canonicalize(output).is_ok_and(|path| path == canonical)
-    {
+    if output.exists() && std::fs::canonicalize(output).is_ok_and(|path| path == canonical) {
         return Err("--output must differ from the source HFQ".to_string());
     }
     if output.exists() {
-        return Err(format!("refusing to overwrite existing output {}", output.display()));
+        return Err(format!(
+            "refusing to overwrite existing output {}",
+            output.display()
+        ));
     }
     eprintln!("{label} final-code import: hashing {}", input.display());
     let source_sha = sha256_file_hex(input)?;
     let source = RuntimeHfqFile::open_with_reap_plan(input, None)
         .map_err(|error| format!("open source HFQ {}: {error}", input.display()))?;
-    let by_name: HashMap<&str, &HfqTensorInfo> = source.tensors()
-        .iter().map(|tensor| (tensor.name.as_str(), tensor)).collect();
+    let by_name: HashMap<&str, &HfqTensorInfo> = source
+        .tensors()
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
     let records = load_mqn_final_code_records(records_path, &source_sha, qt)?;
     for mapped in &records {
         let record = mapped.as_record();
-        let tensor = by_name.get(record.name)
-            .ok_or_else(|| format!("{}: tensor `{}` is absent from source HFQ", mapped.path.display(), record.name))?;
-        let m = u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
-        let k = u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
-        let groups = record.m.checked_mul(record.k).ok_or_else(|| format!("{}: shape overflows", record.name))? / 256;
-        let expected_bytes = groups.checked_mul(group_bytes).ok_or_else(|| format!("{}: packed size overflows", record.name))?;
-        if tensor.quant_type != qt || tensor.group_size != 256
-            || tensor.shape != [m, k] || tensor.data_size != expected_bytes
+        let tensor = by_name.get(record.name).ok_or_else(|| {
+            format!(
+                "{}: tensor `{}` is absent from source HFQ",
+                mapped.path.display(),
+                record.name
+            )
+        })?;
+        let m =
+            u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
+        let k =
+            u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
+        let groups = record
+            .m
+            .checked_mul(record.k)
+            .ok_or_else(|| format!("{}: shape overflows", record.name))?
+            / 256;
+        let expected_bytes = groups
+            .checked_mul(group_bytes)
+            .ok_or_else(|| format!("{}: packed size overflows", record.name))?;
+        if tensor.quant_type != qt
+            || tensor.group_size != 256
+            || tensor.shape != [m, k]
+            || tensor.data_size != expected_bytes
         {
             return Err(format!(
                 "{}: source type-map entry for `{}` is qt={} shape={:?} group_size={} bytes={}, expected qt={qt} shape=[{m},{k}] group_size=256 bytes={expected_bytes}",
                 mapped.path.display(), record.name, tensor.quant_type, tensor.shape, tensor.group_size, tensor.data_size
             ));
         }
-        let (_, source_bytes) = source.tensor_data(record.name)
+        let (_, source_bytes) = source
+            .tensor_data(record.name)
             .ok_or_else(|| format!("{}: missing source tensor data", record.name))?;
         for (group, bytes) in source_bytes.chunks_exact(group_bytes).enumerate() {
             if bytes[..8] != record.d_z_f16[group * 8..group * 8 + 8] {
-                return Err(format!("{}: frozen d_z_f16 differs from source at group {group}", record.name));
+                return Err(format!(
+                    "{}: frozen d_z_f16 differs from source at group {group}",
+                    record.name
+                ));
             }
         }
         let sidecar = awq_sidecar_name(record.name);
         if let Some((info, data)) = source.tensor_data(&sidecar) {
-            if info.quant_type != QuantType::F16 as u8 || info.shape != [k] || data != record.s_f16 {
-                return Err(format!("{}: frozen S_f16 differs from source AWQ sidecar `{sidecar}`", record.name));
+            if info.quant_type != QuantType::F16 as u8 || info.shape != [k] || data != record.s_f16
+            {
+                return Err(format!(
+                    "{}: frozen S_f16 differs from source AWQ sidecar `{sidecar}`",
+                    record.name
+                ));
             }
         }
-        if let Some((index, code)) = record.codes_u8.iter().enumerate().find(|(_, code)| **code > max_code) {
-            return Err(format!("{}: code {code} at index {index} exceeds {label} range", record.name));
+        if let Some((index, code)) = record
+            .codes_u8
+            .iter()
+            .enumerate()
+            .find(|(_, code)| **code > max_code)
+        {
+            return Err(format!(
+                "{}: code {code} at index {index} exceeds {label} range",
+                record.name
+            ));
         }
     }
 
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
-        return Err(format!("output parent directory does not exist: {}", parent.display()));
+        return Err(format!(
+            "output parent directory does not exist: {}",
+            parent.display()
+        ));
     }
-    let name = output.file_name().and_then(|name| name.to_str())
+    let name = output
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or_else(|| format!("invalid output path {}", output.display()))?;
-    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("system clock before Unix epoch: {error}"))?.as_nanos();
-    let temporary = parent.join(format!(".{name}.mqn-final-{}-{nonce}.tmp", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock before Unix epoch: {error}"))?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{name}.mqn-final-{}-{nonce}.tmp",
+        std::process::id()
+    ));
     let result = (|| -> Result<(), String> {
         std::fs::copy(input, &temporary)
             .map_err(|error| format!("copy source HFQ to {}: {error}", temporary.display()))?;
-        let file = OpenOptions::new().read(true).write(true).open(&temporary)
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)
             .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
         let mut mapped = unsafe { memmap2::MmapMut::map_mut(&file) }
             .map_err(|error| format!("map temporary HFQ {}: {error}", temporary.display()))?;
@@ -597,8 +642,10 @@ fn export_mqn_final_codes(
                 let codes = &record.codes_u8[group * 256..(group + 1) * 256];
                 if qt == 50 {
                     for (i, dst) in block[8..].iter_mut().enumerate() {
-                        *dst = codes[i * 4] | codes[i * 4 + 1] << 2
-                            | codes[i * 4 + 2] << 4 | codes[i * 4 + 3] << 6;
+                        *dst = codes[i * 4]
+                            | codes[i * 4 + 1] << 2
+                            | codes[i * 4 + 2] << 4
+                            | codes[i * 4 + 3] << 6;
                     }
                 } else {
                     // Encoder quantize_mq3g256v2: eight three-bit codes
@@ -612,9 +659,12 @@ fn export_mqn_final_codes(
                 }
             }
         }
-        mapped.flush().map_err(|error| format!("flush temporary HFQ: {error}"))?;
+        mapped
+            .flush()
+            .map_err(|error| format!("flush temporary HFQ: {error}"))?;
         drop(mapped);
-        file.sync_all().map_err(|error| format!("sync temporary HFQ: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync temporary HFQ: {error}"))?;
         let rewritten = RuntimeHfqFile::open_with_reap_plan(&temporary, None)
             .map_err(|error| format!("reopen temporary HFQ: {error}"))?;
         if !same_hfq_manifest(&source, &rewritten) {
@@ -626,8 +676,13 @@ fn export_mqn_final_codes(
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
-    std::fs::rename(&temporary, output)
-        .map_err(|error| format!("rename completed HFQ {} to {}: {error}", temporary.display(), output.display()))?;
+    std::fs::rename(&temporary, output).map_err(|error| {
+        format!(
+            "rename completed HFQ {} to {}: {error}",
+            temporary.display(),
+            output.display()
+        )
+    })?;
     Ok((records.len(), source_sha))
 }
 
@@ -643,27 +698,65 @@ mod mqn_final_code_tests {
         let output = dir.path().join("result.hfq");
         let record_path = dir.path().join("codes.safetensors");
         let (m, k) = (2usize, 512usize);
-        let weights: Vec<f32> = (0..m * k).map(|i| ((i * 37) as f32 * 0.017).sin()).collect();
+        let weights: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 37) as f32 * 0.017).sin())
+            .collect();
         let signs1 = gen_fwht_signs(42, 256);
         let signs2 = gen_fwht_signs(1042, 256);
         let (encoded, quant, stride) = if qt == 49 {
-            (quantize_mq3g256v2(&weights, m, k, &signs1, &signs2), QuantType::MQ3G256V2, 104)
+            (
+                quantize_mq3g256v2(&weights, m, k, &signs1, &signs2),
+                QuantType::MQ3G256V2,
+                104,
+            )
         } else {
-            (quantize_mq2g256v2(&weights, m, k, &signs1, &signs2), QuantType::MQ2G256V2, 72)
+            (
+                quantize_mq2g256v2(&weights, m, k, &signs1, &signs2),
+                QuantType::MQ2G256V2,
+                72,
+            )
         };
         let tensor_name = "model.layers.0.linear_attn.in_proj_a.weight";
         let sidecar_name = awq_sidecar_name(tensor_name);
         let s: Vec<u8> = (0..k).flat_map(|_| f32_to_f16(1.0).to_le_bytes()).collect();
-        write_hfq(&input, 1, "{}", &[
-            HfqTensor { name: tensor_name.into(), quant_type: quant, shape: vec![m as u32,k as u32],
-                        group_size: 256, data: encoded.clone(), spilled_len: 0 },
-            HfqTensor { name: sidecar_name, quant_type: QuantType::F16, shape: vec![k as u32],
-                        group_size: 0, data: s.clone(), spilled_len: 0 },
-            HfqTensor { name: "untouched.weight".into(), quant_type: QuantType::F16,
-                        shape: vec![4], group_size: 0, data: vec![7; 8], spilled_len: 0 },
-        ], None).unwrap();
+        write_hfq(
+            &input,
+            1,
+            "{}",
+            &[
+                HfqTensor {
+                    name: tensor_name.into(),
+                    quant_type: quant,
+                    shape: vec![m as u32, k as u32],
+                    group_size: 256,
+                    data: encoded.clone(),
+                    spilled_len: 0,
+                },
+                HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F16,
+                    shape: vec![k as u32],
+                    group_size: 0,
+                    data: s.clone(),
+                    spilled_len: 0,
+                },
+                HfqTensor {
+                    name: "untouched.weight".into(),
+                    quant_type: QuantType::F16,
+                    shape: vec![4],
+                    group_size: 0,
+                    data: vec![7; 8],
+                    spilled_len: 0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
         let sha = sha256_file_hex(&input).unwrap();
-        let grid: Vec<u8> = encoded.chunks_exact(stride).flat_map(|group| group[..8].to_vec()).collect();
+        let grid: Vec<u8> = encoded
+            .chunks_exact(stride)
+            .flat_map(|group| group[..8].to_vec())
+            .collect();
         let mut codes = vec![0u8; m * k];
         for (group, block) in encoded.chunks_exact(stride).enumerate() {
             if qt == 50 {
@@ -674,7 +767,8 @@ mod mqn_final_code_tests {
                 }
             } else {
                 for (i, chunk) in block[8..].chunks_exact(3).enumerate() {
-                    let word = u32::from(chunk[0]) | u32::from(chunk[1]) << 8 | u32::from(chunk[2]) << 16;
+                    let word =
+                        u32::from(chunk[0]) | u32::from(chunk[1]) << 8 | u32::from(chunk[2]) << 16;
                     for j in 0..8 {
                         codes[group * 256 + i * 8 + j] = (word >> (j * 3) & 7) as u8;
                     }
@@ -686,12 +780,20 @@ mod mqn_final_code_tests {
         }
         let tensors = [
             ("S_f16", TensorView::new(Dtype::F16, vec![k], &s).unwrap()),
-            ("d_z_f16", TensorView::new(Dtype::F16, vec![m, k / 256, 2, 2], &grid).unwrap()),
-            ("codes_u8", TensorView::new(Dtype::U8, vec![m, k], &codes).unwrap()),
+            (
+                "d_z_f16",
+                TensorView::new(Dtype::F16, vec![m, k / 256, 2, 2], &grid).unwrap(),
+            ),
+            (
+                "codes_u8",
+                TensorView::new(Dtype::U8, vec![m, k], &codes).unwrap(),
+            ),
         ];
         let metadata = HashMap::from([
-            ("name".into(), tensor_name.into()), ("M".into(), m.to_string()),
-            ("K".into(), k.to_string()), ("qt".into(), qt.to_string()),
+            ("name".into(), tensor_name.into()),
+            ("M".into(), m.to_string()),
+            ("K".into(), k.to_string()),
+            ("qt".into(), qt.to_string()),
             ("source_sha".into(), sha.clone()),
         ]);
         serialize_to_file(tensors, Some(metadata), &record_path).unwrap();
@@ -701,20 +803,40 @@ mod mqn_final_code_tests {
             let mapped = load_mqn_final_code_record(&record_path, &sha, qt).unwrap();
             let record = mapped.as_record();
             assert!(validate_mqn_final_code_record(
-                &Mq4v2FinalCodeRecord { qt: if qt == 49 { 50 } else { 49 }, ..record }, &sha, qt
-            ).is_err());
+                &Mq4v2FinalCodeRecord {
+                    qt: if qt == 49 { 50 } else { 49 },
+                    ..record
+                },
+                &sha,
+                qt
+            )
+            .is_err());
             assert!(validate_mqn_final_code_record(
-                &Mq4v2FinalCodeRecord { m: m + 1, ..record }, &sha, qt
-            ).is_err());
+                &Mq4v2FinalCodeRecord { m: m + 1, ..record },
+                &sha,
+                qt
+            )
+            .is_err());
             assert!(validate_mqn_final_code_record(&record, &"0".repeat(64), qt).is_err());
         }
         let original = std::fs::read(&input).unwrap();
         let rewritten = std::fs::read(&output).unwrap();
-        let offset = RuntimeHfqFile::open_with_reap_plan(&input, None).unwrap()
-            .tensors().iter().find(|tensor| tensor.name == tensor_name).unwrap().data_offset;
-        let changed_offsets: Vec<usize> = original.iter().zip(&rewritten).enumerate()
-            .filter_map(|(i, (a, b))| (a != b).then_some(i)).collect();
-        let expected = if !changed { vec![] } else if qt == 49 {
+        let offset = RuntimeHfqFile::open_with_reap_plan(&input, None)
+            .unwrap()
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == tensor_name)
+            .unwrap()
+            .data_offset;
+        let changed_offsets: Vec<usize> = original
+            .iter()
+            .zip(&rewritten)
+            .enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i))
+            .collect();
+        let expected = if !changed {
+            vec![]
+        } else if qt == 49 {
             vec![offset + 8, offset + 9] // code 2 straddles MQ3 bytes 0 and 1
         } else {
             vec![offset + 8] // code 2 occupies MQ2 bits 4..5 of byte 0
@@ -774,7 +896,11 @@ fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::FinalCodes
     } else if is_early_special_format(&args.format) {
         Route::EarlySpecial
-    } else if args.input.as_deref().is_some_and(|i| is_gguf_input(Path::new(i))) {
+    } else if args
+        .input
+        .as_deref()
+        .is_some_and(|i| is_gguf_input(Path::new(i)))
+    {
         Route::Gguf
     } else if args.reap_overlay.is_some() {
         Route::ReapOverlay
@@ -877,9 +1003,7 @@ pub(crate) fn run() {
             .as_deref()
             .expect("--input is required with --qwen4-dev-tiny");
         if input.starts_with("hf://") {
-            eprintln!(
-                "error: --qwen4-dev-tiny needs a local safetensors directory, not '{input}'"
-            );
+            eprintln!("error: --qwen4-dev-tiny needs a local safetensors directory, not '{input}'");
             std::process::exit(2);
         }
         match crate::qwen4::run_dev_tiny_cli(Path::new(input), Path::new(&args.output), encoding) {
@@ -908,11 +1032,7 @@ pub(crate) fn run() {
             .input
             .as_deref()
             .expect("--input is required for --mq4v2-final-codes");
-        match export_mq4v2_final_codes(
-            Path::new(input),
-            records_path,
-            Path::new(&args.output),
-        ) {
+        match export_mq4v2_final_codes(Path::new(input), records_path, Path::new(&args.output)) {
             Ok((count, source_sha)) => {
                 eprintln!(
                     "MQ4V2 final-code import complete: {count} tensor(s), source_sha={source_sha}, output={}",
@@ -932,8 +1052,16 @@ pub(crate) fn run() {
         (50, args.mq2v2_final_codes.as_deref()),
     ] {
         if let Some(records_path) = records_path {
-            let input = args.input.as_deref().expect("--input is required for final-code import");
-            match export_mqn_final_codes(Path::new(input), records_path, Path::new(&args.output), qt) {
+            let input = args
+                .input
+                .as_deref()
+                .expect("--input is required for final-code import");
+            match export_mqn_final_codes(
+                Path::new(input),
+                records_path,
+                Path::new(&args.output),
+                qt,
+            ) {
                 Ok((count, source_sha)) => {
                     eprintln!("MQ{}V2 final-code import complete: {count} tensor(s), source_sha={source_sha}, output={}", if qt == 49 { 3 } else { 2 }, args.output);
                     return;
@@ -1604,7 +1732,8 @@ pub(crate) fn run() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.awq || args.awq_alpha.is_some() || args.awq_a4_aware || args.awq_a4_route_c2;
+    let awq_enabled =
+        args.awq || args.awq_alpha.is_some() || args.awq_a4_aware || args.awq_a4_route_c2;
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
     let main_route = route_for(&args) == crate::cli::Route::Main;
     // ── Unknown --format ──
@@ -1612,26 +1741,68 @@ pub(crate) fn run() {
     // typo silently produced a qt=0 model. `q4f16` is the one spelling that
     // asks for that arm on purpose.
     let use_q4f16 = format == "q4f16";
-    let format_known = use_q8 || use_q4f16 || use_f32_passthrough || use_mixed || use_fast
-        || use_q8hfq || use_q4k_all || use_q4k_q8embed || use_mq8g256
-        || use_deepseek4_source_precision || use_deepseek4_mq2rxt_overlay
-        || use_mq4g256 || use_mq4v2 || use_mq4v2_lloyd || use_mq4c
-        || use_hfq4g256 || use_hfq3g256 || use_hfq3g128 || use_hfq2g256 || use_hfq2g128
-        || use_hfq_mixed || use_mq6g256 || use_mq5g256 || use_mq6g256v2 || use_mq5g256v2
-        || use_mq3g256v2 || use_mq2g256v2 || use_bf16 || use_f16
-        || use_mq4_mq2lloydexp || use_mq4_mq2glexp || use_mq4_mq2lloyd_native
-        || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap
-        || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq
-        || use_mq4_mq2lloyd_gptq_all || use_mq4_mq6exp
-        || use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq2g256_lloyd_anchored
-        || use_mq3g256_lloyd || use_mq4g256_lloyd || use_hfq6 || use_hfp4 || use_mfp4
-        || use_mfp4l || use_mfp4p || use_mfp4e8 || use_mfp4e8soa
-        || use_mfp3e8_gptq_fmt || use_mfp2e8_gptq_fmt;
+    let format_known = use_q8
+        || use_q4f16
+        || use_f32_passthrough
+        || use_mixed
+        || use_fast
+        || use_q8hfq
+        || use_q4k_all
+        || use_q4k_q8embed
+        || use_mq8g256
+        || use_deepseek4_source_precision
+        || use_deepseek4_mq2rxt_overlay
+        || use_mq4g256
+        || use_mq4v2
+        || use_mq4v2_lloyd
+        || use_mq4c
+        || use_hfq4g256
+        || use_hfq3g256
+        || use_hfq3g128
+        || use_hfq2g256
+        || use_hfq2g128
+        || use_hfq_mixed
+        || use_mq6g256
+        || use_mq5g256
+        || use_mq6g256v2
+        || use_mq5g256v2
+        || use_mq3g256v2
+        || use_mq2g256v2
+        || use_bf16
+        || use_f16
+        || use_mq4_mq2lloydexp
+        || use_mq4_mq2glexp
+        || use_mq4_mq2lloyd_native
+        || use_mq4_mq2lloyd_kmap
+        || use_mq4_mq2lloyd_imatrix
+        || use_mq4_mq3lloyd_kmap
+        || use_mq4_mqlloyd_tiered
+        || use_mq4_mqlloyd_antirez
+        || use_mq4_mqlloyd_antirez_gptq
+        || use_mq4_mq2lloyd_gptq_all
+        || use_mq4_mq6exp
+        || use_mq3g256
+        || use_mq2g256
+        || use_mq2g256_lloyd
+        || use_mq2g256_lloyd_anchored
+        || use_mq3g256_lloyd
+        || use_mq4g256_lloyd
+        || use_hfq6
+        || use_hfp4
+        || use_mfp4
+        || use_mfp4l
+        || use_mfp4p
+        || use_mfp4e8
+        || use_mfp4e8soa
+        || use_mfp3e8_gptq_fmt
+        || use_mfp2e8_gptq_fmt;
     if main_route && !format_known {
         if GgufFormat::from_flag(format).is_some() {
             eprintln!("error: --format {format} is only supported for GGUF weight input");
         } else {
-            eprintln!("error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)");
+            eprintln!(
+                "error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)"
+            );
         }
         std::process::exit(2);
     }
@@ -1659,13 +1830,31 @@ pub(crate) fn run() {
         std::process::exit(2);
     }
     // Formats whose encoder arm applies AWQ pre-scaling to dense tensors.
-    let awq_format = use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2glexp
-        || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix
-        || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez
-        || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all
-        || use_mq4v2 || use_mq4v2_lloyd || use_mq4c || use_mq5g256 || use_mq6g256v2
-        || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2 || use_mq3g256_lloyd
-        || use_mq2g256_lloyd_anchored || use_mq2g256_lloyd || use_mq3g256 || use_mq2g256;
+    let awq_format = use_mq4g256
+        || use_mq4_mq6exp
+        || use_mq4_mq2lloydexp
+        || use_mq4_mq2glexp
+        || use_mq4_mq2lloyd_native
+        || use_mq4_mq2lloyd_kmap
+        || use_mq4_mq2lloyd_imatrix
+        || use_mq4_mq3lloyd_kmap
+        || use_mq4_mqlloyd_tiered
+        || use_mq4_mqlloyd_antirez
+        || use_mq4_mqlloyd_antirez_gptq
+        || use_mq4_mq2lloyd_gptq_all
+        || use_mq4v2
+        || use_mq4v2_lloyd
+        || use_mq4c
+        || use_mq5g256
+        || use_mq6g256v2
+        || use_mq5g256v2
+        || use_mq3g256v2
+        || use_mq2g256v2
+        || use_mq3g256_lloyd
+        || use_mq2g256_lloyd_anchored
+        || use_mq2g256_lloyd
+        || use_mq3g256
+        || use_mq2g256;
     if (args.awq_a4_aware || args.awq_a4_route_c2) && !use_mq4v2 {
         eprintln!("error: A4-aware AWQ currently requires --format mq4v2");
         std::process::exit(1);
@@ -1686,7 +1875,10 @@ pub(crate) fn run() {
         AWQ_A4_ROUTE_C2.set(true).expect("AWQ c2 recipe set twice");
     }
     if let Some(capture) = &args.awq_a4_signed_capture {
-        let source_sha = args.awq_a4_source_sha.as_ref().expect("capture requires source SHA");
+        let source_sha = args
+            .awq_a4_source_sha
+            .as_ref()
+            .expect("capture requires source SHA");
         if source_sha.len() != 64 || !source_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             eprintln!("error: --awq-a4-source-sha must be a 64-digit SHA-256");
             std::process::exit(1);
@@ -1696,7 +1888,8 @@ pub(crate) fn run() {
                 eprintln!("error: cannot open AWQ capture manifest: {error}");
                 std::process::exit(1);
             }),
-        ).unwrap_or_else(|error| {
+        )
+        .unwrap_or_else(|error| {
             eprintln!("error: invalid AWQ capture manifest: {error}");
             std::process::exit(1);
         });
@@ -1706,33 +1899,34 @@ pub(crate) fn run() {
             eprintln!("error: AWQ capture source SHA/path does not match --input");
             std::process::exit(1);
         }
-        AWQ_A4_SIGNED_CAPTURE.set(capture.clone()).expect("AWQ capture set twice");
-        AWQ_A4_SOURCE_SHA.set(source_sha.clone()).expect("AWQ source SHA set twice");
-        eprintln!("AWQ signed QAT capture: {} (partial-layer c2/symmetric objective)", capture.display());
+        AWQ_A4_SIGNED_CAPTURE
+            .set(capture.clone())
+            .expect("AWQ capture set twice");
+        AWQ_A4_SOURCE_SHA
+            .set(source_sha.clone())
+            .expect("AWQ source SHA set twice");
+        eprintln!(
+            "AWQ signed QAT capture: {} (partial-layer c2/symmetric objective)",
+            capture.display()
+        );
     }
     MQ4V2_SYMMETRIC
         .set(args.mq4v2_symmetric)
         .expect("MQ4V2_SYMMETRIC set twice — should not happen");
     if args.mq4v2_symmetric {
-        eprintln!(
-            "MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)"
-        );
+        eprintln!("MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)");
     }
     MQ3V2_SYMMETRIC
         .set(args.mq3v2_symmetric)
         .expect("MQ3V2_SYMMETRIC set twice — should not happen");
     if args.mq3v2_symmetric {
-        eprintln!(
-            "MQ3V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-4*d)"
-        );
+        eprintln!("MQ3V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-4*d)");
     }
     MQ2V2_SYMMETRIC
         .set(args.mq2v2_symmetric)
         .expect("MQ2V2_SYMMETRIC set twice — should not happen");
     if args.mq2v2_symmetric {
-        eprintln!(
-            "MQ2V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-2*d)"
-        );
+        eprintln!("MQ2V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-2*d)");
     }
     if awq_enabled {
         if IMATRIX.get().is_none() {
@@ -2155,7 +2349,14 @@ pub(crate) fn run() {
     if is_cohere2moe {
         // The cohere2moe handler only knows these tiers; any other format
         // used to fall through to Q8 experts without a word.
-        if !(use_q8 || use_f16 || use_bf16 || use_f32_passthrough || use_mq6g256 || use_mq4g256 || use_mq4v2) {
+        if !(use_q8
+            || use_f16
+            || use_bf16
+            || use_f32_passthrough
+            || use_mq6g256
+            || use_mq4g256
+            || use_mq4v2)
+        {
             eprintln!(
                 "error: --format {format} is not supported for Cohere2-MoE; use one of q8, f16, bf16, oracle, mq6, mq4 (experts are written as MQ4G256, qt=13)"
             );
@@ -2270,7 +2471,10 @@ pub(crate) fn run() {
         // The ST ≤ v3 file first; the newer config_sentence_transformers.json
         // wins per key where both define one — the same precedence the dir
         // loader's overlay order gives.
-        for rel in ["sentence_bert_config.json", "config_sentence_transformers.json"] {
+        for rel in [
+            "sentence_bert_config.json",
+            "config_sentence_transformers.json",
+        ] {
             if let Some(v) = read(rel) {
                 for k in ["prompts", "query_length", "document_length"] {
                     if let Some(val) = v.get(k) {
@@ -2333,8 +2537,9 @@ pub(crate) fn run() {
     if let Some(capture) = &args.awq_a4_signed_capture {
         let manifest_path = capture.join("manifest.json");
         let manifest: serde_json::Value = serde_json::from_reader(
-            File::open(&manifest_path).expect("AWQ capture manifest disappeared")
-        ).expect("AWQ capture manifest changed");
+            File::open(&manifest_path).expect("AWQ capture manifest disappeared"),
+        )
+        .expect("AWQ capture manifest changed");
         metadata["awq_a4_capture"] = serde_json::json!({
             "source_sha256": manifest["source"]["sha256"],
             "prompt_sha256": manifest["corpus"]["token_stream"]["sha256"],
@@ -2410,10 +2615,22 @@ pub(crate) fn run() {
         // Visit the largest fused projection first so it chooses the alpha
         // cached for its qkvza/gate-up siblings.
         const A4_ANCHOR_ORDER: [(&str, &str); 7] = [
-            (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_0_qkv.weight"),
-            (".linear_attn.in_proj_z.weight", ".linear_attn.in_proj_1_z.weight"),
-            (".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_2_a.weight"),
-            (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_3_b.weight"),
+            (
+                ".linear_attn.in_proj_qkv.weight",
+                ".linear_attn.in_proj_0_qkv.weight",
+            ),
+            (
+                ".linear_attn.in_proj_z.weight",
+                ".linear_attn.in_proj_1_z.weight",
+            ),
+            (
+                ".linear_attn.in_proj_a.weight",
+                ".linear_attn.in_proj_2_a.weight",
+            ),
+            (
+                ".linear_attn.in_proj_b.weight",
+                ".linear_attn.in_proj_3_b.weight",
+            ),
             (".self_attn.q_proj.weight", ".self_attn.0_q_proj.weight"),
             (".self_attn.k_proj.weight", ".self_attn.1_k_proj.weight"),
             (".self_attn.v_proj.weight", ".self_attn.2_v_proj.weight"),
@@ -3803,7 +4020,7 @@ pub(crate) fn run() {
                 &st_files,
             );
         } // Release source file page cache after each tensor to prevent
-        // mmap'd pages from starving GPU allocations on UMA systems.
+          // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
     }
 
@@ -4066,7 +4283,10 @@ pub(crate) fn run() {
         spill.as_mut(),
     )
     .unwrap_or_else(|e| {
-        eprintln!("error: writing {} failed: {e}; no output written", output_path.display());
+        eprintln!(
+            "error: writing {} failed: {e}; no output written",
+            output_path.display()
+        );
         if let Some(s) = spill.as_ref() {
             let _ = std::fs::remove_file(s.path());
         }
@@ -4652,6 +4872,12 @@ fn try_handle_lfm2moe(
                 data: bytes,
                 spilled_len: 0,
             });
+            // The bias rides F32 (precision-sensitive router input), but it is
+            // still a handled tensor: count it or the load-bearing
+            // "param accounting does not close" check refuses the artifact
+            // (caught live quantizing LFM2.5-24B-A2B: 38 MoE layers × 64
+            // experts = 2432 dropped params).
+            *quantized_params += n_elements as u64;
             st_files[file_idx].drop_tensor_pages(name);
             return true;
         }
@@ -5852,9 +6078,7 @@ fn handle_moe_expert_3d(
                     && (use_mq4v2 || use_mq4v2_lloyd)
                     && mq6v2_promote_supported(arch_id)
                 {
-                    let q = quantize_mq6g256v2(
-                        &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
-                    );
+                    let q = quantize_mq6g256v2(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                     (q, QuantType::MQ6G256V2, 256u32)
                 } else {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
@@ -5936,7 +6160,8 @@ fn handle_moe_expert_3d(
                 // This arm is what makes `--format mq4` mean qt44 for routed
                 // experts. Without it the experts fall to the qt13 arm below,
                 // and on an A3B MoE that is ~99% of the model by tensor count.
-                let q = quantize_mq4g256v2_selected(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                let q =
+                    quantize_mq4g256v2_selected(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                 (q, QuantType::MQ4G256V2, 256u32)
             } else if supports_g256 {
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
@@ -6246,9 +6471,7 @@ fn handle_main_quant(
                         && mq6v2_promote_supported(arch_id)
                     {
                         let m = n_elements / k_dim;
-                        let q = quantize_mq6g256v2(
-                            &f32_data, m, k_dim, &signs1, &signs2,
-                        );
+                        let q = quantize_mq6g256v2(&f32_data, m, k_dim, &signs1, &signs2);
                         (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                     } else {
                         let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
@@ -6338,13 +6561,7 @@ fn handle_main_quant(
                                 if awq_eligible(name) {
                                     let m_dim = meta.shape[0];
                                     let selected = compute_awq_scales_for_weight(
-                                        name,
-                                        im_weights,
-                                        alpha,
-                                        &f32_data,
-                                        m_dim,
-                                        k_dim,
-                                        &signs1,
+                                        name, im_weights, alpha, &f32_data, m_dim, k_dim, &signs1,
                                         &signs2,
                                     );
                                     if selected.relative_output_mse.is_finite() {
@@ -6357,7 +6574,9 @@ fn handle_main_quant(
                                     awq_sidecar_scales = Some(scales.clone());
                                     let mut scaled = f32_data.clone();
                                     awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                    quantize_mq4g256v2_selected(
+                                        &scaled, m_dim, k_dim, &signs1, &signs2,
+                                    )
                                 } else {
                                     let m = meta.shape[0];
                                     let k = k_dim;
@@ -6998,13 +7217,7 @@ fn handle_main_quant(
                             if awq_eligible(name) {
                                 let m_dim = meta.shape[0];
                                 let selected = compute_awq_scales_for_weight(
-                                    name,
-                                    im_weights,
-                                    alpha,
-                                    &f32_data,
-                                    m_dim,
-                                    k_dim,
-                                    &signs1,
+                                    name, im_weights, alpha, &f32_data, m_dim, k_dim, &signs1,
                                     &signs2,
                                 );
                                 if selected.relative_output_mse.is_finite() {
@@ -7542,7 +7755,9 @@ fn handle_main_quant(
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq3g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
-                                quantize_mq3g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq3g256v2_selected(
+                                    &f32_data, m_dim, k_dim, &signs1, &signs2,
+                                )
                             }
                         } else {
                             quantize_mq3g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
@@ -7575,7 +7790,9 @@ fn handle_main_quant(
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq2g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
-                                quantize_mq2g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq2g256v2_selected(
+                                    &f32_data, m_dim, k_dim, &signs1, &signs2,
+                                )
                             }
                         } else {
                             quantize_mq2g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
@@ -7903,7 +8120,7 @@ fn handle_main_quant(
                     (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
                 }
             }; // end K-map outer if-else
-            // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
+               // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
             if qt == QuantType::Q4F16G64 {
                 let is_q4_opt_in = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
                 if !is_q4_opt_in
@@ -8454,7 +8671,9 @@ mod handle_main_quant_f16_fallback_tests {
         let mut spill: Option<TensorSpill> = None;
         let name = "model.layers.10.self_attn.q_proj.weight";
         let shape = vec![4usize, 256];
-        let vals: Vec<f32> = (0..1024).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01).collect();
+        let vals: Vec<f32> = (0..1024)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+            .collect();
         let raw = f16_bytes_of(&vals);
         let mut state = MainQuantState {
             hfq_tensors: &mut hfq_tensors,
@@ -8555,12 +8774,7 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
 
     /// Runs the REAL `handle_moe_expert_3d` for one stacked expert tensor with
     /// K-map Promote6, exactly the flag set `run()` builds for `recipe`.
-    fn run_handler(
-        arch_id: u32,
-        recipe: Recipe,
-        shape: [usize; 3],
-        bf16: &[u8],
-    ) -> Vec<HfqTensor> {
+    fn run_handler(arch_id: u32, recipe: Recipe, shape: [usize; 3], bf16: &[u8]) -> Vec<HfqTensor> {
         assert_no_ambient_expert_overrides();
         let dir = tempfile::tempdir().unwrap();
         let st_path = dir.path().join("experts.safetensors");
@@ -8593,47 +8807,47 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
             false,
             0.0,
             &None,
-            false, // use_gptq_e8
-            false, // use_gptq_mfp3e8
-            false, // use_gptq_mfp2e8
-            false, // use_mq6g256
-            false, // use_mq4g256
-            matches!(recipe, Recipe::Mq4V2), // use_mq4v2
+            false,                                // use_gptq_e8
+            false,                                // use_gptq_mfp3e8
+            false,                                // use_gptq_mfp2e8
+            false,                                // use_mq6g256
+            false,                                // use_mq4g256
+            matches!(recipe, Recipe::Mq4V2),      // use_mq4v2
             matches!(recipe, Recipe::Mq4V2Lloyd), // use_mq4v2_lloyd
-            false, // use_mq4c
-            false, // use_mq4_mq6exp
-            false, // use_mq4_mq2lloydexp
-            false, // use_mq4_mq2glexp
-            false, // use_mq4_mq2lloyd_native
-            false, // use_mq4_mq2lloyd_kmap
-            false, // use_mq4_mq2lloyd_imatrix
-            false, // use_mq4_mq3lloyd_kmap
-            false, // use_mq4_mqlloyd_tiered
-            false, // use_mq4_mqlloyd_antirez
-            false, // use_mq4_mqlloyd_antirez_gptq
-            false, // use_mq4_mq2lloyd_gptq_all
-            false, // use_mq5g256
-            false, // use_hfq6
-            false, // use_hfq4g256
-            false, // use_hfq3g256
-            false, // use_hfq3g128
-            false, // use_hfq2g256
-            false, // use_hfq2g128
-            false, // use_hfq_mixed
-            false, // use_mfp4
-            false, // use_mfp4p
-            false, // use_mfp4e8
-            false, // use_mfp4e8soa
-            false, // use_mfp3e8_gptq_fmt
-            false, // use_mfp2e8_gptq_fmt
-            false, // use_mq3g256
-            false, // use_mq2g256
-            false, // use_mq2g256_lloyd
-            false, // use_mq3g256_lloyd
-            false, // use_mq4g256_lloyd
-            false, // use_hfp4
-            false, // use_mfp4l
-            false, // routed_gl
+            false,                                // use_mq4c
+            false,                                // use_mq4_mq6exp
+            false,                                // use_mq4_mq2lloydexp
+            false,                                // use_mq4_mq2glexp
+            false,                                // use_mq4_mq2lloyd_native
+            false,                                // use_mq4_mq2lloyd_kmap
+            false,                                // use_mq4_mq2lloyd_imatrix
+            false,                                // use_mq4_mq3lloyd_kmap
+            false,                                // use_mq4_mqlloyd_tiered
+            false,                                // use_mq4_mqlloyd_antirez
+            false,                                // use_mq4_mqlloyd_antirez_gptq
+            false,                                // use_mq4_mq2lloyd_gptq_all
+            false,                                // use_mq5g256
+            false,                                // use_hfq6
+            false,                                // use_hfq4g256
+            false,                                // use_hfq3g256
+            false,                                // use_hfq3g128
+            false,                                // use_hfq2g256
+            false,                                // use_hfq2g128
+            false,                                // use_hfq_mixed
+            false,                                // use_mfp4
+            false,                                // use_mfp4p
+            false,                                // use_mfp4e8
+            false,                                // use_mfp4e8soa
+            false,                                // use_mfp3e8_gptq_fmt
+            false,                                // use_mfp2e8_gptq_fmt
+            false,                                // use_mq3g256
+            false,                                // use_mq2g256
+            false,                                // use_mq2g256_lloyd
+            false,                                // use_mq3g256_lloyd
+            false,                                // use_mq4g256_lloyd
+            false,                                // use_hfp4
+            false,                                // use_mfp4l
+            false,                                // routed_gl
             &None,
             false,
             &None,
@@ -8696,7 +8910,11 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         for arch in UNAUDITED_ARCHS {
             let tensors = run_handler(arch, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
             let what = format!("arch {arch} Lloyd+Promote6");
-            assert_eq!(tensors.len(), SYNTH_SHAPE[0], "{what}: one tensor per expert");
+            assert_eq!(
+                tensors.len(),
+                SYNTH_SHAPE[0],
+                "{what}: one tensor per expert"
+            );
             assert_all_qt(&tensors, QuantType::MQ4G256, &what);
             for (slot, t) in tensors.iter().enumerate() {
                 assert_eq!(
@@ -8730,7 +8948,11 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
         for arch in QT47_ARCHS {
             let tensors = run_handler(arch, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
-            assert_all_qt(&tensors, QuantType::MQ6G256V2, &format!("arch {arch} Lloyd+Promote6"));
+            assert_all_qt(
+                &tensors,
+                QuantType::MQ6G256V2,
+                &format!("arch {arch} Lloyd+Promote6"),
+            );
             assert_ne!(tensors_sha256(&tensors), SYNTH_TENSORS_SHA256);
         }
     }
@@ -8742,7 +8964,11 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
         for arch in UNAUDITED_ARCHS {
             let tensors = run_handler(arch, Recipe::Mq4V2, SYNTH_SHAPE, &bf16);
-            assert_all_qt(&tensors, QuantType::MQ6G256, &format!("arch {arch} MQ4V2+Promote6"));
+            assert_all_qt(
+                &tensors,
+                QuantType::MQ6G256,
+                &format!("arch {arch} MQ4V2+Promote6"),
+            );
         }
     }
 
@@ -8756,7 +8982,12 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
     #[test]
     #[ignore = "real-checkpoint: needs /mnt/nas/kaden/models/Qwen3.5-35B-A3B (or MQ6_REAL_A3B_DIR)"]
     fn unaudited_arch_lloyd_promote6_real_expert0_gate_up_stays_qt13_with_baseline_bytes() {
-        let tensors = run_handler(10, Recipe::Mq4V2Lloyd, [1, 1024, 2048], &real_expert0_gate_up());
+        let tensors = run_handler(
+            10,
+            Recipe::Mq4V2Lloyd,
+            [1, 1024, 2048],
+            &real_expert0_gate_up(),
+        );
         assert_eq!(tensors.len(), 1);
         assert_all_qt(&tensors, QuantType::MQ4G256, "real expert0 gate_up arch 10");
         assert_eq!(tensors[0].data.len(), 1024 * 2048 / 256 * 136);
@@ -8771,8 +9002,8 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
                 .unwrap_or_else(|_| "/mnt/nas/kaden/models/Qwen3.5-35B-A3B".to_string()),
         );
         let path = dir.join("model.safetensors-00006-of-00014.safetensors");
-        let file = SafetensorsFile::open(&path)
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let file =
+            SafetensorsFile::open(&path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         let name = "model.language_model.layers.0.mlp.experts.gate_up_proj";
         let (meta, bytes) = file
             .tensor_data(name)
