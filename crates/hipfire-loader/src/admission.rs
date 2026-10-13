@@ -312,6 +312,12 @@ pub(crate) fn partial_offload_refusal(
         let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
             .map_err(|e| format!("qwen35 config: {e}"))?;
         (config.paged_experts, config.reap_keep.is_some())
+    } else if arch_id == 11 {
+        // LFM2.5 parses its own REAP keep-map inside `Lfm2MoeConfig::from_hfq`
+        // (`apply_reap_plan`). It has no paged-expert route.
+        let config = hipfire_arch_lfm2moe::Lfm2MoeConfig::from_hfq(hfq)
+            .map_err(|e| format!("lfm2moe config: {e}"))?;
+        (false, config.reap_keep.is_some())
     } else {
         (false, false)
     };
@@ -327,12 +333,13 @@ pub(crate) fn partial_offload_refusal(
 fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
     use hipfire_config::memory::SpillRefusal::*;
     match refusal {
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
-        // RAM. Qwen4 has its own expert-residency route and the other arches have
-        // none, so either knob is a request this loader cannot honour.
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
         Arch(arch_id) => format!(
             "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
-             only; this source is arch id {arch_id}. Unset both keys for this model"
+             and LFM2.5 only; this source is arch id {arch_id}. Unset both keys for this model"
         ),
         Tp(tp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
@@ -1389,8 +1396,7 @@ pub fn admit_source_with_options(
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
-    if hipfire_arch_qwen35::carrier::weight_host_socket()?
-        .is_some()
+    if hipfire_arch_qwen35::carrier::weight_host_socket()?.is_some()
         && (arch_id != 5 || is_dir || tp != 1 || pp != 1)
     {
         return Err(format!(
@@ -1428,10 +1434,13 @@ pub fn admit_source_with_options(
         let ep = hipfire_config::topology::qwen4_ep()?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp, ep)?;
         let spec_mtp = options.spec.mtp;
-        let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
+        let carrier =
+            crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
         crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
         carrier.admit_options(draft_path, options)?;
-        if let Some(refusal) = qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count()) {
+        if let Some(refusal) =
+            qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count())
+        {
             return Err(refusal);
         }
         // The PLE rows source is chosen (and a missing q4 derived from the
@@ -1927,7 +1936,10 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
-        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1),
+            Ok(true)
+        );
         assert_eq!(
             qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1, 1),
             Ok(false)
@@ -1950,7 +1962,10 @@ mod tests {
         // Expert parallelism attaches the head only on an explicit `on`:
         // `auto`/off stay AR.
         for ep in [2, 4] {
-            assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep),
+                Ok(false)
+            );
             assert_eq!(
                 qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
                 Ok(false)
@@ -1973,7 +1988,12 @@ mod tests {
         }
         assert_eq!(admit(1, 1, 1, true), Ok(()));
         for ep in [0, 3, 5, 8] {
-            assert!(admit(1, 1, ep, false).unwrap_err().contains("ep in {1, 2, 4}"), "ep {ep}");
+            assert!(
+                admit(1, 1, ep, false)
+                    .unwrap_err()
+                    .contains("ep in {1, 2, 4}"),
+                "ep {ep}"
+            );
         }
         for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4)] {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
@@ -1989,9 +2009,15 @@ mod tests {
         assert_eq!(qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4)), None);
         assert_eq!(qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None), None);
         let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1100", Some(4)).unwrap();
-        assert!(arch.contains("gfx1201") && arch.contains("expert parallelism"), "{arch}");
+        assert!(
+            arch.contains("gfx1201") && arch.contains("expert parallelism"),
+            "{arch}"
+        );
         let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2)).unwrap();
-        assert!(count.contains("4 visible devices") && count.contains("2 visible"), "{count}");
+        assert!(
+            count.contains("4 visible devices") && count.contains("2 visible"),
+            "{count}"
+        );
         assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2)).is_some());
         assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2)).is_some());
     }
@@ -2003,12 +2029,17 @@ mod tests {
         assert_eq!(qwen4_ep_device_refusal(4, &gfx1201(4), all), Ok(()));
         assert_eq!(qwen4_ep_device_refusal(2, &gfx1201(4), all), Ok(()));
         // Too few devices.
-        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all).unwrap_err().contains("3 visible"));
+        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all)
+            .unwrap_err()
+            .contains("3 visible"));
         // A different arch on rank 2 refuses and names the rank.
         let mut mixed = gfx1201(4);
         mixed[2] = "gfx1100".to_string();
         let error = qwen4_ep_device_refusal(4, &mixed, all).unwrap_err();
-        assert!(error.contains("rank 2") && error.contains("gfx1100"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("gfx1100"),
+            "{error}"
+        );
         // An arch beyond the rank count is not part of the mesh.
         assert_eq!(qwen4_ep_device_refusal(2, &mixed, all), Ok(()));
         // Every directed pair is probed; one missing direction refuses.
@@ -2023,9 +2054,11 @@ mod tests {
             qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| Ok(!(a == 3 && b == 1))).unwrap_err();
         assert!(error.contains("device 3 cannot access device 1"), "{error}");
         // A failed query is an error, not "no peer".
-        assert!(qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
-            .unwrap_err()
-            .contains("hip"));
+        assert!(
+            qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
+                .unwrap_err()
+                .contains("hip")
+        );
     }
 
     #[test]

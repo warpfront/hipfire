@@ -20,9 +20,11 @@ use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::offload::Placement;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
+use hipfire_runtime::weight_backend::MemoryTarget;
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
@@ -62,11 +64,18 @@ fn load_lfm2_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Op
 /// LFM2 uses STANDARD RMSNorm (`weight * x̂`, no +1 offset — verified against
 /// Lfm2MoeRMSNorm), so no offset is baked in. Also used for the depthwise conv
 /// filter ([hidden, K]) and the F32 expert_bias.
+///
+/// `target` follows the owning layer's residency: a host-placed layer keeps
+/// its norms (and conv filter, expert_bias) in pinned host RAM — the kernels
+/// that read them (`rmsnorm_f32`, `conv1d_gated_decode_f32`,
+/// `deepseek4_moe_topk_bias_aware_f32`) dereference the device alias of the
+/// host-mapped buffer, exactly the dense-projection contract.
 fn load_f32(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     name: &str,
     shape: &[usize],
+    target: MemoryTarget,
 ) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let f32_data: Vec<f32> = match qt {
@@ -96,8 +105,12 @@ fn load_f32(
             ))
         }
     };
-    gpu.upload_f32(&f32_data, shape)
-        .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
+    let buf = match target {
+        MemoryTarget::Device => gpu.upload_f32(&f32_data, shape),
+        MemoryTarget::HostMapped => gpu.upload_f32_host(&f32_data, shape),
+    }
+    .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))?;
+    Ok(buf)
 }
 
 /// REAP keep variant of [`load_f32`] for a 1-D per-expert vector (the MoE
@@ -112,11 +125,16 @@ fn load_f32_keep(
     name: &str,
     m: usize,
     keep: &[u32],
+    target: MemoryTarget,
 ) -> Result<GpuTensor, String> {
     debug_assert_eq!(m, keep.len(), "load_f32_keep: m must equal keep.len()");
     let f32_data = hipfire_reap::load::gather_f32_vec("lfm2moe", hfq, name, keep)?;
-    gpu.upload_f32(&f32_data, &[m])
-        .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
+    let buf = match target {
+        MemoryTarget::Device => gpu.upload_f32(&f32_data, &[m]),
+        MemoryTarget::HostMapped => gpu.upload_f32_host(&f32_data, &[m]),
+    }
+    .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))?;
+    Ok(buf)
 }
 
 /// Minimal Q8_0 dequant (32-elem blocks: little-endian f16 scale + 32 int8).
@@ -137,9 +155,10 @@ fn load_wt(
     name: &str,
     m: usize,
     k: usize,
+    target: MemoryTarget,
 ) -> Result<WeightTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
-    wt_from_raw(gpu, qt, &data, m, k).map_err(|e| format!("lfm2moe: load_wt {name}: {e}"))
+    wt_from_raw(gpu, qt, &data, m, k, target).map_err(|e| format!("lfm2moe: load_wt {name}: {e}"))
 }
 
 /// REAP keep variant of [`load_wt`]: gather the tensor's first-axis rows (one
@@ -162,20 +181,31 @@ fn load_wt_keep(
     m: usize,
     k: usize,
     keep: &[u32],
+    target: MemoryTarget,
 ) -> Result<WeightTensor, String> {
     debug_assert_eq!(m, keep.len(), "load_wt_keep: m must equal keep.len()");
     let (qt, sub) = hipfire_reap::load::gather_weight_rows("lfm2moe", hfq, name, keep)?;
-    wt_from_raw(gpu, qt, &sub, m, k).map_err(|e| format!("lfm2moe: load_wt_keep {name}: {e}"))
+    wt_from_raw(gpu, qt, &sub, m, k, target)
+        .map_err(|e| format!("lfm2moe: load_wt_keep {name}: {e}"))
 }
 
 /// quant_type → DType mapping (mirrors minimax::wt_from_raw); uploads raw
 /// bytes and tags the dtype for kernel dispatch.
+///
+/// `target` places the payload in VRAM (Device) or pinned host RAM
+/// (HostMapped) — the GEMV/MoE kernels read a host-mapped weight through its
+/// device alias over PCIe, so dispatch and kernels are unchanged (the
+/// partial-offload contract). Every arm can host-place, including the
+/// BF16→F32 widening (`upload_f32_host`): this crate owns the whole decode
+/// path, so the f32-fallback refusal the shared qwen35 loader needs
+/// (`weight_backend::HOST_DECODE_REFUSAL`) does not apply here.
 fn wt_from_raw(
     gpu: &mut Gpu,
     qt: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    target: MemoryTarget,
 ) -> Result<WeightTensor, String> {
     // BF16 teacher (qt=16): when HIPFIRE_CALIB_BF16=1 keep native BF16
     // (raw 2-byte payload, DType::BF16, MFMA kernel); otherwise widen to F32
@@ -188,9 +218,8 @@ fn wt_from_raw(
                     data.len()
                 ));
             }
-            let buf = gpu
-                .upload_raw(data, &[data.len()])
-                .map_err(|e| format!("upload_raw BF16 {m}x{k}: {e:?}"))?;
+            let buf = upload_raw_for_target(gpu, data, &[data.len()], target)
+                .map_err(|e| format!("upload BF16 {m}x{k}: {e:?}"))?;
             return Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::BF16,
@@ -214,9 +243,11 @@ fn wt_from_raw(
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect();
-        let buf = gpu
-            .upload_f32(&f32_data, &[m, k])
-            .map_err(|e| format!("lfm2moe: upload F32 BF16->F32 {m}x{k}: {e:?}"))?;
+        let buf = match target {
+            MemoryTarget::Device => gpu.upload_f32(&f32_data, &[m, k]),
+            MemoryTarget::HostMapped => gpu.upload_f32_host(&f32_data, &[m, k]),
+        }
+        .map_err(|e| format!("lfm2moe: upload F32 BF16->F32 {m}x{k}: {e:?}"))?;
         return Ok(WeightTensor {
             buf,
             gpu_dtype: DType::F32,
@@ -230,7 +261,44 @@ fn wt_from_raw(
             lloyd_lut_c16: None,
         });
     }
-    let dtype = match qt {
+    let dtype = lfm2_dtype_from_qt(qt)?;
+    let buf = upload_raw_for_target(gpu, data, &[data.len()], target)
+        .map_err(|e| format!("upload_raw: {e:?}"))?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    })
+}
+
+/// `upload_raw` when the payload stays in VRAM, `upload_raw_host_mapped` when
+/// the layer/expert tier placed it in host RAM. Device is the zero-diff
+/// default every resident load takes.
+fn upload_raw_for_target(
+    gpu: &mut Gpu,
+    data: &[u8],
+    shape: &[usize],
+    target: MemoryTarget,
+) -> HipResult<GpuTensor> {
+    match target {
+        MemoryTarget::Device => gpu.upload_raw(data, shape),
+        MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(data, shape),
+    }
+}
+
+/// quant_type → `DType` for the raw-upload arms. Shared by [`wt_from_raw`] and
+/// the packed host-expert path so the two cannot tag a layout differently.
+/// qt 16 (BF16) and the f32-dequant formats are deliberately absent: they are
+/// handled (or refused) before this mapping.
+fn lfm2_dtype_from_qt(qt: u8) -> Result<DType, String> {
+    Ok(match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
         8 => DType::HFQ6G256,
@@ -244,21 +312,6 @@ fn wt_from_raw(
         44 => DType::MQ4G256V2,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
-    };
-    let buf = gpu
-        .upload_raw(data, &[data.len()])
-        .map_err(|e| format!("upload_raw: {e:?}"))?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: dtype,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-        lloyd_lut_e4m3: None,
-        lloyd_lut_f16: None,
-        lloyd_lut_c16: None,
     })
 }
 
@@ -275,14 +328,27 @@ fn finish_hfq_expert(
     down_bytes: &[u8],
     hidden: usize,
     moe_inter: usize,
+    expert_target: MemoryTarget,
 ) -> Result<ExpertWeights, String> {
-    let mut gate_up = wt_from_raw(gpu, gate_up_qt, gate_up_bytes, 2 * moe_inter, hidden)
-        .map_err(|error| format!("lfm2moe: fuse gate_up L{layer}E{source_expert}: {error}"))?;
-    let mut down = wt_from_raw(gpu, down_qt, down_bytes, hidden, moe_inter)
+    let mut gate_up = wt_from_raw(
+        gpu,
+        gate_up_qt,
+        gate_up_bytes,
+        2 * moe_inter,
+        hidden,
+        expert_target,
+    )
+    .map_err(|error| format!("lfm2moe: fuse gate_up L{layer}E{source_expert}: {error}"))?;
+    let mut down = wt_from_raw(gpu, down_qt, down_bytes, hidden, moe_inter, expert_target)
         .map_err(|error| format!("lfm2moe: down L{layer}E{source_expert}: {error}"))?;
     // AWQ scales are layer-shared and emitted once by the quantizer. Attach
     // them to the first compact slot, which is also what the forward reads;
     // this remains correct when REAP prunes original expert zero.
+    //
+    // The sidecar stays device-resident even when this layer's experts are
+    // host-placed (the offload design's deliberate exception): it is a 1-D
+    // f16 vector of length K, so spilling it would cost PCIe bandwidth per
+    // GEMV to save kilobytes.
     if slot == 0 {
         gate_up.awq_scale = load_lfm2_awq_scale(
             hfq,
@@ -308,6 +374,165 @@ fn finish_hfq_expert(
         }
     }
     Ok(ExpertWeights { gate_up, down })
+}
+
+/// One expert's raw payload, byte-fused and read but not yet placed.
+struct RawExpertPayload {
+    source_expert: usize,
+    slot: usize,
+    gate_up_qt: u8,
+    gate_up: Vec<u8>,
+    down_qt: u8,
+    down: Vec<u8>,
+}
+
+/// Host-place a MoE layer's routed experts as two packed host-mapped blobs
+/// (all gate_up payloads concatenated, all down payloads), with per-expert
+/// `WeightTensor`s holding Borrowed `byte_view`s into them.
+///
+/// Why packing is mandatory, not an optimization: every
+/// `Gpu::upload_raw_host_mapped` allocation carries
+/// `HOST_TAIL_PAD_BYTES` (1 MiB — kernels provably over-read a few bytes
+/// past an exact-fit host reservation, and the pad absorbs it). Per-expert
+/// tensors would pay that pad 2 × `num_experts` times per layer — ~7 GiB of
+/// pinned host RAM on the 24B-A2B (64 experts × 38 MoE layers) — and blow
+/// the host-RAM admission. One blob per projection amortizes the pad to
+/// 2 MiB per layer, and an intra-blob expert's over-read lands in the next
+/// expert's mapped bytes; the last expert's lands in the blob's own pad.
+///
+/// The blob views keep the resident contract elsewhere: the per-expert
+/// device pointers in `expert_gate_up_ptrs`/`expert_down_ptrs` come from
+/// each view's `as_ptr()` (the device alias of the host mapping), so the
+/// indexed MoE GEMV kernels are unchanged.
+///
+/// Returns `(experts, blob_owners)`; the owners must outlive the views
+/// (`MoeFfn::expert_blob_owners`).
+fn finish_hfq_experts_packed(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    layer_prefix: &str,
+    layer: usize,
+    raws: Vec<RawExpertPayload>,
+    hidden: usize,
+    moe_inter: usize,
+) -> Result<(Vec<ExpertWeights>, Vec<GpuTensor>), String> {
+    if raws.is_empty() {
+        return Err(format!(
+            "lfm2moe: layer {layer} host expert placement with zero experts"
+        ));
+    }
+    // Uniformity is structural on this arch (every expert of a layer shares
+    // shape and quant), so the blobs can be flat-concatenated with a single
+    // stride. A non-uniform artifact is refused naming the layer instead of
+    // silently mis-slicing the views.
+    let gate_up_qt = raws[0].gate_up_qt;
+    let down_qt = raws[0].down_qt;
+    let gate_up_len = raws[0].gate_up.len();
+    let down_len = raws[0].down.len();
+    for raw in &raws {
+        if raw.gate_up_qt != gate_up_qt
+            || raw.down_qt != down_qt
+            || raw.gate_up.len() != gate_up_len
+            || raw.down.len() != down_len
+        {
+            return Err(format!(
+                "lfm2moe: layer {layer} experts are not uniform \
+                 (qt {}/{}, lens {}/{} vs {}/{}) — cannot pack for host placement",
+                raw.gate_up_qt,
+                raw.down_qt,
+                raw.gate_up.len(),
+                raw.down.len(),
+                gate_up_qt,
+                gate_up_len
+            ));
+        }
+    }
+    // qt 16 (BF16) experts under host placement: the default arm widens BF16
+    // to F32 (a byte-length transform a view cannot express). A quantized
+    // expert never carries qt 16, so refuse rather than half-place.
+    if gate_up_qt == 16 || down_qt == 16 {
+        return Err(format!(
+            "lfm2moe: layer {layer} carries BF16 (qt 16) routed experts, which have no \
+             packed host placement; quantize the experts or keep this layer resident"
+        ));
+    }
+    let gate_up_dtype = lfm2_dtype_from_qt(gate_up_qt)
+        .map_err(|e| format!("lfm2moe: pack gate_up L{layer}: {e}"))?;
+    let down_dtype =
+        lfm2_dtype_from_qt(down_qt).map_err(|e| format!("lfm2moe: pack down L{layer}: {e}"))?;
+
+    let mut gu_blob = Vec::with_capacity(gate_up_len * raws.len());
+    let mut dn_blob = Vec::with_capacity(down_len * raws.len());
+    // Compact slot order: the router's gathered rows (REAP) emit logits in
+    // slot order, and the pointer table below is indexed the same way.
+    let mut by_slot: Vec<&RawExpertPayload> = raws.iter().collect();
+    by_slot.sort_by_key(|raw| raw.slot);
+    for raw in &by_slot {
+        gu_blob.extend_from_slice(&raw.gate_up);
+        dn_blob.extend_from_slice(&raw.down);
+    }
+    let gu_owner = gpu
+        .upload_raw_host_mapped(&gu_blob, &[gu_blob.len()])
+        .map_err(|e| format!("lfm2moe: host pack gate_up L{layer}: {e:?}"))?;
+    let dn_owner = gpu
+        .upload_raw_host_mapped(&dn_blob, &[dn_blob.len()])
+        .map_err(|e| format!("lfm2moe: host pack down L{layer}: {e:?}"))?;
+
+    let mut experts = Vec::with_capacity(raws.len());
+    for raw in by_slot {
+        let gu_view = gu_owner.buf.byte_view(raw.slot * gate_up_len, gate_up_len);
+        let dn_view = dn_owner.buf.byte_view(raw.slot * down_len, down_len);
+        let mut gate_up = WeightTensor {
+            buf: GpuTensor {
+                buf: gu_view,
+                shape: vec![gate_up_len],
+                dtype: DType::Raw,
+            },
+            gpu_dtype: gate_up_dtype,
+            m: 2 * moe_inter,
+            k: hidden,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        };
+        let mut down = WeightTensor {
+            buf: GpuTensor {
+                buf: dn_view,
+                shape: vec![down_len],
+                dtype: DType::Raw,
+            },
+            gpu_dtype: down_dtype,
+            m: hidden,
+            k: moe_inter,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        };
+        // AWQ sidecars attach exactly as on the device path (slot 0,
+        // layer-shared, device-resident — see finish_hfq_expert).
+        if raw.slot == 0 {
+            gate_up.awq_scale = load_lfm2_awq_scale(
+                hfq,
+                gpu,
+                &format!("{layer_prefix}.feed_forward.awq_scale_gate_up.weight"),
+                hidden,
+            );
+            down.awq_scale = load_lfm2_awq_scale(
+                hfq,
+                gpu,
+                &format!("{layer_prefix}.feed_forward.awq_scale_down.weight"),
+                moe_inter,
+            );
+        }
+        experts.push(ExpertWeights { gate_up, down });
+    }
+    Ok((experts, vec![gu_owner, dn_owner]))
 }
 
 // ──────────────────────────── Weights ────────────────────────────
@@ -362,6 +587,12 @@ pub struct MoeFfn {
     pub experts: Vec<ExpertWeights>, // keep alive (buffers owned here)
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// Owners of the packed host-mapped expert blobs on a spilled layer
+    /// (`finish_hfq_experts_packed`); empty on the resident path, where each
+    /// expert owns its buffer. The per-expert `WeightTensor`s of a packed
+    /// layer hold Borrowed `byte_view`s into these blobs — freed here, after
+    /// the views have been dropped by `experts`' own `free_gpu` no-ops.
+    pub expert_blob_owners: Vec<GpuTensor>,
 }
 
 pub enum Ffn {
@@ -459,14 +690,20 @@ impl DenseFfn {
 }
 
 impl MoeFfn {
-    pub fn free_gpu(self, gpu: &mut Gpu) {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
         self.router.free_all(gpu);
         let _ = gpu.free_tensor(self.expert_bias);
-        for e in self.experts {
+        for e in self.experts.drain(..) {
+            // Packed experts hold Borrowed views; their `free_all` discards
+            // the (refused) pool-free of a non-owning buffer. Only the
+            // owners below return the host-mapped memory.
             e.free_gpu(gpu);
         }
         let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
         let _ = gpu.free_tensor(self.expert_down_ptrs);
+        for owner in self.expert_blob_owners.drain(..) {
+            let _ = gpu.free_tensor(owner);
+        }
     }
 }
 
@@ -489,7 +726,31 @@ impl Lfm2MoeLayerWeights {
 }
 
 impl Lfm2MoeWeights {
+    /// Fully resident load (the pre-offload behaviour, byte-identical).
     pub fn load(hfq: &mut HfqFile, cfg: &Lfm2MoeConfig, gpu: &mut Gpu) -> Result<Self, String> {
+        Self::load_with_placement(hfq, cfg, gpu, &Placement::all_device(cfg.num_hidden_layers))
+    }
+
+    /// Placement-aware load: each layer's own weights follow
+    /// `placement.layer(l)`, its routed experts follow `placement.experts(l)`,
+    /// and the globals (embed/lm_head/embedding_norm) stay resident — the
+    /// partial-offload contract shared with the Qwen3.5 loader.
+    ///
+    /// An all-device placement takes exactly the `load` path (same upload
+    /// calls, same order). Host placement uploads through
+    /// `Gpu::upload_raw_host_mapped` / `upload_f32_host`, whose device alias
+    /// the forward's kernels dereference over PCIe — no kernel or dispatch
+    /// change. The per-layer expert POINTER tables keep storing
+    /// `DeviceBuffer::as_ptr()` verbatim: a host-mapped owner's `ptr` IS the
+    /// device alias (`hipHostGetDevicePointer`), so the indexed MoE GEMVs
+    /// read spilled experts unchanged.
+    pub fn load_with_placement(
+        hfq: &mut HfqFile,
+        cfg: &Lfm2MoeConfig,
+        gpu: &mut Gpu,
+        placement: &Placement,
+    ) -> Result<Self, String> {
+        use hipfire_runtime::offload::{expert_memory_target, memory_target};
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
@@ -572,14 +833,23 @@ impl Lfm2MoeWeights {
                 ))
             }
         };
-        let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
+        let embedding_norm = load_f32(
+            hfq,
+            gpu,
+            "model.embedding_norm.weight",
+            &[hidden],
+            MemoryTarget::Device,
+        )?;
         // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
+        // Always resident (part of the offload placement's always-resident
+        // base — it is read every decode step).
         let lm_head = load_wt(
             hfq,
             gpu,
             "model.embed_tokens.weight",
             cfg.vocab_size,
             hidden,
+            MemoryTarget::Device,
         )?;
 
         let mut conv_state_count = 0usize;
@@ -588,9 +858,24 @@ impl Lfm2MoeWeights {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
-            let operator_norm =
-                load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
-            let ffn_norm = load_f32(hfq, gpu, &format!("{p}.ffn_norm.weight"), &[hidden])?;
+            // This layer's residency pair: its own weights (mixer + FFN +
+            // router/bias/norms) and, separately, its routed experts.
+            let layer_target = memory_target(placement.layer(l));
+            let expert_target = expert_memory_target(placement.experts(l));
+            let operator_norm = load_f32(
+                hfq,
+                gpu,
+                &format!("{p}.operator_norm.weight"),
+                &[hidden],
+                layer_target,
+            )?;
+            let ffn_norm = load_f32(
+                hfq,
+                gpu,
+                &format!("{p}.ffn_norm.weight"),
+                &[hidden],
+                layer_target,
+            )?;
 
             // ── Mixer: conv vs attention ──────────────────────────────────
             let mixer = match cfg.mixer(l) {
@@ -601,6 +886,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.conv.in_proj.weight"),
                         3 * hidden,
                         hidden,
+                        layer_target,
                     )?;
                     // conv.conv.weight ships [hidden,1,K] → loaded flat as [hidden,K] f32.
                     let conv_weight = load_f32(
@@ -608,6 +894,7 @@ impl Lfm2MoeWeights {
                         gpu,
                         &format!("{p}.conv.conv.weight"),
                         &[hidden * k_conv],
+                        layer_target,
                     )?;
                     let out_proj = load_wt(
                         hfq,
@@ -615,6 +902,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.conv.out_proj.weight"),
                         hidden,
                         hidden,
+                        layer_target,
                     )?;
                     let conv_state_idx = conv_state_count;
                     conv_state_count += 1;
@@ -632,6 +920,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.self_attn.q_proj.weight"),
                         q_dim,
                         hidden,
+                        layer_target,
                     )?;
                     let wk = load_wt(
                         hfq,
@@ -639,6 +928,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.self_attn.k_proj.weight"),
                         kv_dim,
                         hidden,
+                        layer_target,
                     )?;
                     let wv = load_wt(
                         hfq,
@@ -646,6 +936,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.self_attn.v_proj.weight"),
                         kv_dim,
                         hidden,
+                        layer_target,
                     )?;
                     let wo = load_wt(
                         hfq,
@@ -653,6 +944,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.self_attn.out_proj.weight"),
                         hidden,
                         q_dim,
+                        layer_target,
                     )?;
                     // Per-HEAD QK-norm: weight is [head_dim], applied to each head.
                     let q_norm = load_f32(
@@ -660,12 +952,14 @@ impl Lfm2MoeWeights {
                         gpu,
                         &format!("{p}.self_attn.q_layernorm.weight"),
                         &[head_dim],
+                        layer_target,
                     )?;
                     let k_norm = load_f32(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.k_layernorm.weight"),
                         &[head_dim],
+                        layer_target,
                     )?;
                     let kv_idx = kv_count;
                     kv_count += 1;
@@ -689,6 +983,7 @@ impl Lfm2MoeWeights {
                     &format!("{p}.feed_forward.w1.weight"),
                     dense_inter,
                     hidden,
+                    layer_target,
                 )?;
                 let w3 = load_wt(
                     hfq,
@@ -696,6 +991,7 @@ impl Lfm2MoeWeights {
                     &format!("{p}.feed_forward.w3.weight"),
                     dense_inter,
                     hidden,
+                    layer_target,
                 )?;
                 let w2 = load_wt(
                     hfq,
@@ -703,6 +999,7 @@ impl Lfm2MoeWeights {
                     &format!("{p}.feed_forward.w2.weight"),
                     hidden,
                     dense_inter,
+                    layer_target,
                 )?;
                 Ffn::Dense(DenseFfn { w1, w3, w2 })
             } else {
@@ -726,6 +1023,7 @@ impl Lfm2MoeWeights {
                         n_exp,
                         hidden,
                         keep,
+                        layer_target,
                     )?,
                     None => load_wt(
                         hfq,
@@ -733,6 +1031,7 @@ impl Lfm2MoeWeights {
                         &format!("{p}.feed_forward.gate.weight"),
                         n_exp,
                         hidden,
+                        layer_target,
                     )?,
                 };
                 // expert_bias is a 1-D [orig_experts] F32 vector indexed by
@@ -745,16 +1044,27 @@ impl Lfm2MoeWeights {
                         &format!("{p}.feed_forward.expert_bias"),
                         n_exp,
                         keep,
+                        layer_target,
                     )?,
-                    None => load_f32(hfq, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?,
+                    None => load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.feed_forward.expert_bias"),
+                        &[n_exp],
+                        layer_target,
+                    )?,
                 };
                 // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
                 // Iterate compact slots `0..n_exp`; `e` = the ORIGINAL expert
                 // index loaded into slot (slot==e on the no-keep identity path).
-                let mut experts = Vec::with_capacity(n_exp);
+                // Payloads are collected raw first, then materialized either as
+                // per-expert device uploads (the resident path) or as two packed
+                // host-mapped blobs with Borrowed per-expert views (the spilled
+                // path — finish_hfq_experts_packed).
+                let mut raws: Vec<RawExpertPayload> = Vec::with_capacity(n_exp);
                 if hfq.has_overlay() {
                     // Overlay offsets belong to a second file. Preserve the
-                    // existing overlay-aware reads and allocation order.
+                    // existing overlay-aware reads.
                     for slot in 0..n_exp {
                         let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
                         let ep = format!("{p}.feed_forward.experts.{e}");
@@ -763,25 +1073,18 @@ impl Lfm2MoeWeights {
                         let mut gate_up_bytes = w1;
                         gate_up_bytes.extend_from_slice(&w3);
                         let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                        experts.push(finish_hfq_expert(
-                            hfq,
-                            gpu,
-                            &p,
-                            l,
-                            e,
+                        raws.push(RawExpertPayload {
+                            source_expert: e,
                             slot,
-                            qt1,
-                            &gate_up_bytes,
-                            qt2,
-                            &w2,
-                            hidden,
-                            moe_inter,
-                        )?);
+                            gate_up_qt: qt1,
+                            gate_up: gate_up_bytes,
+                            down_qt: qt2,
+                            down: w2,
+                        });
                     }
                 } else {
                     // Two experts form four jobs (gate_up + down per expert),
-                    // matching the four-lane storage optimum. All reads finish
-                    // before the original gate_up/down GPU allocation sequence.
+                    // matching the four-lane storage optimum.
                     let mut chunk_start = 0usize;
                     while chunk_start < n_exp {
                         let chunk_end = (chunk_start + 2).min(n_exp);
@@ -830,24 +1133,44 @@ impl Lfm2MoeWeights {
                                 buffers.next().expect("two LFM read jobs per expert").data;
                             let down_bytes =
                                 buffers.next().expect("two LFM read jobs per expert").data;
+                            raws.push(RawExpertPayload {
+                                source_expert: e,
+                                slot,
+                                gate_up_qt: qt1,
+                                gate_up: gate_up_bytes,
+                                down_qt: qt2,
+                                down: down_bytes,
+                            });
+                        }
+                        chunk_start = chunk_end;
+                    }
+                }
+                let (experts, expert_blob_owners) = match expert_target {
+                    MemoryTarget::Device => {
+                        let mut experts = Vec::with_capacity(n_exp);
+                        for raw in raws {
                             experts.push(finish_hfq_expert(
                                 hfq,
                                 gpu,
                                 &p,
                                 l,
-                                e,
-                                slot,
-                                qt1,
-                                &gate_up_bytes,
-                                qt2,
-                                &down_bytes,
+                                raw.source_expert,
+                                raw.slot,
+                                raw.gate_up_qt,
+                                &raw.gate_up,
+                                raw.down_qt,
+                                &raw.down,
                                 hidden,
                                 moe_inter,
+                                MemoryTarget::Device,
                             )?);
                         }
-                        chunk_start = chunk_end;
+                        (experts, Vec::new())
                     }
-                }
+                    MemoryTarget::HostMapped => {
+                        finish_hfq_experts_packed(hfq, gpu, &p, l, raws, hidden, moe_inter)?
+                    }
+                };
 
                 let gu_bytes: Vec<u8> = experts
                     .iter()
@@ -875,6 +1198,7 @@ impl Lfm2MoeWeights {
                     experts,
                     expert_gate_up_ptrs,
                     expert_down_ptrs,
+                    expert_blob_owners,
                 })
             };
 
@@ -907,6 +1231,56 @@ impl Lfm2MoeWeights {
 }
 
 // ─────────────── Source-based load helpers (ModelSource) ──────────────
+
+/// `model.layers.{l}…` → `Some(l)` (raw HF names; no rename happens on this
+/// arch). The placement census's tensor→layer classifier.
+fn lfm2_tensor_layer_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let end = rest.find('.')?;
+    rest[..end].parse().ok()
+}
+
+/// True for one routed-expert weight (`feed_forward.experts.{e}.w{1,2,3}`).
+/// Router gate, expert_bias and the AWQ sidecars are the LAYER's own weights
+/// and follow the layer tier, mirroring the Qwen3.5 MoE census
+/// (`is_routed_expert_weight`).
+fn lfm2_is_routed_expert_weight(name: &str) -> bool {
+    name.contains(".feed_forward.experts.")
+}
+
+/// Per-layer byte census for partial offload, built from the HFQ tensor
+/// index: `non_expert[l]` = everything layer `l` owns except its routed
+/// experts (mixer, norms, dense FFN, router, expert_bias, AWQ sidecars);
+/// `expert[l]` = its routed-expert payload; `always_resident` = the tied
+/// embed/lm_head, the final norm, and any non-layer tensor. Mirrors
+/// `qwen35_layer_bytes`.
+pub fn lfm2_layer_bytes(
+    hfq: &HfqFile,
+    cfg: &Lfm2MoeConfig,
+) -> hipfire_runtime::offload::LayerBytes {
+    let n = cfg.num_hidden_layers;
+    let mut non_expert = vec![0u64; n];
+    let mut expert = vec![0u64; n];
+    let mut always_resident = 0u64;
+    for info in hfq.tensor_infos() {
+        let bytes = info.data_size as u64;
+        match lfm2_tensor_layer_index(&info.name) {
+            Some(layer) if layer < n => {
+                if lfm2_is_routed_expert_weight(&info.name) {
+                    expert[layer] += bytes;
+                } else {
+                    non_expert[layer] += bytes;
+                }
+            }
+            _ => always_resident += bytes,
+        }
+    }
+    hipfire_runtime::offload::LayerBytes {
+        non_expert,
+        expert,
+        always_resident,
+    }
+}
 
 /// Classify a tensor's byte format. Returns `(is_f16, is_q8_0)` based
 /// on byte-count heuristics. Used when loading from safetensors where
@@ -1438,6 +1812,10 @@ pub fn load_weights_from_source(
                 experts,
                 expert_gate_up_ptrs,
                 expert_down_ptrs,
+                // The ModelSource path has no host-placement route (it reads
+                // through `&dyn ModelSource`, which cannot host-map); expert
+                // buffers are always per-expert device owners here.
+                expert_blob_owners: Vec::new(),
             })
         };
 
@@ -1928,5 +2306,54 @@ mod batch_format_tests {
         assert!(!never_cancel());
         assert!(!never_cancel());
         assert_eq!(calls2, 2);
+    }
+}
+
+#[cfg(test)]
+mod offload_census_tests {
+    use super::{lfm2_is_routed_expert_weight, lfm2_tensor_layer_index};
+
+    #[test]
+    fn tensor_layer_index_parses_layer_names() {
+        assert_eq!(
+            lfm2_tensor_layer_index("model.layers.0.conv.in_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            lfm2_tensor_layer_index("model.layers.39.feed_forward.gate.weight"),
+            Some(39)
+        );
+        // Globals and non-model tensors are always-resident.
+        assert_eq!(lfm2_tensor_layer_index("model.embed_tokens.weight"), None);
+        assert_eq!(lfm2_tensor_layer_index("model.embedding_norm.weight"), None);
+        assert_eq!(lfm2_tensor_layer_index("lm_head.weight"), None);
+        // Malformed layer indices never parse into a wrong layer.
+        assert_eq!(lfm2_tensor_layer_index("model.layers.x.conv.weight"), None);
+        assert_eq!(lfm2_tensor_layer_index("model.layers..weight"), None);
+        assert_eq!(lfm2_tensor_layer_index("model.layers.7"), None);
+    }
+
+    #[test]
+    fn routed_expert_classification_matches_the_tier_split() {
+        assert!(lfm2_is_routed_expert_weight(
+            "model.layers.3.feed_forward.experts.5.w1.weight"
+        ));
+        assert!(lfm2_is_routed_expert_weight(
+            "model.layers.3.feed_forward.experts.63.w2.weight"
+        ));
+        // The router, the bias and the AWQ sidecars are the layer's own
+        // weights — they follow the layer tier, not the expert tier.
+        assert!(!lfm2_is_routed_expert_weight(
+            "model.layers.3.feed_forward.gate.weight"
+        ));
+        assert!(!lfm2_is_routed_expert_weight(
+            "model.layers.3.feed_forward.expert_bias"
+        ));
+        assert!(!lfm2_is_routed_expert_weight(
+            "model.layers.3.feed_forward.awq_scale_gate_up.weight"
+        ));
+        assert!(!lfm2_is_routed_expert_weight(
+            "model.layers.3.feed_forward.w1.weight"
+        ));
     }
 }

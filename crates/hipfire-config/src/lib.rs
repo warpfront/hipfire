@@ -5988,8 +5988,14 @@ mod tests {
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
         // Attached verdicts carry no reason; the decline line words it once.
-        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
-        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason,
+            ""
+        );
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason,
+            ""
+        );
         let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
         assert!(line.contains(mtp_host_spill_reason()), "{line}");
         assert!(line.contains("21 expert blobs"), "{line}");
@@ -7655,7 +7661,8 @@ pub mod memory {
     /// same reason in their fail-closed refusal).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum SpillRefusal {
-        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        /// Neither Qwen3.5 dense (5) / MoE (6) nor LFM2.5 (11); carries the
+        /// arch id.
         Arch(u32),
         /// Tensor-parallel ranks each load every layer; carries tp.
         Tp(usize),
@@ -7684,10 +7691,11 @@ pub mod memory {
         is_vl: bool,
     ) -> SpillSupport {
         use SpillRefusal::*;
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in
-        // host RAM. Qwen4 has its own expert-residency route and the other
-        // arches have none, so either knob is a request this loader cannot honour.
-        if !matches!(arch_id, 5 | 6) {
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6 | 11) {
             return SpillSupport::Refused(Arch(arch_id));
         }
         if tp > 1 {
@@ -7869,18 +7877,12 @@ pub mod memory {
             assert_eq!(parse_passback_share(Some("auto")), PassbackShare::Auto);
             assert_eq!(parse_passback_share(Some(" auto ")), PassbackShare::Auto);
             // Both ends of the legal range are pinned shares; 0 disables.
-            assert_eq!(
-                parse_passback_share(Some("0")),
-                PassbackShare::Share(0.0)
-            );
+            assert_eq!(parse_passback_share(Some("0")), PassbackShare::Share(0.0));
             assert_eq!(
                 parse_passback_share(Some("0.375")),
                 PassbackShare::Share(0.375)
             );
-            assert_eq!(
-                parse_passback_share(Some("0.5")),
-                PassbackShare::Share(0.5)
-            );
+            assert_eq!(parse_passback_share(Some("0.5")), PassbackShare::Share(0.5));
             // Out of range and garbage fail closed to scheduling (the schema
             // rejects them earlier; this is the second guard).
             assert_eq!(parse_passback_share(Some("0.6")), PassbackShare::Auto);
@@ -8186,13 +8188,20 @@ pub mod memory {
         #[test]
         fn budget_keys_default_to_full_and_preserve_explicit_placement() {
             use OffloadBudget::{Auto, Full, Layers};
-            let defaults = crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
             for (key, env) in [
                 ("memory.gpu_layer_budget", "HIPFIRE_GPU_LAYER_BUDGET"),
                 ("memory.moe_expert_budget", "HIPFIRE_MOE_EXPERT_BUDGET"),
             ] {
-                assert_eq!(crate::field(key).unwrap().default.to_value(), crate::ConfigValue::Null);
-                assert_eq!(parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()), Full);
+                assert_eq!(
+                    crate::field(key).unwrap().default.to_value(),
+                    crate::ConfigValue::Null
+                );
+                assert_eq!(
+                    parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()),
+                    Full
+                );
                 for (spelling, expected) in [
                     ("null", Full),
                     ("auto", Auto),
@@ -8207,7 +8216,8 @@ pub mod memory {
                             argument: format!("{key}={spelling}"),
                         },
                         layer,
-                    }]).unwrap();
+                    }])
+                    .unwrap();
                     let process = crate::ProcessConfig::from_resolved(&resolved).unwrap();
                     for budget_env in ["HIPFIRE_GPU_LAYER_BUDGET", "HIPFIRE_MOE_EXPERT_BUDGET"] {
                         assert_eq!(
@@ -8251,7 +8261,7 @@ pub mod memory {
             use SpillSupport::{Refused, Supported};
             // Clean single-GPU non-VL non-paged non-REAP MoE: the only
             // supported shape (dense included — the policy is MoE-blind).
-            for arch_id in [5u32, 6] {
+            for arch_id in [5u32, 6, 11] {
                 assert_eq!(
                     spill_support(arch_id, 1, 1, None, false, false, false),
                     Supported,
