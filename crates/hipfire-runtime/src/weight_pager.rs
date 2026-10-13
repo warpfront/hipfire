@@ -40,6 +40,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::hash::Hash;
 use std::path::Path;
 
 use hip_bridge::HipResult;
@@ -119,8 +120,250 @@ pub enum NormKind {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded slot residency
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Pending,
+    Resident,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlotEntry<P> {
+    pool: P,
+    slot: usize,
+    state: SlotState,
+}
+
+/// A stable reservation returned by [`SlotCache::reserve`]. A new reservation
+/// stays pending until its backing I/O and device copy are committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotReservation<K, P> {
+    pub key: K,
+    pub pool: P,
+    pub slot: usize,
+    needs_fill: bool,
+    newly_reserved: bool,
+}
+
+impl<K, P> SlotReservation<K, P> {
+    pub fn needs_fill(&self) -> bool {
+        self.needs_fill
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotCacheError {
+    ZeroSlots,
+    PoolMismatch,
+    AllSlotsPending,
+}
+
+impl std::fmt::Display for SlotCacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroSlots => write!(f, "slot cache requires at least one slot per pool"),
+            Self::PoolMismatch => write!(f, "cache key was requested from a different pool"),
+            Self::AllSlotsPending => write!(f, "all slots in the pool have pending fills"),
+        }
+    }
+}
+
+impl std::error::Error for SlotCacheError {}
+
+/// Fixed-capacity, per-pool LRU cache for paged weight slots.
+///
+/// Misses are first recorded as `Pending`. A key becomes visible through
+/// [`resident_slot`](Self::resident_slot) only after [`commit`](Self::commit),
+/// so failed reads or copies cannot leave stale bytes marked resident.
+pub struct SlotCache<K, P>
+where
+    K: Copy + Eq + Hash,
+    P: Copy + Eq + Hash,
+{
+    slots_per_pool: usize,
+    entries: HashMap<K, SlotEntry<P>>,
+    occupants: HashMap<(P, usize), K>,
+    lru: HashMap<P, VecDeque<usize>>,
+    next_slot: HashMap<P, usize>,
+    hits: u64,
+    misses: u64,
+}
+
+impl<K, P> SlotCache<K, P>
+where
+    K: Copy + Eq + Hash,
+    P: Copy + Eq + Hash,
+{
+    pub fn new(slots_per_pool: usize) -> Result<Self, SlotCacheError> {
+        if slots_per_pool == 0 {
+            return Err(SlotCacheError::ZeroSlots);
+        }
+        Ok(Self {
+            slots_per_pool,
+            entries: HashMap::new(),
+            occupants: HashMap::new(),
+            lru: HashMap::new(),
+            next_slot: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    pub fn slots_per_pool(&self) -> usize {
+        self.slots_per_pool
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// Return a committed slot. Pending fills are intentionally invisible.
+    pub fn resident_slot(&self, key: K) -> Option<usize> {
+        self.entries
+            .get(&key)
+            .and_then(|entry| (entry.state == SlotState::Resident).then_some(entry.slot))
+    }
+
+    /// Reserve a slot for `key`. A resident hit needs no fill; a duplicate
+    /// pending request shares the reservation but does not own another fill.
+    pub fn reserve(&mut self, pool: P, key: K) -> Result<SlotReservation<K, P>, SlotCacheError> {
+        if let Some(entry) = self.entries.get(&key).copied() {
+            if entry.pool != pool {
+                return Err(SlotCacheError::PoolMismatch);
+            }
+            if entry.state == SlotState::Resident {
+                self.hits += 1;
+                self.touch(pool, entry.slot);
+            }
+            return Ok(SlotReservation {
+                key,
+                pool,
+                slot: entry.slot,
+                needs_fill: false,
+                newly_reserved: false,
+            });
+        }
+
+        let next = self.next_slot.entry(pool).or_insert(0);
+        let slot = if *next < self.slots_per_pool {
+            let slot = *next;
+            *next += 1;
+            self.lru.entry(pool).or_default().push_back(slot);
+            slot
+        } else {
+            let queue = self.lru.entry(pool).or_default();
+            let mut reusable = None;
+            for _ in 0..queue.len() {
+                let slot = queue.pop_front().expect("LRU length changed");
+                let pending = self
+                    .occupants
+                    .get(&(pool, slot))
+                    .and_then(|old_key| self.entries.get(old_key))
+                    .is_some_and(|entry| entry.state == SlotState::Pending);
+                if pending {
+                    queue.push_back(slot);
+                } else {
+                    reusable = Some(slot);
+                    break;
+                }
+            }
+            let slot = reusable.ok_or(SlotCacheError::AllSlotsPending)?;
+            if let Some(old_key) = self.occupants.remove(&(pool, slot)) {
+                self.entries.remove(&old_key);
+            }
+            queue.push_back(slot);
+            slot
+        };
+
+        self.misses += 1;
+        self.entries.insert(
+            key,
+            SlotEntry {
+                pool,
+                slot,
+                state: SlotState::Pending,
+            },
+        );
+        self.occupants.insert((pool, slot), key);
+        Ok(SlotReservation {
+            key,
+            pool,
+            slot,
+            needs_fill: true,
+            newly_reserved: true,
+        })
+    }
+
+    /// Publish a successfully filled reservation.
+    pub fn commit(&mut self, reservation: SlotReservation<K, P>) -> bool {
+        if !reservation.newly_reserved {
+            return false;
+        }
+        let Some(entry) = self.entries.get_mut(&reservation.key) else {
+            return false;
+        };
+        if entry.pool != reservation.pool
+            || entry.slot != reservation.slot
+            || entry.state != SlotState::Pending
+        {
+            return false;
+        }
+        entry.state = SlotState::Resident;
+        self.touch(reservation.pool, reservation.slot);
+        true
+    }
+
+    /// Forget a failed fill. The slot remains reusable, but the next dispatch
+    /// must load the key again.
+    pub fn rollback(&mut self, reservation: SlotReservation<K, P>) -> bool {
+        if !reservation.newly_reserved {
+            return false;
+        }
+        let matches = self.entries.get(&reservation.key).is_some_and(|entry| {
+            entry.pool == reservation.pool
+                && entry.slot == reservation.slot
+                && entry.state == SlotState::Pending
+        });
+        if !matches {
+            return false;
+        }
+        self.entries.remove(&reservation.key);
+        self.occupants.remove(&(reservation.pool, reservation.slot));
+        true
+    }
+
+    pub fn invalidate(&mut self, key: K) -> bool {
+        let Some(entry) = self.entries.remove(&key) else {
+            return false;
+        };
+        self.occupants.remove(&(entry.pool, entry.slot));
+        true
+    }
+
+    fn touch(&mut self, pool: P, slot: usize) {
+        let queue = self.lru.entry(pool).or_default();
+        if let Some(pos) = queue.iter().position(|&candidate| candidate == slot) {
+            queue.remove(pos);
+        }
+        queue.push_back(slot);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transport: how bytes get from HFQ file to VRAM
 // ---------------------------------------------------------------------------
+
+/// One byte range to copy from the backing file into an existing GPU tensor.
+/// `dst_offset` is relative to the beginning of `dst`.
+#[derive(Clone, Copy)]
+pub struct FetchReq<'a> {
+    pub file_offset: usize,
+    pub len: usize,
+    pub dst: &'a GpuTensor,
+    pub dst_offset: usize,
+}
 
 /// Opaque handle for an in-flight or completed transfer. Submit returns one,
 /// `wait` consumes a slice of them. v0.1 uses a simple counter; future
@@ -157,6 +400,35 @@ pub trait Transport: Send {
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
     fn wait(&mut self, handles: &[TransferHandle]) -> HipResult<()>;
+
+    /// Synchronously fill byte ranges in allocations owned by the caller.
+    /// Slot-based pagers use this path because their allocations are stable:
+    /// only slot contents change between dispatches.
+    fn fetch_into(
+        &mut self,
+        file_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        dst_offset: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        self.fetch_into_batch(
+            &[FetchReq {
+                file_offset,
+                len,
+                dst,
+                dst_offset,
+            }],
+            gpu,
+        )
+    }
+
+    fn fetch_into_batch(&mut self, _reqs: &[FetchReq<'_>], _gpu: &mut Gpu) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "transport does not support fetch_into_batch",
+        ))
+    }
 
     /// Hint: does this transport need pager-allocated VRAM slabs to be
     /// exported as `dma_buf` for P2P DMA? Pager checks this at allocation
@@ -226,6 +498,14 @@ impl PreadH2DTransport {
         &self.path
     }
 
+    /// Reserve reusable host staging capacity at model load so cache misses do
+    /// not grow the buffer on the forward path.
+    pub fn reserve_staging(&mut self, bytes: usize) {
+        if self.staging.len() < bytes {
+            self.staging.resize(bytes, 0);
+        }
+    }
+
     fn next_handle(&mut self) -> TransferHandle {
         let h = TransferHandle(self.next_handle);
         self.next_handle += 1;
@@ -279,6 +559,39 @@ impl Transport for PreadH2DTransport {
 
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         // Transfers complete synchronously inside `fetch` in v0.1.
+        Ok(())
+    }
+
+    fn fetch_into_batch(&mut self, reqs: &[FetchReq<'_>], gpu: &mut Gpu) -> HipResult<()> {
+        for req in reqs {
+            let end = req
+                .dst_offset
+                .checked_add(req.len)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "paged destination range overflow"))?;
+            if end > req.dst.buf.size() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "paged destination range {}..{} exceeds allocation size {}",
+                        req.dst_offset,
+                        end,
+                        req.dst.buf.size()
+                    ),
+                ));
+            }
+            self.pread_into_staging(req.file_offset, req.len)
+                .map_err(|e| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "pread {} bytes at offset {}: {}",
+                            req.len, req.file_offset, e
+                        ),
+                    )
+                })?;
+            gpu.hip
+                .memcpy_htod_offset(&req.dst.buf, req.dst_offset, &self.staging[..req.len])?;
+        }
         Ok(())
     }
 }
@@ -710,6 +1023,46 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn slot_cache_publishes_only_after_commit() {
+        let mut cache = SlotCache::new(2).unwrap();
+        let reservation = cache.reserve(7u8, 10u16).unwrap();
+        assert!(reservation.needs_fill());
+        assert_eq!(cache.resident_slot(10), None);
+        assert!(cache.commit(reservation));
+        assert_eq!(cache.resident_slot(10), Some(0));
+
+        let hit = cache.reserve(7, 10).unwrap();
+        assert!(!hit.needs_fill());
+        assert_eq!(cache.stats(), (1, 1));
+    }
+
+    #[test]
+    fn slot_cache_rolls_back_failed_fill() {
+        let mut cache = SlotCache::new(1).unwrap();
+        let failed = cache.reserve(3u8, 20u16).unwrap();
+        assert!(cache.rollback(failed));
+        assert_eq!(cache.resident_slot(20), None);
+
+        let retry = cache.reserve(3, 20).unwrap();
+        assert!(retry.needs_fill());
+        assert_eq!(retry.slot, 0);
+    }
+
+    #[test]
+    fn slot_cache_never_evicts_pending_fill() {
+        let mut cache = SlotCache::new(1).unwrap();
+        let pending = cache.reserve(1u8, 1u16).unwrap();
+        assert_eq!(
+            cache.reserve(1, 2).unwrap_err(),
+            SlotCacheError::AllSlotsPending
+        );
+        assert!(cache.commit(pending));
+        let replacement = cache.reserve(1, 2).unwrap();
+        assert_eq!(replacement.slot, 0);
+        assert_eq!(cache.resident_slot(1), None);
+    }
 
     #[test]
     fn weight_id_is_hashable() {

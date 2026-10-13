@@ -1247,6 +1247,9 @@ pub struct DeepseekV4Weights {
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
+    /// Bounded routed-expert slot pools. `None` keeps the fully resident path.
+    /// The mutex serializes pointer-table publication with slot replacement.
+    pub expert_paging: Option<std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
     pub _scaffold: (),
 }
 

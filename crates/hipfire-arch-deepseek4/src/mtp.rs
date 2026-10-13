@@ -899,6 +899,7 @@ pub fn mtp_forward_batched(
         /*hash_routing=*/ false,
         n,
         tokens_dummy,
+        None,
     )?;
     hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
 
