@@ -71,6 +71,19 @@ impl MoeRecipe {
     }
 }
 
+/// Selection bias of a sigmoid router (LFM2, DeepSeek): experts are chosen on
+/// `sigmoid(logits) + bias`, weighted by the unbiased sigmoid scores,
+/// normalized over the selection, then multiplied by `route_scale`.
+#[derive(Clone, Copy)]
+pub struct MoeSelectionBias<'a> {
+    /// `[n_exp]` F32, read for selection only.
+    pub bias: &'a GpuTensor,
+    pub route_scale: f32,
+}
+
+/// Widest selection the biased sigmoid router and the k8 routed kernels take.
+pub const MOE_BIASED_SIGMOID_MAX_K: usize = 8;
+
 /// Architecture declaration, checked against both live operands and the
 /// immutable specialized-kernel contract before any route is selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -882,6 +895,9 @@ pub struct MoeParams<'a> {
     pub k: usize,
     pub n_exp: usize,
     pub norm_topk_prob: bool,
+    /// `Some` for a biased sigmoid router (only with
+    /// [`MoeRecipe::SigmoidRoutedNoShared`]); `None` keeps the unbiased top-8.
+    pub selection_bias: Option<MoeSelectionBias<'a>>,
     pub x_rot_prerotated: bool,
     /// Single-GPU lowered-decode experiment: leave the atomic-free routed
     /// output expanded so the architecture layer can combine it into the

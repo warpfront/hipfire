@@ -19,6 +19,7 @@ use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
 /// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
+#[derive(Clone, Copy)]
 pub enum GemvInput<'a> {
     Raw(&'a GpuTensor),        // launch_op self-rotates via run_auto (plan-aware)
     Prerotated(&'a GpuTensor), // already FWHT-rotated; dispatched via Prerotated variant
@@ -85,6 +86,12 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// `out = silu(gate) ⊙ up` (one row; the dense SwiGLU activation).
+    SiluMul {
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        out: &'a GpuTensor,
+    },
     /// Grouped hyper-connection read.  The operation contract is model-neutral;
     /// architecture crates bind the resident projections and fixed-capacity views.
     HyperRead(crate::pipeline::layer_ops::HyperReadOp<'a>),
@@ -96,6 +103,8 @@ pub enum Step<'a> {
     HyperWrite(crate::pipeline::layer_ops::HyperWriteOp<'a>),
     /// Grouped causal convolution/gating operation.
     GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
+    /// Double-gated causal short convolution with its rolling state.
+    GatedShortConv(crate::pipeline::layer_ops::GatedShortConvOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
@@ -142,11 +151,13 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         Step::Rope { .. } => Some(PipelineOp::Rope),
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
         Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
+        Step::SiluMul { .. } => Some(PipelineOp::SiluMul),
         Step::HyperRead(_)
         | Step::GatedDeltaNet(_)
         | Step::IndexedAttention(_)
         | Step::HyperWrite(_)
         | Step::GroupedDepthwise(_)
+        | Step::GatedShortConv(_)
         | Step::Clear(_)
         | Step::Embed(_)
         | Step::HyperNorm(_)
@@ -776,6 +787,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::IndexedAttention(op) => op.validate_for_gpu(gpu)?,
             Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
             Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedShortConv(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
             Step::Embed(op) => op.validate_for_gpu(gpu)?,
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
@@ -1679,6 +1691,9 @@ pub(crate) fn launch_op_rows(
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::SiluMul { gate, up, out } => gpu
+            .silu_mul_f32(gate, up, out)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
         Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
         Step::IndexedAttention(op) => {
@@ -1688,6 +1703,7 @@ pub(crate) fn launch_op_rows(
         Step::GroupedDepthwise(op) => {
             crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
         }
+        Step::GatedShortConv(op) => crate::pipeline::layer_ops::execute_gated_short_conv(gpu, op),
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
         Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),

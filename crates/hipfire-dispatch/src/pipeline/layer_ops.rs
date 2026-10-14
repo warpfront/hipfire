@@ -4041,6 +4041,76 @@ pub fn execute_dense_ffn(gpu: &mut Gpu, op: &DenseFfnOp<'_>) -> Result<(), Dispa
     hip(gpu.bf16_round_trip_f32(&output))
 }
 
+/// Largest causal window the gated short-convolution kernel holds per thread.
+pub const GATED_SHORT_CONV_MAX_KERNEL: usize = 8;
+
+/// Double-gated causal short convolution over `rows` independent lanes (the
+/// LFM2 LIV operator).  Row `r` of `bcx` holds `[b | c | x]`, each `channels`
+/// wide; the op writes `c ⊙ conv(b ⊙ x)` into row `r` of `output` and advances
+/// lane `r`'s causal history in `state` (`[rows, channels, kernel_size - 1]`,
+/// oldest first).  `weight` is the depthwise filter `[channels, kernel_size]`,
+/// last tap on the current input.
+pub struct GatedShortConvOp<'a> {
+    pub bcx: &'a GpuTensor,
+    pub state: &'a GpuTensor,
+    pub weight: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub channels: usize,
+    pub kernel_size: usize,
+}
+
+impl GatedShortConvOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.channels == 0 {
+            return Err(DispatchError::Hip(
+                "gated short conv has empty geometry".into(),
+            ));
+        }
+        if !(2..=GATED_SHORT_CONV_MAX_KERNEL).contains(&self.kernel_size) {
+            return Err(DispatchError::Hip(format!(
+                "gated short conv kernel size {} outside 2..={GATED_SHORT_CONV_MAX_KERNEL}",
+                self.kernel_size
+            )));
+        }
+        let lanes = checked_mul(self.rows, self.channels, "gated short conv lanes")?;
+        require_tensor(
+            self.bcx,
+            checked_mul(lanes, 3, "gated short conv input")?,
+            DType::F32,
+            "gated short conv input",
+        )?;
+        require_tensor(
+            self.state,
+            checked_mul(lanes, self.kernel_size - 1, "gated short conv state")?,
+            DType::F32,
+            "gated short conv state",
+        )?;
+        require_tensor(
+            self.weight,
+            checked_mul(self.channels, self.kernel_size, "gated short conv weight")?,
+            DType::F32,
+            "gated short conv weight",
+        )?;
+        require_tensor(self.output, lanes, DType::F32, "gated short conv output")
+    }
+}
+
+pub fn execute_gated_short_conv(
+    gpu: &mut Gpu,
+    op: &GatedShortConvOp<'_>,
+) -> Result<(), DispatchError> {
+    hip(gpu.conv1d_gated_decode_f32(
+        op.bcx,
+        op.state,
+        op.weight,
+        op.output,
+        op.rows,
+        op.channels,
+        op.kernel_size,
+    ))
+}
+
 /// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
 pub struct BroadcastAddOp<'a> {
     pub rows_input: &'a GpuTensor,

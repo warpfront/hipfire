@@ -38,9 +38,9 @@ pub use layer_ops::{
     execute_hyper_read, execute_hyper_write, execute_indexed_attention, execute_lm_head,
     execute_project, project_weight, project_weights, qsa_projection_hook_installed,
     reset_qsa_projection_slot, set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp,
-    DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp,
-    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
+    DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture,
+    GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
+    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
     execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
     execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
     execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
@@ -3685,6 +3685,20 @@ fn decode_gate_up_stage(
             2 * p.mi,
             gate_up_k,
         ))?;
+    } else if p.dtypes.routed_gate_up == DType::MQ6G256 && p.k < 8 {
+        // Below top-8 (the biased sigmoid route) take the batched launcher,
+        // as the HFQ4 arm below does.
+        hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
+        ))?;
     } else if p.dtypes.routed_gate_up == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs,
@@ -3706,6 +3720,21 @@ fn decode_gate_up_stage(
             p.up_batch,
             2 * p.mi,
             gate_up_k,
+        ))?;
+    } else if p.k < 8 {
+        // Below top-8 (the biased sigmoid route) the batched launcher is the
+        // faster kernel: bitwise identical, +1.2% LFM2.5-8B-A1B decode (k=4,
+        // gfx1151).
+        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
         ))?;
     } else {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(

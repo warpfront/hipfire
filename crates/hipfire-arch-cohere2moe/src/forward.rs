@@ -329,6 +329,7 @@ fn decode_step_body(
                     k: k_top,
                     n_exp,
                     norm_topk_prob: cfg.norm_topk_prob,
+                    selection_bias: None,
                     x_rot_prerotated: false,
                     defer_routed_combine: false,
                     cpu_deferred_experts: false,

@@ -247,6 +247,90 @@ Served by `hipfire img <tag>` and `/v1/images/generations`; see [`IMAGEGEN.md`](
 
 Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) with `repeat_penalty` 1.05 — applied by the CLI resolver. Do not treat a registry `sampling` field as active defaults.
 
+### LFM2.5-24B-A2B — loadable, **no published artifact**
+
+`LiquidAI/LFM2.5-24B-A2B` (40 layers, 64 experts top-4, hidden 2048, 128k vocab,
+`conv_L_cache` 3, `num_dense_layers` 2, `use_expert_bias` true) loads on arch 11.
+There is **no registry tag and no `hipfire pull` target**: no artifact has been
+published, so add nothing to `registry/models.json` until one is.
+
+Recipe that works today (local, `--format mq4`):
+
+```bash
+hipfire-quantize --input <LFM2.5-24B-A2B dir> \
+                 --output ~/.hipfire/models/lfm2.5-24b-a2b.mq4 --format mq4
+# 12,758,948,048 B output: experts + dense projections MQ4G256, embedding
+# MQ4G256V2, 38 expert_bias tensors F32, norms Q8F16.
+```
+
+Because the model is ~98% routed experts by bytes (11.6 GiB of 12.7 GiB), it does
+not fit VRAM on a 12 GB card (or a 16 GB one) whole; it needs the partial-offload
+expert tier:
+
+```bash
+HIPFIRE_GPU_LAYER_BUDGET=auto HIPFIRE_MOE_EXPERT_BUDGET=auto \
+  hipfire run ~/.hipfire/models/lfm2.5-24b-a2b.mq4 "..."
+# measured on gfx1101 (12.9 GB): "routed experts host on 13 layers ... device
+# weights 9781 MiB of 9947 MiB available", 3366 MiB pinned host RAM.
+```
+
+**Verified on this branch** (gfx1100 RX 7900 XT, HIP 7.15): a locally quantized
+`lfm2.5-24b-a2b.mq4` (12,758,948,048 B, md5 `542f7998…f422`, quantized with
+`--format mq4` from `LiquidAI/LFM2.5-24B-A2B` bf16 safetensors) loads fully
+resident and generates coherently — `serve_harness battery` passes all five
+turns (think-disabled, ~78 tok/s decode, daemon md5 `b9c04329…ab05`), and a
+forced expert-tier spill (`HIPFIRE_MOE_EXPERT_BUDGET=16`, 24 MoE layers
+host-placed, 6,732 MiB pinned host) stays coherent. Earlier gfx1101 work on
+this branch also ran the model under `gpu_layer_budget=auto` +
+`moe_expert_budget=auto` on a 12.9 GB card. A spill changes no numerics —
+greedy decode is byte-identical across placements on the fixtures where a
+non-degenerate comparison is possible (see
+`crates/hipfire-arch-lfm2moe/tests/offload_parity.rs`: 2.6B dense and 8B-A1B
+MoE both match a resident baseline byte-for-byte, whole-layer and
+routed-expert tiers, with a prompt-variety guard that rejects a saturated
+oracle).
+
+**Resolved blocker — LFM2.5 MoE incoherence.** On gfx1100/gfx1101 the published
+`lfm2.5:8b-a1b` artifact used to emit degenerate text (saturated to 1–3 distinct
+tokens under greedy) while the dense 2.6B stayed coherent, and the 24B showed
+the same class of failure. Root cause was
+`kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip`: the
+atomic-free MoE down GEMV was hardcoded to K=512 (two 256-weight groups),
+summing only the first 512 columns of each expert's down projection. LFM2's
+`moe_inter` (1792 on the 8B, 1536 on the 24B) dropped 5/7–6/7 of the dot
+product. The kernel now keeps the K=512 fast path verbatim and loops
+`groups_per_row = K/256` groups otherwise; the gfx1151 buffer/row variants were
+already `k == 512`-gated in `gemv.rs` and are untouched. Verified on gfx1100:
+per-stage intermediates (router sigmoid, top-k, gate/up, rot, down-expanded,
+combine) match a NumPy replay of the HFQ weights to cos=1.0000 on every MoE
+stage, `prompt_probe` emits 36–41 distinct tokens per 48 greedy steps, and
+`hipfire run` on `lfm2.5-8b-a1b.mq4` produces coherent code + reasoning text.
+The same K-hardcoding affected every consumer with `moe_inter != 512` — e.g.
+MiniMax-M2 (`moe_inter` 1536) reads through this kernel too.
+
+**Reasoning + tool calls (arch 11, sequential + VL paths).** LFM2.5 is a pure
+reasoning model — its chat template ends the generation prompt with a literal
+`<think>` opener, so generated tokens begin *inside* the reasoning block and
+only `</think>` is generated. The arch-11 generate paths detect that opener
+(`render_tail_opens_think`) and re-emit `<think>` as display-only text before
+the first generated token, giving downstream consumers a well-formed
+`<think>…</think>…` block: `serve` splits `reasoning_content`/`content`
+(matching vLLM's deepseek_r1-class reasoning parser semantics), the run/chat
+stripper works, and `finish_reason` reports `length` (not `stop`) when a
+turn is still thinking at max_tokens. Tool calls use LFM's dedicated special
+tokens (`\x3C\x7Ctool_call_start\x7C\x3E` / `\x3C\x7Ctool_call_end\x7C\x3E`)
+wrapping a Pythonic `[f(k=v, ...)]` call list. Both generate paths suppress
+the span at the token level (markers and body never reach the client
+stream), parse the body into `tool_calls` on span close
+(`emit_text::parse_lfm_tool_call_body`, mirroring vLLM's `pythonic` tool
+parser: kwargs → JSON object, positional args dropped, malformed body →
+treat-as-text fallback), and emit the calls through the standard
+`{"type":"tool_calls"}` event + `finish_reason: "tool_calls"`. An unclosed
+span at EOS/max_tokens is re-emitted as raw text and never fabricates a
+call. Verified on gfx1100: `serve` returns
+`reasoning_content` + `tool_calls[0].function.arguments =
+"{\"city\":\"Tokyo\"}"` with `finish_reason: "tool_calls"` for a
+system-prompt tool list; streaming emits `reasoning_content` deltas.
 ### Gemma4 (registry — no published artifact yet)
 
 > **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.**

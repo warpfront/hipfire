@@ -854,6 +854,352 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
     out
 }
 
+/// Extract LFM2.5 Pythonic tool calls. Liquid's format wraps a Python list
+/// literal of function calls inside dedicated special tokens (see
+/// [`LFM_TOOL_OPEN`] / [`LFM_TOOL_CLOSE`]). The daemon normally suppresses
+/// these markers at the token level before text reaches the stream, but this
+/// extractor scans decoded text so a caller with the full run recovers the
+/// calls byte-for-byte.
+///
+/// Mirrors vLLM's `pythonic` tool parser: the span body is one
+/// `[f(k=v, ...), g(...)]` list; each call maps to a [`ToolCall`] whose
+/// `arguments` is a JSON object built from the keyword arguments; positional
+/// arguments are parsed but dropped (vLLM `handle_single_tool` does the
+/// same); dotted function names (`a.b.c(...)`) are preserved; a body that
+/// fails to parse contributes no calls — the caller decides whether the raw
+/// text stays visible, matching vLLM's "treat as regular text" fallback.
+pub fn extract_lfm_tool_calls(s: &str) -> Vec<crate::prompt_frame::ToolCall> {
+    let mut out: Vec<crate::prompt_frame::ToolCall> = Vec::new();
+    let mut search_pos = 0;
+    while let Some(open_rel) = s[search_pos..].find(LFM_TOOL_OPEN) {
+        let body_start = search_pos + open_rel + LFM_TOOL_OPEN.len();
+        let (body_end, advance) = match s[body_start..].find(LFM_TOOL_CLOSE) {
+            Some(i) => (body_start + i, body_start + i + LFM_TOOL_CLOSE.len()),
+            None => (s.len(), s.len()),
+        };
+        if let Some(calls) = parse_lfm_call_list(&s[body_start..body_end]) {
+            out.extend(calls);
+        }
+        search_pos = advance;
+        if advance == s.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// LFM2.5 tool-call span markers (literal text form of the special tokens,
+/// written as escapes so this file never carries the raw marker bytes).
+pub(crate) const LFM_TOOL_OPEN: &str = "\x3C\x7Ctool_call_start\x7C\x3E";
+pub(crate) const LFM_TOOL_CLOSE: &str = "\x3C\x7Ctool_call_end\x7C\x3E";
+
+
+/// Parse one LFM tool-call BODY — the bytes BETWEEN the markers — into calls.
+/// `[]` on malformed input (vLLM's treat-as-text fallback is the caller's
+/// choice). For text that still carries the markers use
+/// [`extract_lfm_tool_calls`].
+pub fn parse_lfm_tool_call_body(body: &str) -> Vec<crate::prompt_frame::ToolCall> {
+    parse_lfm_call_list(body).unwrap_or_default()
+}
+
+/// Parse one LFM tool-call body: a Python list literal of `name(k=v, ...)`
+/// calls. All-or-nothing per span, like vLLM — `None` on any malformed input
+/// so the caller leaves the text alone.
+fn parse_lfm_call_list(body: &str) -> Option<Vec<crate::prompt_frame::ToolCall>> {
+    let mut p = LfmPyParser::new(body);
+    p.expect(b'[')?;
+    let mut calls = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.eat(b']') {
+            break;
+        }
+        calls.push(p.parse_call()?);
+        p.skip_ws();
+        if !p.eat(b',') {
+            p.expect(b']')?;
+            break;
+        }
+    }
+    p.skip_ws();
+    if !p.at_end() {
+        return None;
+    }
+    Some(calls)
+}
+
+struct LfmPyParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> LfmPyParser<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { s: s.as_bytes(), i: 0 }
+    }
+    fn at_end(&self) -> bool {
+        self.i >= self.s.len()
+    }
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.skip_ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, c: u8) -> Option<()> {
+        self.eat(c).then_some(())
+    }
+    /// `ident` or dotted `a.b.c` — the call target, preserved verbatim.
+    fn parse_name(&mut self) -> Option<String> {
+        self.skip_ws();
+        let start = self.i;
+        if self.i < self.s.len()
+            && (self.s[self.i].is_ascii_alphabetic() || self.s[self.i] == b'_')
+        {
+            self.i += 1;
+        } else {
+            return None;
+        }
+        loop {
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+            {
+                self.i += 1;
+            }
+            if self.i < self.s.len() && self.s[self.i] == b'.'
+                && self.s.get(self.i + 1).is_some_and(|&n| {
+                    n.is_ascii_alphabetic() || n == b'_'
+                })
+            {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        Some(std::str::from_utf8(&self.s[start..self.i]).ok()?.to_owned())
+    }
+    /// `name(k=v, pos, k2=v2)` → one [`ToolCall`]; positional args parsed,
+    /// dropped (vLLM convention).
+    fn parse_call(&mut self) -> Option<crate::prompt_frame::ToolCall> {
+        let name = self.parse_name()?;
+        self.expect(b'(')?;
+        let mut args = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            if self.eat(b')') {
+                break;
+            }
+            // Keyword arg iff `ident` directly followed by `=` (not `==`).
+            let save = self.i;
+            let is_kw = self.parse_name().is_some_and(|_| {
+                self.skip_ws();
+                self.s.get(self.i) == Some(&b'=')
+                    && self.s.get(self.i + 1) != Some(&b'=')
+            });
+            self.i = save;
+            if is_kw {
+                let key = self.parse_name()?;
+                self.expect(b'=')?;
+                let v = self.parse_value()?;
+                args.insert(key, v);
+            } else {
+                let _ = self.parse_value()?;
+            }
+            self.skip_ws();
+            if !self.eat(b',') {
+                self.expect(b')')?;
+                break;
+            }
+        }
+        Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments: serde_json::Value::Object(args),
+            rendered_body: None,
+        })
+    }
+    /// Python-literal value: string, number, bool/None, list, or dict.
+    fn parse_value(&mut self) -> Option<serde_json::Value> {
+        self.skip_ws();
+        let c = *self.s.get(self.i)?;
+        match c {
+            b'"' | b'\'' => self.parse_string(),
+            b'[' => {
+                self.i += 1;
+                let mut v = Vec::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b']') {
+                        break;
+                    }
+                    v.push(self.parse_value()?);
+                    self.skip_ws();
+                    if !self.eat(b',') {
+                        self.expect(b']')?;
+                        break;
+                    }
+                }
+                Some(serde_json::Value::Array(v))
+            }
+            b'{' => {
+                self.i += 1;
+                let mut m = serde_json::Map::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b'}') {
+                        break;
+                    }
+                    let k = self.parse_value()?;
+                    let k = match k {
+                        serde_json::Value::String(s) => s,
+                        _ => return None,
+                    };
+                    self.expect(b':')?;
+                    let v = self.parse_value()?;
+                    m.insert(k, v);
+                    self.skip_ws();
+                    if !self.eat(b',') {
+                        self.expect(b'}')?;
+                        break;
+                    }
+                }
+                Some(serde_json::Value::Object(m))
+            }
+            _ => self.parse_atom(),
+        }
+    }
+    /// Bareword / number: `True`, `False`, `None` (and JSON spellings), or a
+    /// numeric literal. Anything else (bare identifier, unary `+`, etc.)
+    /// rejects — a silently-accepted garbage arg is worse than no call.
+    fn parse_atom(&mut self) -> Option<serde_json::Value> {
+        let start = self.i;
+        while self.i < self.s.len()
+            && !matches!(self.s[self.i], b')' | b']' | b'}' | b',' | b':' | b'=')
+            && !self.s[self.i].is_ascii_whitespace()
+        {
+            self.i += 1;
+        }
+        let word = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+        match word {
+            "True" | "true" => Some(serde_json::Value::Bool(true)),
+            "False" | "false" => Some(serde_json::Value::Bool(false)),
+            "None" | "null" => Some(serde_json::Value::Null),
+            _ => {
+                if let Ok(i) = word.parse::<i64>() {
+                    Some(serde_json::Value::from(i))
+                } else if let Ok(f) = word.parse::<f64>() {
+                    if f.is_finite() {
+                        serde_json::Number::from_f64(f).map(serde_json::Value::Number)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    /// Single- or double-quoted string with Python escape handling.
+    /// `\\n \\t \\r \\\\ \\' \\" \\0 \\xNN \\uXXXX \\UXXXXXXXX` all decode;
+    /// unknown escapes keep the backslash (Python's pass-through rule).
+    /// Triple-quoted strings supported.
+    fn parse_string(&mut self) -> Option<serde_json::Value> {
+        let quote = self.s[self.i];
+        self.i += 1;
+        let triple = self.s.get(self.i) == Some(&quote)
+            && self.s.get(self.i + 1) == Some(&quote);
+        if triple {
+            self.i += 2;
+        }
+        let mut out = String::new();
+        loop {
+            let c = *self.s.get(self.i)?;
+            if c == quote {
+                if triple {
+                    if self.s.get(self.i + 1) == Some(&quote)
+                        && self.s.get(self.i + 2) == Some(&quote)
+                    {
+                        self.i += 3;
+                        break;
+                    }
+                    out.push(quote as char);
+                    self.i += 1;
+                    continue;
+                }
+                self.i += 1;
+                break;
+            }
+            if !triple && c == b'\n' {
+                return None; // unterminated single-line string
+            }
+            if c != b'\\' {
+                let width = utf8_len(c);
+                let end = self.i + width;
+                if end > self.s.len() {
+                    return None;
+                }
+                out.push_str(std::str::from_utf8(&self.s[self.i..end]).ok()?);
+                self.i = end;
+                continue;
+            }
+            self.i += 1;
+            let esc = *self.s.get(self.i)?;
+            self.i += 1;
+            match esc {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'0' => out.push('\0'),
+                b'\\' => out.push('\\'),
+                b'\'' => out.push('\''),
+                b'"' => out.push('"'),
+                b'a' => out.push('\u{07}'),
+                b'b' => out.push('\u{08}'),
+                b'f' => out.push('\u{0C}'),
+                b'v' => out.push('\u{0B}'),
+                b'x' => out.push(self.hex_char(2)?),
+                b'u' => out.push(self.hex_char(4)?),
+                b'U' => out.push(self.hex_char(8)?),
+                b'\n' => {} // line continuation
+                _ => {
+                    out.push('\\');
+                    out.push(esc as char);
+                }
+            }
+        }
+        Some(serde_json::Value::String(out))
+    }
+    fn hex_char(&mut self, n: usize) -> Option<char> {
+        if self.i + n > self.s.len() {
+            return None;
+        }
+        let hex = std::str::from_utf8(&self.s[self.i..self.i + n]).ok()?;
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        self.i += n;
+        char::from_u32(v)
+    }
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
 /// Parse Qwen3.5/3.6's native tool-call body (legacy-tolerant):
 /// `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`.
 ///
@@ -1143,8 +1489,9 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter,
-        ToolRouteError, ToolRouteEvent, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+        extract_lfm_tool_calls, extract_tool_calls_from_text, ThinkOutputRouter,
+        ThinkRouteEvent, ToolOutputRouter, ToolRouteError, ToolRouteEvent, TOOL_CALL_CLOSE,
+        TOOL_CALL_OPEN,
     };
     use crate::prompt_frame::ToolCall;
 
@@ -1989,5 +2336,85 @@ mod tests {
         assert!(matches!(err, ToolRouteError::MalformedToolProtocol { .. }));
         let err2 = r.push("more").expect_err("latched");
         assert_eq!(err2.detail(), err.detail());
+    }
+
+    #[test]
+    fn lfm_tool_call_span_parses_like_vllm_pythonic() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        let text = format!(
+            "pre {open}[get_candidate_status(candidate_id=\"12345\")]{close}post"
+        );
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_candidate_status");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"candidate_id": "12345"})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_multiple_calls_and_value_types() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        let text = format!(
+            "{open}[f(a=1, b=2.5, c=True, d=None, e=['x', 3]), ns.g(flag=false, l=[1,2], m={{'k': 'v'}})]{close}"
+        );
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"a":1,"b":2.5,"c":true,"d":null,"e":["x",3]})
+        );
+        assert_eq!(calls[1].name, "ns.g");
+        assert_eq!(
+            calls[1].arguments,
+            serde_json::json!({"flag":false,"l":[1,2],"m":{"k":"v"}})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_positional_dropped_and_escapes() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        // Positional args parse but are dropped (vLLM handle_single_tool).
+        let text = format!(
+            "{open}[g('pos', s='line1\\nline2', q='it\\'s', x='\\x41\\u0042')]{close}"
+        );
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"s":"line1\nline2","q":"it's","x":"AB"})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_malformed_body_yields_no_calls() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        for bad in [
+            format!("{open}not a list{close}"),
+            format!("{open}[f(a=)]{close}"),
+            format!("{open}[f(a=1) trailing{close}"),
+            format!("{open}[f(a='unterminated)]{close}"),
+        ] {
+            assert!(
+                extract_lfm_tool_calls(&bad).is_empty(),
+                "should not fabricate calls from {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_tool_call_unclosed_span_still_extracted() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        // Whole-buffer tolerant path: unclosed span at end recovers the call.
+        let text = format!("{open}[f(a=1)]");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
     }
 }

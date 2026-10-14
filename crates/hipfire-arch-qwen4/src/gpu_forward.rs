@@ -2672,6 +2672,7 @@ pub(crate) fn seal_moe_decode<'a>(
         k: config.num_experts_per_tok,
         n_exp: config.num_experts,
         norm_topk_prob: config.norm_topk_prob,
+        selection_bias: None,
         x_rot_prerotated: false,
         defer_routed_combine: false,
         cpu_deferred_experts: false,

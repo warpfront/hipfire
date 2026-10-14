@@ -652,6 +652,7 @@ fn moe_params_for_decode<'a>(
         k,
         n_exp,
         norm_topk_prob: config.norm_topk_prob,
+        selection_bias: None,
         x_rot_prerotated,
         defer_routed_combine,
         cpu_deferred_experts: ffn.cpu_deferred_experts

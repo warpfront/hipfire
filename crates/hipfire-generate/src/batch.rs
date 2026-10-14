@@ -4875,6 +4875,18 @@ pub fn drive_lfm_continuous_batch(
             |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),
         )
         .collect();
+    // LFM tool-call span suppression (mirrors dense::generate_lfm2moe):
+    // the span — markers + body — is held back from the client stream and
+    // parsed into `tool_calls` at the lane's finish. The flag resets itself
+    // whenever the lane's `streamed_tokens` is empty (fresh lane), so no
+    // explicit per-reset-site clearing is needed.
+    let tool_open_tok = tokenizer.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E");
+    let tool_close_tok = tokenizer.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E");
+    let mut in_tool_span = vec![false; batch_size];
+    let mut tool_span_tokens: Vec<Vec<u32>> = (0..batch_size).map(|_| Vec::new()).collect();
+    let mut tool_body_tokens: Vec<Vec<u32>> = (0..batch_size).map(|_| Vec::new()).collect();
+    let mut tool_calls: Vec<Vec<hipfire_runtime::prompt_frame::ToolCall>> =
+        (0..batch_size).map(|_| Vec::new()).collect();
     let mut tokens = vec![0u32; batch_size];
     let mut positions = vec![0usize; batch_size];
     let fail_all = |sched: &mut ContinuousBatchScheduler,
@@ -5919,6 +5931,35 @@ pub fn drive_lfm_continuous_batch(
                 to_await.push((idx, key.clone(), admission, pending_done));
                 continue;
             }
+            // Tool-call span divert (mirrors dense::generate_lfm2moe): the
+            // span is suppressed from the stream; everything still lands in
+            // `lane.streamed_tokens` below. On close the body parses into
+            // `tool_calls`; an unclosed span at finish is re-emitted raw.
+            // The flag clears itself when the lane's `streamed_tokens` is
+            // empty (fresh lane) — no per-reset-site clearing needed.
+            if in_tool_span[idx] && lane.streamed_tokens.is_empty() {
+                in_tool_span[idx] = false;
+            }
+            let mut span_diverted = false;
+            if tool_open_tok.is_some_and(|t| cur_token == t) && !in_tool_span[idx] {
+                in_tool_span[idx] = true;
+                tool_span_tokens[idx].clear();
+                tool_span_tokens[idx].push(cur_token);
+                tool_body_tokens[idx].clear();
+                span_diverted = true;
+            } else if in_tool_span[idx] {
+                tool_span_tokens[idx].push(cur_token);
+                if tool_close_tok.is_some_and(|t| cur_token == t) {
+                    in_tool_span[idx] = false;
+                    let body_text = tokenizer.decode(&tool_body_tokens[idx]);
+                    tool_calls[idx].extend(
+                        hipfire_runtime::emit_text::parse_lfm_tool_call_body(&body_text),
+                    );
+                } else {
+                    tool_body_tokens[idx].push(cur_token);
+                }
+                span_diverted = true;
+            }
             let mut future_streamed = lane.streamed_tokens.clone();
             future_streamed.push(cur_token);
             let all_bytes = tokenizer.decode_bytes(&future_streamed);
@@ -5942,6 +5983,18 @@ pub fn drive_lfm_continuous_batch(
                     lane.prompt_len,
                     generated,
                 );
+                // Unclosed tool span at end-of-turn: re-emit the buffered
+                // raw text (treat-as-text); closed spans already parsed.
+                if in_tool_span[idx] {
+                    let _scope = BatchAttemptScope::enter_for_generation(
+                        &key.id, key.attempt_id, admission,
+                    );
+                    emit_visible_token(
+                        stdout,
+                        &key.id,
+                        &tokenizer.decode(&tool_span_tokens[idx]),
+                    );
+                }
                 let mut pending_done = serde_json::json!({
                     "type": "done",
                     "id": key.id,
@@ -5953,11 +6006,16 @@ pub fn drive_lfm_continuous_batch(
                     "decode_tok_s": (metrics.decode_tok_s * 10.0).round() / 10.0,
                     "ttft_ms": (metrics.ttft_ms * 10.0).round() / 10.0,
                     "cached_tokens": 0,
-                    "finish_reason": "stop",
+                    "finish_reason": if !tool_calls[idx].is_empty() { "tool_calls" } else { "stop" },
                     "attempt_id": key.attempt_id,
                 });
                 pending_done["latency_ms"] =
                     serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                let finish_reason = if !tool_calls[idx].is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
                 attach_continuous_batch_route_evidence(
                     &mut pending_done,
                     batch_size,
@@ -5965,10 +6023,21 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
+                {
+                    let _scope = BatchAttemptScope::enter_for_generation(
+                        &key.id, key.attempt_id, admission,
+                    );
+                    hipfire_engine::emit::stage_terminal_tool_calls(
+                        &mut pending_done,
+                        finish_reason,
+                        &tool_calls[idx],
+                    );
+                    hipfire_engine::emit::emit_tool_calls_event(stdout, &key.id, &tool_calls[idx]);
+                }
                 to_await.push((idx, key.clone(), admission, pending_done));
                 continue;
             }
-            let has_visible = !frag.is_empty();
+            let has_visible = !frag.is_empty() && !span_diverted;
             if has_visible {
                 if lane.first_token_at.is_none() {
                     lane.first_token_at = Some(Instant::now());
@@ -5989,7 +6058,25 @@ pub fn drive_lfm_continuous_batch(
             if should_finish {
                 let hit_length_cap =
                     batch_hit_length_cap(hit_max, hit_lane_cap, is_eos, false, loop_hit);
-                let finish_reason = if hit_length_cap { "length" } else { "stop" };
+                // Unclosed tool span at a length/loop-cap finish: re-emit raw
+                // text; a closed span already parsed into tool_calls.
+                if in_tool_span[idx] {
+                    let _scope = BatchAttemptScope::enter_for_generation(
+                        &key.id, key.attempt_id, admission,
+                    );
+                    emit_visible_token(
+                        stdout,
+                        &key.id,
+                        &tokenizer.decode(&tool_span_tokens[idx]),
+                    );
+                }
+                let finish_reason = if hit_length_cap {
+                    "length"
+                } else if !tool_calls[idx].is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
                 let generated = lane.streamed_tokens.len();
                 let metrics = batch_lane_done_metrics(
                     lane.created_at,
@@ -6022,6 +6109,17 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
+                {
+                    let _scope = BatchAttemptScope::enter_for_generation(
+                        &key.id, key.attempt_id, admission,
+                    );
+                    hipfire_engine::emit::stage_terminal_tool_calls(
+                        &mut pending_done,
+                        finish_reason,
+                        &tool_calls[idx],
+                    );
+                    hipfire_engine::emit::emit_tool_calls_event(stdout, &key.id, &tool_calls[idx]);
+                }
                 to_await.push((idx, key.clone(), admission, pending_done));
             } else {
                 survivors.push(idx);

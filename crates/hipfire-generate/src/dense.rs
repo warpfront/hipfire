@@ -5845,6 +5845,11 @@ pub fn generate_lfm2moe(
     }
 
     // ── Prompt build (same two-path branch as the minimax AR path) ──
+    // `primed_think` records whether the rendered prompt ended with the
+    // template's `<think>` generation-primer, so we only re-emit the opener
+    // (below) when the model truly begins inside the reasoning block. A jinja
+    // render failure that falls back to the Plain frame leaves it false.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
@@ -5909,7 +5914,10 @@ pub fn generate_lfm2moe(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = hipfire_engine::emit::render_tail_opens_think(&rendered);
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
                     hipfire_runtime::prompt_frame::ChatFrame {
@@ -6088,6 +6096,20 @@ pub fn generate_lfm2moe(
         return;
     }
 
+    // LFM2.5's chat template primes the assistant turn with `<think>`
+    // (generation-prompt block), so generated tokens begin *inside* the
+    // reasoning block and the model only ever emits the closing `</think>`.
+    // Downstream `<think>` consumers — the serve reasoning_content/content
+    // split, the run/chat-path stripper, history `stripThinkingInline` — key
+    // on a LEADING `<think>` and so never engage without the opener. The
+    // primer is already in the KV from prefill; re-emit it into the token
+    // stream (display-only) so the turn is a well-formed
+    // `<think>...</think>...` block for every consumer. Mirrors the MiniMax
+    // `primed_think` convention above.
+    if primed_think {
+        emit_dense_token_text(stdout, id, "<think>");
+    }
+
     // ── Decode loop. Sample host-side from the running logits vector.
     // Abort is checked at the top of every iteration so a mid-decode
     // client cancel stops the loop immediately and emits `aborted`+`done`.
@@ -6100,6 +6122,30 @@ pub fn generate_lfm2moe(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
+    // LFM2.5 tool calls arrive inside dedicated special tokens
+    // (\x3C\x7Ctool_call_start\x7C\x3E / \x3C\x7Ctool_call_end\x7C\x3E as
+    // TEXT). The span — markers included — is suppressed from the client
+    // stream and parsed into `tool_calls` at the terminal (vLLM/llama.cpp
+    // semantics: the marker block is protocol, not content). Everything
+    // still lands in `conversation_tokens` so multi-turn history stays
+    // byte-faithful. An unclosed span is re-emitted as raw text (the
+    // treat-as-text fallback) and never fabricates calls.
+    let tool_open_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E"));
+    let tool_close_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E"));
+    // `in_tool_span`: between the markers; `tool_span_tokens`: every token
+    // since the opener (for the unclosed fallback); `tool_body_tokens`: only
+    // the inner tokens (what gets parsed); `tool_calls`: extracted so far.
+    let mut in_tool_span = false;
+    let mut tool_span_tokens: Vec<u32> = Vec::new();
+    let mut tool_body_tokens: Vec<u32> = Vec::new();
+    let mut tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    let mut hit_eos = false;
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     // Multi-byte characters span tokens: decode incrementally, never per token.
@@ -6115,22 +6161,108 @@ pub fn generate_lfm2moe(
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_toks.contains(&next_tok) {
+            hit_eos = true;
             break;
         }
 
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // String-level EOS-class guard. The id-based `stop_toks` above misses
-        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
-        // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The leaking turn-end token decodes on its own to the
-        // marker: catch it on the token's own text and stop WITHOUT emitting
-        // (was: "...Paris.<|endoftext|>").
+        // the literal document-end special token because encoding its STRING
+        // doesn't round-trip to the special-token id (it yields subwords), so
+        // the real token id is never in the set. The leaking turn-end token
+        // decodes on its own to the marker: catch it on the token's own text
+        // and stop WITHOUT emitting.
         if matches!(
             tokenizer.decode(&[next_tok]).trim(),
-            "<|endoftext|>" | "</s>" | "<|im_end|>"
+            "\x3C\x7Cendoftext\x7C\x3E" | "</s>" | "\x3C\x7Cim_end\x7C\x3E"
         ) {
+            hit_eos = true;
             break;
         }
+
+        // Tool-call span handling. Marker ids come from `special_token_id`
+        // at the top of the loop; on span close the body parses into
+        // structured `tool_calls` (emitted as an event at the terminal).
+        // While inside, text_stream is NOT fed — the span never reaches the
+        // client. Tokens always enter `conversation_tokens` and the decode
+        // step, so KV and history see the real stream.
+        if tool_open_tok.is_some_and(|t| next_tok == t) && !in_tool_span {
+            in_tool_span = true;
+            tool_span_tokens.clear();
+            tool_span_tokens.push(next_tok);
+            tool_body_tokens.clear();
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("lfm2moe decode failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+            continue;
+        }
+        if in_tool_span {
+            tool_span_tokens.push(next_tok);
+            if tool_close_tok.is_some_and(|t| next_tok == t) {
+                in_tool_span = false;
+                let body_text = tokenizer.decode(&tool_body_tokens);
+                tool_calls.extend(hipfire_runtime::emit_text::parse_lfm_tool_call_body(
+                    &body_text,
+                ));
+            } else {
+                tool_body_tokens.push(next_tok);
+            }
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("lfm2moe decode failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
+            continue;
+        }
+
         emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -6173,6 +6305,18 @@ pub fn generate_lfm2moe(
     }
     emit_dense_token_text(stdout, id, &text_stream.flush());
 
+    // Unclosed tool span (EOS or max_tokens landed mid-call): never
+    // fabricate a call from a truncated body — re-emit the buffered span
+    // text so the client sees exactly what the model wrote (the
+    // treat-as-text fallback vLLM uses).
+    if in_tool_span {
+        emit_dense_token_text(
+            stdout,
+            id,
+            &m.tokenizer.as_ref().unwrap().decode(&tool_span_tokens),
+        );
+    }
+
     // Abort latched between loop exit and commit must not proceed to the
     // two-phase commit handshake — emit the attested `aborted` terminal
     // instead so the client's drain loop terminates.
@@ -6191,15 +6335,32 @@ pub fn generate_lfm2moe(
     } else {
         0.0
     };
-    let pending_done = serde_json::json!({
+    // "length" when the token budget ended the turn mid-stream; a truncated
+    // reply must not masquerade as a complete "stop". `tool_calls` when the
+    // turn ended by producing executable calls (same convention as every
+    // other arch).
+    let finish_reason = if !hit_eos {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    // Legacy contract surfaces calls ONLY from a `{"type":"tool_calls"}`
+    // event read BEFORE the commit_ready terminal — precede the handshake.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)

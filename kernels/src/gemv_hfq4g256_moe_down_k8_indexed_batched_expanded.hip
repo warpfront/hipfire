@@ -99,11 +99,8 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     __builtin_amdgcn_s_prefetch_data((const void*)row_ptr3, 0);
 #endif
 
-    // 2 live pairwise slots/row (acc2/acc3 would stay 0 on groups==2).
-    float acc0 = 0.0f, acc1 = 0.0f;
-    float bcc0 = 0.0f, bcc1 = 0.0f;
-    float ccc0 = 0.0f, ccc1 = 0.0f;
-    float dcc0 = 0.0f, dcc1 = 0.0f;
+    // Accumulators — general K%256==0, K=512 fast path identical.
+    float acc = 0.0f, bcc = 0.0f, ccc = 0.0f, dcc = 0.0f;
 
     #if HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
     // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform, so
@@ -131,41 +128,70 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
              + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7); \
     } while (0)
 
-    // Hoist both groups' 16 x elements (float4×4) before any weight DOG.
-    const int base0 = tid * 8;
-    const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
-    const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
-    const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
-    const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
+    if (groups_per_row == 2) {
+        // K=512 fast/unrolled — bitwise identical to the original 2-group body.
+        // Preserve pairwise slots and hoisted x for identical scheduling/output.
+        float acc0 = 0.0f, acc1 = 0.0f;
+        float bcc0 = 0.0f, bcc1 = 0.0f;
+        float ccc0 = 0.0f, ccc1 = 0.0f;
+        float dcc0 = 0.0f, dcc1 = 0.0f;
 
-    // Group 0 → pairwise slot 0 (matches baseline tail g=0 → acc0).
-    DOG_X8(row_ptr0 + 0 * 136, row_rsrc0, 0 * 136, acc0,
-           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-    DOG_X8(row_ptr1 + 0 * 136, row_rsrc1, 0 * 136, bcc0,
-           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-    DOG_X8(row_ptr2 + 0 * 136, row_rsrc2, 0 * 136, ccc0,
-           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-    DOG_X8(row_ptr3 + 0 * 136, row_rsrc3, 0 * 136, dcc0,
-           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        // Hoist both groups' 16 x elements (float4×4) before any weight DOG.
+        const int base0 = tid * 8;
+        const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
 
-    // Group 1 → pairwise slot 1 (matches baseline tail g=1 → acc1).
-    DOG_X8(row_ptr0 + 1 * 136, row_rsrc0, 1 * 136, acc1,
-           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-    DOG_X8(row_ptr1 + 1 * 136, row_rsrc1, 1 * 136, bcc1,
-           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-    DOG_X8(row_ptr2 + 1 * 136, row_rsrc2, 1 * 136, ccc1,
-           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-    DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
-           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        // Group 0 → pairwise slot 0 (matches baseline tail g=0 → acc0).
+        DOG_X8(row_ptr0 + 0 * 136, row_rsrc0, 0 * 136, acc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr1 + 0 * 136, row_rsrc1, 0 * 136, bcc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr2 + 0 * 136, row_rsrc2, 0 * 136, ccc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr3 + 0 * 136, row_rsrc3, 0 * 136, dcc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+
+        // Group 1 → pairwise slot 1 (matches baseline tail g=1 → acc1).
+        DOG_X8(row_ptr0 + 1 * 136, row_rsrc0, 1 * 136, acc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(row_ptr1 + 1 * 136, row_rsrc1, 1 * 136, bcc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(row_ptr2 + 1 * 136, row_rsrc2, 1 * 136, ccc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        acc = acc0 + acc1;
+        bcc = bcc0 + bcc1;
+        ccc = ccc0 + ccc1;
+        dcc = dcc0 + dcc1;
+    } else {
+        // General K%256==0: sequential group loop, one accumulator per row.
+        // x float4 pair is hoisted per group; row pointers advance by the
+        // group stride already computed above.
+        for (int g = 0; g < groups_per_row; ++g) {
+            const char* gp0 = row_ptr0 + (long long)g * 136;
+            const char* gp1 = row_ptr1 + (long long)g * 136;
+            const char* gp2 = row_ptr2 + (long long)g * 136;
+            const char* gp3 = row_ptr3 + (long long)g * 136;
+            const long long w_off = (long long)g * 136;
+            const int x_off = g * 256 + tid * 8;
+            const float4 xv_a = *reinterpret_cast<const float4*>(x + x_off);
+            const float4 xv_b = *reinterpret_cast<const float4*>(x + x_off + 4);
+            DOG_X8(gp0, row_rsrc0, w_off, acc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+            DOG_X8(gp1, row_rsrc1, w_off, bcc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+            DOG_X8(gp2, row_rsrc2, w_off, ccc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+            DOG_X8(gp3, row_rsrc3, w_off, dcc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+        }
+    }
     #undef DOG_X8
     #undef HIPFIRE_MOE_DOWN_LOAD_SC
     #undef HIPFIRE_MOE_DOWN_LOAD_ZP
-
-    // groups==2: only slots 0/1 live; (a0+a1) ≡ baseline (a0+a1)+(a2+a3) with a2=a3=0.
-    float acc = acc0 + acc1;
-    float bcc = bcc0 + bcc1;
-    float ccc = ccc0 + ccc1;
-    float dcc = dcc0 + dcc1;
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
     for (int offset = 16; offset > 0; offset >>= 1)

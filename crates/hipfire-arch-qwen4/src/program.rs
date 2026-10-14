@@ -939,6 +939,7 @@ fn build_moe_decode<'a>(
         k: moe_dims.experts_per_token,
         n_exp: moe_dims.num_experts,
         norm_topk_prob: moe.norm_topk_prob,
+        selection_bias: None,
         x_rot_prerotated: false,
         defer_routed_combine: false,
         cpu_deferred_experts: false,

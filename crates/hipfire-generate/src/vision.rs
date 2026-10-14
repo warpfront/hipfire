@@ -3377,6 +3377,10 @@ pub fn generate_lfm2_vl(
             }
         }
     };
+    // Same `primed_think` convention as the text path: emit the template's
+    // think opener as display-only text so downstream reasoning/content
+    // consumers see a well-formed think block.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let template = m.chat_template.as_ref();
@@ -3396,7 +3400,10 @@ pub fn generate_lfm2_vl(
             None => Err("no chat template embedded in artifact".to_string()),
         };
         match rendered {
-            Ok(text) => tokenizer.encode(&text),
+            Ok(text) => {
+                primed_think = hipfire_engine::emit::render_tail_opens_think(&text);
+                tokenizer.encode(&text)
+            }
             Err(e) => {
                 emit_active_attempt_error(
                     stdout,
@@ -3560,6 +3567,29 @@ pub fn generate_lfm2_vl(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
+
+    // Same `primed_think` convention as the text path (generate_lfm2moe):
+    // emit the template's `<think>` opener as display-only text so the
+    // serve reasoning/content split sees a well-formed block.
+    if primed_think {
+        crate::dense::emit_dense_token_text(stdout, id, "\x3Cthink\x3E");
+    }
+
+    // Same tool-span handling as the text path: the LFM tool markers and
+    // their body are suppressed from the stream and parsed into
+    // `tool_calls` at the terminal; all tokens still reach KV + history.
+    let tool_open_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_start\x7C\x3E"));
+    let tool_close_tok = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("\x3C\x7Ctool_call_end\x7C\x3E"));
+    let mut in_tool_span = false;
+    let mut tool_span_tokens: Vec<u32> = Vec::new();
+    let mut tool_body_tokens: Vec<u32> = Vec::new();
+    let mut tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
     let mut decoded_eot = false;
     loop {
         if check_abort(id) {
@@ -3584,8 +3614,34 @@ pub fn generate_lfm2_vl(
             decoded_eot = true;
             break;
         }
-        // Multi-byte characters span tokens: emit only completed text.
-        crate::dense::emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
+        // Tool-call span handling — suppresses marker + body tokens from the
+        // stream; everything still enters conversation_tokens and the decode
+        // step (mirrors dense::generate_lfm2moe).
+        let in_span_boundary = if tool_open_tok.is_some_and(|t| next_tok == t) && !in_tool_span {
+            in_tool_span = true;
+            tool_span_tokens.clear();
+            tool_span_tokens.push(next_tok);
+            tool_body_tokens.clear();
+            true
+        } else if in_tool_span {
+            tool_span_tokens.push(next_tok);
+            if tool_close_tok.is_some_and(|t| next_tok == t) {
+                in_tool_span = false;
+                let body_text = tokenizer.decode(&tool_body_tokens);
+                tool_calls.extend(hipfire_runtime::emit_text::parse_lfm_tool_call_body(
+                    &body_text,
+                ));
+            } else {
+                tool_body_tokens.push(next_tok);
+            }
+            true
+        } else {
+            false
+        };
+        if !in_span_boundary {
+            // Multi-byte characters span tokens: emit only completed text.
+            crate::dense::emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -3613,6 +3669,15 @@ pub fn generate_lfm2_vl(
         }
     }
     crate::dense::emit_dense_token_text(stdout, id, &text_stream.flush());
+    // Unclosed tool span: re-emit the raw text (treat-as-text fallback);
+    // a truncated body never becomes a call.
+    if in_tool_span {
+        crate::dense::emit_dense_token_text(
+            stdout,
+            id,
+            &m.tokenizer.as_ref().unwrap().decode(&tool_span_tokens),
+        );
+    }
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
 
     // Post-loop abort latch — MANDATORY before the two-phase commit
@@ -3636,7 +3701,14 @@ pub fn generate_lfm2_vl(
     } else {
         0.0
     };
-    let pending_done = serde_json::json!({
+    // `tool_calls` finish when a complete span produced executable calls —
+    // same convention as the text path.
+    let finish_reason = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        crate::common::length_or_stop(generated_count, max_tokens, decoded_eot)
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
@@ -3644,8 +3716,12 @@ pub fn generate_lfm2_vl(
         "prefill_ms": prefill_ms,
         "total_ms": t_turn.elapsed().as_millis().max(1),
         "attempt_id": active_attempt_id(),
-        "finish_reason": crate::common::length_or_stop(generated_count, max_tokens, decoded_eot),
+        "finish_reason": finish_reason,
     });
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    // Legacy contract: the `tool_calls` event must precede commit_ready.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
