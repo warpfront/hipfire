@@ -32,6 +32,7 @@ pub mod moe_dump;
 pub(crate) mod draft_head;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
+pub mod mla;
 pub mod sandwich;
 pub(crate) mod steps;
 pub mod step_graph;
@@ -45,9 +46,9 @@ pub use layer_ops::{
     execute_hyper_read, execute_hyper_write, execute_indexed_attention, execute_lm_head,
     execute_project, project_weight, project_weights, qsa_projection_hook_installed,
     reset_qsa_projection_slot, set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp,
-    DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp,
-    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
+    DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture,
+    GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
+    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
     execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
     execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
     execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
@@ -58,6 +59,28 @@ pub use steps::{
     execute_validated_steps_with_moe_hooks, validate_steps, FusedPattern, GemvInput,
     HcFusionCursor, MoeStepHooks, Step,
 };
+
+/// The rows an operation that serves both decode and batched rows runs.
+/// The route alone picks decode or batched kernels; `rows` is only the
+/// extent, so a one-row prefill chunk keeps its batched arithmetic.
+/// Operations whose batched chain needs route-only operands carry a per-op
+/// `XRoute::{Decode { .. }, Batched { .. }}` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowsRoute {
+    /// One decode row.
+    Decode,
+    /// A prefill chunk.
+    Prefill,
+    /// A speculative-verify block.
+    Verify,
+}
+
+impl RowsRoute {
+    /// Whether the rows take the batched kernels.
+    pub fn batched(self) -> bool {
+        self != Self::Decode
+    }
+}
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
@@ -4154,6 +4177,20 @@ fn decode_gate_up_stage(
             2 * p.mi,
             gate_up_k,
         ))?;
+    } else if p.dtypes.routed_gate_up == DType::MQ6G256 && p.k < 8 {
+        // Below top-8 (the biased sigmoid route) take the batched launcher,
+        // as the HFQ4 arm below does.
+        hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
+        ))?;
     } else if p.dtypes.routed_gate_up == DType::MQ6G256 {
         hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
             p.expert_gate_up_ptrs,
@@ -4175,6 +4212,21 @@ fn decode_gate_up_stage(
             p.up_batch,
             2 * p.mi,
             gate_up_k,
+        ))?;
+    } else if p.k < 8 {
+        // Below top-8 (the biased sigmoid route) the batched launcher is the
+        // faster kernel: bitwise identical, +1.2% LFM2.5-8B-A1B decode (k=4,
+        // gfx1151).
+        hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
         ))?;
     } else {
         hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
@@ -4309,6 +4361,15 @@ fn decode_activation_stage(
         // silu_mul is elementwise, so one launch over the whole
         // [k_top * mi] buffer covers every selected expert.
         hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
+    } else if let (_, Some(awq)) = no_shared_routed_awq(p) {
+        hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
+            p.gate_batch,
+            p.up_batch,
+            awq,
+            p.rot_batch,
+            p.mi,
+            p.k
+        ))?;
     } else {
         // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
         hip!(gpu.fused_silu_mul_rotate_mq_batched(
@@ -4657,11 +4718,24 @@ fn decode_input_basis_stage(
             } else {
                 hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
             }
+        } else if let (Some(awq), _) = no_shared_routed_awq(p) {
+            hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
         } else {
             hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
         }
     }
     Ok(())
+}
+
+/// `(gate_up, down)` per-layer AWQ activation scales of the routed experts
+/// (`(W·s)·(x/s) = W·x`). Only a no-shared recipe owns its input rotation.
+fn no_shared_routed_awq<'a>(
+    p: &crate::families::moe::MoeParams<'a>,
+) -> (Option<&'a GpuTensor>, Option<&'a GpuTensor>) {
+    match p.routed_experts.get(0) {
+        Some((gate_up, down)) if p.shared.is_none() => (gate_up.awq_scale, down.awq_scale),
+        _ => (None, None),
+    }
 }
 
 fn decode_route_cpu_stage(

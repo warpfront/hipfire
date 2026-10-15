@@ -5,18 +5,21 @@
 //! attention mixers (6 layers), feeding a DeepSeek-style sigmoid-bias top-4
 //! MoE FFN (layers >= num_dense_layers) or a dense SwiGLU MLP (the first
 //! `num_dense_layers` layers). Per-layer mixer choice comes from the
-//! checkpoint's `layer_types`. Forward pass is free functions in `forward.rs`,
-//! mirroring the MiniMax-M2 (arch_id 10) port.
+//! checkpoint's `layer_types`.
 //!
-//! Kernel coverage (all pre-existing except one small conv variant):
-//!   * attention   -> per-head QK-norm (rmsnorm_batched) + full-dim rotate_half
-//!                    RoPE (rope_f32) + Q8 GQA flash attention
-//!   * MoE routing -> deepseek4_moe_topk_bias_aware (sigmoid + expert_bias,
-//!                    runtime k_top = num_experts_per_tok = 4)
-//!   * MoE experts -> gemv_hfq4g256_moe_{gate_up,down} indexed (FWHT MQ4, k=4)
-//!   * dense MLP   -> Q8 SwiGLU (w1 gate, w3 up, silu_mul, w2 down)
-//!   * LIV conv    -> conv1d_gated_decode_f32 (NEW: K=3, fused B*x / C*conv_out
-//!                    gates + rolling conv-state cache)
+//! Single-lane decode is a typed `hipfire_dispatch` step program per layer
+//! (`program.rs`); `forward.rs` keeps only the lifecycle around it (input
+//! staging, hipGraph and Redline retained replay, oracle capture). The
+//! dispatch steps it binds:
+//!   * mixer norms / projections -> `RmsnormAutomatic`, `Gemv`, `GemvResidual`
+//!   * LIV conv    -> `GatedShortConv` (B*x gate, depthwise causal conv,
+//!                    C gate, rolling conv state)
+//!   * attention   -> `QkNorm`, `Rope`, `Attend` (Q8 KV)
+//!   * dense MLP   -> `SiluMul` between the gate/up and down projections
+//!   * MoE         -> sealed `Moe` call: sigmoid router with the expert
+//!                    selection bias (`MoeSelectionBias`), runtime top-k
+//! The continuous-batching decode (`forward_batch.rs`, dense only) is still
+//! its own loop.
 pub mod arch;
 pub mod arch_model;
 pub mod batch;
@@ -25,6 +28,7 @@ pub mod config;
 pub mod forward;
 pub mod forward_batch;
 pub mod lfm2moe;
+mod program;
 pub mod spec_impl;
 
 pub use arch::Lfm2Moe;

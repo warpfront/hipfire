@@ -4812,8 +4812,15 @@ pub fn generate_muse_glimmer(
                     ctx_len + block_size,
                     "positions.len() must equal ctx_len + block_size"
                 );
+                // A verify window writes `block_size` KV rows from `cur_pos`; one
+                // that would cross the cache finishes the request on AR decode.
+                let past_cap = cur_pos as usize + block_size > cache_cap;
                 // Device: forward from resident log. Host: suffix Vec + host call.
-                let drafter_ok = if device_capture {
+                let drafter_ok = if past_cap {
+                    Err(format!(
+                        "verify window {cur_pos}+{block_size} would pass max_seq {cache_cap}"
+                    ))
+                } else if device_capture {
                     let log = match bundle.state.target_hidden_log() {
                         Some(l) => l,
                         None => {
@@ -4868,10 +4875,11 @@ pub fn generate_muse_glimmer(
                 };
                 if let Err(e) = drafter_ok {
                     // Bring-up: requested drafter must be loud and fatal, not silent fallback
-                    let fatal = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
-                        .ok()
-                        .as_deref()
-                        != Some("1");
+                    let fatal = !past_cap
+                        && hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
+                            .ok()
+                            .as_deref()
+                            != Some("1");
                     if fatal {
                         emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
                         let es = format!("{e}");
@@ -4890,7 +4898,9 @@ pub fn generate_muse_glimmer(
                         }
                         return;
                     }
-                    eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    if !past_cap {
+                        eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    }
                     // One-token-ahead AR fallback: `last_pick` is already emitted and pending at
                     // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
                     // sample a NEW prediction from the returned logits and make it the next pending seed.

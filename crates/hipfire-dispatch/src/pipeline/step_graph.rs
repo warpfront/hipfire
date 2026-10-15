@@ -17,7 +17,8 @@
 //! # Frozen op-kind IDs
 //!
 //! [`OpKind`] discriminants are part of the contract: one per [`Step`] variant
-//! (`1..=26`) plus hand-route ops with no `Step` variant yet (`1000..`). Values
+//! (`1..`) plus hand-route ops (`1000..`); a hand-route op that later gains a
+//! `Step` variant keeps its ID (`Step::SiluMul` is `SiluMul = 1001`). Values
 //! are frozen — never renumber, never reuse, append only. The
 //! `op_kind_ids_frozen` test pins every value.
 
@@ -88,9 +89,47 @@ pub enum OpKind {
     Moe = 25,
     /// [`Step::MoeStage`].
     MoeStage = 26,
+    /// [`Step::GatedShortConv`] (#666 G10, LFM2).
+    GatedShortConv = 27,
+    /// [`Step::HcPre`] (#666 G9, DeepSeek4).
+    HcPre = 28,
+    /// [`Step::HcPost`] (#666 G9, DeepSeek4).
+    HcPost = 29,
+    /// [`Step::HcHead`] (#666 G9, DeepSeek4).
+    HcHead = 30,
+    /// [`Step::QLoraPrepare`] (#666 G9, DeepSeek4).
+    QLoraPrepare = 31,
+    /// [`Step::PackedProjections`] (#666 G9, DeepSeek4).
+    PackedProjections = 32,
+    /// [`Step::QLoraProject`] (#666 G9, DeepSeek4).
+    QLoraProject = 33,
+    /// [`Step::KvJoint`] (#666 G9, DeepSeek4).
+    KvJoint = 34,
+    /// [`Step::ApplyTailRope`] (#666 G9, DeepSeek4).
+    ApplyTailRope = 35,
+    /// [`Step::ExpertFfn`] (#666 G9, DeepSeek4).
+    ExpertFfn = 36,
+    /// [`Step::SparseIndex`] (#666 G9, DeepSeek4).
+    SparseIndex = 37,
+    /// [`Step::KvCompress`] (#666 G9, DeepSeek4).
+    KvCompress = 38,
+    /// [`Step::PreparedProjection`] (#666 G9, DeepSeek4).
+    PreparedProjection = 39,
+    /// [`Step::SwaRingWrite`] (#666 G9, DeepSeek4).
+    SwaRingWrite = 40,
+    /// [`Step::IdentityGather`] (#666 G9, DeepSeek4).
+    IdentityGather = 41,
+    /// [`Step::SwaAttention`] (#666 G9, DeepSeek4).
+    SwaAttention = 42,
+    /// [`Step::SparseAttention`] (#666 G9, DeepSeek4).
+    SparseAttention = 43,
+    /// [`Step::OLora`] (#666 G9, DeepSeek4).
+    OLora = 44,
+    /// [`Step::CompressorProject`] (#666 G9, DeepSeek4).
+    CompressorProject = 45,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
-    /// Hand-route op with no `Step` variant yet: SiLU-mul.
+    /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
     SiluMul = 1001,
     /// Hand-route op with no `Step` variant yet: logits head argmax.
     Argmax = 1002,
@@ -126,6 +165,26 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::Softcap(..) => OpKind::Softcap,
         Step::Moe(..) => OpKind::Moe,
         Step::MoeStage(..) => OpKind::MoeStage,
+        Step::GatedShortConv(..) => OpKind::GatedShortConv,
+        Step::SiluMul { .. } => OpKind::SiluMul,
+        Step::HcPre(..) => OpKind::HcPre,
+        Step::HcPost(..) => OpKind::HcPost,
+        Step::HcHead(..) => OpKind::HcHead,
+        Step::QLoraPrepare(..) => OpKind::QLoraPrepare,
+        Step::PackedProjections(..) => OpKind::PackedProjections,
+        Step::QLoraProject(..) => OpKind::QLoraProject,
+        Step::KvJoint(..) => OpKind::KvJoint,
+        Step::ApplyTailRope(..) => OpKind::ApplyTailRope,
+        Step::ExpertFfn(..) => OpKind::ExpertFfn,
+        Step::SparseIndex(..) => OpKind::SparseIndex,
+        Step::KvCompress(..) => OpKind::KvCompress,
+        Step::PreparedProjection(..) => OpKind::PreparedProjection,
+        Step::SwaRingWrite(..) => OpKind::SwaRingWrite,
+        Step::IdentityGather(..) => OpKind::IdentityGather,
+        Step::SwaAttention(..) => OpKind::SwaAttention,
+        Step::SparseAttention(..) => OpKind::SparseAttention,
+        Step::OLora(..) => OpKind::OLora,
+        Step::CompressorProject(..) => OpKind::CompressorProject,
     }
 }
 
@@ -453,7 +512,7 @@ mod tests {
 
     #[test]
     fn op_kind_ids_frozen() {
-        let pinned: [(OpKind, u16); 29] = [
+        let pinned: &[(OpKind, u16)] = &[
             (OpKind::Gemv, 1),
             (OpKind::GemvResidual, 2),
             (OpKind::RmsnormAutomatic, 3),
@@ -480,11 +539,30 @@ mod tests {
             (OpKind::Softcap, 24),
             (OpKind::Moe, 25),
             (OpKind::MoeStage, 26),
+            (OpKind::GatedShortConv, 27),
+            (OpKind::HcPre, 28),
+            (OpKind::HcPost, 29),
+            (OpKind::HcHead, 30),
+            (OpKind::QLoraPrepare, 31),
+            (OpKind::PackedProjections, 32),
+            (OpKind::QLoraProject, 33),
+            (OpKind::KvJoint, 34),
+            (OpKind::ApplyTailRope, 35),
+            (OpKind::ExpertFfn, 36),
+            (OpKind::SparseIndex, 37),
+            (OpKind::KvCompress, 38),
+            (OpKind::PreparedProjection, 39),
+            (OpKind::SwaRingWrite, 40),
+            (OpKind::IdentityGather, 41),
+            (OpKind::SwaAttention, 42),
+            (OpKind::SparseAttention, 43),
+            (OpKind::OLora, 44),
+            (OpKind::CompressorProject, 45),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),
         ];
-        for (kind, value) in pinned {
+        for &(kind, value) in pinned {
             assert_eq!(kind as u16, value, "{kind:?}");
         }
     }

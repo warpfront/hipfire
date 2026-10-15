@@ -393,6 +393,7 @@ impl Llama {
                         k: layer.wq.k,
                         eps: config.norm_eps,
                         rotation: qkv_rot,
+                        rows: 1,
                     },
                     Step::Gemv {
                         w: &wrq,
@@ -536,6 +537,7 @@ impl Llama {
                         k: layer.w_gate.k,
                         eps: config.norm_eps,
                         rotation: ffn_rot,
+                        rows: 1,
                     },
                     Step::Gemv {
                         w: &wrg,

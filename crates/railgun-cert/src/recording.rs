@@ -973,7 +973,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "ds4-gfx942-compressor-sentinel-gate",
         predicates: &[CaptureMode],
-        condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs:2236-2250)",
+        condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs compressor_op)",
         effect: KernelSelection,
         switches: "eager: compressor kernels skipped on non-boundary tokens; captured: launched and sentinel-early-returned",
         kernels: &["compressor_*"],
@@ -984,7 +984,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "ds4-gfx942-ffn-overlap",
         predicates: &[CaptureMode],
-        condition: "gfx942_ffn_overlap_on && !capture_mode (forward.rs:4390-4391)",
+        condition: "gfx942_ffn_overlap_on && !capture_mode (forward.rs expert_ffn_schedule)",
         effect: KernelSelection,
         switches: "eager: shared/routed FFN on two streams; captured: serial FFN",
         kernels: &[],
@@ -1282,11 +1282,11 @@ pub const DECISIONS: &[Decision] = &[
 pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_mixed", occurrences: 16, decisions: &["dspark-capture-safe-verify-body"] },
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_swa_only", occurrences: 3, decisions: &["dspark-capture-safe-verify-body"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "compressor_forward_impl", occurrences: 1, decisions: &["ds4-gfx942-compressor-sentinel-gate"] },
+    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "compressor_op", occurrences: 1, decisions: &["ds4-gfx942-compressor-sentinel-gate"] },
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "decode_step_heterogeneous", occurrences: 4, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "decode_step_with_graph", occurrences: 2, decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"] },
-    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "ds4_moe_block_core", occurrences: 2, decisions: &["ds4-gfx942-ffn-overlap", "replay-enabled-process-route"] },
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "dspark_requires_typed_device_copy", occurrences: 2, decisions: &["dspark-capture-safe-verify-body"] },
+    Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "expert_ffn_schedule", occurrences: 2, decisions: &["ds4-gfx942-ffn-overlap", "replay-enabled-process-route"] },
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "forward_prefill_batch_chunk_impl", occurrences: 3, decisions: &["dspark-capture-safe-verify-body"] },
     Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "dspark_verify_forward", occurrences: 2, decisions: &["dspark-capture-safe-verify-body", "graph-capture-lifecycle"] },
     Site { file: "hipfire-arch-deepseek4/src/spec_impl.rs", function: "redline_dspark_verify_direct", occurrences: 2, decisions: &["dspark-capture-safe-verify-body"] },

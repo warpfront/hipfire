@@ -249,7 +249,6 @@ fn report_topk_change(first: &TopkSnapshot, second: &TopkSnapshot) {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     std::env::set_var("HIPFIRE_DEEPSEEK4_GRAPH", "0");
-    std::env::set_var("HIPFIRE_FORWARD_LOWERED", "0");
 
     let wall_start = Instant::now();
     println!(

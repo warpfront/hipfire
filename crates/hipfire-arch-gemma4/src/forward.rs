@@ -60,7 +60,8 @@ use crate::program::{
     RowActivations, RowBuffers, RowWidths,
 };
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::{execute_steps, Step};
+use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::llama::{weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -492,10 +493,12 @@ fn prepare_per_layer_inputs_batched(
             gpu,
             &ctx,
             &ple.model_projection.dispatch_ref(),
-            x,
+            hipfire_dispatch::pipeline::GemvInput::Raw(x),
             projection_all,
             x_rot,
+            None,
             b,
+            hipfire_dispatch::pipeline::sandwich::Ladder::Wide,
         )
         .map_err(|e| format!("gemma4 forward_batch ple model_projection: {e}"))?;
     } else {
@@ -996,9 +999,20 @@ fn forward_rows(
             Some(h) => h,
             None => local_hidden.as_ref().unwrap(),
         };
-        // Batched final RMSNorm over all B rows.
-        gpu.rmsnorm_batched(x, &weights.final_norm, normed_hidden, b, dim, eps)
-            .map_err(|e| format!("gemma4 forward_batch_spec final rmsnorm: {e:?}"))?;
+        // Final RMSNorm over all B rows (row-complete).
+        let norm = [Step::RmsnormAutomatic {
+            x,
+            norm_weight: &weights.final_norm,
+            x_plain: normed_hidden,
+            out: normed_hidden,
+            awq_scale: None,
+            k: dim,
+            eps,
+            rotation: RotationPlan::None,
+            rows: b,
+        }];
+        execute_steps(gpu, &ctx, &norm)
+            .map_err(|e| format!("gemma4 forward_batch_spec final rmsnorm: {e}"))?;
 
         if let Some(out) = per_pos_argmax_out {
             out.clear();

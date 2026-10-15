@@ -15,7 +15,7 @@ use crate::context::DispatchCtx;
 use crate::cpu_exec;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability, NARROW_VERIFY_MAX_ROWS,
+    MoeRecipe, MoeResolution, MoeRouteCapability, MOE_BIASED_SIGMOID_MAX_K, NARROW_VERIFY_MAX_ROWS,
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
@@ -718,13 +718,24 @@ impl<'a> SealedMoeOp<'a> {
                         {
                             gpu.sigmoid_f32(params.router_logits)
                                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                            gpu.moe_topk_renorm_k8(
-                                params.router_logits,
-                                params.topk_indices,
-                                params.topk_weights,
-                                params.n_exp,
-                                params.norm_topk_prob,
-                            )
+                            match params.selection_bias {
+                                Some(bias) => gpu.deepseek4_moe_topk_bias_aware_f32(
+                                    params.router_logits,
+                                    bias.bias,
+                                    params.topk_indices,
+                                    params.topk_weights,
+                                    params.n_exp as i32,
+                                    params.k as i32,
+                                    bias.route_scale,
+                                ),
+                                None => gpu.moe_topk_renorm_k8(
+                                    params.router_logits,
+                                    params.topk_indices,
+                                    params.topk_weights,
+                                    params.n_exp,
+                                    params.norm_topk_prob,
+                                ),
+                            }
                             .map_err(|e| DispatchError::Hip(e.to_string()))?;
                         }
                         #[cfg(not(feature = "deltanet"))]
@@ -1816,12 +1827,13 @@ pub(super) fn select_decode(
     // descriptor cannot supply its stable permutation and must fail closed.
     super::reject_fp8_moe(&params.dtypes)?;
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared
-        && (params.k != 8
+        && (!super::sealed_moe::sigmoid_decode_width_ok(params)
             || params.ep_mode != crate::families::moe::MoeEpMode::None
             || params.defer_routed_combine)
     {
         return Err(DispatchError::Hip(
-            "sigmoid MoE decode requires k=8, no EP, and no deferred combine".into(),
+            "sigmoid MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine"
+                .into(),
         ));
     }
     let mut resolution = MoeResolution::resolve_arch(&params.dtypes, params.k, ctx.arch.has_wmma());
@@ -1867,6 +1879,29 @@ pub(super) fn select_decode(
     } else {
         resolution.use_gpu_topk = true;
         resolution.needs_x_rot_local = true;
+    }
+    if params.selection_bias.is_some() {
+        // The bias-aware selector writes any width up to eight. At top-8 every
+        // generic indexed route applies; below it, of the indexed routed
+        // kernels only the uniform FWHT-basis MQ4G256 and MQ6G256 gate/up,
+        // activation, down and combine read that width at run time.
+        use rdna_compute::DType::{MQ4G256, MQ6G256};
+        let runtime_width = matches!(
+            (params.dtypes.routed_gate_up, params.dtypes.routed_down),
+            (MQ4G256, MQ4G256) | (MQ6G256, MQ6G256)
+        ) && !params.dtypes.routed_has_mixed_experts
+            && params.expert_dtype_tags.is_none()
+            && params.expert_down_awq_ptrs.is_none()
+            && params.routed_gate_up_paro.is_none();
+        if params.k < MOE_BIASED_SIGMOID_MAX_K && !runtime_width {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "biased-sigmoid-router-needs-runtime-width-experts",
+                arch: "",
+                quant: "",
+            });
+        }
+        resolution.use_gpu_topk = true;
     }
     super::check_moe_decode_supported(
         resolution.use_gpu_topk,

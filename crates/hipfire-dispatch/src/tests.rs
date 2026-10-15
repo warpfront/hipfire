@@ -1810,6 +1810,7 @@ fn make_qkv3_steps<'a>(
             k: 4096,
             eps: 1e-6,
             rotation,
+            rows: 1,
         },
         Step::Gemv {
             w: wr,
@@ -1844,6 +1845,7 @@ fn make_gate_up2_steps<'a>(
             k: 4096,
             eps: 1e-6,
             rotation,
+            rows: 1,
         },
         Step::Gemv {
             w: wr,
@@ -2046,6 +2048,7 @@ fn guard_qkv_rejects_mixed_gemv_input() {
             k: 4096,
             eps: 1e-6,
             rotation: RotationPlan::FwhtG256,
+            rows: 1,
         },
         Step::Gemv {
             w: &wr,
@@ -2198,6 +2201,7 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
             k: 4096,
             eps: 1e-6,
             rotation: RotationPlan::FwhtG256,
+            rows: 1,
         },
         Step::Gemv {
             w: &wr_v2,
