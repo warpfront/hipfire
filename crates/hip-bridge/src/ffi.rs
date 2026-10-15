@@ -3425,6 +3425,15 @@ impl Stream {
     pub fn raw_ptr(&self) -> *mut c_void {
         self.0
     }
+    /// Non-owning copy of this handle, for borrowing a stream where an owned
+    /// `Stream` is expected (e.g. `Gpu::active_stream`).
+    ///
+    /// # Safety
+    /// The alias must not outlive the stream and must never reach
+    /// `stream_destroy`; the owner destroys the stream exactly once.
+    pub unsafe fn alias(&self) -> Stream {
+        Stream(self.0)
+    }
 }
 // SAFETY: Stream is an opaque HIP handle (*mut c_void). Sending the handle
 // between threads is fine; it is not Sync. Concurrent use needs

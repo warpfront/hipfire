@@ -111,9 +111,6 @@ fn run_prod(args: &Args) -> Result<(), String> {
     // SAFETY: single-threaded main before any concurrent readers.
     unsafe {
         std::env::set_var("HIPFIRE_DEEPSEEK4_LAYER_NORM", "1");
-        // Hand loop so the dump sits next to hc_ffn_mix without lowered
-        // binding indirection; byte-identical on hipx to the lowered path.
-        std::env::set_var("HIPFIRE_FORWARD_LOWERED", "0");
     }
 
     let model_path = Path::new(&args.model);

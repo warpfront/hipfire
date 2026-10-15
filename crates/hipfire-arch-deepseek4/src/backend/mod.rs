@@ -124,3 +124,42 @@ impl Mq2rBackend {
         }
     }
 }
+
+impl hipfire_dispatch::pipeline::mla::attention::LatentAttentionBackend for Mq2rBackend {
+    fn grouped_olora_e8(
+        &self,
+        gpu: &mut Gpu,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        groups: usize,
+        m: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        Mq2rBackend::grouped_olora_e8(*self, gpu, a, x, y, groups, m, k)
+    }
+
+    fn try_indexer_top_k_buf_parallel(
+        &self,
+        gpu: &mut Gpu,
+        scores: &GpuTensor,
+        top_indices: &GpuTensor,
+        n_compressed_buf: &GpuTensor,
+        k_buf: &GpuTensor,
+        n_idx_heads: i32,
+        max_k: i32,
+        bounded: bool,
+    ) -> Result<bool, String> {
+        Mq2rBackend::try_indexer_top_k_buf_parallel(
+            *self,
+            gpu,
+            scores,
+            top_indices,
+            n_compressed_buf,
+            k_buf,
+            n_idx_heads,
+            max_k,
+            bounded,
+        )
+    }
+}

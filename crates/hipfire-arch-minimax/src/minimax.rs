@@ -10,6 +10,12 @@
 //! Expert weights ship pre-split (w1/w2/w3) in the HFQ; the loader byte-fuses
 //! w1‖w3 into the per-expert `gate_up` blob the indexed GEMV kernels expect.
 
+use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::moe::RoutedExpertWeights;
+use hipfire_dispatch::pipeline::{
+    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+};
+use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
@@ -402,6 +408,9 @@ pub struct MiniMaxLayerWeights {
     pub experts: Vec<MiniMaxExpertWeights>,
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// Single-GPU loads: the experts sealed for the shared MoE executor.
+    /// `None` on an EP shard, whose MoE still runs the EP layer program.
+    pub sealed: Option<SealedExperts>,
     /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
     /// pointers index into (→ 0 silu output ⇒ 0 contribution). Owned here so it
     /// is reclaimed by `free_gpu` on unload and by the staging guard on a
@@ -415,6 +424,131 @@ pub struct MiniMaxExpertWeights {
     pub gate_up: WeightTensor,
     /// Down (w2): [hidden, intermediate] MQ4G256.
     pub down: WeightTensor,
+}
+
+/// Load-time expert identity for the shared sealed-MoE executor: one byte
+/// view per expert into the layer's packed gate/up and down blobs, sealed and
+/// live-bound once against the uploaded pointer tables.
+pub struct SealedExperts {
+    views: Vec<(GpuTensor, GpuTensor)>,
+    pub(crate) table: ExpertTable,
+    pub(crate) cache: ExpertBindingCache,
+}
+
+/// The routed experts of one layer as the sealed executor reads them: expert
+/// `e` is the packed representative's format and shape over its own bytes.
+pub(crate) struct PackedExperts<'a> {
+    rep: &'a MiniMaxExpertWeights,
+    views: &'a [(GpuTensor, GpuTensor)],
+}
+
+impl RoutedExpertWeights for PackedExperts<'_> {
+    fn len(&self) -> usize {
+        self.views.len()
+    }
+
+    fn get(&self, expert: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+        let (gate_up, down) = self.views.get(expert)?;
+        Some((
+            WeightRef {
+                buf: gate_up,
+                ..self.rep.gate_up.dispatch_ref()
+            },
+            WeightRef {
+                buf: down,
+                ..self.rep.down.dispatch_ref()
+            },
+        ))
+    }
+}
+
+impl MiniMaxLayerWeights {
+    /// The sealed routed experts, `None` on an EP shard.
+    pub(crate) fn packed_experts(&self) -> Option<(PackedExperts<'_>, &SealedExperts)> {
+        let sealed = self.sealed.as_ref()?;
+        let packed = PackedExperts {
+            rep: &self.experts[0],
+            views: &sealed.views,
+        };
+        Some((packed, sealed))
+    }
+}
+
+/// Seal a single-GPU layer's `n_exp` packed experts (expert `e` at
+/// `e * stride` of each blob) and bind them to the uploaded pointer tables.
+fn seal_packed_experts(
+    gpu: &Gpu,
+    layer: usize,
+    rep: &MiniMaxExpertWeights,
+    n_exp: usize,
+    gu_ptrs: &GpuTensor,
+    dn_ptrs: &GpuTensor,
+) -> Result<SealedExperts, String> {
+    let encoded = |w: &WeightTensor| {
+        w.gpu_dtype
+            .row_bytes(w.k)
+            .map(|row| (row, w.m * row))
+            .ok_or_else(|| format!("minimax L{layer}: no row layout for {:?}", w.gpu_dtype))
+    };
+    let ((gu_row, gu_bytes), (dn_row, dn_bytes)) = (encoded(&rep.gate_up)?, encoded(&rep.down)?);
+    let view = |w: &WeightTensor, e: usize, bytes: usize| GpuTensor {
+        buf: w.buf.buf.byte_view(e * bytes, bytes),
+        shape: vec![bytes],
+        dtype: w.gpu_dtype,
+    };
+    if rep.gate_up.buf.buf.size() != n_exp * gu_bytes || rep.down.buf.buf.size() != n_exp * dn_bytes
+    {
+        return Err(format!(
+            "minimax L{layer}: packed expert blobs are not {n_exp} experts of {gu_bytes}/{dn_bytes} bytes"
+        ));
+    }
+    let views: Vec<_> = (0..n_exp)
+        .map(|e| {
+            (
+                view(&rep.gate_up, e, gu_bytes),
+                view(&rep.down, e, dn_bytes),
+            )
+        })
+        .collect();
+    let resource = |e: usize, name: &str, w: &WeightTensor, row: usize, bytes: usize| {
+        ExpertResource::new(
+            format!("model.layers.{layer}.block_sparse_moe.experts.{e}.{name}"),
+            "minimax-packed-v1",
+            vec![w.m, w.k],
+            w.gpu_dtype,
+            bytes,
+            row,
+            16,
+            dtype_rotation_plan(w.gpu_dtype),
+        )
+        .map_err(|err| format!("minimax L{layer}: expert {e} {name}: {err:?}"))
+    };
+    let mut metadata = Vec::with_capacity(n_exp);
+    for e in 0..n_exp {
+        let resources = ExpertResources::fused(
+            resource(e, "gate_up", &rep.gate_up, gu_row, gu_bytes)?,
+            resource(e, "down", &rep.down, dn_row, dn_bytes)?,
+        )
+        .map_err(|err| format!("minimax L{layer}: expert {e}: {err:?}"))?;
+        metadata.push(
+            ExpertMetadata::new(e, 0, e, resources)
+                .map_err(|err| format!("minimax L{layer}: expert {e}: {err:?}"))?,
+        );
+    }
+    let table = ExpertTable::new(metadata)
+        .map_err(|err| format!("minimax L{layer}: expert table: {err:?}"))?;
+    let mut cache = table
+        .prepare_binding(0, 1, gpu.device_id)
+        .map_err(|err| format!("minimax L{layer}: expert binding: {err:?}"))?;
+    let packed = PackedExperts { rep, views: &views };
+    cache
+        .bind_live(&table, &packed, gu_ptrs, dn_ptrs, None, None)
+        .map_err(|err| format!("minimax L{layer}: bind live experts: {err:?}"))?;
+    Ok(SealedExperts {
+        views,
+        table,
+        cache,
+    })
 }
 
 pub struct MiniMaxWeights {
@@ -752,8 +886,21 @@ impl MiniMaxWeights {
                 experts,
                 expert_gate_up_ptrs,
                 expert_down_ptrs,
+                sealed: None,
                 dummy_gate_up,
             });
+            if shard.is_none() {
+                let layer = layers.last_mut().expect("layer just pushed");
+                let sealed = seal_packed_experts(
+                    gpu,
+                    l,
+                    &layer.experts[0],
+                    n_exp,
+                    &layer.expert_gate_up_ptrs,
+                    &layer.expert_down_ptrs,
+                )?;
+                layer.sealed = Some(sealed);
+            }
         }
 
         Ok(MiniMaxWeights {
@@ -802,8 +949,11 @@ impl MiniMaxLayerWeights {
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            sealed,
             dummy_gate_up,
         } = self;
+        // Borrowed byte views into the expert blobs; dropped before the blobs.
+        drop(sealed);
         let _ = gpu.free_tensor(attn_norm);
         let _ = gpu.free_tensor(ffn_norm);
         let _ = gpu.free_tensor(q_norm);
@@ -1438,8 +1588,19 @@ pub fn load_weights_from_safetensors(
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            sealed: None,
             dummy_gate_up: None,
         });
+        let layer = layers.last_mut().expect("layer just pushed");
+        let sealed = seal_packed_experts(
+            gpu,
+            l,
+            &layer.experts[0],
+            n_exp,
+            &layer.expert_gate_up_ptrs,
+            &layer.expert_down_ptrs,
+        )?;
+        layer.sealed = Some(sealed);
     }
 
     Ok(MiniMaxWeights {

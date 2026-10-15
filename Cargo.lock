@@ -1304,6 +1304,7 @@ dependencies = [
  "saddle-core",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]

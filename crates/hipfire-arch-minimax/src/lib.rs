@@ -25,6 +25,7 @@ pub mod arch_model;
 pub mod carrier;
 pub mod forward;
 pub mod minimax;
+pub(crate) mod program;
 /// MiniMax-M2 impl of the arch-generic `hipfire_runtime::spec` seam
 /// (`impl SpecTarget for MiniMaxBundle`) — lets the model-free n-gram
 /// speculator drive MiniMax-M2 (arch_id=10).

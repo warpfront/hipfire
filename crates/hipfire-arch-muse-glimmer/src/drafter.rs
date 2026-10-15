@@ -157,99 +157,21 @@
 //!     sampling drawing a non-argmax token and breaking the chain, which no
 //!     lossless accept rule can recover — only a better-aligned drafter can.
 //!
-//! REUSE: no new kernels. Projections are `weight_gemv`, norms are
-//! `rmsnorm_batched`, RoPE is `rope_batched_f32` (half-split; n_heads_*=0 to
-//! skip the inactive side), attention is `attention_dflash_f32`.
+//! The forward is one typed `hipfire_dispatch` step program per layer
+//! (`layer_steps`); the context-row watermarks, staging and the window
+//! gather bounds stay here.
 
 use crate::glimmer::GlimmerHiddenLog;
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::sandwich::{
+    gemm_rows, Activation, DraftContext, KvProjection, KvRoute, Ladder, Rope, RopeKind,
+    SandwichAttentionOp, SandwichKv, SandwichMlpOp, SandwichRoute, SandwichStream, StepsRoute,
+};
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, RowsRoute, Step};
+use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{rotate_x_mq_batched_for, weight_gemv, WeightTensor};
+use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::{DType, Gpu, GpuTensor};
-
-// ─── Shared rotation gate (mirrors forward.rs) ───────────────────────────
-// HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
-fn shared_rot_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
-}
-
-// ─── Batched projection dispatch (mirrors forward.rs::proj_gemm_batched) ──
-// Q8_0      → gemm_q8_0_batched_chunked (WMMA on gfx12)
-// MQ4G256/HFQ4G256 → rotate + gemm_hfq4g256_batched_lmhead (prerotated)
-// MQ6G256   → rotate + gemm_mq6g256_batched_lmhead
-// others    → per-row weight_gemv fallback (explicit, no approximation)
-//   Fallback dtypes: F32, Q4K, HFQ4G128, HFQ6G256, HFQ3G256, HFQ2G256, MQ3G256,
-//   MQ2G256, MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32, etc. — any
-//   dtype without a batched GEMM kernel. Drafter weights are Q8_0 so the
-//   Q8_0 batched path is taken; fallback is listed explicitly for
-//   correctness parity with forward.rs and never taken on current artifacts.
-fn proj_gemm_batched(
-    gpu: &mut Gpu,
-    w: &WeightTensor,
-    x: &GpuTensor,
-    y: &GpuTensor,
-    x_rot: &GpuTensor,
-    b: usize,
-    label: &str,
-) -> Result<(), String> {
-    match w.gpu_dtype {
-        DType::Q8_0 => gpu
-            .gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
-            .map_err(|e| format!("glimmer batch {label} (q8): {e:?}")),
-        DType::MQ4G256 | DType::HFQ4G256 => {
-            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
-                .map_err(|e| format!("glimmer batch {label} rotate: {e:?}"))?;
-            gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
-                .map_err(|e| format!("glimmer batch {label} (mq4): {e:?}"))
-        }
-        DType::MQ6G256 => {
-            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
-                .map_err(|e| format!("glimmer batch {label} rotate: {e:?}"))?;
-            gpu.gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
-                .map_err(|e| format!("glimmer batch {label} (mq6): {e:?}"))
-        }
-        _ => {
-            for i in 0..b {
-                let x_row = x.sub_offset(i * w.k, w.k);
-                let y_row = y.sub_offset(i * w.m, w.m);
-                weight_gemv(gpu, w, &x_row, &y_row)
-                    .map_err(|e| format!("glimmer batch {label} row {i}: {e}"))?;
-            }
-            Ok(())
-        }
-    }
-}
-
-// Prerotated variant: x_rot already FWHT-rotated for MQ. Q8 still reads unrotated x.
-fn proj_gemm_batched_prerotated(
-    gpu: &mut Gpu,
-    w: &WeightTensor,
-    x_unrot: &GpuTensor,
-    x_rot: &GpuTensor,
-    y: &GpuTensor,
-    b: usize,
-    label: &str,
-) -> Result<(), String> {
-    match w.gpu_dtype {
-        DType::Q8_0 => gpu
-            .gemm_q8_0_batched_chunked(&w.buf, x_unrot, y, w.m, w.k, b)
-            .map_err(|e| format!("glimmer batch {label} (q8 prerot): {e:?}")),
-        DType::MQ4G256 | DType::HFQ4G256 => gpu
-            .gemm_hfq4g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
-            .map_err(|e| format!("glimmer batch {label} (mq4 prerot): {e:?}")),
-        DType::MQ6G256 => gpu
-            .gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
-            .map_err(|e| format!("glimmer batch {label} (mq6 prerot): {e:?}")),
-        _ => {
-            for i in 0..b {
-                let x_row = x_unrot.sub_offset(i * w.k, w.k);
-                let y_row = y.sub_offset(i * w.m, w.m);
-                weight_gemv(gpu, w, &x_row, &y_row)
-                    .map_err(|e| format!("glimmer batch {label} prerot row {i}: {e}"))?;
-            }
-            Ok(())
-        }
-    }
-}
 
 pub const GLIMMER_DRAFTER_ARCH_ID: u32 = 23;
 
@@ -451,8 +373,8 @@ fn load_wt(
             }
         }
         // MQ4G256 (13) and its Lloyd-codebook sibling (19). The drafter's
-        // forward already dispatches MQ4 with the FWHT rotation
-        // (`proj_gemm_batched` / `_prerotated` above); only this loader arm was
+        // forward already projects MQ4 through the FWHT rotation (the batched
+        // `GemmRows` steps); only this loader arm was
         // missing, so an MQ4 drafter loaded fine everywhere except here and
         // DFlash silently fell back to AR with
         // "unsupported quant_type 13 for 'encoder.fc.weight'".
@@ -894,8 +816,9 @@ pub struct GlimmerDrafterScratch {
     pub logits_tmp: GpuTensor, // [hidden] for final norm
     /// Batched GEMM rotation scratch.
     pub x_rot: GpuTensor, // [block * hidden] — shared rotation for q / gate/up
-    pub kv_input: GpuTensor,   // [(max_ctx+block)*hidden] — cat[target_hidden_proj, tmp]
-    pub kv_input_rot: GpuTensor, // [(max_ctx+block)*hidden] — FWHT-rotated kv_input
+    /// `[ctx_capacity * num_extract * hidden]` — FWHT-rotated `fc_input` rows.
+    pub fc_rot: GpuTensor,
+    pub kv_input_rot: GpuTensor, // [(max_ctx+block)*hidden] — FWHT-rotated ctx rows for K/V
     pub ffn_hidden_rot: GpuTensor, // [block*intermediate] — FWHT-rotated ffn_hidden for down_proj
     /// Persistent buffer for encoder.fc input: [max_ctx * num_extract * hidden]
     /// Host `target_hidden` (ctx*ne*h) is uploaded into this buffer each forward
@@ -1058,7 +981,7 @@ impl GlimmerDrafterScratch {
         alloc(block * cfg.intermediate, "ffn_hidden")?;
         alloc(h, "logits_tmp")?;
         alloc(block * h, "x_rot")?;
-        alloc(kv_rows * h, "kv_input")?;
+        alloc(ctx_capacity * cfg.num_extract() * h, "fc_rot")?;
         alloc(kv_rows * h, "kv_input_rot")?;
         alloc(block * cfg.intermediate, "ffn_hidden_rot")?;
         alloc(ctx_capacity * cfg.num_extract() * h, "fc_input")?;
@@ -1092,7 +1015,7 @@ impl GlimmerDrafterScratch {
             ffn_hidden: next("ffn_hidden"),
             logits_tmp: next("logits_tmp"),
             x_rot: next("x_rot"),
-            kv_input: next("kv_input"),
+            fc_rot: next("fc_rot"),
             kv_input_rot: next("kv_input_rot"),
             ffn_hidden_rot: next("ffn_hidden_rot"),
             fc_input: next("fc_input"),
@@ -1126,7 +1049,7 @@ impl GlimmerDrafterScratch {
             self.ffn_hidden,
             self.logits_tmp,
             self.x_rot,
-            self.kv_input,
+            self.fc_rot,
             self.kv_input_rot,
             self.ffn_hidden_rot,
             self.fc_input,
@@ -1173,7 +1096,150 @@ impl GlimmerDrafterScratch {
     }
 }
 
-// ─── Forward (no new kernels) ─────────────────────────────────────────
+/// One layer's context rows: the `delta` rows new since the last window
+/// (their projection input `thp`, FWHT scratch `rot`, and K/V cache slots),
+/// the cached window `[cur_start, cur_end)`, and where that window lands at
+/// the front of the concatenated K/V with its positions.
+struct CtxViews {
+    thp: GpuTensor,
+    rot: GpuTensor,
+    k_new: GpuTensor,
+    v_new: GpuTensor,
+    k_window: GpuTensor,
+    v_window: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    pos: GpuTensor,
+    delta: usize,
+}
+
+/// Views of one layer's forward: the concatenated K/V `[ctx ++ block]`, the
+/// block rows' K/V and positions, and the context rows when there are any.
+struct LayerViews {
+    k_full: GpuTensor,
+    v_full: GpuTensor,
+    k_tail: GpuTensor,
+    v_tail: GpuTensor,
+    pos_tail: GpuTensor,
+    ctx: Option<CtxViews>,
+}
+
+/// The drafter layers' stream over the block rows: pre-norm sublayers that
+/// add into `x` in place, on the verify ladder.
+fn stream<'a>(
+    cfg: &GlimmerDrafterConfig,
+    s: &'a GlimmerDrafterScratch,
+    block: usize,
+) -> SandwichStream<'a> {
+    SandwichStream {
+        rows: block,
+        hidden: cfg.hidden,
+        eps: cfg.norm_eps,
+        post_eps: cfg.norm_eps,
+        x: &s.x,
+        residual: &s.tmp,
+        normed: &s.tmp,
+        out: None,
+        route: RowsRoute::Verify,
+        kernels: SandwichRoute::Steps(StepsRoute {
+            shared_rotation: false,
+            fused_silu_rotate: false,
+        }),
+        bf16: None,
+    }
+}
+
+/// One drafter layer: a two-norm Llama block over the block rows whose K/V
+/// span the context rows ahead of them.
+///
+/// ```text
+/// n  = rmsnorm(x, input_layernorm);  q = q_norm(Wq·n)
+/// K  = k_norm(Wk·[ctx ++ n]); V = Wv·[ctx ++ n]    (ctx rows cached post-k_norm, pre-RoPE)
+/// x += Wo·attend(rope(q), rope(K), V)               (bidirectional over ctx ++ block)
+/// x += Wd·(silu(Wg·m) ⊙ Wu·m),  m = rmsnorm(x, post_attention_layernorm)
+/// ```
+fn layer_steps<'a>(
+    cfg: &GlimmerDrafterConfig,
+    layer: &'a GlimmerDrafterLayer,
+    s: &'a GlimmerDrafterScratch,
+    v: &'a LayerViews,
+    block: usize,
+    ctx_len: usize,
+) -> [Step<'a>; 2] {
+    let context = v.ctx.as_ref().map(|c| DraftContext {
+        delta: c.delta,
+        input: &c.thp,
+        rot: &c.rot,
+        k_new: &c.k_new,
+        v_new: &c.v_new,
+        k_window: &c.k_window,
+        v_window: &c.v_window,
+        k: &c.k,
+        v: &c.v,
+        rows: ctx_len,
+        positions: &c.pos,
+    });
+    [
+        Step::SandwichAttention(SandwichAttentionOp {
+            stream: stream(cfg, s, block),
+            position: ctx_len,
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            input_norm: &layer.input_layernorm,
+            wq: layer.q_proj.dispatch_ref(),
+            q_norm: &layer.q_norm,
+            kv_proj: Some(KvProjection {
+                wk: layer.k_proj.dispatch_ref(),
+                wv: Some(layer.v_proj.dispatch_ref()),
+                k_norm: &layer.k_norm,
+                v_norm: None,
+            }),
+            q_scale: 1.0,
+            rope: Rope {
+                kind: RopeKind::RotateHalf,
+                theta: cfg.rope_theta,
+            },
+            kv: SandwichKv {
+                k_cache: &v.k_full,
+                v_cache: &v.v_full,
+                physical_cap: ctx_len + block,
+                window: 0,
+                route: KvRoute::Draft {
+                    kv_rows: ctx_len + block,
+                    context,
+                },
+            },
+            pos_buf: &s.pos_buf,
+            positions: Some(&v.pos_tail),
+            gate: None,
+            wo: layer.o_proj.dispatch_ref(),
+            post_norm: None,
+            x_rot: &s.x_rot,
+            q: &s.q,
+            k: &v.k_tail,
+            v: &v.v_tail,
+            attn_out: &s.attn_out,
+        }),
+        Step::SandwichMlp(SandwichMlpOp {
+            stream: stream(cfg, s, block),
+            pre_norm: &layer.post_attention_layernorm,
+            w_gate: layer.gate_proj.dispatch_ref(),
+            w_up: layer.up_proj.dispatch_ref(),
+            w_down: layer.down_proj.dispatch_ref(),
+            activation: Activation::Silu,
+            hidden_dim: cfg.intermediate,
+            post_norm: None,
+            x_rot: &s.ffn_hidden_rot,
+            gate: &s.gate_ffn,
+            up: &s.up_ffn,
+            act: &s.ffn_hidden,
+            out: &s.tmp,
+        }),
+    ]
+}
+
+// ─── Forward ──────────────────────────────────────────────────────────
 /// Muse Glimmer DFlash draft forward (host target_hidden).
 ///
 /// `noise_embedding`: `[block_size * hidden]` raw F32 embeddings of
@@ -1435,28 +1501,35 @@ fn glimmer_drafter_forward_inner(
             let target_seg = scratch
                 .target_hidden_proj
                 .sub_offset(fill_start as usize * h, delta * h);
-            let fc_rot_seg = scratch
-                .kv_input_rot
-                .sub_offset(fill_start as usize * h, delta * h);
-            proj_gemm_batched(
+            let fc_rot_seg = scratch.fc_rot.sub_offset(0, delta * ne_h);
+            let fc = weights.fc.dispatch_ref();
+            let ctx = DispatchCtx::new(gpu);
+            gemm_rows(
                 gpu,
-                &weights.fc,
-                &fc_in_seg,
+                &ctx,
+                &fc,
+                GemvInput::Raw(&fc_in_seg),
                 &target_seg,
                 &fc_rot_seg,
+                None,
                 delta,
-                "fc",
+                Ladder::Route(RowsRoute::Verify),
             )
-            .map_err(|e| format!("drafter fc batched delta [{fill_start}..{cur_end}): {e}"))?;
-            gpu.rmsnorm_batched(
-                &target_seg,
-                &weights.output_norm_enc,
-                &target_seg,
-                delta,
-                h,
-                eps,
-            )
-            .map_err(|e| format!("drafter output_norm batched delta: {e:?}"))?;
+            .and_then(|()| {
+                let norm = Step::RmsnormAutomatic {
+                    x: &target_seg,
+                    norm_weight: &weights.output_norm_enc,
+                    x_plain: &target_seg,
+                    out: &target_seg,
+                    awq_scale: None,
+                    k: h,
+                    eps,
+                    rotation: RotationPlan::None,
+                    rows: delta,
+                };
+                execute_steps(gpu, &ctx, &[norm])
+            })
+            .map_err(|e| format!("drafter fc delta [{fill_start}..{cur_end}): {e:?}"))?;
         }
         // Keep row-index watermarks in sync for observability (they are row-
         // count based and would otherwise slide-invalidate every window at cap;
@@ -1494,363 +1567,40 @@ fn glimmer_drafter_forward_inner(
     }
 
     // --- 3. Per-layer transformer — ctx-concatenated K/V, block Q ---
+    let ctx = DispatchCtx::new(gpu);
+    let pos_all = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(scratch.pos_buf.as_ptr(), l * 4) },
+        shape: vec![l],
+        dtype: DType::F32,
+    };
+    let fill_start = scratch.kv_abs_end.max(cur_start) as usize;
+    let delta = (cur_end as usize).saturating_sub(fill_start);
     for (li, layer) in weights.layers.iter().enumerate() {
-        // input_layernorm(x) -> tmp  (block rows only)
-        gpu.rmsnorm_batched(
-            &scratch.x,
-            &layer.input_layernorm,
-            &scratch.tmp,
-            block_size,
-            h,
-            eps,
-        )
-        .map_err(|e| format!("drafter L{li} input norm: {e:?}"))?;
-
-        // q_proj over B block rows from n1=tmp — batched
-        proj_gemm_batched(
-            gpu,
-            &layer.q_proj,
-            &scratch.tmp,
-            &scratch.q,
-            &scratch.x_rot,
-            block_size,
-            "q_proj",
-        )
-        .map_err(|e| format!("drafter L{li} q batched: {e}"))?;
-
-        // --- Incremental K/V (absolute-position-keyed, per-layer cache) ---
-        // Previously this rebuilt K/V over the whole ctx_len+block (5×2 GEMMs
-        // over up to 2048 rows) every window. Now only the tail
-        // `[fill_start .. cur_end)` is projected per layer into the per-layer
-        // ring `k_ctx_cached`/`v_ctx_cached` (sized max_ctx*kvd direct, absolute
-        // indexed), then the window `[cur_start .. cur_end)` is gathered into
-        // contiguous `k_full`/`v_full` and the block tail is appended.
-        // `k_ctx_cached` stores post-k_norm, pre-RoPE (like dflash.rs); V is raw.
-        // RoPE and attention then run over the assembled contiguous K/V.
-        let k_full = scratch.k.sub_offset(0, l * kvd);
-        let v_full = scratch.v.sub_offset(0, l * kvd);
-        let fill_start = scratch.kv_abs_end.max(cur_start);
-        let delta = (cur_end - fill_start) as usize;
-        if ctx_len > 0 {
-            // Fill per-layer K/V cache for the genuinely new absolute rows.
-            if delta > 0 {
-                let thp_seg = scratch
+        let v = LayerViews {
+            k_full: scratch.k.sub_offset(0, l * kvd),
+            v_full: scratch.v.sub_offset(0, l * kvd),
+            k_tail: scratch.k.sub_offset(ctx_len * kvd, block_size * kvd),
+            v_tail: scratch.v.sub_offset(ctx_len * kvd, block_size * kvd),
+            pos_tail: pos_all.sub_offset(ctx_len, block_size),
+            ctx: (ctx_len > 0).then(|| CtxViews {
+                thp: scratch
                     .target_hidden_proj
-                    .sub_offset(fill_start as usize * h, delta * h);
-                let k_seg =
-                    scratch.k_ctx_cached[li].sub_offset(fill_start as usize * kvd, delta * kvd);
-                let v_seg =
-                    scratch.v_ctx_cached[li].sub_offset(fill_start as usize * kvd, delta * kvd);
-                let need_kv_rot = shared_rot_enabled()
-                    && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
-                        != hipfire_dispatch::types::RotationPlan::None;
-                if need_kv_rot {
-                    let rot_seg = scratch
-                        .kv_input_rot
-                        .sub_offset(fill_start as usize * h, delta * h);
-                    rotate_x_mq_batched_for(gpu, &layer.k_proj, &thp_seg, &rot_seg, h, delta)
-                        .map_err(|e| format!("drafter L{li} kv ctx rotate: {e:?}"))?;
-                    proj_gemm_batched_prerotated(
-                        gpu,
-                        &layer.k_proj,
-                        &thp_seg,
-                        &rot_seg,
-                        &k_seg,
-                        delta,
-                        "k_proj_ctx",
-                    )
-                    .map_err(|e| format!("drafter L{li} k ctx batched: {e}"))?;
-                    proj_gemm_batched_prerotated(
-                        gpu,
-                        &layer.v_proj,
-                        &thp_seg,
-                        &rot_seg,
-                        &v_seg,
-                        delta,
-                        "v_proj_ctx",
-                    )
-                    .map_err(|e| format!("drafter L{li} v ctx batched: {e}"))?;
-                } else {
-                    // Use kv_input_rot as dummy rot buffer for non-MQ path.
-                    let dummy_rot = scratch
-                        .kv_input_rot
-                        .sub_offset(fill_start as usize * h, delta * h);
-                    proj_gemm_batched(
-                        gpu,
-                        &layer.k_proj,
-                        &thp_seg,
-                        &k_seg,
-                        &dummy_rot,
-                        delta,
-                        "k_proj_ctx",
-                    )
-                    .map_err(|e| format!("drafter L{li} k ctx batched: {e}"))?;
-                    proj_gemm_batched(
-                        gpu,
-                        &layer.v_proj,
-                        &thp_seg,
-                        &v_seg,
-                        &dummy_rot,
-                        delta,
-                        "v_proj_ctx",
-                    )
-                    .map_err(|e| format!("drafter L{li} v ctx batched: {e}"))?;
-                }
-                // K cache stores post-k_norm, pre-RoPE (row-local, so split is bit-identical).
-                gpu.rmsnorm_batched(
-                    &k_seg,
-                    &layer.k_norm,
-                    &k_seg,
-                    delta * cfg.n_kv_heads,
-                    cfg.head_dim,
-                    eps,
-                )
-                .map_err(|e| format!("drafter L{li} k_norm ctx: {e:?}"))?;
-            }
-            // Gather window [cur_start .. cur_end) from absolute cache into
-            // contiguous prefix [0 .. ctx_len) of k_full/v_full.
-            let src_k =
-                scratch.k_ctx_cached[li].sub_offset(cur_start as usize * kvd, ctx_len * kvd);
-            let src_v =
-                scratch.v_ctx_cached[li].sub_offset(cur_start as usize * kvd, ctx_len * kvd);
-            let dst_k_ctx = k_full.sub_offset(0, ctx_len * kvd);
-            let dst_v_ctx = v_full.sub_offset(0, ctx_len * kvd);
-            gpu.hip
-                .memcpy_dtod(&dst_k_ctx.buf, &src_k.buf, ctx_len * kvd * 4)
-                .map_err(|e| format!("drafter L{li} k gather: {e:?}"))?;
-            gpu.hip
-                .memcpy_dtod(&dst_v_ctx.buf, &src_v.buf, ctx_len * kvd * 4)
-                .map_err(|e| format!("drafter L{li} v gather: {e:?}"))?;
-        }
-        // Block tail K/V from tmp (B rows) into tail of k_full/v_full.
-        {
-            let k_tail = k_full.sub_offset(ctx_len * kvd, block_size * kvd);
-            let v_tail = v_full.sub_offset(ctx_len * kvd, block_size * kvd);
-            let need_tail_rot = shared_rot_enabled()
-                && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
-                    != hipfire_dispatch::types::RotationPlan::None;
-            if need_tail_rot {
-                rotate_x_mq_batched_for(
-                    gpu,
-                    &layer.k_proj,
-                    &scratch.tmp,
-                    &scratch.x_rot,
-                    h,
-                    block_size,
-                )
-                .map_err(|e| format!("drafter L{li} kv block rotate: {e:?}"))?;
-                proj_gemm_batched_prerotated(
-                    gpu,
-                    &layer.k_proj,
-                    &scratch.tmp,
-                    &scratch.x_rot,
-                    &k_tail,
-                    block_size,
-                    "k_proj_block",
-                )
-                .map_err(|e| format!("drafter L{li} k block batched: {e}"))?;
-                proj_gemm_batched_prerotated(
-                    gpu,
-                    &layer.v_proj,
-                    &scratch.tmp,
-                    &scratch.x_rot,
-                    &v_tail,
-                    block_size,
-                    "v_proj_block",
-                )
-                .map_err(|e| format!("drafter L{li} v block batched: {e}"))?;
-            } else {
-                proj_gemm_batched(
-                    gpu,
-                    &layer.k_proj,
-                    &scratch.tmp,
-                    &k_tail,
-                    &scratch.x_rot,
-                    block_size,
-                    "k_proj_block",
-                )
-                .map_err(|e| format!("drafter L{li} k block batched: {e}"))?;
-                proj_gemm_batched(
-                    gpu,
-                    &layer.v_proj,
-                    &scratch.tmp,
-                    &v_tail,
-                    &scratch.x_rot,
-                    block_size,
-                    "v_proj_block",
-                )
-                .map_err(|e| format!("drafter L{li} v block batched: {e}"))?;
-            }
-            gpu.rmsnorm_batched(
-                &k_tail,
-                &layer.k_norm,
-                &k_tail,
-                block_size * cfg.n_kv_heads,
-                cfg.head_dim,
-                eps,
-            )
-            .map_err(|e| format!("drafter L{li} k_norm block: {e:?}"))?;
-        }
-        // per-head WEIGHTED q norm (K ctx already normed, tail just normed)
-        gpu.rmsnorm_batched(
-            &scratch.q,
-            &layer.q_norm,
-            &scratch.q,
-            block_size * cfg.n_heads,
-            cfg.head_dim,
-            eps,
-        )
-        .map_err(|e| format!("drafter L{li} q_norm: {e:?}"))?;
-
-        // RoPE half-split over the concatenated extent via rope_batched_f32.
-        // positions live in pos_buf as i32; GpuTensor shells match dflash's F32 dtype trick.
-        // Call 1: rotate Q and K-tail together at block positions (same B rows / same phases).
-        // Call 2: rotate K-ctx only (n_heads_q=0) at ctx positions.
-        let pos_tensor = GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(scratch.pos_buf.as_ptr(), l * 4) },
-            shape: vec![l],
-            dtype: DType::F32,
+                    .sub_offset(fill_start * h, delta * h),
+                rot: scratch.kv_input_rot.sub_offset(fill_start * h, delta * h),
+                k_new: scratch.k_ctx_cached[li].sub_offset(fill_start * kvd, delta * kvd),
+                v_new: scratch.v_ctx_cached[li].sub_offset(fill_start * kvd, delta * kvd),
+                k_window: scratch.k_ctx_cached[li]
+                    .sub_offset(cur_start as usize * kvd, ctx_len * kvd),
+                v_window: scratch.v_ctx_cached[li]
+                    .sub_offset(cur_start as usize * kvd, ctx_len * kvd),
+                k: scratch.k.sub_offset(0, ctx_len * kvd),
+                v: scratch.v.sub_offset(0, ctx_len * kvd),
+                pos: pos_all.sub_offset(0, ctx_len),
+                delta,
+            }),
         };
-        let k_tail = scratch.k.sub_offset(ctx_len * kvd, block_size * kvd);
-        let pos_tail = pos_tensor.sub_offset(ctx_len, block_size);
-        gpu.rope_batched_f32(
-            &scratch.q,
-            &k_tail,
-            &pos_tail,
-            cfg.n_heads,
-            cfg.n_kv_heads,
-            cfg.head_dim,
-            cfg.rope_theta,
-            block_size,
-        )
-        .map_err(|e| format!("drafter L{li} rope block: {e:?}"))?;
-        if ctx_len > 0 {
-            let k_ctx = scratch.k.sub_offset(0, ctx_len * kvd);
-            let pos_ctx = pos_tensor.sub_offset(0, ctx_len);
-            // n_heads_q=0 → Q side skipped; scratch.q is a valid dummy pointer.
-            gpu.rope_batched_f32(
-                &scratch.q,
-                &k_ctx,
-                &pos_ctx,
-                0,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-                cfg.rope_theta,
-                ctx_len,
-            )
-            .map_err(|e| format!("drafter L{li} rope ctx: {e:?}"))?;
-        }
-
-        // Attention: B queries attend bidirectionally to L=ctx+B keys/values.
-        // Full bidirectional (no sliding window) — exact while L <= 2048.
-        gpu.attention_dflash_f32(
-            &scratch.q,
-            &k_full,
-            &v_full,
-            &scratch.attn_out,
-            block_size,
-            l,
-            cfg.n_heads,
-            cfg.n_kv_heads,
-            cfg.head_dim,
-        )
-        .map_err(|e| format!("drafter L{li} attention_dflash_f32: {e:?}"))?;
-
-        // o_proj over B rows — batched
-        proj_gemm_batched(
-            gpu,
-            &layer.o_proj,
-            &scratch.attn_out,
-            &scratch.tmp,
-            &scratch.x_rot,
-            block_size,
-            "o_proj",
-        )
-        .map_err(|e| format!("drafter L{li} o batched: {e}"))?;
-        // residual: x = x + tmp (NO post_attention_layernorm on attn output)
-        gpu.add_inplace_f32(&scratch.x, &scratch.tmp)
-            .map_err(|e| format!("drafter L{li} attn residual: {e:?}"))?;
-        // FFN: norm with post_attention_layernorm (IS the pre-FFN norm) reading post-residual x
-        gpu.rmsnorm_batched(
-            &scratch.x,
-            &layer.post_attention_layernorm,
-            &scratch.tmp,
-            block_size,
-            h,
-            eps,
-        )
-        .map_err(|e| format!("drafter L{li} post_attn/pre_ffn norm: {e:?}"))?;
-        // gate_proj / up_proj share input — one rotation, then batched
-        let need_ffn_rot = shared_rot_enabled()
-            && hipfire_dispatch::types::dtype_rotation_plan(layer.gate_proj.gpu_dtype)
-                != hipfire_dispatch::types::RotationPlan::None;
-        if need_ffn_rot {
-            rotate_x_mq_batched_for(
-                gpu,
-                &layer.gate_proj,
-                &scratch.tmp,
-                &scratch.x_rot,
-                h,
-                block_size,
-            )
-            .map_err(|e| format!("drafter L{li} ffn rotate: {e:?}"))?;
-            proj_gemm_batched_prerotated(
-                gpu,
-                &layer.gate_proj,
-                &scratch.tmp,
-                &scratch.x_rot,
-                &scratch.gate_ffn,
-                block_size,
-                "gate_proj",
-            )
-            .map_err(|e| format!("drafter L{li} gate batched: {e}"))?;
-            proj_gemm_batched_prerotated(
-                gpu,
-                &layer.up_proj,
-                &scratch.tmp,
-                &scratch.x_rot,
-                &scratch.up_ffn,
-                block_size,
-                "up_proj",
-            )
-            .map_err(|e| format!("drafter L{li} up batched: {e}"))?;
-        } else {
-            proj_gemm_batched(
-                gpu,
-                &layer.gate_proj,
-                &scratch.tmp,
-                &scratch.gate_ffn,
-                &scratch.x_rot,
-                block_size,
-                "gate_proj",
-            )
-            .map_err(|e| format!("drafter L{li} gate batched: {e}"))?;
-            proj_gemm_batched(
-                gpu,
-                &layer.up_proj,
-                &scratch.tmp,
-                &scratch.up_ffn,
-                &scratch.x_rot,
-                block_size,
-                "up_proj",
-            )
-            .map_err(|e| format!("drafter L{li} up batched: {e}"))?;
-        }
-        gpu.silu_mul_f32(&scratch.gate_ffn, &scratch.up_ffn, &scratch.ffn_hidden)
-            .map_err(|e| format!("drafter L{li} silu: {e:?}"))?;
-        // down_proj batched over B rows
-        proj_gemm_batched(
-            gpu,
-            &layer.down_proj,
-            &scratch.ffn_hidden,
-            &scratch.tmp,
-            &scratch.ffn_hidden_rot,
-            block_size,
-            "down_proj",
-        )
-        .map_err(|e| format!("drafter L{li} down batched: {e}"))?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.tmp)
-            .map_err(|e| format!("drafter L{li} ffn residual: {e:?}"))?;
+        let steps = layer_steps(cfg, layer, scratch, &v, block_size, ctx_len);
+        execute_steps(gpu, &ctx, &steps).map_err(|e| format!("drafter L{li}: {e:?}"))?;
     }
     // Advance absolute watermark — prefix [0..cur_end) is now valid in both
     // fc (target_hidden_proj) and per-layer K/V caches. Next window with the
@@ -1859,9 +1609,18 @@ fn glimmer_drafter_forward_inner(
     if ctx_len > 0 {
         scratch.kv_abs_end = cur_end;
     }
-    gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, block_size, h, eps)
-        .map_err(|e| format!("drafter final norm: {e:?}"))?;
-    Ok(())
+    let norm = Step::RmsnormAutomatic {
+        x: &scratch.x,
+        norm_weight: &weights.norm,
+        x_plain: &scratch.x,
+        out: &scratch.x,
+        awq_scale: None,
+        k: h,
+        eps,
+        rotation: RotationPlan::None,
+        rows: block_size,
+    };
+    execute_steps(gpu, &ctx, &[norm]).map_err(|e| format!("drafter final norm: {e:?}"))
 }
 
 #[cfg(test)]

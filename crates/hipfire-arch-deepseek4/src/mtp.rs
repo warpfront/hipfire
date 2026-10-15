@@ -5,14 +5,12 @@
 use crate::config_cache;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
-    apply_tail_rope, apply_tail_rope_batched, attn_stub, ds4_superop, ffn_routed, ffn_stub,
-    gemv_auto, hc_attn_mix, hc_ffn_mix, kv_joint, mhc_pre, precompute_attn_state_batched,
-    precompute_positions_batched, q_lora, weight_needs_fwht, Deepseek4Bindings, OloraSchedule,
+    apply_tail_rope, attn_stub, ds4_superop, ffn_routed, ffn_stub, gemv_auto,
+    gemv_auto_batched_wmma, hc_attn_mix, hc_ffn_mix, kv_joint, mhc_pre,
+    precompute_attn_state_batched, precompute_positions_batched, q_lora, weight_needs_fwht,
+    Deepseek4Bindings, OloraSchedule,
 };
-use crate::forward::{
-    attention_block_batched_swa_only, ffn_batched, gemv_auto_batched_wmma, hc_attn_mix_batched,
-    hc_ffn_mix_batched, kv_joint_batched, mhc_pre_batched, q_lora_batched,
-};
+use crate::rows_program::{self, RowSlots, RowsWindow};
 use hipfire_dispatch::pipeline::superop::SuperOpKind;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -828,79 +826,25 @@ pub fn mtp_forward_batched(
     precompute_positions_batched(cfg, pbs, gpu, start_pos, batch_size)?;
     precompute_attn_state_batched(cfg, pbs, gpu, start_pos, batch_size)?;
 
-    // ── 8. Standard batched layer block at layer_idx = mtp_layer_idx ──
-    // The MTP layer has compress_ratio = 0 so attention_block_batched_swa_only
-    // is the right path. Hash routing is N/A (mtp_layer_idx >= num_hash_layers).
-    let n = batch_size;
-    let mtp_layer = weights.resolve_layer(mtp_layer_idx);
-    mhc_pre_batched(
-        cfg,
-        mtp_layer,
-        pbs,
-        gpu,
-        mtp_layer_idx,
-        /*is_attn=*/ true,
-        n,
-    )?;
-    let attention_input_precomputed = q_lora_batched(
-        cfg,
-        mtp_layer,
-        weights.mq2r_backend,
-        pbs,
-        &pbs.hc_x_in_batch,
-        gpu,
-        mtp_layer_idx,
-        n,
-    )?;
-    kv_joint_batched(
-        cfg,
-        mtp_layer,
-        weights.mq2r_backend,
-        pbs,
-        gpu,
-        mtp_layer_idx,
-        n,
-        attention_input_precomputed,
-    )?;
-    apply_tail_rope_batched(cfg, mtp_layer, pbs, gpu, mtp_layer_idx, n)?;
-    attention_block_batched_swa_only(
+    // ── 8. The MTP decoder layer over the window (compress ratio 0, not
+    //    hash-routed) ──
+    rows_program::ensure_rows_layer(cfg, weights, state, gpu, mtp_layer_idx)?;
+    let window = RowsWindow::new(pbs, start_pos, batch_size, &[], false);
+    let slots = RowSlots::new(cfg, pbs, 0);
+    let program = rows_program::rows_layer_program(
         cfg,
         weights,
         state,
-        pbs,
         gpu,
         mtp_layer_idx,
-        start_pos,
-        n,
-        false,
+        window,
+        &slots,
+        None,
     )?;
-    hc_attn_mix_batched(cfg, pbs, gpu, n)?;
-    let mtp_layer = weights.resolve_layer(mtp_layer_idx);
-    mhc_pre_batched(
-        cfg,
-        mtp_layer,
-        pbs,
-        gpu,
-        mtp_layer_idx,
-        /*is_attn=*/ false,
-        n,
-    )?;
-    // ffn_batched takes `tokens` for the hash-routed path; MTP layer is
-    // not hash-routed (mtp_layer_idx >= num_hash_layers), so the value
-    // is ignored. Pass an empty slice.
-    let tokens_dummy: &[u32] = &[];
-    ffn_batched(
-        cfg,
-        mtp_layer,
-        weights.mq2r_backend,
-        pbs,
-        gpu,
-        mtp_layer_idx,
-        /*hash_routing=*/ false,
-        n,
-        tokens_dummy,
-    )?;
-    hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
+    let observed =
+        rows_program::Observed::Layer(mtp_layer_idx, weights.resolve_layer(mtp_layer_idx));
+    rows_program::run_rows(&program, cfg, gpu, window, observed)?;
+    drop(program);
 
     // ── 9. Capture the LAST batch position's residual stream → mtp_last_hidden.
     //    Subsequent spec-decode windows read from this.

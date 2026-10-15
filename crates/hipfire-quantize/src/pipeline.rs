@@ -3293,6 +3293,7 @@ pub(crate) fn run() {
                 data: q,
                 spilled_len: 0,
             });
+            quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
             st_files[*file_idx].drop_tensor_pages(name);
             continue;
         }

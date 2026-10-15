@@ -21,6 +21,7 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
+smallvec = "1.15.2"
 
 [dev-dependencies]
 libloading.workspace = true

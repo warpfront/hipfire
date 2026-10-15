@@ -64,6 +64,8 @@ pub mod mtp;
 pub mod forward;
 pub use saddle_core::grammar::dsml as grammar;
 pub mod heterogeneous;
+mod program;
+mod rows_program;
 pub mod mtp_speculator;
 pub mod sampling;
 pub mod spec_decode;
