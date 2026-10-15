@@ -302,6 +302,30 @@ impl AttentionFamily {
         let variant = self.resolve(io.key, ctx, Some(&shape))?;
         dispatch_full_attention(gpu, io.key, variant.tile, io)
     }
+
+    /// [`Self::run_full_attention`] on one registered `tile` of `io.key`
+    /// instead of the best admitted one: a caller whose numerics contract is
+    /// a specific kernel (the DFlash drafters' scalar tile) pins it here.
+    pub fn run_full_attention_on(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        io: &FullAttnParams,
+        tile: TileImpl,
+    ) -> Result<(), DispatchError> {
+        let registered = self
+            .registry
+            .variants_for(io.key)
+            .iter()
+            .any(|v| v.tile == tile && v.arch_required.eval_arch(ctx));
+        if !registered {
+            return Err(DispatchError::Hip(format!(
+                "attention {:?}: tile {tile:?} is not admitted on this arch",
+                io.key
+            )));
+        }
+        dispatch_full_attention(gpu, io.key, tile, io)
+    }
 }
 
 /// Parameters for full-attention (no KV cache). Used by dots-ocr vision

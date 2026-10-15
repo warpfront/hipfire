@@ -168,12 +168,13 @@ impl RotationFamily {
                     }
                 }
             }
+            // The batched launchers run the same kernel over `batch_size` rows.
             RotationVariant::WithSwiGLU => {
                 let x_up = params.x_up.ok_or_else(|| {
                     HipError::new(0, "x_up required for WithSwiGLU rotation")
                 })?;
-                match has_awq {
-                    false => {
+                match (params.awq_scale, batched) {
+                    (None, false) => {
                         self.registry.resolve(KernelKey::SiluMulRotateMq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq(
@@ -183,15 +184,38 @@ impl RotationFamily {
                             params.k,
                         )
                     }
-                    true => {
+                    (Some(awq), false) => {
                         self.registry.resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq_awq(
                             params.x,
                             x_up,
-                            params.awq_scale.unwrap(),
+                            awq,
                             params.x_rot,
                             params.k,
+                        )
+                    }
+                    (None, true) => {
+                        self.registry.resolve(KernelKey::SiluMulRotateMq, ctx, None)
+                            .map_err(he)?;
+                        gpu.fused_silu_mul_rotate_mq_batched(
+                            params.x,
+                            x_up,
+                            params.x_rot,
+                            params.k,
+                            params.batch_size,
+                        )
+                    }
+                    (Some(awq), true) => {
+                        self.registry.resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
+                            .map_err(he)?;
+                        gpu.fused_silu_mul_rotate_mq_awq_batched(
+                            params.x,
+                            x_up,
+                            awq,
+                            params.x_rot,
+                            params.k,
+                            params.batch_size,
                         )
                     }
                 }

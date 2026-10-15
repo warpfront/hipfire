@@ -15,6 +15,12 @@
 //! minimax convention). lm_head is tied to embed_tokens.
 
 use crate::config::{Lfm2MoeConfig, MixerKind};
+use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::moe::RoutedExpertWeights;
+use hipfire_dispatch::pipeline::{
+    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+};
+use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::KvCacheExt;
@@ -362,6 +368,10 @@ pub struct MoeFfn {
     pub experts: Vec<ExpertWeights>, // keep alive (buffers owned here)
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// Load-time expert identity for the shared sealed-MoE executor; the
+    /// pointer tables and expert buffers above stay owned here.
+    pub(crate) table: ExpertTable,
+    pub(crate) cache: ExpertBindingCache,
 }
 
 pub enum Ffn {
@@ -459,6 +469,112 @@ impl DenseFfn {
 }
 
 impl MoeFfn {
+    /// Upload the expert pointer tables and seal the layer's resident experts
+    /// for the shared MoE executor. Every expert of a layer must share one
+    /// gate/up and one down format.
+    pub(crate) fn seal(
+        gpu: &mut Gpu,
+        layer: usize,
+        router: WeightTensor,
+        expert_bias: GpuTensor,
+        experts: Vec<ExpertWeights>,
+    ) -> Result<Self, String> {
+        let first = experts
+            .first()
+            .ok_or_else(|| format!("lfm2moe L{layer}: MoE layer has no experts"))?;
+        let (gate_up_dtype, down_dtype) = (first.gate_up.gpu_dtype, first.down.gpu_dtype);
+        // The shared executor has no layer-wide expert AWQ operand, and no
+        // hipfire quantizer writes LFM2 expert AWQ sidecars: refuse, never drop.
+        if first.gate_up.awq_scale.is_some() || first.down.awq_scale.is_some() {
+            return Err(format!(
+                "lfm2moe L{layer}: expert AWQ sidecars are not supported by the sealed MoE executor"
+            ));
+        }
+        let mut metadata = Vec::with_capacity(experts.len());
+        for (e, expert) in experts.iter().enumerate() {
+            if expert.gate_up.gpu_dtype != gate_up_dtype || expert.down.gpu_dtype != down_dtype {
+                return Err(format!(
+                    "lfm2moe L{layer}: expert {e} format differs from expert 0 (mixed-format layers are not admitted)"
+                ));
+            }
+            let resource = |name: &str, w: &WeightTensor| {
+                let row = w.gpu_dtype.row_bytes(w.k).ok_or_else(|| {
+                    format!("lfm2moe L{layer}: no row layout for {:?}", w.gpu_dtype)
+                })?;
+                ExpertResource::new(
+                    format!("model.layers.{layer}.feed_forward.experts.{e}.{name}"),
+                    "lfm2moe-resident-v1",
+                    vec![w.m, w.k],
+                    w.gpu_dtype,
+                    w.m * row,
+                    row,
+                    16,
+                    dtype_rotation_plan(w.gpu_dtype),
+                )
+                .map_err(|err| format!("lfm2moe L{layer}: expert {e} {name}: {err:?}"))
+            };
+            let resources = ExpertResources::fused(
+                resource("gate_up", &expert.gate_up)?,
+                resource("down", &expert.down)?,
+            )
+            .map_err(|err| format!("lfm2moe L{layer}: expert {e}: {err:?}"))?;
+            metadata.push(
+                ExpertMetadata::new(e, 0, e, resources)
+                    .map_err(|err| format!("lfm2moe L{layer}: expert {e}: {err:?}"))?,
+            );
+        }
+        let table = ExpertTable::new(metadata)
+            .map_err(|err| format!("lfm2moe L{layer}: expert table: {err:?}"))?;
+        let mut cache = table
+            .prepare_binding(0, 1, gpu.device_id)
+            .map_err(|err| format!("lfm2moe L{layer}: expert binding: {err:?}"))?;
+        let ptr_table = |gpu: &mut Gpu, ptrs: Vec<u8>, label: &str| -> Result<GpuTensor, String> {
+            let t = gpu
+                .alloc_tensor(&[2 * experts.len()], DType::F32)
+                .map_err(|e| format!("lfm2moe: alloc {label}: {e:?}"))?;
+            if let Err(e) = gpu.hip.memcpy_htod(&t.buf, &ptrs) {
+                let _ = gpu.free_tensor(t);
+                return Err(format!("lfm2moe: htod {label}: {e:?}"));
+            }
+            Ok(t)
+        };
+        let ptrs = |f: fn(&ExpertWeights) -> &WeightTensor| -> Vec<u8> {
+            experts
+                .iter()
+                .flat_map(|e| (f(e).buf.buf.as_ptr() as u64).to_ne_bytes())
+                .collect()
+        };
+        let expert_gate_up_ptrs = ptr_table(gpu, ptrs(|e| &e.gate_up), "gu_ptrs")?;
+        let expert_down_ptrs = match ptr_table(gpu, ptrs(|e| &e.down), "dn_ptrs") {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(expert_gate_up_ptrs);
+                return Err(e);
+            }
+        };
+        if let Err(err) = cache.bind_live(
+            &table,
+            &ResidentExperts(&experts),
+            &expert_gate_up_ptrs,
+            &expert_down_ptrs,
+            None,
+            None,
+        ) {
+            let _ = gpu.free_tensor(expert_gate_up_ptrs);
+            let _ = gpu.free_tensor(expert_down_ptrs);
+            return Err(format!("lfm2moe L{layer}: bind live experts: {err:?}"));
+        }
+        Ok(Self {
+            router,
+            expert_bias,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            table,
+            cache,
+        })
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.router.free_all(gpu);
         let _ = gpu.free_tensor(self.expert_bias);
@@ -467,6 +583,33 @@ impl MoeFfn {
         }
         let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
         let _ = gpu.free_tensor(self.expert_down_ptrs);
+    }
+}
+
+/// Resident per-expert weights, as the sealed executor reads them.
+struct ResidentExperts<'a>(&'a [ExpertWeights]);
+
+impl RoutedExpertWeights for ResidentExperts<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn get(&self, expert: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+        self.0
+            .get(expert)
+            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+    }
+}
+
+impl RoutedExpertWeights for MoeFfn {
+    fn len(&self) -> usize {
+        self.experts.len()
+    }
+
+    fn get(&self, expert: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+        self.experts
+            .get(expert)
+            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
     }
 }
 
@@ -849,33 +992,7 @@ impl Lfm2MoeWeights {
                     }
                 }
 
-                let gu_bytes: Vec<u8> = experts
-                    .iter()
-                    .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
-                    .collect();
-                let dn_bytes: Vec<u8> = experts
-                    .iter()
-                    .flat_map(|e| (e.down.buf.buf.as_ptr() as u64).to_ne_bytes())
-                    .collect();
-                let expert_gate_up_ptrs = gpu
-                    .alloc_tensor(&[2 * n_exp], DType::F32)
-                    .map_err(|e| format!("lfm2moe: alloc gu_ptrs: {e:?}"))?;
-                let expert_down_ptrs = gpu
-                    .alloc_tensor(&[2 * n_exp], DType::F32)
-                    .map_err(|e| format!("lfm2moe: alloc dn_ptrs: {e:?}"))?;
-                gpu.hip
-                    .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
-                    .map_err(|e| format!("lfm2moe: htod gu_ptrs: {e:?}"))?;
-                gpu.hip
-                    .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
-                    .map_err(|e| format!("lfm2moe: htod dn_ptrs: {e:?}"))?;
-                Ffn::Moe(MoeFfn {
-                    router,
-                    expert_bias,
-                    experts,
-                    expert_gate_up_ptrs,
-                    expert_down_ptrs,
-                })
+                Ffn::Moe(MoeFfn::seal(gpu, l, router, expert_bias, experts)?)
             };
 
             layers.push(Lfm2MoeLayerWeights {
@@ -1412,33 +1529,7 @@ pub fn load_weights_from_source(
                 }
                 experts.push(ExpertWeights { gate_up, down });
             }
-            let gu_bytes: Vec<u8> = experts
-                .iter()
-                .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
-                .collect();
-            let dn_bytes: Vec<u8> = experts
-                .iter()
-                .flat_map(|e| (e.down.buf.buf.as_ptr() as u64).to_ne_bytes())
-                .collect();
-            let expert_gate_up_ptrs = gpu
-                .alloc_tensor(&[2 * n_exp], DType::F32)
-                .map_err(|e| format!("lfm2moe: alloc gu_ptrs: {e:?}"))?;
-            let expert_down_ptrs = gpu
-                .alloc_tensor(&[2 * n_exp], DType::F32)
-                .map_err(|e| format!("lfm2moe: alloc dn_ptrs: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
-                .map_err(|e| format!("lfm2moe: htod gu_ptrs: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
-                .map_err(|e| format!("lfm2moe: htod dn_ptrs: {e:?}"))?;
-            Ffn::Moe(MoeFfn {
-                router,
-                expert_bias,
-                experts,
-                expert_gate_up_ptrs,
-                expert_down_ptrs,
-            })
+            Ffn::Moe(MoeFfn::seal(gpu, l, router, expert_bias, experts)?)
         };
 
         layers.push(Lfm2MoeLayerWeights {

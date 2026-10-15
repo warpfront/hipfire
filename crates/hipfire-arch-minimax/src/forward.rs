@@ -10,13 +10,13 @@
 //!   h += combine( experts( sigmoid+bias top-8 route( rmsnorm(h) ) ) )       [MoE]
 //! then logits = lm_head( rmsnorm(h) ).
 //!
-//! Attention weights are Q8 (plain input). The router is Q8 (plain). Routed
-//! experts are FWHT-pre-rotated (MQ4G256 / MQ2G256Lloyd / MQ6G256): the input
-//! is rotated (`rotate_x_mq_for`) and the silu output rotated
-//! (`fused_silu_mul_rotate_mq_batched_for`) before the indexed-MoE GEMV kernels
-//! — exactly qwen35's / deepseek4's MoE path. Routing uses `sigmoid_f32` +
-//! `deepseek4_moe_topk_bias_aware_f32` with route_scale = 1.0 (MiniMax-M2
-//! applies no routed-scaling factor).
+//! Single-lane decode runs each layer as the typed step program in
+//! [`crate::program`]: Q8 attention projections, flat QK-norm, prefix
+//! half-split RoPE over the first `rotary_dim` channels, the Q8 KV attention,
+//! then one sealed MoE call (sigmoid router with the selection bias, top-8
+//! FWHT-basis routed experts, route_scale = 1.0: MiniMax-M2 applies no
+//! routed-scaling factor). The batched prefill and EP MoE below still issue
+//! their kernels by hand.
 //!
 //! Decode has two entry points: `decode_step` (eager, used for prefill +
 //! warmup) and `decode_step_with_graph` (hipGraph capture/replay of the
@@ -28,13 +28,13 @@
 //! kept OUTSIDE the captured region (token_id is baked into its kernarg).
 
 use crate::minimax::{MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights};
+use crate::program::{head_steps, LayerRefs};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
-use hipfire_runtime::llama::KvCacheExt;
+use hipfire_dispatch::pipeline::{execute_steps, BoundMoeExperts};
+use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
 };
@@ -194,10 +194,11 @@ pub fn decode_step_with_graph(
         .map_err(|e| format!("minimax graph: download logits: {e:?}"))
 }
 
-/// The capturable core: stage the device position scalar, run the 62-layer
-/// attention+MoE pipeline, then final-norm + lm_head. Does NOT do the embedding
-/// lookup (the caller stages `state.h`). Under graph capture, `capture` is
-/// `None` (no D2H); the oracle dumper passes `Some(..)` and runs eager only.
+/// The capturable core: stage the device position scalar, run each layer's
+/// typed step program (attention, then the sealed MoE), then final-norm +
+/// lm_head. Does NOT do the embedding lookup (the caller stages `state.h`).
+/// Under graph capture, `capture` is `None` (no D2H); the oracle dumper passes
+/// `Some(..)` and runs eager only.
 fn decode_step_body(
     cfg: &MiniMaxConfig,
     weights: &MiniMaxWeights,
@@ -206,13 +207,6 @@ fn decode_step_body(
     position: u32,
     mut capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
-    let hidden = cfg.hidden_size;
-    let q_dim = cfg.q_dim();
-    let kv_dim = cfg.kv_dim();
-    let inter = cfg.intermediate_size;
-    let n_exp = cfg.num_local_experts;
-    let k_top = cfg.num_experts_per_tok;
-    let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
     let capture_postattn =
         hipfire_config::developer_var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
@@ -228,476 +222,83 @@ fn decode_step_body(
             .map_err(|e| format!("minimax: htod pos: {e:?}"))?;
     }
 
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Skipped
-    // when capturing (oracle dumper needs the hand path). Default off (opt-in)
-    // until hipx byte-parity validated (minimax only fits on hipx).
-    if minimax_forward_lowered_enabled() && capture.is_none() {
-        return decode_step_body_lowered(cfg, weights, state, gpu, position);
-    }
-
-    for (l, layer) in weights.layers.iter().enumerate() {
+    {
+        let state = &*state;
         let ctx = DispatchCtx::new(gpu);
-        // ── Attention block (Q8 projections → plain input) ──────────────────
-        // QKV (attn-norm + q/k/v) via execute_steps → FusedQkvQ8_0.
-        qkv_via_execute_steps(gpu, &ctx, layer, state, eps)
-            .map_err(|e| format!("minimax L{l}: {e}"))?;
-
-        // Per-LAYER QK-norm: RMSNorm over the whole flat q[q_dim]/k[kv_dim]
-        // vector (batch=1), BEFORE head reshape.
-        if cfg.use_qk_norm {
-            gpu.rmsnorm_batched(&state.fa_q, &layer.q_norm, &state.fa_q, 1, q_dim, eps)
-                .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
-            gpu.rmsnorm_batched(&state.fa_k, &layer.k_norm, &state.fa_k, 1, kv_dim, eps)
-                .map_err(|e| format!("minimax L{l}: k_norm: {e:?}"))?;
-        }
-
-        // Partial rotate_half RoPE on the first `rotary_dim` of each head.
-        gpu.rope_partial_interleaved_f32(
-            &state.fa_q,
-            &state.fa_k,
-            &state.pos_buf,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            cfg.rotary_dim,
-            cfg.rope_theta,
-        )
-        .map_err(|e| format!("minimax L{l}: rope: {e:?}"))?;
-
-        // KV cache write (Q8) + GQA attention. The attention kernel reads the
-        // live KV length from `pos_buf[0]+1`; we pass `state.max_seq` as the
-        // geometry hint (NOT `seq_len`) so the captured launch grid / shared-mem
-        // is sized for the max and stays valid as the cache grows on replay.
-        gpu.kv_cache_write_q8_0(
-            &state.kv.k_gpu[l],
-            &state.fa_k,
-            &state.pos_buf,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-        )
-        .map_err(|e| format!("minimax L{l}: kv write k: {e:?}"))?;
-        gpu.kv_cache_write_q8_0(
-            &state.kv.v_gpu[l],
-            &state.fa_v,
-            &state.pos_buf,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-        )
-        .map_err(|e| format!("minimax L{l}: kv write v: {e:?}"))?;
-        gpu.attention_q8_0_kv(
-            &state.fa_q,
-            &state.kv.k_gpu[l],
-            &state.kv.v_gpu[l],
-            &state.fa_attn_out,
-            &state.pos_buf,
-            state.max_seq,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            state.kv.physical_cap,
-        )
-        .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
-
-        // o_proj + residual: h += W_o · attn_out (via execute_steps).
-        let wro = layer.wo.dispatch_ref();
-        execute_steps(
-            gpu,
-            &ctx,
-            &[Step::GemvResidual {
-                w: &wro,
-                input: GemvInput::Raw(&state.fa_attn_out),
-                residual: &state.h,
-                out: &state.h,
-            }],
-        )
-        .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))?;
-
-        if capture_postattn {
-            if let Some(cap) = capture.as_deref_mut() {
-                let h = gpu
-                    .download_f32(&state.h)
-                    .map_err(|e| format!("minimax L{l}: postattn capture: {e:?}"))?;
-                cap[l].extend_from_slice(&h);
+        for (l, layer) in weights.layers.iter().enumerate() {
+            let refs = LayerRefs::new(layer);
+            let attention = refs
+                .attention_steps(cfg, state, l, position as usize)
+                .map_err(|e| format!("minimax L{l}: {e}"))?;
+            execute_steps(gpu, &ctx, &attention)
+                .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
+            if capture_postattn {
+                capture_hidden(gpu, state, capture.as_deref_mut(), l)?;
+            }
+            let (routed, sealed) = layer
+                .packed_experts()
+                .ok_or_else(|| format!("minimax L{l}: experts are not sealed (EP shard)"))?;
+            let bound = BoundMoeExperts::from_cache(&sealed.table, &sealed.cache)
+                .map_err(|e| format!("minimax L{l}: bind experts: {e:?}"))?;
+            let moe = refs
+                .moe_step(cfg, &ctx, state, l, &routed, bound)
+                .map_err(|e| format!("minimax L{l}: {e}"))?;
+            execute_steps(gpu, &ctx, std::slice::from_ref(&moe))
+                .map_err(|e| format!("minimax L{l}: moe: {e:?}"))?;
+            if !capture_postattn {
+                capture_hidden(gpu, state, capture.as_deref_mut(), l)?;
             }
         }
-
-        // ── MoE block (no shared expert) ────────────────────────────────────
-        // ffn_tmp = rmsnorm(h) (plain, feeds the Q8 router); ffn_x_rot =
-        // FWHT(ffn_tmp) (feeds the FWHT-pre-rotated experts).
-        gpu.rmsnorm_f32(&state.h, &layer.ffn_norm, &state.ffn_tmp, eps)
-            .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
-        rotate_x_mq_for(
-            gpu,
-            &layer.experts[0].gate_up,
-            &state.ffn_tmp,
-            &state.ffn_x_rot,
-            hidden,
-        )
-        .map_err(|e| format!("minimax L{l}: ffn rotate: {e:?}"))?;
-
-        // Router: sigmoid(logits) + bias-aware top-k (gather unbiased + normalize;
-        // route_scale = 1.0 — MiniMax-M2 applies no routed-scaling factor).
-        weight_gemv(gpu, &layer.router, &state.ffn_tmp, &state.router_logits)
-            .map_err(|e| format!("minimax L{l}: router: {e}"))?;
-        gpu.sigmoid_f32(&state.router_logits)
-            .map_err(|e| format!("minimax L{l}: sigmoid: {e:?}"))?;
-        gpu.deepseek4_moe_topk_bias_aware_f32(
-            &state.router_logits,
-            &layer.routing_bias,
-            &state.topk_indices,
-            &state.topk_weights,
-            n_exp as i32,
-            k_top as i32,
-            1.0,
-        )
-        .map_err(|e| format!("minimax L{l}: topk: {e:?}"))?;
-
-        // Routed experts: gate_up (rotated input) → silu·mul·rotate → down → combine.
-        // Dispatch the indexed-MoE GEMV by expert dtype. MQ4/MQ6/MQ2-Lloyd are
-        // FWHT-pre-rotated (byte-compatible with the matching hfq/lloyd kernels
-        // given rotated input). The hfq4/hfq6 family uses a separate down +
-        // `moe_down_combine`; the MQ2-Lloyd down is residual-scaled (fuses the
-        // weighted combine into the down GEMV, accumulating into h directly).
-        let edt = layer.experts[0].gate_up.gpu_dtype;
-        match edt {
-            DType::MQ4G256 | DType::HFQ4G256 => gpu
-                .gemv_hfq4g256_moe_gate_up_k8_indexed(
-                    &layer.expert_gate_up_ptrs,
-                    &state.topk_indices,
-                    &state.ffn_x_rot,
-                    &state.gate_batch,
-                    &state.up_batch,
-                    2 * inter,
-                    hidden,
-                    k_top,
-                )
-                .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?,
-            DType::MQ6G256 | DType::HFQ6G256 => gpu
-                .gemv_hfq6g256_moe_gate_up_k8_indexed(
-                    &layer.expert_gate_up_ptrs,
-                    &state.topk_indices,
-                    &state.ffn_x_rot,
-                    &state.gate_batch,
-                    &state.up_batch,
-                    2 * inter,
-                    hidden,
-                    k_top,
-                )
-                .map_err(|e| format!("minimax L{l}: gate_up hfq6: {e:?}"))?,
-            DType::MQ2G256Lloyd => gpu
-                .deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-                    &layer.expert_gate_up_ptrs,
-                    &state.topk_indices,
-                    &state.ffn_x_rot,
-                    &state.gate_batch,
-                    &state.up_batch,
-                    2 * inter,
-                    hidden,
-                    k_top,
-                )
-                .map_err(|e| format!("minimax L{l}: gate_up mq2l: {e:?}"))?,
-            DType::MQ3G256Lloyd => gpu
-                .deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
-                    &layer.expert_gate_up_ptrs,
-                    &state.topk_indices,
-                    &state.ffn_x_rot,
-                    &state.gate_batch,
-                    &state.up_batch,
-                    2 * inter,
-                    hidden,
-                    k_top,
-                )
-                .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
-            other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
-        }
-
-        fused_silu_mul_rotate_mq_batched_for(
-            gpu,
-            &layer.experts[0].down,
-            &state.gate_batch,
-            &state.up_batch,
-            &state.rot_batch,
-            inter,
-            k_top,
-        )
-        .map_err(|e| format!("minimax L{l}: silu_mul_rotate: {e:?}"))?;
-
-        // Down dispatches on the DOWN proj's own dtype (may differ from gate_up:
-        // e.g. gate_up=mq2-lloyd + down=mq4, since down carries ~24x the energy).
-        let ddt = layer.experts[0].down.gpu_dtype;
-        match ddt {
-            DType::MQ4G256 | DType::HFQ4G256 => {
-                gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                    &layer.expert_down_ptrs,
-                    &state.topk_indices,
-                    &state.rot_batch,
-                    &state.down_expanded,
-                    hidden,
-                    inter,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("minimax L{l}: down hfq4: {e:?}"))?;
-                gpu.moe_down_combine_k8_batched(
-                    &state.down_expanded,
-                    &state.topk_weights,
-                    &state.h,
-                    hidden,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
-            }
-            DType::MQ6G256 | DType::HFQ6G256 => {
-                gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                    &layer.expert_down_ptrs,
-                    &state.topk_indices,
-                    &state.rot_batch,
-                    &state.down_expanded,
-                    hidden,
-                    inter,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("minimax L{l}: down hfq6: {e:?}"))?;
-                gpu.moe_down_combine_k8_batched(
-                    &state.down_expanded,
-                    &state.topk_weights,
-                    &state.h,
-                    hidden,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
-            }
-            DType::MQ2G256Lloyd => {
-                // Fused down + weighted residual accumulate (no separate combine).
-                gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-                    &layer.expert_down_ptrs,
-                    &state.topk_indices,
-                    &state.topk_weights,
-                    &state.rot_batch,
-                    &state.h,
-                    hidden,
-                    inter,
-                    k_top,
-                    false,
-                )
-                .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
-            }
-            DType::MQ3G256Lloyd => {
-                // Fused down + weighted residual accumulate (no separate combine).
-                gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
-                    &layer.expert_down_ptrs,
-                    &state.topk_indices,
-                    &state.topk_weights,
-                    &state.rot_batch,
-                    &state.h,
-                    hidden,
-                    inter,
-                    k_top,
-                )
-                .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
-            }
-            other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
-        }
-
-        // Capture post-layer residual (pre final-norm) for the oracle compare.
-        if !capture_postattn {
-            if let Some(cap) = capture.as_deref_mut() {
-                let h = gpu
-                    .download_f32(&state.h)
-                    .map_err(|e| format!("minimax L{l}: capture download: {e:?}"))?;
-                cap[l].extend_from_slice(&h);
-            }
-        }
+        let lm_head = weights.lm_head.dispatch_ref();
+        execute_steps(gpu, &ctx, &head_steps(cfg, weights, &lm_head, state))
+            .map_err(|e| format!("minimax: head: {e:?}"))?;
     }
     state.n_tokens = seq_len;
+    Ok(())
+}
 
-    // Final RMSNorm + lm_head (Q8 → plain).
-    gpu.rmsnorm_f32(&state.h, &weights.final_norm, &state.final_norm_buf, eps)
-        .map_err(|e| format!("minimax: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("minimax: lm_head: {e}"))?;
+/// Oracle dumper: append layer `l`'s residual stream to `capture[l]`.
+fn capture_hidden(
+    gpu: &mut Gpu,
+    state: &MiniMaxState,
+    capture: Option<&mut [Vec<f32>]>,
+    l: usize,
+) -> Result<(), String> {
+    if let Some(cap) = capture {
+        let h = gpu
+            .download_f32(&state.h)
+            .map_err(|e| format!("minimax L{l}: capture download: {e:?}"))?;
+        cap[l].extend_from_slice(&h);
+    }
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// #397 Ship 6 — forward-as-pipeline: MiniMax-M2 lowered decode (mechanical reuse).
-//
-// MiniMax is a standard MoE transformer — every layer is [Attend, Moe] (no conv,
-// no dense, one variant), so it reuses the Attend + Moe super-ops with no new op
-// kind. ADDITIVE + opt-in (HIPFIRE_FORWARD_LOWERED, default off until hipx
-// byte-parity validated — minimax only fits on hipx). The hand loop in
-// decode_step_body is untouched → default path byte-identical. The block fns
-// mirror the hand-loop arms verbatim; the lowered handlers call them.
+// EP decode (Ship 6 substrate-EP). Each rank runs the [Attend, Moe] layer
+// program through `hipfire_runtime::ep::run_layer_program_ep`: Attend is the
+// Single attention step program (replicated); Moe is the EP-only hand block
+// below, which accumulates the rank's routed experts into the zeroed partial
+// the EP executor all-reduces. Single decode runs the sealed MoE step instead.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// QKV projection (attn-norm folded in) via the canonical `execute_steps`
-/// interpreter. minimax's q/k/v are Q8_0 (no Givens/AWQ), so the `QKV3` pattern
-/// fuses into the single `FusedQkvQ8_0` kernel; otherwise it falls through to
-/// per-op GEMV. Reads `h`, writes `fa_q/fa_k/fa_v`; uses `tmp` (x_plain) +
-/// `x_rot` (rmsnorm output) as scratch. Mirrors qwen35's `qkv_via_execute_steps`
-/// non-Givens arm — the existing Q8 fused-QKV consumer.
-fn qkv_via_execute_steps(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    layer: &MiniMaxLayerWeights,
-    state: &MiniMaxState,
-    eps: f32,
-) -> Result<(), String> {
-    let rotation = dtype_rotation_plan(layer.wq.gpu_dtype);
-    let wrq = layer.wq.dispatch_ref();
-    let wrk = layer.wk.dispatch_ref();
-    let wrv = layer.wv.dispatch_ref();
-    let steps = [
-        Step::RmsnormAutomatic {
-            x: &state.h,
-            norm_weight: &layer.attn_norm,
-            x_plain: &state.tmp,
-            out: &state.x_rot,
-            awq_scale: layer.wq.awq_scale.as_ref(),
-            k: layer.wq.k,
-            eps,
-            rotation,
-        },
-        Step::Gemv {
-            w: &wrq,
-            input: GemvInput::Prerotated(&state.x_rot),
-            out: &state.fa_q,
-        },
-        Step::Gemv {
-            w: &wrk,
-            input: GemvInput::Prerotated(&state.x_rot),
-            out: &state.fa_k,
-        },
-        Step::Gemv {
-            w: &wrv,
-            input: GemvInput::Prerotated(&state.x_rot),
-            out: &state.fa_v,
-        },
-    ];
-    execute_steps(gpu, ctx, &steps).map_err(|e| format!("minimax qkv: {e:?}"))
-}
-
-/// Attention block (attn-norm folded in). Mirrors the hand-loop attention arm.
-fn minimax_attn_block(
-    gpu: &mut Gpu,
-    cfg: &MiniMaxConfig,
-    layer: &MiniMaxLayerWeights,
-    state: &MiniMaxState,
-    l: usize,
-) -> Result<(), String> {
-    let q_dim = cfg.q_dim();
-    let kv_dim = cfg.kv_dim();
-    let eps = cfg.rms_norm_eps;
-    let ctx = DispatchCtx::new(gpu);
-    // QKV (attn-norm + q/k/v) via execute_steps → FusedQkvQ8_0.
-    qkv_via_execute_steps(gpu, &ctx, layer, state, eps)
-        .map_err(|e| format!("minimax L{l}: {e}"))?;
-    if cfg.use_qk_norm {
-        gpu.rmsnorm_batched(&state.fa_q, &layer.q_norm, &state.fa_q, 1, q_dim, eps)
-            .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
-        gpu.rmsnorm_batched(&state.fa_k, &layer.k_norm, &state.fa_k, 1, kv_dim, eps)
-            .map_err(|e| format!("minimax L{l}: k_norm: {e:?}"))?;
-    }
-    gpu.rope_partial_interleaved_f32(
-        &state.fa_q,
-        &state.fa_k,
-        &state.pos_buf,
-        cfg.num_attention_heads,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
-        cfg.rotary_dim,
-        cfg.rope_theta,
-    )
-    .map_err(|e| format!("minimax L{l}: rope: {e:?}"))?;
-    // KV write (Q8) + attention via the shared KV-usage abstraction. minimax is
-    // Q8 non-flash unconditional → derive returns AttnQ8_0Kv at pos+1<=15000
-    // (no partials → flash_partials: None; >15k flips to flash — documented
-    // Q8-fidelity edge). capture_mode NOT threaded (non-flash kernel is
-    // capture-safe; minimax captures it under HIPFIRE_MINIMAX_GRAPH).
-    // NOTE: the hand path passed `state.max_seq` as the kernel's seq_len_hint
-    // (LDS-sizing only; the kernel reads the true length from pos_buf), while
-    // the dispatch arm passes pos+1. The attended-position count comes from
-    // pos_buf either way, so output is unchanged — VALIDATED by hand≡lowered A/B.
-    let pos = state.pos_host[0] as usize;
-    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
-        hipfire_dispatch::families::kv_tier::KvTierInputs {
-            pos,
-            ..state.kv.tier_inputs()
-        },
-    )
-    .map_err(|e| format!("minimax L{l}: kv tier: {e}"))?;
-    let io = hipfire_dispatch::families::attention::AttnParams {
-        q: &state.fa_q,
-        k: &state.fa_k,
-        v: &state.fa_v,
-        k_cache: &state.kv.k_gpu[l],
-        v_cache: &state.kv.v_gpu[l],
-        k_scales: None,
-        v_scales: None,
-        pos_buf: &state.pos_buf,
-        pos,
-        positions: None,
-        n_heads: cfg.num_attention_heads,
-        n_kv_heads: cfg.num_key_value_heads,
-        head_dim: cfg.head_dim,
-        physical_cap: state.kv.physical_cap,
-        batch_size: 1,
-        max_ctx_len: 0,
-        flash_partials: None,
-        givens_cos: None,
-        givens_sin: None,
-        tree_bias: None,
-        block_start: 0,
-        block_cols: 0,
-        output_gate: None,
-        output_awq_scale: None,
-        output: &state.fa_attn_out,
-    };
-    hipfire_dispatch::pipeline::execute_steps(
-        gpu,
-        &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
-    )
-    .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
-    // o_proj + residual: h += W_o · attn_out (via execute_steps).
-    let wro = layer.wo.dispatch_ref();
-    execute_steps(
-        gpu,
-        &ctx,
-        &[Step::GemvResidual {
-            w: &wro,
-            input: GemvInput::Raw(&state.fa_attn_out),
-            residual: &state.h,
-            out: &state.h,
-        }],
-    )
-    .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))
-}
-
-/// MoE block (ffn-norm folded in). Mirrors the hand-loop MoE arm (8-arm dtype dispatch).
+/// EP MoE block (ffn-norm folded in): the routed down/combine accumulates
+/// into the zeroed `out_target` partial (the EP driver all-reduces it and adds
+/// it into each rank's `state.h`). MiniMax has NO shared expert, so the
+/// entire MoE output is routed.
 #[allow(clippy::too_many_arguments)]
-fn minimax_moe_block(
+fn minimax_moe_block_ep(
     gpu: &mut Gpu,
     cfg: &MiniMaxConfig,
     layer: &MiniMaxLayerWeights,
     state: &MiniMaxState,
     l: usize,
-    // EP (Ship 6 substrate-EP): when `Some`, the routed combine/down accumulates
-    // into this zeroed partial instead of `state.h` (the EP driver all-reduces it
-    // and adds into each rank's `state.h`). MiniMax has NO shared expert, so the
-    // entire MoE output is routed → the whole block redirects. `None` = normal.
-    routed_out: Option<&GpuTensor>,
+    out_target: &GpuTensor,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
     let inter = cfg.intermediate_size;
     let n_exp = cfg.num_local_experts;
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
-    let out_target: &GpuTensor = routed_out.unwrap_or(&state.h);
     gpu.rmsnorm_f32(&state.h, &layer.ffn_norm, &state.ffn_tmp, eps)
         .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
     rotate_x_mq_for(
@@ -862,7 +463,7 @@ fn minimax_moe_block(
     Ok(())
 }
 
-/// Per-layer execution context for the lowered decode path (rebuilt each layer).
+/// Per-layer EP execution context (rebuilt each layer).
 struct MinimaxBindings<'a> {
     cfg: &'a MiniMaxConfig,
     layer: &'a MiniMaxLayerWeights,
@@ -874,20 +475,25 @@ impl<'a> ForwardBindings for MinimaxBindings<'a> {
     fn run_attend(
         &mut self,
         gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
+        ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        minimax_attn_block(gpu, self.cfg, self.layer, self.state, self.l)
-            .map_err(DispatchError::Hip)
+        let refs = LayerRefs::new(self.layer);
+        let position = self.state.pos_host[0] as usize;
+        let steps = refs
+            .attention_steps(self.cfg, self.state, self.l, position)
+            .map_err(|e| DispatchError::Hip(format!("minimax L{}: {e}", self.l)))?;
+        execute_steps(gpu, ctx, &steps)
     }
     fn run_moe(
         &mut self,
-        gpu: &mut Gpu,
+        _gpu: &mut Gpu,
         _ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        minimax_moe_block(gpu, self.cfg, self.layer, self.state, self.l, None)
-            .map_err(DispatchError::Hip)
+        Err(DispatchError::Hip(
+            "minimax EP bindings run the MoE only as an EP partial".into(),
+        ))
     }
     fn run_moe_ep(
         &mut self,
@@ -901,15 +507,8 @@ impl<'a> ForwardBindings for MinimaxBindings<'a> {
         // whole block redirects into `routed_out` (zeroed by the EP executor);
         // `state.h` (the replicated attention residual) is added after all-reduce
         // via ep_add_into_residual. `skip_shared` is irrelevant (no shared expert).
-        minimax_moe_block(
-            gpu,
-            self.cfg,
-            self.layer,
-            self.state,
-            self.l,
-            Some(routed_out),
-        )
-        .map_err(DispatchError::Hip)
+        minimax_moe_block_ep(gpu, self.cfg, self.layer, self.state, self.l, routed_out)
+            .map_err(DispatchError::Hip)
     }
     fn ep_add_into_residual(
         &mut self,
@@ -989,60 +588,13 @@ fn mm_superop(kind: SuperOpKind) -> SuperOp {
     }
 }
 
-/// MiniMax has ONE layer shape (all layers Attn+MoE) → the same 2-op program for
-/// every layer. Pure → unit-testable.
+/// MiniMax has ONE layer shape (all layers Attn+MoE) → the same 2-op EP
+/// program for every layer.
 fn minimax_lower_program() -> superop::LayerProgram {
     vec![
         mm_superop(SuperOpKind::Attend),
         mm_superop(SuperOpKind::Moe),
     ]
-}
-
-/// Cached HIPFIRE_FORWARD_LOWERED toggle for minimax. #397 Ship 6: the minimax
-/// lowered decode is **DEFAULT ON** as of 2026-06-07 — hipx/gfx1151 byte-parity
-/// validated (lowered == hand token-text md5 2a46c35e… on the mq2-lloyd tier,
-/// "Paris is the capital of France."). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0`
-/// forces the legacy hand loop (still present in decode_step_body).
-fn minimax_forward_lowered_enabled() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
-            .ok()
-            .as_deref()
-            != Some("0")
-    })
-}
-
-/// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Pos scalar is
-/// already staged by the caller (decode_step_body). Behaviorally equivalent to
-/// the hand loop (validated via FORWARD_LOWERED=0-vs-=1 token-text md5 on hipx).
-fn decode_step_body_lowered(
-    cfg: &MiniMaxConfig,
-    weights: &MiniMaxWeights,
-    state: &mut MiniMaxState,
-    gpu: &mut Gpu,
-    position: u32,
-) -> Result<(), String> {
-    let eps = cfg.rms_norm_eps;
-    let seq_len = position as usize + 1;
-    let ctx = DispatchCtx::new(gpu);
-    let program = minimax_lower_program();
-    for (l, layer) in weights.layers.iter().enumerate() {
-        let mut bind = MinimaxBindings {
-            cfg,
-            layer,
-            state,
-            l,
-        };
-        superop::run_layer_program(gpu, &ctx, &program, &mut bind)
-            .map_err(|e| format!("minimax L{l}: lowered run_layer_program: {e}"))?;
-    }
-    state.n_tokens = seq_len;
-    gpu.rmsnorm_f32(&state.h, &weights.final_norm, &state.final_norm_buf, eps)
-        .map_err(|e| format!("minimax: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("minimax: lm_head: {e}"))
 }
 
 /// True iff every layer's expert gate_up + down dtypes have batched kernels, so
