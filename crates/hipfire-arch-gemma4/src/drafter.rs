@@ -980,6 +980,7 @@ fn run_step(
         k: dcfg.hidden,
         eps: dcfg.norm_eps,
         rotation: hipfire_dispatch::types::RotationPlan::None,
+        rows: 1,
     });
     // The next step's hidden half; pre_projection already consumed this one.
     steps.push(Step::Gemv {

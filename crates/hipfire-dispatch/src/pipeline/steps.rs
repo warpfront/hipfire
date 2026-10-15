@@ -19,6 +19,7 @@ use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
 /// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
+#[derive(Clone, Copy)]
 pub enum GemvInput<'a> {
     Raw(&'a GpuTensor),        // launch_op self-rotates via run_auto (plan-aware)
     Prerotated(&'a GpuTensor), // already FWHT-rotated; dispatched via Prerotated variant
@@ -52,6 +53,10 @@ pub enum Step<'a> {
         k: usize,
         eps: f32,
         rotation: RotationPlan, // FwhtG256 for MQ dtypes, None for HFQ4/others
+        /// Row-major rows of width `k`. `1` is the single-row route (the
+        /// fusion table's producer); more rows take the batched kernels and
+        /// are a fusion barrier. A row norm is row-complete, never head-split.
+        rows: usize,
     },
     /// Paired KV-write + flash-attention (Phase 0.3). Consumes a KvTierPlan
     /// (derived once per attention step) and AttnParams (tensor borrows).
@@ -60,8 +65,9 @@ pub enum Step<'a> {
         plan: crate::families::kv_tier::KvTierPlan,
         io: crate::families::attention::AttnParams<'a>,
     },
-    /// In-place RoPE on Q and K. Per-op only (no fused entry) — present so the
-    /// attention block can be one contiguous step list (future fusion seam).
+    /// In-place RoPE on Q and K with an explicit channel pairing. Per-op only
+    /// (no fused entry) — present so the attention block can be one contiguous
+    /// step list (future fusion seam).
     Rope {
         q: &'a GpuTensor,
         k: &'a GpuTensor,
@@ -69,7 +75,7 @@ pub enum Step<'a> {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
-        theta: f32,
+        rope: crate::pipeline::sandwich::Rope,
     },
     /// Per-head rmsnorm on one tensor (Qwen3-style qk-norm). One step per tensor.
     QkNorm {
@@ -85,6 +91,12 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// `out = silu(gate) ⊙ up` (one row; the dense SwiGLU activation).
+    SiluMul {
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        out: &'a GpuTensor,
+    },
     /// Grouped hyper-connection read.  The operation contract is model-neutral;
     /// architecture crates bind the resident projections and fixed-capacity views.
     HyperRead(crate::pipeline::layer_ops::HyperReadOp<'a>),
@@ -96,6 +108,8 @@ pub enum Step<'a> {
     HyperWrite(crate::pipeline::layer_ops::HyperWriteOp<'a>),
     /// Grouped causal convolution/gating operation.
     GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
+    /// Double-gated causal short convolution with its rolling state.
+    GatedShortConv(crate::pipeline::layer_ops::GatedShortConvOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
@@ -137,16 +151,19 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
     match step {
         Step::Gemv { .. } => Some(PipelineOp::Gemv),
         Step::GemvResidual { .. } => Some(PipelineOp::GemvResidual),
-        Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { rows: 1, .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { .. } => None,
         Step::Attend { .. } => Some(PipelineOp::Attend),
         Step::Rope { .. } => Some(PipelineOp::Rope),
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
         Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
+        Step::SiluMul { .. } => Some(PipelineOp::SiluMul),
         Step::HyperRead(_)
         | Step::GatedDeltaNet(_)
         | Step::IndexedAttention(_)
         | Step::HyperWrite(_)
         | Step::GroupedDepthwise(_)
+        | Step::GatedShortConv(_)
         | Step::Clear(_)
         | Step::Embed(_)
         | Step::HyperNorm(_)
@@ -776,12 +793,28 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::IndexedAttention(op) => op.validate_for_gpu(gpu)?,
             Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
             Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedShortConv(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
             Step::Embed(op) => op.validate_for_gpu(gpu)?,
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::ParallelMoeMlp(op) => op.mlp.validate_for_gpu(gpu)?,
+            // One row keeps the single-row route's contract (`x` may be a wider
+            // buffer whose shape the kernel reads); a batch must hold its rows.
+            Step::RmsnormAutomatic { x, out, k, rows, .. } if *rows != 1 => {
+                let need = rows * k;
+                if *rows == 0 || x.numel() < need || out.numel() < need {
+                    return Err(DispatchError::Hip(format!(
+                        "rmsnorm: {rows} rows of {k} need {need} elements, x has {}, out {}",
+                        x.numel(),
+                        out.numel()
+                    )));
+                }
+            }
             _ => {}
         }
     }
@@ -1608,8 +1641,16 @@ pub(crate) fn launch_op_rows(
             k,
             eps,
             rotation,
+            rows,
         } => {
-            if *rotation == RotationPlan::None {
+            if *rows > 1 && *rotation == RotationPlan::None {
+                gpu.rmsnorm_batched(x, norm_weight, out, *rows, *k, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else if *rows > 1 && *rotation == RotationPlan::Mq8Internal {
+                Err(DispatchError::Hip(
+                    "rmsnorm: MQ8 internal rotation is single-row only".into(),
+                ))
+            } else if *rotation == RotationPlan::None {
                 // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
                 // x_plain is not written in this path (scratch only for FWHT path).
                 gpu.rmsnorm_f32(x, norm_weight, out, *eps)
@@ -1639,7 +1680,7 @@ pub(crate) fn launch_op_rows(
                             awq_scale: *awq_scale,
                             k: *k,
                             eps: *eps,
-                            batch_size: 1,
+                            batch_size: *rows,
                             variant: RotationVariant::WithRmsnorm,
                             givens_pairs: None,
                             givens_theta: None,
@@ -1663,10 +1704,8 @@ pub(crate) fn launch_op_rows(
             n_heads,
             n_kv_heads,
             head_dim,
-            theta,
-        } => gpu
-            .rope_f32(q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim, *theta)
-            .map_err(|e| DispatchError::Hip(e.to_string())),
+            rope,
+        } => rope.apply_row(gpu, q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim),
         Step::QkNorm {
             x,
             weight,
@@ -1679,6 +1718,9 @@ pub(crate) fn launch_op_rows(
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::SiluMul { gate, up, out } => gpu
+            .silu_mul_f32(gate, up, out)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::HyperRead(op) => crate::pipeline::layer_ops::execute_hyper_read(gpu, op),
         Step::GatedDeltaNet(op) => crate::pipeline::layer_ops::execute_gated_delta_net(gpu, op),
         Step::IndexedAttention(op) => {
@@ -1688,6 +1730,7 @@ pub(crate) fn launch_op_rows(
         Step::GroupedDepthwise(op) => {
             crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
         }
+        Step::GatedShortConv(op) => crate::pipeline::layer_ops::execute_gated_short_conv(gpu, op),
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
         Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
@@ -2319,6 +2362,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2349,6 +2393,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2374,6 +2419,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,

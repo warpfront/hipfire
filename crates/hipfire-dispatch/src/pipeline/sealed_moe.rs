@@ -17,7 +17,7 @@ use crate::families::gemv::WeightRef;
 use crate::families::moe::{
     ExpertTierIdentity, MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries,
     MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability,
-    RoutedExpertWeights,
+    RoutedExpertWeights, MOE_BIASED_SIGMOID_MAX_K,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -2679,6 +2679,40 @@ fn seal_decode_with_router<'a>(
     seal_indexed_decode(experts, ctx, params, router)
 }
 
+/// The unbiased sigmoid router selects exactly eight experts; a selection
+/// bias routes through the runtime-width bias-aware selector.
+pub(super) fn sigmoid_decode_width_ok(params: &MoeParams<'_>) -> bool {
+    match params.selection_bias {
+        None => params.k == 8,
+        Some(_) => (1..=MOE_BIASED_SIGMOID_MAX_K).contains(&params.k),
+    }
+}
+
+/// A selection bias belongs to the sigmoid recipe, always normalizes over the
+/// selection, and covers every expert.
+fn validate_selection_bias(params: &MoeParams<'_>) -> Result<(), DispatchError> {
+    let Some(bias) = params.selection_bias else {
+        return Ok(());
+    };
+    if params.recipe != MoeRecipe::SigmoidRoutedNoShared {
+        return Err(invalid(
+            "a selection bias requires the sigmoid routed recipe",
+        ));
+    }
+    if !params.norm_topk_prob {
+        return Err(invalid(
+            "the biased sigmoid router always normalizes; norm_topk_prob must be true",
+        ));
+    }
+    if !bias.route_scale.is_finite() {
+        return Err(invalid("selection bias route scale is not finite"));
+    }
+    if bias.bias.dtype != DType::F32 {
+        return Err(invalid("selection bias must be F32"));
+    }
+    require_elements(bias.bias, params.n_exp, "selection bias")
+}
+
 fn require_recipe_feature(recipe: MoeRecipe) -> Result<(), DispatchError> {
     #[cfg(not(feature = "deltanet"))]
     if recipe == MoeRecipe::SigmoidRoutedNoShared {
@@ -2737,9 +2771,9 @@ fn prepare_decode<'a>(
     require_recipe_feature(params.recipe)?;
     resolve_decode_normalization(ctx, &mut params)?;
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
-        if params.k != 8 {
+        if !sigmoid_decode_width_ok(&params) {
             return Err(invalid(format!(
-                "sigmoid MoE decode requires k=8, got {}",
+                "sigmoid MoE decode requires k=8 (1..={MOE_BIASED_SIGMOID_MAX_K} with a selection bias), got {}",
                 params.k
             )));
         }
@@ -3358,12 +3392,15 @@ fn validate_decode(
         return Err(invalid("deferred routed combine requires routed_out=None"));
     }
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared
-        && (params.k != 8 || params.ep_mode != MoeEpMode::None || params.defer_routed_combine)
+        && (!sigmoid_decode_width_ok(params)
+            || params.ep_mode != MoeEpMode::None
+            || params.defer_routed_combine)
     {
         return Err(invalid(
-            "sigmoid MoE decode requires k=8, no EP, and no deferred combine",
+            "sigmoid MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine",
         ));
     }
+    validate_selection_bias(params)?;
     validate_normalization(&params.normalization, params.hidden, params.hidden)?;
     validate_shared_decode(params, params.hidden)?;
     validate_weight_ref(
@@ -6417,6 +6454,7 @@ mod tests {
             k,
             n_exp,
             norm_topk_prob: false,
+            selection_bias: None,
             x_rot_prerotated: true,
             defer_routed_combine: false,
             cpu_deferred_experts: false,
@@ -6634,6 +6672,7 @@ mod tests {
             k,
             n_exp,
             norm_topk_prob: false,
+            selection_bias: None,
             x_rot_prerotated: true,
             defer_routed_combine: false,
             cpu_deferred_experts: false,
@@ -6751,6 +6790,135 @@ mod tests {
         assert!(format!("{error:?}").contains("context device"), "{error:?}");
     }
 
+    #[test]
+    #[cfg(feature = "deltanet")]
+    fn biased_sigmoid_decode_admits_narrow_k_only_as_normalized_sigmoid() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+        let table = table(8, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x95_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x96_0000);
+        let bias = f32_elems(0x97_0000, 8);
+        let short_bias = f32_elems(0x98_0000, 7);
+        let biases = [&bias, &short_bias];
+        let params = |k, which: Option<usize>| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                k,
+                8,
+                MoeEpMode::None,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params.norm_topk_prob = true;
+            params.selection_bias = which.map(|i| MoeSelectionBias {
+                bias: biases[i],
+                route_scale: 1.0,
+            });
+            params
+        };
+        let call = seal_decode(experts, &ctx, params(4, Some(0))).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+
+        // Without the bias the sigmoid route stays top-8 only.
+        let error = seal_decode(experts, &ctx, params(4, None))
+            .err()
+            .expect("unbiased sigmoid k=4 must fail");
+        assert!(format!("{error:?}").contains("k=8"), "{error:?}");
+        // The bias-aware selector always normalizes.
+        let mut unnormalized = params(4, Some(0));
+        unnormalized.norm_topk_prob = false;
+        let error = seal_decode(experts, &ctx, unnormalized)
+            .err()
+            .expect("unnormalized biased route must fail");
+        assert!(format!("{error:?}").contains("norm_topk_prob"), "{error:?}");
+        // The bias must cover every expert.
+        let error = seal_decode(experts, &ctx, params(4, Some(1)))
+            .err()
+            .expect("short bias must fail");
+        assert!(format!("{error:?}").contains("selection bias"), "{error:?}");
+        // A selection bias belongs to the sigmoid recipe only.
+        let mut softmax = ep_decode_params(
+            &scratch,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            0,
+            8,
+            8,
+            MoeEpMode::None,
+            None,
+            false,
+        );
+        softmax.selection_bias = Some(MoeSelectionBias {
+            bias: &bias,
+            route_scale: 1.0,
+        });
+        let error = seal_decode(experts, &ctx, softmax)
+            .err()
+            .expect("biased softmax route must fail");
+        assert!(
+            format!("{error:?}").contains("sigmoid routed recipe"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "deltanet")]
+    fn biased_sigmoid_decode_admits_lloyd_experts_only_at_top8() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+        let table = table(8, DType::MQ2G256Lloyd);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x99_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x9a_0000);
+        let bias = f32_elems(0x9b_0000, 8);
+        let params = |k| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                k,
+                8,
+                MoeEpMode::None,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params.dtypes.experts_all_gate_up_mq4 = false;
+            params.dtypes.routed_gate_up = DType::MQ2G256Lloyd;
+            params.dtypes.routed_down = DType::MQ2G256Lloyd;
+            params.norm_topk_prob = true;
+            params.selection_bias = Some(MoeSelectionBias {
+                bias: &bias,
+                route_scale: 1.0,
+            });
+            params
+        };
+        let call = seal_decode(experts, &ctx, params(8)).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+        // The Lloyd routed kernels read a fixed top-8 width.
+        let error = seal_decode(experts, &ctx, params(4))
+            .err()
+            .expect("biased Lloyd k=4 must fail");
+        assert!(format!("{error:?}").contains("runtime-width"), "{error:?}");
+    }
     #[cfg(not(feature = "deltanet"))]
     #[test]
     fn sigmoid_decode_refuses_before_publication_without_deltanet() {

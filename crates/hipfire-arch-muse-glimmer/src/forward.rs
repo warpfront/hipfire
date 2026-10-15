@@ -31,10 +31,15 @@ use crate::config::{GlimmerConfig, GlimmerLayerType};
 use crate::glimmer::{
     device_capture_audit_enabled, GlimmerState, GlimmerWeights, GLIMMER_MAX_SPEC_BLOCK,
 };
+use crate::program;
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::sandwich::{
+    windowed_q8_partials_elems, WindowedQ8Tiled, WINDOWED_Q8_TILED_MIN_SEQ,
+};
 use hipfire_runtime::llama::{
-    fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
-    fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, rotate_x_mq_batched_for,
-    weight_gemv, weight_gemv_prerotated, EmbeddingFormat, WeightTensor,
+    fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
+    rotate_x_mq_batched_for, weight_gemv, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -178,10 +183,23 @@ fn muse_gemm_enabled() -> bool {
 
 // Opt-out for fusing the FFN activation and MagnumQuant G256 rotation.
 #[inline]
-fn fused_silu_rotate_supported(w: &WeightTensor) -> bool {
-    hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_SILU_ROTATE").as_deref() != Ok("0")
+pub(crate) fn fused_silu_rotate_supported(w: &WeightTensor) -> bool {
+    fused_silu_rotate_enabled()
         && matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ6G256)
         && w.k % 256 == 0
+}
+
+pub(crate) fn fused_silu_rotate_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_SILU_ROTATE").as_deref() != Ok("0")
+}
+
+/// `HIPFIRE_GLIMMER_WMMA_FULL=0` keeps batched attention on the F32 scalar
+/// kernels instead of the query-tiled F16 WMMA flash kernels (relative L2
+/// ~1e-3; greedy text measured identical on Muse Glimmer).
+pub(crate) fn wmma_flash_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_WMMA_FULL")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
 }
 
 #[inline]
@@ -225,7 +243,7 @@ fn run_prefill_fused_qkvza_key(
 // ───────────────────── Shared rotation gate ─────────────────────
 // HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
 // Mirrors Gemma4's attn_input_qkv and Qwen35's run_fa_layer_body precedent.
-fn shared_rot_enabled() -> bool {
+pub(crate) fn shared_rot_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
 }
 
@@ -236,37 +254,6 @@ fn batched_lm_head_enabled() -> bool {
             .as_deref(),
         Some("0") | Some("off") | Some("false")
     )
-}
-
-/// Master switch for fused sandwich post-norm + residual-add
-/// (`rmsnorm_residual_add_f32`). Default ON; opt out with
-/// `HIPFIRE_GLIMMER_FUSED_POSTNORM=0|off|false|no` (case-insensitive).
-/// Decode-only; not byte-identical (residual add rounds in-kernel).
-fn fused_postnorm_enabled() -> bool {
-    match hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_POSTNORM") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "no"
-        ),
-        Err(_) => true,
-    }
-}
-
-/// Master switch for fused scale-less Q/K RMSNorm + q scale + RoPE
-/// (`fused_gemma4_qk_norm_rope_f32`). Default ON; opt out with
-/// `HIPFIRE_GLIMMER_FUSED_QK_ROPE=0|off|false` (case-insensitive).
-/// Decode-only (`glimmer_layer_decode`); collapses q_norm + k_norm +
-/// scale_f32(q) + optional rope from up to 4 launches to 1. Full/NoPE
-/// layers pass `n_rot_pairs=0` (norm+scale, no RoPE). Not eligible when
-/// any of NO_QK_NORM / NO_QK_SCALE / ROPE_INTERLEAVED ablations are on.
-fn fused_qk_rope_enabled() -> bool {
-    match hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_QK_ROPE") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false"
-        ),
-        Err(_) => true,
-    }
 }
 
 /// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
@@ -315,13 +302,6 @@ pub fn glimmer_prefill_chunk_size(prompt_len: usize) -> usize {
 // ───────────────────────────── Decode ─────────────────────────────
 
 /// Decode one token; returns the full logits vector.
-/// Diagnostic ablation switches. Bring-up only: each disables ONE architectural
-/// feature so a divergence can be bisected across GPUs in parallel. All default
-/// OFF (i.e. the feature is ON) — setting the var disables that feature.
-fn abl(name: &str) -> bool {
-    std::env::var(name).ok().as_deref() == Some("1")
-}
-
 pub fn decode_step(
     cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
@@ -418,15 +398,13 @@ fn embed_lookup(
     // There is no Gemma-style sqrt(dim) embed_scale in Glimmer — this norm is
     // what takes its place, and omitting it leaves the residual stream at the
     // wrong magnitude for every downstream layer.
-    if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
-        gpu.rmsnorm_f32(
-            &state.x,
-            &state.embed_norm_ones,
-            &state.x,
-            _cfg.rms_norm_eps,
-        )
-        .map_err(|e| format!("glimmer: embed_norm: {e:?}"))?;
-    }
+    gpu.rmsnorm_f32(
+        &state.x,
+        &state.embed_norm_ones,
+        &state.x,
+        _cfg.rms_norm_eps,
+    )
+    .map_err(|e| format!("glimmer: embed_norm: {e:?}"))?;
     Ok(())
 }
 
@@ -458,10 +436,8 @@ fn embed_lookup_batched(
             .map_err(|e| format!("glimmer: embed q8 batched: {e:?}"))?,
         EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
     }
-    if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
-        gpu.rmsnorm_batched(x, &state.embed_norm_ones, x, b, dim, rms_eps)
-            .map_err(|e| format!("glimmer: embed_norm batched: {e:?}"))?;
-    }
+    gpu.rmsnorm_batched(x, &state.embed_norm_ones, x, b, dim, rms_eps)
+        .map_err(|e| format!("glimmer: embed_norm batched: {e:?}"))?;
     Ok(true)
 }
 
@@ -472,538 +448,92 @@ fn decode_step_body(
     gpu: &mut Gpu,
     position: u32,
 ) -> Result<(), String> {
-    // Device position scalar (i32) — staged from heap-stable Box.
-    state.pos_host[0] = position as i32;
-    {
-        let pos_bytes =
-            unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
-        gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
-            .map_err(|e| format!("glimmer: htod pos: {e:?}"))?;
-    }
-
-    for layer_idx in 0..cfg.n_layers {
-        let slot = state.kv_slot_for_layer[layer_idx];
-        let lw = &weights.layers[layer_idx];
-        glimmer_layer_decode(gpu, cfg, lw, layer_idx, slot, state)?;
+    stage_decode_position(gpu, cfg, state, position)?;
+    let ctx = DispatchCtx::new(gpu);
+    for layer in 0..cfg.n_layers {
+        run_layer(gpu, &ctx, cfg, weights, state, layer)?;
     }
     state.n_tokens = position as usize + 1;
-
-    // Final RMSNorm -> tmp (rms eps)
-    gpu.rmsnorm_f32(&state.x, &weights.final_norm, &state.tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("glimmer: final rmsnorm: {e:?}"))?;
-
-    // LM head (untied) -> logits
-    weight_gemv(gpu, &weights.lm_head, &state.tmp, &state.logits)
-        .map_err(|e| format!("glimmer: lm_head: {e}"))?;
-
-    // output_multiplier BEFORE softcap (brief RESOLVED)
-    if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
-        gpu.scale_f32(&state.logits, cfg.output_multiplier)
-            .map_err(|e| format!("glimmer: output_multiplier scale: {e:?}"))?;
-    }
-
-    // Final logit softcapping: tanh(x/cap)*cap with cap 20.0
-    if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
-        gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
-            .map_err(|e| format!("glimmer: logit softcap: {e:?}"))?;
-    }
-    Ok(())
+    run_head(gpu, &ctx, cfg, weights, state)
 }
 
-fn glimmer_layer_decode(
+/// Stage `position` for the layer programs: the device position scalar, the
+/// tiled-attention position copy and partials once the context reaches
+/// [`WINDOWED_Q8_TILED_MIN_SEQ`], and the KV pages up to `position`.
+fn stage_decode_position(
     gpu: &mut Gpu,
     cfg: &GlimmerConfig,
-    lw: &crate::glimmer::GlimmerLayerWeights,
-    layer_idx: usize,
-    kv_slot: usize,
     state: &mut GlimmerState,
+    position: u32,
 ) -> Result<(), String> {
-    let dim = cfg.dim;
-    let head_dim = cfg.head_dim;
-    let n_heads = cfg.n_heads;
-    let n_kv = cfg.n_kv_heads;
-    let rms_eps = cfg.rms_norm_eps;
-    let post_eps = cfg.post_norm_eps;
-    let dim_bytes = dim * 4;
-
-    // residual = x
-    gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
-        .map_err(|e| format!("glimmer L{layer_idx}: save residual: {e:?}"))?;
-
-    // n1 = input_layernorm(x) -> tmp/tmp_rot
-    // Shared FWHT rotation: 4 projections (q/k/v/gate) read the SAME normed
-    // input. Each weight_gemv on MQ4G256 internally rotates its input (6656-
-    // element FWHT), so the old path rotated the identical vector 4 times.
-    // Rotate once via fused_rmsnorm_rotate_for_mq (precedent:
-    // crates/hipfire-arch-qwen35/src/qwen35.rs:17515 and
-    // crates/hipfire-arch-gemma4/src/forward.rs:192-199 — the latter states
-    // "Prerotated GEMVs share tmp_rot (NO re-rotation -- byte-identical math)").
-    // Byte-identical when the fused kernel's rmsnorm+FWHT sequence matches
-    // the separate rmsnorm_f32 + rotate_x_mq sequence (same per-group
-    // butterfly, same sign tables from ensure_mq_signs). Accumulation order
-    // in the GEMVs is unchanged (each GEMV still accumulates its own M rows).
-    let use_shared_attn = shared_rot_enabled()
-        && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype)
-            != hipfire_dispatch::types::RotationPlan::None;
-    if use_shared_attn {
-        // Fused rmsnorm+rotate: x --rmsnorm--> x_rot (FWHT). Returns Some(&x_rot)
-        // when rotation was applied, None for non-rotating dtypes (fallback,
-        // though we already checked rotation is needed, so this is Some).
-        // The plain tmp is not populated in the fused path; weight_gemv_prerotated
-        // ignores its `x` arg when `x_rot` is Some (see llama.rs:1221).
-        let x_rot_opt = fused_rmsnorm_rotate_for_mq(
-            gpu,
-            &lw.q_proj,
-            &state.x,
-            &lw.input_layernorm,
-            &state.tmp,
-            &state.x_rot,
-            rms_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: fused input rmsnorm+rotate: {e:?}"))?;
-        // gfx1100 MQ4/HFQ4 exact Glimmer shape: one fused Q+K+V+attn_gate GEMV
-        // (K=6656) instead of four sequential launches. fused_qkvza_hfq4g256
-        // selects the Glimmer-shaped module at (4096,256,256,4096,6656).
-        let dt = lw.q_proj.gpu_dtype;
-        let qkvg_same = lw.k_proj.gpu_dtype == dt
-            && lw.v_proj.gpu_dtype == dt
-            && lw.attn_gate_proj.gpu_dtype == dt;
-        let fused_qkvg = gpu.arch_caps.is_gfx1100()
-            && qkvg_same
-            && matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
-            && lw.q_proj.m == 4096
-            && lw.k_proj.m == 256
-            && lw.v_proj.m == 256
-            && lw.attn_gate_proj.m == 4096
-            && lw.q_proj.k == 6656
-            && lw.k_proj.k == 6656
-            && lw.v_proj.k == 6656
-            && lw.attn_gate_proj.k == 6656;
-        if fused_qkvg {
-            let x_rot = x_rot_opt.ok_or_else(|| {
-                format!("glimmer L{layer_idx}: fused qkvg decode expected prerotated x")
-            })?;
-            gpu.fused_qkvza_hfq4g256(
-                &lw.q_proj.buf,
-                &lw.k_proj.buf,
-                &lw.v_proj.buf,
-                &lw.attn_gate_proj.buf,
-                x_rot,
-                &state.q,
-                &state.k,
-                &state.v,
-                &state.attn_gate,
-                lw.q_proj.m,
-                lw.k_proj.m,
-                lw.v_proj.m,
-                lw.attn_gate_proj.m,
-                lw.q_proj.k,
-            )
-            .map_err(|e| format!("glimmer L{layer_idx}: fused qkvg decode: {e:?}"))?;
-        } else {
-            let x_rot = x_rot_opt.as_ref().copied();
-            // x param is ignored when x_rot is Some; pass &state.x as placeholder
-            // (matches Gemma4's weight_gemv_prerotated(gpu, q_proj, x, Some(tmp_rot), q_out)).
-            weight_gemv_prerotated(gpu, &lw.q_proj, &state.x, x_rot, &state.q)
-                .map_err(|e| format!("glimmer L{layer_idx}: q_proj (prerot): {e:?}"))?;
-            weight_gemv_prerotated(gpu, &lw.k_proj, &state.x, x_rot, &state.k)
-                .map_err(|e| format!("glimmer L{layer_idx}: k_proj (prerot): {e:?}"))?;
-            weight_gemv_prerotated(gpu, &lw.v_proj, &state.x, x_rot, &state.v)
-                .map_err(|e| format!("glimmer L{layer_idx}: v_proj (prerot): {e:?}"))?;
-            weight_gemv_prerotated(gpu, &lw.attn_gate_proj, &state.x, x_rot, &state.attn_gate)
-                .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj (prerot): {e:?}"))?;
-        }
-    } else {
-        gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, rms_eps)
-            .map_err(|e| format!("glimmer L{layer_idx}: input rmsnorm: {e:?}"))?;
-        weight_gemv(gpu, &lw.q_proj, &state.tmp, &state.q)
-            .map_err(|e| format!("glimmer L{layer_idx}: q_proj: {e}"))?;
-        weight_gemv(gpu, &lw.k_proj, &state.tmp, &state.k)
-            .map_err(|e| format!("glimmer L{layer_idx}: k_proj: {e}"))?;
-        weight_gemv(gpu, &lw.v_proj, &state.tmp, &state.v)
-            .map_err(|e| format!("glimmer L{layer_idx}: v_proj: {e}"))?;
-        weight_gemv(gpu, &lw.attn_gate_proj, &state.tmp, &state.attn_gate)
-            .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj: {e}"))?;
-    }
-
-    // Scale-less QK-norm (no learned weight tensors; ones-filled weight)
-    // Still runs RMSNorm per head, then Q *= qk_scale_factor, then optional RoPE.
-    // Fused path collapses q_norm + k_norm + q scale + rope into one launch when
-    // eligible; partial ablations and interleaved RoPE force the exact chain.
-    let fuse_qk_rope = fused_qk_rope_enabled()
-        && !abl("HIPFIRE_GLIMMER_NO_QK_NORM")
-        && !abl("HIPFIRE_GLIMMER_NO_QK_SCALE")
-        && !abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED");
-    if fuse_qk_rope {
-        let n_rot_pairs = if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
-            head_dim / 2
-        } else {
-            0
-        };
-        gpu.fused_gemma4_qk_norm_rope_f32(
-            &state.q,
-            &state.k,
-            &state.qk_norm_ones,
-            &state.qk_norm_ones,
-            &state.pos_buf,
-            n_heads,
-            n_kv,
-            head_dim,
-            n_rot_pairs,
-            cfg.qk_scale_factor,
-            cfg.rope_theta_for(layer_idx),
-            rms_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: fused qk norm+rope: {e:?}"))?;
-    } else {
-        if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
-            gpu.rmsnorm_batched(
-                &state.q,
-                &state.qk_norm_ones,
-                &state.q,
-                n_heads,
-                head_dim,
-                rms_eps,
-            )
-            .map_err(|e| format!("glimmer L{layer_idx}: q_norm: {e:?}"))?;
-            gpu.rmsnorm_batched(
-                &state.k,
-                &state.qk_norm_ones,
-                &state.k,
-                n_kv,
-                head_dim,
-                rms_eps,
-            )
-            .map_err(|e| format!("glimmer L{layer_idx}: k_norm: {e:?}"))?;
-        }
-        // Do NOT pre-scale by sqrt(head_dim); Glimmer wants kernel 1/sqrt AND 3.87
-        if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
-            gpu.scale_f32(&state.q, cfg.qk_scale_factor)
-                .map_err(|e| format!("glimmer L{layer_idx}: q scale qk_factor: {e:?}"))?;
-        }
-
-        // RoPE only on layers whose layer_rope_theta != 0 (copy cohere2moe shape)
-        if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
-            let theta = cfg.rope_theta_for(layer_idx);
-            // RoPE convention. HF reports rope_type "default" (Llama half-split),
-            // which is `rope_f32`. HIPFIRE_GLIMMER_ROPE_INTERLEAVED=1 selects the
-            // GPT-J interleaved variant for A/B during bring-up — getting this
-            // backwards scrambles attention into plausible-looking noise.
-            if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
-                gpu.rope_interleaved_f32(
-                    &state.q,
-                    &state.k,
-                    &state.pos_buf,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    head_dim, // n_rot = full head_dim (no partial rotation)
-                    theta,
-                )
-                .map_err(|e| format!("glimmer L{layer_idx}: rope interleaved: {e:?}"))?;
-            } else {
-                gpu.rope_f32(
-                    &state.q,
-                    &state.k,
-                    &state.pos_buf,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    theta,
-                )
-                .map_err(|e| format!("glimmer L{layer_idx}: rope: {e:?}"))?;
-            }
-        }
-    }
-
-    // KV write (Q8) + windowed/full attention via attention_q8_0_kv_swa
-    // window = sliding_window on sliding layers (rope), 0 on full (NoPE)
-    let window = cfg.window_for(layer_idx);
-    let kv = match cfg.layer_types[layer_idx] {
-        GlimmerLayerType::Sliding => &mut state.kv_sliding,
-        GlimmerLayerType::Full => &mut state.kv_full,
-    };
-    // Map physical pages up to the position about to be written. No-op on the
-    // contiguous backend (fast_mapped_token_capacity returns None) and a cheap
-    // early-out once the prefix is already mapped, so it is safe unconditional.
-    kv.ensure_mapped_capacity(gpu, state.pos_host[0] as usize + 1)
-        .map_err(|e| format!("glimmer L{layer_idx}: kv map: {e:?}"))?;
-    gpu.kv_cache_write_q8_0(&kv.k_gpu[kv_slot], &state.k, &state.pos_buf, n_kv, head_dim)
-        .map_err(|e| format!("glimmer L{layer_idx}: kv write k: {e:?}"))?;
-    gpu.kv_cache_write_q8_0(&kv.v_gpu[kv_slot], &state.v, &state.pos_buf, n_kv, head_dim)
-        .map_err(|e| format!("glimmer L{layer_idx}: kv write v: {e:?}"))?;
-
-    // Flash decode. `attention_q8_0_kv_swa` launches grid [n_heads] = 32
-    // workgroups, one per head, and each walks the whole key range serially
-    // while materializing every score in LDS. On a 64-CU part that leaves half
-    // the GPU idle at ANY context and makes cost grow with seq_len. Measured
-    // via `hipfire bench --matrix`: Glimmer decode falls 30.3% from ctx 128 to
-    // 8192 (32.49 -> 22.66 tok/s) where Qwen3.5-27B on the same GPU and harness
-    // loses 4.1% (35.85 -> 34.39) because it decodes through the flash family.
-    //
-    // The batched flash kernel tiles keys at 128 and puts the tile count in the
-    // grid, so at ctx 8192 it launches ~64x more workgroups and reduces
-    // partials instead of serializing. Glimmer already uses it for prefill;
-    // batch_size=1 is the decode case. Same KV layout, same window semantics
-    // (window<=0 = full causal), so the 13 NoPE layers pass window=0.
-    //
-    // Neither kernel wins outright, so this is a THRESHOLD and not a swap. The
-    // 32-workgroup SWA is cheaper when there is too little work to spread; the
-    // tiled flash wins once there is. Measured on gfx1201 via
-    // `hipfire bench --matrix --tg 64`, medians of 3:
-    //
-    //     ctx      768   1024   1536   2048   4096   8192
-    //     SWA    29.99  29.08  27.53  26.22  24.94  22.66
-    //     flash  28.65  28.55  28.38  28.20  27.86  27.20
-    //
-    // Crossover sits between 1024 and 1536, hence the 1280 default. Picking
-    // flash above it takes the ctx-128->8192 decay from -30.3% to -5.2%, which
-    // is the -4.1% Qwen3.5-27B shows on the same GPU and harness, and is worth
-    // +20.0% at ctx 8192. Byte-identical to the SWA path either side.
-    //
-    // `HIPFIRE_GLIMMER_FLASH_DECODE` overrides the threshold in tokens; 0
-    // disables flash decode entirely.
-    let flash_min = hipfire_config::developer_var("HIPFIRE_GLIMMER_FLASH_DECODE")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1280);
-    let seq_len_now = state.pos_host[0] as usize + 1;
-    let decode_flash = flash_min > 0 && seq_len_now >= flash_min;
-    if decode_flash {
-        let n_tiles = (state.max_seq + 127) / 128;
-        let need = n_heads * n_tiles * (2 + head_dim) * 64;
+    state.pos_host[0] = position as i32;
+    // Heap-stable source: the Box outlives every copy below.
+    let pos_bytes = unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
+    gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
+        .map_err(|e| format!("glimmer: htod pos: {e:?}"))?;
+    let seq_len = position as usize + 1;
+    if seq_len >= WINDOWED_Q8_TILED_MIN_SEQ {
         if state.prefill_flash_partials.is_none() {
+            let need = windowed_q8_partials_elems(cfg.n_heads, cfg.head_dim, state.max_seq);
             let buf = gpu
                 .alloc_tensor(&[need], DType::F32)
-                .map_err(|e| format!("glimmer L{layer_idx}: decode flash partials: {e:?}"))?;
+                .map_err(|e| format!("glimmer: decode flash partials: {e:?}"))?;
             state.prefill_flash_partials = Some(buf);
         }
         if state.decode_pos.is_none() {
             let t = gpu
                 .alloc_tensor(&[1], DType::F32)
-                .map_err(|e| format!("glimmer L{layer_idx}: decode pos tensor: {e:?}"))?;
+                .map_err(|e| format!("glimmer: decode pos tensor: {e:?}"))?;
             state.decode_pos = Some(t);
         }
-        {
-            let pos_bytes =
-                unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
-            let t = state.decode_pos.as_ref().unwrap();
-            gpu.hip
-                .memcpy_htod(&t.buf, pos_bytes)
-                .map_err(|e| format!("glimmer L{layer_idx}: decode pos htod: {e:?}"))?;
-        }
-        let kv = match cfg.layer_types[layer_idx] {
-            GlimmerLayerType::Sliding => &state.kv_sliding,
-            GlimmerLayerType::Full => &state.kv_full,
-        };
-        let partials = state.prefill_flash_partials.as_ref().unwrap();
-        gpu.attention_flash_q8_0_batched_masked_windowed(
-            &state.q,
-            &kv.k_gpu[kv_slot],
-            &kv.v_gpu[kv_slot],
-            &state.attn_out,
-            state.decode_pos.as_ref().unwrap(),
-            n_heads,
-            n_kv,
-            head_dim,
-            state.max_seq,
-            seq_len_now,
-            1,
-            partials,
-            None,
-            0,
-            0,
-            window as i32,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: flash decode: {e:?}"))?;
-    } else {
-        gpu.attention_q8_0_kv_swa(
-            &state.q,
-            &kv.k_gpu[kv_slot],
-            &kv.v_gpu[kv_slot],
-            &state.attn_out,
-            &state.pos_buf,
-            // seq_len_hint: the CURRENT sequence length, not state.max_seq.
-            //
-            // This argument never reaches the kernel — the host uses it solely to
-            // size the launch (attention.rs: block_size, and
-            // shared_mem = (hint + block_size + head_dim) * 4). The kernel derives
-            // its own `seq_len = pos_buf[0] + 1` and indexes `scores[t]` by
-            // absolute t, so the LDS it actually needs is pos+1 floats.
-            //
-            // Passing state.max_seq over-allocated LDS by the full cache size and,
-            // worse, imposed a hard ceiling: shared_mem crosses the 64 KB LDS limit
-            // at max_seq ~16000, so LOADING with a larger max_seq made every decode
-            // fail with `hipModuleLaunchKernel: invalid argument` at layer 0 —
-            // regardless of how few tokens were actually in the cache. Glimmer
-            // declares max_position_embeddings = 131072; measured, max_seq=8192
-            // decoded at 32.1 tok/s while max_seq=16384 could not decode at all.
-            // Every test had used 8192, so it stayed hidden until `hipfire bench
-            // --matrix` (whose default --ctx list reaches 20000) tripped it.
-            //
-            // Now the ceiling tracks REAL context instead of configured capacity.
-            // Contexts past ~16k still need the flash path: `scores` is indexed by
-            // absolute t, so this kernel is inherently O(seq_len) in LDS.
-            state.pos_host[0] as usize + 1,
-            n_heads,
-            n_kv,
-            head_dim,
-            kv.physical_cap,
-            window,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: attention swa: {e:?}"))?;
+        let t = state.decode_pos.as_ref().unwrap();
+        gpu.hip
+            .memcpy_htod(&t.buf, pos_bytes)
+            .map_err(|e| format!("glimmer: decode pos htod: {e:?}"))?;
     }
-
-    // Gated attention: attn_out *= sigmoid(attn_gate) BEFORE o_proj
-    // Uses gpu.sigmoid_mul_f32 (norm.rs:2006) — do not write a new kernel.
-    if !abl("HIPFIRE_GLIMMER_NO_ATTN_GATE") {
-        gpu.sigmoid_mul_f32(&state.attn_out, &state.attn_gate)
-            .map_err(|e| format!("glimmer L{layer_idx}: sigmoid_mul: {e:?}"))?;
+    // No-op on the contiguous backend; maps VMM pages up to the new row.
+    for kv in [&mut state.kv_sliding, &mut state.kv_full] {
+        kv.ensure_mapped_capacity(gpu, seq_len)
+            .map_err(|e| format!("glimmer: kv map: {e:?}"))?;
     }
-
-    // o_proj(attn_out) -> tmp
-    weight_gemv(gpu, &lw.o_proj, &state.attn_out, &state.tmp)
-        .map_err(|e| format!("glimmer L{layer_idx}: o_proj: {e}"))?;
-
-    // Sandwich post-attention norm (post_eps 1e-8) + residual add: x = residual + norm(tmp)
-    // Fused into one launch; eager fallback = rmsnorm + memcpy + add.
-    if fused_postnorm_enabled() {
-        gpu.rmsnorm_residual_add_f32(
-            &state.tmp,
-            &lw.post_attention_layernorm,
-            &state.residual,
-            &state.x,
-            post_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: fused post_attn norm+residual: {e:?}"))?;
-    } else {
-        gpu.rmsnorm_f32(
-            &state.tmp,
-            &lw.post_attention_layernorm,
-            &state.tmp,
-            post_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: post_attn rmsnorm: {e:?}"))?;
-        gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
-            .map_err(|e| format!("glimmer L{layer_idx}: reset x (attn): {e:?}"))?;
-        gpu.add_inplace_f32(&state.x, &state.tmp)
-            .map_err(|e| format!("glimmer L{layer_idx}: attn residual add: {e:?}"))?;
-    }
-
-    // residual = x (FFN stream)
-    gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
-        .map_err(|e| format!("glimmer L{layer_idx}: save ffn residual: {e:?}"))?;
-
-    // ── SwiGLU FFN (silu, not gelu_tanh) ──────────────────────────
-    // Shared rotation for gate/up: 2 projections sharing the same normed
-    // input. Precedent: qwen35.rs:17799-17800 (w_gate/w_up sharing x_rot)
-    // and gemma4's fused FFN path. Saves 1 redundant FWHT per layer.
-    let use_shared_ffn = shared_rot_enabled()
-        && hipfire_dispatch::types::dtype_rotation_plan(lw.gate_proj.gpu_dtype)
-            != hipfire_dispatch::types::RotationPlan::None;
-    if use_shared_ffn {
-        let x_rot_opt = fused_rmsnorm_rotate_for_mq(
-            gpu,
-            &lw.gate_proj,
-            &state.x,
-            &lw.pre_feedforward_layernorm,
-            &state.tmp,
-            &state.x_rot,
-            rms_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: fused pre_ffn rmsnorm+rotate: {e:?}"))?;
-        // gfx1100 MQ4/HFQ4 exact Glimmer FFN shape: one fused gate+up GEMV
-        // (gate_m=up_m=19968, K=6656) instead of two sequential launches.
-        let dt = lw.gate_proj.gpu_dtype;
-        let fused_gu = gpu.arch_caps.is_gfx1100()
-            && lw.up_proj.gpu_dtype == dt
-            && matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
-            && lw.gate_proj.m == 19968
-            && lw.up_proj.m == 19968
-            && lw.gate_proj.k == 6656
-            && lw.up_proj.k == 6656;
-        if fused_gu {
-            let x_rot = x_rot_opt.ok_or_else(|| {
-                format!("glimmer L{layer_idx}: fused gate+up decode expected prerotated x")
-            })?;
-            gpu.fused_gate_up_hfq4g256(
-                &lw.gate_proj.buf,
-                &lw.up_proj.buf,
-                x_rot,
-                &state.gate_ffn,
-                &state.up_ffn,
-                lw.gate_proj.m,
-                lw.up_proj.m,
-                lw.gate_proj.k,
-            )
-            .map_err(|e| format!("glimmer L{layer_idx}: fused gate+up decode: {e:?}"))?;
-        } else {
-            let x_rot = x_rot_opt.as_ref().copied();
-            weight_gemv_prerotated(gpu, &lw.gate_proj, &state.x, x_rot, &state.gate_ffn)
-                .map_err(|e| format!("glimmer L{layer_idx}: gate_proj (prerot): {e:?}"))?;
-            weight_gemv_prerotated(gpu, &lw.up_proj, &state.x, x_rot, &state.up_ffn)
-                .map_err(|e| format!("glimmer L{layer_idx}: up_proj (prerot): {e:?}"))?;
-        }
-    } else {
-        gpu.rmsnorm_f32(&state.x, &lw.pre_feedforward_layernorm, &state.tmp, rms_eps)
-            .map_err(|e| format!("glimmer L{layer_idx}: pre_ffn rmsnorm: {e:?}"))?;
-        weight_gemv(gpu, &lw.gate_proj, &state.tmp, &state.gate_ffn)
-            .map_err(|e| format!("glimmer L{layer_idx}: gate_proj: {e}"))?;
-        weight_gemv(gpu, &lw.up_proj, &state.tmp, &state.up_ffn)
-            .map_err(|e| format!("glimmer L{layer_idx}: up_proj: {e}"))?;
-    }
-    // Fuse silu(gate) * up with the FWHT consumed by rotating MQ down projections.
-    if fused_silu_rotate_supported(&lw.down_proj) {
-        fused_silu_mul_rotate_mq_for(
-            gpu,
-            &lw.down_proj,
-            &state.gate_ffn,
-            &state.up_ffn,
-            &state.ffn_hidden,
-            lw.down_proj.k,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: fused silu_mul+rotate: {e:?}"))?;
-        weight_gemv_prerotated(
-            gpu,
-            &lw.down_proj,
-            &state.ffn_hidden,
-            Some(&state.ffn_hidden),
-            &state.ffn_out,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: down_proj (prerot): {e:?}"))?;
-    } else {
-        gpu.silu_mul_f32(&state.gate_ffn, &state.up_ffn, &state.ffn_hidden)
-            .map_err(|e| format!("glimmer L{layer_idx}: silu_mul: {e:?}"))?;
-        weight_gemv(gpu, &lw.down_proj, &state.ffn_hidden, &state.ffn_out)
-            .map_err(|e| format!("glimmer L{layer_idx}: down_proj: {e}"))?;
-    }
-
-    // Sandwich post-FFN norm (post_eps) + residual add
-    // Fused into one launch; eager fallback = rmsnorm + memcpy + add.
-    if fused_postnorm_enabled() {
-        gpu.rmsnorm_residual_add_f32(
-            &state.ffn_out,
-            &lw.post_feedforward_layernorm,
-            &state.residual,
-            &state.x,
-            post_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: fused post_ffn norm+residual: {e:?}"))?;
-    } else {
-        gpu.rmsnorm_f32(
-            &state.ffn_out,
-            &lw.post_feedforward_layernorm,
-            &state.tmp,
-            post_eps,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: post_ffn rmsnorm: {e:?}"))?;
-        gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
-            .map_err(|e| format!("glimmer L{layer_idx}: reset x (ffn): {e:?}"))?;
-        gpu.add_inplace_f32(&state.x, &state.tmp)
-            .map_err(|e| format!("glimmer L{layer_idx}: ffn residual add: {e:?}"))?;
-    }
-
     Ok(())
+}
+
+/// Run decoder layer `layer`'s step program at the staged position.
+fn run_layer(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &GlimmerState,
+    layer: usize,
+) -> Result<(), String> {
+    let lw = &weights.layers[layer];
+    let tiled = match (&state.decode_pos, &state.prefill_flash_partials) {
+        (Some(positions), Some(partials)) => Some(WindowedQ8Tiled {
+            positions,
+            partials,
+        }),
+        _ => None,
+    };
+    let io = program::LayerIo::decode(state, tiled);
+    let steps = program::layer_steps(cfg, layer, lw, state, &io);
+    execute_steps(gpu, ctx, &steps).map_err(|e| format!("glimmer L{layer}: {e:?}"))
+}
+
+/// Final norm and LM head into `state.logits`.
+fn run_head(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &GlimmerState,
+) -> Result<(), String> {
+    let lm_head = weights.lm_head.dispatch_ref();
+    let io = program::LayerIo::decode(state, None);
+    let mut steps = vec![io.final_norm(cfg, weights)];
+    steps.extend(program::lm_head_steps(cfg, &lm_head, &state.tmp, &state.logits));
+    execute_steps(gpu, ctx, &steps).map_err(|e| format!("glimmer head: {e:?}"))
 }
 
 // ─── Block-parallel verify (DFlash) ──────────────────────────────────
@@ -1378,17 +908,10 @@ fn decode_step_capture_impl(
 
     let body = (|| {
         embed_lookup(cfg, weights, state, gpu, token_id)?;
-        state.pos_host[0] = position as i32;
-        {
-            let pos_bytes =
-                unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
-            gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
-                .map_err(|e| format!("glimmer capture: htod pos: {e:?}"))?;
-        }
+        stage_decode_position(gpu, cfg, state, position)?;
+        let ctx = DispatchCtx::new(gpu);
         for layer_idx in 0..cfg.n_layers {
-            let slot = state.kv_slot_for_layer[layer_idx];
-            let lw = &weights.layers[layer_idx];
-            glimmer_layer_decode(gpu, cfg, lw, layer_idx, slot, state)?;
+            run_layer(gpu, &ctx, cfg, weights, state, layer_idx)?;
             if let Some(caps) = &host_layers {
                 if caps.contains(&layer_idx) {
                     let host = gpu
@@ -1410,18 +933,7 @@ fn decode_step_capture_impl(
                 }
             }
         }
-        gpu.rmsnorm_f32(&state.x, &weights.final_norm, &state.tmp, cfg.rms_norm_eps)
-            .map_err(|e| format!("glimmer capture: final rmsnorm: {e:?}"))?;
-        weight_gemv(gpu, &weights.lm_head, &state.tmp, &state.logits)
-            .map_err(|e| format!("glimmer capture: lm_head: {e}"))?;
-        if cfg.output_multiplier != 1.0 {
-            gpu.scale_f32(&state.logits, cfg.output_multiplier)
-                .map_err(|e| format!("glimmer capture: outmul: {e:?}"))?;
-        }
-        if cfg.final_logit_softcapping > 0.0 {
-            gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
-                .map_err(|e| format!("glimmer capture: softcap: {e:?}"))?;
-        }
+        run_head(gpu, &ctx, cfg, weights, state)?;
         let logits = gpu
             .download_f32(&state.logits)
             .map_err(|e| format!("glimmer capture: download logits: {e:?}"))?;
@@ -1818,11 +1330,11 @@ pub fn glimmer_lm_head_picks(
         .map_err(|e| format!("glimmer lm_head_picks q8 batched: {e:?}"))?;
         // One scale/softcap over the full [B*vocab] buffer (uniform per element),
         // then GPU batched argmax so only B i32 indices cross PCIe.
-        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+        if cfg.output_multiplier != 1.0 {
             gpu.scale_f32(&logits_b, cfg.output_multiplier)
                 .map_err(|e| format!("glimmer lm_head_picks scale: {e:?}"))?;
         }
-        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+        if cfg.final_logit_softcapping > 0.0 {
             gpu.logit_softcap_f32(&logits_b, batch * vocab, cfg.final_logit_softcapping)
                 .map_err(|e| format!("glimmer lm_head_picks softcap: {e:?}"))?;
         }
@@ -1868,11 +1380,11 @@ pub fn glimmer_lm_head_picks(
             batch,
         )
         .map_err(|e| format!("glimmer lm_head_picks f32 batched: {e}"))?;
-        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+        if cfg.output_multiplier != 1.0 {
             gpu.scale_f32(&logits_b, cfg.output_multiplier)
                 .map_err(|e| format!("glimmer lm_head_picks scale f32: {e:?}"))?;
         }
-        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+        if cfg.final_logit_softcapping > 0.0 {
             gpu.logit_softcap_f32(&logits_b, batch * vocab, cfg.final_logit_softcapping)
                 .map_err(|e| format!("glimmer lm_head_picks softcap f32: {e:?}"))?;
         }
@@ -1938,11 +1450,11 @@ pub fn glimmer_lm_head_picks(
             batch,
         )
         .map_err(|e| format!("glimmer lm_head_picks bf16 batched: {e}"))?;
-        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+        if cfg.output_multiplier != 1.0 {
             gpu.scale_f32(&logits_b, cfg.output_multiplier)
                 .map_err(|e| format!("glimmer lm_head_picks scale bf16: {e:?}"))?;
         }
-        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+        if cfg.final_logit_softcapping > 0.0 {
             gpu.logit_softcap_f32(&logits_b, batch * vocab, cfg.final_logit_softcapping)
                 .map_err(|e| format!("glimmer lm_head_picks softcap bf16: {e:?}"))?;
         }
@@ -1972,11 +1484,11 @@ pub fn glimmer_lm_head_picks(
             picks.push(v as u32);
         }
         let _ = gpu.free_tensor(hidden_bf16);
-        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+        if cfg.output_multiplier != 1.0 {
             gpu.scale_f32(&logits_b, cfg.output_multiplier)
                 .map_err(|e| format!("glimmer lm_head_picks scale f32: {e:?}"))?;
         }
-        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+        if cfg.final_logit_softcapping > 0.0 {
             gpu.logit_softcap_f32(&logits_b, batch * vocab, cfg.final_logit_softcapping)
                 .map_err(|e| format!("glimmer lm_head_picks softcap f32: {e:?}"))?;
         }
@@ -2016,11 +1528,11 @@ pub fn glimmer_lm_head_picks(
             let hidden_row = hidden_batch.sub_offset(i * dim, dim);
             weight_gemv(gpu, &weights.lm_head, &hidden_row, logits_scratch)
                 .map_err(|e| format!("glimmer lm_head_picks row {i}: {e}"))?;
-            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+            if cfg.output_multiplier != 1.0 {
                 gpu.scale_f32(logits_scratch, cfg.output_multiplier)
                     .map_err(|e| format!("glimmer lm_head_picks scale row {i}: {e:?}"))?;
             }
-            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+            if cfg.final_logit_softcapping > 0.0 {
                 gpu.logit_softcap_f32(logits_scratch, vocab, cfg.final_logit_softcapping)
                     .map_err(|e| format!("glimmer lm_head_picks softcap row {i}: {e:?}"))?;
             }
@@ -2356,10 +1868,8 @@ fn verify_block_capture_impl(
                     for (i, &tok) in block.iter().enumerate() {
                         gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim)
                             .map_err(|e| format!("glimmer verify_batch embed f32: {e:?}"))?;
-                        if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
-                            gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps)
-                                .map_err(|e| format!("glimmer verify_batch embed_norm: {e:?}"))?;
-                        }
+                        gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps)
+                            .map_err(|e| format!("glimmer verify_batch embed_norm: {e:?}"))?;
                         gpu.hip
                             .memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
                             .map_err(|e| format!("glimmer verify_batch embed copy: {e:?}"))?;
@@ -2445,31 +1955,18 @@ fn verify_block_capture_impl(
             }
 
             // Scale-less QK-norm + q scale 3.87
-            if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
-                gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps)
-                    .map_err(|e| format!("glimmer batch L{layer_idx} q_norm: {e:?}"))?;
-                gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps)
-                    .map_err(|e| format!("glimmer batch L{layer_idx} k_norm: {e:?}"))?;
-            }
-            if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
-                gpu.scale_f32(&q, cfg.qk_scale_factor)
-                    .map_err(|e| format!("glimmer batch L{layer_idx} q scale: {e:?}"))?;
-            }
+            gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps)
+                .map_err(|e| format!("glimmer batch L{layer_idx} q_norm: {e:?}"))?;
+            gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps)
+                .map_err(|e| format!("glimmer batch L{layer_idx} k_norm: {e:?}"))?;
+            gpu.scale_f32(&q, cfg.qk_scale_factor)
+                .map_err(|e| format!("glimmer batch L{layer_idx} q scale: {e:?}"))?;
 
             // RoPE (skip on NoPE layers where theta==0)
-            if has_rope || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
+            if has_rope {
                 let theta = cfg.rope_theta_for(layer_idx);
-                if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
-                    gpu.rope_interleaved_f32_batched(
-                        &q, &k, &pos_array, n_heads, n_kv, hd, hd, theta, b,
-                    )
-                    .map_err(|e| {
-                        format!("glimmer batch L{layer_idx} rope interleaved batched: {e:?}")
-                    })?;
-                } else {
-                    gpu.rope_batched_f32(&q, &k, &pos_array, n_heads, n_kv, hd, theta, b)
-                        .map_err(|e| format!("glimmer batch L{layer_idx} rope batched: {e:?}"))?;
-                }
+                gpu.rope_batched_f32(&q, &k, &pos_array, n_heads, n_kv, hd, theta, b)
+                    .map_err(|e| format!("glimmer batch L{layer_idx} rope batched: {e:?}"))?;
             }
 
             // KV write batched
@@ -2533,10 +2030,8 @@ fn verify_block_capture_impl(
             }
 
             // Gated attention: attn_out *= sigmoid(gate) BEFORE o_proj
-            if !abl("HIPFIRE_GLIMMER_NO_ATTN_GATE") {
-                gpu.sigmoid_mul_f32(&attn_out, &attn_gate)
-                    .map_err(|e| format!("glimmer batch L{layer_idx} sigmoid_mul: {e:?}"))?;
-            }
+            gpu.sigmoid_mul_f32(&attn_out, &attn_gate)
+                .map_err(|e| format!("glimmer batch L{layer_idx} sigmoid_mul: {e:?}"))?;
 
             // o_proj: attn_out [B,q_dim] -> o_out [B,dim]
             // Dispatch by dtype; for MQ4 we rotate attn_out, for Q8 direct.
@@ -3057,10 +2552,8 @@ fn prefill_chunk_batched(
                     for (i, &tok) in chunk.iter().enumerate() {
                         gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim)
                             .map_err(|e| format!("glimmer prefill embed f32: {e:?}"))?;
-                        if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
-                            gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps)
-                                .map_err(|e| format!("glimmer prefill embed_norm: {e:?}"))?;
-                        }
+                        gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps)
+                            .map_err(|e| format!("glimmer prefill embed_norm: {e:?}"))?;
                         gpu.hip
                             .memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
                             .map_err(|e| format!("glimmer prefill embed copy: {e:?}"))?;
@@ -3263,30 +2756,17 @@ fn prefill_chunk_batched(
                     )?;
                 }
             }
-            if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
-                gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps)
-                    .map_err(|e| format!("glimmer prefill L{layer_idx} q_norm: {e:?}"))?;
-                gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps)
-                    .map_err(|e| format!("glimmer prefill L{layer_idx} k_norm: {e:?}"))?;
-            }
-            if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
-                gpu.scale_f32(&q, cfg.qk_scale_factor)
-                    .map_err(|e| format!("glimmer prefill L{layer_idx} q scale: {e:?}"))?;
-            }
+            gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} q_norm: {e:?}"))?;
+            gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} k_norm: {e:?}"))?;
+            gpu.scale_f32(&q, cfg.qk_scale_factor)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} q scale: {e:?}"))?;
 
-            if has_rope || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
+            if has_rope {
                 let theta = cfg.rope_theta_for(layer_idx);
-                if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
-                    gpu.rope_interleaved_f32_batched(
-                        &q, &k, &pos_array, n_heads, n_kv, hd, hd, theta, b,
-                    )
-                    .map_err(|e| {
-                        format!("glimmer prefill L{layer_idx} rope interleaved batched: {e:?}")
-                    })?;
-                } else {
-                    gpu.rope_batched_f32(&q, &k, &pos_array, n_heads, n_kv, hd, theta, b)
-                        .map_err(|e| format!("glimmer prefill L{layer_idx} rope batched: {e:?}"))?;
-                }
+                gpu.rope_batched_f32(&q, &k, &pos_array, n_heads, n_kv, hd, theta, b)
+                    .map_err(|e| format!("glimmer prefill L{layer_idx} rope batched: {e:?}"))?;
             }
 
             // This chunk writes positions [position, position+b). Map that prefix
@@ -3545,10 +3025,8 @@ fn prefill_chunk_batched(
                 .map_err(|e| format!("glimmer prefill L{layer_idx} attention batched: {e:?}"))?;
             }
 
-            if !abl("HIPFIRE_GLIMMER_NO_ATTN_GATE") {
-                gpu.sigmoid_mul_f32(&attn_out, &attn_gate)
-                    .map_err(|e| format!("glimmer prefill L{layer_idx} sigmoid_mul: {e:?}"))?;
-            }
+            gpu.sigmoid_mul_f32(&attn_out, &attn_gate)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} sigmoid_mul: {e:?}"))?;
 
             // o_proj (M=6656, K=4096). The old comment here read "stays on the
             // current baseline (29.8 TF best measured)" — that number is the
@@ -3890,11 +3368,11 @@ fn prefill_chunk_batched(
                 let last_norm = normed.sub_offset((b - 1) * dim, dim);
                 weight_gemv(gpu, &weights.lm_head, &last_norm, &state.logits)
                     .map_err(|e| format!("glimmer prefill lm_head: {e}"))?;
-                if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+                if cfg.output_multiplier != 1.0 {
                     gpu.scale_f32(&state.logits, cfg.output_multiplier)
                         .map_err(|e| format!("glimmer prefill outmul: {e:?}"))?;
                 }
-                if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+                if cfg.final_logit_softcapping > 0.0 {
                     gpu.logit_softcap_f32(
                         &state.logits,
                         cfg.vocab_size,

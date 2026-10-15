@@ -1200,6 +1200,7 @@ fn forward_step_after_x(
                     k: layer.wq.k,
                     eps: cfg.rms_norm_eps,
                     rotation: qkv_rot,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &wrq,
@@ -1353,6 +1354,7 @@ fn forward_step_after_x(
                     k: layer.w_gate.k,
                     eps: cfg.rms_norm_eps,
                     rotation: ffn_rot,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &wrg,

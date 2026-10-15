@@ -486,6 +486,76 @@ fn dense_lfm_fault_rolls_back_and_retry_matches_fresh() {
     exercise_dense_fixture("lfm2.5-1.2b.mq4", 72_000);
 }
 
+/// MiniMax acceptance fixture (G7). Its 79 GB do not fit every GPU host; the
+/// rows skip with a message when it is absent.
+const MINIMAX_FIXTURE: &str = "MiniMax-M2.7.mq2";
+
+/// MiniMax (dense route, sealed-MoE step program): same end-to-end contract.
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_DENSE_FIXTURE with MiniMax-M2.7.mq2"]
+fn dense_minimax_fault_rolls_back_and_retry_matches_fresh() {
+    exercise_dense_fixture(MINIMAX_FIXTURE, 73_000);
+}
+
+/// COR-007: eight MiniMax load / generate / reset / unload cycles. Cycle 0
+/// pays one-time driver and kernel costs; from cycle 1 on, free VRAM after
+/// each unload must stay within 64 MiB of cycle 1's and must not fall on
+/// every successive cycle. Every cycle generates the same bytes.
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_DENSE_FIXTURE with MiniMax-M2.7.mq2"]
+fn minimax_eight_cycle_unload_drift() {
+    let _guard = lock();
+    let Some(path) = dense_fixture(MINIMAX_FIXTURE) else {
+        return;
+    };
+    let Some(mut gpu) = dense_gpu() else {
+        return;
+    };
+    dense_warm_first_alloc(&mut gpu);
+    let mut baseline: Option<Vec<u8>> = None;
+    let mut free = Vec::new();
+    for cycle in 0..8u64 {
+        let mut m = dense_load(&mut gpu, &path);
+        let loaded = dense_free_vram_bytes(&gpu);
+        let id = format!("cor007-{cycle}");
+        let out = run_generate(&mut m, &mut gpu, &id, &id, 74_000 + cycle, true);
+        match &baseline {
+            None => {
+                let events = parse_lines(&out);
+                assert!(
+                    events.iter().any(|e| e["type"] == "done"),
+                    "clean turn ends in done: {events:?}"
+                );
+                baseline = Some(out);
+            }
+            Some(base) => assert_envelope_equal(base, &out),
+        }
+        let reset =
+            hipfire_generate::common::production_fail_closed_rollback(&mut m, &mut gpu, None, None);
+        assert!(
+            reset.rolled_back,
+            "cycle {cycle} reset: {:?}",
+            reset.context
+        );
+        hipfire_loader::unload_model(m, &mut gpu).expect("unload minimax fixture");
+        gpu.drain_pool();
+        let f = dense_free_vram_bytes(&gpu);
+        eprintln!("cor007: cycle {cycle} free VRAM loaded {loaded}, after unload {f}");
+        free.push(f);
+    }
+    batch_clear_all_terminals();
+    clear_terminal_control();
+    set_active_attempt_id(0);
+    let steady = &free[1..];
+    let drift = steady[0].saturating_sub(*steady.iter().min().expect("steady cycles"));
+    let falling = steady.windows(2).all(|w| w[1] < w[0]);
+    eprintln!("cor007: steady free {steady:?}, drift {drift} B, falls every cycle: {falling}");
+    assert!(
+        drift <= DENSE_VRAM_SLACK_BYTES && !falling,
+        "COR-007 unload drift: {drift} B over cycles 1..8 (limit {DENSE_VRAM_SLACK_BYTES}), falls every cycle: {falling}"
+    );
+}
+
 /// Reset-phase failure stays visible and unattested: a rollback that cannot
 /// be attested still emits exactly one error carrying the reset context
 /// with `rolled_back=false`, never `done`.

@@ -1207,6 +1207,20 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
     })
 }
 
+/// #666 G11: Muse Glimmer (arch 14) is served on one device only until the
+/// G13 dense axes give it a pipeline/tensor placement. Any parallel degree
+/// (`pp`, `tp`, `topology.ep`) is refused here, before teardown or
+/// allocation, instead of reaching a generic EP or carrier refusal or being
+/// ignored (`topology.ep`).
+fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) -> Option<String> {
+    (arch_id == 14 && (pp > 1 || tp > 1 || ep > 1)).then(|| {
+        format!(
+            "muse_glimmer: single-device only; pp={pp}, tp={tp}, topology.ep={ep} requested \
+             (no pipeline, tensor or expert parallel placement exists for arch 14)"
+        )
+    })
+}
+
 /// Pipeline/tensor-parallel geometry admission (#666 G2). `Gpus::init_uniform`
 /// refuses `n_layers < n_devices` deep inside GPU init (`multi_gpu.rs`) —
 /// after the daemon has already torn down the resident model for the pp path
@@ -1558,6 +1572,12 @@ pub fn admit_source_with_options(
     // topology branch and any allocation — so the prior model stays loaded.
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
+    }
+    if arch_id == 14 {
+        let ep = hipfire_config::topology::ep()?;
+        if let Some(refusal) = muse_glimmer_topology_refusal(arch_id, pp, tp, ep) {
+            return Err(refusal);
+        }
     }
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
@@ -2689,6 +2709,18 @@ mod tests {
         // Non-diffusion archs never hit this gate, on any arch string.
         assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    #[test]
+    fn muse_glimmer_refuses_every_parallel_axis() {
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (1, 4, 1), (1, 1, 2), (1, 1, 4)] {
+            let err = muse_glimmer_topology_refusal(14, pp, tp, ep)
+                .unwrap_or_else(|| panic!("pp={pp} tp={tp} ep={ep} must refuse"));
+            assert!(err.contains("single-device only"), "{err}");
+        }
+        assert_eq!(muse_glimmer_topology_refusal(14, 1, 1, 1), None);
+        // Other architectures keep their own topology gates.
+        assert_eq!(muse_glimmer_topology_refusal(5, 2, 2, 2), None);
     }
 
     /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`
