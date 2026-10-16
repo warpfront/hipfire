@@ -816,7 +816,7 @@ pub(crate) fn prefill_tile(
     let reuse = mtp_reuse_prefill_ids_enabled();
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
         b.poll_npu_trunk(gpu)?;
-        mtp_prefill_chunk(
+        let filled = mtp_prefill_chunk(
             b,
             &mut Qwen4Ops::Single(&mut *gpu),
             tokens,
@@ -827,7 +827,11 @@ pub(crate) fn prefill_tile(
             reuse,
             &|| false,
         )
-        .map_err(BundleError::Forward)
+        .map_err(BundleError::Forward)?;
+        match filled {
+            std::ops::ControlFlow::Continue(pick) => Ok(pick),
+            std::ops::ControlFlow::Break(()) => unreachable!("a never-abort fill cannot break"),
+        }
     }))
     .map_err(|e| format!("prefill_tile: {e}"))
 }

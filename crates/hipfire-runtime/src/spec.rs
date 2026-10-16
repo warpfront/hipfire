@@ -651,7 +651,7 @@ pub trait SpecGrammar {
 }
 
 /// Outcome of [`Speculator::prefill`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefillOutcome {
     /// Prompt prefilled; `first_token` is the target's next-token draw at the
     /// last prompt position (the seed for the first decode window). At temp≈0
@@ -661,6 +661,17 @@ pub enum PrefillOutcome {
     /// Client cancelled mid-prefill. The caller resets conversation state and
     /// emits the aborted/done events; the slot guard restores the target bundle.
     Aborted,
+}
+
+impl PrefillOutcome {
+    /// The seed of a prefill whose caller never aborts (oracles, tests);
+    /// an abort there is an error.
+    pub fn into_first_token(self) -> Result<u32, String> {
+        match self {
+            PrefillOutcome::Ready { first_token } => Ok(first_token),
+            PrefillOutcome::Aborted => Err("prefill aborted".into()),
+        }
+    }
 }
 
 /// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
@@ -1148,7 +1159,8 @@ pub trait MtpDrafter {
     /// `fill_tokens` is the slice actually advanced this call (warm suffix on
     /// cache hit, full prompt on miss). `cache_hit=false` ⇒ cold start (reset
     /// recurrent + MTP cache first); `true` ⇒ warm suffix extension (preserve
-    /// prior state).
+    /// prior state). A client abort polled through `abort` is
+    /// `Ok(PrefillOutcome::Aborted)`, never `Err`: errors are real failures.
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -1158,7 +1170,7 @@ pub trait MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String>;
+    ) -> Result<PrefillOutcome, String>;
 
     /// One acceptance window: seed at absolute `position`; draft up to `k`,
     /// verify, accept the longest matching prefix + bonus under the installed
@@ -1364,7 +1376,7 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
         } else {
             (prompt_tokens, 0)
         };
-        let first_token = self.arch.mtp_prefill(
+        self.arch.mtp_prefill(
             gpu,
             target,
             prompt_tokens,
@@ -1372,8 +1384,7 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
             start_pos,
             cache_hit,
             abort,
-        )?;
-        Ok(PrefillOutcome::Ready { first_token })
+        )
     }
 
     fn step(
@@ -2093,7 +2104,7 @@ mod tests {
                 _start_pos: usize,
                 _cache_hit: bool,
                 _abort: &dyn Fn() -> bool,
-            ) -> Result<u32, String> {
+            ) -> Result<PrefillOutcome, String> {
                 unreachable!()
             }
 

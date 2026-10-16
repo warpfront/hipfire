@@ -963,8 +963,9 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
                 ..SpecRequestConfig::default()
             });
         }
-        let mut seed =
-            drafter.mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?;
+        let mut seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?
+            .into_first_token()?;
         ids.push(seed);
         let eos = bundle.config.eos_token_id;
         let mut windows: Vec<serde_json::Value> = Vec::new();

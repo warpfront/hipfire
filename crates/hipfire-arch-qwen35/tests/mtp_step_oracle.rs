@@ -241,6 +241,7 @@ fn mtp_step_oracle_no_repair() {
     let mut drafter_d = greedy_drafter(head_d, CTX);
     let mut seed_d = drafter_d
         .mtp_prefill(&mut gpu, &mut slot_d, &prompt, &prompt, 0, false, &no_abort)
+        .and_then(|outcome| outcome.into_first_token())
         .expect("arm D prefill");
     let eos_d = slot_d.config.eos_token;
     let mut history_d: Vec<u32> = prompt.clone();
@@ -326,6 +327,7 @@ fn mtp_step_oracle_no_repair() {
     let mut drafter_b = greedy_drafter(head_b, CTX);
     let seed_b = drafter_b
         .mtp_prefill(&mut gpu, &mut slot_b, &full, &full, 0, false, &no_abort)
+        .and_then(|outcome| outcome.into_first_token())
         .expect("arm B2 cold prefill");
     assert_eq!(
         seed_b, history_d[pos_d],

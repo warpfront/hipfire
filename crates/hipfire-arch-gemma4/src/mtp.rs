@@ -25,7 +25,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::argmax;
 use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, MtpDrafter, MtpWindow, SpecAdvance, SpecGrammar, SpecScratch, SpecTarget,
+    accept_greedy_prefix, MtpDrafter, MtpWindow, PrefillOutcome, SpecAdvance, SpecGrammar,
+    SpecScratch, SpecTarget,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -140,11 +141,13 @@ impl MtpDrafter for Gemma4Drafter {
         start_pos: usize,
         _cache_hit: bool,
         _abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         let bundle = gemma4(target)?;
         let logits = bundle.prefill(gpu, prompt_tokens, start_pos, SessionRoute::Mtp)?;
         self.take_target_hidden(gpu, bundle)?;
-        Ok(argmax(&logits))
+        Ok(PrefillOutcome::Ready {
+            first_token: argmax(&logits),
+        })
     }
 
     fn mtp_step(

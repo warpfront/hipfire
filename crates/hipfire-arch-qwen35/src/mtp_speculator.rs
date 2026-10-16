@@ -23,8 +23,8 @@ use crate::mtp_spec::{
 use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::spec::{
-    terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, SpecGrammar,
-    SpecRequestConfig, SpecTarget, Speculator,
+    terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, PrefillOutcome,
+    SpecGrammar, SpecRequestConfig, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_sampling::PenaltyHistory;
 use rdna_compute::Gpu;
@@ -411,10 +411,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         self.last_window = None;
         if abort() {
-            return Err("aborted".into());
+            return Ok(PrefillOutcome::Aborted);
         }
         // Cold start: reset the trunk recurrent state (target owns it) BEFORE
         // borrowing the concrete slot, so positions start at 0. Warm hit
@@ -425,10 +425,10 @@ impl MtpDrafter for Qwen35MtpDrafter {
         if Self::tp_target(target).is_some() {
             let first_token = self.tp_prefill(target, fill_tokens, start_pos, cache_hit)?;
             if abort() {
-                return Err("aborted".into());
+                return Ok(PrefillOutcome::Aborted);
             }
             self.begin_ngram_request(prompt_tokens);
-            return Ok(first_token);
+            return Ok(PrefillOutcome::Ready { first_token });
         }
         let slot = Self::slot(target)?;
         self.ensure_state(gpu, slot)?;
@@ -475,7 +475,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         self.checkpoints = checkpoints;
         prefill.map_err(|e| format!("mtp prefill: {e}"))?;
         if abort() {
-            return Err("aborted".into());
+            return Ok(PrefillOutcome::Aborted);
         }
 
         // Seed from the trunk logits at the last prefilled position
@@ -502,7 +502,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         };
 
         self.begin_ngram_request(prompt_tokens);
-        Ok(first_token)
+        Ok(PrefillOutcome::Ready { first_token })
     }
 
     fn mtp_step(

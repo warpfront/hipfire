@@ -32,8 +32,8 @@ use hipfire_runtime::sampler::{sample_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
     accept_greedy_prefix, terminal_prefix_replay, GreedyAccept, MtpDrafter, MtpRequestStats,
-    MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep,
-    SpecTarget, Speculator,
+    MtpSpeculator, MtpWindow, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig,
+    SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
@@ -176,6 +176,7 @@ impl HeadTicket {
         }
     }
 }
+use std::ops::ControlFlow;
 use std::time::Instant;
 
 /// `HIPFIRE_MTP_FLOOR_TRACE=1`: one `QWEN4_FLOOR_TRACE` JSON line per AR
@@ -6049,7 +6050,7 @@ fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'stat
 /// leaving `pending` on the chunk's last
 /// row. Returns the trunk pick when `needs_pick`. The boundary, session and
 /// pick bookkeeping stay with the caller; `abort` is polled before every
-/// sub-chunk (or row) and a hit resets the target. Every rows pass is
+/// sub-chunk (or row) and a hit resets the target and breaks. Every rows pass is
 /// [`MtpFillContext::PromptFill`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mtp_prefill_chunk(
@@ -6062,7 +6063,7 @@ pub(crate) fn mtp_prefill_chunk(
     mut append_scratch: Option<&mut MtpAppendScratch>,
     reuse_trunk_ids: bool,
     abort: &dyn Fn() -> bool,
-) -> Result<Option<u32>, String> {
+) -> Result<ControlFlow<(), Option<u32>>, String> {
     let max_chunk = bundle.ops_chunk_rows(ops).unwrap_or(1).max(1);
     let paired = !ops.is_mesh() && bundle.npu_trunk_planned() && chunk.len() > max_chunk;
     // The pair's banks and its interior snapshot row: the target forward runs
@@ -6086,7 +6087,7 @@ pub(crate) fn mtp_prefill_chunk(
         // prompt-id uploads and pending rows remain those of the sequential run.
         for piece in shape.pieces() {
             let tokens = &chunk[piece.clone()];
-            mtp_append_prefill_chunk(
+            if mtp_append_prefill_chunk(
                 bundle,
                 ops,
                 tokens,
@@ -6096,27 +6097,33 @@ pub(crate) fn mtp_prefill_chunk(
                 append_scratch.as_deref_mut(),
                 false,
                 abort,
-            )?;
+            )?
+            .is_break()
+            {
+                return Ok(ControlFlow::Break(()));
+            }
             if piece.end < chunk.len() {
                 bundle
                     .publish_pair_session_boundary(ops.gpu()?, pos + piece.end)
                     .map_err(|e| e.to_string())?;
             }
         }
-    } else {
-        mtp_append_prefill_chunk(
-            bundle,
-            ops,
-            chunk,
-            pos,
-            0,
-            pending,
-            append_scratch,
-            reuse_trunk_ids,
-            abort,
-        )?;
+    } else if mtp_append_prefill_chunk(
+        bundle,
+        ops,
+        chunk,
+        pos,
+        0,
+        pending,
+        append_scratch,
+        reuse_trunk_ids,
+        abort,
+    )?
+    .is_break()
+    {
+        return Ok(ControlFlow::Break(()));
     }
-    Ok(pick)
+    Ok(ControlFlow::Continue(pick))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6130,7 +6137,7 @@ fn mtp_append_prefill_chunk(
     append_scratch: Option<&mut MtpAppendScratch>,
     reuse_trunk_ids: bool,
     abort: &dyn Fn() -> bool,
-) -> Result<(), String> {
+) -> Result<ControlFlow<()>, String> {
     // The head's batched rows route: the incumbent batched fill
     // (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`, on by default), or the DET prompt
     // fill (exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET` on unless `0`), which uses
@@ -6171,7 +6178,7 @@ fn mtp_append_prefill_chunk(
         while off < chunk.len() {
             if abort() {
                 bundle.ops_reset(ops)?;
-                return Err("Qwen4 native MTP prefill aborted".to_string());
+                return Ok(ControlFlow::Break(()));
             }
             let n = (chunk.len() - off).min(sub_rows);
             let position = pos
@@ -6223,7 +6230,7 @@ fn mtp_append_prefill_chunk(
         for (index, &token) in chunk.iter().enumerate() {
             if abort() {
                 bundle.ops_reset(ops)?;
-                return Err("Qwen4 native MTP prefill aborted".to_string());
+                return Ok(ControlFlow::Break(()));
             }
             let position = pos
                 .checked_add(index)
@@ -6236,7 +6243,7 @@ fn mtp_append_prefill_chunk(
                 .map_err(|error| error.to_string())?;
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 /// What [`finish_native_window`] needs from a batched window's verify.
@@ -7205,7 +7212,7 @@ impl Qwen4MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         if ops.is_mesh() {
             self.refuse_unsupported_under_pp()?;
             if cache_hit || start_pos != 0 {
@@ -7281,7 +7288,7 @@ impl Qwen4MtpDrafter {
         while pos < prompt_tokens.len() {
             if abort() {
                 Self::bundle(target)?.ops_reset(ops)?;
-                return Err("Qwen4 native MTP prefill aborted".to_string());
+                return Ok(PrefillOutcome::Aborted);
             }
             // A chunk ends at the session cache's next snapshot boundary when
             // one lies inside the natural chunk, else at the natural chunk end.
@@ -7315,7 +7322,7 @@ impl Qwen4MtpDrafter {
             } else {
                 mtp_prefill_chunk_needs_pick(end, prompt_tokens.len(), skip_intermediate_pick)
             };
-            let pick = mtp_prefill_chunk(
+            let ControlFlow::Continue(pick) = mtp_prefill_chunk(
                 Self::bundle(target)?,
                 ops,
                 chunk,
@@ -7325,7 +7332,10 @@ impl Qwen4MtpDrafter {
                 batched_scratch.as_deref_mut(),
                 reuse_trunk_ids,
                 abort,
-            )?;
+            )?
+            else {
+                return Ok(PrefillOutcome::Aborted);
+            };
             // Target and head both hold the exact state at `end` only now: a
             // due snapshot boundary is reported here, after the forward and the
             // head append of this chunk.
@@ -7344,7 +7354,7 @@ impl Qwen4MtpDrafter {
         // last prompt row's `p` (naive: with the AR sampler itself), exactly
         // as AR draws its first token. Its penalty history is the full prompt
         // (cold and cache-hit alike); `fill_tokens` is only the uncached tail.
-        match self.sampled.as_mut() {
+        let first_token = match self.sampled.as_mut() {
             Some(s) => {
                 if !s.prompt_set {
                     s.history.set_prompt(prompt_tokens);
@@ -7352,13 +7362,14 @@ impl Qwen4MtpDrafter {
                 }
                 if s.draws_drafts() {
                     s.load_target(ops.gpu()?, Self::bundle(target)?, 0, 0)?;
-                    Ok(s.target.sample(s.rng.next_f32()))
+                    s.target.sample(s.rng.next_f32())
                 } else {
-                    s.naive_draw(ops.gpu()?, Self::bundle(target)?, 0, 0)
+                    s.naive_draw(ops.gpu()?, Self::bundle(target)?, 0, 0)?
                 }
             }
-            None => Ok(pick),
-        }
+            None => pick,
+        };
+        Ok(PrefillOutcome::Ready { first_token })
     }
 
     /// The body of [`MtpDrafter::mtp_forced_advance`] past its EP fan-out.
@@ -7451,7 +7462,7 @@ impl Qwen4MtpDrafter {
     /// whole prompt through every band, the head filled chunk by chunk on the
     /// output device. `fill_tokens`/`start_pos`/`cache_hit` are validated like
     /// the single-card entry; prefix reuse is refused (the MTP route has no
-    /// aggregate session record). Returns the first-token seed.
+    /// aggregate session record). Returns the first-token seed, or `Aborted`.
     pub fn pp_mtp_prefill(
         &mut self,
         gpus: &mut Gpus,
@@ -7461,7 +7472,7 @@ impl Qwen4MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         self.require_supported_request()?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         self.refuse_unsupported_under_pp()?;
@@ -7622,7 +7633,7 @@ impl Qwen4MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         self.mtp_prefill_ops(
             &mut Qwen4Ops::Single(gpu),
             target,
@@ -7651,7 +7662,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         self.require_supported_request()?;
         validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
         // Expert parallelism: rank 0 and every peer's replica run the whole
@@ -7663,7 +7674,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             self.refuse_naive_under_ep()?;
             if abort() {
                 target.reset_recurrent(gpu)?;
-                return Err("Qwen4 native MTP prefill aborted".to_string());
+                return Ok(PrefillOutcome::Aborted);
             }
             let never = || false;
             return Self::bundle(target)?.ep_drafter_fanout(

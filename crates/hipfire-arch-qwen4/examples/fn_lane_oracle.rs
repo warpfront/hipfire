@@ -2027,7 +2027,9 @@ fn singleton_phase(
     let mut drafter = Qwen4MtpDrafter::new(k, max_seq, None);
     drafter.configure_request(SpecRequestConfig::default());
     let result = (|| -> R<(u32, Vec<SpecWin>)> {
-        let seed = drafter.mtp_prefill(gpu, &mut *bundle, prompt, prompt, 0, false, &|| false)?;
+        let seed = drafter
+            .mtp_prefill(gpu, &mut *bundle, prompt, prompt, 0, false, &|| false)?
+            .into_first_token()?;
         let eos = bundle.config.eos_token_id;
         let mut emitted = vec![seed];
         let mut pending = seed;
@@ -2315,8 +2317,9 @@ impl App {
         let before = diff.bad;
         let result = (|| -> R<()> {
             let req = l.req;
-            let seed =
-                drafter.mtp_prefill(gpu, &mut *bundle, &prompt, &prompt, 0, false, &|| false)?;
+            let seed = drafter
+                .mtp_prefill(gpu, &mut *bundle, &prompt, &prompt, 0, false, &|| false)?
+                .into_first_token()?;
             let lane_first = l
                 .first
                 .ok_or_else(|| format!("req {req}: the lane never produced its first token"))?;

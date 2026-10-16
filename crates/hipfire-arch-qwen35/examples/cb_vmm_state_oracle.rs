@@ -1703,7 +1703,7 @@ fn slot_full_state(gpu: &Gpu, slot: &ModelSlot, d: &Qwen35MtpDrafter, pos: usize
 /// One isolated singleton MTP greedy run (`budget` picks, `eos`).
 fn spec_run(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, dir: Option<&Path>) -> Result<SpecTrace> {
     d.configure_request(SpecRequestConfig::default());
-    let seed0 = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?;
+    let seed0 = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?.into_first_token()?;
     let mut tr = SpecTrace { emitted: vec![seed0], cycles: vec![], finish: String::new(), position: f.prefix, pending_seed: seed0, states: vec![] };
     let mut history = f.tokens.clone();
     history.push(seed0);
@@ -1809,7 +1809,7 @@ fn spec_replay(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f:
 /// Run `f` for `cycles` windows (0 = prefill only); returns the committed position.
 fn spec_partial(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Qwen35MtpDrafter, f: &Fixture, budget: usize, eos: u32, cycles: usize) -> Result<usize> {
     d.configure_request(SpecRequestConfig::default());
-    let mut seed = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?;
+    let mut seed = d.mtp_prefill(gpu, slot, &f.tokens, &f.tokens, 0, false, &|| false)?.into_first_token()?;
     let (mut pos, mut emitted) = (f.prefix, 1usize);
     let mut history = f.tokens.clone();
     history.push(seed);

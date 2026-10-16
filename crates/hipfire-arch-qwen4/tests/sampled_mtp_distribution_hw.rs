@@ -1162,15 +1162,17 @@ impl Loaded {
     ) -> Result<MtpRun, String> {
         let eos = self.bundle.config.eos_token_id;
         drafter.configure_request(cfg);
-        let mut seed_token = drafter.mtp_prefill(
-            &mut self.gpu,
-            &mut self.bundle,
-            prompt,
-            prompt,
-            0,
-            false,
-            &|| false,
-        )?;
+        let mut seed_token = drafter
+            .mtp_prefill(
+                &mut self.gpu,
+                &mut self.bundle,
+                prompt,
+                prompt,
+                0,
+                false,
+                &|| false,
+            )?
+            .into_first_token()?;
         let mut ids = vec![seed_token];
         let (mut drafted, mut accepted) = (0, 0);
         let mut windows = Vec::new();

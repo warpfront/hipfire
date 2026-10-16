@@ -1411,15 +1411,17 @@ fn cq_prefill(
             let drafter = drafter
                 .as_mut()
                 .ok_or("native MTP drafter is not allocated")?;
-            let seed = drafter.mtp_prefill(
-                gpu,
-                &mut rig.bundle,
-                prompt,
-                &prompt[start..],
-                start,
-                start > 0,
-                &|| false,
-            )?;
+            let seed = drafter
+                .mtp_prefill(
+                    gpu,
+                    &mut rig.bundle,
+                    prompt,
+                    &prompt[start..],
+                    start,
+                    start > 0,
+                    &|| false,
+                )?
+                .into_first_token()?;
             Ok(Some(seed))
         }
     }

@@ -27,7 +27,7 @@ use crate::spec_decode::{
 };
 use crate::spec_impl::Deepseek4Bundle;
 use hipfire_runtime::spec::{
-    MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
+    MtpDrafter, MtpSpeculator, MtpWindow, PrefillOutcome, SpecGrammar, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::sync::Arc;
@@ -101,7 +101,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         _abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<PrefillOutcome, String> {
         // Cold start: reset recurrent state (n_tokens → 0, mtp_last_hidden → None).
         // DeepseekV4State::reset() does no GPU work.
         if !cache_hit {
@@ -141,7 +141,9 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         )
         .map_err(|e| format!("mtp prefill: {e}"))?;
 
-        Ok(logits_argmax(&logits) as u32)
+        Ok(PrefillOutcome::Ready {
+            first_token: logits_argmax(&logits) as u32,
+        })
     }
 
     fn mtp_step(

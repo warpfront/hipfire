@@ -324,6 +324,7 @@ fn mtp_recurrent_state_byte_identity() {
         let mut drafter_a = greedy_drafter(head_a, CTX_PATH1);
         let mut seed = drafter_a
             .mtp_prefill(&mut gpu, &mut slot_a, &prompt, &prompt, 0, false, &no_abort)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("arm A prefill");
         let eos_a = slot_a.config.eos_token;
         // Host history: prompt + every baked token (last = pending seed).
@@ -421,6 +422,7 @@ fn mtp_recurrent_state_byte_identity() {
                 false,
                 &no_abort,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("arm B cold prefill");
         assert_eq!(
             seed_b, pending,
@@ -530,6 +532,7 @@ fn mtp_recurrent_state_byte_identity() {
         let suffix = long[p..].to_vec();
         let seed_a = drafter_a
             .mtp_prefill(&mut gpu, &mut slot_a, &long, &suffix, p, true, &no_abort)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("arm A suffix re-prefill");
         let dn_a = dn_bytes(&gpu, &slot_a);
         let kv_a = kv_prefix_bytes(&gpu, &slot_a, long.len());
@@ -555,6 +558,7 @@ fn mtp_recurrent_state_byte_identity() {
         let mut drafter_b = greedy_drafter(head_b, CTX_PATH2);
         let seed_b = drafter_b
             .mtp_prefill(&mut gpu, &mut slot_b, &long, &long, 0, false, &no_abort)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("arm B cold prefill");
         assert_eq!(
             seed_a, seed_b,

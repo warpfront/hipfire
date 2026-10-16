@@ -1169,7 +1169,7 @@ impl MtpDrafter for DsparkDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String> {
+    ) -> Result<crate::spec::PrefillOutcome, String> {
         if !cache_hit {
             target.reset_recurrent(gpu)?;
         }
@@ -1200,10 +1200,12 @@ impl MtpDrafter for DsparkDrafter {
         // already reset above on cache_miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
         match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
-            crate::spec::SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
-            crate::spec::SpecAdvance::Aborted => {
-                Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
+            crate::spec::SpecAdvance::Ready { last_argmax, .. } => {
+                Ok(crate::spec::PrefillOutcome::Ready {
+                    first_token: last_argmax,
+                })
             }
+            crate::spec::SpecAdvance::Aborted => Ok(crate::spec::PrefillOutcome::Aborted),
         }
     }
 

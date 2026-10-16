@@ -719,9 +719,9 @@ fn mtp_prompt(
     }
     speculator.configure_request(request);
     let first = match pp.as_deref_mut() {
-        Some(gpus) => {
-            pp_drafter(speculator)?.pp_mtp_prefill(gpus, bundle, ids, ids, 0, false, &|| false)?
-        }
+        Some(gpus) => pp_drafter(speculator)?
+            .pp_mtp_prefill(gpus, bundle, ids, ids, 0, false, &|| false)?
+            .into_first_token()?,
         None => match speculator.prefill(gpu, bundle, ids, ids, 0, false, None, &|| false)? {
             PrefillOutcome::Ready { first_token } => first_token,
             PrefillOutcome::Aborted => return Err("MTP prefill aborted".into()),

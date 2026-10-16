@@ -167,6 +167,7 @@ fn run_mtp(
             reused > 0,
             &|| false,
         )
+        .and_then(|outcome| outcome.into_first_token())
         .expect("MTP prefill");
     let digests = state_digests(bundle, gpu, SessionRoute::Mtp, tokens.len());
     bundle.session_commit();
@@ -875,6 +876,7 @@ fn retired_turn_commits_live_on_flash_next() {
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         let seed = drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("MTP prefill");
         let mut emitted = vec![seed];
         for i in 0..owed {
@@ -930,6 +932,7 @@ fn retired_turn_commits_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the retired turn");
         bundle.session_commit();
 
@@ -937,6 +940,7 @@ fn retired_turn_commits_live_on_flash_next() {
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         let reference_seed = drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("reference MTP prefill");
         assert_eq!(reference_seed, seed, "owed {owed}: cold seed");
         assert!(
@@ -968,6 +972,7 @@ fn retired_turn_commits_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the reference turn");
         bundle.session_commit();
 
@@ -1033,6 +1038,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
     MtpDrafter::configure_request(&mut drafter, cfg);
     let seed = drafter
         .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+        .and_then(|outcome| outcome.into_first_token())
         .expect("MTP prefill");
     let mut stream = vec![seed];
     for i in 0..4 {
@@ -1048,6 +1054,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
         MtpDrafter::configure_request(&mut drafter, cfg);
         let cold_seed = drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("MTP prefill");
         assert_eq!(cold_seed, seed, "n {n}: cold seed");
         let window = drafter
@@ -1118,6 +1125,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the repaired turn");
         bundle.session_commit();
 
@@ -1151,6 +1159,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the reference turn");
         bundle.session_commit();
 

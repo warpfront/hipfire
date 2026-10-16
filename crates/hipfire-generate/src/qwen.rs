@@ -10861,17 +10861,15 @@ fn spec_prefill(
     } else {
         (prompt_tokens, 0)
     };
-    drafter
-        .pp_mtp_prefill(
-            gpus,
-            bundle,
-            prompt_tokens,
-            fill_tokens,
-            start_pos,
-            cache_hit,
-            abort,
-        )
-        .map(|first_token| PrefillOutcome::Ready { first_token })
+    drafter.pp_mtp_prefill(
+        gpus,
+        bundle,
+        prompt_tokens,
+        fill_tokens,
+        start_pos,
+        cache_hit,
+        abort,
+    )
 }
 
 /// `Speculator::step` of the spec loop, on the mesh for a pipeline-parallel

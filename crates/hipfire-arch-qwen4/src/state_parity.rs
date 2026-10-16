@@ -2129,7 +2129,10 @@ fn real_model_probe(
     };
     let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(DRAFTS.len(), 2048, None);
     use hipfire_runtime::spec::MtpDrafter;
-    let seed = match drafter.mtp_prefill(gpu, bundle, tokens, tokens, 0, false, &|| false) {
+    let seed = match drafter
+        .mtp_prefill(gpu, bundle, tokens, tokens, 0, false, &|| false)
+        .and_then(|outcome| outcome.into_first_token())
+    {
         Ok(seed) => seed,
         Err(error) => {
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
@@ -2495,15 +2498,17 @@ pub fn run_mtp_fill_digest(
                         "warm length {length}: session plan starts at {start_pos}, expected {prefix_len}"
                     ));
                 }
-                drafter.mtp_prefill(
-                    &mut gpu,
-                    &mut bundle,
-                    &prompt,
-                    &prompt[prefix_len..],
-                    prefix_len,
-                    true,
-                    &|| false,
-                )?
+                drafter
+                    .mtp_prefill(
+                        &mut gpu,
+                        &mut bundle,
+                        &prompt,
+                        &prompt[prefix_len..],
+                        prefix_len,
+                        true,
+                        &|| false,
+                    )?
+                    .into_first_token()?
             } else {
                 let prompt = match prompt_ids.as_deref() {
                     Some(ids) => ids
@@ -2514,7 +2519,9 @@ pub fn run_mtp_fill_digest(
                         .to_vec(),
                     None => tokens(length as u64, length),
                 };
-                drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
+                drafter
+                    .mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
+                    .into_first_token()?
             };
             let after_fill = bundle_family_json(&gpu, &bundle)?;
             // The prompt's last row: the final chunk's LM head writes it.
@@ -2940,7 +2947,9 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
             allow_ngram_modifier: true,
             ..SpecRequestConfig::default()
         });
-        drafter.mtp_prefill(gpu, bundle, prompt, prompt, 0, false, &|| false)
+        drafter
+            .mtp_prefill(gpu, bundle, prompt, prompt, 0, false, &|| false)?
+            .into_first_token()
     }
 
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
