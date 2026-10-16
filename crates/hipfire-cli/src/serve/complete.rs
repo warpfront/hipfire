@@ -3513,6 +3513,9 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "mtp_windows": done.get("mtp_windows"),
         "ar_windows": done.get("ar_windows"),
         "mtp_retired": done.get("mtp_retired"),
+        "spec_retired": done.get("spec_retired"),
+        "spec_retired_at": done.get("spec_retired_at"),
+        "ar_tokens": done.get("ar_tokens"),
         "mtp_window_timings": done.get("mtp_window_timings"),
     })
 }

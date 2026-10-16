@@ -3852,6 +3852,7 @@ pub fn generate_dflash(
                     finish_reason,
                     active_attempt_id(),
                 );
+                spec_retire_done_fields(&mut pending_done, &run);
                 if spec_name == "mtp" {
                     qwen_mtp_done_fields(
                         &mut pending_done,
@@ -4003,6 +4004,7 @@ pub fn generate_dflash(
             "finish_reason": finish_reason,
             "attempt_id": active_attempt_id(),
         });
+        spec_retire_done_fields(&mut pending_done, &run);
         if spec_name == "mtp" {
             qwen_mtp_done_fields(
                 &mut pending_done,
@@ -4067,11 +4069,36 @@ pub fn generate_dflash(
     let _ = stdout.flush();
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
     let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
+    let retired = run
+        .spec_retired_at
+        .map(|at| format!(", retired to AR at {at} for {} tok", run.ar_steps))
+        .unwrap_or_default();
     eprintln!(
-        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows)",
+        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows{retired})",
         run.generated, run.spec_cycles
     );
     true
+}
+
+/// Spec → AR retirement on the `done` envelope; absent when the request never
+/// retired. `cycles`/`tau` cover the spec windows only.
+fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
+    if let Some(at) = run.spec_retired_at {
+        done["spec_retired"] = serde_json::Value::Bool(true);
+        done["spec_retired_at"] = serde_json::json!(at);
+        done["ar_tokens"] = serde_json::json!(run.ar_steps);
+    }
+}
+
+/// Break-even line of the spec → AR retirement policy from `HIPFIRE_SPEC_RETIRE`
+/// (see [`hipfire_runtime::spec_retire::parse_break_even`]). A malformed value
+/// turns retirement off and says so, rather than guessing a line.
+fn spec_retire_break_even() -> Option<hipfire_runtime::spec_retire::BreakEven> {
+    let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
+    hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()).unwrap_or_else(|e| {
+        eprintln!("[spec-retire] {e}; retirement off");
+        None
+    })
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -4779,6 +4806,15 @@ pub fn generate_spec(
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
+    // Spec → AR retirement (`hipfire_runtime::spec_retire`) for greedy requests
+    // on a speculator with an AR step. It reads token counts only, so a greedy
+    // request retires at the same cycle on every run.
+    let mut retire = hipfire_runtime::spec_retire::SpecRetire::new(
+        (temp <= 1e-6 && spec.supports_ar_step())
+            .then(spec_retire_break_even)
+            .flatten(),
+    );
+    let mut ar_steps = 0usize;
     while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
@@ -5060,18 +5096,25 @@ pub fn generate_spec(
         );
         let window_seed = seed_token;
         let mtp_outer_t0 = std::time::Instant::now();
-        let step = match spec_step(
-            pp.as_deref_mut(),
-            gpu,
-            spec.as_mut(),
-            slot,
-            position,
-            seed_token,
-            &emitted,
-            emit.grammar(),
-            temp,
-            max_emit,
-        ) {
+        let ar_step = retire.is_retired();
+        let step_result = if ar_step {
+            spec.ar_step(gpu, slot, position, seed_token)
+                .map(|t| hipfire_runtime::spec::SpecStep::new([t], t, 0, 0))
+        } else {
+            spec_step(
+                pp.as_deref_mut(),
+                gpu,
+                spec.as_mut(),
+                slot,
+                position,
+                seed_token,
+                &emitted,
+                emit.grammar(),
+                temp,
+                max_emit,
+            )
+        };
+        let step = match step_result {
             Ok(s) => s,
             Err(e) => {
                 // Authoritative failure: reset+sync first, then one correlated
@@ -5092,8 +5135,12 @@ pub fn generate_spec(
                 return None;
             }
         };
-        spec_cycles += 1;
-        spec_accepted += step.accepted;
+        if ar_step {
+            ar_steps += 1;
+        } else {
+            spec_cycles += 1;
+            spec_accepted += step.accepted;
+        }
         // `emit` is already the committed tail with the seed re-echo stripped.
         let committed_tail = step.emit;
         // Absolute host cursor before this window's commit. Spec.step left
@@ -5222,6 +5269,13 @@ pub fn generate_spec(
         } else {
             host.seed_token
         };
+        if !ar_step && retire.observe(committed_tail.len(), position) {
+            eprintln!(
+                "[spec-retire] id={id} drafter={} retired to AR at position {position} (generated {generated}, {spec_cycles} cycles, tau {:.2})",
+                spec.name(),
+                spec_accepted as f64 / spec_cycles as f64,
+            );
+        }
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
         // target + drafter. Native Qwen4 MTP first tries a window-local repair
@@ -5794,6 +5848,8 @@ pub fn generate_spec(
         generated,
         spec_cycles,
         spec_accepted,
+        spec_retired_at: retire.retired_at(),
+        ar_steps,
         streamed_tokens,
         prefill_tokens_len: prefill_tokens.len(),
         finish,

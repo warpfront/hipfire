@@ -969,6 +969,21 @@ impl Speculator for GenericDflashSpeculator {
         }
     }
 
+    fn supports_ar_step(&self) -> bool {
+        true
+    }
+
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        self.step_one_token(gpu, target, position, seed, 0.0)
+            .map(|step| step.next_seed)
+    }
+
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Drafter-local reset: clear the cumulative host shadow + the draft's
         // upload/projection tracking. The target's KV/recurrent reset is the

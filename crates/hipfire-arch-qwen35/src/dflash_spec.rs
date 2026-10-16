@@ -1174,6 +1174,63 @@ impl Speculator for DflashSpeculator {
         Ok(true)
     }
 
+    fn supports_ar_step(&self) -> bool {
+        self.df.is_some()
+    }
+
+    /// AR's single-token decode forward plus this position's hidden rows, then
+    /// the same scatter + log append a forced advance does, so the draft
+    /// context stays whole for a later request on this prompt cache.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        let df = self
+            .df
+            .as_mut()
+            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        // No retained window: a terminal stop after this token flushes plainly.
+        self.last_window = None;
+        qwen35::forward_scratch_with_hidden(
+            gpu,
+            &slot.weights,
+            &slot.config,
+            seed,
+            position,
+            &mut slot.kv_cache,
+            &mut slot.dn_state,
+            &slot.scratch,
+            &mut df.hidden_rb,
+        )
+        .map_err(|e| e.to_string())?;
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            &df.hidden_rb,
+            &df.draft_scratch.target_hidden,
+            position,
+            1,
+            1,
+            df.draft_scratch.ctx_modulus(),
+        )
+        .map_err(|e| e.to_string())?;
+        let co = slot.kv_cache.compact_offset as i32;
+        df.draft_scratch.thlog.append_committed(position, 1, co);
+        // The verify's argmax kernel and buffer: same tie-break, no per-token alloc.
+        let argmax = df.verify_scratch.argmax.sub_offset(0, 1);
+        gpu.argmax_f32_batched(&slot.scratch.logits, &argmax, slot.config.vocab_size, 1)
+            .map_err(|e| e.to_string())?;
+        crate::speculative::dflash_download_verify_argmax(gpu, &df.verify_scratch, 1)
+            .map(|t| t[0])
+            .map_err(|e| e.to_string())
+    }
+
     /// Temp>0 verify is distribution-correct on the ddtree-batched arm (SWOR)
     /// and on DFlash2 selector-chain rejection sampling. Legacy chain without
     /// a selector stays greedy-only at this gate.

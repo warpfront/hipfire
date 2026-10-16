@@ -147,6 +147,7 @@ pub(crate) struct Metrics {
     pub(crate) prompt_tokens: AtomicU64,
     pub(crate) completion_tokens: AtomicU64,
     pub(crate) cached_prompt_tokens: AtomicU64,
+    pub(crate) spec_retired: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -164,6 +165,7 @@ impl Default for Metrics {
             prompt_tokens: AtomicU64::new(0),
             completion_tokens: AtomicU64::new(0),
             cached_prompt_tokens: AtomicU64::new(0),
+            spec_retired: AtomicU64::new(0),
         }
     }
 }
@@ -214,6 +216,9 @@ impl Metrics {
         }
         if let Some(v) = f64_field("tau") {
             self.spec_tau.observe(v);
+        }
+        if done.get("spec_retired") == Some(&serde_json::Value::Bool(true)) {
+            self.spec_retired.fetch_add(1, Ordering::Relaxed);
         }
         let cached = u64_field("cached_tokens");
         if let Some(v) = cached {
@@ -302,6 +307,12 @@ impl Metrics {
             "hipfire_cached_prompt_tokens_total",
             "Prompt tokens served from the prefix cache, as reported by the daemon.",
             self.cached_prompt_tokens.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "hipfire_spec_retired_total",
+            "Speculative requests the spec-retire policy switched to plain AR decode.",
+            self.spec_retired.load(Ordering::Relaxed),
         );
         counter(
             &mut out,

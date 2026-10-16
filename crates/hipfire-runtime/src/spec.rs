@@ -819,6 +819,29 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Whether [`Self::ar_step`] is implemented. The spec-retire policy
+    /// ([`crate::spec_retire`]) only arms for speculators that can continue a
+    /// request as plain AR.
+    fn supports_ar_step(&self) -> bool {
+        false
+    }
+
+    /// One greedy target-only token for a request the spec-retire policy
+    /// retired: feed `seed` at absolute `position` through the target, keep
+    /// drafter-local per-position state in sync (a later request that hits
+    /// this prompt cache drafts from those rows), and return the target's
+    /// argmax next token. No draft runs.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        let _ = (gpu, target, position, seed);
+        Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
     /// Repair a terminal that consumed only a strict prefix of the most recent
     /// speculative window. Implementations with a retained pre-window snapshot
     /// restore it and replay only the state-committable prefix, leaving the last
