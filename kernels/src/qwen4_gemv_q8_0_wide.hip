@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
 // Qwen4 decode/verify siblings of gemv_q8_0_wide (gemv_q8_0_wide.hip).
 
@@ -10,11 +11,13 @@
 // four-accumulator math on a row staged through LDS with dword loads issued
 // before the x loads, x (20 values per lane) held in registers, four rows
 // (waves) per block. Bitwise gemv_q8_0_wide; 10.5 -> 9.5 us per call.
-__launch_bounds__(128)
-extern "C" __global__ void gemv_q8_0_wide_k640_staged(
+template <bool kScaledAdd>
+static __device__ __forceinline__ void gemv_q8_0_wide_k640_staged_body(
     const unsigned char* __restrict__ A_q8,
     const float* __restrict__ x,
     float* __restrict__ y,
+    float* __restrict__ residual,
+    const float* __restrict__ scalar,
     int M
 ) {
     __shared__ __align__(16) unsigned int staged[4][170];
@@ -47,7 +50,43 @@ extern "C" __global__ void gemv_q8_0_wide_k640_staged(
     float sum = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
-    if (lane == 0) y[row] = sum;
+    if (lane != 0) return;
+    y[row] = sum;
+    if (kScaledAdd) {
+        // bf16_scaled_add_f32 on this row (same expression and roundings).
+        const hip_bfloat16 lhs = static_cast<hip_bfloat16>(residual[row]);
+        const hip_bfloat16 rhs = static_cast<hip_bfloat16>(sum);
+        const hip_bfloat16 gate = static_cast<hip_bfloat16>(scalar[0]);
+        const hip_bfloat16 product = static_cast<hip_bfloat16>(
+            static_cast<float>(gate) * static_cast<float>(rhs));
+        residual[row] = static_cast<float>(static_cast<hip_bfloat16>(
+            static_cast<float>(lhs) + static_cast<float>(product)));
+    }
+}
+
+__launch_bounds__(128)
+extern "C" __global__ void gemv_q8_0_wide_k640_staged(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M
+) {
+    gemv_q8_0_wide_k640_staged_body<false>(A_q8, x, y, nullptr, nullptr, M);
+}
+
+// gemv_q8_0_wide_k640_staged followed by bf16_scaled_add_f32(residual, y,
+// scalar) in one launch (Qwen4 decode shared-expert down + source BF16 fold);
+// y and residual are bitwise the two launches.
+__launch_bounds__(128)
+extern "C" __global__ void gemv_q8_0_wide_k640_staged_bf16_scaled_add(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    float* __restrict__ residual,
+    const float* __restrict__ scalar,
+    int M
+) {
+    gemv_q8_0_wide_k640_staged_body<true>(A_q8, x, y, residual, scalar, M);
 }
 
 // gemv_q8_0_wide over R activation rows (x row stride K, y row stride M):

@@ -89,3 +89,71 @@ extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expande
     if (tid == 0)
         expert_outputs[(long long)flat * M + row] = acc;
 }
+
+// K = 640 twin of the kernel above with R weight rows per wave: the pick's
+// x slice (20 floats per lane) is loaded once and reused for R rows; each
+// row keeps the scalar kernel's per-lane expression, group order and
+// shuffle reduction, so every expanded row is bitwise the kernel above.
+// Grid [ceil(M / R), 10, N].
+template <int R>
+static __device__ __forceinline__ void mq4g128v2_down_k640_rows(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const int* __restrict__ topk_indices,
+    const float* __restrict__ rot_batch,
+    float* __restrict__ expert_outputs,
+    int M, int K, int N, int n_exp
+) {
+    constexpr int GROUPS = 5;
+    const int row0 = blockIdx.x * R;
+    const int rank = blockIdx.y;
+    const int token = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (row0 >= M || rank >= 10 || token >= N || K != GROUPS * 128) return;
+    const int flat = token * 10 + rank;
+    const int expert = topk_indices[flat];
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    if (expert >= 0 && expert < n_exp) {
+        const char* A = reinterpret_cast<const char*>(expert_ptrs[expert]);
+        const float* x = rot_batch + (long long)flat * K + tid * 4;
+        float xs[GROUPS][4];
+#pragma unroll
+        for (int g = 0; g < GROUPS; ++g)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) xs[g][i] = x[g * 128 + i];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = row0 + r < M ? row0 + r : M - 1;
+            const char* row_ptr = A + (long long)row * GROUPS * 68;
+#pragma unroll
+            for (int g = 0; g < GROUPS; ++g) {
+                const char* gp = row_ptr + g * 68;
+                const float scale = __half2float(__ushort_as_half(*(const unsigned short*)gp));
+                const float zero = __half2float(__ushort_as_half(*(const unsigned short*)(gp + 2)));
+                const unsigned char* payload = (const unsigned char*)(gp + 4);
+                const unsigned char b0 = payload[tid * 2];
+                const unsigned char b1 = payload[tid * 2 + 1];
+                acc[r] += (scale * (float)(b0 & 0xF) + zero) * xs[g][0]
+                    + (scale * (float)(b0 >> 4) + zero) * xs[g][1]
+                    + (scale * (float)(b1 & 0xF) + zero) * xs[g][2]
+                    + (scale * (float)(b1 >> 4) + zero) * xs[g][3];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float sum = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (tid == 0 && row0 + r < M)
+            expert_outputs[(long long)flat * M + row0 + r] = sum;
+    }
+}
+
+__launch_bounds__(32, 8)
+extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4(
+    const unsigned long long* __restrict__ expert_ptrs, const int* __restrict__ topk_indices,
+    const float* __restrict__ rot_batch, float* __restrict__ expert_outputs, int M, int K, int N, int n_exp) {
+    mq4g128v2_down_k640_rows<4>(expert_ptrs, topk_indices, rot_batch, expert_outputs, M, K, N, n_exp);
+}

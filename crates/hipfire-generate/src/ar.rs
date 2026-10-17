@@ -2048,6 +2048,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     m.seq_pos = prompt_tokens.len();
     m.conversation_tokens.extend_from_slice(prompt_tokens);
     let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t_prefill = Instant::now();
     // Once per request, after prefill and before the first decode forward
     // (and any decode capture/record): map context ahead for the whole
     // `max_tokens` budget (AR: no draft rows). Best effort; the model logs
@@ -2099,6 +2100,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // exactly like a sampled token (KV write, commit, classify, stops).
     let mut forced_close = std::collections::VecDeque::new();
     let t_decode = Instant::now();
+    // One promotion attempt per request: a refusal (e.g. no free lane) keeps
+    // it here for good rather than retrying every token.
+    let mut promotion_tried = false;
 
     while generated < max_tokens {
         if check_abort(id) {
@@ -2106,6 +2110,83 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             let _ = gpu.free_tensor(decode_logits);
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
+        }
+        // Qwen4 fn-lanes continuous batching: a serve-batched peer is waiting
+        // and the daemon granted a permit. Here the next token is picked but
+        // neither fed nor streamed, so the request moves into an exact lane
+        // that feeds and streams it, instead of the peer waiting for this
+        // whole generation. A refusal changes nothing: the same token is fed
+        // below.
+        if !promotion_tried
+            && forced_close.is_empty()
+            && greedy_on_gpu
+            && !decode_penalizes
+            && m.qwen4().is_some_and(|b| b.lanes().is_some())
+        {
+            if let Some(permit) = crate::batch::promotion_permit()
+                .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
+            {
+                promotion_tried = true;
+                // `sample_cpu` is the decode argmax here (greedy, no penalty).
+                let seed = match pending {
+                    Some(token) => Ok(token),
+                    None => gpu.download_f32(&decode_logits).map(|mut row| {
+                        sampler::sample_cpu(&mut row, &m.conversation_tokens, &sampler_config)
+                    }),
+                };
+                if let Ok(seed) = seed {
+                    pending = Some(seed);
+                    let position = m.seq_pos;
+                    let promoted = match (
+                        m.tokenizer.as_ref(),
+                        m.state.as_deref_mut().and_then(|s| {
+                            (s as &mut dyn std::any::Any)
+                                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+                        }),
+                    ) {
+                        (Some(tokenizer), Some(bundle)) => crate::batch::promote_qwen4_singleton(
+                            gpu,
+                            bundle,
+                            None,
+                            crate::batch::Qwen4Boundary {
+                                id,
+                                permit,
+                                tokenizer,
+                                started_in_think,
+                                prompt_tokens,
+                                emitted: &streamed_tokens,
+                                position,
+                                seed_token: seed,
+                                seed_emitted: false,
+                                max_tokens,
+                                created_at: t0,
+                                prefill_done_at: t_prefill,
+                            },
+                        ),
+                        _ => Err("no qwen4 bundle or tokenizer".to_string()),
+                    };
+                    match promoted {
+                        Ok(promoted) => {
+                            // The resident state moved into the lane: drop the
+                            // host caches that described it.
+                            m.seq_pos = 0;
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                            crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                            crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                            gpu.replay.rearm_after_layout_growth();
+                            eprintln!(
+                                "[fn-lanes-promote] id={id} promoted from AR singleton at generated={generated} position={position}"
+                            );
+                            crate::batch::put_promoted_qwen4(promoted);
+                            let _ = gpu.free_tensor(decode_logits);
+                            return;
+                        }
+                        Err(e) => eprintln!("[fn-lanes-promote] id={id} stays on AR: {e}"),
+                    }
+                }
+            }
         }
         if let Some(token) = forced_close.pop_front() {
             pending = Some(token);

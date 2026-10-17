@@ -51,6 +51,7 @@ use rdna_compute::tensor_ops::{
     gated_delta_gate_batched_rotate_arena, gated_delta_step_gate_wmma_arena,
     gated_delta_step_gate_wmma_qknormed_arena, indexed_attention_norm_rope_batch_arena,
     indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
+    gated_delta_core_lanes, GdnCoreLane,
 };
 use smallvec::SmallVec;
 
@@ -2266,6 +2267,126 @@ pub fn execute_grouped_depthwise_rows(
 /// Native input projections only, skipping qkv/a/b/z covered by the trunk.
 pub fn execute_gated_delta_net_uncovered(gpu: &mut Gpu, op: &GatedDeltaNetOp<'_>, covered: [bool; 4]) -> Result<(), DispatchError> {
     execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, None, Some(covered), None)
+}
+
+/// The Core phase of several one-row AR lanes' GDN mixers (consecutive
+/// `Step::GatedDeltaNet` Core steps of a lane step) through the multi-lane
+/// kernels: each lane gets exactly the per-row branch's arguments for its row
+/// (convolution + gate parameters, then the fused step + gated norm), minus
+/// the decode rotation, which a Core phase's output projection never reads (the
+/// interpreter drops the memo after the step). `Ok(false)`: nothing launched;
+/// run the ops one by one.
+pub fn execute_gated_delta_net_core_lanes(
+    gpu: &mut Gpu,
+    ops: &[&GatedDeltaNetOp<'_>],
+) -> Result<bool, DispatchError> {
+    let Some(first) = ops.first() else {
+        return Ok(false);
+    };
+    let qkv = 2 * first.key_heads * first.key_dim + first.value_heads * first.value_dim;
+    let value = first.value_heads * first.value_dim;
+    let heads = first.value_heads;
+    let mut views = Vec::with_capacity(ops.len());
+    for op in ops {
+        op.check_phase()?;
+        if op.phase != MixerPhase::Core
+            || op.rows != 1
+            || op.row_capture.is_some()
+            || gdn_persistent_batch(gpu, op, 1)
+            || 2 * op.key_heads * op.key_dim + op.value_heads * op.value_dim != qkv
+            || op.value_heads != heads
+        {
+            return Ok(false);
+        }
+        let projection2 = view(op.projection2, 0, qkv);
+        views.push((
+            view(op.projection, 0, qkv),
+            view(&projection2, 0, op.key_heads * op.key_dim),
+            view(
+                &projection2,
+                op.key_heads * op.key_dim,
+                op.key_heads * op.key_dim,
+            ),
+            view(&projection2, 2 * op.key_heads * op.key_dim, value),
+            projection2,
+            [
+                view(op.a, 0, heads),
+                view(op.b, 0, heads),
+                view(op.gate, 0, heads),
+                view(op.beta, 0, heads),
+            ],
+            [
+                view(op.recurrent_output, 0, value),
+                view(op.z_output, 0, value),
+                view(op.output_scratch, 0, value),
+            ],
+        ));
+    }
+    let lanes: Vec<GdnCoreLane<'_>> = ops
+        .iter()
+        .zip(&views)
+        .map(
+            |(
+                op,
+                (projection, q, k, v, projection2, [a, b, gate, beta], [recurrent, z, output]),
+            )| {
+                let history_rows = op.conv_kernel.saturating_sub(1);
+                GdnCoreLane {
+                    conv: GatedDeltaConv {
+                        input: projection,
+                        kernel: op.conv,
+                        history: op.conv_state,
+                        output: projection2,
+                        next_history: op.conv_state,
+                        channels: qkv,
+                        history_rows,
+                        kernel_size: op.conv_kernel,
+                        cursor: if history_rows == 0 {
+                            0
+                        } else {
+                            op.start_position % history_rows
+                        },
+                        row_index: 0,
+                    },
+                    params: GatedDeltaParams {
+                        a,
+                        b,
+                        a_log: op.a_log,
+                        dt_bias: op.dt_bias,
+                        gate,
+                        beta,
+                    },
+                    step: GatedDeltaStep {
+                        q,
+                        k,
+                        v,
+                        gate,
+                        beta,
+                        state: op.recurrent,
+                        output: recurrent,
+                        key_heads: op.key_heads,
+                        value_heads: op.value_heads,
+                        key_dim: op.key_dim,
+                        value_dim: op.value_dim,
+                        position: op.start_position,
+                    },
+                    gate: GatedDeltaGate {
+                        recurrent_output: recurrent,
+                        z,
+                        norm: op.norm,
+                        output,
+                        value_heads: op.value_heads,
+                        value_dim: op.value_dim,
+                    },
+                }
+            },
+        )
+        .collect();
+    let launched = hip(gated_delta_core_lanes(gpu, &lanes, heads))?;
+    if launched {
+        gpu.scratch.prerotated = None;
+    }
+    Ok(launched)
 }
 
 fn execute_gated_delta_net_hc_impl(

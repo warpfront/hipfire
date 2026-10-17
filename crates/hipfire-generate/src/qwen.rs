@@ -4818,6 +4818,7 @@ pub fn generate_spec(
                                     emitted: &emitted,
                                     position,
                                     seed_token,
+                                    seed_emitted: true,
                                     max_tokens,
                                     created_at: t0,
                                     prefill_done_at: t_prefill,

@@ -989,7 +989,16 @@ impl Qwen4Bundle {
                 .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
                 .target_snapshot = Some(TargetTicket::Local(snapshot));
         }
+        // A single-GPU verify's row launchers may take the gfx1151 PM row
+        // kernels (column-identical to the 1-row incumbents, as in the lane step).
+        let rows_scope = match ops {
+            Qwen4Ops::Single(gpu) => Some(std::mem::replace(&mut gpu.lane_rows_scope, true)),
+            Qwen4Ops::Mesh(_) => None,
+        };
         let result = self.ops_spec_rows(ops, block, read_picks);
+        if let (Some(previous), Qwen4Ops::Single(gpu)) = (rows_scope, &mut *ops) {
+            gpu.lane_rows_scope = previous;
+        }
         self.ops_disarm(ops);
         if let Err(error) = &result {
             if mesh {

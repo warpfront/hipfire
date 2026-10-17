@@ -2900,11 +2900,25 @@ impl Gpu {
             &[batch_size, 10, k, 4],
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded activations",
         )?;
-        const FUNC: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
+        // K = 640 on exact gfx1151, eager: four weight rows per wave reuse the
+        // pick's x (bitwise the one-row kernel).
+        let r4 = k == 640
+            && self.flags.qwen4_moe_down_r4_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode;
+        const MODULE: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
+        let (func, rows_per_block) = if r4 {
+            (
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+                4,
+            )
+        } else {
+            (MODULE, 1)
+        };
         self.ensure_kernel(
-            FUNC,
+            MODULE,
             kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
-            FUNC,
+            func,
         )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -2929,10 +2943,10 @@ impl Gpu {
                 .saturating_add(k.saturating_mul(4))
                 .saturating_add(m.saturating_mul(4)),
         );
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func, bytes);
         let result = self.launch_maybe_blob(
-            FUNC,
-            [m as u32, 10, batch_size as u32],
+            func,
+            [m.div_ceil(rows_per_block) as u32, 10, batch_size as u32],
             [32, 1, 1],
             0,
             &mut params,

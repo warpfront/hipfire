@@ -923,6 +923,28 @@ fn execute_window<'a>(
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < end {
+        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
+        // as one multi-lane launch per kernel; otherwise one by one below.
+        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+            && !cpu_exec::cpu_exec_enabled()
+        {
+            let ops: Vec<_> = steps[i..end]
+                .iter()
+                .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
+                .map_while(|s| match s {
+                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
+                        Some(op)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if ops.len() >= 2
+                && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(gpu, &ops)?
+            {
+                i += ops.len();
+                continue;
+            }
+        }
         if hc_fuse {
             use crate::pipeline::layer_ops::{
                 execute_gated_delta_net_hc, execute_hyper_read_paired,

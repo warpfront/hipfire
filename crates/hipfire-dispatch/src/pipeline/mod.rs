@@ -4102,6 +4102,23 @@ fn decode_shared_down_stage(
                 ))?;
                 return Ok(());
             }
+            // Q8_0 K=640 shared down with the same BF16 fold in its epilogue
+            // (exact gfx1151, eager; bitwise the GEMV + scaled-add launches).
+            if p.recipe.bf16_round_trip()
+                && shared_down_w.dtype == DType::Q8_0
+                && shared_down_w.awq_scale.is_none()
+                && hip!(gpu.gemv_q8_0_k640_bf16_scaled_add(
+                    shared_down_w.buf,
+                    &shared_hid,
+                    p.ffn_out,
+                    out_target,
+                    scalar_buf,
+                    shared_down_w.m,
+                    shared_down_w.k,
+                ))?
+            {
+                return Ok(());
+            }
             if shared_down_w.dtype == DType::MQ4G128V2 {
                 let shared_down_rot = slice_moe_f32_view(p.rot_batch, 0, shared_down_w.k);
                 hip!(gpu.rotate_x_mq_128_v2(&shared_hid, &shared_down_rot, shared_down_w.k, 1,))?;

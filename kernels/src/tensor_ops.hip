@@ -254,9 +254,10 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     if constexpr (kQ8) {
         // The thread's value row: 128 key-channel codes, read 16 at a time
         // (a 16-byte word per step, from cache after the first pass) and
-        // dequantized on use. The update is the F32 route's expression on
-        // the dequantized state; the row is requantized from the updated
-        // values (recomputed, not stored) after the output.
+        // dequantized on use; the second and third passes load the next word
+        // while they work on the current one. The update is the F32 route's
+        // expression on the dequantized state; the row is requantized from the
+        // updated values (recomputed, not stored) after the output.
         int4* row = reinterpret_cast<int4*>(gdn_q8_row(state, value_head, value_index));
         float* scale_slot = gdn_q8_scales(state, value_heads) + value_head * 128 + value_index;
         const float scale = *scale_slot;
@@ -274,8 +275,10 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
         const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
         float out = 0.0f;
         float peak = 0.0f;
+        int4 next = row[0];
         for (int word = 0; word < 8; ++word) {
-            const int4 codes = row[word];
+            const int4 codes = next;
+            if (word < 7) next = row[word + 1];
 #pragma unroll
             for (int b = 0; b < 16; ++b) {
                 const int kd = word * 16 + b;
@@ -288,8 +291,10 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
             }
         }
         const float inv = gdn_q8_inv(peak);
+        next = row[0];
         for (int word = 0; word < 8; ++word) {
-            const int4 codes = row[word];
+            const int4 codes = next;
+            if (word < 7) next = row[word + 1];
             int packed[4] = {0, 0, 0, 0};
 #pragma unroll
             for (int b = 0; b < 16; ++b) {

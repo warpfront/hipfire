@@ -20518,6 +20518,70 @@ impl Gpu {
         })
     }
 
+    /// Single-token Qwen4 shared-expert down on exact gfx1151: [`Gpu::gemv_q8_0`]
+    /// of a Q8_0 `k = 640` weight into `y`, then `bf16_scaled_add_f32(residual,
+    /// y, scalar)`, in one launch (`y` and `residual` bitwise the two
+    /// launches). `Ok(false)`: not taken (`HIPFIRE_QWEN4_SHARED_DOWN_FUSE=0`,
+    /// another arch or shape, or a recorder / graph capture is active), nothing
+    /// launched.
+    pub fn gemv_q8_0_k640_bf16_scaled_add(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        residual: &GpuTensor,
+        scalar: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<bool> {
+        if k != 640
+            || !self.flags.qwen4_shared_down_fuse_enabled()
+            || self.replay.is_recording()
+            || self.graphs.capture_mode
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_wide_k640_staged_bf16_scaled_add";
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0_wide",
+            kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+            FUNC,
+        )?;
+        let a_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let r_ptr = residual.buf.as_ptr();
+        let s_ptr = scalar.buf.as_ptr();
+        let m_val = m as i32;
+        let mut params = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &r_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [m.div_ceil(4) as u32, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_ptr(r_ptr);
+                b.push_ptr(s_ptr);
+                b.push_i32(m_val);
+                b
+            },
+        )?;
+        Ok(true)
+    }
+
     /// [`Gpu::gemv_bf16_xf32`] for four `(weight, y, m)` BF16 matrices that
     /// read the same `x` (width `k`), in one launch. Every output row is the
     /// value the single-matrix launch computes.
