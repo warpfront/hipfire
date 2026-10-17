@@ -596,100 +596,185 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
 
 // ── Residual GEMV dispatch ─────────────────────────────
 
-fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchError> {
-    let w = params.w;
-    let x = params.x;
-    let y = params.y;
-    let m = w.m;
-    let k = w.k;
-    use DType::*;
+type ResidualFn =
+    fn(&mut Gpu, &GpuTensor, &GpuTensor, &GpuTensor, usize, usize) -> hip_bridge::HipResult<()>;
 
-    match w.dtype {
-        HFQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
-        HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
-        HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
-        // MQ-family WithResidual requires caller-supplied pre-rotated x
-        // (same contract as Prerotated) — dispatch through HFQ residual kernel.
-        MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
-        MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual_mq4v2(w.buf, x, y, m, k)),
-        // qt=52 residual LUT twin. LUT None fails closed (never uniform).
-        MQ4G256V2Lloyd => {
-            let lut = w.lloyd_lut_f16.ok_or_else(|| {
-                DispatchError::Hip(
-                    "gemv family (residual): MQ4G256V2Lloyd weight reached the LUT kernel with lloyd_lut_f16=None — re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode".into(),
-                )
-            })?;
-            hip!(gpu.gemv_hfq4g256_residual_mq4v2_lloyd(w.buf, x, y, m, k, lut))
+/// Fused `y += W·x` kernel for a weight dtype. Both residual variants launch
+/// through this one table, so a dtype cannot have a residual arm but no
+/// SwiGLU-residual arm (#789: legacy MQ3G256, #810: MQ6G256).
+enum ResidualKernel {
+    Plain(ResidualFn),
+    /// qt=52: the LUT residual twin, which needs the weight's codebook.
+    Mq4v2Lloyd,
+}
+
+fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel, DispatchError> {
+    use DType::*;
+    use ResidualKernel::Plain;
+    // MQ-family arms require caller-supplied pre-rotated x (same contract as
+    // Prerotated); legacy MQ dtypes share the HFQ residual kernel of their width.
+    Ok(match dtype {
+        HFQ4G256 | MQ4G256 => Plain(Gpu::gemv_hfq4g256_residual),
+        HFQ3G256 | MQ3G256 => Plain(Gpu::gemv_hfq3g256_residual),
+        HFQ6G256 | MQ6G256 => Plain(Gpu::gemv_hfq6g256_residual),
+        MQ5G256 => Plain(Gpu::gemv_hfq5g256_residual),
+        MQ4G256V2 => Plain(Gpu::gemv_hfq4g256_residual_mq4v2),
+        MQ4G256V2Lloyd => ResidualKernel::Mq4v2Lloyd,
+        MQ5G256V2 => Plain(Gpu::gemv_mq5g256v2_residual),
+        MQ6G256V2 => Plain(Gpu::gemv_mq6g256v2_residual),
+        MQ3G256V2 => Plain(Gpu::gemv_mq3g256v2_residual),
+        MQ2G256V2 => Plain(Gpu::gemv_mq2g256v2_residual),
+        MQ4CG256 => Plain(Gpu::gemv_mq4cg256_residual),
+        MQ3G256Lloyd => Plain(Gpu::gemv_mq3g256_lloyd_residual),
+        MQ4G256Lloyd => Plain(Gpu::gemv_mq4g256_lloyd_residual),
+        MQ4G128V2 => return reject_mq4g128v2().map(|()| unreachable!()),
+        _ => {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant,
+                arch: "",
+                quant: "",
+            })
         }
-        MQ5G256V2 => hip!(gpu.gemv_mq5g256v2_residual(w.buf, x, y, m, k)),
-        MQ6G256V2 => hip!(gpu.gemv_mq6g256v2_residual(w.buf, x, y, m, k)),
-        MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x, y, m, k)),
-        MQ2G256V2 => hip!(gpu.gemv_mq2g256v2_residual(w.buf, x, y, m, k)),
-        MQ4CG256 => hip!(gpu.gemv_mq4cg256_residual(w.buf, x, y, m, k)),
-        MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
-        MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x, y, m, k)),
-        MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
-        MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
-        MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
-        MQ4G128V2 => reject_mq4g128v2(),
-        _ => Err(DispatchError::UnsupportedVariant {
-            family: "gemv",
-            variant: "residual",
-            arch: "",
-            quant: "",
-        }),
+    })
+}
+
+fn launch_residual(
+    gpu: &mut Gpu,
+    w: &WeightRef,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    variant: &'static str,
+) -> Result<(), DispatchError> {
+    match residual_kernel(w.dtype, variant)? {
+        ResidualKernel::Plain(kernel) => hip!(kernel(gpu, w.buf, x, y, w.m, w.k)),
+        // LUT None fails closed (never uniform).
+        ResidualKernel::Mq4v2Lloyd => {
+            let lut = w.lloyd_lut_f16.ok_or_else(|| {
+                DispatchError::Hip(format!(
+                    "gemv family ({variant}): MQ4G256V2Lloyd weight reached the LUT kernel with lloyd_lut_f16=None — re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode"
+                ))
+            })?;
+            hip!(gpu.gemv_hfq4g256_residual_mq4v2_lloyd(w.buf, x, y, w.m, w.k, lut))
+        }
     }
+}
+
+fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchError> {
+    launch_residual(gpu, params.w, params.x, params.y, "residual")
 }
 
 // ── SwiGLU + Residual GEMV dispatch ────────────────────
 
 fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchError> {
-    let w = params.w;
+    // The caller pre-computes silu(gate)*up into `gate` (MQ-family: also
+    // pre-rotated via fused_silu_mul_rotate_mq); the GEMV is then the plain
+    // residual kernel over that input. True fused SwiGLU+Residual kernels
+    // (PARO) are not yet wired here.
     let x_in = params.gate.ok_or_else(|| DispatchError::MissingImpl {
         key: KernelKey::GemvF32,
     })?;
     let residual = params.residual.unwrap_or(params.y);
-    let m = w.m;
-    let k = w.k;
-    use DType::*;
+    launch_residual(gpu, params.w, x_in, residual, "swiglu_residual")
+}
 
-    // SwiGLU+Residual dispatch.
-    //
-    // HFQ dtypes: caller must pre-compute silu(gate)*up and pass as `gate`
-    // (the GEMV then does y += W · silu(gate*up) with the pre-fused input).
-    // MQ-family: caller must also pre-rotate via fused_silu_mul_rotate_mq.
-    // True fused SwiGLU+Residual kernels (PARO) are not yet wired here.
-    match w.dtype {
-        HFQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
-        HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
-        HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
-        MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
-        MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual_mq4v2(w.buf, x_in, residual, m, k)),
-        // qt=52: same contract as the V2 arm above (x_in already holds the
-        // rotated silu*up), through the LUT residual twin. LUT None fails closed.
-        MQ4G256V2Lloyd => {
-            let lut = w.lloyd_lut_f16.ok_or_else(|| {
-                DispatchError::Hip(
-                    "gemv family (swiglu_residual): MQ4G256V2Lloyd weight reached the LUT kernel with lloyd_lut_f16=None".into(),
-                )
-            })?;
-            hip!(gpu.gemv_hfq4g256_residual_mq4v2_lloyd(w.buf, x_in, residual, m, k, lut))
+#[cfg(test)]
+mod residual_coverage_tests {
+    use super::*;
+
+    /// Every DType. The exhaustive match makes a new variant a compile error
+    /// here until it is listed.
+    macro_rules! all_dtypes {
+        ($($v:ident),* $(,)?) => {{
+            #[allow(dead_code)]
+            fn exhaustive(d: DType) {
+                match d {
+                    $(DType::$v)|* => {}
+                }
+            }
+            [$(DType::$v),*]
+        }};
+    }
+
+    #[test]
+    fn every_planned_residual_dtype_has_a_dispatch_arm() {
+        let all = all_dtypes!(
+            F32,
+            F16,
+            BF16,
+            Q4K,
+            Q6K,
+            Q8_0,
+            Q4F16G64,
+            Q4F16G32,
+            Q8HFQ,
+            HFQ4G256,
+            HFQ4G128,
+            HFQ3G256,
+            HFQ3G128,
+            MQ4G256,
+            MQ4G256V2,
+            MQ4G256V2Lloyd,
+            MQ4CG256,
+            MQ6G256V2,
+            MQ5G256V2,
+            MQ4G128V2,
+            MQ4G128,
+            MQ3G256V2,
+            MQ2G256V2,
+            MQ8G256,
+            MQ6G256,
+            MQ5G256,
+            MQ3G256,
+            MQ2G256,
+            MQ2G256Lloyd,
+            MQ2G256LloydU,
+            MQ3G256Lloyd,
+            MQ4G256Lloyd,
+            MQ2G256GL,
+            MQ3G256GL,
+            HFP4G32,
+            MFP4G32,
+            MFP4G32Lloyd,
+            MFP4G32P,
+            MFP4G32E8,
+            MFP4G32E8SOA,
+            MFP3G32E8,
+            MFP2G32E8,
+            MFP4G32E8G128,
+            HFQ2G256,
+            HFQ2G128,
+            TQ2G128,
+            BQ1G128,
+            HFQ6G256,
+            ParoQ4G128,
+            FP8E4M3B128,
+            FP8E4M3PT,
+            Raw,
+            MQ3I4G128R256,
+            MQ3I4G128R128,
+            MQ2I4G128R256,
+            MQ2I4G128R128,
+            E8PI4G128R256,
+            E8PI4G128R128,
+        );
+        let mut missing = Vec::new();
+        for dtype in all {
+            for (variant, planned) in [
+                ("residual", KernelKey::for_gemv_residual(dtype).is_ok()),
+                (
+                    "swiglu_residual",
+                    KernelKey::for_gemv_swiglu_residual(dtype).is_ok(),
+                ),
+            ] {
+                if planned && residual_kernel(dtype, variant).is_err() {
+                    missing.push(format!("{dtype:?} {variant}"));
+                }
+            }
         }
-        MQ5G256V2 => hip!(gpu.gemv_mq5g256v2_residual(w.buf, x_in, residual, m, k)),
-        MQ6G256V2 => hip!(gpu.gemv_mq6g256v2_residual(w.buf, x_in, residual, m, k)),
-        MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x_in, residual, m, k)),
-        MQ2G256V2 => hip!(gpu.gemv_mq2g256v2_residual(w.buf, x_in, residual, m, k)),
-        MQ4CG256 => hip!(gpu.gemv_mq4cg256_residual(w.buf, x_in, residual, m, k)),
-        MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
-        MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
-        MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
-        MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
-        MQ4G128V2 => reject_mq4g128v2(),
-        _ => Err(DispatchError::UnsupportedVariant {
-            family: "gemv",
-            variant: "swiglu_residual",
-            arch: "",
-            quant: "",
-        }),
+        assert!(
+            missing.is_empty(),
+            "planned without a dispatch arm: {missing:?}"
+        );
     }
 }
