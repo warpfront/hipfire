@@ -59,7 +59,7 @@
       # NixOS module's `pkgs.rocmPackages` LD_LIBRARY_PATH.
       overlays.default = final: prev: {
         rocmPackages = (import nixpkgs {
-          inherit (final) system;
+          system = final.stdenv.hostPlatform.system;
           config = { rocmSupport = true; allowUnfree = true; };
         }).rocmPackages;
         hipfire = final.callPackage ./nix/package.nix {

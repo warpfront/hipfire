@@ -93,10 +93,6 @@ let
         pkgs.rocmPackages.rocm-comgr
         pkgs.rocmPackages.rocprofiler-register
       ]}"
-      # JIT hipcc needs HIP_PATH (clr) and rocm-device-libs bitcode dir.
-      # Without these the daemon panics on first kernel compile.
-      "HIP_PATH=${pkgs.rocmPackages.clr}"
-      "HIPFIRE_HIPCC_EXTRA_FLAGS=--rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
     ];
 in
 {

@@ -77,9 +77,11 @@ hipfire.url = "github:warpfront/hipfire/<tag-or-commit>";
 `nix build github:warpfront/hipfire#hipfire-kernels` output contains the same
 exact-source registry objects and `.index.json` files. Override `gpuTargets`
 with the architecture of your GPU to avoid building the entire five-arch set;
-the NixOS module uses `services.hipfire.gpuTargets`. An unsupported architecture
-or unregistered runtime route requires hipcc JIT. Packaging fails if a required
-registry entry cannot compile; partial unindexed packages are not installed.
+the NixOS module uses `services.hipfire.gpuTargets`. Targets outside the
+five-arch registry (for example `gfx1200` or `gfx1030`) package no kernels and
+are compiled by hipcc JIT on first use, as is any unregistered runtime route.
+Packaging fails if a required registry entry cannot compile; partial unindexed
+packages are not installed.
 
 ## NixOS module
 
@@ -287,8 +289,8 @@ Set only arches you need. Common labels (not an admission list):
 | gfx1030 | RX 6800 XT class |
 | gfx1100 | RX 7900 XTX class |
 | gfx1151 | Strix Halo |
-| gfx1200 | Radeon AI PRO R9700 class |
-| gfx1201 | RX 9070 / 9070 XT class |
+| gfx1200 | RX 9060 / 9060 XT class |
+| gfx1201 | RX 9070 / 9070 XT, Radeon AI PRO R9700 class |
 
 ```nix
 services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
@@ -338,7 +340,12 @@ nixos-25.11’s ROCm 6.4.3 `libamdhip64` can segfault on **gfx1151** during
 weight upload — prefer the overlay on Strix Halo hosts.
 
 `LD_LIBRARY_PATH` is injected on the daemon/CLI wrappers and the systemd
-unit when `rocmSupport = true`.
+unit when `rocmSupport = true`. The wrappers, the kernel package build and the
+dev shell also set `HIPFIRE_ROCM_PATH` to the prefix built by
+`nix/rocm-root.nix`, which joins `clr`, `rocm-runtime` and `rocm-device-libs`:
+hipfire requires the HIP headers, `libamdhip64`, `libhsa-runtime64`, `hipcc`
+and the device bitcode under a single root, and nixpkgs splits them across
+those packages.
 
 ### Bring your own ROCm
 

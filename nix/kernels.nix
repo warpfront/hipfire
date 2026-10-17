@@ -1,13 +1,20 @@
+let
+  # rdna-compute kernel_registry::SUPPORTED_ARCHES. Other targets (gfx1200,
+  # gfx1030, ...) have no registry to package; the daemon JIT-compiles them.
+  registryArchs = [ "gfx1201" "gfx1100" "gfx1151" "gfx906" "gfx942" ];
+in
 { lib
 , rustPlatform
+, symlinkJoin
 , rocmPackages
 , src ? lib.cleanSource ./..
 , cargoLockFile ? ../Cargo.lock
-, gpuTargets ? [ "gfx1201" "gfx1100" "gfx1151" "gfx906" "gfx942" ]
+, gpuTargets ? registryArchs
 }:
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+  packagedTargets = lib.concatStringsSep " " (lib.filter (arch: lib.elem arch registryArchs) gpuTargets);
 in
 rustPlatform.buildRustPackage {
   pname = "hipfire-kernels";
@@ -23,16 +30,16 @@ rustPlatform.buildRustPackage {
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    export HIPFIRE_ROCM_PATH=${rocmPackages.clr}
-    export HIPFIRE_HIPCC_EXTRA_FLAGS=--rocm-device-lib-path=${rocmPackages.rocm-device-libs}/amdgcn/bitcode
-    bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets}
+    export HIPFIRE_ROCM_PATH=${import ./rocm-root.nix { inherit symlinkJoin rocmPackages; }}
+    # No arguments would make the script package every registry arch.
+    ${lib.optionalString (packagedTargets != "") "bash scripts/compile-kernels.sh ${packagedTargets}"}
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p "$out/kernels/compiled"
-    for arch in ${lib.concatStringsSep " " gpuTargets}; do
+    for arch in ${packagedTargets}; do
       test -f "kernels/compiled/$arch/rmsnorm.index.json"
       cp -r "kernels/compiled/$arch" "$out/kernels/compiled/"
     done

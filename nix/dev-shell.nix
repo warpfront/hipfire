@@ -1,5 +1,6 @@
 { lib
 , mkShell
+, symlinkJoin
 , rust-bin
 , rocmPackages
 , pkg-config
@@ -37,6 +38,10 @@ mkShell {
       rocmPackages.rocm-comgr
       rocmPackages.rocprofiler-register
     ]);
+
+  # One coherent ROCm root for hipfire's resolver and JIT (see rocm-root.nix).
+  HIPFIRE_ROCM_PATH = lib.optionalString rocmSupport
+    (import ./rocm-root.nix { inherit symlinkJoin rocmPackages; });
 
   shellHook = ''
     echo "hipfire dev shell"
