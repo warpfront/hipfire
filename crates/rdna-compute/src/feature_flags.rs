@@ -299,7 +299,8 @@ pub struct FeatureFlags {
     pub gate_up_ldsstage: bool,
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 WMMA
     /// GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per block, X slab staged in
-    /// LDS) for gate_up/qkvza/qkv/residual. Default on for exact gfx1151, false
+    /// LDS) for gate_up/qkvza/qkv/residual, and the matching Q8_0
+    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head). Default on for exact gfx1151, false
     /// elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
