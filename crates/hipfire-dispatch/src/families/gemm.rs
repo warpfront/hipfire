@@ -639,8 +639,8 @@ impl GemmFamily {
             // `(w.buf, x, y, m, k, batch_size)` is byte-identical, and each method
             // keeps its own internal arch routing (WMMA for batch>1 on gfx11/12,
             // dp4a on gfx906, fp16/scalar fallback) so output is preserved exactly.
-            // Scalar Q8 kernel, F32 in/out, chunked at its 64-row cap
-            // (`q8_0_batched_chunks`): the bare kernel asserts above 64 rows (#732).
+            // Scalar Q8 kernel, F32 in/out, launched in 64-row chunks
+            // (`q8_0_batched_chunks`, #732).
             K::GemmQ8_0Batched => {
                 hip!(gpu.gemm_q8_0_batched_f32_chunked(w.buf, x, y, m, k, batch_size))
             }

@@ -13,13 +13,12 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::{LazyLock, OnceLock};
 
-/// Most activation rows one `gemm_q8_0_batched` launch takes: the kernel keeps
-/// one accumulator per row and `gemm_q8_0_batched` asserts above this. Callers
-/// with more rows go through [`Gpu::gemm_q8_0_batched_f32_chunked`], which
-/// splits with [`q8_0_batched_chunks`].
+/// Most activation rows one `gemm_q8_0_batched` kernel launch takes: the
+/// kernel keeps one accumulator per row. `gemm_q8_0_batched` launches once per
+/// [`q8_0_batched_chunks`] chunk above this.
 pub const Q8_0_BATCHED_MAX_BATCH: usize = 64;
 
-/// The `(row_offset, rows)` launches [`Gpu::gemm_q8_0_batched_f32_chunked`]
+/// The `(row_offset, rows)` launches [`Gpu::gemm_q8_0_batched`]
 /// makes for `n` activation rows: consecutive, non-overlapping, covering
 /// `0..n` exactly, each at most [`Q8_0_BATCHED_MAX_BATCH`] rows (the last takes
 /// the remainder). `n == 0` yields no launch. Pure; the single place the
@@ -26300,8 +26299,10 @@ impl Gpu {
     /// One block per output row (32 threads, one wave). Each thread holds
     /// `Q8_0_BATCHED_MAX_BATCH` (64) per-batch accumulators and broadcasts each
     /// weight load. Drops the (batch_size − 1)× weight re-reads of the GEMV-loop
-    /// path. One launch only: `batch_size` above 64 asserts, so callers that can
-    /// see more rows use [`Self::gemm_q8_0_batched_f32_chunked`] (#732).
+    /// path. Launches once per [`q8_0_batched_chunks`] chunk of at most 64 rows
+    /// (none at 0 rows), each through bounds-checked `sub_offset` views; a row's
+    /// reduction does not depend on `batch_size`, so the bytes equal one call
+    /// per row (#732).
     pub fn gemm_q8_0_batched(
         &mut self,
         a_raw: &GpuTensor,
@@ -26311,11 +26312,27 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        for (off, take) in q8_0_batched_chunks(batch_size) {
+            let x_sub = x.sub_offset(off * k, take * k);
+            let y_sub = y.sub_offset(off * m, take * m);
+            self.gemm_q8_0_batched_launch(a_raw, &x_sub, &y_sub, m, k, take)?;
+        }
+        Ok(())
+    }
+
+    /// One kernel launch. The kernel skips rows past `Q8_0_BATCHED_MAX_BATCH`
+    /// without an error, so more rows here would leave output rows unwritten.
+    fn gemm_q8_0_batched_launch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(
-            batch_size <= Q8_0_BATCHED_MAX_BATCH,
-            "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH={Q8_0_BATCHED_MAX_BATCH}; use gemm_q8_0_batched_f32_chunked"
-        );
+        assert!(batch_size <= Q8_0_BATCHED_MAX_BATCH);
         self.ensure_kernel(
             "gemm_q8_0_batched",
             kernels::GEMM_Q8_0_BATCHED_SRC,
@@ -26478,13 +26495,15 @@ impl Gpu {
         self.gemm_q8_0_batched_f32_chunked(a_raw, x, y, m, k, n)
     }
 
-    /// Explicit F32-precision Q8_0 batched GEMM: sub-batches at MAX_BATCH=64 and
-    /// always runs the scalar `gemm_q8_0_batched` path (F32 activations and F32
+    /// Explicit F32-precision Q8_0 batched GEMM: always runs the scalar
+    /// `gemm_q8_0_batched` path (F32 activations and F32
     /// dequant of Q8 weights). Separate from [`Self::gemm_q8_0_batched_chunked`],
     /// whose automatic WMMA selector rounds both F32 inputs and dequant weights
     /// to F16 on gfx12 — that loss breaks Gemma prefill/decode continuation.
     /// Keeps the same portable Always contract as the generic F32 kernels; no
-    /// arch gate. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
+    /// arch gate. Y[n, m] = X[n, k] @ A_q8[m, k]^T. The name predates #732: the
+    /// 64-row split now lives in `gemm_q8_0_batched`; this entry only adds the
+    /// gfx1151 staged-rows route.
     pub fn gemm_q8_0_batched_f32_chunked(
         &mut self,
         a_raw: &GpuTensor,
@@ -26499,13 +26518,7 @@ impl Gpu {
         if self.gemv_q8_0_staged_rows_supported(k, self.route_rows(n)) {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
-        self.bind_thread()?;
-        for (off, take) in q8_0_batched_chunks(n) {
-            let x_sub = x.sub_offset(off * k, take * k);
-            let y_sub = y.sub_offset(off * m, take * m);
-            self.gemm_q8_0_batched(a_raw, &x_sub, &y_sub, m, k, take)?;
-        }
-        Ok(())
+        self.gemm_q8_0_batched(a_raw, x, y, m, k, n)
     }
 
     /// Resolve and dispatch the Q8_0 dense prefill GEMM (`Y[N,M] = X[N,K] @

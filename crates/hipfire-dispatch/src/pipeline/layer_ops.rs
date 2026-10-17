@@ -755,10 +755,9 @@ fn project_rotated(
             gpu.gemm_mq2g256v2(weight.buf, x, output, weight.m, weight.k, rows)
         }
         (DType::Q8_0, false) => gpu.gemv_q8_0(weight.buf, x, output, weight.m, weight.k),
-        // `gemm_q8_0_batched` is capped at MAX_BATCH=64 (it asserts), so a
-        // prefill wider than that fails outright. The F32-preserving chunked
-        // entry sub-batches at 64 and calls that SAME kernel per sub-batch, so
-        // the arithmetic the Q8 trunk already had is unchanged.
+        // The F32-preserving chunked entry runs the scalar `gemm_q8_0_batched`
+        // kernel in 64-row launches, so the arithmetic the Q8 trunk already
+        // had is unchanged.
         //
         // Deliberately not `gemm_q8_0_batched_chunked`: on gfx11/gfx1151 that
         // routes to the WMMA kernel, which rounds the activations and the

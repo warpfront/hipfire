@@ -142,21 +142,9 @@ pub fn gemm_rows(
         DType::F32 => gpu
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
-        DType::Q8_0 if *EAGLE_STRICT => {
-            // The bare scalar kernel holds at most `Q8_0_BATCHED_MAX_BATCH` rows.
-            for (off, n) in rdna_compute::gemm::q8_0_batched_chunks(rows) {
-                gpu.gemm_q8_0_batched(
-                    w.buf,
-                    &x.sub_offset(off * w.k, n * w.k),
-                    &y.sub_offset(off * w.m, n * w.m),
-                    w.m,
-                    w.k,
-                    n,
-                )
-                .map_err(hip)?;
-            }
-            Ok(())
-        }
+        DType::Q8_0 if *EAGLE_STRICT => gpu
+            .gemm_q8_0_batched(w.buf, x, y, w.m, w.k, rows)
+            .map_err(hip),
         // gfx1151: the 4-warp 64x64 tile reads each weight tile once per 64
         // rows (the 16x16 kernel re-reads it per 16 rows); a sub-64 row tail
         // takes the 16x16 kernel.
