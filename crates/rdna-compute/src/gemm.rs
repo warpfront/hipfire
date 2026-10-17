@@ -26599,9 +26599,19 @@ impl Gpu {
         // RDNA3/RDNA3.5 and RDNA4 wave32 WMMA use different f32-accumulator
         // output layouts, so select the matching kernel source. The RDNA3
         // source (gfx1151-tuned) is the single-warp Q8_0 drop-in on gfx11 /
-        // RDNA3.5; `_gfx12` is its RDNA4 sibling. Launch is identical.
+        // RDNA3.5; `_gfx12` is its RDNA4 sibling. Exact gfx1151 at 1..=16 rows
+        // takes `_gfx1151_xlds` (byte-identical outputs, 4 waves x 16 rows per
+        // block, b128 weight loads; needs a 16 B aligned A, K % 256 == 0).
+        let xlds = !self.arch_caps.is_rdna4()
+            && self.gfx1151_xlds_active(batch_size, k)
+            && (a.buf.as_ptr() as usize).is_multiple_of(16);
         let (kname, ksrc): (&str, &str) = if self.arch_caps.is_rdna4() {
             ("gemm_q8_0_wmma_gfx12", kernels::GEMM_Q8_0_WMMA_GFX12_SRC)
+        } else if xlds {
+            (
+                "gemm_q8_0_wmma_gfx1151_xlds",
+                kernels::GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC,
+            )
         } else {
             ("gemm_q8_0_wmma", kernels::GEMM_Q8_0_WMMA_SRC)
         };
@@ -26640,14 +26650,19 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        let row_tiles = (m + 15) / 16;
+        // The XLDS kernel's block is 4 waves of 16 rows each.
+        let (row_tiles, threads) = if xlds {
+            (m.div_ceil(64), 128)
+        } else {
+            (m.div_ceil(16), 32)
+        };
         let batch_tiles = (batch_size + 15) / 16;
         let bytes = m * (k / 32) * 34 + batch_size * k * 2 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [threads, 1, 1],
             0,
             &mut params,
             || {

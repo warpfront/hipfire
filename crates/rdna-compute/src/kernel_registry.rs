@@ -1915,6 +1915,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds"
             ]
         );
+        // Exact-gfx1151 1..=16-row Q8_0 WMMA (HIPFIRE_GFX1151_XLDS; =0 restores the base kernel).
+        add!(
+            "gemm_q8_0_wmma_gfx1151_xlds",
+            kernels::GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC,
+            ["gemm_q8_0_wmma_gfx1151_xlds"]
+        );
         add!(
             "gemm_mqv2_wmma_gfx1151_mw_lds",
             kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC,
