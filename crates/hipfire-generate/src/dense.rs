@@ -561,6 +561,7 @@ pub fn generate_deepseek4_spec(
             frequency_penalty: 0.0,
             // The DSpark speculator keeps no one-row windows to retain.
             stop_sequences: false,
+            logprobs: false,
         });
     }
 
@@ -606,6 +607,7 @@ pub fn generate_deepseek4_spec(
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
             decoded_vocab,
+            logprobs_top_k: None,
         },
         temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
     ) {
@@ -2230,7 +2232,8 @@ fn trace_gemma4_logits(
 /// when a cache is attached.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`, opt-in with
-/// `HIPFIRE_GEMMA4_EAGLE=1`) runs greedy requests through the generic
+/// `HIPFIRE_GEMMA4_EAGLE=1`; not faster than AR on gfx1151) runs greedy,
+/// sampled, penalized and logprobs requests through the generic
 /// `generate_spec` core instead ([`generate_gemma4_spec`]).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
@@ -2391,20 +2394,17 @@ pub fn generate_gemma4(
         return;
     }
 
-    // Greedy, penalty-free requests that fit one verify block past their
-    // budget go to the EAGLE speculator. It commits the target's batched
-    // verify argmax, which can differ from AR decode on near-tied logits.
-    let spec = temp <= 1e-6
-        && sampler_cfg.repeat_penalty == 1.0
-        && sampler_cfg.presence_penalty == 0.0
-        && sampler_cfg.frequency_penalty == 0.0
-        && logprobs_top_k.is_none()
-        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
-            .ok()
-            .as_deref()
-            == Some("1")
+    // Requests that fit one verify block past their budget go to the EAGLE
+    // speculator. Greedy ones commit the target's batched verify argmax,
+    // which can differ from AR decode on near-tied logits; sampled and
+    // penalized ones draw each verify row with the AR sampler.
+    let spec = hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+        .ok()
+        .as_deref()
+        == Some("1")
         && m.speculator.as_ref().is_some_and(|s| {
-            spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
+            (temp <= 1e-6 || !s.requires_greedy())
+                && spec_ctx_request_fits(prompt_ids.len(), max_tokens, s.block_size(), cache_cap)
         });
     let route = if spec {
         hipfire_runtime::session_cache::SessionRoute::Mtp
@@ -2423,10 +2423,13 @@ pub fn generate_gemma4(
             id,
             prompt_ids,
             reused,
+            &sampler_cfg,
+            request_seed,
             max_tokens,
             max_think_tokens,
             enable_thinking,
             cfg_eos_tok,
+            logprobs_top_k,
         );
         return;
     }
@@ -2583,8 +2586,10 @@ pub fn generate_gemma4(
 /// Gemma 4 EAGLE spec decode on the generic `generate_spec` core: the
 /// `MtpSpeculator<Gemma4Drafter>` in `m.speculator`, the bundle as
 /// `SpecTarget` and `GemmaSpecEmit`. `reused` prompt tokens come from the
-/// session plan; greedy only. Writes the Gemma `done` envelope and commits
-/// the session's snapshots.
+/// session plan. The request's sampler (temperature, top-p/k, min-p,
+/// penalties, seed) and logprobs reach the drafter through
+/// `configure_request`. Writes the Gemma `done` envelope and commits the
+/// session's snapshots.
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4_spec(
     m: &mut LoadedModel,
@@ -2593,11 +2598,29 @@ fn generate_gemma4_spec(
     id: &str,
     prompt_ids: Vec<u32>,
     reused: usize,
+    sampler_cfg: &hipfire_runtime::sampler::SamplerConfig,
+    request_seed: u32,
     max_tokens: usize,
     max_think_tokens: usize,
     enable_thinking: bool,
     cfg_eos_tok: u32,
+    logprobs_top_k: Option<usize>,
 ) {
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.configure_request(SpecRequestConfig {
+            temp: sampler_cfg.temperature,
+            top_p: sampler_cfg.top_p,
+            top_k: sampler_cfg.top_k,
+            min_p: sampler_cfg.min_p.unwrap_or(0.0),
+            rng_seed: request_seed as u64,
+            repeat_penalty: sampler_cfg.repeat_penalty,
+            repeat_window: sampler_cfg.repeat_window,
+            presence_penalty: sampler_cfg.presence_penalty,
+            frequency_penalty: sampler_cfg.frequency_penalty,
+            logprobs: logprobs_top_k.is_some(),
+            ..SpecRequestConfig::default()
+        });
+    }
     // Host mirrors match the reused prefix; the bundle owns device state.
     m.seq_pos = reused;
     m.conversation_tokens.clear();
@@ -2629,8 +2652,9 @@ fn generate_gemma4_spec(
                 ThinkMode::NonThink
             },
             decoded_vocab: None,
+            logprobs_top_k,
         },
-        0.0,
+        sampler_cfg.temperature,
     ) else {
         // generate_spec already wrote the terminal event.
         return;

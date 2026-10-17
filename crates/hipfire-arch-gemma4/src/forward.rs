@@ -693,7 +693,9 @@ pub fn forward_batch(
     tokens: &[u32],
     start_pos: usize,
 ) -> Result<Vec<f32>, String> {
-    forward_batch_spec(cfg, weights, state, gpu, tokens, start_pos, None, None)
+    forward_batch_spec(
+        cfg, weights, state, gpu, tokens, start_pos, None, None, None,
+    )
 }
 
 /// Batched verify forward with optional spec-decode out-params (Part A of the
@@ -710,9 +712,12 @@ pub fn forward_batch(
 ///   each block position ([B], `argmax_per_pos[i]` = the target's prediction
 ///   AFTER block position `i`). Computed by running the SAME lm_head + final
 ///   logit softcap the eager path uses, per row. Required for greedy accept.
+/// * `per_pos_logits_out` — when `Some`, receives the same rows' logits
+///   `[B × vocab]` on the host, softcapped like the eager `decode_step`'s
+///   (sampled or penalized verify, logprobs).
 ///
-/// When BOTH are `None` this is byte-identical to `forward_batch` (only the
-/// last-row final-norm + lm_head + softcap + download runs, as before).
+/// When all three are `None` this is byte-identical to `forward_batch` (only
+/// the last-row final-norm + lm_head + softcap + download runs, as before).
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_spec(
     cfg: &Gemma4Config,
@@ -723,6 +728,7 @@ pub fn forward_batch_spec(
     start_pos: usize,
     per_token_hidden_out: Option<&GpuTensor>,
     per_pos_argmax_out: Option<&mut Vec<u32>>,
+    per_pos_logits_out: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>, String> {
     forward_rows(
         cfg,
@@ -733,6 +739,7 @@ pub fn forward_batch_spec(
         start_pos,
         per_token_hidden_out,
         per_pos_argmax_out,
+        per_pos_logits_out,
         true,
     )
 }
@@ -755,7 +762,9 @@ pub fn forward_prefill_batch(
             decode_step(cfg, weights, state, gpu, *token, pos as u32)?;
             continue;
         }
-        forward_rows(cfg, weights, state, gpu, chunk, pos, None, None, false)?;
+        forward_rows(
+            cfg, weights, state, gpu, chunk, pos, None, None, None, false,
+        )?;
     }
     Ok(())
 }
@@ -772,7 +781,8 @@ fn forward_rows(
     tokens: &[u32],
     start_pos: usize,
     per_token_hidden_out: Option<&GpuTensor>,
-    per_pos_argmax_out: Option<&mut Vec<u32>>,
+    mut per_pos_argmax_out: Option<&mut Vec<u32>>,
+    mut per_pos_logits_out: Option<&mut Vec<f32>>,
     last_logits: bool,
 ) -> Result<Vec<f32>, String> {
     let b = tokens.len();
@@ -967,7 +977,7 @@ fn forward_rows(
     drop(steps);
     state.n_tokens = start_pos + b;
 
-    // ── Spec-decode out-params (ADDITIVE; both default-off). ──
+    // ── Spec-decode out-params (ADDITIVE; all default-off). ──
     // `x` here holds the [B, dim] post-residual hidden for all B positions.
     //
     // (1) per_token_hidden_out: batched final-norm over all B rows → the
@@ -979,12 +989,13 @@ fn forward_rows(
     //     forward uses for its other projections, so the MQ4 lm_head rotation is
     //     handled with explicit scratch (NOT weight_gemv's internal mq_x_rot,
     //     which the batched path never sizes → would fault on MQ4 lm_head).
+    // (3) per_pos_logits_out: the same [B, vocab] rows, softcapped, on the host.
     //
-    // Both use a [B, dim] normed-hidden buffer. When (1) is requested we write
-    // straight into it; otherwise we allocate a local one only if (2) needs it.
+    // All use a [B, dim] normed-hidden buffer. When (1) is requested we write
+    // straight into it; otherwise we allocate a local one only if (2)/(3) need it.
     let want_hidden = per_token_hidden_out.is_some();
-    let want_argmax = per_pos_argmax_out.is_some();
-    if want_hidden || want_argmax {
+    let want_rows = per_pos_argmax_out.is_some() || per_pos_logits_out.is_some();
+    if want_hidden || want_rows {
         // Normed hidden destination: the caller's buffer if provided, else a
         // local scratch sized [B, dim].
         let local_hidden = if want_hidden {
@@ -1000,9 +1011,7 @@ fn forward_rows(
         gpu.rmsnorm_batched(x, &weights.final_norm, normed_hidden, b, dim, eps)
             .map_err(|e| format!("gemma4 forward_batch_spec final rmsnorm: {e:?}"))?;
 
-        if let Some(out) = per_pos_argmax_out {
-            out.clear();
-            out.reserve(b);
+        if want_rows {
             let vocab = cfg.vocab_size;
             if weights.lm_head.gpu_dtype == DType::Q8_0 {
                 // FAST PATH (the spec-verify perf lever): a single batched Q8 WMMA
@@ -1013,9 +1022,9 @@ fn forward_rows(
                 // correct after the stale-fp16-cache fix); elsewhere it sub-batches
                 // the scalar Q8 GEMM — either way Y[B, vocab] row-major.
                 //
-                // Softcap is SKIPPED: it's a strictly-monotonic per-element map
-                // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
-                // decision is an argmax, so this is bit-exact in the decision.
+                // The argmax skips the softcap: it's a strictly-monotonic
+                // per-element map (tanh-scaled), so argmax(softcap(z)) ==
+                // argmax(z). The host rows of (3) take it.
                 let logits_b = bufs.alloc(b * vocab, "spec_logits_b")?;
                 // Not `_chunked`: verify stays on the scalar kernel rather
                 // than the gfx12 WMMA variant, whose drift accumulates in KV.
@@ -1031,19 +1040,38 @@ fn forward_rows(
                 );
                 lm_result
                     .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
-                // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
-                let idx_buf = bufs.alloc(b, "spec_argmax_idx")?;
-                gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
-                    .map_err(|e| format!("gemma4 forward_batch_spec batched argmax: {e:?}"))?;
-                let mut idx_i32 = vec![0i32; b];
-                let idx_bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(idx_i32.as_mut_ptr() as *mut u8, b * 4)
-                };
-                gpu.hip
-                    .memcpy_dtoh(idx_bytes, &idx_buf.buf)
-                    .map_err(|e| format!("gemma4 forward_batch_spec argmax dtoh: {e:?}"))?;
-                for v in idx_i32 {
-                    out.push(v as u32);
+                if let Some(out) = per_pos_argmax_out {
+                    out.clear();
+                    out.reserve(b);
+                    // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
+                    let idx_buf = bufs.alloc(b, "spec_argmax_idx")?;
+                    gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
+                        .map_err(|e| format!("gemma4 forward_batch_spec batched argmax: {e:?}"))?;
+                    let mut idx_i32 = vec![0i32; b];
+                    let idx_bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(idx_i32.as_mut_ptr() as *mut u8, b * 4)
+                    };
+                    gpu.hip
+                        .memcpy_dtoh(idx_bytes, &idx_buf.buf)
+                        .map_err(|e| format!("gemma4 forward_batch_spec argmax dtoh: {e:?}"))?;
+                    for v in idx_i32 {
+                        out.push(v as u32);
+                    }
+                }
+                if let Some(out) = per_pos_logits_out {
+                    if cfg.final_logit_softcapping > 0.0 {
+                        gpu.logit_softcap_f32(&logits_b, b * vocab, cfg.final_logit_softcapping)
+                            .map_err(|e| {
+                                format!("gemma4 forward_batch_spec rows softcap: {e:?}")
+                            })?;
+                    }
+                    out.resize(b * vocab, 0.0);
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, b * vocab * 4)
+                    };
+                    gpu.hip
+                        .memcpy_dtoh(bytes, &logits_b.buf)
+                        .map_err(|e| format!("gemma4 forward_batch_spec rows dtoh: {e:?}"))?;
                 }
             } else {
                 // FALLBACK (non-Q8 lm_head, e.g. MQ4): per-row SCALAR `weight_gemv`
@@ -1053,6 +1081,14 @@ fn forward_rows(
                 // `gemm_hfq4g256_residual_wmma[_gfx12]`, whose b>1 path faults
                 // (illegal access) at this output width on gfx12. `weight_gemv`
                 // (per-row, b=1) sidesteps it entirely.
+                if let Some(out) = per_pos_argmax_out.as_deref_mut() {
+                    out.clear();
+                    out.reserve(b);
+                }
+                if let Some(out) = per_pos_logits_out.as_deref_mut() {
+                    out.clear();
+                    out.reserve(b * vocab);
+                }
                 for i in 0..b {
                     let hidden_row = normed_hidden.sub_offset(i * dim, dim);
                     weight_gemv(gpu, &weights.lm_head, &hidden_row, &state.logits)
@@ -1066,7 +1102,12 @@ fn forward_rows(
                     let row = gpu.download_f32(&state.logits).map_err(|e| {
                         format!("gemma4 forward_batch_spec download row {i}: {e:?}")
                     })?;
-                    out.push(argmax_f32_row(&row));
+                    if let Some(out) = per_pos_argmax_out.as_deref_mut() {
+                        out.push(argmax_f32_row(&row));
+                    }
+                    if let Some(out) = per_pos_logits_out.as_deref_mut() {
+                        out.extend_from_slice(&row);
+                    }
                 }
             }
         }

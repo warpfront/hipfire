@@ -10,10 +10,18 @@
 //! KV) and the target's post-norm hidden of `position - 1`, the hidden that
 //! predicted it. The drafter drafts `k` tokens at the constant query
 //! position `position`; one batched verify writes `[seed, drafts..]` at
-//! `position..` and returns per-row argmax and post-norm hidden; the greedy
-//! accept rule commits the accepted drafts plus the bonus. Gemma 4 KV is
+//! `position..` and returns per-row argmax (greedy) or per-row logits
+//! (sampled or penalized requests, logprobs) and post-norm hidden; the accept
+//! rule commits the accepted drafts plus the bonus. Gemma 4 KV is
 //! position-indexed, so rejected rows need no rollback: the next verify
-//! overwrites them. Greedy only.
+//! overwrites them.
+//!
+//! Sampled and penalized requests verify by SpecInfer naive sampling: drafts
+//! stay the draft head's argmax, verify row `i` draws one token with the AR
+//! producer's sampler (`sampler::sample_cpu` and its process-wide RNG,
+//! penalized against `suffix_W(prompt ‖ emitted ‖ drafts[..i])`), and a
+//! draft is accepted iff it equals its row's draw. Every emitted token is one
+//! AR draw in AR's order, so the output follows the AR distribution.
 
 use crate::bundle::Gemma4Bundle;
 use crate::drafter::{
@@ -22,12 +30,14 @@ use crate::drafter::{
 };
 use crate::forward::{decode_step, forward_batch_spec};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::argmax;
+use hipfire_runtime::llama::{argmax, reset_cpu_sampler_rng, sample_top_k_p};
+use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
     accept_greedy_prefix, MtpDrafter, MtpWindow, PrefillOutcome, SpecAdvance, SpecGrammar,
-    SpecScratch, SpecTarget,
+    SpecRequestConfig, SpecScratch, SpecTarget,
 };
+use hipfire_runtime::spec_sampling::{accept_naive_prefix, naive_target_sampler, PenaltyHistory};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn gemma4(target: &mut dyn SpecTarget) -> Result<&mut Gemma4Bundle, String> {
@@ -35,6 +45,71 @@ fn gemma4(target: &mut dyn SpecTarget) -> Result<&mut Gemma4Bundle, String> {
         .as_any_mut()
         .downcast_mut::<Gemma4Bundle>()
         .ok_or_else(|| "gemma4 drafter: target is not a Gemma 4 bundle".to_string())
+}
+
+/// The target policy of a sampled or penalized request: the sampler the
+/// Gemma 4 AR producer (`generate_gemma4`) draws every token with, and the
+/// penalty history it sees there (prompt ‖ generated).
+// ponytail: naive acceptance (argmax drafts); Leviathan with the draft head's
+// distribution as `q` would accept more drafts at temp > 0.
+struct TargetPolicy {
+    sampler: SamplerConfig,
+    history: PenaltyHistory,
+    /// The request's prompt is in `history` (its first prefill sets it).
+    prompt_set: bool,
+    /// Penalized copy of the row being drawn.
+    scratch: Vec<f32>,
+}
+
+impl TargetPolicy {
+    fn new(cfg: &SpecRequestConfig) -> Self {
+        // The AR producer's per-request seeding of the shared sampler RNG.
+        reset_cpu_sampler_rng(cfg.rng_seed as u32);
+        Self {
+            sampler: naive_target_sampler(cfg),
+            history: PenaltyHistory::new(cfg.penalty_window()),
+            prompt_set: false,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// One AR draw from `row` penalized by `history`.
+    fn draw(sampler: &SamplerConfig, scratch: &mut Vec<f32>, row: &[f32], history: &[u32]) -> u32 {
+        if history.is_empty() {
+            // No penalty stage: `sample_cpu` would not touch the row.
+            return sample_top_k_p(
+                row,
+                sampler.temperature,
+                sampler.top_p,
+                sampler.top_k,
+                sampler.min_p,
+            );
+        }
+        scratch.clear();
+        scratch.extend_from_slice(row);
+        sample_cpu(scratch, history, sampler)
+    }
+
+    /// The prefill's first token. `prompt` is the full rendered prompt (on a
+    /// realign it also replays the emitted tokens, which AR's history holds).
+    fn draw_prefill(&mut self, row: &[f32], prompt: &[u32]) -> u32 {
+        if !self.prompt_set {
+            self.history.set_prompt(prompt);
+            self.prompt_set = true;
+        }
+        let tail = &prompt[prompt.len().saturating_sub(self.history.window())..];
+        Self::draw(&self.sampler, &mut self.scratch, row, tail)
+    }
+
+    /// Verify row `index`'s token, penalized by history row `index`.
+    fn draw_row(&mut self, row: &[f32], index: usize) -> u32 {
+        Self::draw(
+            &self.sampler,
+            &mut self.scratch,
+            row,
+            self.history.row(index),
+        )
+    }
 }
 
 /// The arch-22 EAGLE drafter riding a Gemma 4 target.
@@ -48,6 +123,15 @@ pub struct Gemma4Drafter {
     verify_hidden: GpuTensor,
     k: usize,
     ctx_capacity: usize,
+    vocab: usize,
+    /// The request's target policy when it samples (`temp > 1e-6`) or
+    /// penalizes; `None` verifies by greedy argmax.
+    policy: Option<TargetPolicy>,
+    /// The request asked for logprobs: `rows` backs `token_logits`.
+    logprobs: bool,
+    /// Host target logits `[n · vocab]` behind the last emission: the prefill
+    /// row, a `k = 0` decode row, or a window's verify rows.
+    rows: Vec<f32>,
 }
 
 impl Gemma4Drafter {
@@ -114,6 +198,10 @@ impl Gemma4Drafter {
             verify_hidden,
             k: draft_len,
             ctx_capacity: target.state.max_seq,
+            vocab: target.config.vocab_size,
+            policy: None,
+            logprobs: false,
+            rows: Vec::new(),
         })
     }
 
@@ -128,6 +216,13 @@ impl Gemma4Drafter {
         gpu.hip
             .memcpy_dtod_at(&self.pending_hidden.buf, 0, &bundle.state.tmp.buf, 0, bytes)
             .map_err(|e| format!("gemma4 drafter: capture hidden: {e:?}"))
+    }
+
+    /// Keep a single-row emission's logits for `token_logits`.
+    fn keep_row(&mut self, logits: Vec<f32>) {
+        if self.logprobs {
+            self.rows = logits;
+        }
     }
 }
 
@@ -145,9 +240,12 @@ impl MtpDrafter for Gemma4Drafter {
         let bundle = gemma4(target)?;
         let logits = bundle.prefill(gpu, prompt_tokens, start_pos, SessionRoute::Mtp)?;
         self.take_target_hidden(gpu, bundle)?;
-        Ok(PrefillOutcome::Ready {
-            first_token: argmax(&logits),
-        })
+        let first_token = match self.policy.as_mut() {
+            None => argmax(&logits),
+            Some(policy) => policy.draw_prefill(&logits, prompt_tokens),
+        };
+        self.keep_row(logits);
+        Ok(PrefillOutcome::Ready { first_token })
     }
 
     fn mtp_step(
@@ -156,7 +254,7 @@ impl MtpDrafter for Gemma4Drafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
-        _emitted: &[u32],
+        emitted: &[u32],
         k: usize,
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
@@ -169,6 +267,9 @@ impl MtpDrafter for Gemma4Drafter {
             ));
         }
         let dim = bundle.config.dim;
+        if let Some(policy) = self.policy.as_mut() {
+            policy.history.begin_window(emitted);
+        }
         if k == 0 {
             // The seed alone: one ordinary decode step.
             let logits = decode_step(
@@ -180,8 +281,13 @@ impl MtpDrafter for Gemma4Drafter {
                 position as u32,
             )?;
             self.take_target_hidden(gpu, bundle)?;
+            let token = match self.policy.as_mut() {
+                None => argmax(&logits),
+                Some(policy) => policy.draw_row(&logits, 0),
+            };
+            self.keep_row(logits);
             return Ok(MtpWindow {
-                committed: vec![argmax(&logits)],
+                committed: vec![token],
                 accepted: 0,
                 drafts_generated: 0,
             });
@@ -207,6 +313,8 @@ impl MtpDrafter for Gemma4Drafter {
         }
         let hidden = self.verify_hidden.sub_offset(0, block.len() * dim);
         let mut picks = Vec::with_capacity(block.len());
+        let greedy = self.policy.is_none();
+        let want_rows = !greedy || self.logprobs;
         forward_batch_spec(
             &bundle.config,
             &bundle.weights,
@@ -215,9 +323,21 @@ impl MtpDrafter for Gemma4Drafter {
             &block,
             position,
             Some(&hidden),
-            Some(&mut picks),
+            greedy.then_some(&mut picks),
+            want_rows.then_some(&mut self.rows),
         )?;
-        let accept = accept_greedy_prefix(&block[1..], &picks, Some(eos));
+        let accept = match self.policy.as_mut() {
+            None => accept_greedy_prefix(&block[1..], &picks, Some(eos)),
+            Some(policy) => {
+                for &draft in &block[1..] {
+                    policy.history.push_draft(draft);
+                }
+                let (vocab, rows) = (self.vocab, &self.rows);
+                accept_naive_prefix(&block[1..], Some(eos), |row| {
+                    Ok(policy.draw_row(&rows[row * vocab..(row + 1) * vocab], row))
+                })?
+            }
+        };
         let committed = accept.committed.len();
         // The seed and every committed token but the last are in the KV; the
         // last stays pending, conditioned on the hidden of the row before it.
@@ -271,7 +391,19 @@ impl MtpDrafter for Gemma4Drafter {
     }
 
     fn requires_greedy(&self) -> bool {
-        true
+        false
+    }
+
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        self.logprobs = cfg.logprobs;
+        self.policy = (cfg.temp > 1e-6 || cfg.penalties_active()).then(|| TargetPolicy::new(&cfg));
+    }
+
+    fn token_logits(&self, index: usize) -> Option<&[f32]> {
+        if !self.logprobs {
+            return None;
+        }
+        self.rows.get(index * self.vocab..(index + 1) * self.vocab)
     }
 
     fn name(&self) -> &'static str {
@@ -361,6 +493,7 @@ impl SpecTarget for Gemma4Bundle {
             position,
             None,
             Some(&mut picks),
+            None,
         )?;
         Ok(picks)
     }

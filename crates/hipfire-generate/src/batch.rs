@@ -2091,6 +2091,7 @@ fn spec_request_config(s: &BatchSampling, rng_seed: u64) -> hipfire_runtime::spe
         // A lane window's tickets are its own (`finish_native_window` consumes
         // them); only the singleton drafter retains a window for a terminal repair.
         stop_sequences: false,
+        logprobs: false,
     }
 }
 

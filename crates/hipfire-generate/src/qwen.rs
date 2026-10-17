@@ -2982,13 +2982,30 @@ pub fn render_client_events(
     t_ms: u64,
     hold_tool_calls: bool,
 ) {
+    render_client_events_with_logprob(stdout, id, events, t_ms, hold_tool_calls, None);
+}
+
+/// [`render_client_events`] whose token events carry one committed token's
+/// `logprob` / `top_logprobs` fields (`common::token_logprob_fields`).
+fn render_client_events_with_logprob(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    events: &[ClientEvent],
+    t_ms: u64,
+    hold_tool_calls: bool,
+    logprob: Option<&(f64, serde_json::Value)>,
+) {
     for ev in events {
         match ev {
             ClientEvent::Committed { id: tok_id, idx } => {
                 emit_committed_event(stdout, id, *tok_id, *idx, t_ms);
             }
             ClientEvent::Token(text) => {
-                let envelope = qwen_dflash_token_event_value(id, text, active_attempt_id());
+                let mut envelope = qwen_dflash_token_event_value(id, text, active_attempt_id());
+                if let Some((lp, top)) = logprob {
+                    envelope["logprob"] = serde_json::json!(lp);
+                    envelope["top_logprobs"] = top.clone();
+                }
                 let _ = writeln!(stdout, "{}", envelope);
                 let _ = stdout.flush();
             }
@@ -3606,6 +3623,8 @@ pub fn generate_dflash(
             // the drafter keeps its pre-window target/head snapshots reopenable
             // for `repair_terminal_prefix` only when the request may need that.
             stop_sequences: !stop.is_empty(),
+            // The Qwen spec routes emit no logprobs.
+            logprobs: false,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -3641,6 +3660,7 @@ pub fn generate_dflash(
             assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
             decoded_vocab: None,
+            logprobs_top_k: None,
         },
         temp,
     ) {
@@ -4468,6 +4488,15 @@ pub fn generate_spec(
     // can reproduce: no tools/grammar, no stop strings, no think budget.
     let promo_shape_ok =
         emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    let logprobs_top_k = emit_req.logprobs_top_k;
+    // Logprob fields of emission token `index` (`tok`), from the target row
+    // the speculator kept for it.
+    let token_logprob = |spec: &dyn Speculator, index: usize, tok: u32| {
+        logprobs_top_k.and_then(|k| {
+            let row = spec.token_logits(index)?;
+            crate::common::token_logprob_fields(row, tok, Some(k), tokenizer)
+        })
+    };
     let promo_started_in_think = matches!(
         emit_req.assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
@@ -4662,12 +4691,13 @@ pub fn generate_spec(
     // first token is itself a terminator (→ skip the spec loop entirely, so
     // spec_step_dflash never drafts a whole block seeded on a terminal token).
     let first_begin = emit.begin(first_token);
-    render_client_events(
+    render_client_events_with_logprob(
         stdout,
         id,
         &first_begin.events,
         t0.elapsed().as_millis() as u64,
         false,
+        token_logprob(spec.as_ref(), 0, first_token).as_ref(),
     );
 
     // Count/bake the first token only when the emitter emitted it (same guard
@@ -5127,12 +5157,13 @@ pub fn generate_spec(
             pending_seed_committable = spec_outcome_seed_committable(&outcome);
             if pending_seed_committable {
                 emitted.push(tok);
-                render_client_events(
+                render_client_events_with_logprob(
                     stdout,
                     id,
                     &outcome.events,
                     t0.elapsed().as_millis() as u64,
                     false,
+                    token_logprob(spec.as_ref(), consumed, tok).as_ref(),
                 );
                 generated += 1;
             }

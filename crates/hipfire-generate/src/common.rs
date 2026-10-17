@@ -1656,6 +1656,9 @@ pub struct SpecEmitRequest {
     /// Pre-decoded vocab for arches whose grammar masks per-token (ds4). The
     /// wrapper builds/caches the Arc so this struct carries no `LoadedModel` ref.
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+    /// `Some(k)`: each emitted token event carries `logprob` and `k`
+    /// `top_logprobs` from the row `Speculator::token_logits` kept for it.
+    pub logprobs_top_k: Option<usize>,
 }
 
 /// Summary returned by `generate_spec` to its arch wrapper, which writes the

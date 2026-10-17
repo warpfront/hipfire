@@ -124,6 +124,7 @@ fn main() {
                 last_pos,
                 Some(&hidden),
                 Some(&mut per_pos_argmax),
+                None,
             )
             .expect("overlap verify");
             let overlap_hidden = gpu.download_f32(&hidden).expect("download overlap hidden");
@@ -206,6 +207,7 @@ fn main() {
             prompt_tokens.len(),
             Some(&append_hidden_out),
             Some(&mut append_argmax_rows),
+            None,
         )
         .expect("append batch verify");
         let append_batch_hidden = gpu
