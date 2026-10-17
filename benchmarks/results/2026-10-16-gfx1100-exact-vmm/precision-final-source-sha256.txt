@@ -1,0 +1,3 @@
+d822a09c5907a3a5e4483af05db1c92891eb00a62a88dc6b0f2fbb3005d35a3f  crates/hipfire-arch-qwen35/src/forward_slots/vmm.rs
+2125a2e4451ba0b0032d7825ba66e96815c60609c727bd53e75122359304da92  crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs
+d3c3b95ec68b562fc1d1dd07bd8532892b7323b5e7e7be02363e14ef150b9281  crates/hipfire-loader/src/batch_staging.rs

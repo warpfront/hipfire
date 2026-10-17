@@ -23,6 +23,7 @@
 //! fields.
 
 use crate::LoadedModel;
+use hipfire_arch_qwen35::qwen35::StateQuant;
 use rdna_compute::Gpu;
 
 /// What the load handler needs to know after staging.
@@ -609,7 +610,10 @@ fn stage_qwen4_lanes(
         if let Err(e) = gpu.abort_route_kernel_load() {
             return refuse(&format!("kernel route reset failed: {e}"));
         }
-        eprintln!("  kernels: {} [left the planned route: qwen4 fn-lanes]", crate::LAZY_KERNELS_NOTE);
+        eprintln!(
+            "  kernels: {} [left the planned route: qwen4 fn-lanes]",
+            crate::LAZY_KERNELS_NOTE
+        );
     }
     if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget, spec) {
         return refuse(&format!("staging failed: {e}"));
@@ -637,6 +641,10 @@ fn stage_qwen4_lanes(
     }
 }
 
+fn stochastic_q8_state_without_ef(quant: StateQuant, has_state: bool, has_ef: bool) -> bool {
+    quant == StateQuant::Q8 && has_state && !has_ef
+}
+
 /// Stage the VMM continuous-batching store beside the resident Qwen35
 /// bundle. No fixed-lane KV is allocated: request owners are created lazily
 /// at admission, shaped like the resident (VMM) singleton KV. Any failure
@@ -655,6 +663,19 @@ fn stage_qwen_vmm_batch(
         );
         return out;
     };
+    if gpu.arch_caps.is_gfx1100()
+        && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        && stochastic_q8_state_without_ef(
+            b.dn_state.quant,
+            !b.dn_state.s_scales.is_empty(),
+            !b.dn_state.s_ef_residual.is_empty(),
+        )
+    {
+        // Legacy stochastic Q8 state is not singleton-exact under hipGraph:
+        // replay freezes the captured requant frame, unlike eager AR lanes.
+        eprintln!("[daemon] gfx1100 Exact VMM requires Q8 error feedback (HIPFIRE_DN_STATE_EF=1); stochastic EF-off singleton graph parity is unproven — existing route");
+        return out;
+    }
     // The executor's own coverage predicate (embedding/lm_head dtypes,
     // slots-body layer coverage, VMM KV route and flash plan) — not the
     // fixed-lane `qwen_batch_weight_formats_supported` gate.
@@ -719,7 +740,15 @@ fn stage_qwen_vmm_batch(
         }
     }
     if out.vmm && req.spec {
-        stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        if gpu.arch_caps.is_gfx1100()
+            && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        {
+            // gfx1100 exact AR uses singleton layers per request. Shared
+            // speculative verify has a separate numerical/state contract.
+            eprintln!("[daemon] gfx1100 Exact VMM: AR lanes only; batched speculative verification is not admitted");
+        } else {
+            stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        }
     }
     out
 }
@@ -861,6 +890,29 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
                 receipt.block_size
             );
             engine.free_gpu(gpu);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stochastic_q8_state_without_ef, StateQuant};
+
+    #[test]
+    fn exact_ef_guard_only_rejects_live_stochastic_q8_state() {
+        assert!(stochastic_q8_state_without_ef(StateQuant::Q8, true, false));
+        assert!(!stochastic_q8_state_without_ef(StateQuant::Q8, true, true));
+        assert!(!stochastic_q8_state_without_ef(
+            StateQuant::Q8,
+            false,
+            false
+        ));
+        for quant in [StateQuant::FP32, StateQuant::Q4] {
+            for has_state in [false, true] {
+                for has_ef in [false, true] {
+                    assert!(!stochastic_q8_state_without_ef(quant, has_state, has_ef));
+                }
+            }
         }
     }
 }

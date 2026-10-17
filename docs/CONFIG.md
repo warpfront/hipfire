@@ -1452,6 +1452,16 @@ ranges are the schema's; every key also appears in the generated
 | `memory.unsafe_wsl_vmm_kv` | `false` | bool. UNSAFE until certified: allow the VMM KV backend under WSL/ROCDXG, where WDDM VA growth may alias earlier KV pages. Off: automatic KV selects legacy and an explicit `kv_backend = "vmm"` is refused. |
 | `replay.unsafe_wsl_redline` | `false` | bool. UNSAFE until certified: allow Redline PM4/retained replay under WSL/ROCDXG. Off: the retained default falls back to the HIP graph and an explicit `replay.backend = "redline"`/`"shadow"` is refused. |
 
+The Qwen dense uniform `MQ4G256V2` Exact route also admits exact gfx1100
+with Q8 VMM KV. On gfx1100 each target lane executes the complete singleton
+layer program; target projections are not merged across requests. This first
+route supports AR lanes only: cross-request DFlash/MTP verification is not
+installed, while the existing singleton speculative path remains available.
+gfx1201 retains its batched projection and speculative-lane routes.
+Q8 recurrent state requires the default-on error feedback; with it disabled,
+gfx1100 Exact serve staging keeps the existing singleton route because the
+legacy stochastic state's singleton hipGraph is not byte-stable.
+
 ### Architecture-gated default-on kernel routes
 
 All are process booleans that default to `true` and take effect only on the

@@ -4,6 +4,9 @@
 // Exact VMM batched step: byte-identical, per request, to the default
 // singleton route.
 //
+// On gfx1100 the complete singleton layer program runs per request;
+// the batched projection details below describe the gfx1201 route only.
+//
 // Decode rows run the singleton's own lowered layer program
 // (`qwen35::forward::{lower_variant, variant_of}` + `Qwen35Bindings`). The
 // projection super-ops are batched across requests, each column
@@ -25,16 +28,19 @@
 use super::{Qwen35RequestState, Qwen35VmmStore, RequestStepKind};
 use crate::forward_slots::final_logits_per_slot;
 use crate::qwen35::forward::{
-    conv_qknorm_enabled, conv_scalar_prep_enabled, gated_norm_mq_rotate_enabled, gdn_compact_qk_div, lower_variant,
-    qkvza_scalar_prep_enabled, qwen35_fa_epilogue_enabled, qwen35_fa_prep_enabled, variant_of, Qwen35Bindings,
+    conv_qknorm_enabled, conv_scalar_prep_enabled, gated_norm_mq_rotate_enabled,
+    gdn_compact_qk_div, lower_variant, qkvza_scalar_prep_enabled, qwen35_fa_epilogue_enabled,
+    qwen35_fa_prep_enabled, variant_of, Qwen35Bindings,
 };
 use crate::qwen35::{LayerWeights, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::ops::{delta_net, pm_xbatch};
 use hipfire_dispatch::families::gemv::RotateInputs;
-use hipfire_dispatch::pipeline::superop::{dispatch_super_op, SuperOpKind};
-use hipfire_runtime::llama::{fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, WeightTensor};
+use hipfire_dispatch::ops::{delta_net, pm_xbatch};
+use hipfire_dispatch::pipeline::superop::{dispatch_super_op, run_layer_program, SuperOpKind};
+use hipfire_runtime::llama::{
+    fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, WeightTensor,
+};
 use hipfire_runtime::slot_batch::BatchStepPlan;
 use rdna_compute::pm_xbatch::PM_XBATCH_MAX;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -44,22 +50,44 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// DeltaNet/FullAttention layers, uniform MQ4G256V2 projections, gfx1201,
 /// and the lowered decode program (the default; `HIPFIRE_FORWARD_LOWERED=0`
 /// selects the hand path, which this route does not mirror).
+/// gfx1100 executes the complete singleton layer program per row instead:
+/// its fused projection/prep/residual stages share binding-local state.
 pub(super) fn supports(gpu: &Gpu, weights: &Qwen35Weights) -> Result<(), String> {
-    if !gpu.arch_caps.is_gfx1201() {
-        return Err(format!("exact VMM route: arch {} not admitted (gfx1201 only)", gpu.arch));
+    if !gpu.arch_caps.is_gfx1201() && !gpu.arch_caps.is_gfx1100() {
+        return Err(format!(
+            "exact VMM route: arch {} not admitted (gfx1100/gfx1201 only)",
+            gpu.arch
+        ));
     }
-    if hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("0") {
-        return Err("exact VMM route: singleton is on the hand decode path (HIPFIRE_FORWARD_LOWERED=0)".into());
+    if hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+        .ok()
+        .as_deref()
+        == Some("0")
+    {
+        return Err(
+            "exact VMM route: singleton is on the hand decode path (HIPFIRE_FORWARD_LOWERED=0)"
+                .into(),
+        );
     }
     let v2 = |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256V2;
     for (i, layer) in weights.layers.iter().enumerate() {
         let ok = match layer {
-            LayerWeights::DeltaNet(l) => [&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.w_gate, &l.w_up, &l.wo, &l.w_down].into_iter().all(v2),
-            LayerWeights::FullAttn(l) => [&l.wq, &l.wk, &l.wv, &l.w_gate, &l.w_up, &l.wo, &l.w_down].into_iter().all(v2),
+            LayerWeights::DeltaNet(l) => [
+                &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.w_gate, &l.w_up, &l.wo, &l.w_down,
+            ]
+            .into_iter()
+            .all(v2),
+            LayerWeights::FullAttn(l) => {
+                [&l.wq, &l.wk, &l.wv, &l.w_gate, &l.w_up, &l.wo, &l.w_down]
+                    .into_iter()
+                    .all(v2)
+            }
             _ => false,
         };
         if !ok {
-            return Err(format!("exact VMM route: layer {i} is not a dense uniform-MQ4G256V2 layer"));
+            return Err(format!(
+                "exact VMM route: layer {i} is not a dense uniform-MQ4G256V2 layer"
+            ));
         }
     }
     Ok(())
@@ -75,14 +103,30 @@ pub(super) fn prefill_chunk_len(
     st: &Qwen35RequestState,
     remaining: usize,
 ) -> Result<usize, String> {
-    let ceiling = crate::qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, &st.dn, &st.kv, None)
-        .map_err(|e| format!("exact prefill chunk limit: {e}"))?;
-    Ok(crate::qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
-        .unwrap_or(remaining.min(ceiling).max(1)))
+    let ceiling =
+        crate::qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, &st.dn, &st.kv, None)
+            .map_err(|e| format!("exact prefill chunk limit: {e}"))?;
+    Ok(
+        crate::qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
+            .unwrap_or(remaining.min(ceiling).max(1)),
+    )
 }
 
-fn copy_row(gpu: &Gpu, dst: &GpuTensor, dst_row: usize, src: &GpuTensor, src_row: usize, elems: usize) -> HipResult<()> {
-    gpu.memcpy_dtod_at_auto(&dst.buf, dst_row * elems * 4, &src.buf, src_row * elems * 4, elems * 4)
+fn copy_row(
+    gpu: &Gpu,
+    dst: &GpuTensor,
+    dst_row: usize,
+    src: &GpuTensor,
+    src_row: usize,
+    elems: usize,
+) -> HipResult<()> {
+    gpu.memcpy_dtod_at_auto(
+        &dst.buf,
+        dst_row * elems * 4,
+        &src.buf,
+        src_row * elems * 4,
+        elems * 4,
+    )
 }
 
 /// Batched plain projection super-op `ordinal` (0 = attention projection,
@@ -99,17 +143,46 @@ fn batched_proj(
     let (norm, ws): (&GpuTensor, Vec<(&WeightTensor, &GpuTensor)>) = match (layer, ordinal) {
         (LayerWeights::DeltaNet(l), 0) => (
             &l.attn_norm,
-            vec![(&l.wqkv, &p.dn_qkv_batch), (&l.wz, &p.dn_z_batch), (&l.w_beta, &p.dn_beta_batch), (&l.w_alpha, &p.dn_alpha_batch)],
+            vec![
+                (&l.wqkv, &p.dn_qkv_batch),
+                (&l.wz, &p.dn_z_batch),
+                (&l.w_beta, &p.dn_beta_batch),
+                (&l.w_alpha, &p.dn_alpha_batch),
+            ],
         ),
         (LayerWeights::FullAttn(l), 0) => (
             &l.attn_norm,
-            vec![(&l.wq, &p.fa_q_full_batch), (&l.wk, &p.fa_k_batch), (&l.wv, &p.fa_v_batch)],
+            vec![
+                (&l.wq, &p.fa_q_full_batch),
+                (&l.wk, &p.fa_k_batch),
+                (&l.wv, &p.fa_v_batch),
+            ],
         ),
-        (LayerWeights::DeltaNet(l), 1) => (&l.ffn_norm, vec![(&l.w_gate, &p.gate_ffn_batch), (&l.w_up, &p.up_batch)]),
-        (LayerWeights::FullAttn(l), 1) => (&l.ffn_norm, vec![(&l.w_gate, &p.gate_ffn_batch), (&l.w_up, &p.up_batch)]),
-        _ => return Err(HipError::new(0, "exact VMM step: unsupported projection super-op")),
+        (LayerWeights::DeltaNet(l), 1) => (
+            &l.ffn_norm,
+            vec![(&l.w_gate, &p.gate_ffn_batch), (&l.w_up, &p.up_batch)],
+        ),
+        (LayerWeights::FullAttn(l), 1) => (
+            &l.ffn_norm,
+            vec![(&l.w_gate, &p.gate_ffn_batch), (&l.w_up, &p.up_batch)],
+        ),
+        _ => {
+            return Err(HipError::new(
+                0,
+                "exact VMM step: unsupported projection super-op",
+            ))
+        }
     };
-    fused_rmsnorm_rotate_mq_batched_for(gpu, &p.x_batch, norm, ws[0].0, &p.x_rot_batch, config.dim, config.norm_eps, n)?;
+    fused_rmsnorm_rotate_mq_batched_for(
+        gpu,
+        &p.x_batch,
+        norm,
+        ws[0].0,
+        &p.x_rot_batch,
+        config.dim,
+        config.norm_eps,
+        n,
+    )?;
     for (w, y) in ws {
         for (b0, nb) in xbatch_chunks(n) {
             pm_xbatch::plain(
@@ -129,21 +202,30 @@ fn batched_proj(
 /// `(first row, rows)` launches covering `n` rows, at most
 /// [`PM_XBATCH_MAX`] each.
 fn xbatch_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..n).step_by(PM_XBATCH_MAX).map(move |b0| (b0, PM_XBATCH_MAX.min(n - b0)))
+    (0..n)
+        .step_by(PM_XBATCH_MAX)
+        .map(move |b0| (b0, PM_XBATCH_MAX.min(n - b0)))
 }
 
 /// Residual projection of super-op run `ordinal` (0 = attention/DeltaNet
 /// `wo`, 1 = `w_down`): its weight and the batch buffer that stages each
 /// row's rotated input contiguously as `[n][k]` (a buffer no row scratch
 /// view aliases).
-fn residual_target<'a>(st: &'a Qwen35VmmStore, layer: &'a LayerWeights, ordinal: usize) -> HipResult<(&'a WeightTensor, &'a GpuTensor)> {
+fn residual_target<'a>(
+    st: &'a Qwen35VmmStore,
+    layer: &'a LayerWeights,
+    ordinal: usize,
+) -> HipResult<(&'a WeightTensor, &'a GpuTensor)> {
     let p = &st.pbs;
     match (layer, ordinal) {
         (LayerWeights::DeltaNet(l), 0) => Ok((&l.wo, &p.dn_normed_rot_batch)),
         (LayerWeights::FullAttn(l), 0) => Ok((&l.wo, &p.fa_attn_out_rot_batch)),
         (LayerWeights::DeltaNet(l), 1) => Ok((&l.w_down, &p.ffn_hidden_batch)),
         (LayerWeights::FullAttn(l), 1) => Ok((&l.w_down, &p.ffn_hidden_batch)),
-        _ => Err(HipError::new(0, "exact VMM step: unsupported residual super-op")),
+        _ => Err(HipError::new(
+            0,
+            "exact VMM step: unsupported residual super-op",
+        )),
     }
 }
 
@@ -257,13 +339,22 @@ fn stage_residual_input(
             gpu.ensure_mq_signs()?;
             fused_silu_mul_rotate_mq_for(gpu, w, &s.gate_ffn, &s.up, &dst, k)
         }
-        _ => Err(HipError::new(0, "exact VMM step: unsupported residual super-op")),
+        _ => Err(HipError::new(
+            0,
+            "exact VMM step: unsupported residual super-op",
+        )),
     }
 }
 
 /// Batched residual projection `x_batch[r] += W · staged[r]` for every
 /// decode row: per column the singleton's `gemv_mq4g256v2_residual`.
-fn batched_residual(gpu: &mut Gpu, st: &Qwen35VmmStore, layer: &LayerWeights, ordinal: usize, n: usize) -> HipResult<()> {
+fn batched_residual(
+    gpu: &mut Gpu,
+    st: &Qwen35VmmStore,
+    layer: &LayerWeights,
+    ordinal: usize,
+    n: usize,
+) -> HipResult<()> {
     let (w, stage) = residual_target(st, layer, ordinal)?;
     let x_batch = &st.pbs.x_batch;
     for (b0, nb) in xbatch_chunks(n) {
@@ -296,10 +387,12 @@ struct RowTwins {
 
 impl RowTwins {
     fn gdn_table(&self, d: usize) -> GpuTensor {
-        self.gdn.sub_offset(d * self.stride * 72 / 4, self.stride * 72 / 4)
+        self.gdn
+            .sub_offset(d * self.stride * 72 / 4, self.stride * 72 / 4)
     }
     fn conv_table(&self, d: usize) -> GpuTensor {
-        self.conv.sub_offset(d * self.stride * 40 / 4, self.stride * 40 / 4)
+        self.conv
+            .sub_offset(d * self.stride * 40 / 4, self.stride * 40 / 4)
     }
 }
 
@@ -326,7 +419,11 @@ fn stage_row_twins(
     }
     let n = rows.len();
     let ms = st.max_slots;
-    let n_dn = config.layer_types.iter().filter(|t| **t == crate::qwen35::LayerType::LinearAttention).count();
+    let n_dn = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == crate::qwen35::LayerType::LinearAttention)
+        .count();
     let nv = config.linear_num_value_heads;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = nv * config.linear_value_head_dim;
@@ -344,9 +441,13 @@ fn stage_row_twins(
     if !dn && !fa_prep {
         return Ok(None);
     }
-    let tags: Vec<u64> = rows.iter().map(|&(slot, _)| req(slot).epoch.request_tag).collect();
+    let tags: Vec<u64> = rows
+        .iter()
+        .map(|&(slot, _)| req(slot).epoch.request_tag)
+        .collect();
     let p = &st.pbs;
-    let ptr = |t: &GpuTensor, row: usize, len: usize| t.buf.as_ptr() as u64 + (row * len * 4) as u64;
+    let ptr =
+        |t: &GpuTensor, row: usize, len: usize| t.buf.as_ptr() as u64 + (row * len * 4) as u64;
     let conv_off = n_dn * ms * 72;
     let gnorm_off = conv_off + n_dn * ms * 40;
     let fa_off = gnorm_off + ms * 24;
@@ -360,8 +461,10 @@ fn stage_row_twins(
         fa_table: view(fa_off, ms * 40),
         stride: ms,
     };
-    let key: Vec<(usize, hipfire_runtime::slot_batch::RequestEpoch)> =
-        rows.iter().map(|&(slot, _)| (slot, req(slot).epoch)).collect();
+    let key: Vec<(usize, hipfire_runtime::slot_batch::RequestEpoch)> = rows
+        .iter()
+        .map(|&(slot, _)| (slot, req(slot).epoch))
+        .collect();
     if st.rows_tables_key == key {
         return Ok(Some(t));
     }
@@ -393,8 +496,22 @@ fn stage_row_twins(
                     state: s.conv_states[d].buf.as_ptr() as u64,
                 });
             }
-            gpu.stage_gated_delta_net_q8_compact3_b2_rows(&t.gdn_table(d), &gdn_rows, &tags, &tags, 1, nv)?;
-            gpu.stage_conv1d_silu_split_qknorm_b256_rows(&t.conv_table(d), &conv_rows, &tags, &tags, k_dim, v_dim)?;
+            gpu.stage_gated_delta_net_q8_compact3_b2_rows(
+                &t.gdn_table(d),
+                &gdn_rows,
+                &tags,
+                &tags,
+                1,
+                nv,
+            )?;
+            gpu.stage_conv1d_silu_split_qknorm_b256_rows(
+                &t.conv_table(d),
+                &conv_rows,
+                &tags,
+                &tags,
+                k_dim,
+                v_dim,
+            )?;
         }
         let gnorm_rows: Vec<GatedNormRow> = (0..n)
             .map(|r| GatedNormRow {
@@ -445,22 +562,49 @@ pub(super) fn decode(
         .iter()
         .map(|&i| {
             let r = &plan.requests[i];
-            (pb.row_slot[r.rows.begin] as usize, pb.positions[r.rows.begin] as usize)
+            (
+                pb.row_slot[r.rows.begin] as usize,
+                pb.positions[r.rows.begin] as usize,
+            )
         })
         .collect();
-    let tokens: Vec<i32> = members.iter().map(|&i| pb.tokens[plan.requests[i].rows.begin] as i32).collect();
+    let tokens: Vec<i32> = members
+        .iter()
+        .map(|&i| pb.tokens[plan.requests[i].rows.begin] as i32)
+        .collect();
     let tb: Vec<u8> = tokens.iter().flat_map(|t| t.to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&st.pbs.tokens.buf, &tb)?;
     // Row positions, uploaded once: each row's scratch view reads its own.
-    let pos_bytes: Vec<u8> = rows.iter().flat_map(|&(_, p)| (p as i32).to_ne_bytes()).collect();
+    let pos_bytes: Vec<u8> = rows
+        .iter()
+        .flat_map(|&(_, p)| (p as i32).to_ne_bytes())
+        .collect();
     gpu.hip.memcpy_htod(&st.pbs.positions.buf, &pos_bytes)?;
-    crate::forward_slots::embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+    crate::forward_slots::embed_lookup_slots(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &st.pbs.x_batch,
+        &st.pbs.tokens,
+        n,
+        dim,
+    )?;
     let row_scratch: Vec<RowScratch> = (0..n).map(|r| RowScratch::new(s, st, config, r)).collect();
     // Row→slot map and flash plan for the row-batched attention.
-    let slot_bytes: Vec<u8> = rows.iter().flat_map(|&(slot, _)| (slot as i32).to_ne_bytes()).collect();
+    let slot_bytes: Vec<u8> = rows
+        .iter()
+        .flat_map(|&(slot, _)| (slot as i32).to_ne_bytes())
+        .collect();
     gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &slot_bytes)?;
     let max_ctx = rows.iter().map(|&(_, p)| p + 1).max().unwrap_or(1);
-    let flash = gpu.vmm_flash_decode_plan(st.format, config.n_heads, config.n_kv_heads, config.head_dim, st.model_max_seq, max_ctx)?;
+    let flash = gpu.vmm_flash_decode_plan(
+        st.format,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        st.model_max_seq,
+        max_ctx,
+    )?;
     let twins = stage_row_twins(gpu, st, config, &rows, &row_scratch)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -470,6 +614,53 @@ pub(super) fn decode(
     let mut delta_layer_idx = 0usize;
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let program = lower_variant(variant_of(layer));
+        // gfx1100's fused projections and FA epilogue have not been replaced
+        // by row-batched twins. Keep one binding alive for the entire layer:
+        // in particular, Attend can mark FA output as already rotated for
+        // ResidualGemv. Splitting that binding loses the marker and rotates
+        // the output twice. The request scheduler and KV ownership are still
+        // shared; these layer launches deliberately remain per request.
+        if gpu.arch_caps.is_gfx1100() {
+            for (r, &(slot, pos)) in rows.iter().enumerate() {
+                let req = st.slots[slot].as_mut().expect("provisioned slot");
+                let frame = req.dn.s_ef_residual.is_empty().then(|| {
+                    let g = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(req.gdn_frame);
+                    g
+                });
+                let result = {
+                    let ctx = DispatchCtx::new(gpu);
+                    let mut bind = Qwen35Bindings {
+                        layer,
+                        s: &row_scratch[r],
+                        config,
+                        kv_cache: &mut req.kv,
+                        dn_state: &req.dn,
+                        pos,
+                        layer_idx,
+                        delta_layer_idx,
+                        k_dim,
+                        v_dim,
+                        n_v_heads,
+                        hd,
+                        precomputed_attn_x_rot: false,
+                        fa_output_prerotated: false,
+                        defer_routed_combine: false,
+                    };
+                    run_layer_program(gpu, &ctx, &program, &mut bind)
+                        .map_err(|e| HipError::new(0, &e.to_string()))
+                };
+                if let Some(g) = frame {
+                    req.gdn_frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
+                }
+                result?;
+            }
+            if matches!(layer, LayerWeights::DeltaNet(_)) {
+                delta_layer_idx += 1;
+            }
+            continue;
+        }
         let mut proj_ordinal = 0usize;
         let mut last_proj: Option<usize> = None;
         // Whether the run just executed staged the next residual's inputs.
@@ -485,13 +676,18 @@ pub(super) fn decode(
                 continue;
             }
             if program[i].kind == SuperOpKind::ResidualGemv {
-                let ordinal = last_proj.ok_or_else(|| HipError::new(0, "exact VMM step: residual before projection"))?;
+                let ordinal = last_proj.ok_or_else(|| {
+                    HipError::new(0, "exact VMM step: residual before projection")
+                })?;
                 if !staged {
                     // Directly after its projection (down after gate+up):
                     // one batched fused SiLU·up rotate over every row.
                     let (w, stage) = residual_target(st, layer, ordinal)?;
                     if ordinal != 1 {
-                        return Err(HipError::new(0, "exact VMM step: unstaged attention residual"));
+                        return Err(HipError::new(
+                            0,
+                            "exact VMM step: unstaged attention residual",
+                        ));
                     }
                     gpu.ensure_mq_signs()?;
                     hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for(
@@ -513,7 +709,12 @@ pub(super) fn decode(
             }
             // A run of non-batched super-ops: the singleton bindings, per row.
             let end = (i..program.len())
-                .find(|&j| matches!(program[j].kind, SuperOpKind::Proj | SuperOpKind::ResidualGemv))
+                .find(|&j| {
+                    matches!(
+                        program[j].kind,
+                        SuperOpKind::Proj | SuperOpKind::ResidualGemv
+                    )
+                })
                 .unwrap_or(program.len());
             let stage_for = (end < program.len() && program[end].kind == SuperOpKind::ResidualGemv)
                 .then_some(last_proj)
@@ -529,12 +730,21 @@ pub(super) fn decode(
                     && qwen35_fa_prep_enabled(gpu, config)
                     && !hipfire_runtime::triattn::tap_enabled()
                     && !qwen35_fa_epilogue_enabled(gpu, config, &l.wo)
-                    && rows
-                        .iter()
-                        .all(|&(slot, _)| st.slots[slot].as_ref().is_some_and(|q| q.kv.compact_offset == 0));
+                    && rows.iter().all(|&(slot, _)| {
+                        st.slots[slot]
+                            .as_ref()
+                            .is_some_and(|q| q.kv.compact_offset == 0)
+                    });
                 if batched_attend {
                     if let Some(t) = twins.as_ref().filter(|t| t.fa_prep) {
-                        gpu.qwen36_27b_fa_prep_rows(&t.fa_table, n, &l.q_norm, &l.k_norm, config.norm_eps, config.rope_theta)?;
+                        gpu.qwen36_27b_fa_prep_rows(
+                            &t.fa_table,
+                            n,
+                            &l.q_norm,
+                            &l.k_norm,
+                            config.norm_eps,
+                            config.rope_theta,
+                        )?;
                     } else {
                         for rs in &row_scratch {
                             gpu.qwen35_fa_prep_gfx1100(
@@ -556,7 +766,9 @@ pub(super) fn decode(
                         .kv_layer_ids
                         .iter()
                         .position(|&x| x == layer_idx)
-                        .ok_or_else(|| HipError::new(0, "exact VMM step: FA layer without a KV layer"))?;
+                        .ok_or_else(|| {
+                            HipError::new(0, "exact VMM step: FA layer without a KV layer")
+                        })?;
                     super::vmm_kv_write_attend(
                         gpu,
                         config,
@@ -571,9 +783,19 @@ pub(super) fn decode(
                         n,
                     )?;
                     let q = config.n_heads * config.head_dim;
-                    gpu.sigmoid_mul_f32(&st.pbs.fa_attn_out_batch.sub_offset(0, n * q), &st.pbs.fa_gate_batch.sub_offset(0, n * q))?;
+                    gpu.sigmoid_mul_f32(
+                        &st.pbs.fa_attn_out_batch.sub_offset(0, n * q),
+                        &st.pbs.fa_gate_batch.sub_offset(0, n * q),
+                    )?;
                     let (_, stage) = residual_target(st, layer, 0)?;
-                    hipfire_runtime::llama::rotate_x_mq_batched_for(gpu, &l.wo, &st.pbs.fa_attn_out_batch, stage, l.wo.k, n)?;
+                    hipfire_runtime::llama::rotate_x_mq_batched_for(
+                        gpu,
+                        &l.wo,
+                        &st.pbs.fa_attn_out_batch,
+                        stage,
+                        l.wo.k,
+                        n,
+                    )?;
                     staged = true;
                     i = end;
                     continue;
@@ -585,10 +807,18 @@ pub(super) fn decode(
             // only its stateful conv before the rest of the run.
             let split_dn_prep = match layer {
                 LayerWeights::DeltaNet(l) => {
-                    let quant = st.slots[rows[0].0].as_ref().expect("provisioned slot").dn.quant;
+                    let quant = st.slots[rows[0].0]
+                        .as_ref()
+                        .expect("provisioned slot")
+                        .dn
+                        .quant;
                     program[i].kind == SuperOpKind::Attend
-                        && rows.iter().all(|&(slot, _)| st.slots[slot].as_ref().is_some_and(|q| q.dn.quant == quant))
-                        && !qkvza_scalar_prep_enabled(gpu, config, n_v_heads, quant, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha)
+                        && rows.iter().all(|&(slot, _)| {
+                            st.slots[slot].as_ref().is_some_and(|q| q.dn.quant == quant)
+                        })
+                        && !qkvza_scalar_prep_enabled(
+                            gpu, config, n_v_heads, quant, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha,
+                        )
                         && !conv_scalar_prep_enabled(gpu, config, n_v_heads, quant)
                         && conv_qknorm_enabled(gpu, config, quant)
                         && gdn_compact_qk_div(gpu, config, n_v_heads, quant).is_some()
@@ -609,11 +839,18 @@ pub(super) fn decode(
             // The whole DeltaNet attention run on the rows twins: conv,
             // GDN recurrence and gated-norm rotate, each one launch over all
             // rows, the gated norm writing each row's `wo` input in place.
-            if let (true, LayerWeights::DeltaNet(l), Some(t)) = (split_dn_prep, layer, twins.as_ref()) {
+            if let (true, LayerWeights::DeltaNet(l), Some(t)) =
+                (split_dn_prep, layer, twins.as_ref())
+            {
                 let kinds: Vec<SuperOpKind> = program[i..end].iter().map(|o| o.kind).collect();
                 if t.dn
                     && stage_for == Some(0)
-                    && kinds == [SuperOpKind::Attend, SuperOpKind::Recurrent, SuperOpKind::Norm]
+                    && kinds
+                        == [
+                            SuperOpKind::Attend,
+                            SuperOpKind::Recurrent,
+                            SuperOpKind::Norm,
+                        ]
                     && l.wo.awq_scale.is_some()
                     && gated_norm_mq_rotate_enabled(gpu, config, n_v_heads, &l.wo)
                 {
@@ -701,19 +938,30 @@ pub(super) fn decode(
                     rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
                 }
                 // Attention `wo` inputs stage batched after the row loop.
-                let batched_stage = matches!(layer, LayerWeights::FullAttn(_)) && stage_for == Some(0);
+                let batched_stage =
+                    matches!(layer, LayerWeights::FullAttn(_)) && stage_for == Some(0);
                 if let Some(ordinal) = stage_for.filter(|_| !batched_stage) {
                     stage_residual_input(gpu, st, rs, config, layer, ordinal, r)?;
                 }
             }
             if let (LayerWeights::FullAttn(l), Some(0)) = (layer, stage_for) {
                 let (_, stage) = residual_target(st, layer, 0)?;
-                hipfire_runtime::llama::rotate_x_mq_batched_for(gpu, &l.wo, &st.pbs.fa_attn_out_batch, stage, l.wo.k, n)?;
+                hipfire_runtime::llama::rotate_x_mq_batched_for(
+                    gpu,
+                    &l.wo,
+                    &st.pbs.fa_attn_out_batch,
+                    stage,
+                    l.wo.k,
+                    n,
+                )?;
             }
             staged = stage_for.is_some();
             i = end;
         }
-        if matches!(layer, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)) {
+        if matches!(
+            layer,
+            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)
+        ) {
             delta_layer_idx += 1;
         }
     }
@@ -729,7 +977,13 @@ pub(super) fn decode(
             gpu.rmsnorm_f32(&rs.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
             let ctx = DispatchCtx::new(gpu);
             let xr = hipfire_runtime::llama::gemv_family()
-                .rotate(&ctx, gpu, &out.dispatch_ref(), &s.tmp, &RotateInputs::default())
+                .rotate(
+                    &ctx,
+                    gpu,
+                    &out.dispatch_ref(),
+                    &s.tmp,
+                    &RotateInputs::default(),
+                )
                 .map_err(|e| HipError::new(0, &e.to_string()))?
                 .into_buf();
             copy_row(gpu, &st.pbs.x_rot_batch, r, &xr, 0, dim)?;
@@ -802,16 +1056,30 @@ pub(super) fn prefill(
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(req.gdn_frame);
             g
         });
-        crate::qwen35::forward_prefill_batch(
-            gpu, weights, config, tokens, pos, &mut req.kv, &mut req.dn, s, None, None, None, None,
-        )?;
+        let result = crate::qwen35::forward_prefill_batch(
+            gpu,
+            weights,
+            config,
+            tokens,
+            pos,
+            &mut req.kv,
+            &mut req.dn,
+            s,
+            None,
+            None,
+            None,
+            None,
+        );
         if let Some(g) = frame {
             req.gdn_frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
         }
+        result?;
     }
     if head {
-        let view = st.logits.sub_offset(slot * config.vocab_size, config.vocab_size);
+        let view = st
+            .logits
+            .sub_offset(slot * config.vocab_size, config.vocab_size);
         gpu.memcpy_dtod_at_auto(&view.buf, 0, &s.logits.buf, 0, config.vocab_size * 4)?;
         // Sampled once for all completing prompts by `forward_inner` after the
         // prefill phase: each head's logits row is a distinct slot view of

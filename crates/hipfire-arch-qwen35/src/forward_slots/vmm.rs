@@ -28,32 +28,31 @@
 // every other KV mode is refused rather than routed to a legacy arena.
 
 use super::{
-    embed_lookup_slots, final_logits_per_slot, lm_head_slots_admissible,
-    q8_prefill_wmma_enabled, require_batchable_deltanet_layer,
-    require_batchable_deltanet_moe_layer, require_batchable_fullattn_layer,
-    require_batchable_fullattn_moe_layer, require_batchable_moe_ffn,
-    run_layers_slots, slots_embed_format_admitted, LayerKvAddr, SlotKvTier,
+    embed_lookup_slots, final_logits_per_slot, lm_head_slots_admissible, q8_prefill_wmma_enabled,
+    require_batchable_deltanet_layer, require_batchable_deltanet_moe_layer,
+    require_batchable_fullattn_layer, require_batchable_fullattn_moe_layer,
+    require_batchable_moe_ffn, run_layers_slots, slots_embed_format_admitted, LayerKvAddr,
+    SlotKvTier,
 };
-use crate::qwen35::LayerWeights;
 use crate::carrier::Qwen35Bundle;
+use crate::qwen35::LayerWeights;
 use crate::qwen35::{
     DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights,
 };
 use hip_bridge::{HipError, HipResult};
-use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{EmbeddingFormat, KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
+use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestStepKind, StepOutput,
 };
 use rdna_compute::attention::{VmmFlashDecodePlan, VmmKvFormat, VmmKvSide};
 use rdna_compute::kv_slots::{validate_vmm_rows, VmmKvSlotDesc};
-use hipfire_runtime::sampler::SamplerConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
+pub mod dflash;
 mod exact;
 pub mod spec;
-pub mod dflash;
-
 
 /// Load-time admission for the VMM executor on this resident model: the
 /// exact predicates `forward_step` enforces (Q8_0 embedding table, an
@@ -70,8 +69,7 @@ pub fn vmm_executor_supports(
     if route == VmmRoute::Exact {
         exact::supports(gpu, weights)?;
     }
-    slots_embed_format_admitted(weights.embd_format)
-        .map_err(|e| format!("VMM executor: {e}"))?;
+    slots_embed_format_admitted(weights.embd_format).map_err(|e| format!("VMM executor: {e}"))?;
     if !lm_head_slots_admissible(weights.output.gpu_dtype) {
         return Err(format!(
             "VMM executor: lm_head dtype {:?} not admitted by the slots head",
@@ -88,10 +86,12 @@ pub fn vmm_executor_supports(
                 require_batchable_fullattn_layer(l, arch).map(drop)
             }
             (LayerWeights::DeltaNetMoe(l), LayerType::LinearAttention) => {
-                require_batchable_deltanet_moe_layer(l, arch).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
+                require_batchable_deltanet_moe_layer(l, arch)
+                    .and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
             }
             (LayerWeights::FullAttnMoe(l), LayerType::FullAttention) => {
-                require_batchable_fullattn_moe_layer(l, arch).and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
+                require_batchable_fullattn_moe_layer(l, arch)
+                    .and_then(|_| require_batchable_moe_ffn(gpu, &l.ffn))
             }
             _ => return Err(format!("VMM executor: layer {i} weight/type mismatch")),
         };
@@ -252,7 +252,12 @@ pub fn vmm_grant_growth(
 
 /// Admission of a new lane: it can take what it holds right after its
 /// prompt fill (`need.held`) and the lanes stay safe with it added.
-pub fn vmm_admission_fits(room: usize, kv_room: usize, lanes: &[VmmLaneNeed], need: VmmLaneNeed) -> bool {
+pub fn vmm_admission_fits(
+    room: usize,
+    kv_room: usize,
+    lanes: &[VmmLaneNeed],
+    need: VmmLaneNeed,
+) -> bool {
     if need.held > room || need.held_kv > kv_room {
         return false;
     }
@@ -289,7 +294,10 @@ pub(super) fn vmm_kv_write_attend(
     pbs: &PrefillBatchScratch,
     n: usize,
 ) -> HipResult<()> {
-    for (side, src) in [(VmmKvSide::K, &pbs.fa_k_batch), (VmmKvSide::V, &pbs.fa_v_batch)] {
+    for (side, src) in [
+        (VmmKvSide::K, &pbs.fa_k_batch),
+        (VmmKvSide::V, &pbs.fa_v_batch),
+    ] {
         gpu.kv_cache_write_batched_vmm(
             layer.format,
             side,
@@ -466,7 +474,9 @@ impl Qwen35RequestState {
             Ok(dn) => dn,
             Err(e) => {
                 let cleanup = kv.release_vmm_after(gpu, None);
-                return Err(format!("VMM executor: request DeltaNet state: {e}; kv free: {cleanup:?}"));
+                return Err(format!(
+                    "VMM executor: request DeltaNet state: {e}; kv free: {cleanup:?}"
+                ));
             }
         };
         Ok(Self {
@@ -543,7 +553,10 @@ impl Qwen35RequestState {
     /// Free this owner. Every forward that read it has completed (the
     /// executor synchronizes before `forward_step` returns).
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
-        let r = self.kv.release_vmm_after(gpu, None).map_err(|e| e.to_string());
+        let r = self
+            .kv
+            .release_vmm_after(gpu, None)
+            .map_err(|e| e.to_string());
         self.dn.free_gpu(gpu);
         if let Some(mtp) = self.mtp {
             mtp.free_gpu(gpu);
@@ -790,23 +803,31 @@ impl Qwen35VmmStore {
             VmmRoute::Exact => max_slots,
             VmmRoute::Nonexact => row_budget,
         };
-        let result = (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor, GpuTensor)> {
-            let mut descs = Vec::with_capacity(kv_layer_ids.len());
-            for _ in &kv_layer_ids {
-                descs.push(gpu.zeros(&[max_slots * 32], DType::Raw)?);
-            }
-            // 4-byte elements so per-row-group sub-views address rows.
-            let row_slot = gpu.zeros(&[trunk_rows], DType::F32)?;
-            // Fixed partials budget, never rows × context: the attention runs
-            // in row groups that fit it. At least one row at the bound.
-            let floats = (VMM_FLASH_PARTIALS_BYTES / 4)
-                .min(trunk_rows * worst.partial_floats_per_row)
-                .max(worst.partial_floats_per_row);
-            let partials = gpu.zeros(&[floats], DType::F32)?;
-            let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
-            let hidden_out = gpu.zeros(&[trunk_rows * config.dim], DType::F32)?;
-            Ok((descs, row_slot, partials, logits, hidden_out))
-        })();
+        let singleton_rows = route == VmmRoute::Exact && gpu.arch_caps.is_gfx1100();
+        let result =
+            (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor, GpuTensor)> {
+                let mut descs = Vec::with_capacity(kv_layer_ids.len());
+                for _ in &kv_layer_ids {
+                    descs.push(gpu.zeros(&[max_slots * 32], DType::Raw)?);
+                }
+                // 4-byte elements so per-row-group sub-views address rows.
+                let row_slot = gpu.zeros(&[trunk_rows], DType::F32)?;
+                // Fixed partials budget, never rows × context: the attention runs
+                // in row groups that fit it. At least one row at the bound.
+                // gfx1100 Exact attends through each lane's singleton scratch.
+                // Keep only a placeholder for this unused batched-attention owner.
+                let floats = if singleton_rows {
+                    1
+                } else {
+                    (VMM_FLASH_PARTIALS_BYTES / 4)
+                        .min(trunk_rows * worst.partial_floats_per_row)
+                        .max(worst.partial_floats_per_row)
+                };
+                let partials = gpu.zeros(&[floats], DType::F32)?;
+                let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
+                let hidden_out = gpu.zeros(&[trunk_rows * config.dim], DType::F32)?;
+                Ok((descs, row_slot, partials, logits, hidden_out))
+            })();
         let (descs_dev, row_slot_dev, flash_partials, logits, hidden_out) =
             result.map_err(|e| format!("VMM executor scratch: {e}"))?;
         // Plain trunk rows only: no GDN S-tape (that is a verify/tree cost).
@@ -823,12 +844,16 @@ impl Qwen35VmmStore {
                 return Err(format!("VMM executor pbs: {e}"));
             }
         };
-        let n_dn = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+        let n_dn = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count();
         // GDN (72 B) + conv (40 B) rows per DeltaNet layer; gated norm (24 B)
         // and FA prep (40 B) rows are layer-independent.
         let table_bytes = max_slots * (n_dn * (72 + 40) + 24 + 40);
         let rows_tables = match route {
-            VmmRoute::Exact => match gpu.zeros(&[table_bytes / 4], DType::F32) {
+            VmmRoute::Exact if !singleton_rows => match gpu.zeros(&[table_bytes / 4], DType::F32) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     let _ = pbs.free_gpu(gpu);
@@ -842,7 +867,7 @@ impl Qwen35VmmStore {
                     return Err(format!("VMM executor rows tables: {e}"));
                 }
             },
-            VmmRoute::Nonexact => None,
+            VmmRoute::Exact | VmmRoute::Nonexact => None,
         };
         let n_kv = kv_layer_ids.len();
         Ok(Self {
@@ -903,13 +928,19 @@ impl Qwen35VmmStore {
     /// or a KV owner of another format.
     pub fn admit(&mut self, state: Qwen35RequestState) -> Result<(), (Qwen35RequestState, String)> {
         if !matches!(self.phase, Phase::Idle) {
-            return Err((state, "VMM executor: admit during an uncommitted step".into()));
+            return Err((
+                state,
+                "VMM executor: admit during an uncommitted step".into(),
+            ));
         }
         if !state.epoch.is_admitted() {
             return Err((state, "VMM executor: admit of an unadmitted epoch".into()));
         }
         if state.slot >= self.max_slots {
-            let m = format!("VMM executor: slot {} >= width {}", state.slot, self.max_slots);
+            let m = format!(
+                "VMM executor: slot {} >= width {}",
+                state.slot, self.max_slots
+            );
             return Err((state, m));
         }
         if self.slots[state.slot].is_some() {
@@ -921,7 +952,12 @@ impl Qwen35VmmStore {
         }
         match vmm_format_of(&state.kv) {
             Ok(f) if f == self.format => {}
-            Ok(_) => return Err((state, "VMM executor: request KV format differs from store".into())),
+            Ok(_) => {
+                return Err((
+                    state,
+                    "VMM executor: request KV format differs from store".into(),
+                ))
+            }
             Err(e) => return Err((state, e)),
         }
         let slot = state.slot;
@@ -1052,7 +1088,10 @@ impl Qwen35VmmStore {
         } else {
             0
         };
-        let end = st.reserve_end.max(st.position).min(st.kv.vmm_logical_bound());
+        let end = st
+            .reserve_end
+            .max(st.position)
+            .min(st.kv.vmm_logical_bound());
         let remaining = st
             .kv
             .planned_mapped_growth_bytes(gpu, end)
@@ -1068,7 +1107,10 @@ impl Qwen35VmmStore {
     /// prefix entries are outside the room and never complete, so they are
     /// not lanes.
     pub fn memory_state(&self, gpu: &Gpu) -> Result<VmmMemoryState, String> {
-        let free = gpu.device_mem_info().map_err(|e| format!("VMM memory: VRAM query: {e}"))?.0;
+        let free = gpu
+            .device_mem_info()
+            .map_err(|e| format!("VMM memory: VRAM query: {e}"))?
+            .0;
         let lanes = self
             .slots
             .iter()
@@ -1128,10 +1170,9 @@ impl Qwen35VmmStore {
         let dn = dn_state_bytes(template_dn);
         let spec = match lane {
             VmmLaneSpec::Ar => 0,
-            VmmLaneSpec::Mtp => self
-                .spec
-                .as_ref()
-                .map_or(0, |e| vmm_spec_bytes(VmmLaneSpec::Mtp, e.lane_bytes(), 0, 0, 0)),
+            VmmLaneSpec::Mtp => self.spec.as_ref().map_or(0, |e| {
+                vmm_spec_bytes(VmmLaneSpec::Mtp, e.lane_bytes(), 0, 0, 0)
+            }),
             VmmLaneSpec::Dflash => match &self.dflash_engine {
                 None => 0,
                 Some(engine) => {
@@ -1148,7 +1189,13 @@ impl Qwen35VmmStore {
                         Ok(min_ceiling) => engine.checkpoint_bound(prompt_len, min_ceiling),
                         Err(_) => engine.checkpoint_bound_unplanned(prompt_len),
                     };
-                    vmm_spec_bytes(VmmLaneSpec::Dflash, 0, lane_state, engine.snapshot_bytes(), bound)
+                    vmm_spec_bytes(
+                        VmmLaneSpec::Dflash,
+                        0,
+                        lane_state,
+                        engine.snapshot_bytes(),
+                        bound,
+                    )
                 }
             },
         };
@@ -1229,8 +1276,10 @@ impl Qwen35VmmStore {
     pub fn budget_report(&self, gpu: &Gpu) -> String {
         let n_kv = self.kv_layer_ids.len();
         let free = gpu.device_mem_info().map_or(0, |(f, _)| f);
-        let (lane_bytes, snapshot_bytes) =
-            self.dflash_engine.as_ref().map_or((0, 0), |e| (e.lane_bytes(), e.snapshot_bytes()));
+        let (lane_bytes, snapshot_bytes) = self
+            .dflash_engine
+            .as_ref()
+            .map_or((0, 0), |e| (e.lane_bytes(), e.snapshot_bytes()));
         let mtp_lane_bytes = self.spec.as_ref().map_or(0, |e| e.lane_bytes());
         let mut s = format!(
             "kv_budget={} mapped_kv={} device_free={free} pool_parked={} map_reserve={VMM_MAP_DEVICE_RESERVE_BYTES} dflash_lane_bytes={lane_bytes} mtp_lane_bytes={mtp_lane_bytes} dn_snapshot_bytes={snapshot_bytes} lanes=[",
@@ -1351,7 +1400,10 @@ impl Qwen35VmmExecutor<'_> {
             VmmRoute::Nonexact => n,
         };
         if trunk_rows > st.row_budget {
-            return Err(format!("provision_step: {trunk_rows} rows exceed row budget {}", st.row_budget));
+            return Err(format!(
+                "provision_step: {trunk_rows} rows exceed row budget {}",
+                st.row_budget
+            ));
         }
         if b.m_per_slot.len() > st.max_slots
             || b.tokens.len() != n
@@ -1373,7 +1425,9 @@ impl Qwen35VmmExecutor<'_> {
                     st.spec_check_verify(r, draft_len, seed)?;
                 }
                 RequestStepKind::Forced => {
-                    return Err("provision_step: Forced rows are not admitted on the VMM executor".into());
+                    return Err(
+                        "provision_step: Forced rows are not admitted on the VMM executor".into(),
+                    );
                 }
             }
             let state = st
@@ -1398,7 +1452,8 @@ impl Qwen35VmmExecutor<'_> {
                     state.slot, r.rows.len
                 ));
             }
-            if r.kind == RequestStepKind::Prefill && state.position + r.rows.len > state.prompt_len {
+            if r.kind == RequestStepKind::Prefill && state.position + r.rows.len > state.prompt_len
+            {
                 return Err(format!(
                     "provision_step: prefill past prompt end {} for {:?}",
                     state.prompt_len, r.epoch
@@ -1445,7 +1500,8 @@ impl Qwen35VmmExecutor<'_> {
             if end > state.kv.vmm_logical_bound() {
                 return Err(format!(
                     "provision_step: epoch {:?} needs {end} positions > logical bound {}",
-                    r.epoch, state.kv.vmm_logical_bound()
+                    r.epoch,
+                    state.kv.vmm_logical_bound()
                 ));
             }
         }
@@ -1467,7 +1523,10 @@ impl Qwen35VmmExecutor<'_> {
         );
         let st = &mut *self.store;
         for r in &plan.requests {
-            let budget = st.kv_budget_bytes.saturating_sub(mapped_total).min(device_room);
+            let budget = st
+                .kv_budget_bytes
+                .saturating_sub(mapped_total)
+                .min(device_room);
             let s = st
                 .slots
                 .iter_mut()
@@ -1504,15 +1563,13 @@ impl Qwen35VmmExecutor<'_> {
                 .flatten()
                 .find(|s| s.epoch == r.epoch)
                 .expect("validated above");
-            let generation = s
-                .kv
-                .vmm_owner_generation(gpu)
-                .map_err(|e| format!("provision_step: {:?}: {e}", r.epoch))?;
+            let generation =
+                s.kv.vmm_owner_generation(gpu)
+                    .map_err(|e| format!("provision_step: {:?}: {e}", r.epoch))?;
             st.row_gen[r.rows.begin..r.rows.begin + r.rows.len].fill(generation);
-            let descs = s
-                .kv
-                .vmm_slot_descs(gpu)
-                .map_err(|e| format!("provision_step: descriptors for {:?}: {e}", r.epoch))?;
+            let descs =
+                s.kv.vmm_slot_descs(gpu)
+                    .map_err(|e| format!("provision_step: descriptors for {:?}: {e}", r.epoch))?;
             for (l, &layer) in st.kv_layer_ids.iter().enumerate() {
                 // Idle requests stay MASKED: never fake participants.
                 st.descs_host[l * ms + s.slot] = descs[layer];
@@ -1537,7 +1594,11 @@ impl Qwen35VmmExecutor<'_> {
     /// Waits for completion (the pick download synchronizes) so commit can
     /// release leases safely. On error the step is aborted and every
     /// participant poisoned.
-    pub fn forward_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<StepOutput, String> {
+    pub fn forward_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<StepOutput, String> {
         let key = StepKey::of(plan);
         match &self.store.phase {
             Phase::Provisioned(k) if *k == key => {}
@@ -1604,9 +1665,13 @@ impl Qwen35VmmExecutor<'_> {
             sample_heads(gpu, st, config, s, plan, &prefill, &mut picks)?;
         } else if split {
             run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
-            run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
+            run_pass(
+                gpu, st, weights, config, s, plan, &prefill, true, &mut picks,
+            )?;
         } else if !decode.is_empty() || !prefill.is_empty() {
-            let all: Vec<usize> = (0..plan.requests.len()).filter(|&i| !is_verify(i)).collect();
+            let all: Vec<usize> = (0..plan.requests.len())
+                .filter(|&i| !is_verify(i))
+                .collect();
             run_pass(gpu, st, weights, config, s, plan, &all, false, &mut picks)?;
         }
         // Verify requests: their own shared verify trunk + head (singleton
@@ -1652,10 +1717,21 @@ fn run_pass(
     let to_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
     st.row_slot_host.clear();
     st.row_slot_host.extend(b.tokens.iter().map(|&t| t as i32));
-    gpu.hip.memcpy_htod(&st.pbs.tokens.buf, &to_bytes(&st.row_slot_host))?;
-    gpu.hip.memcpy_htod(&st.pbs.positions.buf, &to_bytes(&b.positions))?;
-    gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &to_bytes(&b.row_slot))?;
-    embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+    gpu.hip
+        .memcpy_htod(&st.pbs.tokens.buf, &to_bytes(&st.row_slot_host))?;
+    gpu.hip
+        .memcpy_htod(&st.pbs.positions.buf, &to_bytes(&b.positions))?;
+    gpu.hip
+        .memcpy_htod(&st.row_slot_dev.buf, &to_bytes(&b.row_slot))?;
+    embed_lookup_slots(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &st.pbs.x_batch,
+        &st.pbs.tokens,
+        n,
+        dim,
+    )?;
 
     let mut dn: Vec<Option<&DeltaNetState>> = vec![None; n_slots];
     for state in st.slots.iter().flatten() {
@@ -1675,7 +1751,10 @@ fn run_pass(
         max_ctx_len,
     )?;
     if flash.partial_floats_per_row > st.flash_partials.numel() {
-        return Err(HipError::new(0, "VMM executor: flash partials undersized for this step"));
+        return Err(HipError::new(
+            0,
+            "VMM executor: flash partials undersized for this step",
+        ));
     }
     let tier = SlotKvTier {
         mode: mode_of(format),
@@ -1796,12 +1875,14 @@ fn sample_heads(
     let jobs: Vec<hipfire_runtime::batch_sampler::BatchSampleJob<'_>> = heads
         .iter()
         .zip(&views)
-        .map(|((_, state), view)| hipfire_runtime::batch_sampler::BatchSampleJob {
-            logits: view,
-            history: &state.history,
-            cfg: &state.sampler,
-            rng_state: state.rng_state,
-        })
+        .map(
+            |((_, state), view)| hipfire_runtime::batch_sampler::BatchSampleJob {
+                logits: view,
+                history: &state.history,
+                cfg: &state.sampler,
+                rng_state: state.rng_state,
+            },
+        )
         .collect();
     let arena = st.sampler_arena.as_mut().expect("allocated above");
     let sampled = hipfire_runtime::batch_sampler::sample_batch(gpu, arena, &jobs)?;
@@ -1842,11 +1923,14 @@ impl Qwen35VmmExecutor<'_> {
         for r in &plan.requests {
             match st.slots.iter().flatten().find(|s| s.epoch == r.epoch) {
                 Some(s) if !s.poisoned => {}
-                _ => return Err(format!("commit_step: epoch {:?} no longer owns its slot", r.epoch)),
+                _ => {
+                    return Err(format!(
+                        "commit_step: epoch {:?} no longer owns its slot",
+                        r.epoch
+                    ))
+                }
             }
-            if st.wants_head(r)
-                && output.target_picks[r.rows.begin + r.rows.len - 1] == u32::MAX
-            {
+            if st.wants_head(r) && output.target_picks[r.rows.begin + r.rows.len - 1] == u32::MAX {
                 return Err("commit_step: head row without a target pick".into());
             }
         }
@@ -1929,7 +2013,10 @@ mod tests {
         assert_eq!(vmm_map_room(88_080_384, 384_518_400), 0);
         assert_eq!(vmm_map_room(600 * MIB, 0), 88 * MIB);
         assert_eq!(vmm_map_room(100 * MIB, 500 * MIB), 88 * MIB);
-        assert_eq!(vmm_map_room(usize::MAX, usize::MAX), usize::MAX - VMM_MAP_DEVICE_RESERVE_BYTES);
+        assert_eq!(
+            vmm_map_room(usize::MAX, usize::MAX),
+            usize::MAX - VMM_MAP_DEVICE_RESERVE_BYTES
+        );
     }
 
     /// Lanes that already hold their whole reservation complete first and
@@ -1954,24 +2041,51 @@ mod tests {
         let mut lanes = vec![lane(1_400 * MIB, 128 * MIB, 2 * CHUNK); 2];
         let (mut room, mut kv_room) = (2 * CHUNK, usize::MAX);
         // Lane 1 may take one chunk: it can then finish in the chunk left.
-        assert!(vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 1, CHUNK));
+        assert!(vmm_grant_growth(
+            &mut room,
+            &mut kv_room,
+            &mut lanes,
+            1,
+            CHUNK
+        ));
         assert_eq!(room, CHUNK);
-        assert_eq!(lanes[1], lane(1_400 * MIB + CHUNK, 128 * MIB + CHUNK, CHUNK));
+        assert_eq!(
+            lanes[1],
+            lane(1_400 * MIB + CHUNK, 128 * MIB + CHUNK, CHUNK)
+        );
         // Lane 0 taking that chunk would leave both lanes a chunk short with
         // no room: it waits, and nothing changes.
         let before = (room, lanes.clone());
-        assert!(!vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 0, CHUNK));
+        assert!(!vmm_grant_growth(
+            &mut room,
+            &mut kv_room,
+            &mut lanes,
+            0,
+            CHUNK
+        ));
         assert_eq!((room, lanes.clone()), before);
         // Lane 1 taking it completes lane 1's reservation; its release then
         // covers lane 0.
-        assert!(vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 1, CHUNK));
+        assert!(vmm_grant_growth(
+            &mut room,
+            &mut kv_room,
+            &mut lanes,
+            1,
+            CHUNK
+        ));
         assert_eq!(room, 0);
         // A step that maps nothing is always granted, even with no room.
         assert!(vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 0, 0));
         // Growth past the room is never granted.
         let mut lanes = vec![lane(0, 0, 0)];
         let (mut room, mut kv_room) = (CHUNK - 1, usize::MAX);
-        assert!(!vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 0, CHUNK));
+        assert!(!vmm_grant_growth(
+            &mut room,
+            &mut kv_room,
+            &mut lanes,
+            0,
+            CHUNK
+        ));
     }
 
     /// Measured long8 footprint per DFlash lane: lane state 1,038,090,240 B,
@@ -2002,14 +2116,20 @@ mod tests {
         // MTP: the probed MTP lane state only.
         assert_eq!(vmm_spec_bytes(VmmLaneSpec::Mtp, 7, 11, 13, 3), 7);
         // DFlash: lane state plus one snapshot per checkpoint.
-        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 3), 11 + 3 * 13);
+        assert_eq!(
+            vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 3),
+            11 + 3 * 13
+        );
         assert_eq!(vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 0), 11);
     }
 
     #[test]
     fn seed_free_deduction_covers_the_lane_owners_and_a_margin() {
         let (kv, dn, lane_state) = (3 * CHUNK, 120_324_096, 1_038_090_240);
-        assert_eq!(vmm_seed_free_deduction(kv + dn + lane_state), kv + dn + lane_state + 256 * MIB);
+        assert_eq!(
+            vmm_seed_free_deduction(kv + dn + lane_state),
+            kv + dn + lane_state + 256 * MIB
+        );
         assert_eq!(vmm_seed_free_deduction(usize::MAX), usize::MAX);
     }
 
