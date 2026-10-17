@@ -582,6 +582,43 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     );
 }
 
+/// #651: ParoQ4G64 (40-byte groups, 64-channel Givens blocks) and ParoQ4G128
+/// (72-byte groups, 128-channel blocks) must never share a GEMV route, in
+/// either direction, while keeping the same Givens-then-plain-GEMV contract.
+#[test]
+fn paro_g64_and_g128_never_share_a_route() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    let ctx = DispatchCtx::for_test("gfx1151");
+    for (dtype, key, group, row) in [
+        (ParoQ4G64, KernelKey::GemvParoQ4G64, 64, 40),
+        (ParoQ4G128, KernelKey::GemvParoQ4G128, 128, 72),
+    ] {
+        assert_eq!(
+            KernelKey::for_gemv(dtype, GemvVariant::Plain, false).unwrap(),
+            key
+        );
+        // Prerotated (decode QKV/FFN) and Plain must land on the same kernel.
+        assert_eq!(KernelKey::for_gemv_prerotated(dtype).unwrap(), key);
+        assert_eq!(
+            fam.resolve(dtype, GemvVariant::Plain, false, &ctx, None)
+                .unwrap()
+                .key,
+            key
+        );
+        assert_eq!(dtype_rotation_plan(dtype), RotationPlan::Givens);
+        assert_eq!(dtype_post_rotation_variant(dtype), GemvVariant::Plain);
+        assert_eq!(dtype.paro_group_size(), Some(group));
+        assert_eq!(dtype.row_bytes(group), Some(row));
+    }
+    assert_ne!(KernelKey::GemvParoQ4G64, KernelKey::GemvParoQ4G128);
+    // No fused residual twin: both take the plain GEMV + add fallback.
+    assert!(KernelKey::for_gemv_residual(ParoQ4G64).is_err());
+    assert!(has_dispatch_plan(Role::Residual, ParoQ4G64));
+    // Only the G128 dtype is admitted into the G128-only MoE tier list.
+    assert!(!crate::families::moe::MIXED_SUPPORTED_TIERS.contains(&ParoQ4G64));
+}
+
 /// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
 /// then the FFN/qkv used Prerotated (the second panic domino). Lock every variant
 /// these dtypes are actually dispatched through.

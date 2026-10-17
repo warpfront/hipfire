@@ -19,7 +19,7 @@ describes the math and wire contracts.
 | **HFQ** | none | INT asymmetric | G256 (G128 variants exist) | Dense Llama / Mistral / Gemma / plain Qwen |
 | **MQ (MagnumQuant)** | offline FWHT-256 | INT asymmetric (or Lloyd codebook) | G256 | Qwen 3.5+ hybrid path; FWHT baked into weights |
 | **HFP / MFP** | optional offline FWHT | OCP E2M1 FP4 | G32 rows | RDNA-oriented FP4; MFP = HFP + FWHT |
-| **PARO** | pairwise Givens | AWQ W4 | G128 | Imported ParoQuant/AWQ probe path |
+| **PARO** | pairwise Givens | AWQ W4 | G128 or G64 (`ParoQ4G128` / `ParoQ4G64`, from `group_size`) | Imported ParoQuant/AWQ probe path |
 | **Q8F16** | none | INT8 + f16 scale | G32 | Embeddings, routers, precision-sensitive 2D |
 
 Production defaults for day-to-day use:
@@ -176,7 +176,9 @@ lockstep (`crates/hipfire-runtime/src/llama.rs`,
 
 **Always batch-eligible (both owners):** `MQ4G256`, `HFQ4G256`, `MQ6G256`,
 `HFQ6G256`, `Q8_0`. (qwen35 also treats `ParoQ4G128` / `F32` as always-ok for
-the PARO probe path.)
+the PARO probe path; llama admits `ParoQ4G64`, whose prefill rotates each
+projection's rows and runs `gemm_hfq4g64`, while llama `ParoQ4G128` stays
+per-token.)
 
 | DType | `llama::is_batchable_la` | `qwen35::is_batchable_la` |
 |---|---|---|

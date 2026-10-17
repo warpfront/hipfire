@@ -1230,6 +1230,23 @@ fn dispatch_attend(
                         io.physical_cap,
                         fp,
                     )),
+                    // The flash tile walks head_dim in 128-wide halves (32
+                    // lanes x 4): a 64-wide head (SmolLM2, Llama-3.2-1B) would
+                    // read the next head's Q/K and write past its partials row.
+                    // attention_q8_0_kv reads the position from pos_buf on a
+                    // fixed grid, so it is graph/replay-safe as well.
+                    (None, None) if io.head_dim % 128 != 0 => hip!(gpu.attention_q8_0_kv(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                    )),
                     (None, None) => hip!(gpu.attention_flash_q8_0(
                         io.q,
                         io.k_cache,

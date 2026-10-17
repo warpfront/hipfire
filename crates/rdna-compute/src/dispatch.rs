@@ -912,6 +912,10 @@ pub enum DType {
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
+    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
+    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
+    // reverse); `paro_group_size` is the one place either width is read from.
     /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
     /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
     /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
@@ -1001,6 +1005,7 @@ impl DType {
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
             | DType::ParoQ4G128
+            | DType::ParoQ4G64
             | DType::Raw
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
@@ -1040,6 +1045,7 @@ impl DType {
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.
             DType::ParoQ4G128 => grouped(128, 72),
+            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -1058,6 +1064,17 @@ impl DType {
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128 => None,
+            _ => None,
+        }
+    }
+
+    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
+    /// block of its activation rotation (the two are the same in ParoQuant).
+    /// `None` for every non-Paro dtype.
+    pub fn paro_group_size(self) -> Option<usize> {
+        match self {
+            DType::ParoQ4G128 => Some(128),
+            DType::ParoQ4G64 => Some(64),
             _ => None,
         }
     }
@@ -8544,6 +8561,9 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
         assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
+        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
+        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));

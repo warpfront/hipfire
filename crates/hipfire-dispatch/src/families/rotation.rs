@@ -23,6 +23,8 @@ pub struct RotationParams<'a> {
     pub givens_theta: Option<&'a GpuTensor>,
     pub givens_scales: Option<&'a GpuTensor>,
     pub givens_krot: Option<usize>,
+    /// Givens block width = `DType::paro_group_size` of the consuming weight.
+    pub givens_group_size: Option<usize>,
 }
 
 /// Rotation kernel family — selects and runs FWHT rotation kernels.
@@ -65,6 +67,9 @@ impl RotationFamily {
                 let krot = params.givens_krot.ok_or_else(|| {
                     HipError::new(0, "givens_krot required for Givens rotation")
                 })?;
+                let group = params.givens_group_size.ok_or_else(|| {
+                    HipError::new(0, "givens_group_size required for Givens rotation")
+                })?;
                 // givens_rotate_to does copy_d2d + rotate in one kernel
                 gpu.givens_rotate_to(
                     params.x, params.x_rot,
@@ -72,6 +77,7 @@ impl RotationFamily {
                     1, /* seq_len */
                     params.k,
                     krot,
+                    group,
                 )
             }
             RotationVariant::PlainG128 => {

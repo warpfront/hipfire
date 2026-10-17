@@ -126,6 +126,18 @@ fn herr(e: impl std::fmt::Display) -> hip_bridge::HipError {
     hip_bridge::HipError::new(0, &e.to_string())
 }
 
+/// Norm-step rotation and projection input for a group of projections that
+/// share one normed activation. A Givens (Paro) weight carries its own rotation
+/// sidecar, so no single rotated activation serves the group: the norm stays
+/// plain and every GEMV rotates its raw input (`GemvInput::Raw`).
+fn shared_input(rot: RotationPlan, x_rot: &GpuTensor) -> (RotationPlan, GemvInput<'_>) {
+    if rot == RotationPlan::Givens {
+        (RotationPlan::None, GemvInput::Raw(x_rot))
+    } else {
+        (rot, GemvInput::Prerotated(x_rot))
+    }
+}
+
 /// Shared dense-transformer decode forward for one token. Runs the per-layer op
 /// sequence; the caller does embedding (before) and final norm + lm_head +
 /// sampling (after), since those buffers/dtypes differ per arch.
@@ -135,6 +147,8 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
 
     for l in 0..arch.n_layers() {
         let layer = arch.layer(l);
+        let (qkv_rot, qkv_in) = shared_input(layer.qkv_rot, s.x_rot);
+        let (ffn_rot, ffn_in) = shared_input(layer.ffn_rot, s.x_rot);
 
         // The attention block as one contiguous step list: QKV (fuses to
         // FusedQkv*), bias, qk-norm, RoPE — then, on the `Some` path, the
@@ -151,21 +165,21 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                 awq_scale: layer.qkv_awq,
                 k: layer.qkv_k,
                 eps: k.norm_eps,
-                rotation: layer.qkv_rot,
+                rotation: qkv_rot,
             },
             Step::Gemv {
                 w: &layer.wq,
-                input: GemvInput::Prerotated(s.x_rot),
+                input: qkv_in,
                 out: s.q,
             },
             Step::Gemv {
                 w: &layer.wk,
-                input: GemvInput::Prerotated(s.x_rot),
+                input: qkv_in,
                 out: s.k,
             },
             Step::Gemv {
                 w: &layer.wv,
-                input: GemvInput::Prerotated(s.x_rot),
+                input: qkv_in,
                 out: s.v,
             },
         ];
@@ -261,16 +275,16 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                     awq_scale: layer.ffn_awq,
                     k: layer.ffn_k,
                     eps: k.norm_eps,
-                    rotation: layer.ffn_rot,
+                    rotation: ffn_rot,
                 },
                 Step::Gemv {
                     w: &layer.w_gate,
-                    input: GemvInput::Prerotated(s.x_rot),
+                    input: ffn_in,
                     out: s.gate,
                 },
                 Step::Gemv {
                     w: &layer.w_up,
-                    input: GemvInput::Prerotated(s.x_rot),
+                    input: ffn_in,
                     out: s.up,
                 },
             ],

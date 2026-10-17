@@ -536,8 +536,11 @@ pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> boo
     };
     dt == DType::ParoQ4G128
         && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
+        // The pack4 kernel reads the native PARO4-G128 tensor, whose rotation is
+        // embedded in the weight bytes. A safetensors-Dir weight (HFQ4-G128 repack
+        // + sidecar `rotation`) has the same dtype but not that layout.
         && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
+            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0 && w.rotation.is_none(),
             _ => false,
         })
         // Gate and up must have equal m — the fused kernel takes a single m.
@@ -1658,6 +1661,7 @@ pub(crate) fn launch_op_rows(
                             givens_theta: None,
                             givens_scales: None,
                             givens_krot: None,
+                            givens_group_size: None,
                         },
                     )
                     .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -2200,6 +2204,78 @@ mod tests {
         assert!(!guard_gate_up_paro4g128t(empty, &ctx));
         assert!(!guard_qkvza_paro4g128t(empty, &ctx));
         assert!(!guard_qkv_paro4g128t(empty, &ctx));
+    }
+
+    /// The pack4 kernel behind `FusedGateUpParo4G128T` reads the rotation from
+    /// native PARO4-G128 weight bytes. A safetensors-Dir weight of the same
+    /// dtype carries a sidecar rotation instead, and a G64 weight has neither
+    /// layout: both must stay on the per-projection Givens + GEMV path.
+    #[test]
+    fn paro_gate_up_fusion_admits_only_native_g128() {
+        use crate::families::gemv::GivensRef;
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let t = || GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) },
+            shape: vec![1024],
+            dtype: DType::F32,
+        };
+        let (x, norm, act, pairs, theta, scales) = (t(), t(), t(), t(), t(), t());
+        let sidecar = GivensRef {
+            pairs: &pairs,
+            theta: &theta,
+            scales: &scales,
+            krot: 8,
+        };
+        let admits = |dtype: DType, rotation: Option<GivensRef>| {
+            let w = WeightRef {
+                buf: &x,
+                dtype,
+                m: 16,
+                k: 128,
+                row_stride: 0,
+                rotation,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            };
+            let steps = [
+                Step::RmsnormAutomatic {
+                    x: &x,
+                    norm_weight: &norm,
+                    x_plain: &act,
+                    out: &act,
+                    awq_scale: None,
+                    k: 128,
+                    eps: 1e-6,
+                    rotation: RotationPlan::None,
+                },
+                Step::Gemv {
+                    w: &w,
+                    input: GemvInput::Raw(&act),
+                    out: &act,
+                },
+                Step::Gemv {
+                    w: &w,
+                    input: GemvInput::Raw(&act),
+                    out: &act,
+                },
+            ];
+            guard_gate_up_paro4g128t(&steps, &ctx)
+        };
+        assert!(
+            admits(DType::ParoQ4G128, None),
+            "native PARO4-G128 window must fuse"
+        );
+        assert!(
+            !admits(DType::ParoQ4G128, Some(sidecar)),
+            "sidecar G128 must not fuse"
+        );
+        assert!(
+            !admits(DType::ParoQ4G64, Some(sidecar)),
+            "G64 must not fuse"
+        );
+        assert!(!admits(DType::ParoQ4G64, None), "G64 must not fuse");
     }
 
     #[test]

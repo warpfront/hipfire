@@ -16,10 +16,17 @@
 #include <assert.h>
 
 #define CTA_M 4
+// Paro rotation block = the weight's quant group. The G64 twin
+// (`GIVENS_ROTATE_TO_G64_SRC`) predefines both widths and the entry name.
+#ifndef GROUP_SIZE
 #define GROUP_SIZE 128
 #define HALF_GROUP 64
+#endif
+#ifndef GIVENS_ROTATE_TO_KERNEL
+#define GIVENS_ROTATE_TO_KERNEL givens_rotate_to_f32
+#endif
 
-extern "C" __global__ void givens_rotate_to_f32(
+extern "C" __global__ void GIVENS_ROTATE_TO_KERNEL(
     const float* __restrict__ x_in,          // [seq_len, hidden_dim]
     float*       __restrict__ x_out,         // [seq_len, hidden_dim]
     const short* __restrict__ pairs,         // [krot, hidden_dim]

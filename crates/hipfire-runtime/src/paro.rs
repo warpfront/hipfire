@@ -154,6 +154,18 @@ pub fn load_paro_weight(
     group_size: u32,
     krot: u8,
 ) -> HipResult<WeightTensor> {
+    // The group width picks the dtype, and with it every kernel the weight can
+    // reach: G64 and G128 never share a GEMV/GEMM or Givens launch.
+    let gpu_dtype = match group_size {
+        128 => DType::ParoQ4G128,
+        64 => DType::ParoQ4G64,
+        g => {
+            return Err(HipError::new(
+                0,
+                &format!("{tensor_prefix}: ParoQuant group_size {g} is unsupported (64 or 128)"),
+            ))
+        }
+    };
     let qw_name = format!("{tensor_prefix}.qweight");
     let qz_name = format!("{tensor_prefix}.qzeros");
     let sc_name = format!("{tensor_prefix}.scales");
@@ -177,6 +189,15 @@ pub fn load_paro_weight(
         let (_, sc_data) = source
             .tensor_data(&sc_name)
             .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
+        check_awq_layout(
+            tensor_prefix,
+            qw_data,
+            qz_data,
+            sc_data,
+            out_dim,
+            in_dim,
+            group_size as usize,
+        )?;
 
         // Repack AWQ → HFQ4G128.
         let hfq_data = repack_awq_to_hfq4g128(
@@ -205,7 +226,7 @@ pub fn load_paro_weight(
 
         Ok(WeightTensor {
             buf: pending.buf.take().expect("Paro weight buffer staged"),
-            gpu_dtype: DType::ParoQ4G128,
+            gpu_dtype,
             m: out_dim,
             k: in_dim,
             row_stride: 0,
@@ -370,6 +391,13 @@ pub fn paro_repack_moe_projection(
     let qw_name = format!("{full_prefix}.qweight");
     let qz_name = format!("{full_prefix}.qzeros");
     let sc_name = format!("{full_prefix}.scales");
+    // Every MoE consumer of these rows is HFQ4-G128 (ParoQ4G128 experts).
+    if group_size != 128 {
+        return Err(HipError::new(
+            0,
+            &format!("{full_prefix}: ParoQuant MoE experts support group_size 128 only, got {group_size}"),
+        ));
+    }
     let (_, qw_data) = source
         .tensor_data(&qw_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qw_name}")))?;
@@ -379,9 +407,52 @@ pub fn paro_repack_moe_projection(
     let (_, sc_data) = source
         .tensor_data(&sc_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {sc_name}")))?;
+    check_awq_layout(
+        full_prefix,
+        qw_data,
+        qz_data,
+        sc_data,
+        out_dim,
+        in_dim,
+        group_size,
+    )?;
     Ok(repack_awq_to_hfq4g128(
         qw_data, qz_data, sc_data, out_dim, in_dim, group_size,
     ))
+}
+
+/// Refuse AWQ tensors whose byte sizes do not match `[K, M/8]` qweight,
+/// `[K/g, M/8]` qzeros and `[K/g, M]` F16 scales for this group width — e.g.
+/// a G64 checkpoint whose config claims G128 — before the repack indexes them.
+fn check_awq_layout(
+    prefix: &str,
+    qweight: &[u8],
+    qzeros: &[u8],
+    scales: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> HipResult<()> {
+    let groups = in_dim / group_size;
+    let ok = out_dim % 8 == 0
+        && in_dim % group_size == 0
+        && qweight.len() == in_dim * out_dim / 2
+        && qzeros.len() == groups * out_dim / 2
+        && scales.len() == groups * out_dim * 2;
+    if ok {
+        Ok(())
+    } else {
+        Err(HipError::new(
+            0,
+            &format!(
+                "{prefix}: ParoQuant AWQ tensors (qweight {} B, qzeros {} B, scales {} B) do not \
+                 match [{out_dim} x {in_dim}] at group_size {group_size}",
+                qweight.len(),
+                qzeros.len(),
+                scales.len()
+            ),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +535,97 @@ mod tests {
             layout: "unknown",
         };
         assert!(paro_text_prefix(&src).is_err());
+    }
+
+    /// AutoAWQ packing, written independently of the repacker: nibble slot `i`
+    /// of an int32 word holds output lane `AWQ_ORDER[i]` (ParoQuant `_AWQ_REORDER`).
+    const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    /// f16 scales that are exact in f32: (bits, value).
+    const SCALES: [(u16, f32); 4] = [(0x3C00, 1.0), (0x3800, 0.5), (0x3400, 0.25), (0x4000, 2.0)];
+
+    struct Awq {
+        qweight: Vec<u8>,
+        qzeros: Vec<u8>,
+        scales: Vec<u8>,
+        /// `[m][k]` reference weights `scale * (q - zero)`.
+        dense: Vec<f32>,
+    }
+
+    fn awq_fixture(m: usize, k: usize, g: usize) -> Awq {
+        let q = |kk: usize, mm: usize| ((kk * 7 + mm * 3 + kk / 5) % 16) as u32;
+        let z = |gg: usize, mm: usize| ((gg * 5 + mm) % 16) as u32;
+        let s = |gg: usize, mm: usize| SCALES[(gg + 2 * mm) % 4];
+        let pack = |rows: usize, nib: &dyn Fn(usize, usize) -> u32| {
+            let mut out = Vec::new();
+            for r in 0..rows {
+                for col in 0..m / 8 {
+                    let mut word = 0u32;
+                    for (slot, &lane) in AWQ_ORDER.iter().enumerate() {
+                        word |= nib(r, col * 8 + lane) << (4 * slot);
+                    }
+                    out.extend(word.to_le_bytes());
+                }
+            }
+            out
+        };
+        let groups = k / g;
+        let scales = (0..groups)
+            .flat_map(|gg| (0..m).flat_map(move |mm| s(gg, mm).0.to_le_bytes()))
+            .collect();
+        let dense = (0..m * k)
+            .map(|i| {
+                let (mm, kk) = (i / k, i % k);
+                s(kk / g, mm).1 * (q(kk, mm) as f32 - z(kk / g, mm) as f32)
+            })
+            .collect();
+        Awq {
+            qweight: pack(k, &q),
+            qzeros: pack(groups, &z),
+            scales,
+            dense,
+        }
+    }
+
+    /// HFQ4 reader: per group `[f32 scale][f32 zero][g/2 nibble bytes]`, low
+    /// nibble = even element, `ceil(k/g)` groups per row.
+    fn dequant_hfq4(bytes: &[u8], m: usize, k: usize, g: usize) -> Vec<f32> {
+        let group_bytes = 8 + g / 2;
+        let row_bytes = k.div_ceil(g) * group_bytes;
+        let f = |b: &[u8]| f32::from_le_bytes(b[..4].try_into().unwrap());
+        (0..m * k)
+            .map(|i| {
+                let (mm, kk) = (i / k, i % k);
+                let grp = &bytes[mm * row_bytes + (kk / g) * group_bytes..];
+                let byte = grp[8 + (kk % g) / 2];
+                let nib = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                f(grp) * nib as f32 + f(&grp[4..])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn awq_repack_matches_oracle_per_group_width() {
+        // K=960 is SmolLM2-360M's hidden size: 15 G64 groups, not G128-aligned.
+        for (k, g, dtype) in [(960, 64, DType::ParoQ4G64), (1024, 128, DType::ParoQ4G128)] {
+            let m = 16;
+            let a = awq_fixture(m, k, g);
+            check_awq_layout("t", &a.qweight, &a.qzeros, &a.scales, m, k, g).unwrap();
+            let packed = repack_awq_to_hfq4g128(&a.qweight, &a.qzeros, &a.scales, m, k, g);
+            assert_eq!(packed.len(), m * dtype.row_bytes(k).unwrap());
+            assert_eq!(dequant_hfq4(&packed, m, k, g), a.dense, "G{g}");
+        }
+    }
+
+    #[test]
+    fn g64_bytes_are_not_a_g128_tensor() {
+        // K=1024 is a whole number of groups at both widths.
+        let (m, k) = (16, 1024);
+        let a = awq_fixture(m, k, 64);
+        let packed = repack_awq_to_hfq4g128(&a.qweight, &a.qzeros, &a.scales, m, k, 64);
+        assert_eq!(dequant_hfq4(&packed, m, k, 64), a.dense);
+        // Negative control: the 72-byte G128 layout over the same bytes.
+        assert_ne!(dequant_hfq4(&packed, m, k, 128), a.dense);
+        // A G64 checkpoint whose config claims G128 is refused before repack.
+        assert!(check_awq_layout("t", &a.qweight, &a.qzeros, &a.scales, m, k, 128).is_err());
     }
 }

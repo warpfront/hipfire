@@ -140,7 +140,8 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // be fluent garbage rather than a fault.
         MFP4G32E8G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
-        ParoQ4G128 => RotationPlan::Givens,
+        // The Givens block width is the dtype's `paro_group_size` (128 / 64).
+        ParoQ4G128 | ParoQ4G64 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
         // in the natural basis, so x must NOT be rotated. Stated explicitly
         // rather than left to the `_` fallthrough below — by the same argument
@@ -162,7 +163,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
 pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
-        ParoQ4G128 => GemvVariant::Plain,
+        ParoQ4G128 | ParoQ4G64 => GemvVariant::Plain,
         // GL formats are MoE-indexed-only and intentionally have no dense
         // prerotated GEMV route.
         MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
@@ -292,6 +293,7 @@ pub enum KernelKey {
     GemvMfp4G32Fused,
     GemvHfp4G32,
     GemvParoQ4G128,
+    GemvParoQ4G64,
     GemvQ4F16G64,
     GemvQ4F16G32,
     GemvQ8HFQ,
@@ -828,6 +830,7 @@ impl KernelKey {
             (MFP4G32E8G128, Plain) => Ok(Self::GemvMfp4G32E8G128),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
+            (ParoQ4G64, Plain) => Ok(Self::GemvParoQ4G64),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
             (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
@@ -888,6 +891,7 @@ impl KernelKey {
             // dispatches GemvQ8_0 → gpu.gemv_q8_0 and GemvParoQ4G128 → gpu.gemv_hfq4g128.
             Q8_0 => Ok(Self::GemvQ8_0),
             ParoQ4G128 => Ok(Self::GemvParoQ4G128),
+            ParoQ4G64 => Ok(Self::GemvParoQ4G64),
             // Any other dtype: if it is rotation-free (RotationPlan::None), its
             // "prerotated" input IS its plain input (no rotation was applied), so the
             // plain GEMV kernel is correct — route to for_gemv(Plain), the exact kernel
@@ -1018,7 +1022,7 @@ impl KernelKey {
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
             | MFP4G32E8 | MFP4G32E8SOA | MFP4G32E8G128
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
-            | ParoQ4G128
+            | ParoQ4G128 | ParoQ4G64
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
             // wave32/wave64 kernel with no ISA-specific intrinsics, same as its
             // HFQ2G128 sibling — identical arch gating.
@@ -1139,6 +1143,7 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP3G32E8
             | MFP2G32E8
             | ParoQ4G128
+            | ParoQ4G64
     )
 }
 

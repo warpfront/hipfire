@@ -55,6 +55,7 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::MFP4G32E8G128,
         DType::HFP4G32,
         DType::ParoQ4G128,
+        DType::ParoQ4G64,
         DType::Q4F16G64,
         DType::Q4F16G32,
         DType::BF16, // native bf16 reference (KLD oracle); plain gemv, no rotation

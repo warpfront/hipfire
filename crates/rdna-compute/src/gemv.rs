@@ -805,6 +805,49 @@ impl Gpu {
         }
         result
     }
+
+    /// HFQ4-G64 GEMV (ParoQ4G64): flat 4-bit with 64-weight, 40-byte groups.
+    pub fn gemv_hfq4g64(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_hfq4g64";
+        self.ensure_kernel(FUNC, kernels::GEMV_HFQ4G64_SRC, FUNC)?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g64_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let result =
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Qwen4 qt53 (MQ4G128V2) GEMV against a G128-rotated activation.
     ///
     /// This is deliberately separate from the legacy MQ4G128/V1 launcher:
@@ -935,6 +978,9 @@ impl Gpu {
     /// activations to `x_out`. Replaces the
     /// `copy_d2d + givens_rotate` pair used by `rotate_x_paro_for` —
     /// one graph node + one inter-node dependency removed.
+    ///
+    /// `group_size` is the Paro rotation block (= the weight's quant group,
+    /// `DType::paro_group_size`): 128 or 64; any other width is refused.
     #[allow(clippy::too_many_arguments)]
     pub fn givens_rotate_to(
         &mut self,
@@ -946,16 +992,26 @@ impl Gpu {
         seq_len: usize,
         hidden_dim: usize,
         krot: usize,
+        group_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "givens_rotate_to_f32",
-            kernels::GIVENS_ROTATE_TO_SRC,
-            "givens_rotate_to_f32",
-        )?;
+        let (func, src) = match group_size {
+            128 => ("givens_rotate_to_f32", kernels::GIVENS_ROTATE_TO_SRC),
+            64 => (
+                "givens_rotate_to_g64_f32",
+                kernels::GIVENS_ROTATE_TO_G64_SRC,
+            ),
+            g => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("givens_rotate_to: no kernel for Paro group size {g} (64 or 128)"),
+                ))
+            }
+        };
+        self.ensure_kernel(func, src, func)?;
 
         let cta_m: u32 = 4;
-        let group_size: u32 = 128;
+        let group_size = group_size as u32;
         let groups_per_row = (hidden_dim as u32 + group_size - 1) / group_size;
         let grid_x = ((seq_len as u32) + cta_m - 1) / cta_m;
 
@@ -984,9 +1040,9 @@ impl Gpu {
         // Bytes: read x_in (seq × dim × 4) + write x_out (seq × dim × 4)
         // + read pairs/theta/scales (krot × dim × 2 + dim × 2).
         let bytes = seq_len * hidden_dim * 4 * 2 + krot * hidden_dim * 2 + hidden_dim * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "rotate", "givens_rotate_to_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rotate", func, bytes);
         let result = self.launch_maybe_blob(
-            "givens_rotate_to_f32",
+            func,
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
             smem,

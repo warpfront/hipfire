@@ -1355,6 +1355,16 @@ pub(crate) fn load_paroquant_weight(
     group_size: u32,
     krot: u8,
 ) -> HipResult<WeightTensor> {
+    // This loader tags every tensor ParoQ4G128; a G64 checkpoint must not reach
+    // the G128 kernels (llama's shared loader is the one that maps G64).
+    if group_size != 128 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "{tensor_prefix}: qwen3.5 ParoQuant supports group_size 128 only, got {group_size}"
+            ),
+        ));
+    }
     let qw_name = format!("{tensor_prefix}.qweight");
     let qz_name = format!("{tensor_prefix}.qzeros");
     let sc_name = format!("{tensor_prefix}.scales");

@@ -433,6 +433,8 @@ impl GemvFamily {
                     givens_theta: g.map(|g| g.theta),
                     givens_scales: g.map(|g| g.scales),
                     givens_krot: g.map(|g| g.krot),
+                    // The rotation block is the weight dtype's group, never sidecar metadata.
+                    givens_group_size: w.dtype.paro_group_size(),
                 },
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -527,6 +529,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
         K::GemvHfq4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
         K::GemvHfq4G128 | K::GemvParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
+        K::GemvParoQ4G64 => hip!(gpu.gemv_hfq4g64(w.buf, x, y, m, k)),
         K::GemvHfq3G256 => hip!(gpu.gemv_hfq3g256(w.buf, x, y, m, k)),
         K::GemvHfq3G128 => hip!(gpu.gemv_hfq3g128(w.buf, x, y, m, k)),
         K::GemvHfq2G256 => hip!(gpu.gemv_hfq2g256(w.buf, x, y, m, k)),

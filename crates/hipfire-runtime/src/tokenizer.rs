@@ -532,9 +532,10 @@ pub struct Tokenizer {
     merge_pair_rank: HashMap<(u32, u32), u32>,
     /// For GPT-2 BPE only: byte `b` → token id of `byte_to_gpt2_char(b).to_string()`.
     /// Construction guarantees every byte 0..=255 has a valid id (else
-    /// `from_*` returns `MissingByteSymbol`), so `encode_gpt2_bpe`'s initial
-    /// seed is infallible. `None` for SentencePiece tokenizers (no
-    /// byte-level encoding).
+    /// `from_*` returns `MissingByteSymbol`), except [`BYTE_ABSENT`] entries an
+    /// HF tokenizer.json without `unk_token`/`byte_fallback` admits; the encoder
+    /// drops those bytes. `None` for SentencePiece tokenizers (no byte-level
+    /// encoding).
     byte_to_id: Option<[u32; 256]>,
     /// Special tokens: strings like "<|im_start|>" → their token ID.
     /// Sorted longest-first for greedy matching.
@@ -673,25 +674,37 @@ fn resolve_merges(
     Ok((merges, merge_pair_rank))
 }
 
+/// `byte_to_id` entry for a byte whose GPT-2 char has no vocab symbol. Only an
+/// HF tokenizer.json BPE with no `unk_token` and no `byte_fallback` admits it
+/// (e.g. SmolLM2's trained vocab lacks bytes like 0x04 and 0xff): HF drops such
+/// a char from the word, and `encode_gpt2_chunk` does the same.
+const BYTE_ABSENT: u32 = u32::MAX;
+
 /// For GPT-2 BPE tokenizers: build the byte → token-id lookup table by
 /// running every byte 0..=255 through `byte_to_gpt2_char` and resolving
 /// the resulting char string against `token_to_id`. Returns `Err` on the
 /// first byte whose char isn't in the vocab — that would silently corrupt
-/// `encode_gpt2_bpe`'s initial seed (#203).
-fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], TokenizerError> {
+/// `encode_gpt2_bpe`'s initial seed (#203) — unless `absent_ok`, where the
+/// byte maps to [`BYTE_ABSENT`] and is dropped at encode time.
+fn build_byte_to_id(
+    token_to_id: &HashMap<String, u32>,
+    absent_ok: bool,
+) -> Result<[u32; 256], TokenizerError> {
     let mut out = [0u32; 256];
     let mut buf = [0u8; 4];
     for b in 0u32..=255 {
         let ch = byte_to_gpt2_char(b as u8);
         let s = ch.encode_utf8(&mut buf);
-        let id = token_to_id
-            .get(s)
-            .copied()
-            .ok_or(TokenizerError::MissingByteSymbol {
-                byte: b as u8,
-                char: ch,
-            })?;
-        out[b as usize] = id;
+        out[b as usize] = match token_to_id.get(s) {
+            Some(&id) => id,
+            None if absent_ok => BYTE_ABSENT,
+            None => {
+                return Err(TokenizerError::MissingByteSymbol {
+                    byte: b as u8,
+                    char: ch,
+                })
+            }
+        };
     }
     Ok(out)
 }
@@ -850,7 +863,7 @@ impl Tokenizer {
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         // For GPT-2 BPE, every byte 0..=255 must have a vocab entry. SP doesn't need this.
         let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
+            Some(build_byte_to_id(&token_to_id, false)?)
         } else {
             None
         };
@@ -1025,8 +1038,12 @@ impl Tokenizer {
         .then(|| vocab_map.keys().map(|s| s.chars().count()).max().unwrap_or(0));
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
+        // HF BPE drops a char it has no symbol for when there is neither an
+        // `unk_token` nor `byte_fallback`; mirror that instead of refusing.
+        let byte_absent_ok = model.get("unk_token").map_or(true, |v| v.is_null())
+            && model.get("byte_fallback").and_then(|v| v.as_bool()) != Some(true);
         let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
+            Some(build_byte_to_id(&token_to_id, byte_absent_ok)?)
         } else {
             None
         };
@@ -1215,7 +1232,7 @@ impl Tokenizer {
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
+            Some(build_byte_to_id(&token_to_id, false)?)
         } else {
             None
         };
@@ -1741,7 +1758,7 @@ impl Tokenizer {
         // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
         // Construction guarantees `byte_to_id` covers every byte 0..=255
         // for GPT-2 BPE tokenizers (else `from_*` returned
-        // `MissingByteSymbol`), so the table lookup is infallible.
+        // `MissingByteSymbol`) apart from `BYTE_ABSENT` bytes, which HF drops.
         let byte_to_id = self
             .byte_to_id
             .as_ref()
@@ -1749,6 +1766,7 @@ impl Tokenizer {
         let mut syms: Vec<u32> = chunk_bytes
             .iter()
             .map(|&b| byte_to_id[b as usize])
+            .filter(|&id| id != BYTE_ABSENT)
             .collect();
         let n = syms.len();
         if n == 0 {
@@ -3307,6 +3325,32 @@ mod pretok_tests {
             // Canonical `\p{N}{1,3}` keeps "123" together so the merge fires.
             assert_eq!(tok.encode_gpt2_bpe("a123"), vec![97, 256, 51]);
         }
+    }
+
+    /// SmolLM2's trained vocab has no symbol for some bytes (0x04, 0xff, …).
+    /// HF BPE with neither `unk_token` nor `byte_fallback` drops such a byte;
+    /// with an `unk_token` the vocab still refuses to load.
+    #[test]
+    fn from_hf_json_drops_bytes_without_symbol_like_hf() {
+        let mut tok_json: serde_json::Value =
+            serde_json::from_str(&byte_level_json(&["ab"], &["a b"], serde_json::Value::Null))
+                .unwrap();
+        let absent = byte_to_gpt2_char(0x04).to_string();
+        tok_json["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&absent);
+        tok_json["model"]["unk_token"] = serde_json::Value::Null;
+        let tok = Tokenizer::from_hf_json(&tok_json.to_string())
+            .expect("HF admits a BPE vocab without every byte symbol");
+        // The canonical pre-tokenizer isolates 0x04; HF (tokenizers 0.22) emits
+        // nothing for it and leaves both neighbours intact.
+        assert_eq!(tok.encode_gpt2_bpe("ab\x04ab"), vec![256, 256]);
+        tok_json["model"]["unk_token"] = json!("<unk>");
+        assert!(matches!(
+            Tokenizer::from_hf_json(&tok_json.to_string()),
+            Err(TokenizerError::MissingByteSymbol { byte: 0x04, .. })
+        ));
     }
 
     #[test]
