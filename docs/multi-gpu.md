@@ -240,8 +240,10 @@ stream, buffers, expert shard and exchange state. What differs from physical
 mode:
 
 - **Device count:** at least one visible device, not N.
-- **Arch:** unchanged. The aliased devices are still checked: exact gfx1100 or
-  exact gfx1201, one arch for every rank.
+- **Arch:** the aliased devices are still checked: exact gfx1100 or exact
+  gfx1201, one arch for every rank. Under emulation gfx1151 (Strix Halo, one
+  unified-memory GPU) is admitted too; it proves byte parity and lifecycle on
+  one device and is never a physical EP admission.
 - **Peer checks:** ranks that resolve to the same physical device are never
   probed and no peer mapping is enabled between them (the row gather and the
   tile exchange accept ranks that share a device); each pair of distinct
@@ -399,6 +401,17 @@ charged per rank at that rank's own share (an uneven split charges the low
 ranks more), and the host RAM and GTT checks cover every rank that has not
 pinned yet. Each rank prints its own fit line and `qwen4 EP rank r/n: loaded on
 device d (K routed experts of 512 per stack, …)`.
+
+Ownership is sealed once per load (`Qwen4EpSeal`, `crates/hipfire-arch-qwen4/src/ep_seal.rs`):
+one EP mesh epoch, every rank's physical device, and one sealed expert plan
+per routed-expert group (48 trunk layers plus the MTP head), planned by the
+shared `sealed_moe::plan_packed_expert_parallel` from the source's tensor
+index. Every rank derives its compact spans from those plans (checked against
+the `e % N` stride the exchange kernels use) and loads its weights under the
+seal's identity for it (mesh epoch, logical rank, physical device). The mesh
+refuses a peer that was loaded from another source generation or is bound to
+another seal, rank or device. The load log names the epoch:
+`qwen4 EP plan: N ranks on devices [...] (mesh epoch E, 49 sealed expert groups), …`.
 
 ### Flash-Next EP: per-rank expert fit
 

@@ -650,11 +650,10 @@ impl PeerMirrors {
 
 // ─────────────────────────────── Qwen4 mesh ───────────────────────────────
 
-/// Loads one peer rank on the worker's own thread: `(hip device id,
-/// placement)` → the peer's `Gpu` and a fully attached bundle (forward
-/// attached, experts uploaded compactly for the placement).
-pub type PeerLoadFn =
-    dyn Fn(i32, Qwen4EpPlacement) -> Result<(Gpu, Qwen4Bundle), String> + Send + Sync;
+/// Loads one peer rank on the worker's own thread: rank → the peer's `Gpu`
+/// (on the seal's physical device for the rank) and a fully attached bundle
+/// bound to rank 0's seal at that rank (`Qwen4Bundle::bind_ep_seal`).
+pub type PeerLoadFn = dyn Fn(usize) -> Result<(Gpu, Qwen4Bundle), String> + Send + Sync;
 
 /// What a peer worker owns.
 pub struct Qwen4EpPeer {
@@ -1190,12 +1189,13 @@ impl Qwen4Bundle {
 
     /// Replicate the loaded single-rank bundle into an EP mesh.
     ///
-    /// `self` is rank 0 on `gpu` and must already be loaded with the rank-0
-    /// expert-parallel placement and its forward attached. `peer_device_ids`
-    /// are the HIP devices of ranks `1..`; `loader` builds one peer on its
-    /// worker thread (hipfire-loader supplies it). Sequence:
+    /// `self` is rank 0 on `gpu`: loaded with its forward attached and bound
+    /// to its load's seal ([`Qwen4Bundle::bind_ep_seal`]), from which the
+    /// rank count and every rank's physical device come. `loader` builds one
+    /// peer on its worker thread (hipfire-loader supplies it). Sequence:
     ///
-    /// 1. every peer loads concurrently on its own thread; its config and EP
+    /// 1. every peer loads on its own thread; it must be bound to rank 0's
+    ///    seal at its own rank on the seal's device, and its config and EP
     ///    placement are checked against rank 0;
     /// 2. each rank registers its gather buffers with one
     ///    [`EpRowGatherBuilder`](hipfire_runtime::ep_row_gather::EpRowGatherBuilder)
@@ -1214,27 +1214,37 @@ impl Qwen4Bundle {
     pub fn attach_ep_mesh(
         &mut self,
         gpu: &mut Gpu,
-        peer_device_ids: &[i32],
         loader: Arc<PeerLoadFn>,
     ) -> Result<(), BundleError> {
         if self.ep.is_some() {
             return Err(ep_err("the mesh is already attached"));
         }
-        let ranks = 1 + peer_device_ids.len();
+        let seal = match &self.ep_seal {
+            Some(bound) if bound.rank == 0 => bound.seal.clone(),
+            Some(bound) => {
+                return Err(ep_err(format!(
+                    "this bundle is rank {}, not rank 0",
+                    bound.rank
+                )))
+            }
+            None => return Err(ep_err("rank 0 is not bound to an EP seal")),
+        };
+        let ranks = seal.ranks();
         if !(2..=8).contains(&ranks) {
             return Err(ep_err(format!("{ranks} ranks requested; supported: 2..=8")));
         }
-        // Developer-only logical emulation (`HIPFIRE_EMULATE_GPUS`) runs several
-        // ranks on one physical device; physical mode keeps one rank per device.
-        let emulated = hipfire_runtime::config::get().emulate_gpus.is_some();
-        let mut device_ids = vec![gpu.device_id];
-        for &id in peer_device_ids {
-            if !emulated && device_ids.contains(&id) {
-                return Err(ep_err(format!("device {id} is used by more than one rank")));
-            }
-            device_ids.push(id);
+        // The sealed planner admitted the physical devices (distinct unless
+        // `HIPFIRE_EMULATE_GPUS` aliases logical ranks onto one device).
+        let device_ids = seal.physical_devices().to_vec();
+        if device_ids[0] != gpu.device_id {
+            return Err(ep_err(format!(
+                "rank 0 runs on device {}, the seal places it on {}",
+                gpu.device_id, device_ids[0]
+            )));
         }
-        let own = Qwen4EpPlacement { rank: 0, ranks };
+        let own = seal
+            .placement(0)
+            .map_err(|error| ep_err(error.to_string()))?;
         let forward = self
             .execution
             .as_ref()
@@ -1253,37 +1263,37 @@ impl Qwen4Bundle {
         };
         let fingerprint = self.ep_replication_fingerprint();
 
-        let inits: Vec<Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>> =
-            peer_device_ids
-                .iter()
-                .map(|&device| {
-                    let loader = loader.clone();
-                    let config = self.config.clone();
-                    let fingerprint = fingerprint.clone();
-                    Box::new(move |rank: usize| {
-                        let placement = Qwen4EpPlacement { rank, ranks };
-                        let (gpu, mut bundle) = loader(device, placement)?;
-                        align_peer_session(&mut bundle, placement, &fingerprint);
-                        let peer = Qwen4EpPeer {
-                            rank,
-                            gpu,
-                            bundle,
-                            mirrors: PeerMirrors::default(),
-                            gather: None,
-                            tile: None,
-                        };
-                        let checked = peer.check_replica(&config, placement, &fingerprint);
-                        match checked {
-                            Ok(()) => Ok(peer),
-                            Err(error) => {
-                                let _ = peer.teardown();
-                                Err(error)
-                            }
+        let inits: Vec<Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>> = (1..ranks)
+            .map(|_| {
+                let loader = loader.clone();
+                let config = self.config.clone();
+                let fingerprint = fingerprint.clone();
+                let seal = seal.clone();
+                Box::new(move |rank: usize| {
+                    let (gpu, mut bundle) = loader(rank)?;
+                    let placement = seal.placement(rank).map_err(|error| error.to_string())?;
+                    align_peer_session(&mut bundle, placement, &fingerprint);
+                    let peer = Qwen4EpPeer {
+                        rank,
+                        gpu,
+                        bundle,
+                        mirrors: PeerMirrors::default(),
+                        gather: None,
+                        tile: None,
+                    };
+                    let checked = peer
+                        .check_seal(&seal)
+                        .and_then(|()| peer.check_replica(&config, placement, &fingerprint));
+                    match checked {
+                        Ok(()) => Ok(peer),
+                        Err(error) => {
+                            let _ = peer.teardown();
+                            Err(error)
                         }
-                    })
-                        as Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>
-                })
-                .collect();
+                    }
+                }) as Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>
+            })
+            .collect();
         let pool = PeerPool::spawn(inits, Qwen4EpPeer::teardown).map_err(ep_err)?;
 
         match self.ep_attach_steps(gpu, pool, spec, trunk_layers, device_ids) {
@@ -1959,6 +1969,33 @@ pub(crate) struct ReplicaFingerprint {
 }
 
 impl Qwen4EpPeer {
+    /// A loaded peer must be bound to rank 0's seal itself (not an equal
+    /// one planned from another mesh epoch) at its own rank, on the seal's
+    /// physical device for that rank.
+    fn check_seal(&self, seal: &Arc<crate::ep_seal::Qwen4EpSeal>) -> Result<(), String> {
+        let bound = self
+            .bundle
+            .ep_seal()
+            .ok_or("the loaded peer is not bound to an EP seal")?;
+        if !Arc::ptr_eq(&bound.seal, seal) || bound.rank != self.rank {
+            return Err(format!(
+                "the loaded peer is bound to rank {} of a seal of epoch {}, expected rank {} of epoch {}",
+                bound.rank,
+                bound.seal.mesh().epoch().as_u64(),
+                self.rank,
+                seal.mesh().epoch().as_u64()
+            ));
+        }
+        let device = seal.physical_devices()[self.rank];
+        if self.gpu.device_id != device {
+            return Err(format!(
+                "the loaded peer runs on device {}, the seal places rank {} on {device}",
+                self.gpu.device_id, self.rank
+            ));
+        }
+        Ok(())
+    }
+
     /// A loaded peer must be the same model as rank 0, at its own placement,
     /// with the same host-side request configuration.
     fn check_replica(

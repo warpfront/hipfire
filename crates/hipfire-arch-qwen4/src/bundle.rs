@@ -216,6 +216,9 @@ pub struct Qwen4Bundle {
     /// scope and boundary chunk never depend on the taken forward or the
     /// detached mesh; `None` outside PP.
     pub(crate) pp_band: Option<Qwen4PpBandMeta>,
+    /// This rank's binding to its expert-parallel load's seal
+    /// (`bind_ep_seal`); `None` on a single-device load.
+    pub(crate) ep_seal: Option<crate::ep_seal::Qwen4EpRankSeal>,
     /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
@@ -846,6 +849,7 @@ impl Qwen4Bundle {
             ep: None,
             pp: None,
             pp_band: None,
+            ep_seal: None,
             trunk_overlay: None,
             npu_model_index: None,
         })

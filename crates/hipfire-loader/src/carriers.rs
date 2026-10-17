@@ -797,26 +797,29 @@ impl Carrier for Qwen4Carrier {
             max_k,
         };
         // Expert parallelism: devices and peer access are verified with real
-        // devices before rank 0 allocates anything.
-        let mut ep_plan = plan_qwen4_ep(ep, ctx.pp, ctx.gpu, &shared)?;
+        // devices, and the load's seal planned, before rank 0 allocates anything.
+        let mut ep_plan = plan_qwen4_ep(ep, ctx.pp, ctx.gpu, &shared, &src)?;
         // Every rank applies the same expert VRAM split: the minimum over
         // ranks of what each rank's free VRAM keeps, measured before rank 0
         // allocates.
         if let Some(plan) = ep_plan.as_mut() {
-            let free = qwen4_ep_free_vram(ctx.gpu, &plan.devices)?;
+            let devices = plan.seal.physical_devices();
+            let free = qwen4_ep_free_vram(ctx.gpu, devices)?;
             plan.expert_vram_layers =
-                qwen4_ep_vram_layers(ctx.gpu, &shared, plan.ranks, &free, &src)?;
+                qwen4_ep_vram_layers(ctx.gpu, &shared, plan.seal.ranks(), &free, &src)?;
             eprintln!(
-                "qwen4 EP plan: {} ranks on devices {:?}, free VRAM per rank {:?} MiB, expert VRAM split {} MoE layers on every rank",
-                plan.ranks,
-                plan.devices,
+                "qwen4 EP plan: {} ranks on devices {:?} (mesh epoch {}, {} sealed expert groups), free VRAM per rank {:?} MiB, expert VRAM split {} MoE layers on every rank",
+                plan.seal.ranks(),
+                devices,
+                plan.seal.mesh().epoch().as_u64(),
+                plan.seal.plans().len(),
                 free.iter().map(|bytes| bytes >> 20).collect::<Vec<_>>(),
                 plan.expert_vram_layers
             );
         }
         let mut loaded = load_qwen4_rank(
             ctx.gpu,
-            ep_plan.as_ref().map(|plan| plan.placement(0)),
+            ep_plan.as_ref().map(|plan| plan.rank(0)),
             &shared,
             ep_plan.as_ref().map(|plan| plan.expert_vram_layers),
             Some(Qwen4SessionSeed {
@@ -1171,13 +1174,13 @@ pub struct Qwen4RankLoad {
 }
 
 /// The resolved expert-parallel mesh request: what the mesh owner needs after
-/// rank 0 is loaded. `devices[r]` is the HIP logical device of rank `r`
-/// (rank 0 is the daemon's own device); `shared` is the load context to give
-/// every peer's [`load_qwen4_rank`].
+/// rank 0 is loaded. `seal` is the load's one EP mesh epoch, every rank's
+/// physical device and the sealed expert plans every rank's placement and
+/// load identity derive from (rank 0 is the daemon's own device); `shared` is
+/// the load context to give every peer's [`load_qwen4_rank`].
 #[derive(Clone)]
 pub struct Qwen4EpPlan {
-    pub ranks: usize,
-    pub devices: Vec<i32>,
+    pub seal: std::sync::Arc<hipfire_arch_qwen4::ep_seal::Qwen4EpSeal>,
     pub shared: Qwen4RankShared,
     /// The expert VRAM split (MoE layers resident, of trunk + MTP) every rank
     /// applies: the minimum over ranks ([`qwen4_ep_vram_layers`]). Pass it as
@@ -1186,10 +1189,11 @@ pub struct Qwen4EpPlan {
 }
 
 impl Qwen4EpPlan {
-    pub fn placement(&self, rank: usize) -> hipfire_arch_qwen4::weights::Qwen4EpPlacement {
-        hipfire_arch_qwen4::weights::Qwen4EpPlacement {
+    /// Rank `rank`'s binding to the seal, for [`load_qwen4_rank`].
+    pub fn rank(&self, rank: usize) -> hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal {
+        hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal {
+            seal: self.seal.clone(),
             rank,
-            ranks: self.ranks,
         }
     }
 }
@@ -1207,12 +1211,14 @@ fn qwen4_ep_emulation_map(devices: &[i32]) -> String {
 
 /// Resolve the expert-parallel plan for `ep`: `None` for `ep <= 1`; otherwise
 /// the geometry and (with real devices) architecture and peer-access checks of
-/// [`crate::admission::qwen4_ep_preflight`], before rank 0 allocates anything.
+/// [`crate::admission::qwen4_ep_preflight`], then the load's seal planned from
+/// `src`'s tensor index, before rank 0 allocates anything.
 fn plan_qwen4_ep(
     ep: usize,
     pp: usize,
     gpu: &rdna_compute::Gpu,
     shared: &Qwen4RankShared,
+    src: &ModelSource,
 ) -> Result<Option<Qwen4EpPlan>, String> {
     if ep <= 1 {
         return Ok(None);
@@ -1237,9 +1243,26 @@ fn plan_qwen4_ep(
             qwen4_ep_emulation_map(&devices)
         );
     }
+    let ModelSource::Hfq(hfq) = src else {
+        return Err(
+            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+        );
+    };
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
+        .map_err(|error| error.to_string())?;
+    let identity = hfq
+        .source_identity()
+        .map_err(|error| format!("qwen4: EP source identity: {error}"))?;
+    let seal = hipfire_arch_qwen4::ep_seal::Qwen4EpSeal::seal(
+        &receipt.manifest,
+        receipt.config.num_hidden_layers,
+        ep,
+        &devices,
+        &identity,
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     Ok(Some(Qwen4EpPlan {
-        ranks: ep,
-        devices,
+        seal: std::sync::Arc::new(seal),
         shared: shared.clone(),
         expert_vram_layers: 0,
     }))
@@ -1260,12 +1283,12 @@ pub fn open_qwen4_rank_source(
 /// **Seam for the EP mesh owner.** Called by [`Qwen4Carrier`]'s load after rank
 /// 0 is fully loaded (and before the speculator / `LoadedModel` are built), only
 /// when `topology.ep` > 1. The owner starts one persistent worker thread per
-/// peer rank `1..plan.ranks`, constructs that rank's `Gpu` on
-/// `plan.devices[rank]`, calls [`open_qwen4_rank_source`] and
-/// [`load_qwen4_rank`] there with `Some(plan.placement(rank))`, `&plan.shared`
-/// and no session seed, builds the row-gather mesh over all ranks' bundles and
-/// attaches it to `bundle` (rank 0). On `Err` the carrier frees rank 0's GPU
-/// state; the owner must free any peer it already loaded.
+/// peer rank `1..ranks`, constructs that rank's `Gpu` on the seal's physical
+/// device for it, calls [`open_qwen4_rank_source`] and [`load_qwen4_rank`]
+/// there with `Some(plan.rank(rank))`, `&plan.shared` and no session seed,
+/// builds the row-gather mesh over all ranks' bundles and attaches it to
+/// `bundle` (rank 0). On `Err` the carrier frees rank 0's GPU state; the owner
+/// must free any peer it already loaded.
 ///
 /// Peers load on their own worker threads, one rank at a time in ascending
 /// order (the host-RAM check of pinned experts assumes it), each at the agreed
@@ -1277,18 +1300,22 @@ pub fn attach_qwen4_ep_peers(
     gpu: &mut rdna_compute::Gpu,
     plan: &Qwen4EpPlan,
 ) -> Result<(), String> {
-    let shared = plan.shared.clone();
-    let expert_vram_layers = plan.expert_vram_layers;
+    let plan = plan.clone();
     let loader: std::sync::Arc<hipfire_arch_qwen4::ep::PeerLoadFn> =
-        std::sync::Arc::new(move |device, placement| {
+        std::sync::Arc::new(move |rank| {
+            let device = *plan
+                .seal
+                .physical_devices()
+                .get(rank)
+                .ok_or_else(|| format!("rank {rank} is outside the seal"))?;
             let mut peer_gpu = rdna_compute::Gpu::init_with_device(device)
                 .map_err(|error| format!("init HIP device {device}: {error:?}"))?;
-            let loaded = open_qwen4_rank_source(&shared, &peer_gpu.arch).and_then(|source| {
+            let loaded = open_qwen4_rank_source(&plan.shared, &peer_gpu.arch).and_then(|source| {
                 load_qwen4_rank(
                     &mut peer_gpu,
-                    Some(placement),
-                    &shared,
-                    Some(expert_vram_layers),
+                    Some(plan.rank(rank)),
+                    &plan.shared,
+                    Some(plan.expert_vram_layers),
                     None,
                     source,
                 )
@@ -1299,7 +1326,7 @@ pub fn attach_qwen4_ep_peers(
             }
         });
     bundle
-        .attach_ep_mesh(gpu, &plan.devices[1..], loader)
+        .attach_ep_mesh(gpu, loader)
         .map_err(|error| format!("qwen4: expert parallelism mesh setup failed: {error}"))
 }
 
@@ -1592,7 +1619,9 @@ pub fn qwen4_ep_vram_layers(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
         );
     };
-    if gpu.is_uma() {
+    // Logical emulation (`HIPFIRE_EMULATE_GPUS`) aliases every rank onto one
+    // device, so a UMA APU (gfx1151) runs it with the per-alias VRAM split.
+    if gpu.is_uma() && hipfire_runtime::config::get().emulate_gpus.is_none() {
         return Err("qwen4: expert parallelism needs discrete GPUs".into());
     }
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
@@ -1668,14 +1697,17 @@ struct RankCtx<'a> {
 /// the forward program and the native MTP head.
 ///
 /// `ep == None` is the single-device load, byte for byte what the carrier did
-/// inline before. With `ep == Some(rank, ranks)` (`ranks` in 2..=8) this is one
-/// rank of an expert-parallel load: routed experts (trunk and MTP head) are
-/// declared `ExpertSharded { 512, Stride }` and uploaded compactly (this
-/// rank's experts `e % ranks == rank` ascending, `local_count(512)` per stack, in
-/// VRAM or pinned host RAM per the residency policy); everything else is
-/// replicated; the rank attaches its own native MTP head when it is on; the
-/// rank prints its fit line and an `qwen4 EP rank r/N` load line. `session` is
-/// rank 0's session
+/// inline before. With `ep == Some(rank seal)` (`ranks` in 2..=8) this is one
+/// rank of an expert-parallel load: the source must be the generation the
+/// seal was planned from; routed experts (trunk and MTP head) are declared
+/// `ExpertSharded { 512, Stride }` and uploaded compactly per the seal's
+/// placement for the rank (this rank's experts `e % ranks == rank` ascending,
+/// `local_count(512)` per stack, in VRAM or pinned host RAM per the residency
+/// policy) under the seal's load identity (mesh epoch, rank, physical
+/// device); everything else is replicated; the bundle is bound to the seal;
+/// the rank attaches its own native MTP head when it is on; the rank prints
+/// its fit line and an `qwen4 EP rank r/N` load line. `session` is rank 0's
+/// session
 /// cache seed. `expert_vram_layers` (`None` = the env/auto resolution of a
 /// single-device load) pins the expert VRAM split in MoE layers resident of
 /// trunk + MTP (the total = fully resident, the MTP layer last): an EP mesh
@@ -1687,13 +1719,13 @@ struct RankCtx<'a> {
 /// thread by its own methods), the source, and process-global read-only config.
 pub fn load_qwen4_rank(
     gpu: &mut rdna_compute::Gpu,
-    ep: Option<hipfire_arch_qwen4::weights::Qwen4EpPlacement>,
+    ep_seal: Option<hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal>,
     shared: &Qwen4RankShared,
     expert_vram_layers: Option<usize>,
     session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
 ) -> Result<Qwen4RankLoad, String> {
-    load_qwen4_rank_scoped(gpu, ep, shared, expert_vram_layers, session, src, None)
+    load_qwen4_rank_scoped(gpu, ep_seal, shared, expert_vram_layers, session, src, None)
 }
 
 /// [`load_qwen4_rank`] for one pipeline band (`band == Some`) or the whole
@@ -1710,7 +1742,7 @@ pub fn load_qwen4_rank(
 /// band agrees.
 fn load_qwen4_rank_scoped(
     gpu: &mut rdna_compute::Gpu,
-    ep: Option<hipfire_arch_qwen4::weights::Qwen4EpPlacement>,
+    ep_seal: Option<hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal>,
     shared: &Qwen4RankShared,
     expert_vram_layers: Option<usize>,
     session: Option<Qwen4SessionSeed<'_>>,
@@ -1724,14 +1756,23 @@ fn load_qwen4_rank_scoped(
     let hotset_policy = hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env()?;
     let placement_policy = hipfire_arch_qwen4::expert_hotset::PlacementPolicy::from_env()?;
     let hotset_budget = hipfire_arch_qwen4::expert_hotset::HotsetBudget::from_env()?;
-    if let Some(placement) = ep {
-        if placement.ranks < 2 || placement.rank >= placement.ranks {
-            return Err(format!(
-                "qwen4: rank {} of {} is not an expert-parallel rank",
-                placement.rank, placement.ranks
-            ));
+    let ep = match &ep_seal {
+        Some(bound) => {
+            if let ModelSource::Hfq(hfq) = &src {
+                let identity = hfq
+                    .source_identity()
+                    .map_err(|error| format!("qwen4: EP source identity: {error}"))?;
+                bound.seal.check_source(&identity)?;
+            }
+            Some(
+                bound
+                    .seal
+                    .placement(bound.rank)
+                    .map_err(|error| format!("qwen4: {error}"))?,
+            )
         }
-    }
+        None => None,
+    };
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
     // A band carries a session cache (`session`) like a Single load (except
     // under native MTP) and the output band the native MTP head; the other
@@ -2684,8 +2725,23 @@ fn load_qwen4_rank_scoped(
         })
         .and_then(|(trunk, mtp)| trunk.checked_add(mtp))
         .map_or(usize::MAX, |bytes| bytes >> 20);
-    let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
-    let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
+    // An EP rank fulfills under its seal's identity (the load's one mesh
+    // epoch, its logical rank, its physical device); one device is its own
+    // single-device mesh.
+    let (mesh, expected) = match &ep_seal {
+        Some(bound) => (
+            bound.seal.mesh().clone(),
+            bound
+                .seal
+                .origin(bound.rank)
+                .ok_or_else(|| format!("qwen4: rank {} is outside the EP seal", bound.rank))?,
+        ),
+        None => {
+            let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
+            let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
+            (mesh, expected)
+        }
+    };
     // A rank-order PLE table's worker starts now: it reads the table's
     // hottest prefix at a capped rate while the weights load, and
     // prewarms on from there once the model is ready. The PLE hot-row
@@ -2796,16 +2852,12 @@ fn load_qwen4_rank_scoped(
     };
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
     let source = HfqModelSource::from_hfq(hfq);
-    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads_ep(
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
         &manifest.weights,
         &mesh,
         config.num_hidden_layers,
         ctx.gpu,
         expected,
-        ep.map(|placement| hipfire_runtime::weight_store::EpFulfill {
-            rank: placement.rank,
-            ranks: placement.ranks,
-        }),
         |entry| {
             // A slab layer arena is one span of the container, not a tensor:
             // the recipe resolves it before the by-name read.
@@ -2847,14 +2899,21 @@ fn load_qwen4_rank_scoped(
             ),
         })?;
     bundle.attach_npu_trunk_identity(npu_identity);
-    // The assembled weights must report the placement this rank was
-    // loaded for (derived from the fulfilled projection census).
-    if bundle.weights.ep_placement() != ep {
-        let found = bundle.weights.ep_placement();
+    // The assembled weights must report the seal's placement and load
+    // identity for this rank (from the fulfilled projection census and the
+    // store's origin); single-device weights report no placement.
+    let bound = match ep_seal {
+        Some(bound) => bundle.bind_ep_seal(bound.seal, bound.rank),
+        None => match bundle.weights.ep_placement() {
+            None => Ok(()),
+            Some(found) => Err(format!(
+                "qwen4: assembled weights report expert placement {found:?} on a single-device load"
+            )),
+        },
+    };
+    if let Err(error) = bound {
         let _ = bundle.free_gpu(ctx.gpu);
-        return Err(format!(
-            "qwen4: assembled weights report expert placement {found:?}, expected {ep:?}"
-        ));
+        return Err(error);
     }
     // The row store reads the pack's rows from the pack once the worker
     // has verified it.

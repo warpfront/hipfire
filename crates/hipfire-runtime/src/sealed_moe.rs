@@ -1773,6 +1773,188 @@ pub fn plan_single_expert_execution(
     Ok((execution, table, cache))
 }
 
+/// One packed, fused routed-expert group as a family declares it: its router
+/// and the stacked `[n_experts, 2 * intermediate, hidden]` gate/up and
+/// `[n_experts, hidden, intermediate]` down sources of one MoE layer. `layer`
+/// labels the group in the sealed plans (a head outside the trunk takes the
+/// next index after it).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PackedExpertGroup {
+    pub layer: usize,
+    pub router: String,
+    pub gate_up: String,
+    pub down: String,
+}
+
+/// The source generation a sealed plan binds: every file's identity (path,
+/// device, inode, length, mtime), so a rank that opens a replaced or modified
+/// artifact is told apart from the generation the plan was sealed from.
+pub fn source_generation_fingerprint(source: &crate::model_source::SourceIdentity) -> String {
+    source
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "{}:{}:{}:{}:{}.{}",
+                file.canonical_path.display(),
+                file.dev,
+                file.ino,
+                file.len,
+                file.mtime_secs,
+                file.mtime_nanos
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Seal expert-parallel plans for packed fused expert groups on `mesh`'s EP
+/// axis, straight from the source's sealed tensor index. Every stack is
+/// `ExpertSharded { n_experts, Stride }` (rank `r` owns the experts
+/// `e % ranks == r`, compact in ascending `e`) and the router replicates, so
+/// ownership, compact local slots, rank devices and the collective rows come
+/// from the ordinary manifest and expert planners. Every source carries
+/// [`source_generation_fingerprint`]; `execution` names the family's EP
+/// protocol. One plan per group, in `groups` order.
+pub fn plan_packed_expert_parallel(
+    groups: &[PackedExpertGroup],
+    family: &str,
+    execution: &str,
+    source: &crate::model_source::SourceIdentity,
+    mesh: &DeviceMesh,
+    physical_devices: &[i32],
+) -> Result<Vec<ExpertExecutionPlan>, String> {
+    use crate::weight_manifest::{
+        ExpertGroupSpec, ExpertParallelism, ExpertProjectionResources, ExpertResourceRequirements,
+        ExpertSourceLayout, ShardPolicy, WeightEntry,
+    };
+    if mesh.n_devices() < 2 || mesh.size_of(DimKind::Ep) != mesh.n_devices() {
+        return Err(format!(
+            "{family}: packed expert-parallel plans need a pure EP mesh of 2+ ranks, got {:?}",
+            mesh.axes()
+        ));
+    }
+    let fingerprint = source_generation_fingerprint(source);
+    let metadata = |name: &str| -> Result<(ExpertSourceMetadata, Vec<usize>), String> {
+        let range = source
+            .manifest
+            .iter()
+            .find(|range| range.name == name)
+            .ok_or_else(|| format!("{family}: expert source '{name}' is absent"))?;
+        let dtype = crate::weight_store::source_dtype(&range.dtype)?;
+        let shape = &range.logical_shape;
+        let bytes = usize::try_from(range.length)
+            .map_err(|_| format!("{family}: expert source '{name}' length overflows usize"))?;
+        let rows: usize = shape.iter().rev().skip(1).product();
+        if shape.len() < 2 || rows == 0 || bytes == 0 || bytes % rows != 0 {
+            return Err(format!(
+                "{family}: expert source '{name}' shape {shape:?} does not split its {bytes} bytes into rows"
+            ));
+        }
+        let basis = format!("{:?}", hipfire_dispatch::types::dtype_rotation_plan(dtype));
+        let metadata = ExpertSourceMetadata::new(
+            name,
+            fingerprint.as_str(),
+            shape.clone(),
+            dtype,
+            bytes,
+            bytes / rows,
+            1,
+            format!("{:?}:{}", source.format, range.dtype),
+            basis,
+        );
+        Ok((metadata, shape.clone()))
+    };
+    let mut manifest = Vec::with_capacity(3 * groups.len());
+    let mut specs = Vec::with_capacity(groups.len());
+    let mut sources = Vec::with_capacity(3 * groups.len());
+    for group in groups {
+        let (router, router_shape) = metadata(&group.router)?;
+        let (gate_up, gate_up_shape) = metadata(&group.gate_up)?;
+        let (down, down_shape) = metadata(&group.down)?;
+        let n_experts = gate_up_shape[0];
+        if gate_up_shape.len() != 3 || down_shape.len() != 3 || down_shape[0] != n_experts {
+            return Err(format!(
+                "{family}: layer {} expert stacks {gate_up_shape:?}/{down_shape:?} are not packed [experts, rows, cols]",
+                group.layer
+            ));
+        }
+        let gate_up_bytes = gate_up.encoded_bytes / n_experts;
+        if gate_up.encoded_bytes % n_experts != 0 || gate_up_bytes % 2 != 0 {
+            return Err(format!(
+                "{family}: layer {} fused gate/up bytes {} do not split into {n_experts} gate/up pairs",
+                group.layer, gate_up.encoded_bytes
+            ));
+        }
+        let resources = ExpertProjectionResources {
+            gate_bytes: gate_up_bytes / 2,
+            up_bytes: gate_up_bytes / 2,
+            down_bytes: down.encoded_bytes / n_experts,
+            alignment: 1,
+        };
+        let sharded = ShardPolicy::ExpertSharded {
+            n_experts,
+            assign: ExpertAssign::Stride,
+        };
+        manifest.push(WeightEntry::layer(
+            &group.router,
+            group.layer,
+            router_shape,
+            router.dtype,
+            ShardPolicy::Replicate,
+        ));
+        manifest.push(WeightEntry::layer(
+            &group.gate_up,
+            group.layer,
+            gate_up_shape,
+            gate_up.dtype,
+            sharded.clone(),
+        ));
+        manifest.push(WeightEntry::layer(
+            &group.down,
+            group.layer,
+            down_shape,
+            down.dtype,
+            sharded,
+        ));
+        specs.push(ExpertGroupSpec {
+            group: format!("{family}.moe.layer.{}", group.layer),
+            layer: Some(group.layer),
+            n_experts,
+            parallelism: ExpertParallelism::ExpertParallel,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PackedFused {
+                gate_up: group.gate_up.clone(),
+                down: group.down.clone(),
+                sidecars: Vec::new(),
+            },
+            resources: ExpertResourceRequirements::new(vec![resources; n_experts]),
+            router: group.router.clone(),
+            execution: execution.to_string(),
+        });
+        sources.extend([router, gate_up, down]);
+    }
+    let n_layers = groups
+        .iter()
+        .map(|group| group.layer + 1)
+        .max()
+        .unwrap_or(0);
+    let placement = crate::mesh_placement::BandPlacement::uniform(mesh, n_layers)
+        .map_err(|error| format!("{family}: expert manifest planning: {error}"))?;
+    let manifest_plan =
+        crate::weight_manifest::plan_manifest(&manifest, &[], mesh, n_layers, &placement)
+            .map_err(|error| format!("{family}: expert manifest planning: {error}"))?;
+    plan_expert_execution(
+        &manifest,
+        &manifest_plan,
+        &specs,
+        &sources,
+        mesh,
+        physical_devices,
+    )
+    .map_err(|error| format!("{family}: {error}"))
+}
+
 /// Repartition an already sealed Single expert plan into an expert-parallel
 /// plan on `mesh` with `assignment` and `execution`.
 ///
@@ -2325,12 +2507,100 @@ pub fn execute_cpu_mesh(
 mod tests {
     use super::*;
     use crate::device_mesh::DimKind;
+    use crate::model_source::{SourceFormat, SourceIdentity, SourceRangeIdentity};
     use crate::weight_manifest::{ExpertProjectionResources, PlacementHint, ShardPolicy};
 
     /// Plan a one-layer manifest under the uniform placement of `mesh`.
     fn plan_one_layer(manifest: &[WeightEntry], mesh: &DeviceMesh) -> ManifestPlan {
         let placement = crate::mesh_placement::BandPlacement::uniform(mesh, 1).unwrap();
         crate::weight_manifest::plan_manifest(manifest, &[], mesh, 1, &placement).unwrap()
+    }
+
+    /// Six experts over four ranks (uneven): the trunk layer and a head
+    /// labelled after it seal stride ownership with compact ascending slots
+    /// on the mesh's devices, and a malformed request is refused.
+    #[test]
+    fn packed_expert_parallel_seals_stride_ownership_per_group() {
+        let range =
+            |name: &str, dtype: &str, shape: &[usize], row_bytes: usize| SourceRangeIdentity {
+                name: name.to_string(),
+                file_index: 0,
+                offset: 0,
+                length: (shape[..shape.len() - 1].iter().product::<usize>() * row_bytes) as u64,
+                dtype: dtype.to_string(),
+                logical_shape: shape.to_vec(),
+            };
+        let mut manifest = Vec::new();
+        let mut groups = Vec::new();
+        for (layer, prefix) in [(0, "l0"), (1, "head")] {
+            groups.push(PackedExpertGroup {
+                layer,
+                router: format!("{prefix}.gate"),
+                gate_up: format!("{prefix}.gate_up"),
+                down: format!("{prefix}.down"),
+            });
+            manifest.push(range(&format!("{prefix}.gate"), "F32", &[6, 256], 1024));
+            manifest.push(range(
+                &format!("{prefix}.gate_up"),
+                "MQ4G256V2",
+                &[6, 4, 256],
+                136,
+            ));
+            manifest.push(range(
+                &format!("{prefix}.down"),
+                "MQ4G128V2",
+                &[6, 256, 2],
+                68,
+            ));
+        }
+        let source = SourceIdentity {
+            canonical_path: "/m.hfq".into(),
+            format: SourceFormat::Hfq,
+            files: vec![crate::model_source::SourceFileIdentity {
+                canonical_path: "/m.hfq".into(),
+                dev: 1,
+                ino: 2,
+                len: 3,
+                mtime_secs: 4,
+                mtime_nanos: 5,
+            }],
+            metadata_json: String::new(),
+            manifest,
+        };
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 4)]).unwrap();
+        let devices = [3, 1, 2, 0];
+        let plans =
+            plan_packed_expert_parallel(&groups, "t", "x", &source, &mesh, &devices).unwrap();
+        assert_eq!(plans.len(), 2);
+        for (plan, group) in plans.iter().zip(&groups) {
+            assert_eq!(plan.layer(), Some(group.layer));
+            assert_eq!(plan.mesh_epoch(), mesh.epoch());
+            assert_eq!(plan.physical_devices(), devices);
+            for expert in 0..6 {
+                assert_eq!(plan.owner_rank(expert), Some(expert % 4));
+                for rank in 0..4 {
+                    let slot = (expert % 4 == rank).then_some(expert / 4);
+                    assert_eq!(plan.local_slot(rank, expert), slot, "e{expert} r{rank}");
+                }
+            }
+            let owned: Vec<_> = plan
+                .rank_ownership()
+                .iter()
+                .map(|r| r.global_expert_ids.clone())
+                .collect();
+            assert_eq!(owned, vec![vec![0, 4], vec![1, 5], vec![2], vec![3]]);
+        }
+        let single = DeviceMesh::single().unwrap();
+        assert!(plan_packed_expert_parallel(&groups, "t", "x", &source, &single, &[0]).is_err());
+        let mut missing = groups.clone();
+        missing[1].down = "absent".into();
+        let error =
+            plan_packed_expert_parallel(&missing, "t", "x", &source, &mesh, &devices).unwrap_err();
+        assert!(error.contains("'absent' is absent"), "{error}");
+        // Two ranks on one device need logical emulation.
+        let error = plan_packed_expert_parallel(&groups, "t", "x", &source, &mesh, &[0, 1, 1, 2])
+            .unwrap_err();
+        assert!(error.contains("duplicate"), "{error}");
     }
 
     fn ep_fixture() -> (

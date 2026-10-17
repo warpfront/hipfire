@@ -18,6 +18,7 @@ pub mod cache_quality;
 pub mod chunk_dump;
 pub mod config;
 pub mod ep;
+pub mod ep_seal;
 pub mod expert_keep;
 pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 /// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
