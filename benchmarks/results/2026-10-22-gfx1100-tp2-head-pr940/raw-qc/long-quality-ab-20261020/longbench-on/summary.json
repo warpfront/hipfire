@@ -1,0 +1,12 @@
+{
+  "completed": 30,
+  "expected": 30,
+  "correct": 17,
+  "sampled_peak_vram_bytes": [
+    10613534720,
+    10569023488
+  ],
+  "elapsed_s": 2856.287100051006,
+  "incomplete": false,
+  "length_limited": []
+}

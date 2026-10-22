@@ -1,0 +1,66 @@
+{
+  "arm": "off",
+  "suite": "longbench",
+  "load": {
+    "type": "load",
+    "model": "/home/husrcf/.hipfire/models/qwen3.8-27b.mq4-xts",
+    "params": {
+      "tp": 2,
+      "pp": 1,
+      "devices": [
+        0,
+        1
+      ],
+      "max_seq": 65536,
+      "kv_mode": "q8",
+      "kv_backend": "vmm",
+      "state_quant": "q8",
+      "speculation": "off",
+      "dflash_mode": "off",
+      "dspark_mode": "off",
+      "mtp_mode": "off",
+      "ngram_draft": false
+    }
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "seed": 7,
+    "presence_penalty": 0.0,
+    "repeat_penalty": 1.0,
+    "thinking_enabled": true,
+    "reasoning_effort": "xhigh",
+    "assistant_prefix": "open_think",
+    "max_think_tokens": 0,
+    "max_tokens": 32768
+  },
+  "source_ref": "4cc190ea8b70d610ecf150485d53118cd9277e5a",
+  "source_diff_md5": "c11370bebb69603dfd2607c2126f6a36",
+  "cli_md5": "c66edaa44172927a26447ffbebbfe132",
+  "daemon_md5": "6b45820bfe90db9ea265aa607b2a36a8",
+  "model_md5": "6702fe8a56c0c8ec85aca1804b8df29e",
+  "model_sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
+  "client_md5": "d09b9855199752796122af5e7b083382",
+  "runner_md5": "bf640de1dbdd6323353fc339f697886f",
+  "dataset_md5": "394813558a296ba824e9ccc2c43c31fb",
+  "manifest_md5": "f044a6b28319ed1f28811bb0f2de52b4",
+  "longdecode_md5": "5835a98b204573eaf0a00575b4d855c4",
+  "environment": {
+    "HIP_PLATFORM": "amd",
+    "HIP_CLANG_PATH": "/opt/rocm/llvm/bin",
+    "HIPFIRE_HOME": "/home/husrcf/Code/ProtBind/hipfire/tmp/tp2-head-prefill-evidence/long-quality-ab-20261020/longbench-off/home",
+    "HIPFIRE_DEVICES": "0,1",
+    "HIP_VISIBLE_DEVICES": "0,1",
+    "HIPFIRE_LOCK_DIR": "/run/lock/hipfire",
+    "HIPFIRE_CAPTURE_REASONING": "1",
+    "HIPFIRE_DFLASH_DRAFT": "",
+    "HIPFIRE_DPM_WARMUP_SECS": "10",
+    "HIPFIRE_KERNEL_CACHE": "/home/husrcf/Code/ProtBind/hipfire/tmp/issue770-kernels",
+    "HIPFIRE_TP_SHARD_LM_HEAD": "0",
+    "HIPFIRE_TP_PREFILL_REUSE": "0"
+  },
+  "policy": "one fresh resident daemon per arm/suite; reset per row; not fresh process per row",
+  "warmup": "discarded 16-token generation on first actual prompt, reset before recorded tasks"
+}

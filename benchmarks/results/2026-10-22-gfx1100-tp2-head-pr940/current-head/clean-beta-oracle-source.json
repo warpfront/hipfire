@@ -1,0 +1,10 @@
+{
+  "source_ref": "88e9f0d6f9671841e6cc73e93990b3e7adb2c5c9",
+  "source_diff_md5": "d41d8cd98f00b204e9800998ecf8427e",
+  "oracle_md5": "0d67db20f20717d8d1108feac8f256cd",
+  "oracle_sha256": "a6f1781bf55080e2c343d8b42fe9ce5e02ec8d579395012861def99a74841e92",
+  "kernel": "7.0.0-38-generic",
+  "hip": "7.15.26333-0000000",
+  "model_sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
+  "model_sha256_rechecked": "2026-10-22"
+}

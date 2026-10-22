@@ -1,0 +1,9 @@
+{
+  "tp1_tp2_exit_codes": {
+    "base": 101,
+    "default": 101
+  },
+  "tp2_default_vs_optout_exact": true,
+  "shared_oracle_failure_unresolved": true,
+  "logits_md5": "532b0a5a419e5c7567dc0f9850d0bc2e"
+}

@@ -1,0 +1,45 @@
+{
+  "command": [
+    "/home/husrcf/Code/ProtBind/hipfire/tmp/tp2-head-prefill-evidence/default-measured-bin/hipfire",
+    "bench",
+    "/home/husrcf/.hipfire/models/qwen3.8-27b.mq4-xts",
+    "--tp",
+    "2",
+    "--runs",
+    "1",
+    "--warmups",
+    "3",
+    "--max-tokens",
+    "1024",
+    "--max-seq",
+    "16384",
+    "--kv-mode",
+    "q8",
+    "--kv-backend",
+    "vmm",
+    "--spec",
+    "off",
+    "--backend",
+    "noslots",
+    "--workload",
+    "stateless",
+    "--prompt-file",
+    "benchmarks/prompts/mq4v2_k5120_long_ar.txt",
+    "--json"
+  ],
+  "arm": "base",
+  "graph": "default",
+  "binary_md5": {
+    "hipfire": "c66edaa44172927a26447ffbebbfe132",
+    "daemon": "ea98ede36ab9c987a1e46cc886d666b6"
+  },
+  "source_ref": "4cc190ea8b70d610ecf150485d53118cd9277e5a",
+  "source_diff_md5": "c11370bebb69603dfd2607c2126f6a36",
+  "binary_source": {
+    "source_ref": "4cc190ea8b70d610ecf150485d53118cd9277e5a",
+    "source_diff_md5": "c11370bebb69603dfd2607c2126f6a36",
+    "cli_md5": "c66edaa44172927a26447ffbebbfe132",
+    "daemon_md5": "ea98ede36ab9c987a1e46cc886d666b6"
+  },
+  "model_sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae"
+}

@@ -1,0 +1,16 @@
+{
+  "completed": 5,
+  "expected": 5,
+  "correct": 0,
+  "sampled_peak_vram_bytes": [
+    10110119936,
+    10067705856
+  ],
+  "elapsed_s": 3485.166421951959,
+  "incomplete": false,
+  "length_limited": [
+    "code-snake",
+    "code-tetris",
+    "radix-attention"
+  ]
+}

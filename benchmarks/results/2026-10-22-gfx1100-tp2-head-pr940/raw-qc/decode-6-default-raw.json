@@ -1,0 +1,198 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/husrcf/.hipfire/models/qwen3.8-27b.mq4-xts",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "pp": 1,
+    "audio": false,
+    "video": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "reasoning_effort_probe_error": null,
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "explicit",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 16384,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": null,
+    "card_cap": null,
+    "kv_mode": "q8",
+    "mtp_mode_effective": "off"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 37280,
+    "vram_total_mb": 46064,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "explicit",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 46016,
+  "max_seq": {
+    "effective": 16384,
+    "requested": 16384,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 1024,
+  "runs": 1,
+  "batch": 1,
+  "prompt_tokens": 126,
+  "prompt_md5": "9f64b7bc79c38aaa65cccc511b167390",
+  "prompt_chars": 632,
+  "warnings": [
+    "prompt is 126 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card1",
+    "pci": "0000:53:00.0",
+    "arch": "gfx1100",
+    "selected_by": "hardware.devices=0,1",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 40,
+      "duration_s": 19.29,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 84.3,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 79.0
+          },
+          "junction": {
+            "max": 97.0
+          },
+          "mem": {
+            "max": 98.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2325.3,
+            "min": 1949.0,
+            "max": 2461.0
+          },
+          "mclk": {
+            "avg": 1124.0,
+            "min": 1124.0,
+            "max": 1124.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 46064.0,
+        "vram_used_mib": 9039.6,
+        "vram_free_mib": 37024.4,
+        "gtt_total_mib": 112655.4,
+        "gtt_used_mib": 145.8,
+        "gtt_free_mib": 112509.6,
+        "mem_total_mib": 225310.9,
+        "mem_available_mib": 211783.6
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 53.5,
+    "mean": 53.5,
+    "min": 53.5,
+    "max": 53.5,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 4154.8,
+    "mean": 4154.8,
+    "min": 4154.8,
+    "max": 4154.8,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 53.5,
+    "mean": 53.5,
+    "min": 53.5,
+    "max": 53.5,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 30.3,
+    "mean": 30.3,
+    "min": 30.3,
+    "max": 30.3,
+    "stdev": 0.0
+  },
+  "spec_requested": "off",
+  "load_speculation": {
+    "mtp_mode": "off",
+    "dflash_mode": "off",
+    "dspark_mode": "off",
+    "ngram_draft": false,
+    "mtp_effective": "off"
+  },
+  "spec_route": [
+    null
+  ],
+  "spec_tau": [
+    null
+  ],
+  "spec_mtp": [
+    null
+  ],
+  "samples": {
+    "decode": [
+      53.5
+    ],
+    "prefill": [
+      4154.8
+    ],
+    "wall": [
+      53.5
+    ],
+    "ttft_ms": [
+      30.3
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "explicit",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8",
+  "pp": 1,
+  "warmups_run": 3
+}

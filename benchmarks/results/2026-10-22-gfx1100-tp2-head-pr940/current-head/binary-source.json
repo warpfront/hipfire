@@ -1,0 +1,22 @@
+{
+  "source_ref": "cb149177464fa08ee19575b97dd0ff957109ea25",
+  "source_tree": "7d9d217e7edd8c4f3c630f6241bdcec522503abc",
+  "source_diff_md5": "d41d8cd98f00b204e9800998ecf8427e",
+  "comparison_beta": "88e9f0d6f9671841e6cc73e93990b3e7adb2c5c9",
+  "hip_version": "7.15.26333-0000000",
+  "build_verification_log_sha256": "62ecd442d77b48743d157ef03fe2c6cd04b05b5625807933d15130a7d7f9f8f9",
+  "files": {
+    "hipfire": {
+      "md5": "227a064cec4eb925dfc7d04e59c08d66",
+      "sha256": "8a92e866db4a581ab041374a5346275c1015630522acf3c27e08c50c699bb86a"
+    },
+    "daemon": {
+      "md5": "1bc8845b120a84d40e005f805e393d01",
+      "sha256": "a338d6fd390f25c90335a06a9a3d885ee600ecb9146bbdf0a0ea99e196fa80ea"
+    },
+    "examples/qwen_dense_tp2_parity": {
+      "md5": "e9e76da6a27bf2b2f8f5fe8639305c9c",
+      "sha256": "73017264493e7e78f674a042b202aa7448c995e36f6e2f2c92889e73b5b55970"
+    }
+  }
+}

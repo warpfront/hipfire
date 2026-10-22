@@ -178,13 +178,28 @@ fn run_tp(path: &str, seed: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
             .unwrap(),
         );
     }
+    let head_oracle = if std::env::var("HIPFIRE_TP_HEAD_ORACLE").as_deref() == Ok("1") {
+        Some(
+            gpus.devices[0]
+                .alloc_tensor(&[global.vocab_size], rdna_compute::DType::F32)
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     // Two-phase peer topology: probe without mutation. Complete P2P enables
     // RCCL path; mixed topology uses host-staged allreduce and never enables
     // peers (ROCm does not map later allocations after enable).
     let peer = gpus
         .can_access_peer_all()
         .expect("parity TP can_access_peer_all");
+    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).expect("parity TP rank streams");
     if peer {
+        if std::env::var("HIPFIRE_TP_PARITY_GRAPHS").as_deref() == Ok("1") {
+            let barriers = global.n_layers * 2;
+            gpus.prepare_tp2_whole_token_graph(barriers, global.dim * 4)
+                .expect("parity TP graph signal tape");
+        }
         let enabled = gpus
             .enable_peer_all()
             .expect("parity TP enable_peer_all after rank allocations");
@@ -202,11 +217,77 @@ fn run_tp(path: &str, seed: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
         &mut gpus, &shard, &weights, &configs, seed, 0, &mut kvs, &mut dns, &scratches,
     )
     .expect("TP prefill");
+    if std::env::var("HIPFIRE_TP_PARITY_REPEAT_PREFILL").as_deref() == Ok("1") {
+        gpus.devices[0].bind_thread().unwrap();
+        let expected = gpus.devices[0].download_f32(&scratches[0].logits).unwrap();
+        // Grow beyond the short seed, then reuse the larger PBS for a short
+        // request. Padding/strides must depend on live rows, not stale rows.
+        let prime = seed.repeat(8);
+        for rank in 0..tp {
+            dns[rank].reset(&mut gpus.devices[rank]).unwrap();
+            kvs[rank].compact_offset = 0;
+        }
+        qwen35::forward_prefill_dense_tp(
+            &mut gpus, &shard, &weights, &configs, &prime, 0, &mut kvs, &mut dns, &scratches,
+        )
+        .expect("grow TP prefill scratch before shrink test");
+        for repetition in 0..3 {
+            for rank in 0..tp {
+                gpus.devices[rank].bind_thread().unwrap();
+                dns[rank].reset(&mut gpus.devices[rank]).unwrap();
+                kvs[rank].compact_offset = 0;
+            }
+            qwen35::forward_prefill_dense_tp(
+                &mut gpus, &shard, &weights, &configs, seed, 0, &mut kvs, &mut dns, &scratches,
+            )
+            .expect("repeated TP prefill");
+            gpus.devices[0].bind_thread().unwrap();
+            let actual = gpus.devices[0].download_f32(&scratches[0].logits).unwrap();
+            assert!(
+                expected
+                    .iter()
+                    .zip(&actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "repeated prefill logit divergence at repetition {repetition}"
+            );
+        }
+        println!("PASS repeated prefill 3/3 bit-exact");
+    }
     let mut tokens = Vec::new();
     let mut logits = Vec::new();
     for step in 0..decode {
         gpus.devices[0].bind_thread().unwrap();
         let row = gpus.devices[0].download_f32(&scratches[0].logits).unwrap();
+        if let Some(out) = &head_oracle {
+            // Independent reference: the original unsliced WeightRef, not
+            // project_rows with start=0 (which could share an adapter bug).
+            let ctx = hipfire_dispatch::context::DispatchCtx::new(&gpus.devices[0]);
+            let wr = weights[0].output.dispatch_ref();
+            hipfire_dispatch::pipeline::execute_steps(
+                &mut gpus.devices[0],
+                &ctx,
+                &[hipfire_dispatch::pipeline::Step::Gemv {
+                    w: &wr,
+                    input: hipfire_dispatch::pipeline::GemvInput::Raw(&scratches[0].tmp),
+                    out,
+                }],
+            )
+            .unwrap();
+            let reference = gpus.devices[0].download_f32(out).unwrap();
+            assert!(
+                reference.iter().chain(&row).all(|v| v.is_finite()),
+                "non-finite head logits at step {step}"
+            );
+            let unequal = row
+                .iter()
+                .zip(&reference)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                unequal, 0,
+                "full-vs-sharded head logits differ at actual TP state step {step}"
+            );
+        }
         tokens.push(argmax(&row));
         logits.push(row);
         if step + 1 < decode {
@@ -224,6 +305,10 @@ fn run_tp(path: &str, seed: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
             .expect("TP decode");
         }
     }
+    gpus.drop_rank_graphs(false);
+    if let Some(out) = head_oracle {
+        gpus.devices[0].free_tensor(out).unwrap();
+    }
     gpus.free_peer_reduce_scratch()
         .expect("parity TP free peer scratch");
     (tokens, logits)
@@ -239,8 +324,21 @@ fn main() {
     drop(hfq);
     let (reference_tokens, reference_logits) = run_reference(&path, &seed);
     let (tp_tokens, tp_logits) = run_tp(&path, &seed, &reference_tokens);
+    if let Ok(path) = std::env::var("HIPFIRE_TP_PARITY_DUMP") {
+        use std::io::Write;
+        let mut out = std::fs::File::create(path).expect("create TP logit dump");
+        for row in &tp_logits {
+            for value in row {
+                out.write_all(&value.to_le_bytes()).unwrap();
+            }
+        }
+    }
     let mut worst = 0.0f32;
     for (step, (reference, tp_row)) in reference_logits.iter().zip(&tp_logits).enumerate() {
+        assert!(
+            reference.iter().chain(tp_row).all(|v| v.is_finite()),
+            "non-finite logits at step {step}"
+        );
         let scale = reference
             .iter()
             .fold(0.0f32, |m, x| m.max(x.abs()))

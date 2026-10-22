@@ -18,6 +18,7 @@ pub mod mesh_tp;
 pub mod oracle;
 pub mod prefill;
 pub(crate) mod program;
+pub mod tp_output;
 pub mod weights;
 
 pub use batch::{

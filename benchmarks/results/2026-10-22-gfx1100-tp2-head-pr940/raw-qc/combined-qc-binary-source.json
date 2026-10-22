@@ -1,0 +1,7 @@
+{
+  "source_ref": "4cc190ea8b70d610ecf150485d53118cd9277e5a",
+  "source_diff_md5": "d41d8cd98f00b204e9800998ecf8427e",
+  "cli_md5": "c66edaa44172927a26447ffbebbfe132",
+  "daemon_md5": "6b45820bfe90db9ea265aa607b2a36a8",
+  "note": "Frozen before the head default-on proposal. Both long-quality off/on arms use this immutable copied binary pair. A run identity's source_ref/source_diff_md5 reflect the live worktree at launch, not compiler provenance; this receipt owns compiler provenance. No default-unset result is claimed from these off/on runs."
+}

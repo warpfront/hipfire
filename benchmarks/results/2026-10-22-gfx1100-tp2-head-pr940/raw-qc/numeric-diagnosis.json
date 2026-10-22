@@ -1,0 +1,56 @@
+{
+  "scope": "TP1 versus TP2 numerical failure diagnosis only; no product repair or threshold change",
+  "base_beta": "66db8cb528444b28751bee98fba2e24cfc024acc",
+  "model": "qwen3.8-27b.mq4-xts",
+  "model_sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
+  "hardware": "2x gfx1100 W7900, HIP 7.15; canonical exclusive locks held",
+  "fixture": {"prompt_tokens": 14, "kv": "legacy Q8", "deltanet_state": "FP32"},
+  "original_gate": {"metric": "max_abs(logits_ref - logits_tp) / max_abs(logits_ref), worst across positions", "limit_strictly_below": 0.003},
+  "controls": {
+    "lm_head_sharding": false,
+    "prefill_scratch_reuse": false,
+    "graph_capture": false,
+    "clean_beta_instrumented_first_logit_relative_error": 0.01028941806980339,
+    "two_rank_post_layer_hidden_equal_all_64_layers": true
+  },
+  "experiments": [
+    {"case": "control", "steps": 4, "worst_relative_error": 0.01029, "gate": "FAIL"},
+    {"case": "iu4-off", "steps": 4, "worst_relative_error": 0.01029, "gate": "FAIL", "note": "14 rows do not enter the >=64-row IU4 residual branch"},
+    {"case": "tp1-token-prefill", "steps": 4, "worst_relative_error": 0.002675, "gate": "PASS", "tp_logits_identical_to_control": true},
+    {"case": "residual-base", "steps": 4, "env": "HIPFIRE_RESIDUAL_KSPLIT_OFF=1", "worst_relative_error": 0.001851, "gate": "PASS"},
+    {"case": "layers-ldsstage-off-32-v2", "steps": 32, "env": "HIPFIRE_RESIDUAL_LDSSTAGE=0", "worst_relative_error": 0.001636, "argmax_equal": "32/32", "gate": "PASS"}
+  ],
+  "localization": {
+    "dispatch": "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_residual_wmma",
+    "admission": "exact gfx1100, batch<=16, K divisible by 512, residual LDS-staged enabled; ordinary short prefill also takes this verifier-labelled tier",
+    "kernel": "kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage.hip",
+    "hidden_last_layer_rel_l2_default": 0.017732821216402607,
+    "hidden_last_layer_rel_l2_ldsstage_off": 0.0034432340344309822
+  },
+  "standalone_residual_oracle": {
+    "binary_md5": "b558e03588f50985cdba336a00870836",
+    "real_weights_layer": 0,
+    "rows": 14,
+    "input": "deterministic random finite F32 staged to F16, identical nonzero residual",
+    "ldsstage_vs_base_rel_l2": {"out_proj": 0.00001122, "down_proj": 0.00003468},
+    "full_K_vs_two_K_half_rel_l2": {"out_proj": 0.000001007117, "down_proj": 0.000003037826},
+    "gate": "PASS original per-operator relative L2 <=5e-5, all finite",
+    "caveat": "Layer-0 weights and this input only; no assertion that every model/layer is bug-free. Reduced warmups/repetitions are diagnostic only, not performance evidence."
+  },
+  "quantization_observation": {
+    "first_full_attention_layer": 3,
+    "default_K_codes_changed": 91,
+    "default_V_codes_changed": 134,
+    "codes_per_side": 14336,
+    "first_layer_max_integer_change": 1,
+    "layer63_V_max_integer_change_default": 6,
+    "layer63_V_max_integer_change_ldsstage_off": 1,
+    "assessment": "Observed quantized-code differences and layerwise amplification support small arithmetic perturbations crossing Q8 thresholds and propagating through the network. This is an inference, not proof that Q8 is the sole amplifier."
+  },
+  "conclusion": {
+    "confirmed": "Pre-existing clean-beta numerical-gate failure, linked by single-variable intervention to the default small-batch LDS residual tier; not a speed gate and not introduced by the pending TP2 lm_head/scratch optimizations.",
+    "not_proven": "An indexing, tail, synchronization, or memory-safety bug in the LDS kernel; the tested standalone cases pass.",
+    "next_step": "Treat as separate arithmetic-consistency investigation. Do not weaken the gate, silently disable the tier, or claim universal correctness/performance from this fixture. No product fix applied."
+  },
+  "evidence": ["layer-analysis.json", "kv-analysis.json", "residual-kernel.log", "layers-ldsstage-off-32-v2/result.json", "layers-kv-control/identity.json", "layers-kv-ldsstage-off/identity.json"]
+}
