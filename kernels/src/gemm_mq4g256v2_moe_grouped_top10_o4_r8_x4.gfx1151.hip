@@ -82,7 +82,7 @@ static __device__ __forceinline__ unsigned int hf_nibble_bytes(unsigned int x) {
 // mostly dead traffic).  R < 8 subtiles without a live slot exit at once:
 // their grouped rows are never read on the few-row route (the unscatter
 // skips dead slots).  Per live slot the arithmetic is R8's.
-template <int R>
+template <int R, bool INVERSE = false>
 __device__ __forceinline__ void grouped_top10_o4_body(
     const unsigned long long* __restrict__ expert_weight_ptrs,
     const int* __restrict__ expert_tile_ids,
@@ -94,7 +94,8 @@ __device__ __forceinline__ void grouped_top10_o4_body(
     int x_row_div,
     int grouped_rows,
     int n_experts,
-    float4* xs
+    float4* xs,
+    int mapped_start = 0
 ) {
     static_assert(R % 2 == 0 && R <= 8, "slots per subtile");
     // readfirstlane: the compiler cannot see that threadIdx.x >> 5 is
@@ -103,7 +104,7 @@ __device__ __forceinline__ void grouped_top10_o4_body(
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
     const int tid = threadIdx.x & 31;
     const int row0 = (blockIdx.x * 4 + wave) * 4;
-    const int slot_start = blockIdx.y * R;
+    const int slot_start = INVERSE ? mapped_start : blockIdx.y * R;
     // Block-uniform exits only: every wave takes part in the barriers.
     if (slot_start >= grouped_rows) return;
 
@@ -318,4 +319,51 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4(
     __shared__ float4 xs[2 * 64];
     grouped_top10_o4_body<2>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
                              Y_grouped, M, K, x_row_div, grouped_rows, n_experts, xs);
+}
+
+// Few-row inverse launch: the current scatter maps every valid flat slot to
+// its grouped row. Even rows lead two-slot subtiles; odd and invalid rows
+// exit before the shared-memory body. Pad16 expert boundaries make every
+// live pair have one valid even leader, including an odd run last pair.
+// Grid [ceil(M / 16), total_slots, 1], block 128. No extra grouping pass.
+__launch_bounds__(128, 2)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse(
+    const unsigned long long* __restrict__ expert_weight_ptrs,
+    const int* __restrict__ expert_tile_ids,
+    const int* __restrict__ sorted_slot_index,
+    const int* __restrict__ inverse_perm,
+    const float* __restrict__ X_src,
+    float* __restrict__ Y_grouped,
+    int M, int K, int x_row_div, int grouped_rows, int n_experts, int total_slots
+) {
+    const int flat = blockIdx.y;
+    if (flat >= total_slots) return;
+    const int start = inverse_perm[flat];
+    if (start < 0 || start >= grouped_rows || (start & 1)) return;
+    __shared__ float4 xs[2 * 64];
+    grouped_top10_o4_body<2, true>(expert_weight_ptrs, expert_tile_ids,
+        sorted_slot_index, X_src, Y_grouped, M, K, x_row_div,
+        grouped_rows, n_experts, xs, start);
+}
+
+// Exact K2560 GU specialization. Runtime host admission owns K==2560.
+// Keep the original loops, quad/tail order, divisor, ABI and R2 footprint.
+__launch_bounds__(128, 2)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse_k2560(
+    const unsigned long long* __restrict__ expert_weight_ptrs,
+    const int* __restrict__ expert_tile_ids,
+    const int* __restrict__ sorted_slot_index,
+    const int* __restrict__ inverse_perm,
+    const float* __restrict__ X_src,
+    float* __restrict__ Y_grouped,
+    int M, int K, int x_row_div, int grouped_rows, int n_experts, int total_slots
+) {
+    const int flat = blockIdx.y;
+    if (flat >= total_slots) return;
+    const int start = inverse_perm[flat];
+    if (start < 0 || start >= grouped_rows || (start & 1)) return;
+    __shared__ float4 xs[2 * 64];
+    grouped_top10_o4_body<2, true>(expert_weight_ptrs, expert_tile_ids,
+        sorted_slot_index, X_src, Y_grouped, M, 2560, x_row_div,
+        grouped_rows, n_experts, xs, start);
 }

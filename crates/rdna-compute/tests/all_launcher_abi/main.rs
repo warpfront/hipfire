@@ -3350,3 +3350,166 @@ fn negative_collection_helper_with_nested_for_leaf_is_a_read_only_if_the_leaf_on
         );
     }
 }
+
+// ---- canonical immutable-array kernelParams map/append -----------------------
+
+fn canonical_params_map_source() -> String {
+    r#"impl Gpu {
+    fn mapped(&mut self) -> HipResult<()> {
+        let pointers = [x.buf.as_ptr(), y.buf.as_ptr()];
+        let dims = [3i32, 7i32];
+        let mut params: Vec<*mut c_void> = pointers.iter().map(|p| p as *const _ as *mut c_void).collect();
+        params.extend(dims.iter().map(|n| n as *const _ as *mut c_void));
+        self.launch_maybe_blob("mapped_symbol", g, bl, 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            for p in pointers { b.push_ptr(p); }
+            for n in dims { b.push_i32(n); }
+            b
+        })
+    }
+}"#.to_string()
+}
+
+#[test]
+fn canonical_params_map_and_extend_preserve_origins_and_fail_closed() {
+    let source = canonical_params_map_source();
+    let symbols = [(
+        "mapped_symbol",
+        Decl::from_scalars(&[(8, 'p'), (8, 'p'), (4, 'i'), (4, 'i')]),
+    )];
+    let (abi, coverage) = run_synth(&source, &symbols, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "canonical map/append: {abi:?} {coverage:?}"
+    );
+    // Existing explicit literal-index blob arguments name the same array cells.
+    let indexed_blob = source
+        .replace(
+            "for p in pointers { b.push_ptr(p); }",
+            "b.push_ptr(pointers[0]); b.push_ptr(pointers[1]);",
+        )
+        .replace(
+            "for n in dims { b.push_i32(n); }",
+            "b.push_i32(dims[0]); b.push_i32(dims[1]);",
+        );
+    let (abi, coverage) = run_synth(&indexed_blob, &symbols, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "indexed map/append: {abi:?} {coverage:?}"
+    );
+    // Adapters can reorder/drop elements; unknown closures/sources can change
+    // origins; a mutable source could change the values referenced by params.
+    for bad in [
+        source.replace("pointers.iter().map", "pointers.iter().rev().map"),
+        source.replace("pointers.iter().map", "pointers.iter().skip(1).map"),
+        source.replace("dims.iter().map", "dims.iter().rev().map"),
+        source.replace("dims.iter().map", "dims.iter().filter(|_| true).map"),
+        source.replace("|p| p as *const _", "|p| other as *const _"),
+        source.replace(
+            "|p| p as *const _ as *mut c_void",
+            "|p| { p as *const _ as *mut c_void }",
+        ),
+        source.replace("let pointers =", "let mut pointers ="),
+        source.replace("let dims =", "let mut dims ="),
+        source.replace(
+            "        self.launch_maybe_blob",
+            "        let dims = [9i32, 11i32];\n        self.launch_maybe_blob",
+        ),
+        source.replace(
+            "let pointers = [x.buf.as_ptr(), y.buf.as_ptr()];",
+            "let pointers = pointer_helper();",
+        ),
+        source.replace("params.extend(dims", "params.extend(pointers"),
+        source.replace(
+            "        self.launch_maybe_blob",
+            "        params.reverse();\n        self.launch_maybe_blob",
+        ),
+        source.replace(
+            "        params.extend(dims.iter().map(|n| n as *const _ as *mut c_void));\n",
+            "",
+        ),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &no_policy());
+        assert!(
+            !abi.is_empty() || !coverage.is_empty(),
+            "unproved mapping must fail: {bad}"
+        );
+    }
+    // A closure's void-pointer cast is NOT the ABI of the element it points at.
+    // The immutable array's actual elements must still have the declared type.
+    for bad in [
+        source.replace("[3i32, 7i32]", "[3f32, 7f32]"),
+        source.replace("[x.buf.as_ptr(), y.buf.as_ptr()]", "[x.buf.as_ptr(), 7u64]"),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &no_policy());
+        assert!(
+            !abi.is_empty() || !coverage.is_empty(),
+            "mapped wrong element type must fail: {bad}"
+        );
+    }
+}
+
+#[test]
+fn canonical_params_map_checks_actual_few_row_launchers_against_hip() {
+    // Only the two actual Rust files needed by these launches, not the whole
+    // closed-coverage fixture. The shared gate below still scans every file.
+    let root = root();
+    let paths = vec![
+        "crates/rdna-compute/src/moe_few.rs".to_string(),
+        "crates/rdna-compute/src/gemm.rs".to_string(),
+    ];
+    let world = World::load(&root, &paths).expect("actual few-row sources parse");
+    let inverse_source = std::fs::read_to_string(
+        root.join("kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip"),
+    )
+    .unwrap();
+    let down_source = std::fs::read_to_string(
+        root.join("kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip"),
+    )
+    .unwrap();
+    let inverse = hip::decls_of(&inverse_source).expect("actual inverse HIP declarations");
+    let down = hip::decls_of(&format!(
+        "#define QT53_DOWN_ENTRY gemv_mq4g128v2_moe_down_top10_k640\n#define QT53_DOWN_K640 1\n{down_source}"
+    )).expect("actual special down HIP declaration");
+    let mut symbols = Symbols::default();
+    for (name, declaration) in [
+        (
+            "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse_k2560",
+            inverse["gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse_k2560"].clone(),
+        ),
+        (
+            "gemv_mq4g128v2_moe_down_top10_k640",
+            down["gemv_mq4g128v2_moe_down_top10_k640"].clone(),
+        ),
+    ] {
+        eprintln!(
+            "actual few-row ABI: {name} args={} end={} declaration={declaration:?}",
+            declaration.args.len(),
+            declaration.end
+        );
+        symbols.hip.insert(
+            name.to_string(),
+            vec![("actual HIP".to_string(), declaration)],
+        );
+    }
+    let analysis = analyze(&world, &symbols, &no_policy());
+    let (abi, coverage) = violations(&analysis, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "actual few-row ABI: {abi:?} {coverage:?}"
+    );
+    assert!(
+        analysis.checked_sites >= 2,
+        "both real launch sites must be checked"
+    );
+    for name in symbols.all_names() {
+        assert!(
+            analysis.covered.contains(&name),
+            "actual live launch not checked: {name}"
+        );
+    }
+    eprintln!(
+        "actual few-row checked sites={} covered={:?}",
+        analysis.checked_sites, analysis.covered
+    );
+}

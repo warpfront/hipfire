@@ -1752,6 +1752,26 @@ pub(crate) fn gate_up_front(
             p.batch_size,
         ))
     } else if use_path2 {
+        if gpu.arch_caps.is_gfx1151()
+            && p.mi == 640
+            && p.gate_up_k == 2560
+            && p.k_top == 10
+            && (1..=8).contains(&p.batch_size)
+        {
+            return hip(gpu.gemm_mq4g256v2_moe_grouped_top10_inverse(
+                gate_up_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.inverse_perm,
+                p.x_rot_batch,
+                p.y_gate_up_grouped,
+                2 * p.mi,
+                p.gate_up_k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+            ));
+        }
         hip(gpu.gemm_mq4g256v2_moe_grouped_top10(
             gate_up_ptrs,
             p.expert_tile_ids,

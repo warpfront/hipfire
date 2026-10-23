@@ -811,7 +811,7 @@ static __device__ __forceinline__ void hcw_apply8_g(const uint4 mq, int t, int c
 // Grid: [ceil(M/(16*RW)), ceil(N/(16*BV))]. Block: [32*RW].
 // ---------------------------------------------------------------------------
 template <int BITS, int BV, int RW, bool OVERWRITE, bool OUT_BF16 = false, int PREFETCH = 1,
-          bool HC = false, bool DQ = false>
+          bool HC = false, bool DQ = false, bool GATE_ROW4 = false>
 __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
                                               const _Float16* __restrict__ X,
                                               float* __restrict__ Y,
@@ -1032,19 +1032,28 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         // iteration.  Same hcw_gate on the same logits, moved as raw bits; ragged tokens
         // (t >= N) load nothing (stage 2 skips them).  No LDS (a gate array in LDS moves the
         // kernel into the next LDS-occupancy bucket and the K loop then spills).
+        // gfx1151 RW4's eight-lane rows share the same four gates as RW8,
+        // with four producer slots per lane for its eight stage-2 iterations.
+        // Keep the RW8 mapping and other architectures' existing epilogues.
         constexpr bool GATE_ROW = HC && (RW == 8);
-        constexpr int GPL = BV / 4;
+#if defined(__gfx1151__)
+        constexpr bool GATE4 = HC && GATE_ROW4 && RW == 4;
+#else
+        constexpr bool GATE4 = false;
+#endif
+        constexpr int GPL = GATE4 ? 4 : BV / 4;
+        static_assert(!GATE4 || (BV == 8 && NT == 128));
         static_assert(!GATE_ROW || (BV % 4 == 0 && TOK == 16 * BV && NT == 256));
         float gp[GPL > 0 ? GPL : 1];
-        if constexpr (GATE_ROW) {
+        if constexpr (GATE_ROW || GATE4) {
             // Opaque tid: the gate loads' address arithmetic stays here instead of being
             // hoisted above the K loop, where it would stay live through it.
             int gtid = tid;
             asm volatile("" : "+v"(gtid));
 #pragma unroll
             for (int k = 0; k < GPL; k++) {
-                const int q = (gtid & 15) + 16 * k;  // pair: iteration q >> 2, branch q & 3
-                const int t = batch_start + (q >> 2) * 16 + (gtid >> 4);
+                const int q = (gtid & (GATE4 ? 7 : 15)) + (GATE4 ? 8 : 16) * k;
+                const int t = batch_start + (q >> 2) * 16 + (gtid >> (GATE4 ? 3 : 4));
                 float gk = 0.0f;
                 if (t < N) gk = hcw_gate(hc_gates[(long long)t * 4 + (q & 3)]);
                 gp[k] = gk;
@@ -1060,13 +1069,15 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             const int c8 = item % CPT;
             const int t = batch_start + tl;
             const int c0 = (row_block < 0 ? (int)blockIdx.x : row_block) * RW * 16 + c8 * 8;
-            if constexpr (GATE_ROW) {
-                // All lanes take part (before any lane skips): pair (it, br) sits in lane
-                // (4 * it + br) & 15 of the row, slot it >> 2.
+            if constexpr (GATE_ROW || GATE4) {
+                // All lanes take part before any ragged lane skips. RW8's
+                // provider is (4*it+br)&15, slot it>>2; RW4's eight-lane
+                // provider is (4*it+br)&7, slot it>>1.
                 float sv = gp[0];
 #pragma unroll
-                for (int k = 1; k < GPL; k++) sv = ((it >> 2) == k) ? gp[k] : sv;
-                const int rowaddr = (tid & 16) + ((it & 3) * 4);  // wave lane of the row's pair 0
+                for (int k = 1; k < GPL; k++) sv = ((it >> (GATE4 ? 1 : 2)) == k) ? gp[k] : sv;
+                const int rowaddr = GATE4 ? (tid & 24) + ((it & 1) * 4)
+                                          : (tid & 16) + ((it & 3) * 4);  // wave lane of the row's pair 0
                 float gb[4];
 #pragma unroll
                 for (int br = 0; br < 4; br++)
@@ -1277,7 +1288,7 @@ gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw(const char* __restrict__ A,
                                      float* __restrict__ Y,
                                      int M, int K, int N,
                                      void* hc_streams, const float* hc_gates, int hc_bf16) {
-    resid_bt_xlds<6, 8, 4, true, false, 1, true>(A, X, Y, M, K, N, -1, hc_streams, hc_gates,
+    resid_bt_xlds<6, 8, 4, true, false, 1, true, false, true>(A, X, Y, M, K, N, -1, hc_streams, hc_gates,
                                                 hc_bf16);
 }
 

@@ -63,6 +63,7 @@ pub mod lane_rows_pm;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
+mod moe_few;
 pub mod moe_rotate_i4_pm;
 pub mod moe_slot_ops;
 pub mod slab_admission;

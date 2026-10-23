@@ -1739,6 +1739,33 @@ pub fn emit_module_codec(
 /// of 2 row pairs x 32 lanes x 8 f32.
 pub const NT_GATE_BYTES: u32 = 2048;
 
+/// gfx1151 gate/up over eight pad16 tiles per weight panel, with two
+/// rotating operand buffers (208 VGPR, 16 KiB gate handoff LDS). Each output
+/// retains the incumbent's ascending K128 fold and BF16/SwiGLU rounding.
+/// The 64-byte ABI and grid are unchanged. Ordinary Spec/R4 emissions keep
+/// their original register layout and prefetch policy; this entry has its
+/// own object and an explicit measured-shape runtime selector.
+pub fn emit_gate_up_stream8(arch: Arch) -> Result<Emitted, String> {
+    if arch != Arch::Gfx1151 {
+        return Err("qwen4_moe_sym stream8: measured gfx1151 gate/up only".into());
+    }
+    nt::emit_buffered(
+        R4Spec {
+            base: Spec {
+                arch,
+                kind: Kind::GateUp,
+                nt: 8,
+                rr: 1,
+                codec: WeightCodec::Mq4Sym,
+            },
+            chains: 1,
+            prefetch: true,
+            grouped: false,
+        },
+        2,
+    )
+}
+
 /// Expert-run tiles (`nt` 16-slot tiles of one expert per weight stream).
 ///
 /// Grid and ABI are the 16-slot entry's; the block is 128 (four waves). CTA
@@ -1846,6 +1873,7 @@ mod nt {
         /// `(16 * tile + lane) * 72` of the epoch's `m_total`-record plane instead
         /// of the flat-slot gather. The fold, rounding and stores are unchanged.
         gpos: bool,
+        buffered: u8,
     }
     impl G {
         fn arch(&self) -> Arch {
@@ -1856,6 +1884,15 @@ mod nt {
         }
         fn aw(&self) -> u8 {
             self.spec.aw()
+        }
+        fn streamed(&self) -> bool {
+            self.buffered < self.nt()
+        }
+        fn buffered_tiles(&self) -> u8 {
+            self.buffered
+        }
+        fn x_end(&self) -> u8 {
+            self.x(0) + self.aw() * self.buffered_tiles()
         }
         fn gate_up(&self) -> bool {
             self.spec.kind == Kind::GateUp
@@ -1932,10 +1969,12 @@ mod nt {
             self.wh_set(p ^ self.flip())
         }
         fn d(&self, j: u8) -> u8 {
-            self.sums_end() + 2 * self.aw() + 2 + j
+            self.sums_end() + 2 * self.aw() + 2 + j % self.buffered_tiles()
         }
         fn x(&self, j: u8) -> u8 {
-            (self.d(self.nt())).div_ceil(8) * 8 + self.aw() * j
+            let base =
+                (self.sums_end() + 2 * self.aw() + 2 + self.buffered_tiles()).div_ceil(8) * 8;
+            base + self.aw() * (j % self.buffered_tiles())
         }
         fn live(&self, j: u8) -> u8 {
             LIVE0 + 2 * j
@@ -1944,7 +1983,7 @@ mod nt {
             if j == 0 {
                 CACC
             } else {
-                self.x(self.nt()) + 8 * (j - 1)
+                self.x_end() + 8 * (j - 1)
             }
         }
         // Epilogue temporaries: gate values over tile 0's activations, the
@@ -2053,16 +2092,18 @@ mod nt {
                     p.v::<1>("xq_off", XQOFF + j, kernel())?;
                 }
                 p.v::<8>("sum", self.sum(j), Live::Whole)?;
-                p.v::<1>("d", self.d(j), kernel())?;
-                for c in 0..4u8 {
-                    if gfx12 {
-                        p.v::<2>("x", self.x(j) + 2 * c, kernel())?;
-                    } else if j == 0 && c == 0 {
-                        for b in 0..rr {
-                            p.v::<4>("x", self.x(0), body(b))?;
+                if j < self.buffered_tiles() {
+                    p.v::<1>("d", self.d(j), kernel())?;
+                    for c in 0..4u8 {
+                        if gfx12 {
+                            p.v::<2>("x", self.x(j) + 2 * c, kernel())?;
+                        } else if j == 0 && c == 0 {
+                            for b in 0..rr {
+                                p.v::<4>("x", self.x(0), body(b))?;
+                            }
+                        } else {
+                            p.v::<4>("x", self.x(j) + 4 * c, kernel())?;
                         }
-                    } else {
-                        p.v::<4>("x", self.x(j) + 4 * c, kernel())?;
                     }
                 }
                 p.s::<2>("live", self.live(j), Live::Whole)?;
@@ -2778,9 +2819,32 @@ mod nt {
         // row offset (or the out-of-range offset of a padding slot).
         for j in 0..nt {
             pro_tile(wg.isa(), g, j)?;
-            load_x_init(wg, g, j)?;
+            if j < g.buffered_tiles() {
+                load_x_init(wg, g, j)?;
+            }
         }
         pro_init(wg.isa(), g)?;
+        if g.streamed() {
+            let b = wg.isa();
+            // The streamed current-epoch tile loads naturally settle the next
+            // weight set. Enter the loop with the same weight-ready ledger,
+            // retaining both operand buffers pending (not a full load drain).
+            let use_weight = Instruction::new(
+                "",
+                vec![],
+                vec![
+                    crate::reg::RegRef {
+                        kind: crate::reg::Kind::V,
+                        base: g.wa(0),
+                        len: g.aw(),
+                    },
+                    v(g.wh(0)),
+                ],
+            );
+            for (counter, n, _) in b.ledger.required(&use_weight) {
+                b.wait(counter, n)?;
+            }
+        }
         if g.settles_loads() {
             super::super::gemm_uk::Prefetch::<0>::wait_load(wg.isa())?;
         }
@@ -3067,17 +3131,29 @@ mod nt {
             } else {
                 fold(w, ())?;
             }
-            if let Some(srd) = outside {
+            if g.streamed() {
+                // Refill this consumed ring slot with this epoch's tile j+2.
+                // Only the final two slots preload the next epoch's tiles 0/1.
+                if j + 2 < g.nt() {
+                    load_x(w.isa(), g, j + 2, SRD_X[p])?;
+                } else if let Some(srd) = outside {
+                    load_x(w.isa(), g, j + 2 - g.nt(), srd)?;
+                }
+            } else if let Some(srd) = outside {
                 load_x(w.isa(), g, j, srd)?;
             }
         }
         Ok(())
     }
 
-    fn advance(b: &mut Builder) -> Result<(), String> {
+    fn advance(b: &mut Builder, streamed: bool) -> Result<(), String> {
         add64_imm(b, SRD_W, 136)?;
         for r in SRD_X {
-            add64(b, r, r, XS2)?;
+            // Streamed epoch 1 still reads SRD_X[1] while it computes; move
+            // only epoch 0 here so epoch 1 can prefetch epoch 2 into its ring.
+            if !streamed || r == SRD_X[0] {
+                add64(b, r, r, XS2)?;
+            }
         }
         Ok(())
     }
@@ -3107,13 +3183,16 @@ mod nt {
                 if g.prefetch {
                     load_w(wg.isa(), g, 1)?;
                     compute(wg, g, 0, "l0", Some(SRD_X[1]))?;
-                    advance(wg.isa())?;
+                    advance(wg.isa(), g.streamed())?;
                     load_w(wg.isa(), g, 0)?;
                     compute(wg, g, 1, "l1", Some(SRD_X[0]))?;
+                    if g.streamed() {
+                        add64(wg.isa(), SRD_X[1], SRD_X[1], XS2)?;
+                    }
                 } else {
                     compute(wg, g, 0, "l0", None)?;
                     load_epoch(wg, g, 1, "l0x")?;
-                    advance(wg.isa())?;
+                    advance(wg.isa(), g.streamed())?;
                     compute(wg, g, 1, "l1", None)?;
                     load_epoch(wg, g, 0, "l1x")?;
                 }
@@ -3604,7 +3683,7 @@ mod nt {
     }
 
     pub(super) fn emit_with(r4: R4Spec) -> Result<Emitted, String> {
-        emit_full(r4, false)
+        emit_full(r4, false, r4.base.nt)
     }
 
     /// The position-indexed twin of `spec` (down only): symbol `..._sym_gp_pm_...`, variant `<tag>_gp`.
@@ -3617,10 +3696,15 @@ mod nt {
                 grouped: false,
             },
             true,
+            spec.nt,
         )
     }
 
-    fn emit_full(r4: R4Spec, gpos: bool) -> Result<Emitted, String> {
+    pub(super) fn emit_buffered(r4: R4Spec, buffered: u8) -> Result<Emitted, String> {
+        emit_full(r4, false, buffered)
+    }
+
+    fn emit_full(r4: R4Spec, gpos: bool, buffered: u8) -> Result<Emitted, String> {
         let spec = r4.base;
         let g = G {
             spec,
@@ -3629,6 +3713,7 @@ mod nt {
             prefetch: r4.prefetch,
             grouped: r4.grouped,
             gpos,
+            buffered,
         };
         let mut b = Builder::new(kernel_spec_of(&g), g.plan()?);
         b.enable_delay_alu();
@@ -3640,7 +3725,9 @@ mod nt {
     fn kernel_spec_of(g: &G) -> KernelSpec {
         let spec = g.spec;
         let experimental = g.experimental();
-        let suffix = if experimental {
+        let suffix = if g.streamed() {
+            format!("_stream{}", g.buffered_tiles())
+        } else if experimental {
             format!(
                 "_r4c{}p{}{}",
                 g.chains,
@@ -3755,6 +3842,7 @@ mod nt {
                         prefetch: true,
                         grouped: false,
                         gpos: gp,
+                        buffered: spec.nt,
                     },
                 })
             }
@@ -3889,7 +3977,7 @@ mod nt {
         }
         /// Step the weight descriptor and both activation descriptors one trip's epoch pair on.
         pub fn advance(b: &mut Builder) -> Result<(), String> {
-            super::advance(b)
+            super::advance(b, false)
         }
         /// `s_cmp_eq_u32 TRIPS, 0`: no full trip (workgroup-uniform).
         pub fn trips_zero_insn() -> Instruction {

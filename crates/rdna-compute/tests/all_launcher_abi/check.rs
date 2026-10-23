@@ -151,6 +151,26 @@ fn compare_params(
         ));
     } else if v.pushes.len() == pi.len() && lay.len() == pi.len() {
         for (i, (a, b)) in pi.iter().zip(lay.iter()).enumerate() {
+            if let Some((value, loc)) = a
+                .as_ref()
+                .and_then(|name| mapped_param_value(ctx, name, sloc))
+            {
+                match world.infer_kind(&value, ctx, &loc, 0) {
+                    Some(kind) if kind == (b.size, b.kind) => {}
+                    kind => probs.push(format!(
+                        "arg {i}: mapped kernelParams value `{}` has type {kind:?}, blob has ({}, {})",
+                        text(&value), b.size, b.kind
+                    )),
+                }
+                if arg_ident(&b.expr).as_ref() != a.as_ref() && text(&value) != text(&b.expr) {
+                    probs.push(format!(
+                        "arg {i}: mapped kernelParams reads `{}` but the blob pushes `{}`",
+                        text(&value),
+                        text(&b.expr)
+                    ));
+                }
+                continue;
+            }
             let bi = arg_ident(&b.expr);
             if let (Some(a), Some(bi)) = (a, &bi) {
                 let a_arr = a.ends_with("[]");

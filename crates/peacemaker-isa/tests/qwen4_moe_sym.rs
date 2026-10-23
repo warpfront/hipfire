@@ -78,7 +78,8 @@ fn entries_are_deterministic_and_target_only_their_arches() {
         codec: qwen4_moe_sym::WeightCodec::Mq4Sym
     })
     .is_err());
-    // gfx11 NT8 does not fit the VGPR file.
+    // The ordinary all-resident gfx11 NT8 spec exceeds the VGPR budget.
+    // The separate two-buffer streamed gate/up entry has its own API.
     assert!(qwen4_moe_sym::emit(Spec {
         arch: Arch::Gfx1151,
         kind: Kind::GateUp,
@@ -829,4 +830,16 @@ mod toolchain {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// The separate eight-tile/two-operand-buffer bundle must exactly match
+/// native emission. The all-resident NT8 Spec remains rejected above.
+#[test]
+fn streamed_gate_up_bundle_is_fresh_and_arch_only() {
+    for arch in [Arch::Gfx1100, Arch::Gfx1201] {
+        assert!(qwen4_moe_sym::emit_gate_up_stream8(arch).is_err());
+    }
+    let e = qwen4_moe_sym::emit_gate_up_stream8(Arch::Gfx1151).unwrap();
+    assert_eq!(e.shape.barriers, 2);
+    assert_committed_gfx1151_bundle_is_fresh("qwen4_moe_gate_up_stream8_pm_gfx1151", &e.s_text);
 }

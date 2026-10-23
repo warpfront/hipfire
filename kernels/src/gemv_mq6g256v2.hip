@@ -9,6 +9,11 @@
 #define HIPFIRE_MQ6G256V2_KERNEL gemv_mq6g256v2
 #endif
 
+// Compile-time entry name for separately cached scalar specializations.
+#ifndef MQ6_GEMV_ENTRY
+#define MQ6_GEMV_ENTRY HIPFIRE_MQ6G256V2_KERNEL
+#endif
+
 #ifndef HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
 #define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
 #endif
@@ -20,7 +25,7 @@
 // K%256 required. Same 4-accumulator interleaving as gemv_mq4g256v2 for byte-exact.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
+extern "C" __global__ void MQ6_GEMV_ENTRY(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -32,6 +37,8 @@ extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
 
 #if defined(HIPFIRE_MQ6G256V2_K2048)
     const int groups_per_row = 8;
+#elif defined(MQ6_GEMV_COMPILE_K2560)
+    constexpr int groups_per_row = 10;
 #else
     const int groups_per_row = K / 256;
 #endif
@@ -57,6 +64,9 @@ extern "C" __global__ void HIPFIRE_MQ6G256V2_KERNEL(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
+#if defined(MQ6_GEMV_COMPILE_K2560_UNROLL2)
+    #pragma unroll 2
+#endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 200;

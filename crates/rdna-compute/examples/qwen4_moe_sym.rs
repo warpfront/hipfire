@@ -733,7 +733,7 @@ const fn entry_rr(
     }
 }
 
-const ENTRIES_GFX1151: [Entry; 6] = [
+const ENTRIES_GFX1151: [Entry; 9] = [
     entry(
         "pm_nt1",
         "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151",
@@ -771,6 +771,25 @@ const ENTRIES_GFX1151: [Entry; 6] = [
     entry_rr(
         "pm_nt4_dr4",
         "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",
+        "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4",
+        4,
+    ),
+    entry(
+        "pm_nt8_stream2",
+        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2",
+        "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4",
+        128,
+        true,
+    ),
+    entry_rr(
+        "pm_nt8_stream2_dr2",
+        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2",
+        "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r2",
+        2,
+    ),
+    entry_rr(
+        "pm_nt8_stream2_dr4",
+        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2",
         "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4",
         4,
     ),
@@ -846,6 +865,18 @@ fn cand_and_anchors(gpu: &Gpu, host: bool, total_slots: usize) -> Res<(Entry, Ve
     let [gu, dn] = gpu
         .qwen4_moe_sym_gemm_symbols(host, total_slots, geo().e)
         .ok_or("no sym GEMM symbols on this arch")?;
+    let gu = gpu
+        .qwen4_moe_sym_gate_up_symbol(
+            host,
+            [
+                geo().gu_m,
+                geo().hid,
+                geo().topk,
+                total_slots / geo().topk,
+                geo().e,
+            ],
+        )
+        .unwrap_or(gu);
     let rr = gpu.qwen4_moe_sym_down_rr()?;
     let all = entries(gpu);
     let mixed: &[Entry] = if gpu.arch == "gfx1201" {

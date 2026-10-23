@@ -459,7 +459,119 @@ impl World {
 
 // ---- params array -----------------------------------------------------------------
 
+/// The one-to-one kernelParams builder used by the few-row launchers.
+/// Only immutable literal arrays, an unadapted `.iter()`, and this exact
+/// reference-to-void-pointer cast are accepted. Keep each array index as an
+/// origin; do not infer a layout from the closure's cast alone.
+fn mapped_param_elems(
+    expr: &[Tt],
+    ctx: &Ctx,
+    loc: &[usize],
+    sloc: &[usize],
+    collect: bool,
+) -> Result<Vec<Vec<Tt>>, String> {
+    let expected = if collect { 10 } else { 7 };
+    if expr.len() != expected
+        || expr[0].id().is_none()
+        || !expr[1].is_p('.')
+        || !expr[2].is_id("iter")
+        || !expr[3].is_g('(')
+        || !expr[3].group().unwrap().is_empty()
+        || !expr[4].is_p('.')
+        || !expr[5].is_id("map")
+        || !expr[6].is_g('(')
+        || (collect
+            && (!expr[7].is_p('.')
+                || !expr[8].is_id("collect")
+                || !expr[9].is_g('(')
+                || !expr[9].group().unwrap().is_empty()))
+    {
+        return Err(
+            "params mapping must be NAME.iter().map(canonical cast), without iterator adapters"
+                .into(),
+        );
+    }
+    let closure = expr[6].group().unwrap();
+    if closure.len() != 12
+        || !closure[0].is_p('|')
+        || closure[1].id().is_none()
+        || !closure[2].is_p('|')
+        || closure[3].id() != closure[1].id()
+        || !closure[4].is_id("as")
+        || !closure[5].is_p('*')
+        || !closure[6].is_id("const")
+        || !closure[7].is_id("_")
+        || !closure[8].is_id("as")
+        || !closure[9].is_p('*')
+        || !closure[10].is_id("mut")
+        || !closure[11].is_id("c_void")
+    {
+        return Err("params mapping closure must be |v| v as *const _ as *mut c_void".into());
+    }
+    let name = expr[0].id().unwrap();
+    let binding = ctx
+        .idx
+        .visible(name, loc)
+        .ok_or_else(|| format!("params mapping source `{name}` has no visible binding"))?;
+    if ctx.idx.visible(name, sloc).map(|b| &b.loc) != Some(&binding.loc) {
+        return Err(format!(
+            "params mapping source `{name}` is shadowed before the launch"
+        ));
+    }
+    let (start, parent) = binding
+        .loc
+        .split_last()
+        .ok_or("params mapping source has no location")?;
+    let tokens = tokens_at(ctx.body, parent).ok_or("params mapping source location is invalid")?;
+    // No mutable source, alias, call result, conditional, or repeated array.
+    // These arrays contain the immutable pointer/scalar values kernelParams
+    // references, so later element mutation cannot be hidden by this reader.
+    if !tokens.get(*start).map_or(false, |t| t.is_id("let"))
+        || !tokens.get(*start + 1).map_or(false, |t| t.is_id(name))
+        || !tokens.get(*start + 2).map_or(false, |t| t.is_p('='))
+        || binding.init.len() != 1
+        || !binding.init[0].is_g('[')
+        || binding.init[0].group().unwrap().iter().any(|t| t.is_p(';'))
+    {
+        return Err(format!(
+            "params mapping source `{name}` must be an immutable literal array"
+        ));
+    }
+    let source = split_top(binding.init[0].group().unwrap(), ',');
+    if source.is_empty() || source.iter().any(Vec::is_empty) {
+        return Err("params mapping source cannot be empty".into());
+    }
+    (0..source.len())
+        .map(|index| lex(&format!("&{name}[{index}] as *const _ as *mut c_void")))
+        .collect()
+}
+
+/// Resolve an index emitted by mapped_param_elems to the actual value the
+/// immutable array entry stores. The ABI is the value, not the outer void cast.
+/// Mapping rejects later shadowing before producing these identifiers.
+pub fn mapped_param_value(ctx: &Ctx, name: &str, sloc: &[usize]) -> Option<(Vec<Tt>, Loc)> {
+    let ts = lex(name).ok()?;
+    if ts.len() != 2 || ts[0].id().is_none() || !ts[1].is_g('[') {
+        return None;
+    }
+    let index = ts[1].group()?;
+    let [Tt::N(number, _)] = index else {
+        return None;
+    };
+    let index = usize::try_from(parse_int(number)?).ok()?;
+    let binding = ctx.idx.visible(ts[0].id()?, sloc)?;
+    if binding.init.len() != 1
+        || !binding.init[0].is_g('[')
+        || binding.init[0].group()?.iter().any(|t| t.is_p(';'))
+    {
+        return None;
+    }
+    let entries = split_top(binding.init[0].group()?, ',');
+    Some((entries.get(index)?.clone(), binding.loc.clone()))
+}
+
 fn collect_param_pushes(
+    ctx: &Ctx,
     ts: &[Tt],
     loc: &mut Loc,
     pname: &str,
@@ -491,9 +603,17 @@ fn collect_param_pushes(
                     }
                     out.push((args[0].clone(), conds.clone()));
                 }
+            } else if between && m == "extend" {
+                let args = split_top(ts[i + 3].group().unwrap(), ',');
+                if args.len() != 1 {
+                    return Err("params.extend with unexpected arity".into());
+                }
+                for entry in mapped_param_elems(&args[0], ctx, &here, sloc, false)? {
+                    out.push((entry, conds.clone()));
+                }
             } else if between && m != "len" {
-                // Only `push` builds the array; any other method (reverse, sort, swap,
-                // extend, ..) could reorder or change it, so it is refused.
+                // Only push and the exact mapped append above are understood;
+                // reverse, sort, swap and all other mutations remain refused.
                 return Err(format!("params array `{pname}` is used through `{m}` between its declaration and the launch"));
             }
             i += 4;
@@ -532,6 +652,7 @@ fn collect_param_pushes(
                 bc.extend(prior.iter().cloned());
                 bc.push((atom.clone(), pos));
                 collect_param_pushes(
+                    ctx,
                     ts[j].group().unwrap(),
                     &mut bl,
                     pname,
@@ -555,6 +676,7 @@ fn collect_param_pushes(
                         let mut bl = loc.clone();
                         bl.push(j);
                         collect_param_pushes(
+                            ctx,
                             ts[j].group().unwrap(),
                             &mut bl,
                             pname,
@@ -574,7 +696,7 @@ fn collect_param_pushes(
         }
         if let Tt::G(_, c, _) = t {
             let mut bl = here.clone();
-            collect_param_pushes(c, &mut bl, pname, bloc, sloc, safe, conds, out)?;
+            collect_param_pushes(ctx, c, &mut bl, pname, bloc, sloc, safe, conds, out)?;
         }
         i += 1;
     }
@@ -1056,15 +1178,15 @@ impl World {
             {
                 // Entries come from later `push` calls.
             } else {
-                return Err(format!(
-                    "params initializer `{}` is not a vec!/array literal",
-                    text(init)
-                ));
+                for entry in mapped_param_elems(init, ctx, &b.loc, body_loc, true)? {
+                    elems.push((entry, Vec::new()));
+                }
             }
             let mut pp: Vec<(Vec<Tt>, Conds)> = Vec::new();
             let mut l: Loc = Vec::new();
             let safe = prior_launch_groups(ctx.body, body_loc);
             collect_param_pushes(
+                ctx,
                 ctx.body,
                 &mut l,
                 &pname,

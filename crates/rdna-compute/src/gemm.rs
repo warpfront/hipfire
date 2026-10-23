@@ -48975,6 +48975,8 @@ const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
 /// bitwise the module's 16-slot entries, which the ORACLE keeps as the anchor.
 const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
+const QWEN4_MOE_SYM_STREAM8_MODULE: &str = "qwen4_moe_gate_up_stream8_pm_gfx1151";
+const QWEN4_MOE_SYM_STREAM8_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
 /// Module key of the grouped-position down twins (`kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201`: the grouped
 /// producer `moe_rotate_i4_gp_pm_gfx1201` plus `qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt{4,8}`).
@@ -50520,6 +50522,27 @@ impl Gpu {
         Some(pair)
     }
 
+    /// Gate/up entry for `[m, k, top_k, live_source_rows, experts]`.
+    /// The streamed variant is a positive gfx1151/VRAM/7168..8192-row
+    /// allowlist for the measured Flash-Next shape; smaller skewed banks
+    /// and all other architectures/residencies keep the baseline entries.
+    pub fn qwen4_moe_sym_gate_up_symbol(
+        &self,
+        host_mapped: bool,
+        shape: [usize; 5],
+    ) -> Option<&'static str> {
+        let total_slots = qwen4_moe_sym_total_slots(shape[3], shape[2]);
+        let [base, _] = self.qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, shape[4])?;
+        let pm = base == QWEN4_MOE_SYM_PM_GATE_UP[0][0];
+        Some(
+            if qwen4_moe_stream8_selected(&self.arch, pm, host_mapped, shape) {
+                QWEN4_MOE_SYM_STREAM8_GATE_UP
+            } else {
+                base
+            },
+        )
+    }
+
     /// Down-GEMM row repeat: contiguous 64-row blocks one workgroup covers
     /// (`grid.x = m / (64 * rr)`). `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4)
     /// applies on a descriptor with row-repeat entries (the gfx1151 builder PM
@@ -50560,7 +50583,15 @@ impl Gpu {
     pub fn ensure_qwen4_moe_sym_pm_entry(&mut self, func: &str) -> HipResult<()> {
         let kernel = self.qwen4_moe_sym_require(func)?;
         self.bind_thread()?;
-        self.ensure_embedded_kernel(kernel.module, kernel.image, func)
+        if self.arch.as_str() == "gfx1151" && func == QWEN4_MOE_SYM_STREAM8_GATE_UP {
+            self.ensure_embedded_kernel(
+                QWEN4_MOE_SYM_STREAM8_MODULE,
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                func,
+            )
+        } else {
+            self.ensure_embedded_kernel(kernel.module, kernel.image, func)
+        }
     }
 
     /// `[gate/up, down]` entries of the MQ3-I4 NT1 module on this device (the
@@ -52074,12 +52105,21 @@ impl Gpu {
         let nev = moe_expert_table_len(ptrs);
         let n_experts = usize::try_from(nev).unwrap_or(0);
         let total_slots = qwen4_moe_sym_total_slots(dims[4], dims[2]);
-        let func = self
+        let baseline_func = self
             .qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)
             .map(|[gate_up, dn]| if down { dn } else { gate_up })
             .unwrap_or_else(|| {
                 moe_sym_iu4_symbols(kernel, *QWEN4_MOE_SYM_PM, rr, host_mapped)[usize::from(down)]
             });
+        let func = if down {
+            baseline_func
+        } else {
+            self.qwen4_moe_sym_gate_up_symbol(
+                host_mapped,
+                [dims[0], dims[1], dims[2], dims[4], n_experts],
+            )
+            .unwrap_or(baseline_func)
+        };
         let block = kernel.block_threads[usize::from(down)];
         // The grouped-position twin of the selected NT entry: same grid, ABI and bytes, its own bundle.
         let func = qwen4_moe_down_gp_entry(func, grouped_plane);
@@ -52089,10 +52129,18 @@ impl Gpu {
             moe_sym_iu4_extents(func, down, rr, pm.then_some(kernel.max_slots), dims)?;
         let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
         self.bind_thread()?;
-        let (module, image) = qwen4_moe_down_gp_image(kernel, grouped_plane);
-        match (pm, kernel.hipcc_twin.as_ref()) {
-            (false, Some(twin)) => self.ensure_kernel(twin.module, (twin.source)(), func)?,
-            _ => self.ensure_embedded_kernel(module, image, func)?,
+        if pm && func == QWEN4_MOE_SYM_STREAM8_GATE_UP {
+            self.ensure_embedded_kernel(
+                QWEN4_MOE_SYM_STREAM8_MODULE,
+                kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
+                func,
+            )?;
+        } else {
+            let (module, image) = qwen4_moe_down_gp_image(kernel, grouped_plane);
+            match (pm, kernel.hipcc_twin.as_ref()) {
+                (false, Some(twin)) => self.ensure_kernel(twin.module, (twin.source)(), func)?,
+                _ => self.ensure_embedded_kernel(module, image, func)?,
+            }
         }
         let pp = ptrs.buf.as_ptr();
         let tp = tiles.buf.as_ptr();
@@ -55764,6 +55812,52 @@ mod miscompiled_optin_refusal_tests {
     fn miscompiled_optin_explicit_zero_runs_default_route_without_refusal() {
         for var in VARS {
             assert_eq!(miscompiled_optin_decision(var, Some("0")), (false, None));
+        }
+    }
+}
+
+fn qwen4_moe_stream8_selected(
+    arch: &str,
+    pm: bool,
+    host: bool,
+    [m, k, top, rows, experts]: [usize; 5],
+) -> bool {
+    arch == "gfx1151"
+        && pm
+        && !host
+        && m == 1280
+        && k == 2560
+        && top == 10
+        && experts == 512
+        && (7168..=8192).contains(&rows)
+}
+
+#[cfg(test)]
+mod qwen4_moe_stream8_selection {
+    use super::qwen4_moe_stream8_selected as selected;
+    #[test]
+    fn only_measured_shape_and_arch_enter_stream8() {
+        for rows in [1, 8, 512, 4096, 4672, 5198, 7167, 8193, 16384] {
+            assert!(!selected(
+                "gfx1151",
+                true,
+                false,
+                [1280, 2560, 10, rows, 512]
+            ));
+        }
+        for rows in [7168, 8191, 8192] {
+            let shape = [1280, 2560, 10, rows, 512];
+            assert!(selected("gfx1151", true, false, shape));
+            for arch in ["gfx1100", "gfx1150", "gfx1201", "gfx942", "unknown"] {
+                assert!(!selected(arch, true, false, shape));
+            }
+            assert!(!selected("gfx1151", false, false, shape));
+            assert!(!selected("gfx1151", true, true, shape));
+            for (i, value) in [(0, 640), (1, 1280), (2, 8), (4, 128)] {
+                let mut other = shape;
+                other[i] = value;
+                assert!(!selected("gfx1151", true, false, other));
+            }
         }
     }
 }

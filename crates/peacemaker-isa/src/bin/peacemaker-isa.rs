@@ -263,6 +263,13 @@ fn iu4_v2b_a4(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
 /// `down_nt4rR` one expert-run down entry with R contiguous 64-row blocks per CTA.
 fn qwen4_moe_sym(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::qwen4_moe_sym::{self, Spec};
+    if epi == "gate_up_stream8" {
+        let e = qwen4_moe_sym::emit_gate_up_stream8(arch)?;
+        return Ok((
+            e.s_text,
+            serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+        ));
+    }
     if epi == "all" {
         let (_, text, proof) = qwen4_moe_sym::emit_module(arch)?;
         return Ok((

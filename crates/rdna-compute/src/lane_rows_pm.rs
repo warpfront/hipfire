@@ -28,8 +28,10 @@
 //! The launchers are routed from the four incumbent rows launchers
 //! (`gemm_mq6g256v2_f32_rows`, `gemm_mq6g256v2_f32_rows_x4`,
 //! `gemv_q8_0_k8_rows`, `gemv_q8_0_staged_rows` at K = 320) when
-//! [`Gpu::lane_rows_pm_enabled`] holds; they themselves do not consult the
-//! flag (the byte oracle `lane_rows_pm_oracle` calls them directly).
+//! [`Gpu::lane_rows_pm_enabled`] holds. Only the two MQ6 launchers also
+//! admit native singleton Qwen4 rows 2..=8, including recorded/captured
+//! launches with explicit effect/ABI contracts; Q8 remains lane-only.
+//! Direct PM launchers do not consult the flag (the byte oracle calls them).
 //!
 //! Fixed-eight-row tile exports accept total logical rows in
 //! `1..=hipfire_config::QWEN4_VERIFY_MAX_ROWS`, including partial final tiles.
@@ -226,6 +228,22 @@ fn refuse(name: &str, detail: &str) -> HipError {
     HipError::new(1, &format!("{name}: {detail}"))
 }
 
+fn native_mq6_scope_admits(
+    enabled: bool,
+    gfx1151: bool,
+    qwen4_scope: bool,
+    lane_rows_scope: bool,
+    canonical_prefill: bool,
+    rows: usize,
+) -> bool {
+    enabled
+        && gfx1151
+        && qwen4_scope
+        && !lane_rows_scope
+        && !canonical_prefill
+        && (2..=LANE_ROWS_PM_MAX).contains(&rows)
+}
+
 impl Gpu {
     /// Whether the incumbent rows launchers route to the lane-rows PM kernels:
     /// the `fn_lane_pm_rows` flag (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151 default on) on
@@ -237,6 +255,20 @@ impl Gpu {
             && self.lane_rows_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
+    }
+
+    /// Native Qwen4 MQ6 only: the narrow exports have explicit pointer/effect
+    /// and padded-blob contracts for graph capture and retained replay. Keep
+    /// the eager lane predicate above (including every Q8 route) unchanged.
+    pub(crate) fn mq6_native_rows_pm_enabled(&self, rows: usize) -> bool {
+        native_mq6_scope_admits(
+            self.flags.fn_lane_pm_rows_enabled(),
+            self.arch_caps.is_gfx1151(),
+            self.qwen4_scope,
+            self.lane_rows_scope,
+            self.route_rows(rows) != rows,
+            rows,
+        )
     }
 
     /// Verify the pinned `qwen4_lane_rows_pm` image and load `symbol` (narrow
@@ -292,7 +324,9 @@ impl Gpu {
         if !mq6_admits(m, k, batch) {
             return Err(refuse(
                 NAME,
-                &format!("batch {batch} in 1..=8, m {m} > 0, k {k} % 256 == 0 and 32-bit byte offsets required"),
+                &format!(
+                    "batch {batch} in 1..=8, m {m} > 0, k {k} % 256 == 0 and 32-bit byte offsets required"
+                ),
             ));
         }
         need(NAME, "weight", a_raw, m * (k / 256) * MQ6_GROUP_BYTES)?;
@@ -361,7 +395,9 @@ impl Gpu {
         if !mq6_x4_admits(ms, k, batch) {
             return Err(refuse(
                 NAME,
-                &format!("batch {batch} in 1..=8, heights {ms:?} (not all 0), k {k} % 256 == 0 and 32-bit byte offsets required"),
+                &format!(
+                    "batch {batch} in 1..=8, heights {ms:?} (not all 0), k {k} % 256 == 0 and 32-bit byte offsets required"
+                ),
             ));
         }
         need(NAME, "x", x, batch * k * 4)?;
@@ -451,7 +487,9 @@ impl Gpu {
         if !q8_k8_admits(m, k, batch) {
             return Err(refuse(
                 NAME,
-                &format!("batch {batch} in 1..=8, m {m} > 0, k {k} % 2048 == 0 and 32-bit byte offsets required"),
+                &format!(
+                    "batch {batch} in 1..=8, m {m} > 0, k {k} % 2048 == 0 and 32-bit byte offsets required"
+                ),
             ));
         }
         need(NAME, "weight", weight, m * (k / 32) * Q8_BLOCK_BYTES)?;
@@ -581,6 +619,35 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_mq6_scope_is_narrow_and_preserves_other_routes() {
+        for rows in 2..=8 {
+            assert!(native_mq6_scope_admits(
+                true, true, true, false, false, rows
+            ));
+            assert!(!native_mq6_scope_admits(
+                false, true, true, false, false, rows
+            ));
+            assert!(!native_mq6_scope_admits(
+                true, false, true, false, false, rows
+            ));
+            assert!(!native_mq6_scope_admits(
+                true, true, false, false, false, rows
+            ));
+            assert!(!native_mq6_scope_admits(
+                true, true, true, true, false, rows
+            ));
+            assert!(!native_mq6_scope_admits(
+                true, true, true, false, true, rows
+            ));
+        }
+        for rows in [0, 1, 9, 16, 32, 512, 8192] {
+            assert!(!native_mq6_scope_admits(
+                true, true, true, false, false, rows
+            ));
+        }
+    }
 
     #[test]
     fn embedded_image_matches_its_pinned_digest() {

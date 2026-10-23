@@ -3446,8 +3446,8 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // Keep the sealed inventory unchanged; beta later added the
-                // HC-write widening to the shared source on every arch.
+                // Keep the sealed inventory unchanged. The later HC x8
+                // export is gfx1201-only and does not alter gfx11 exports.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3455,7 +3455,6 @@ mod tests {
                     sealed
                         .iter()
                         .copied()
-                        .chain(["hyper_write_bf16x8_gfx1201"])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
             }

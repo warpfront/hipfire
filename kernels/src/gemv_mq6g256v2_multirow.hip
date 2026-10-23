@@ -328,6 +328,7 @@ extern "C" __global__ void gemv_mq6g256v2_multirow_r2(
     #define LOAD_LM_PACKED(gp, weight_offset) \
         HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
 
+    // Keep payload temporaries distinct from the caller's b0..b3 float accumulators.
     #define DOG_X8(gp, weight_offset, a, pfx) do { \
         const unsigned int hA = LOAD_LM_HEADER(gp, weight_offset); \
         const unsigned int hB = LOAD_LM_HEADER((gp) + 4, (weight_offset) + 4); \
@@ -335,9 +336,9 @@ extern "C" __global__ void gemv_mq6g256v2_multirow_r2(
         float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
         const unsigned char* d = (const unsigned char*)((gp) + 8 + boff); \
-        unsigned char b0=d[0], b1=d[1], b2=d[2], b3=d[3], b4=d[4], b5=d[5]; \
-        int q0=b0 &63; int q1=(b0>>6)|((b1&0xF)<<2); int q2=(b1>>4)|((b2&3)<<4); int q3=b2>>2; \
-        int q4=b3 &63; int q5=(b3>>6)|((b4&0xF)<<2); int q6=(b4>>4)|((b5&3)<<4); int q7=b5>>2; \
+        unsigned char packed_b0=d[0], packed_b1=d[1], packed_b2=d[2], packed_b3=d[3], packed_b4=d[4], packed_b5=d[5]; \
+        int q0=packed_b0 &63; int q1=(packed_b0>>6)|((packed_b1&0xF)<<2); int q2=(packed_b1>>4)|((packed_b2&3)<<4); int q3=packed_b2>>2; \
+        int q4=packed_b3 &63; int q5=(packed_b3>>6)|((packed_b4&0xF)<<2); int q6=(packed_b4>>4)|((packed_b5&3)<<4); int q7=packed_b5>>2; \
         (a) += (sc*(float)q0+zp)*pfx##0 + (sc*(float)q1+zp)*pfx##1 + (sc*(float)q2+zp)*pfx##2 + (sc*(float)q3+zp)*pfx##3 \
              + (sc*(float)q4+zp)*pfx##4 + (sc*(float)q5+zp)*pfx##5 + (sc*(float)q6+zp)*pfx##6 + (sc*(float)q7+zp)*pfx##7; \
     } while (0)
@@ -382,9 +383,9 @@ extern "C" __global__ void gemv_mq6g256v2_multirow_r2(
         float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
         const unsigned char* d = (const unsigned char*)((gp) + 8 + boff); \
-        unsigned char b0=d[0], b1=d[1], b2=d[2], b3=d[3], b4=d[4], b5=d[5]; \
-        int q0=b0 &63; int q1=(b0>>6)|((b1&0xF)<<2); int q2=(b1>>4)|((b2&3)<<4); int q3=b2>>2; \
-        int q4=b3 &63; int q5=(b3>>6)|((b4&0xF)<<2); int q6=(b4>>4)|((b5&3)<<4); int q7=b5>>2; \
+        unsigned char packed_b0=d[0], packed_b1=d[1], packed_b2=d[2], packed_b3=d[3], packed_b4=d[4], packed_b5=d[5]; \
+        int q0=packed_b0 &63; int q1=(packed_b0>>6)|((packed_b1&0xF)<<2); int q2=(packed_b1>>4)|((packed_b2&3)<<4); int q3=packed_b2>>2; \
+        int q4=packed_b3 &63; int q5=(packed_b3>>6)|((packed_b4&0xF)<<2); int q6=(packed_b4>>4)|((packed_b5&3)<<4); int q7=packed_b5>>2; \
         (a) += (sc*(float)q0+zp)*x0 + (sc*(float)q1+zp)*x1 + (sc*(float)q2+zp)*x2 + (sc*(float)q3+zp)*x3 \
              + (sc*(float)q4+zp)*x4 + (sc*(float)q5+zp)*x5 + (sc*(float)q6+zp)*x6 + (sc*(float)q7+zp)*x7; \
     } while (0)

@@ -2543,6 +2543,49 @@ pub const GEMV_MQ3G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq3
 pub const GEMV_MQ2G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256v2.hip");
 /// MQ6G256V2: dual-scale 6-bit (qt=47).
 pub const GEMV_MQ6G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256v2.hip");
+/// gfx1151 K2560 scalar MQ6: fold the group/tail control at compile time.
+/// The non-unrolled body keeps 76 VGPR; the measured vocabulary-sized head
+/// uses two explicit quad iterations (95 VGPR). Arithmetic/32-byte ABI match
+/// the generic entry; selection is limited by `gemv_mq6g256v2_specialized`.
+pub const GEMV_MQ6G256V2_K2560_SRC: &str = concat!(
+    "#define MQ6_GEMV_COMPILE_K2560 1\n",
+    "#define MQ6_GEMV_ENTRY gemv_mq6g256v2_k2560\n",
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
+pub const GEMV_MQ6G256V2_K2560_U2_SRC: &str = concat!(
+    "#define MQ6_GEMV_COMPILE_K2560 1\n",
+    "#define MQ6_GEMV_COMPILE_K2560_UNROLL2 1\n",
+    "#define MQ6_GEMV_ENTRY gemv_mq6g256v2_k2560_u2\n",
+    include_str!("../../../kernels/src/gemv_mq6g256v2.hip")
+);
+
+/// `(source, module stem, symbol)` for measured scalar MQ6 shapes.
+/// Only owning HIP allocations carry the residency proof used by this
+/// selector; host-mapped weights and borrowed/VMM views retain generic K.
+pub fn gemv_mq6g256v2_specialized(
+    arch: &str,
+    hip_allocation: bool,
+    m: usize,
+    k: usize,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if arch != "gfx1151" || !hip_allocation || k != 2560 {
+        return None;
+    }
+    match m {
+        1..=10240 => Some((
+            GEMV_MQ6G256V2_K2560_SRC,
+            "gemv_mq6g256v2_k2560",
+            "gemv_mq6g256v2_k2560",
+        )),
+        248320 => Some((
+            GEMV_MQ6G256V2_K2560_U2_SRC,
+            "gemv_mq6g256v2_k2560_u2",
+            "gemv_mq6g256v2_k2560_u2",
+        )),
+        _ => None,
+    }
+}
+
 /// `gemv_mq6g256v2.hip` as #774 left it (shared row helper): Qwen4's
 /// `gemv_mq6g256v2_x4` loads from module `qwen4_gemv_mq6g256v2`, and the
 /// x-batch and draft-head re-score sources below build on it.
@@ -3037,6 +3080,15 @@ pub const GEMM_MQ4G128V2_MULTIROW_GFX1151_SRC: &str =
 /// sole route-weight application.
 pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip");
+
+/// Exact K640/top-10 QT53 indexed down: the original 48-byte ABI, wave32
+/// reduction, flat output and asymmetric scale/zero arithmetic. The generic
+/// entry additionally accepts runtime `k_top` (52 explicit bytes).
+pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_K640_SRC: &str = concat!(
+    "#define QT53_DOWN_ENTRY gemv_mq4g128v2_moe_down_top10_k640\n",
+    "#define QT53_DOWN_K640 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip")
+);
 
 /// Portable F32 parity consumer for qt53 grouped down.  It preserves the
 /// indexed decode kernel's 32-lane reduction association while reusing one
@@ -4315,6 +4367,11 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
+/// Separate measured gfx1151 streamed NT8 gate/up, 64-byte ABI, 208 VGPR.
+/// No incumbent module bytes move. Source: emit --kernel qwen4_moe_sym
+/// --epi gate_up_stream8 --arch gfx1151; adjacent ISA contract pins resources.
+pub const QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_gate_up_stream8_pm_gfx1151.hxaco");
 /// Certified builder module of the MQ3-I4 (`WeightCodec::Mq3I4`, planar qt131/qt132
 /// experts) NT1 entries of the same grouped symmetric IU4 MoE GEMMs, gfx1201
 /// (`peacemaker-isa emit --kernel qwen4_moe_sym_w3 --epi all --arch gfx1201`, one
@@ -11957,3 +12014,26 @@ pub const GELU_NEW_MUL_F32_SRC: &str = include_str!("../../../kernels/src/gelu_n
 
 /// OpenAI CLIP quick-GELU: `out = x * sigmoid(1.702 x)`.
 pub const QUICK_GELU_F32_SRC: &str = include_str!("../../../kernels/src/quick_gelu_f32.hip");
+
+#[cfg(test)]
+mod mq6_scalar_specialization_tests {
+    use super::gemv_mq6g256v2_specialized as select;
+    #[test]
+    fn only_measured_arch_residency_and_k_select_specialized_entries() {
+        for m in [1, 33, 512, 2560, 2571, 10240, 248320] {
+            let (_, module, symbol) = select("gfx1151", true, m, 2560).unwrap();
+            assert_eq!(module, symbol);
+            assert_eq!(symbol.ends_with("_u2"), m == 248320);
+            assert!(select("gfx1151", false, m, 2560).is_none());
+            for arch in ["gfx1100", "gfx1150", "gfx1201", "gfx942"] {
+                assert!(select(arch, true, m, 2560).is_none());
+            }
+            for k in [0, 640, 2048, 2561, 5120] {
+                assert!(select("gfx1151", true, m, k).is_none());
+            }
+        }
+        for m in [0, 10241, 32768, 248319, 248321] {
+            assert!(select("gfx1151", true, m, 2560).is_none());
+        }
+    }
+}

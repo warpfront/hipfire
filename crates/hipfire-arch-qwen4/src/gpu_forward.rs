@@ -8661,6 +8661,15 @@ impl Qwen4GpuForward {
         check_band_admission(bundle, &scope, single_scope)?;
         let mesh_trunk_ops = mesh_trunk_op_range(&bundle.config, &scope)?;
         let flash_next = bundle.config.profile.is_flash_next();
+        // gfx1151 has no walked closed route: its ordinary loader remains
+        // lazy. Bind both native few-row MQ6 exports before any capture or
+        // retained body can start, using the same pinned image as dispatch.
+        // This does not admit Q8, lane capture, or a partial closed route.
+        if single_scope && gpu.arch_caps.is_gfx1151() && gpu.flags.fn_lane_pm_rows_enabled() {
+            for symbol in ["gemv_mq6g256v2_xbatch_pm", "gemv_mq6g256v2_x4_xbatch_pm"] {
+                gpu.ensure_lane_rows_pm_entry(symbol)?;
+            }
+        }
         let (scratch, host_token_bytes, host_ple_bytes) =
             Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
         let mut moe: Vec<Option<Qwen4MoeLayerRuntime>> =

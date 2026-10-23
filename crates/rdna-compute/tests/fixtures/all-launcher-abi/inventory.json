@@ -339,6 +339,7 @@
     "crates/rdna-compute/src/slab_moe.rs::slab_arch_kernels": "per-arch slab table lookup returning &'static SlabArchKernels (module, image and symbol names, plan source); names only, the launchers mq_i4_moe_gemv_slab, qwen4_moe_rotate128_i4_slab and the planner are checked sites",
     "crates/rdna-compute/src/slab_moe.rs::slab_cold_k1_metadata": "cold K1 table lookup by (arch, cold codec) returning &'static SlabCold (module, image and symbol names); names only, mq_i4_moe_gemv_slab launches through it and is a checked site",
     "crates/rdna-compute/src/gemm.rs::slab_k2_raw": "ungated K2 inventory selector keyed by (arch, slab codec) returning (module name, [gate/up, down] symbol names) from slab_k2_metadata and the QWEN4_MOE_SYM_PM_*/QWEN4_MOE_SYM_W3_* name constants; names only, it has no launch, ensure or compile call and its only caller is expert_capabilities::k2_raw, which builds a RawKernel name pair for the admission matrix",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gate_up_symbol": "pure gate/up name selector over the canonical descriptor pair and the gfx1151 stream8 allowlist; contains no launch, ensure or compile call. The returned name is consumed by qwen4_moe_sym_gemm, whose real params/blob launch sites remain checked",
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols_wide": "reporting-only twin of qwen4_moe_sym_gemm_symbols: returns the canonical native pair except the F2 widened resident NT8 gate/up entry; names only, never launches (launchers call qwen4_moe_sym_gemm)",
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols": "reporting-only twin target of qwen4_moe_sym_gemm_symbols_wide: returns the canonical native pair over the descriptor entries; names only, never launches (launchers call qwen4_moe_sym_gemm)"
   },
@@ -378,6 +379,7 @@
     }
   },
   "unlaunched": {
+    "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse": "generic-K inverse arithmetic sibling exported by the shared HIP module; no production launcher or example calls it (only its source declaration and registry export inventory mention it). The measured production route uses inverse_k2560 through gemm_mq4g256v2_moe_grouped_top10_inverse, whose actual params/blob ABI is checked",
     "HIPFIRE_MOE_PROJECTION_KERNEL": "the raw source declares its entry through a macro that only the Rust-side #define prefixes of the _SRC constants give a name; those constants' real symbols are checked through their const origins",
     "gemm_fp8b128_moe_grouped_fp8mfma": "HIP twin of the PM emitter kernel; the emitter ABI is cross-checked against it in pm_emitters_agree_with_image_metadata and no production launcher exists",
     "gemm_mq4g256v2_moe_grouped_top10_o2_r8": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it",

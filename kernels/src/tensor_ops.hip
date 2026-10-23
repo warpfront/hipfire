@@ -1943,6 +1943,7 @@ extern "C" __global__ void hyper_write_bf16x2(
 // [256, 1, 1], LDS 0.  The host launcher fails closed unless the stream/mixed
 // pointers are 16-byte aligned for the uint4/float4 transactions; unaligned
 // subviews stay on the x2 production path.
+#if defined(__GFX12__)
 extern "C" __global__ void hyper_write_bf16x8_gfx1201(
     const unsigned int* input,
     const float* mixed,
@@ -1981,6 +1982,7 @@ extern "C" __global__ void hyper_write_bf16x8_gfx1201(
     *(uint4*)(output + ((row * wide + column) >> 1)) =
         make_uint4(out[0], out[1], out[2], out[3]);
 }
+#endif
 
 // `normalized16`, when non-null, also receives each normalized value rounded
 // to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and

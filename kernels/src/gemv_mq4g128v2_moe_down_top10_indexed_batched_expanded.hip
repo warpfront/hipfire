@@ -11,18 +11,31 @@
 //
 // Wire rows use exactly 68*ceil(K/128) bytes.  This is deliberately not the
 // legacy 72-byte HFQ4G128/Paro row stride.
+// The exact K640 module uses this same arithmetic with a constant trip
+// count. The generic entry remains the independent dynamic-K launch oracle.
+#ifndef QT53_DOWN_ENTRY
+#define QT53_DOWN_ENTRY gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded
+#endif
 __launch_bounds__(32, 8)
-extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
+extern "C" __global__ void QT53_DOWN_ENTRY(
     const unsigned long long* __restrict__ expert_ptrs,
     const int* __restrict__ topk_indices,
     const float* __restrict__ rot_batch,
     float* __restrict__ expert_outputs,
     int M,
-    int K,
+    int K_arg,
     int N,
-    int n_exp,
-    int k_top
+    int n_exp
+#ifndef QT53_DOWN_K640
+    , int k_top
+#endif
 ) {
+#ifdef QT53_DOWN_K640
+    constexpr int K = 640;
+    constexpr int k_top = 10;
+#else
+    const int K = K_arg;
+#endif
     const int row = blockIdx.x;
     const int rank = blockIdx.y;
     const int token = blockIdx.z;
@@ -152,6 +165,7 @@ static __device__ __forceinline__ void mq4g128v2_down_k640_rows(
     }
 }
 
+#ifndef QT53_DOWN_K640
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4(
     const unsigned long long* __restrict__ expert_ptrs, const int* __restrict__ topk_indices,
@@ -159,3 +173,4 @@ extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expande
     int k_top) {
     mq4g128v2_down_k640_rows<4>(expert_ptrs, topk_indices, rot_batch, expert_outputs, M, K, N, n_exp, k_top);
 }
+#endif

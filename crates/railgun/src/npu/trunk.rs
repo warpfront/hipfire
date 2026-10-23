@@ -955,10 +955,15 @@ impl NpuTrunkRuntime {
             if !state.retired || (!state.prepared && !self.api.query(b.retired.raw())?) {
                 return Err("bank consumer not retired".into());
             }
-            self.wait_host(Seq {
-                bank,
-                value: state.generation,
-            })?;
+            // prepare_bank already waited for this generation before queuing
+            // retirement and the next producer. A kick without prepare still
+            // needs the host completion check before reusing the bank.
+            if !state.prepared {
+                self.wait_host(Seq {
+                    bank,
+                    value: state.generation,
+                })?;
+            }
         }
         // signed-difference GEQ implementations must never see generation wrap.
         if state.generation == i32::MAX as u32 {

@@ -115,6 +115,7 @@ PEACEMAKER_KERNELS = [
     "qsa_gather_pm_gfx1151",
     "qsa_gather_pm_gfx1201",
     "qwen4_moe_iu4_sym_pm_gfx1151",
+    "qwen4_moe_gate_up_stream8_pm_gfx1151",
     "qwen4_moe_iu4_sym_pm_gfx1201",
     "qwen4_moe_iu4_sym_w3_pm_gfx1201",
     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control",
