@@ -2451,6 +2451,7 @@ fn run_case(
         "twin_selfcheck": {"slots_checked_gate": gate.expected.twin_slots_checked,
             "slots_checked_down": down.expected.twin_slots_checked,
             "mismatch_count": gate.twin_mismatches + down.twin_mismatches},
+        "pass": gate.mismatches + down.mismatches + gate.twin_mismatches + down.twin_mismatches == 0,
     });
     if ctx.old_parity && case.old_parity && case.tight() {
         if ctx.gpu.is_none() {
