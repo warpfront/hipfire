@@ -1,0 +1,2497 @@
+{
+  "schema_version": 1,
+  "guard_kind": "sampled_not_hard_limit",
+  "limitations": "Device-wide sampling can miss short spikes or overshoot; not a hard allocation cap. Escaped process groups are not contained. Unrelated GPU users are never signalled.",
+  "pci_bdf": "0000:9e:00.0",
+  "command": [
+    "target/release/examples/tiered_kv_storage_oracle",
+    "--history-tokens",
+    "262144",
+    "--window-tokens",
+    "32768",
+    "--resident-reserve-bytes",
+    "19327352832",
+    "--out",
+    "results/tiered-kv/storage-256k.json"
+  ],
+  "limit_bytes": 25769803776,
+  "safety_margin_bytes": 536870912,
+  "guard_limit_bytes": 25232932864,
+  "sample_interval_seconds": 0.05,
+  "baseline_bytes": 72835072,
+  "peak_bytes": 21155815424,
+  "peak_delta_bytes": 21082980352,
+  "samples": [
+    {
+      "elapsed_seconds": 0.0008624029578641057,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.0013768139760941267,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.051538554020226,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.10171152593102306,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.1518678949214518,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.2020509960129857,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.2522450889227912,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.3024285699939355,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.35263994592241943,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.40282860794104636,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.4530104160076007,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.5031654029153287,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.5533088879892603,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.6034708080114797,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.653664689976722,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.703809215920046,
+      "vram_used_bytes": 72847360,
+      "raw": "72847360\n"
+    },
+    {
+      "elapsed_seconds": 0.7539870570180938,
+      "vram_used_bytes": 72896512,
+      "raw": "72896512\n"
+    },
+    {
+      "elapsed_seconds": 0.804174956982024,
+      "vram_used_bytes": 19400249344,
+      "raw": "19400249344\n"
+    },
+    {
+      "elapsed_seconds": 0.8543553329072893,
+      "vram_used_bytes": 19400249344,
+      "raw": "19400249344\n"
+    },
+    {
+      "elapsed_seconds": 0.9045338549185544,
+      "vram_used_bytes": 19400249344,
+      "raw": "19400249344\n"
+    },
+    {
+      "elapsed_seconds": 0.9547126379329711,
+      "vram_used_bytes": 19400249344,
+      "raw": "19400249344\n"
+    },
+    {
+      "elapsed_seconds": 1.004892201977782,
+      "vram_used_bytes": 19639390208,
+      "raw": "19639390208\n"
+    },
+    {
+      "elapsed_seconds": 1.0551169029204175,
+      "vram_used_bytes": 21122166784,
+      "raw": "21122166784\n"
+    },
+    {
+      "elapsed_seconds": 1.105296276975423,
+      "vram_used_bytes": 21122277376,
+      "raw": "21122277376\n"
+    },
+    {
+      "elapsed_seconds": 1.1554756310069934,
+      "vram_used_bytes": 21122375680,
+      "raw": "21122375680\n"
+    },
+    {
+      "elapsed_seconds": 1.2056552049471065,
+      "vram_used_bytes": 21122473984,
+      "raw": "21122473984\n"
+    },
+    {
+      "elapsed_seconds": 1.255842212936841,
+      "vram_used_bytes": 21122584576,
+      "raw": "21122584576\n"
+    },
+    {
+      "elapsed_seconds": 1.3060218369355425,
+      "vram_used_bytes": 21122682880,
+      "raw": "21122682880\n"
+    },
+    {
+      "elapsed_seconds": 1.3562113209627569,
+      "vram_used_bytes": 21122793472,
+      "raw": "21122793472\n"
+    },
+    {
+      "elapsed_seconds": 1.40639104496222,
+      "vram_used_bytes": 21122904064,
+      "raw": "21122904064\n"
+    },
+    {
+      "elapsed_seconds": 1.456569566973485,
+      "vram_used_bytes": 21123002368,
+      "raw": "21123002368\n"
+    },
+    {
+      "elapsed_seconds": 1.5067492709495127,
+      "vram_used_bytes": 21123112960,
+      "raw": "21123112960\n"
+    },
+    {
+      "elapsed_seconds": 1.556928734993562,
+      "vram_used_bytes": 21123211264,
+      "raw": "21123211264\n"
+    },
+    {
+      "elapsed_seconds": 1.6070964959217235,
+      "vram_used_bytes": 21123321856,
+      "raw": "21123321856\n"
+    },
+    {
+      "elapsed_seconds": 1.6572731039486825,
+      "vram_used_bytes": 21123432448,
+      "raw": "21123432448\n"
+    },
+    {
+      "elapsed_seconds": 1.707460833946243,
+      "vram_used_bytes": 21123547136,
+      "raw": "21123547136\n"
+    },
+    {
+      "elapsed_seconds": 1.757644786965102,
+      "vram_used_bytes": 21123645440,
+      "raw": "21123645440\n"
+    },
+    {
+      "elapsed_seconds": 1.80782518198248,
+      "vram_used_bytes": 21123756032,
+      "raw": "21123756032\n"
+    },
+    {
+      "elapsed_seconds": 1.8584574989508837,
+      "vram_used_bytes": 21123866624,
+      "raw": "21123866624\n"
+    },
+    {
+      "elapsed_seconds": 1.908636381966062,
+      "vram_used_bytes": 21123964928,
+      "raw": "21123964928\n"
+    },
+    {
+      "elapsed_seconds": 1.9588156850077212,
+      "vram_used_bytes": 21124063232,
+      "raw": "21124063232\n"
+    },
+    {
+      "elapsed_seconds": 2.008997143013403,
+      "vram_used_bytes": 21124161536,
+      "raw": "21124161536\n"
+    },
+    {
+      "elapsed_seconds": 2.0591766969300807,
+      "vram_used_bytes": 21124272128,
+      "raw": "21124272128\n"
+    },
+    {
+      "elapsed_seconds": 2.1093556289561093,
+      "vram_used_bytes": 21124370432,
+      "raw": "21124370432\n"
+    },
+    {
+      "elapsed_seconds": 2.159534191014245,
+      "vram_used_bytes": 21124468736,
+      "raw": "21124468736\n"
+    },
+    {
+      "elapsed_seconds": 2.2097147669410333,
+      "vram_used_bytes": 21124567040,
+      "raw": "21124567040\n"
+    },
+    {
+      "elapsed_seconds": 2.259894620976411,
+      "vram_used_bytes": 21124665344,
+      "raw": "21124665344\n"
+    },
+    {
+      "elapsed_seconds": 2.3100473629310727,
+      "vram_used_bytes": 21124763648,
+      "raw": "21124763648\n"
+    },
+    {
+      "elapsed_seconds": 2.3602427279111,
+      "vram_used_bytes": 21124874240,
+      "raw": "21124874240\n"
+    },
+    {
+      "elapsed_seconds": 2.4104309579124674,
+      "vram_used_bytes": 21124984832,
+      "raw": "21124984832\n"
+    },
+    {
+      "elapsed_seconds": 2.4606101909885183,
+      "vram_used_bytes": 21125083136,
+      "raw": "21125083136\n"
+    },
+    {
+      "elapsed_seconds": 2.5107888230122626,
+      "vram_used_bytes": 21125193728,
+      "raw": "21125193728\n"
+    },
+    {
+      "elapsed_seconds": 2.560967825935222,
+      "vram_used_bytes": 21125292032,
+      "raw": "21125292032\n"
+    },
+    {
+      "elapsed_seconds": 2.611147830961272,
+      "vram_used_bytes": 21125402624,
+      "raw": "21125402624\n"
+    },
+    {
+      "elapsed_seconds": 2.6613263830076903,
+      "vram_used_bytes": 21125500928,
+      "raw": "21125500928\n"
+    },
+    {
+      "elapsed_seconds": 2.7115056859329343,
+      "vram_used_bytes": 21125615616,
+      "raw": "21125615616\n"
+    },
+    {
+      "elapsed_seconds": 2.761685189907439,
+      "vram_used_bytes": 21125713920,
+      "raw": "21125713920\n"
+    },
+    {
+      "elapsed_seconds": 2.8118648839881644,
+      "vram_used_bytes": 21125812224,
+      "raw": "21125812224\n"
+    },
+    {
+      "elapsed_seconds": 2.8620438559446484,
+      "vram_used_bytes": 21125922816,
+      "raw": "21125922816\n"
+    },
+    {
+      "elapsed_seconds": 2.9122622149297968,
+      "vram_used_bytes": 21126021120,
+      "raw": "21126021120\n"
+    },
+    {
+      "elapsed_seconds": 2.9624411069089547,
+      "vram_used_bytes": 21126119424,
+      "raw": "21126119424\n"
+    },
+    {
+      "elapsed_seconds": 3.0126194789772853,
+      "vram_used_bytes": 21126230016,
+      "raw": "21126230016\n"
+    },
+    {
+      "elapsed_seconds": 3.062807428999804,
+      "vram_used_bytes": 21126328320,
+      "raw": "21126328320\n"
+    },
+    {
+      "elapsed_seconds": 3.1129870829172432,
+      "vram_used_bytes": 21126438912,
+      "raw": "21126438912\n"
+    },
+    {
+      "elapsed_seconds": 3.1631660759449005,
+      "vram_used_bytes": 21126537216,
+      "raw": "21126537216\n"
+    },
+    {
+      "elapsed_seconds": 3.2133444969076663,
+      "vram_used_bytes": 21126647808,
+      "raw": "21126647808\n"
+    },
+    {
+      "elapsed_seconds": 3.263522817986086,
+      "vram_used_bytes": 21126758400,
+      "raw": "21126758400\n"
+    },
+    {
+      "elapsed_seconds": 3.313703062944114,
+      "vram_used_bytes": 21126856704,
+      "raw": "21126856704\n"
+    },
+    {
+      "elapsed_seconds": 3.363883427926339,
+      "vram_used_bytes": 21126967296,
+      "raw": "21126967296\n"
+    },
+    {
+      "elapsed_seconds": 3.4140873790020123,
+      "vram_used_bytes": 21127077888,
+      "raw": "21127077888\n"
+    },
+    {
+      "elapsed_seconds": 3.464267553994432,
+      "vram_used_bytes": 21127176192,
+      "raw": "21127176192\n"
+    },
+    {
+      "elapsed_seconds": 3.514447398018092,
+      "vram_used_bytes": 21127286784,
+      "raw": "21127286784\n"
+    },
+    {
+      "elapsed_seconds": 3.564635798917152,
+      "vram_used_bytes": 21127397376,
+      "raw": "21127397376\n"
+    },
+    {
+      "elapsed_seconds": 3.614814981003292,
+      "vram_used_bytes": 21127507968,
+      "raw": "21127507968\n"
+    },
+    {
+      "elapsed_seconds": 3.6649948159465566,
+      "vram_used_bytes": 21127618560,
+      "raw": "21127618560\n"
+    },
+    {
+      "elapsed_seconds": 3.7151805809699,
+      "vram_used_bytes": 21127733248,
+      "raw": "21127733248\n"
+    },
+    {
+      "elapsed_seconds": 3.7653599239420146,
+      "vram_used_bytes": 21127843840,
+      "raw": "21127843840\n"
+    },
+    {
+      "elapsed_seconds": 3.815543645992875,
+      "vram_used_bytes": 21127954432,
+      "raw": "21127954432\n"
+    },
+    {
+      "elapsed_seconds": 3.8657233900157735,
+      "vram_used_bytes": 21128065024,
+      "raw": "21128065024\n"
+    },
+    {
+      "elapsed_seconds": 3.9159029339207336,
+      "vram_used_bytes": 21128175616,
+      "raw": "21128175616\n"
+    },
+    {
+      "elapsed_seconds": 3.966083850013092,
+      "vram_used_bytes": 21128286208,
+      "raw": "21128286208\n"
+    },
+    {
+      "elapsed_seconds": 4.016260246979073,
+      "vram_used_bytes": 21128396800,
+      "raw": "21128396800\n"
+    },
+    {
+      "elapsed_seconds": 4.066412467975169,
+      "vram_used_bytes": 21128507392,
+      "raw": "21128507392\n"
+    },
+    {
+      "elapsed_seconds": 4.116589456913061,
+      "vram_used_bytes": 21128617984,
+      "raw": "21128617984\n"
+    },
+    {
+      "elapsed_seconds": 4.166768249007873,
+      "vram_used_bytes": 21128728576,
+      "raw": "21128728576\n"
+    },
+    {
+      "elapsed_seconds": 4.216948743909597,
+      "vram_used_bytes": 21128839168,
+      "raw": "21128839168\n"
+    },
+    {
+      "elapsed_seconds": 4.267148757004179,
+      "vram_used_bytes": 21128949760,
+      "raw": "21128949760\n"
+    },
+    {
+      "elapsed_seconds": 4.317327277967706,
+      "vram_used_bytes": 21129060352,
+      "raw": "21129060352\n"
+    },
+    {
+      "elapsed_seconds": 4.367506751907058,
+      "vram_used_bytes": 21129170944,
+      "raw": "21129170944\n"
+    },
+    {
+      "elapsed_seconds": 4.417685623979196,
+      "vram_used_bytes": 21129293824,
+      "raw": "21129293824\n"
+    },
+    {
+      "elapsed_seconds": 4.467864766018465,
+      "vram_used_bytes": 21129392128,
+      "raw": "21129392128\n"
+    },
+    {
+      "elapsed_seconds": 4.518043156946078,
+      "vram_used_bytes": 21129515008,
+      "raw": "21129515008\n"
+    },
+    {
+      "elapsed_seconds": 4.56824184791185,
+      "vram_used_bytes": 21129613312,
+      "raw": "21129613312\n"
+    },
+    {
+      "elapsed_seconds": 4.618431960931048,
+      "vram_used_bytes": 21129723904,
+      "raw": "21129723904\n"
+    },
+    {
+      "elapsed_seconds": 4.668619730975479,
+      "vram_used_bytes": 21129838592,
+      "raw": "21129838592\n"
+    },
+    {
+      "elapsed_seconds": 4.718799183960073,
+      "vram_used_bytes": 21129949184,
+      "raw": "21129949184\n"
+    },
+    {
+      "elapsed_seconds": 4.768978155916557,
+      "vram_used_bytes": 21130059776,
+      "raw": "21130059776\n"
+    },
+    {
+      "elapsed_seconds": 4.819157299003564,
+      "vram_used_bytes": 21130170368,
+      "raw": "21130170368\n"
+    },
+    {
+      "elapsed_seconds": 4.869336841977201,
+      "vram_used_bytes": 21130280960,
+      "raw": "21130280960\n"
+    },
+    {
+      "elapsed_seconds": 4.919525121920742,
+      "vram_used_bytes": 21130391552,
+      "raw": "21130391552\n"
+    },
+    {
+      "elapsed_seconds": 4.9697045559296384,
+      "vram_used_bytes": 21130502144,
+      "raw": "21130502144\n"
+    },
+    {
+      "elapsed_seconds": 5.019883617991582,
+      "vram_used_bytes": 21130612736,
+      "raw": "21130612736\n"
+    },
+    {
+      "elapsed_seconds": 5.070100492914207,
+      "vram_used_bytes": 21130723328,
+      "raw": "21130723328\n"
+    },
+    {
+      "elapsed_seconds": 5.120280036935583,
+      "vram_used_bytes": 21130833920,
+      "raw": "21130833920\n"
+    },
+    {
+      "elapsed_seconds": 5.170459339977242,
+      "vram_used_bytes": 21130944512,
+      "raw": "21130944512\n"
+    },
+    {
+      "elapsed_seconds": 5.220906167989597,
+      "vram_used_bytes": 21131055104,
+      "raw": "21131055104\n"
+    },
+    {
+      "elapsed_seconds": 5.271235078922473,
+      "vram_used_bytes": 21131165696,
+      "raw": "21131165696\n"
+    },
+    {
+      "elapsed_seconds": 5.321414992911741,
+      "vram_used_bytes": 21131276288,
+      "raw": "21131276288\n"
+    },
+    {
+      "elapsed_seconds": 5.371594336000271,
+      "vram_used_bytes": 21131386880,
+      "raw": "21131386880\n"
+    },
+    {
+      "elapsed_seconds": 5.421774539980106,
+      "vram_used_bytes": 21131497472,
+      "raw": "21131497472\n"
+    },
+    {
+      "elapsed_seconds": 5.471956057008356,
+      "vram_used_bytes": 21131595776,
+      "raw": "21131595776\n"
+    },
+    {
+      "elapsed_seconds": 5.522156009916216,
+      "vram_used_bytes": 21131706368,
+      "raw": "21131706368\n"
+    },
+    {
+      "elapsed_seconds": 5.572340362006798,
+      "vram_used_bytes": 21131816960,
+      "raw": "21131816960\n"
+    },
+    {
+      "elapsed_seconds": 5.622520286007784,
+      "vram_used_bytes": 21131931648,
+      "raw": "21131931648\n"
+    },
+    {
+      "elapsed_seconds": 5.6726994179189205,
+      "vram_used_bytes": 21132029952,
+      "raw": "21132029952\n"
+    },
+    {
+      "elapsed_seconds": 5.722878471016884,
+      "vram_used_bytes": 21132140544,
+      "raw": "21132140544\n"
+    },
+    {
+      "elapsed_seconds": 5.773080216953531,
+      "vram_used_bytes": 21132251136,
+      "raw": "21132251136\n"
+    },
+    {
+      "elapsed_seconds": 5.823352748993784,
+      "vram_used_bytes": 21132361728,
+      "raw": "21132361728\n"
+    },
+    {
+      "elapsed_seconds": 5.8735323519213125,
+      "vram_used_bytes": 21132472320,
+      "raw": "21132472320\n"
+    },
+    {
+      "elapsed_seconds": 5.923694050987251,
+      "vram_used_bytes": 21132570624,
+      "raw": "21132570624\n"
+    },
+    {
+      "elapsed_seconds": 5.973871028982103,
+      "vram_used_bytes": 21132681216,
+      "raw": "21132681216\n"
+    },
+    {
+      "elapsed_seconds": 6.024024622980505,
+      "vram_used_bytes": 21132791808,
+      "raw": "21132791808\n"
+    },
+    {
+      "elapsed_seconds": 6.074208523961715,
+      "vram_used_bytes": 21132902400,
+      "raw": "21132902400\n"
+    },
+    {
+      "elapsed_seconds": 6.124388167983852,
+      "vram_used_bytes": 21133000704,
+      "raw": "21133000704\n"
+    },
+    {
+      "elapsed_seconds": 6.174566739005968,
+      "vram_used_bytes": 21133111296,
+      "raw": "21133111296\n"
+    },
+    {
+      "elapsed_seconds": 6.224725140957162,
+      "vram_used_bytes": 21133221888,
+      "raw": "21133221888\n"
+    },
+    {
+      "elapsed_seconds": 6.274901988916099,
+      "vram_used_bytes": 21133320192,
+      "raw": "21133320192\n"
+    },
+    {
+      "elapsed_seconds": 6.325103654991835,
+      "vram_used_bytes": 21133430784,
+      "raw": "21133430784\n"
+    },
+    {
+      "elapsed_seconds": 6.375282034976408,
+      "vram_used_bytes": 21133541376,
+      "raw": "21133541376\n"
+    },
+    {
+      "elapsed_seconds": 6.425461517996155,
+      "vram_used_bytes": 21133651968,
+      "raw": "21133651968\n"
+    },
+    {
+      "elapsed_seconds": 6.475640950957313,
+      "vram_used_bytes": 21133762560,
+      "raw": "21133762560\n"
+    },
+    {
+      "elapsed_seconds": 6.525820794980973,
+      "vram_used_bytes": 21133860864,
+      "raw": "21133860864\n"
+    },
+    {
+      "elapsed_seconds": 6.5760001769522205,
+      "vram_used_bytes": 21133975552,
+      "raw": "21133975552\n"
+    },
+    {
+      "elapsed_seconds": 6.626180561957881,
+      "vram_used_bytes": 21134073856,
+      "raw": "21134073856\n"
+    },
+    {
+      "elapsed_seconds": 6.676359514007345,
+      "vram_used_bytes": 21134184448,
+      "raw": "21134184448\n"
+    },
+    {
+      "elapsed_seconds": 6.726538345916197,
+      "vram_used_bytes": 21134295040,
+      "raw": "21134295040\n"
+    },
+    {
+      "elapsed_seconds": 6.776717738015577,
+      "vram_used_bytes": 21134401536,
+      "raw": "21134401536\n"
+    },
+    {
+      "elapsed_seconds": 6.826896599959582,
+      "vram_used_bytes": 21134503936,
+      "raw": "21134503936\n"
+    },
+    {
+      "elapsed_seconds": 6.877115258015692,
+      "vram_used_bytes": 21134626816,
+      "raw": "21134626816\n"
+    },
+    {
+      "elapsed_seconds": 6.927300171926618,
+      "vram_used_bytes": 21134737408,
+      "raw": "21134737408\n"
+    },
+    {
+      "elapsed_seconds": 6.977505293907598,
+      "vram_used_bytes": 21134848000,
+      "raw": "21134848000\n"
+    },
+    {
+      "elapsed_seconds": 7.0276846459601074,
+      "vram_used_bytes": 21134958592,
+      "raw": "21134958592\n"
+    },
+    {
+      "elapsed_seconds": 7.077863908954896,
+      "vram_used_bytes": 21135069184,
+      "raw": "21135069184\n"
+    },
+    {
+      "elapsed_seconds": 7.128043061005883,
+      "vram_used_bytes": 21135179776,
+      "raw": "21135179776\n"
+    },
+    {
+      "elapsed_seconds": 7.178241500980221,
+      "vram_used_bytes": 21135290368,
+      "raw": "21135290368\n"
+    },
+    {
+      "elapsed_seconds": 7.228420942905359,
+      "vram_used_bytes": 21135400960,
+      "raw": "21135400960\n"
+    },
+    {
+      "elapsed_seconds": 7.278599994955584,
+      "vram_used_bytes": 21135511552,
+      "raw": "21135511552\n"
+    },
+    {
+      "elapsed_seconds": 7.328779357951134,
+      "vram_used_bytes": 21135622144,
+      "raw": "21135622144\n"
+    },
+    {
+      "elapsed_seconds": 7.37895857996773,
+      "vram_used_bytes": 21135732736,
+      "raw": "21135732736\n"
+    },
+    {
+      "elapsed_seconds": 7.429163752007298,
+      "vram_used_bytes": 21135843328,
+      "raw": "21135843328\n"
+    },
+    {
+      "elapsed_seconds": 7.479344757972285,
+      "vram_used_bytes": 21135953920,
+      "raw": "21135953920\n"
+    },
+    {
+      "elapsed_seconds": 7.529524830984883,
+      "vram_used_bytes": 21136068608,
+      "raw": "21136068608\n"
+    },
+    {
+      "elapsed_seconds": 7.579709693905897,
+      "vram_used_bytes": 21136166912,
+      "raw": "21136166912\n"
+    },
+    {
+      "elapsed_seconds": 7.629890228970908,
+      "vram_used_bytes": 21136277504,
+      "raw": "21136277504\n"
+    },
+    {
+      "elapsed_seconds": 7.680093206930906,
+      "vram_used_bytes": 21136400384,
+      "raw": "21136400384\n"
+    },
+    {
+      "elapsed_seconds": 7.730387240997516,
+      "vram_used_bytes": 21136510976,
+      "raw": "21136510976\n"
+    },
+    {
+      "elapsed_seconds": 7.780566812958568,
+      "vram_used_bytes": 21136621568,
+      "raw": "21136621568\n"
+    },
+    {
+      "elapsed_seconds": 7.83075846999418,
+      "vram_used_bytes": 21136732160,
+      "raw": "21136732160\n"
+    },
+    {
+      "elapsed_seconds": 7.880936959991232,
+      "vram_used_bytes": 21136842752,
+      "raw": "21136842752\n"
+    },
+    {
+      "elapsed_seconds": 7.93136649497319,
+      "vram_used_bytes": 21136953344,
+      "raw": "21136953344\n"
+    },
+    {
+      "elapsed_seconds": 7.981546449009329,
+      "vram_used_bytes": 21137063936,
+      "raw": "21137063936\n"
+    },
+    {
+      "elapsed_seconds": 8.031735198921524,
+      "vram_used_bytes": 21137174528,
+      "raw": "21137174528\n"
+    },
+    {
+      "elapsed_seconds": 8.081919470918365,
+      "vram_used_bytes": 21137285120,
+      "raw": "21137285120\n"
+    },
+    {
+      "elapsed_seconds": 8.132120104972273,
+      "vram_used_bytes": 21137395712,
+      "raw": "21137395712\n"
+    },
+    {
+      "elapsed_seconds": 8.182299547013827,
+      "vram_used_bytes": 21137506304,
+      "raw": "21137506304\n"
+    },
+    {
+      "elapsed_seconds": 8.23247899999842,
+      "vram_used_bytes": 21137604608,
+      "raw": "21137604608\n"
+    },
+    {
+      "elapsed_seconds": 8.28265783097595,
+      "vram_used_bytes": 21137715200,
+      "raw": "21137715200\n"
+    },
+    {
+      "elapsed_seconds": 8.332837042980827,
+      "vram_used_bytes": 21137838080,
+      "raw": "21137838080\n"
+    },
+    {
+      "elapsed_seconds": 8.383015783969313,
+      "vram_used_bytes": 21137936384,
+      "raw": "21137936384\n"
+    },
+    {
+      "elapsed_seconds": 8.433195126010105,
+      "vram_used_bytes": 21138059264,
+      "raw": "21138059264\n"
+    },
+    {
+      "elapsed_seconds": 8.483373736962676,
+      "vram_used_bytes": 21138173952,
+      "raw": "21138173952\n"
+    },
+    {
+      "elapsed_seconds": 8.533552628010511,
+      "vram_used_bytes": 21138284544,
+      "raw": "21138284544\n"
+    },
+    {
+      "elapsed_seconds": 8.58373194001615,
+      "vram_used_bytes": 21138395136,
+      "raw": "21138395136\n"
+    },
+    {
+      "elapsed_seconds": 8.633911754004657,
+      "vram_used_bytes": 21138505728,
+      "raw": "21138505728\n"
+    },
+    {
+      "elapsed_seconds": 8.684111073962413,
+      "vram_used_bytes": 21138616320,
+      "raw": "21138616320\n"
+    },
+    {
+      "elapsed_seconds": 8.734290416934527,
+      "vram_used_bytes": 21138726912,
+      "raw": "21138726912\n"
+    },
+    {
+      "elapsed_seconds": 8.784470179933123,
+      "vram_used_bytes": 21138837504,
+      "raw": "21138837504\n"
+    },
+    {
+      "elapsed_seconds": 8.834649631986395,
+      "vram_used_bytes": 21138948096,
+      "raw": "21138948096\n"
+    },
+    {
+      "elapsed_seconds": 8.884828993934207,
+      "vram_used_bytes": 21139058688,
+      "raw": "21139058688\n"
+    },
+    {
+      "elapsed_seconds": 8.935008005937561,
+      "vram_used_bytes": 21139169280,
+      "raw": "21139169280\n"
+    },
+    {
+      "elapsed_seconds": 8.985188029007986,
+      "vram_used_bytes": 21139292160,
+      "raw": "21139292160\n"
+    },
+    {
+      "elapsed_seconds": 9.035367160919122,
+      "vram_used_bytes": 21139394560,
+      "raw": "21139394560\n"
+    },
+    {
+      "elapsed_seconds": 9.085545592010021,
+      "vram_used_bytes": 21139513344,
+      "raw": "21139513344\n"
+    },
+    {
+      "elapsed_seconds": 9.135733810951933,
+      "vram_used_bytes": 21139623936,
+      "raw": "21139623936\n"
+    },
+    {
+      "elapsed_seconds": 9.185912882909179,
+      "vram_used_bytes": 21139734528,
+      "raw": "21139734528\n"
+    },
+    {
+      "elapsed_seconds": 9.23611361591611,
+      "vram_used_bytes": 21139845120,
+      "raw": "21139845120\n"
+    },
+    {
+      "elapsed_seconds": 9.286293098004535,
+      "vram_used_bytes": 21139955712,
+      "raw": "21139955712\n"
+    },
+    {
+      "elapsed_seconds": 9.336471788934432,
+      "vram_used_bytes": 21140066304,
+      "raw": "21140066304\n"
+    },
+    {
+      "elapsed_seconds": 9.386650810018182,
+      "vram_used_bytes": 21140176896,
+      "raw": "21140176896\n"
+    },
+    {
+      "elapsed_seconds": 9.436838327907026,
+      "vram_used_bytes": 21140291584,
+      "raw": "21140291584\n"
+    },
+    {
+      "elapsed_seconds": 9.487018442014232,
+      "vram_used_bytes": 21140402176,
+      "raw": "21140402176\n"
+    },
+    {
+      "elapsed_seconds": 9.537263750913553,
+      "vram_used_bytes": 21140516864,
+      "raw": "21140516864\n"
+    },
+    {
+      "elapsed_seconds": 9.587444164906628,
+      "vram_used_bytes": 21140623360,
+      "raw": "21140623360\n"
+    },
+    {
+      "elapsed_seconds": 9.637623546994291,
+      "vram_used_bytes": 21140733952,
+      "raw": "21140733952\n"
+    },
+    {
+      "elapsed_seconds": 9.687802618951537,
+      "vram_used_bytes": 21140856832,
+      "raw": "21140856832\n"
+    },
+    {
+      "elapsed_seconds": 9.738193118013442,
+      "vram_used_bytes": 21140967424,
+      "raw": "21140967424\n"
+    },
+    {
+      "elapsed_seconds": 9.788373391958885,
+      "vram_used_bytes": 21141065728,
+      "raw": "21141065728\n"
+    },
+    {
+      "elapsed_seconds": 9.838553395005874,
+      "vram_used_bytes": 21141188608,
+      "raw": "21141188608\n"
+    },
+    {
+      "elapsed_seconds": 9.888732686988078,
+      "vram_used_bytes": 21141299200,
+      "raw": "21141299200\n"
+    },
+    {
+      "elapsed_seconds": 9.938912860001437,
+      "vram_used_bytes": 21141409792,
+      "raw": "21141409792\n"
+    },
+    {
+      "elapsed_seconds": 9.989259244990535,
+      "vram_used_bytes": 21141520384,
+      "raw": "21141520384\n"
+    },
+    {
+      "elapsed_seconds": 10.03944620094262,
+      "vram_used_bytes": 21141630976,
+      "raw": "21141630976\n"
+    },
+    {
+      "elapsed_seconds": 10.089625542983413,
+      "vram_used_bytes": 21141741568,
+      "raw": "21141741568\n"
+    },
+    {
+      "elapsed_seconds": 10.139804704929702,
+      "vram_used_bytes": 21141852160,
+      "raw": "21141852160\n"
+    },
+    {
+      "elapsed_seconds": 10.189994868007489,
+      "vram_used_bytes": 21141962752,
+      "raw": "21141962752\n"
+    },
+    {
+      "elapsed_seconds": 10.240177184925415,
+      "vram_used_bytes": 21142073344,
+      "raw": "21142073344\n"
+    },
+    {
+      "elapsed_seconds": 10.290357398916967,
+      "vram_used_bytes": 21142183936,
+      "raw": "21142183936\n"
+    },
+    {
+      "elapsed_seconds": 10.340542761958204,
+      "vram_used_bytes": 21142294528,
+      "raw": "21142294528\n"
+    },
+    {
+      "elapsed_seconds": 10.390723967924714,
+      "vram_used_bytes": 21142409216,
+      "raw": "21142409216\n"
+    },
+    {
+      "elapsed_seconds": 10.44090592500288,
+      "vram_used_bytes": 21142519808,
+      "raw": "21142519808\n"
+    },
+    {
+      "elapsed_seconds": 10.49110555590596,
+      "vram_used_bytes": 21142618112,
+      "raw": "21142618112\n"
+    },
+    {
+      "elapsed_seconds": 10.54128869494889,
+      "vram_used_bytes": 21142728704,
+      "raw": "21142728704\n"
+    },
+    {
+      "elapsed_seconds": 10.591467374935746,
+      "vram_used_bytes": 21142839296,
+      "raw": "21142839296\n"
+    },
+    {
+      "elapsed_seconds": 10.641646086005494,
+      "vram_used_bytes": 21142949888,
+      "raw": "21142949888\n"
+    },
+    {
+      "elapsed_seconds": 10.691825437941588,
+      "vram_used_bytes": 21143060480,
+      "raw": "21143060480\n"
+    },
+    {
+      "elapsed_seconds": 10.742004318977706,
+      "vram_used_bytes": 21143183360,
+      "raw": "21143183360\n"
+    },
+    {
+      "elapsed_seconds": 10.792277761967853,
+      "vram_used_bytes": 21143281664,
+      "raw": "21143281664\n"
+    },
+    {
+      "elapsed_seconds": 10.842457173974253,
+      "vram_used_bytes": 21143404544,
+      "raw": "21143404544\n"
+    },
+    {
+      "elapsed_seconds": 10.892637236975133,
+      "vram_used_bytes": 21143502848,
+      "raw": "21143502848\n"
+    },
+    {
+      "elapsed_seconds": 10.942816899972968,
+      "vram_used_bytes": 21143613440,
+      "raw": "21143613440\n"
+    },
+    {
+      "elapsed_seconds": 10.993005109019578,
+      "vram_used_bytes": 21143724032,
+      "raw": "21143724032\n"
+    },
+    {
+      "elapsed_seconds": 11.04318555293139,
+      "vram_used_bytes": 21143834624,
+      "raw": "21143834624\n"
+    },
+    {
+      "elapsed_seconds": 11.093365374952555,
+      "vram_used_bytes": 21143945216,
+      "raw": "21143945216\n"
+    },
+    {
+      "elapsed_seconds": 11.143516773008741,
+      "vram_used_bytes": 21144055808,
+      "raw": "21144055808\n"
+    },
+    {
+      "elapsed_seconds": 11.193694873014465,
+      "vram_used_bytes": 21144154112,
+      "raw": "21144154112\n"
+    },
+    {
+      "elapsed_seconds": 11.243883261922747,
+      "vram_used_bytes": 21144252416,
+      "raw": "21144252416\n"
+    },
+    {
+      "elapsed_seconds": 11.294125804910436,
+      "vram_used_bytes": 21144350720,
+      "raw": "21144350720\n"
+    },
+    {
+      "elapsed_seconds": 11.344350794912316,
+      "vram_used_bytes": 21144449024,
+      "raw": "21144449024\n"
+    },
+    {
+      "elapsed_seconds": 11.39456231892109,
+      "vram_used_bytes": 21144563712,
+      "raw": "21144563712\n"
+    },
+    {
+      "elapsed_seconds": 11.444779783952981,
+      "vram_used_bytes": 21144662016,
+      "raw": "21144662016\n"
+    },
+    {
+      "elapsed_seconds": 11.494988070917316,
+      "vram_used_bytes": 21144760320,
+      "raw": "21144760320\n"
+    },
+    {
+      "elapsed_seconds": 11.545174926985055,
+      "vram_used_bytes": 21144858624,
+      "raw": "21144858624\n"
+    },
+    {
+      "elapsed_seconds": 11.595360009931028,
+      "vram_used_bytes": 21144956928,
+      "raw": "21144956928\n"
+    },
+    {
+      "elapsed_seconds": 11.645594788948074,
+      "vram_used_bytes": 21145055232,
+      "raw": "21145055232\n"
+    },
+    {
+      "elapsed_seconds": 11.695846850983799,
+      "vram_used_bytes": 21145141248,
+      "raw": "21145141248\n"
+    },
+    {
+      "elapsed_seconds": 11.746103290934116,
+      "vram_used_bytes": 21145239552,
+      "raw": "21145239552\n"
+    },
+    {
+      "elapsed_seconds": 11.796345022972673,
+      "vram_used_bytes": 21145337856,
+      "raw": "21145337856\n"
+    },
+    {
+      "elapsed_seconds": 11.846568580018356,
+      "vram_used_bytes": 21145436160,
+      "raw": "21145436160\n"
+    },
+    {
+      "elapsed_seconds": 11.896793338935822,
+      "vram_used_bytes": 21145534464,
+      "raw": "21145534464\n"
+    },
+    {
+      "elapsed_seconds": 11.94701942091342,
+      "vram_used_bytes": 21145632768,
+      "raw": "21145632768\n"
+    },
+    {
+      "elapsed_seconds": 11.997239060001448,
+      "vram_used_bytes": 21145731072,
+      "raw": "21145731072\n"
+    },
+    {
+      "elapsed_seconds": 12.047456364962272,
+      "vram_used_bytes": 21145841664,
+      "raw": "21145841664\n"
+    },
+    {
+      "elapsed_seconds": 12.097674129996449,
+      "vram_used_bytes": 21145939968,
+      "raw": "21145939968\n"
+    },
+    {
+      "elapsed_seconds": 12.14788697694894,
+      "vram_used_bytes": 21146038272,
+      "raw": "21146038272\n"
+    },
+    {
+      "elapsed_seconds": 12.19809969200287,
+      "vram_used_bytes": 21146136576,
+      "raw": "21146136576\n"
+    },
+    {
+      "elapsed_seconds": 12.248296487960033,
+      "vram_used_bytes": 21146234880,
+      "raw": "21146234880\n"
+    },
+    {
+      "elapsed_seconds": 12.29855313792359,
+      "vram_used_bytes": 21146333184,
+      "raw": "21146333184\n"
+    },
+    {
+      "elapsed_seconds": 12.348743690992706,
+      "vram_used_bytes": 21146431488,
+      "raw": "21146431488\n"
+    },
+    {
+      "elapsed_seconds": 12.398930837982334,
+      "vram_used_bytes": 21146542080,
+      "raw": "21146542080\n"
+    },
+    {
+      "elapsed_seconds": 12.449133464018814,
+      "vram_used_bytes": 21146644480,
+      "raw": "21146644480\n"
+    },
+    {
+      "elapsed_seconds": 12.49931506998837,
+      "vram_used_bytes": 21146742784,
+      "raw": "21146742784\n"
+    },
+    {
+      "elapsed_seconds": 12.549494792008772,
+      "vram_used_bytes": 21146841088,
+      "raw": "21146841088\n"
+    },
+    {
+      "elapsed_seconds": 12.599685985944234,
+      "vram_used_bytes": 21146939392,
+      "raw": "21146939392\n"
+    },
+    {
+      "elapsed_seconds": 12.649866339983419,
+      "vram_used_bytes": 21147049984,
+      "raw": "21147049984\n"
+    },
+    {
+      "elapsed_seconds": 12.700045931967907,
+      "vram_used_bytes": 21147148288,
+      "raw": "21147148288\n"
+    },
+    {
+      "elapsed_seconds": 12.750254650018178,
+      "vram_used_bytes": 21147246592,
+      "raw": "21147246592\n"
+    },
+    {
+      "elapsed_seconds": 12.800434552016668,
+      "vram_used_bytes": 21147357184,
+      "raw": "21147357184\n"
+    },
+    {
+      "elapsed_seconds": 12.850614534923807,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 12.900795629946515,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 12.950975943007506,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.001156526966952,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.051336108939722,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.101516251917928,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.151695634005591,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.201875024940819,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.252081408980303,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.302261441014707,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.352441443945281,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.40262128598988,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.452754779020324,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.502903069951572,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.553105696919374,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.603285758988932,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.653465109993704,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.703644581953995,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.753824744955637,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.804005077923648,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.854185211006552,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.904366345959716,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 13.954547110013664,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.004732091911137,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.054913236992434,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.105116874910891,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.155302027007565,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.205493691959418,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.255674375919625,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.305854158010334,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.356043317937292,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.40624499192927,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.456424653995782,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.506612831959501,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.556792823947035,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.606972144916654,
+      "vram_used_bytes": 21147381760,
+      "raw": "21147381760\n"
+    },
+    {
+      "elapsed_seconds": 14.657152678933926,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 14.707333572907373,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 14.757513104006648,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 14.807693406939507,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 14.857872326974757,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 14.908051598002203,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 14.958369145984761,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.008549107937142,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.058729190961458,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.108869696967304,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.159047976019792,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.209253256907687,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.25943285797257,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.309614192927256,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.35979434591718,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.409974998910911,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.460120434989221,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.510236733942293,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.560414121020585,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.610594664001837,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.660773884970695,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.710953617002815,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.76115514000412,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.811343809007667,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.861523972009309,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.911703733960167,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 15.96189221192617,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.012297678971663,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.06247927399818,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.112659596954472,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.162843697005883,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.213024670956656,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.26320455293171,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.31338396295905,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.36356338392943,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.413744387915358,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.463923247996718,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.51413795701228,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.564331354922615,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.614511025953107,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.664690156001598,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.714850199990906,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.765031393966638,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.81521193694789,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.865391267929226,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.915570848970674,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 16.965749979950488,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.015929349930957,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.066133828950115,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.116322146961465,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.166502489941195,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.216682832920924,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.266863466007635,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.317043436923996,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.367251192918047,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.417431454989128,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.467611366999336,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.517791658989154,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.567971469950862,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.618151471950114,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.668332495959476,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.71852155495435,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.76870632590726,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.818888461915776,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.869079805910587,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.919266099925153,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 17.969446752918884,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.019626163993962,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.069805483915843,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.119985515950248,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.17016668000724,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.22035870491527,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.270537924952805,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.320716944988817,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.37089867994655,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.421098358929157,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.471277789911255,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.52145657897927,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.57163572893478,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.62181486899499,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.671993938973173,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.722172787995078,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.772352057974786,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.822531768935733,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.872711531003006,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.922890931018628,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 18.97332969098352,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.023509642924182,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.073689082986675,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.12386869394686,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.174048385000788,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.224250238970853,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.274438326014206,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.32461740600411,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.37479703593999,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.424976876936853,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.47516014496796,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.52534100797493,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.575521449907683,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.62570211291313,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.675882254960015,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.726083657937124,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.776265341904946,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.82645094394684,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.876631286926568,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.926816427963786,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 19.976998613914475,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.027177913929336,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.077360259951092,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.127539428998716,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.17772115394473,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.227901475969702,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.27810271794442,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.32828327093739,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.37847779993899,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.428658602992073,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.478806803002954,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.528983637923375,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.57917280693073,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.62935327901505,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.67953328997828,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.729712410015054,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.7798914789455,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.83008288196288,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.880273172981106,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.93047616898548,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 20.980652652913705,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.03086394490674,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.081089974963106,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.131293691927567,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.181497187935747,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.231700273929164,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.281891937018372,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.332118637976237,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.382337243994698,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.43255049898289,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.482766789966263,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.532984694000334,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.58319524396211,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.633395734941587,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.68359901092481,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.73378922091797,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.783991234959103,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.834186605992727,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.884383579017594,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.934586965944618,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 21.98480411793571,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.035001331940293,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.085191492922604,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.135386263020337,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.18559090094641,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.23579378600698,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.28594546194654,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.33616090193391,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.38636493892409,
+      "vram_used_bytes": 21155815424,
+      "raw": "21155815424\n"
+    },
+    {
+      "elapsed_seconds": 22.436560208909214,
+      "vram_used_bytes": 21109678080,
+      "raw": "21109678080\n"
+    },
+    {
+      "elapsed_seconds": 22.48674902692437,
+      "vram_used_bytes": 19679051776,
+      "raw": "19679051776\n"
+    },
+    {
+      "elapsed_seconds": 22.536900572944432,
+      "vram_used_bytes": 19678650368,
+      "raw": "19678650368\n"
+    },
+    {
+      "elapsed_seconds": 22.58709961094428,
+      "vram_used_bytes": 19678248960,
+      "raw": "19678248960\n"
+    },
+    {
+      "elapsed_seconds": 22.637304789968766,
+      "vram_used_bytes": 19677888512,
+      "raw": "19677888512\n"
+    },
+    {
+      "elapsed_seconds": 22.687524126959033,
+      "vram_used_bytes": 19677503488,
+      "raw": "19677503488\n"
+    },
+    {
+      "elapsed_seconds": 22.737707693944685,
+      "vram_used_bytes": 19677110272,
+      "raw": "19677110272\n"
+    },
+    {
+      "elapsed_seconds": 22.787887814920396,
+      "vram_used_bytes": 19676758016,
+      "raw": "19676758016\n"
+    },
+    {
+      "elapsed_seconds": 22.838109566946514,
+      "vram_used_bytes": 19676348416,
+      "raw": "19676348416\n"
+    },
+    {
+      "elapsed_seconds": 22.8882899179589,
+      "vram_used_bytes": 19675930624,
+      "raw": "19675930624\n"
+    },
+    {
+      "elapsed_seconds": 22.938468606909737,
+      "vram_used_bytes": 19675521024,
+      "raw": "19675521024\n"
+    },
+    {
+      "elapsed_seconds": 22.98864792601671,
+      "vram_used_bytes": 19675103232,
+      "raw": "19675103232\n"
+    },
+    {
+      "elapsed_seconds": 23.038827106007375,
+      "vram_used_bytes": 19674685440,
+      "raw": "19674685440\n"
+    },
+    {
+      "elapsed_seconds": 23.08900714700576,
+      "vram_used_bytes": 19674275840,
+      "raw": "19674275840\n"
+    },
+    {
+      "elapsed_seconds": 23.139174512936734,
+      "vram_used_bytes": 19673866240,
+      "raw": "19673866240\n"
+    },
+    {
+      "elapsed_seconds": 23.189351607928984,
+      "vram_used_bytes": 19673456640,
+      "raw": "19673456640\n"
+    },
+    {
+      "elapsed_seconds": 23.239591263933107,
+      "vram_used_bytes": 19673047040,
+      "raw": "19673047040\n"
+    },
+    {
+      "elapsed_seconds": 23.28980653290637,
+      "vram_used_bytes": 19672653824,
+      "raw": "19672653824\n"
+    },
+    {
+      "elapsed_seconds": 23.34002058894839,
+      "vram_used_bytes": 19672244224,
+      "raw": "19672244224\n"
+    },
+    {
+      "elapsed_seconds": 23.39020950696431,
+      "vram_used_bytes": 19671834624,
+      "raw": "19671834624\n"
+    },
+    {
+      "elapsed_seconds": 23.44041920499876,
+      "vram_used_bytes": 19671425024,
+      "raw": "19671425024\n"
+    },
+    {
+      "elapsed_seconds": 23.49060281191487,
+      "vram_used_bytes": 19671007232,
+      "raw": "19671007232\n"
+    },
+    {
+      "elapsed_seconds": 23.540785297984257,
+      "vram_used_bytes": 19670581248,
+      "raw": "19670581248\n"
+    },
+    {
+      "elapsed_seconds": 23.590968464966863,
+      "vram_used_bytes": 19670171648,
+      "raw": "19670171648\n"
+    },
+    {
+      "elapsed_seconds": 23.641149207018316,
+      "vram_used_bytes": 19669745664,
+      "raw": "19669745664\n"
+    },
+    {
+      "elapsed_seconds": 23.691330539993942,
+      "vram_used_bytes": 19669319680,
+      "raw": "19669319680\n"
+    },
+    {
+      "elapsed_seconds": 23.741526581929065,
+      "vram_used_bytes": 19668893696,
+      "raw": "19668893696\n"
+    },
+    {
+      "elapsed_seconds": 23.7917089270195,
+      "vram_used_bytes": 19668484096,
+      "raw": "19668484096\n"
+    },
+    {
+      "elapsed_seconds": 23.841891994001344,
+      "vram_used_bytes": 19668074496,
+      "raw": "19668074496\n"
+    },
+    {
+      "elapsed_seconds": 23.892050452996045,
+      "vram_used_bytes": 19667656704,
+      "raw": "19667656704\n"
+    },
+    {
+      "elapsed_seconds": 23.942250681924634,
+      "vram_used_bytes": 19667238912,
+      "raw": "19667238912\n"
+    },
+    {
+      "elapsed_seconds": 23.992430642945692,
+      "vram_used_bytes": 19666829312,
+      "raw": "19666829312\n"
+    },
+    {
+      "elapsed_seconds": 24.04261066392064,
+      "vram_used_bytes": 19666419712,
+      "raw": "19666419712\n"
+    },
+    {
+      "elapsed_seconds": 24.092799661913887,
+      "vram_used_bytes": 19666001920,
+      "raw": "19666001920\n"
+    },
+    {
+      "elapsed_seconds": 24.142980153905228,
+      "vram_used_bytes": 19665592320,
+      "raw": "19665592320\n"
+    },
+    {
+      "elapsed_seconds": 24.193160313996486,
+      "vram_used_bytes": 19665182720,
+      "raw": "19665182720\n"
+    },
+    {
+      "elapsed_seconds": 24.24334096594248,
+      "vram_used_bytes": 19664781312,
+      "raw": "19664781312\n"
+    },
+    {
+      "elapsed_seconds": 24.29352998395916,
+      "vram_used_bytes": 19664396288,
+      "raw": "19664396288\n"
+    },
+    {
+      "elapsed_seconds": 24.34370912297163,
+      "vram_used_bytes": 19663986688,
+      "raw": "19663986688\n"
+    },
+    {
+      "elapsed_seconds": 24.39388861192856,
+      "vram_used_bytes": 19663577088,
+      "raw": "19663577088\n"
+    },
+    {
+      "elapsed_seconds": 24.44408188899979,
+      "vram_used_bytes": 19663183872,
+      "raw": "19663183872\n"
+    },
+    {
+      "elapsed_seconds": 24.494261507992633,
+      "vram_used_bytes": 19662774272,
+      "raw": "19662774272\n"
+    },
+    {
+      "elapsed_seconds": 24.544458751915954,
+      "vram_used_bytes": 19570307072,
+      "raw": "19570307072\n"
+    },
+    {
+      "elapsed_seconds": 24.59461074892897,
+      "vram_used_bytes": 19561783296,
+      "raw": "19561783296\n"
+    }
+  ],
+  "child_pid": 2803007,
+  "child_exit_code": 0,
+  "termination_signals": [
+    "SIGTERM",
+    "SIGKILL"
+  ],
+  "status": "completed",
+  "sysfs_counter": "/sys/class/drm/card0/device/mem_info_vram_used",
+  "resolved_counter": "/sys/devices/pci0000:9b/0000:9b:01.1/0000:9c:00.0/0000:9d:00.0/0000:9e:00.0/mem_info_vram_used",
+  "elapsed_seconds": 26.594828765955754,
+  "exit_code": 0
+}

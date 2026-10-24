@@ -2132,6 +2132,197 @@ pub fn prepare_scratch_inputs(
     Ok(())
 }
 
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug)]
+struct PositionedLabAdmission {
+    dense: bool,
+    legacy_q8: bool,
+    adaptive: bool,
+    compact_offset: usize,
+    cpu_offload: bool,
+    capture: bool,
+    replay: bool,
+}
+
+#[cfg(feature = "lab")]
+impl PositionedLabAdmission {
+    fn validate(self) -> HipResult<()> {
+        if !self.dense
+            || !self.legacy_q8
+            || self.adaptive
+            || self.compact_offset != 0
+            || self.cpu_offload
+            || self.capture
+            || self.replay
+        {
+            return Err(HipError::new(
+                0,
+                "positioned lab forward requires dense legacy Q8/Q8, no adaptive KV, \
+                 compaction, CPU offload, capture or replay",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate both index domains before touching embedding, recurrent state or KV.
+#[cfg(feature = "lab")]
+fn positioned_lab_indices(
+    absolute_pos: usize,
+    packed_pos: usize,
+    logical_bound: usize,
+    physical_cap: usize,
+    position_buffer_bytes: usize,
+) -> HipResult<(i32, i32)> {
+    let packed_end = checked_kv_end(packed_pos, 1, "positioned lab forward")?;
+    if absolute_pos >= logical_bound
+        || packed_pos > absolute_pos
+        || packed_end > physical_cap
+        || position_buffer_bytes < 4
+    {
+        return Err(HipError::new(
+            0,
+            "positioned lab forward: absolute/packed position or position buffer outside bounds",
+        ));
+    }
+    let absolute = i32::try_from(absolute_pos)
+        .map_err(|_| HipError::new(0, "positioned lab forward: absolute position exceeds i32"))?;
+    let packed = i32::try_from(packed_pos)
+        .map_err(|_| HipError::new(0, "positioned lab forward: packed position exceeds i32"))?;
+    i32::try_from(packed_end)
+        .map_err(|_| HipError::new(0, "positioned lab forward: packed frontier exceeds i32"))?;
+    Ok((absolute, packed))
+}
+
+/// Lab-only single-token text AR with independent absolute RoPE and packed KV
+/// indices. This does not select, stage, archive or commit history. The caller
+/// must have initialized every packed row in `0..packed_pos`; the current row
+/// is written at `packed_pos` and attention sees exactly `packed_pos + 1` rows.
+/// A partially filled selected prefix must NOT leave a hole before this row.
+///
+/// `packed_pos_buf` is caller-owned, distinct from `scratch.pos_buf`, and must
+/// remain live and unmodified until the forward completes on its stream. The
+/// scratch scalar stays absolute for RoPE; only write/attention read the extra
+/// scalar. Every logical token must have been forwarded in order so DeltaNet
+/// advances over the complete stream; an earlier ordinary production prefill
+/// may establish that state before switching to this one-row decode entry.
+/// This hook adds no prefill, speculative, graph, VMM or serving support.
+#[cfg(feature = "lab")]
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_positioned_lab(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    absolute_pos: usize,
+    packed_pos: usize,
+    packed_pos_buf: &hip_bridge::DeviceBuffer,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    PositionedLabAdmission {
+        dense: config.num_experts == 0
+            && weights.ep_shard.is_none()
+            && weights.layers.len() == config.n_layers
+            && config.layer_types.len() == config.n_layers
+            && weights.layers.iter().all(|layer| {
+                matches!(layer, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_))
+            }),
+        legacy_q8: !kv_cache.uses_vmm_backend()
+            && kv_cache.quantized
+            && kv_cache.quant_q8
+            && kv_cache.v_mode == llama::VMode::Q8
+            && !kv_cache.quant_int8
+            && !kv_cache.quant_hfq4
+            && !kv_cache.quant_asym4
+            && !kv_cache.quant_asym3
+            && !kv_cache.quant_asym2
+            && !kv_cache.quant_fwht
+            && !kv_cache.quant_bf16
+            && !kv_cache.quant_fp8
+            && kv_cache.k_scales.is_empty()
+            && kv_cache.v_scales.is_empty(),
+        adaptive: !matches!(
+            hipfire_runtime::config::get().kv_adaptive.as_str(),
+            "" | "off"
+        ),
+        compact_offset: kv_cache.compact_offset,
+        cpu_offload: gpu.owns_host_cpu_weights(),
+        capture: gpu.graphs.capture_mode,
+        replay: gpu.replay.is_enabled()
+            || gpu.replay.is_recording()
+            || gpu.graphs.ar_forward_replay_enabled
+            || gpu.graphs.graph_exec.is_some(),
+    }
+    .validate()?;
+    let (_, packed_i32) = positioned_lab_indices(
+        absolute_pos,
+        packed_pos,
+        kv_cache.max_seq,
+        kv_cache.physical_cap,
+        packed_pos_buf.size(),
+    )?;
+    if token as usize >= config.vocab_size
+        || packed_pos_buf.as_ptr() == scratch.pos_buf.as_ptr()
+        || kv_cache.n_kv_heads != config.n_kv_heads
+        || kv_cache.head_dim != config.head_dim
+        || config.n_heads == 0
+        || config.n_kv_heads == 0
+        || !config.n_heads.is_multiple_of(config.n_kv_heads)
+        || config.head_dim == 0
+        || !config.head_dim.is_multiple_of(32)
+    {
+        return Err(HipError::new(
+            0,
+            "positioned lab forward: invalid token, buffer alias or KV geometry",
+        ));
+    }
+    // Legacy ensure_mapped_capacity is a no-op, so check the actual Q8 backing
+    // extents as well as physical_cap before any kernel may write a row.
+    let row_bytes = config
+        .n_kv_heads
+        .checked_mul(config.head_dim / 32)
+        .and_then(|n| n.checked_mul(34))
+        .ok_or_else(|| HipError::new(0, "positioned lab forward: Q8 row size overflow"))?;
+    let required_bytes = row_bytes
+        .checked_mul(packed_pos + 1)
+        .ok_or_else(|| HipError::new(0, "positioned lab forward: Q8 extent overflow"))?;
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        if matches!(layer, LayerWeights::FullAttn(_)) {
+            for sides in [&kv_cache.k_gpu, &kv_cache.v_gpu] {
+                if sides.get(layer_idx).is_none_or(|t| {
+                    t.buf.size() < required_bytes || t.buf.is_vmm_owner() || t.buf.is_host_mapped()
+                }) {
+                    return Err(HipError::new(
+                        0,
+                        "positioned lab forward: Q8 side is missing or too small",
+                    ));
+                }
+            }
+        }
+    }
+    // Do not enter forward_scratch: that wrapper owns graph/Redline routing.
+    // The input helper and shared declarative body retain the normal arithmetic.
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::set_decode_position(absolute_pos).map_err(|e| HipError::new(0, &e))?;
+    prepare_scratch_inputs(gpu, weights, config, token, absolute_pos, scratch)?;
+    gpu.hip
+        .memcpy_htod(packed_pos_buf, &packed_i32.to_ne_bytes())?;
+    forward_scratch_layers_with_position(
+        gpu,
+        weights,
+        config,
+        absolute_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        None,
+        Some((packed_pos, packed_pos_buf)),
+    )
+}
+
 /// Same as `forward_scratch` but also extracts hidden states from the
 /// configured target layers into `hidden_rb`. Used by the DFlash draft path
 /// during target verification. `hidden_rb.advance_head()` is called once
@@ -2406,6 +2597,26 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
+    forward_scratch_layers_with_position(
+        gpu, weights, config, pos, kv_cache, dn_state, s, hidden_rb, mrope, None,
+    )
+}
+
+/// The positioned lab entry alone separates the KV row from the RoPE row.
+/// Ordinary decode, graph capture, EP and speculative callers keep `None`.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_layers_with_position(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    mrope: Option<&MropeCtx>,
+    kv_position: Option<(usize, &hip_bridge::DeviceBuffer)>,
+) -> HipResult<()> {
     let ctx = DispatchCtx::new(gpu);
     if let Some(mc) = mrope {
         debug_assert_eq!(
@@ -2472,7 +2683,19 @@ fn forward_scratch_layers(
             tap,
             MixerOutput::Residual,
         );
-        execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
+        if let (Some((position, pos_buf)), Step::GatedAttention(op)) = (kv_position, &mixer) {
+            // Project and rotate at the absolute position in the binding;
+            // only KV write/attention consume the packed position scalar.
+            op.project(gpu, &ctx)
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            let prerotated = op
+                .attend_with_kv_position(gpu, &ctx, position, pos_buf)
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            op.output(gpu, &ctx, prerotated)
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+        } else {
+            execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
+        }
         match super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual) {
             Some(ffn) => execute_steps(gpu, &ctx, &[Step::GatedMlp(ffn)])
                 .map_err(|e| HipError::new(0, &e.to_string()))?,
@@ -5622,6 +5845,91 @@ pub fn forward_with_embedding(
 mod tests {
     use super::*;
     use hipfire_dispatch::pipeline::superop::SuperOpKind;
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_lab_indices_keep_identity_and_separate_packed_frontier() {
+        assert_eq!(positioned_lab_indices(0, 0, 128, 32, 4).unwrap(), (0, 0));
+        assert_eq!(
+            positioned_lab_indices(31, 31, 128, 32, 4).unwrap(),
+            (31, 31)
+        );
+        assert_eq!(
+            positioned_lab_indices(100, 7, 128, 32, 8).unwrap(),
+            (100, 7)
+        );
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_lab_indices_refuse_bounds_overflow_and_short_buffer() {
+        for (absolute, packed, logical, physical, bytes) in [
+            (128, 7, 128, 32, 4),
+            (100, 32, 128, 32, 4),
+            (0, 1, 128, 32, 4),
+            (0, 0, 128, 32, 3),
+            (0, 0, 128, 0, 4),
+            (0, 0, 0, 32, 4),
+            (usize::MAX, usize::MAX, usize::MAX, usize::MAX, 4),
+            (i32::MAX as usize + 1, 0, usize::MAX, 32, 4),
+            (
+                i32::MAX as usize,
+                i32::MAX as usize,
+                usize::MAX,
+                usize::MAX,
+                4,
+            ),
+        ] {
+            assert!(positioned_lab_indices(absolute, packed, logical, physical, bytes).is_err());
+        }
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_lab_admission_is_narrow_and_gpu_free() {
+        let admitted = PositionedLabAdmission {
+            dense: true,
+            legacy_q8: true,
+            adaptive: false,
+            compact_offset: 0,
+            cpu_offload: false,
+            capture: false,
+            replay: false,
+        };
+        admitted.validate().unwrap();
+        for rejected in [
+            PositionedLabAdmission {
+                dense: false,
+                ..admitted
+            },
+            PositionedLabAdmission {
+                legacy_q8: false,
+                ..admitted
+            },
+            PositionedLabAdmission {
+                adaptive: true,
+                ..admitted
+            },
+            PositionedLabAdmission {
+                compact_offset: 1,
+                ..admitted
+            },
+            PositionedLabAdmission {
+                cpu_offload: true,
+                ..admitted
+            },
+            PositionedLabAdmission {
+                capture: true,
+                ..admitted
+            },
+            PositionedLabAdmission {
+                replay: true,
+                ..admitted
+            },
+        ] {
+            assert!(rejected.validate().is_err(), "{rejected:?}");
+        }
+    }
 
     #[test]
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {

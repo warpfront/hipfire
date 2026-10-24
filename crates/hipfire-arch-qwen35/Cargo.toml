@@ -13,7 +13,7 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
 moe-oracle = []
 # GPU bring-up probes (host-mapped/offloaded weights); build with `--features lab`.
-lab = []
+lab = ["hipfire-runtime/lab"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
@@ -37,6 +37,14 @@ sha2.workspace = true
 # CPU transcription on identical inputs. Lives here (not in hipfire-cpu) so the
 # CPU crate keeps a GPU-free dependency list.
 hipfire-cpu = { path = "../hipfire-cpu" }
+
+[[example]]
+name = "qwen35_tiered_kv_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qwen35_tiered_prefill_oracle"
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "test_qwen35_load_multi"

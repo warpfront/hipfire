@@ -1,0 +1,78 @@
+{
+  "schema": "hipfire.tiered_kv_comparison.v1",
+  "pass": true,
+  "oracle_schema": "hipfire.tiered_kv_model.v2",
+  "scope": "Lab positional/state comparison only; NOT a quality, serving, or performance gate.",
+  "inputs": {
+    "baseline": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-baseline.json",
+      "sha256": "567b0408f99441ff5414a8edd66489a84c6ff3c2155dc166595d3760048a2d7a"
+    },
+    "identity": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-identity.json",
+      "sha256": "d0386b4db532d89d9022a63a07de9bfd1189b28fa3f62f2ce316d3f3a62e66a5"
+    },
+    "bounded": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-bounded.json",
+      "sha256": "2b30c49c3ac05ef8992e3db6fd5dd17eccbfbb14d97cccb7e0cddc78d07d9616"
+    },
+    "wrong-rope": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-wrong-rope.json",
+      "sha256": "ef085a9a0010e276b6d6c1fc97935e1bdfec9b0842bb09a2f619ed767c237e23"
+    },
+    "baseline_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-baseline.vram.json",
+      "sha256": "5aa0f0118a6fc12e586a205f166b5858adb1ca16d94c6aa0a6751160aee81d74"
+    },
+    "identity_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-identity.vram.json",
+      "sha256": "64e2fa91d7753b6b86952def257a19e95f7f52a2886c6421e448f7ccb8002cc3"
+    },
+    "bounded_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-bounded.vram.json",
+      "sha256": "61a2eb390af4d2b9e84552fbe5d57f6d14890d2a807835ae9c20e81a641088b3"
+    },
+    "wrong-rope_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model/27b-v3-long-wrong-rope.vram.json",
+      "sha256": "4dbf34183cd923fc11f82f9a78c3700981d7b61eae41c741923e49ebb9e1e98a"
+    }
+  },
+  "checks": [
+    "identity: full trace, prefill/final DN/KV/hidden and first FA K bit-exact",
+    "bounded: byte-verified staged history, common prefill/first token, real gap, smaller capacity, absolute-position FA K matches",
+    "wrong-rope: byte-verified staged history, common prefill/first token, real gap, smaller capacity, wrong-position FA K differs"
+  ],
+  "guard_evidence": {
+    "baseline": "sampled_guard_passed_not_hard_cap_proof",
+    "identity": "sampled_guard_passed_not_hard_cap_proof",
+    "bounded": "sampled_guard_passed_not_hard_cap_proof",
+    "wrong-rope": "sampled_guard_passed_not_hard_cap_proof"
+  },
+  "sparse_later_tokens_required_equal": false,
+  "validated_arms": {
+    "baseline": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 7199
+    },
+    "identity": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 7199
+    },
+    "bounded": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 2079
+    },
+    "wrong-rope": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 2079
+    }
+  }
+}

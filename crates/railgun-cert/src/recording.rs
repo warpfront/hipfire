@@ -1817,6 +1817,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "forward_scratch_positioned_lab",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
         function: "forward_scratch_dense_tp",
         occurrences: 1,
         decisions: &["graph-capture-lifecycle"],
@@ -1835,7 +1841,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "forward_batch_chunk_impl",
+        function: "forward_batch_chunk_impl_with_position",
         occurrences: 7,
         decisions: &[
             "q8-multirow-verify-attention",
@@ -1843,6 +1849,12 @@ pub const SITES: &[Site] = &[
             "captured-verify-attention-physical-cap",
             "gdn-chunk-scan",
         ],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_prefill_chunk_positioned_lab",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",

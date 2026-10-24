@@ -133,6 +133,8 @@ pub mod spec_emit;
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 
+#[cfg(all(feature = "deltanet", feature = "lab"))]
+pub use carrier::load_qwen35_bundle_bounded_lab;
 #[cfg(feature = "deltanet")]
 pub use carrier::{free_qwen35_bundle, load_bundle as load_qwen35_bundle, Qwen35Bundle};
 #[cfg(feature = "deltanet")]

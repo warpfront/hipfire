@@ -952,6 +952,62 @@ pub fn batch_chunk_full_attn_prepare(
     fa_gate_in_place: bool,
     tap: Option<BatchedAttentionTap<'_>>,
 ) -> HipResult<()> {
+    batch_chunk_full_attn_prepare_with_position(
+        gpu,
+        _fa_attn_multirow,
+        layer,
+        config,
+        pbs,
+        _s,
+        kv_cache,
+        n,
+        _start_pos,
+        _max_ctx_len,
+        _ctx,
+        _batch_semantics,
+        tree_verify,
+        _kv_layer_idx,
+        layer_idx,
+        fusion,
+        gfx12_fa_prep,
+        gfx12_fa_prep_fp8q,
+        fa_gate_in_place,
+        tap,
+        None,
+    )
+}
+
+/// Shared batched attention with a separate RoPE phase input. KV slots and
+/// causal frontiers remain packed; `None` preserves the ordinary route.
+pub fn batch_chunk_full_attn_prepare_with_position(
+    gpu: &mut Gpu,
+    // F2 split: the trailing KV-write + flash-attention dispatch moved to
+    // the caller, so these attend-only params are kept for signature
+    // stability but currently unused.
+    _fa_attn_multirow: bool,
+    layer: &AttentionLayerView<'_>,
+    config: &HybridDims,
+    pbs: &BatchScratch<'_>,
+    _s: &FlashScratch<'_>,
+    kv_cache: &KvView<'_>,
+    n: usize,
+    _start_pos: usize,
+    _max_ctx_len: usize,
+    _ctx: &DispatchCtx,
+    _batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    _kv_layer_idx: usize,
+    layer_idx: usize,
+    fusion: DflashFusionCtx,
+    gfx12_fa_prep: bool,
+    gfx12_fa_prep_fp8q: bool,
+    // The fp8q prep leaves the gate in `fa_q_full_batch` (no gate copy); the
+    // output projection must then read it in place (`fa_gate_in_place`) with
+    // the IU4 or FP8-stream sigmoid producer.
+    fa_gate_in_place: bool,
+    tap: Option<BatchedAttentionTap<'_>>,
+    rope_positions_override: Option<&GpuTensor>,
+) -> HipResult<()> {
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
@@ -968,7 +1024,9 @@ pub fn batch_chunk_full_attn_prepare(
     // 39aa358: in DDTree verify, rotate at DEPTH positions; KV writes below
     // still use flat physical slots. The fused kernel takes the same buffer
     // choice, so tree mode stays fused.
-    let fa_prep_rope_pos_buf = if tree_verify.is_some() {
+    let fa_prep_rope_pos_buf = if let Some(positions) = rope_positions_override {
+        positions
+    } else if tree_verify.is_some() {
         &pbs.rope_positions
     } else {
         &pbs.positions
@@ -1087,16 +1145,11 @@ pub fn batch_chunk_full_attn_prepare(
         // 39aa358: in DDTree verify, rotate at DEPTH positions (correct
         // sibling phases); KV writes below still use flat physical
         // slots. Linear path unchanged.
-        let rope_pos_buf = if tree_verify.is_some() {
-            &pbs.rope_positions
-        } else {
-            &pbs.positions
-        };
         fa_prep_unfused_rope(
             gpu,
             config,
             pbs,
-            rope_pos_buf,
+            fa_prep_rope_pos_buf,
             n,
             kv_cache.compact_offset as i32,
         )?;
@@ -2515,6 +2568,60 @@ pub fn batch_chunk_full_attn_attn(
     commit_stride: Option<usize>,
     tap: Option<BatchedAttentionTap<'_>>,
 ) -> HipResult<()> {
+    batch_chunk_full_attn_attn_with_position(
+        gpu,
+        fa_attn_multirow,
+        layer,
+        config,
+        pbs,
+        s,
+        kv_cache,
+        n,
+        dim,
+        start_pos,
+        max_ctx_len,
+        ctx,
+        batch_semantics,
+        tree_verify,
+        q8_wmma_arch,
+        arch_has_wmma,
+        kv_layer_idx,
+        layer_idx,
+        epilogue,
+        fusion,
+        commit_stride,
+        tap,
+        None,
+    )
+}
+
+/// Shared batched attention with a separate RoPE phase input. KV slots and
+/// causal frontiers remain packed; `None` preserves the ordinary route.
+pub fn batch_chunk_full_attn_attn_with_position(
+    gpu: &mut Gpu,
+    fa_attn_multirow: bool,
+    layer: &AttentionLayerView<'_>,
+    config: &HybridDims,
+    pbs: &BatchScratch<'_>,
+    s: &FlashScratch<'_>,
+    kv_cache: &KvView<'_>,
+    n: usize,
+    dim: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    kv_layer_idx: usize,
+    layer_idx: usize,
+    epilogue: BatchEpilogue<'_>,
+    fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
+    tap: Option<BatchedAttentionTap<'_>>,
+    rope_positions_override: Option<&GpuTensor>,
+) -> HipResult<()> {
     // Fully batched FA layer. Mirrors the FA branch of
     // forward_scratch_layers kernel-for-kernel, but every
     // launch covers all N tokens at once.
@@ -2593,7 +2700,10 @@ pub fn batch_chunk_full_attn_attn(
         fusion,
         math,
     )?;
-    let fa_pm_qprep = fusion == DflashFusionCtx::Off
+    // PM qprep reads pbs.positions for RoPE as well as KV addressing. Keep
+    // the separate-phase route on prep + attend until that ABI is split.
+    let fa_pm_qprep = rope_positions_override.is_none()
+        && fusion == DflashFusionCtx::Off
         && !gfx12_fa_prep
         && !gfx12_fa_prep_fp8q
         && !fa_gate_in_place
@@ -2614,7 +2724,7 @@ pub fn batch_chunk_full_attn_attn(
         batch_chunk_fa_pm_qprep_prep(gpu, layer.q_norm, layer.k_norm, config, pbs, kv_cache, n)?;
         batch_chunk_fa_pm_qprep_direct(gpu, config, pbs, kv_cache, n, max_ctx_len, layer_idx)?;
     } else {
-        batch_chunk_full_attn_prepare(
+        batch_chunk_full_attn_prepare_with_position(
             gpu,
             fa_attn_multirow,
             layer,
@@ -2635,6 +2745,7 @@ pub fn batch_chunk_full_attn_attn(
             gfx12_fa_prep_fp8q,
             fa_gate_in_place,
             tap,
+            rope_positions_override,
         )?;
     }
 

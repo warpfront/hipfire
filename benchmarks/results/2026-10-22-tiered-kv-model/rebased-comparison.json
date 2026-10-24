@@ -1,0 +1,78 @@
+{
+  "schema": "hipfire.tiered_kv_comparison.v1",
+  "pass": true,
+  "oracle_schema": "hipfire.tiered_kv_model.v2",
+  "scope": "Lab positional/state comparison only; NOT a quality, serving, or performance gate.",
+  "inputs": {
+    "baseline": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/baseline.json",
+      "sha256": "da9b748c12c9bb0fa688bb6a74e0f87718f016f43b91f498934227d6ad4f6f31"
+    },
+    "identity": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/identity.json",
+      "sha256": "bfe1c2faa9d2d0027566fa8e6c431a49470197b41df8e7df4a6aef560b08f860"
+    },
+    "bounded": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/bounded.json",
+      "sha256": "cf8b8cf8827de94ed2d23b2add8a58486529900d73bbf57d6adc81fdb8fb040e"
+    },
+    "wrong-rope": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/wrong-rope.json",
+      "sha256": "0d6beb59fae051c86f6c7d11c6c11f2258c00d20d8fc5e59ad7ca3280b0b867c"
+    },
+    "baseline_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/baseline.vram.json",
+      "sha256": "18c4db02d0e329636638664a126b27a8a53c58019c2f080bc6e419b3194e1074"
+    },
+    "identity_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/identity.vram.json",
+      "sha256": "592a0fd929c9c3804f086be8cb52e7f62e5b6d4a625b66020592327d7152c979"
+    },
+    "bounded_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/bounded.vram.json",
+      "sha256": "0a6708d67f862fd3ec2bec87e51b6c83c419467484ec7e8b7fd1b52ef2838d68"
+    },
+    "wrong-rope_guard": {
+      "path": "/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-tiered-kv/results/tiered-kv-model-rebased/wrong-rope.vram.json",
+      "sha256": "798fd990b8dcaafdb5966382c985ef7027e04c2184f8bb1af475a9bb4937f1e7"
+    }
+  },
+  "checks": [
+    "identity: full trace, prefill/final DN/KV/hidden and first FA K bit-exact",
+    "bounded: byte-verified staged history, common prefill/first token, real gap, smaller capacity, absolute-position FA K matches",
+    "wrong-rope: byte-verified staged history, common prefill/first token, real gap, smaller capacity, wrong-position FA K differs"
+  ],
+  "guard_evidence": {
+    "baseline": "sampled_guard_passed_not_hard_cap_proof",
+    "identity": "sampled_guard_passed_not_hard_cap_proof",
+    "bounded": "sampled_guard_passed_not_hard_cap_proof",
+    "wrong-rope": "sampled_guard_passed_not_hard_cap_proof"
+  },
+  "sparse_later_tokens_required_equal": false,
+  "validated_arms": {
+    "baseline": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 7199
+    },
+    "identity": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 7199
+    },
+    "bounded": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 2079
+    },
+    "wrong-rope": {
+      "requested_decode_tokens": 1024,
+      "generated_tokens": 1024,
+      "finish_reason": "length",
+      "physical_cap": 2079
+    }
+  }
+}

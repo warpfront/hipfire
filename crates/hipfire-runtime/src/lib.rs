@@ -105,6 +105,9 @@ pub mod sidecar;
 /// docs for the per-slot-absolute `positions[]` invariant.
 pub mod slot_batch;
 pub mod spec;
+/// Experimental host-history / bounded-device KV primitives; not a serve route.
+#[cfg(feature = "lab")]
+pub mod tiered_kv;
 
 pub mod ngram_mod;
 pub mod offload;

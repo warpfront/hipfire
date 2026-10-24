@@ -458,6 +458,32 @@ pub(crate) fn unspillable_no_fit_refusal(
 /// [`KvCache::free_gpu`]) and the original error is preserved with any
 /// cleanup/VMM-pending context appended.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
+    load_bundle_impl(src, ctx, None)
+}
+
+/// Lab-only dense text loader with a caller-owned physical KV row budget.
+///
+/// Allocates the bounded cache directly: `ctx.max_seq` remains the logical
+/// RoPE/context limit, while KV and decode attention scratch use `physical_cap`.
+/// No eviction, compaction, or logical-to-physical mapping is installed here;
+/// the caller must manage packed rows and never use ordinary append beyond the
+/// physical budget. Only single-GPU legacy Q8/Q8, non-adaptive, non-speculative
+/// text loads are admitted. Unlike the normal loader, sequence auto-sizing is
+/// intentionally not run: its full-history KV budget is not this lab contract.
+#[cfg(feature = "lab")]
+pub fn load_qwen35_bundle_bounded_lab(
+    src: ModelSource,
+    ctx: &mut LoadCtx,
+    physical_cap: usize,
+) -> Result<Qwen35Bundle, String> {
+    load_bundle_impl(src, ctx, Some(physical_cap))
+}
+
+fn load_bundle_impl(
+    src: ModelSource,
+    ctx: &mut LoadCtx,
+    bounded_lab_cap: Option<usize>,
+) -> Result<Qwen35Bundle, String> {
     let ModelSource::Hfq(mut hfq) = src else {
         return Err("qwen35: directory source unsupported".into());
     };
@@ -466,7 +492,13 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
-    let mut plan = plan_qwen35_gpu_stages(&config, ctx)?;
+    if let Some(cap) = bounded_lab_cap {
+        validate_bounded_lab_request(&hfq, &config, ctx, cap)?;
+    }
+    let mut plan = plan_qwen35_gpu_stages(&config, ctx, bounded_lab_cap)?;
+    if bounded_lab_cap.is_some() {
+        validate_bounded_lab_kv(ctx.kv_backend, plan.pair, plan.adaptive.is_some())?;
+    }
     // Placement is resolved once, here, against the measured capacity a
     // configured spill must fit — before any allocation. `None` (no knob) keeps
     // the load byte-identical to the pre-offload loader.
@@ -509,7 +541,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     let weights_ms = weights_started.elapsed().as_secs_f64() * 1e3;
     // The real card bound is determined only now: weights (including any
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
-    if let Some(mut sequence) = ctx.sequence {
+    if let Some(mut sequence) = ctx.sequence.filter(|_| bounded_lab_cap.is_none()) {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
             let (free, _) = ctx
                 .gpu
@@ -551,7 +583,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         }
         sequence.card_cap = card_cap;
         ctx.sequence = Some(sequence);
-        plan = match plan_qwen35_gpu_stages(&config, ctx) {
+        plan = match plan_qwen35_gpu_stages(&config, ctx, None) {
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
@@ -626,6 +658,102 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     })
 }
 
+/// Pure validation: no clamping, no env override, and no full-history fallback.
+fn validate_bounded_lab_cap(max_seq: usize, physical_cap: usize) -> Result<usize, String> {
+    if physical_cap == 0 || physical_cap >= max_seq {
+        return Err(format!(
+            "bounded KV lab requires 0 < physical_cap < logical max_seq (got physical_cap={physical_cap}, max_seq={max_seq})"
+        ));
+    }
+    Ok(physical_cap)
+}
+
+fn validate_bounded_lab_kv(
+    backend: KvBackend,
+    pair: kv_mode::KvPair,
+    adaptive: bool,
+) -> Result<(), String> {
+    if backend != KvBackend::Legacy
+        || adaptive
+        || !matches!(
+            pair,
+            kv_mode::KvPair::Native(kv_mode::KvMode::Q8)
+                | kv_mode::KvPair::Split(kv_mode::KvMode::Q8, llama::VMode::Q8)
+        )
+    {
+        return Err("bounded KV lab requires legacy backend, static Q8/Q8 KV".into());
+    }
+    Ok(())
+}
+
+/// Header/typed-load checks only; runs before placement queries or GPU upload.
+fn validate_bounded_lab_request(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    physical_cap: usize,
+) -> Result<(), String> {
+    validate_bounded_lab_cap(ctx.max_seq, physical_cap)?;
+    let refuse = |what: &str| Err(format!("bounded KV lab does not support {what}"));
+    if hfq.arch_id != 5 || config.num_experts != 0 {
+        return refuse("non-dense Qwen3.5 HFQ models");
+    }
+    if ctx.pp != 1 {
+        return refuse("pipeline parallelism (requires pp=1)");
+    }
+    if ctx.cask.sidecar.is_some() || ctx.cask.cask_m_folding || ctx.cask.handoff_tokens != 0 {
+        return refuse("CASK");
+    }
+    if ctx.draft_path.is_some()
+        || ctx.mtp_path.is_some()
+        || ctx.gemma4_drafter_path.is_some()
+        || ctx.spec.mtp == Some(true)
+        || ctx.spec.dflash == Some(true)
+        || ctx.spec.dspark == Some(true)
+        || ctx.spec.ngram_draft == Some(true)
+    {
+        return refuse("draft models or speculative decoding");
+    }
+    if ctx.vision_mode != "off"
+        || ctx.vision_path.is_some()
+        || hfq
+            .tensor_infos()
+            .iter()
+            .any(|t| t.name.starts_with("model.visual."))
+    {
+        return refuse("vision (requires vision_mode=off and a text-only HFQ)");
+    }
+    if ctx.xdna.is_some() {
+        return refuse("XDNA sidecars");
+    }
+    if config.n_kv_heads == 0
+        || config.head_dim == 0
+        || config.head_dim % 32 != 0
+        || !config.layer_types.contains(&LayerType::FullAttention)
+    {
+        return refuse("invalid Q8 attention geometry");
+    }
+    // Match the capped Q8 constructor's rounded u32 storage arithmetic before
+    // it can overflow, panic, or turn an enormous request into a small buffer.
+    let full_layers = config
+        .layer_types
+        .iter()
+        .filter(|&&t| t == LayerType::FullAttention)
+        .count();
+    config
+        .n_kv_heads
+        .checked_mul(config.head_dim)
+        .and_then(|_| config.n_kv_heads.checked_mul(config.head_dim / 32))
+        .and_then(|blocks| physical_cap.checked_mul(blocks))
+        .and_then(|blocks| blocks.checked_mul(34))
+        .and_then(|bytes| bytes.checked_add(3))
+        .and_then(|rounded| (rounded / 4).checked_mul(4))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_mul(full_layers))
+        .ok_or("bounded KV lab Q8 allocation sizing overflow")?;
+    Ok(())
+}
+
 /// CPU-resolved KV construction inputs. Built before any weight upload so
 /// malformed adaptive / V / compat configs never touch device memory.
 struct Qwen35KvPlan {
@@ -638,7 +766,11 @@ struct Qwen35KvPlan {
 }
 
 /// All CPU-only validation that must precede `load_weights`.
-fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35KvPlan, String> {
+fn plan_qwen35_gpu_stages(
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    bounded_lab_cap: Option<usize>,
+) -> Result<Qwen35KvPlan, String> {
     let mode_raw = ctx
         .kv_mode_override
         .filter(|s| !s.is_empty())
@@ -747,7 +879,12 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         }
     }
 
-    let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
+    // The lab path does not borrow CASK's cap policy or its env override.
+    // Thread the caller's validated cap into the *initial* allocation plan.
+    let physical_cap = match bounded_lab_cap {
+        Some(cap) => validate_bounded_lab_cap(ctx.max_seq, cap)?,
+        None => ctx.cask.physical_cap(ctx.max_seq)?,
+    };
     let dims = KvDims {
         layers: KvLayers::Mask(is_kv_layer.clone()),
         n_kv_heads: config.n_kv_heads,
@@ -1553,6 +1690,46 @@ mod tests {
     use super::*;
     use hipfire_runtime::kv_adaptive::{KMode, Preset};
     use hipfire_runtime::llama::VMode;
+
+    #[test]
+    fn bounded_lab_cap_is_exact_and_never_clamped() {
+        assert_eq!(validate_bounded_lab_cap(1_000_000, 513).unwrap(), 513);
+        assert_eq!(validate_bounded_lab_cap(2, 1).unwrap(), 1);
+        assert_eq!(validate_bounded_lab_cap(usize::MAX, 4096).unwrap(), 4096);
+        for (logical, physical) in [
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (512, 512),
+            (512, 513),
+            (512, usize::MAX),
+        ] {
+            assert!(
+                validate_bounded_lab_cap(logical, physical).is_err(),
+                "logical={logical}, physical={physical}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_lab_kv_envelope_is_fail_closed() {
+        use kv_mode::{KvMode, KvPair};
+        let q8 = KvPair::Split(KvMode::Q8, VMode::Q8);
+        assert!(validate_bounded_lab_kv(KvBackend::Legacy, q8, false).is_ok());
+        assert!(
+            validate_bounded_lab_kv(KvBackend::Legacy, KvPair::Native(KvMode::Q8), false).is_ok()
+        );
+        assert!(validate_bounded_lab_kv(KvBackend::Vmm, q8, false).is_err());
+        assert!(validate_bounded_lab_kv(KvBackend::Legacy, q8, true).is_err());
+        for pair in [
+            KvPair::Native(KvMode::Fp8),
+            KvPair::Native(KvMode::Bf16),
+            KvPair::Split(KvMode::Fwht3, VMode::Q8),
+            KvPair::Split(KvMode::Q8, VMode::Lloyd4),
+        ] {
+            assert!(validate_bounded_lab_kv(KvBackend::Legacy, pair, false).is_err());
+        }
+    }
 
     #[test]
     fn parse_presets_agree_with_controller_floors() {

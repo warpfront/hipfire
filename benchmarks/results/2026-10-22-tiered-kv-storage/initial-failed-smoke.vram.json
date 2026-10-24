@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "guard_kind": "sampled_not_hard_limit",
+  "limitations": "Device-wide sampling can miss short spikes or overshoot; not a hard allocation cap. Escaped process groups are not contained. Unrelated GPU users are never signalled.",
+  "pci_bdf": "0000:9e:00.0",
+  "command": [
+    "target/release/examples/tiered_kv_storage_oracle",
+    "--history-tokens",
+    "8192",
+    "--window-tokens",
+    "4096",
+    "--out",
+    "results/tiered-kv/smoke.json"
+  ],
+  "limit_bytes": 25769803776,
+  "safety_margin_bytes": 536870912,
+  "guard_limit_bytes": 25232932864,
+  "sample_interval_seconds": 0.05,
+  "baseline_bytes": 72835072,
+  "peak_bytes": 793190400,
+  "peak_delta_bytes": 720355328,
+  "samples": [
+    {
+      "elapsed_seconds": 0.0008629539515823126,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.0015085380291566253,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.051642547943629324,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.10182352794799954,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.15200374694541097,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.20218517794273794,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.25239009503275156,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.302571284933947,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.35277979902457446,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.4029602180235088,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.4531400860287249,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.5033220279728994,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.553503438946791,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.603685932001099,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.6538661399390548,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    },
+    {
+      "elapsed_seconds": 0.7040489140199497,
+      "vram_used_bytes": 72847360,
+      "raw": "72847360\n"
+    },
+    {
+      "elapsed_seconds": 0.7541858890326694,
+      "vram_used_bytes": 72888320,
+      "raw": "72888320\n"
+    },
+    {
+      "elapsed_seconds": 0.8043503869557753,
+      "vram_used_bytes": 781783040,
+      "raw": "781783040\n"
+    },
+    {
+      "elapsed_seconds": 0.8548433580435812,
+      "vram_used_bytes": 788201472,
+      "raw": "788201472\n"
+    },
+    {
+      "elapsed_seconds": 0.9050333959748968,
+      "vram_used_bytes": 788287488,
+      "raw": "788287488\n"
+    },
+    {
+      "elapsed_seconds": 0.9552168609807268,
+      "vram_used_bytes": 788385792,
+      "raw": "788385792\n"
+    },
+    {
+      "elapsed_seconds": 1.005441615008749,
+      "vram_used_bytes": 788496384,
+      "raw": "788496384\n"
+    },
+    {
+      "elapsed_seconds": 1.0556243780301884,
+      "vram_used_bytes": 788606976,
+      "raw": "788606976\n"
+    },
+    {
+      "elapsed_seconds": 1.1057805309537798,
+      "vram_used_bytes": 788705280,
+      "raw": "788705280\n"
+    },
+    {
+      "elapsed_seconds": 1.155960539006628,
+      "vram_used_bytes": 788815872,
+      "raw": "788815872\n"
+    },
+    {
+      "elapsed_seconds": 1.2061423800187185,
+      "vram_used_bytes": 788914176,
+      "raw": "788914176\n"
+    },
+    {
+      "elapsed_seconds": 1.2563565940363333,
+      "vram_used_bytes": 788951040,
+      "raw": "788951040\n"
+    },
+    {
+      "elapsed_seconds": 1.3065377350430936,
+      "vram_used_bytes": 788951040,
+      "raw": "788951040\n"
+    },
+    {
+      "elapsed_seconds": 1.3567184139974415,
+      "vram_used_bytes": 788951040,
+      "raw": "788951040\n"
+    },
+    {
+      "elapsed_seconds": 1.4068998949369416,
+      "vram_used_bytes": 788951040,
+      "raw": "788951040\n"
+    },
+    {
+      "elapsed_seconds": 1.4570803840178996,
+      "vram_used_bytes": 788951040,
+      "raw": "788951040\n"
+    },
+    {
+      "elapsed_seconds": 1.5072613640222698,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.5574424039805308,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.6076230829348788,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.657803370966576,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.707994019961916,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.7581738969311118,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.8083756170235574,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.8585571079747751,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.9087380879791453,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 1.9589193479623646,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.0090744679328054,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.0592521210201085,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.1094344429438934,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.1596157039748505,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.2097971140174195,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.259978284011595,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.3101676600053906,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.3603717340156436,
+      "vram_used_bytes": 793190400,
+      "raw": "793190400\n"
+    },
+    {
+      "elapsed_seconds": 2.410552122979425,
+      "vram_used_bytes": 323207168,
+      "raw": "323207168\n"
+    },
+    {
+      "elapsed_seconds": 2.4607324509415776,
+      "vram_used_bytes": 276660224,
+      "raw": "276660224\n"
+    },
+    {
+      "elapsed_seconds": 2.5109141019638628,
+      "vram_used_bytes": 72835072,
+      "raw": "72835072\n"
+    }
+  ],
+  "child_pid": 2796655,
+  "child_exit_code": 1,
+  "termination_signals": [
+    "SIGTERM",
+    "SIGKILL"
+  ],
+  "status": "completed",
+  "sysfs_counter": "/sys/class/drm/card0/device/mem_info_vram_used",
+  "resolved_counter": "/sys/devices/pci0000:9b/0000:9b:01.1/0000:9c:00.0/0000:9d:00.0/0000:9e:00.0/mem_info_vram_used",
+  "elapsed_seconds": 4.511133361957036,
+  "exit_code": 1
+}

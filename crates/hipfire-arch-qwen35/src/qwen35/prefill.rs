@@ -48,10 +48,10 @@ use hipfire_dispatch::pipeline::batched::{
     TreeVerifyCtx,
 };
 use hipfire_dispatch::pipeline::batched_attention::{
-    batch_chunk_fa_attend, batch_chunk_full_attn_attn, batch_chunk_full_attn_input_projection,
-    batch_chunk_full_attn_output_projection, batch_chunk_full_attn_prepare,
-    dflash_fa_batch_fusion_admitted, execute_fa_attend_step, fa_pertoken_min_ctx,
-    fa_prep_unfused_qk_norm, fa_prep_unfused_rope, gfx12_fa_prep_admitted,
+    batch_chunk_fa_attend, batch_chunk_full_attn_attn, batch_chunk_full_attn_attn_with_position,
+    batch_chunk_full_attn_input_projection, batch_chunk_full_attn_output_projection,
+    batch_chunk_full_attn_prepare, dflash_fa_batch_fusion_admitted, execute_fa_attend_step,
+    fa_pertoken_min_ctx, fa_prep_unfused_qk_norm, fa_prep_unfused_rope, gfx12_fa_prep_admitted,
     q8_multirow_attn_admitted,
 };
 use hipfire_dispatch::pipeline::batched_deltanet::{
@@ -5273,6 +5273,397 @@ fn prefill_dispatch_workload(
     }
 }
 
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug)]
+struct PositionedPrefillAdmission {
+    dense: bool,
+    legacy_q8: bool,
+    lean: bool,
+    adaptive: bool,
+    cask: bool,
+    compact_offset: usize,
+    cpu_offload: bool,
+    capture: bool,
+    replay: bool,
+    verify_scope: bool,
+    iu4_verify_scope: bool,
+}
+
+#[cfg(feature = "lab")]
+impl PositionedPrefillAdmission {
+    fn validate(self) -> HipResult<()> {
+        if !self.dense
+            || !self.legacy_q8
+            || self.lean
+            || self.adaptive
+            || self.cask
+            || self.compact_offset != 0
+            || self.cpu_offload
+            || self.capture
+            || self.replay
+            || self.verify_scope
+            || self.iu4_verify_scope
+        {
+            return Err(HipError::new(
+                0,
+                "positioned lab prefill requires dense legacy Q8/Q8 and full caller PBS; \
+                 no adaptive KV, CASK, compaction, CPU offload, capture, replay or verify scope",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Pure checked geometry, including BOTH exclusive frontiers: launchers pass
+/// packed_end as i32, while each absolute position is an i32 RoPE input.
+#[cfg(feature = "lab")]
+fn positioned_prefill_geometry(
+    absolute_start: usize,
+    packed_start: usize,
+    n: usize,
+    max_batch: usize,
+    logical_bound: usize,
+    physical_cap: usize,
+    positions_bytes: usize,
+    rope_positions_bytes: usize,
+) -> HipResult<(usize, usize)> {
+    let absolute_end = checked_kv_end(absolute_start, n, "positioned lab prefill")?;
+    let packed_end = checked_kv_end(packed_start, n, "positioned lab prefill")?;
+    if n == 0
+        || n > 512
+        || n > max_batch
+        || max_batch > 512
+        || packed_start > absolute_start
+        || absolute_end > logical_bound
+        || packed_end > physical_cap
+        || positions_bytes < n * 4
+        || rope_positions_bytes < n * 4
+        || absolute_end > i32::MAX as usize
+        || packed_end > i32::MAX as usize
+    {
+        return Err(HipError::new(
+            0,
+            "positioned lab prefill: require 1..=512 rows, bounded full PBS, \
+             valid absolute/packed frontiers and complete position buffers",
+        ));
+    }
+    Ok((absolute_end, packed_end))
+}
+
+#[cfg(feature = "lab")]
+fn positioned_prefill_bytes(factors: &[usize]) -> HipResult<usize> {
+    factors
+        .iter()
+        .try_fold(1usize, |a, &b| a.checked_mul(b))
+        .ok_or_else(|| HipError::new(0, "positioned lab prefill: buffer extent overflow"))
+}
+
+/// The dense chunk scan aliases raw Q as an A workspace with C64-padded rows.
+/// Validate this before uploads, not only when the shared scan builds its views.
+#[cfg(feature = "lab")]
+fn positioned_prefill_raw_q_bytes(n: usize, k_dim: usize) -> HipResult<usize> {
+    positioned_prefill_bytes(&[n.div_ceil(64), 64, k_dim, 4])
+}
+
+#[cfg(feature = "lab")]
+fn positioned_prefill_buffer(tensor: &GpuTensor, bytes: usize) -> HipResult<()> {
+    positioned_prefill_buffer_extent(
+        tensor.buf.size(),
+        bytes,
+        tensor.buf.is_vmm_owner(),
+        tensor.buf.is_host_mapped(),
+    )
+}
+
+#[cfg(feature = "lab")]
+fn positioned_prefill_buffer_extent(
+    actual: usize,
+    required: usize,
+    vmm: bool,
+    host: bool,
+) -> HipResult<()> {
+    if actual < required || vmm || host {
+        return Err(HipError::new(
+            0,
+            "positioned lab prefill: missing, short or non-legacy physical buffer",
+        ));
+    }
+    Ok(())
+}
+
+/// Lab-only eager text prefill of ONE bounded chunk, with independent absolute
+/// RoPE phases and packed KV slots. Every row executes the whole model once:
+/// DeltaNet advances over the complete logical stream, not selected history.
+/// The caller must initialize all packed rows `0..packed_start` contiguously,
+/// then this call writes `packed_start..packed_start + tokens.len()`. Attention
+/// uses that packed causal frontier; no selection, archive or KV commit occurs.
+///
+/// Supply a fixed full (not lean) `PrefillBatchScratch::new[_opt]` of at most
+/// 512 rows, made for this config. It remains caller-owned and must stay live
+/// until GPU work finishes. No outer scheduler, hidden ring, tape, tree, mask,
+/// band, MoE, VMM, adaptive KV, CASK, graph or serving route is entered. All
+/// admission/geometry rejection precedes uploads and recurrent/KV writes.
+/// Last-token logits are left in `scratch.logits`. A one-row chunk is supported
+/// but still uses batched arithmetic (ordinary prefill falls back to decode
+/// for one row); compare identity with an identical >=2-row chunk schedule.
+#[cfg(feature = "lab")]
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_chunk_positioned_lab(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    absolute_start: usize,
+    packed_start: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<()> {
+    PositionedPrefillAdmission {
+        dense: config.num_experts == 0
+            && weights.ep_shard.is_none()
+            && weights.layers.len() == config.n_layers
+            && config.layer_types.len() == config.n_layers
+            && weights
+                .layers
+                .iter()
+                .zip(&config.layer_types)
+                .all(|(layer, kind)| {
+                    matches!(
+                        (layer, kind),
+                        (LayerWeights::DeltaNet(_), LayerType::LinearAttention)
+                            | (LayerWeights::FullAttn(_), LayerType::FullAttention)
+                    )
+                }),
+        legacy_q8: !kv_cache.uses_vmm_backend()
+            && kv_cache.quantized
+            && kv_cache.quant_q8
+            && kv_cache.v_mode == llama::VMode::Q8
+            && !kv_cache.quant_int8
+            && !kv_cache.quant_hfq4
+            && !kv_cache.quant_asym4
+            && !kv_cache.quant_asym3
+            && !kv_cache.quant_asym2
+            && !kv_cache.quant_fwht
+            && !kv_cache.quant_bf16
+            && !kv_cache.quant_fp8
+            && kv_cache.k_scales.is_empty()
+            && kv_cache.v_scales.is_empty(),
+        lean: pbs.lean,
+        adaptive: !matches!(
+            hipfire_runtime::config::get().kv_adaptive.as_str(),
+            "" | "off"
+        ),
+        cask: hipfire_runtime::triattn::tap_enabled()
+            || hipfire_config::process_value("HIPFIRE_CASK_SIDECAR").is_some_and(|v| !v.is_empty()),
+        compact_offset: kv_cache.compact_offset,
+        cpu_offload: gpu.owns_host_cpu_weights(),
+        capture: gpu.graphs.capture_mode,
+        replay: gpu.replay.is_enabled()
+            || gpu.replay.is_recording()
+            || gpu.graphs.ar_forward_replay_enabled
+            || gpu.graphs.graph_exec.is_some(),
+        verify_scope: gpu.fp8_verify_scope,
+        iu4_verify_scope: gpu.iu4_verify_scope,
+    }
+    .validate()?;
+    let n = tokens.len();
+    let (_, packed_end) = positioned_prefill_geometry(
+        absolute_start,
+        packed_start,
+        n,
+        pbs.max_batch,
+        kv_cache.max_seq,
+        kv_cache.physical_cap,
+        pbs.positions.buf.size(),
+        pbs.rope_positions.buf.size(),
+    )?;
+    // FullAttention MUST use the batched prep that accepts the explicit RoPE
+    // input; never silently take the per-token fallback's slot-based RoPE.
+    for layer in &weights.layers {
+        qwen35_layer_batch_admissible(layer, config, &gpu.arch)?;
+    }
+    if tokens
+        .iter()
+        .any(|&t| t as usize >= config.vocab_size || t > i32::MAX as u32)
+        || kv_cache.n_kv_heads != config.n_kv_heads
+        || kv_cache.head_dim != config.head_dim
+        || config.n_heads == 0
+        || config.n_kv_heads == 0
+        || !config.n_heads.is_multiple_of(config.n_kv_heads)
+        || config.head_dim == 0
+        || !config.head_dim.is_multiple_of(32)
+        || pbs.positions.buf.as_ptr() == pbs.rope_positions.buf.as_ptr()
+    {
+        return Err(HipError::new(
+            0,
+            "positioned lab prefill: invalid token or KV/position geometry",
+        ));
+    }
+    let kv_dim = positioned_prefill_bytes(&[config.n_kv_heads, config.head_dim])?;
+    if kv_cache.kv_dim != kv_dim {
+        return Err(HipError::new(
+            0,
+            "positioned lab prefill: KV row geometry mismatch",
+        ));
+    }
+    let q8_bytes =
+        positioned_prefill_bytes(&[packed_end, config.n_kv_heads, config.head_dim / 32, 34])?;
+    for (idx, layer) in weights.layers.iter().enumerate() {
+        if matches!(layer, LayerWeights::FullAttn(_)) {
+            for side in [&kv_cache.k_gpu, &kv_cache.v_gpu] {
+                let tensor = side
+                    .get(idx)
+                    .ok_or_else(|| HipError::new(0, "positioned lab prefill: missing Q8 side"))?;
+                positioned_prefill_buffer(tensor, q8_bytes)?;
+            }
+        }
+    }
+    // Read actual physical extents, not only max_batch / physical_cap metadata.
+    let k_dim =
+        positioned_prefill_bytes(&[config.linear_num_key_heads, config.linear_key_head_dim])?;
+    let v_dim =
+        positioned_prefill_bytes(&[config.linear_num_value_heads, config.linear_value_head_dim])?;
+    let q_dim = positioned_prefill_bytes(&[config.n_heads, config.head_dim])?;
+    let qkv_dim = k_dim
+        .checked_mul(2)
+        .and_then(|k| k.checked_add(v_dim))
+        .ok_or_else(|| HipError::new(0, "positioned lab prefill: QKV size overflow"))?;
+    let folded_dim = v_dim
+        .checked_add(256)
+        .ok_or_else(|| HipError::new(0, "positioned lab prefill: folded size overflow"))?;
+    for (tensor, width) in [
+        (&pbs.x_batch, config.dim),
+        (&pbs.x_rot_batch, config.dim),
+        (&pbs.x_norm_batch, config.dim),
+        (&pbs.dn_qkv_batch, qkv_dim),
+        (&pbs.dn_z_batch, v_dim),
+        (&pbs.dn_z_fold_batch, folded_dim),
+        (&pbs.dn_alpha_batch, config.linear_num_value_heads),
+        (&pbs.dn_beta_batch, config.linear_num_value_heads),
+        (&pbs.dn_k_raw_batch, k_dim),
+        (&pbs.dn_v_batch, v_dim),
+        (&pbs.dn_q_batch, v_dim),
+        (&pbs.dn_k_batch, v_dim),
+        (&pbs.dn_attn_out_batch, v_dim),
+        (&pbs.dn_normed_batch, v_dim),
+        (&pbs.dn_normed_rot_batch, v_dim),
+        (&pbs.gate_ffn_batch, config.hidden_dim),
+        (&pbs.up_batch, config.hidden_dim),
+        (&pbs.ffn_hidden_batch, config.hidden_dim),
+        (&pbs.positions, 1),
+        (&pbs.rope_positions, 1),
+        (&pbs.tokens, 1),
+        (&pbs.fa_q_full_batch, positioned_prefill_bytes(&[q_dim, 2])?),
+        (&pbs.fa_q_batch, q_dim),
+        (&pbs.fa_gate_batch, q_dim),
+        (&pbs.fa_k_batch, kv_dim),
+        (&pbs.fa_v_batch, kv_dim),
+        (&pbs.fa_attn_out_batch, q_dim),
+        (&pbs.fa_attn_out_rot_batch, q_dim),
+    ] {
+        positioned_prefill_buffer(tensor, positioned_prefill_bytes(&[n, width, 4])?)?;
+    }
+    positioned_prefill_buffer(
+        &pbs.dn_q_raw_batch,
+        positioned_prefill_raw_q_bytes(n, k_dim)?,
+    )?;
+    for (tensor, width) in [
+        (&pbs.x_rot_f16_batch, config.dim),
+        (&pbs.dn_normed_rot_f16_batch, v_dim),
+        (&pbs.ffn_hidden_f16_batch, config.hidden_dim),
+        (&pbs.fa_attn_out_rot_f16_batch, q_dim),
+    ] {
+        positioned_prefill_buffer(tensor, positioned_prefill_bytes(&[n, width, 2])?)?;
+    }
+    let n_la = config
+        .layer_types
+        .iter()
+        .filter(|&&t| t == LayerType::LinearAttention)
+        .count();
+    if dn_state.s_matrices.len() != n_la
+        || dn_state.conv_states.len() != n_la
+        || dn_state.s_scales.len() != n_la
+        || (!dn_state.s_ef_residual.is_empty() && dn_state.s_ef_residual.len() != n_la)
+        || (n_la > 0
+            && (config.linear_key_head_dim == 0
+                || config.linear_key_head_dim != config.linear_value_head_dim
+                || config.conv_kernel_dim == 0))
+    {
+        return Err(HipError::new(
+            0,
+            "positioned lab prefill: invalid single-lane DeltaNet state",
+        ));
+    }
+    let state_elems = positioned_prefill_bytes(&[
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+        config.linear_key_head_dim,
+    ])?;
+    let conv_elems =
+        positioned_prefill_bytes(&[qkv_dim, config.conv_kernel_dim.saturating_sub(1)])?;
+    for idx in 0..n_la {
+        let (s_bytes, scales) = match dn_state.quant {
+            StateQuant::FP32 => (
+                positioned_prefill_bytes(&[state_elems, 4])?,
+                config.linear_num_value_heads,
+            ),
+            StateQuant::Q8 => (state_elems, v_dim),
+            StateQuant::Q4 => (state_elems / 2, v_dim),
+        };
+        // Reject multi-lane owners, not just undersized state, before recurrence.
+        if dn_state.s_matrices[idx].buf.size() != s_bytes {
+            return Err(HipError::new(
+                0,
+                "positioned lab prefill: DeltaNet state is not single-lane",
+            ));
+        }
+        positioned_prefill_buffer(&dn_state.s_matrices[idx], s_bytes)?;
+        positioned_prefill_buffer(
+            &dn_state.s_scales[idx],
+            positioned_prefill_bytes(&[scales, 4])?,
+        )?;
+        positioned_prefill_buffer(
+            &dn_state.conv_states[idx],
+            positioned_prefill_bytes(&[conv_elems, 4])?,
+        )?;
+        if let Some(ef) = dn_state.s_ef_residual.get(idx) {
+            positioned_prefill_buffer(ef, positioned_prefill_bytes(&[state_elems, 2])?)?;
+        }
+    }
+    // Match ordinary eager prefill's dispatch scope even if a prior decode
+    // left plain-AR eligibility set. This is after every admission check.
+    gpu.replay.enter_batched_forward();
+    forward_batch_chunk_impl_with_position(
+        gpu,
+        weights,
+        config,
+        tokens,
+        packed_start,
+        kv_cache,
+        dn_state,
+        scratch,
+        pbs,
+        None,
+        None,
+        None,
+        0,
+        None,
+        false,
+        false,
+        None,
+        None,
+        true,
+        None,
+        None,
+        BatchSemantics::Sequential,
+        DflashFusionCtx::Off,
+        None,
+        Some(absolute_start),
+    )
+}
+
 pub(crate) fn forward_prefill_chunk(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -6994,6 +7385,63 @@ pub(crate) fn forward_batch_chunk_impl(
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
 ) -> HipResult<()> {
+    forward_batch_chunk_impl_with_position(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        s,
+        pbs,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tape_offset,
+        tree_verify,
+        pre_uploaded,
+        pre_embedded,
+        band,
+        mask_override,
+        needs_last_token_logits,
+        max_layer,
+        routed_out,
+        batch_semantics,
+        fusion,
+        commit_stride,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_chunk_impl_with_position(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<HiddenRowsOut<'_>>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tape_offset: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
+    pre_embedded: bool,
+    band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
+    max_layer: Option<usize>,
+    routed_out: Option<&GpuTensor>,
+    batch_semantics: BatchSemantics<'_>,
+    fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
+    absolute_start_override: Option<usize>,
+) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
@@ -7118,6 +7566,15 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify,
         pre_uploaded,
     )?;
+    // Only the lab entry supplies this override, after its complete read-only
+    // admission preflight. Packed positions remain untouched for all KV writes,
+    // causal masks and attention frontiers; FullAttention prep alone reads the
+    // separate absolute phases. DeltaNet still runs once over every input row.
+    if let Some(absolute_start) = absolute_start_override {
+        let positions: Vec<i32> = (0..n).map(|i| (absolute_start + i) as i32).collect();
+        let bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
+        gpu.hip.memcpy_htod(&pbs.rope_positions.buf, bytes)?;
+    }
 
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
@@ -7353,7 +7810,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) if fa_batched_ok => {
-                batch_chunk_full_attn_attn(
+                batch_chunk_full_attn_attn_with_position(
                     gpu,
                     fa_attn_multirow,
                     &layer.mixer_view(),
@@ -7376,6 +7833,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     fusion,
                     commit_stride,
                     tap,
+                    absolute_start_override.map(|_| &pbs.rope_positions),
                 )?;
                 layer.ffn_rows(
                     gpu,
@@ -7913,6 +8371,157 @@ mod tests {
     };
     use rdna_compute::DType;
 
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_prefill_admission_rejects_each_unsupported_route() {
+        let valid = PositionedPrefillAdmission {
+            dense: true,
+            legacy_q8: true,
+            lean: false,
+            adaptive: false,
+            cask: false,
+            compact_offset: 0,
+            cpu_offload: false,
+            capture: false,
+            replay: false,
+            verify_scope: false,
+            iu4_verify_scope: false,
+        };
+        assert!(valid.validate().is_ok());
+        for invalid in [
+            PositionedPrefillAdmission {
+                dense: false,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                legacy_q8: false,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                lean: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                adaptive: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                cask: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                compact_offset: 1,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                cpu_offload: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                capture: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                replay: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                verify_scope: true,
+                ..valid
+            },
+            PositionedPrefillAdmission {
+                iu4_verify_scope: true,
+                ..valid
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_prefill_geometry_separates_absolute_and_packed_frontiers() {
+        assert_eq!(
+            positioned_prefill_geometry(0, 0, 512, 512, 1024, 512, 2048, 2048).unwrap(),
+            (512, 512)
+        );
+        assert_eq!(
+            positioned_prefill_geometry(900, 7, 100, 512, 1000, 128, 2048, 2048).unwrap(),
+            (1000, 107)
+        );
+        assert_eq!(
+            positioned_prefill_geometry(999, 127, 1, 512, 1000, 128, 4, 4).unwrap(),
+            (1000, 128)
+        );
+        assert_eq!(
+            positioned_prefill_geometry(i32::MAX as usize - 1, 0, 1, 1, i32::MAX as usize, 1, 4, 4)
+                .unwrap(),
+            (i32::MAX as usize, 1)
+        );
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_prefill_geometry_rejects_invalid_bounds_and_short_buffers() {
+        for args in [
+            (0, 0, 0, 512, 1024, 512, 2048, 2048),
+            (0, 0, 513, 512, 1024, 1024, 4096, 4096),
+            (0, 0, 2, 1, 1024, 512, 2048, 2048),
+            (0, 0, 2, 1024, 1024, 512, 4096, 4096),
+            (7, 8, 2, 512, 1024, 512, 2048, 2048),
+            (1023, 0, 2, 512, 1024, 512, 2048, 2048),
+            (900, 511, 2, 512, 1024, 512, 2048, 2048),
+            (900, 0, 2, 512, 1024, 512, 7, 8),
+            (900, 0, 2, 512, 1024, 512, 8, 7),
+            (usize::MAX, 0, 2, 512, usize::MAX, 512, 8, 8),
+            (usize::MAX, usize::MAX, 2, 512, usize::MAX, usize::MAX, 8, 8),
+            (i32::MAX as usize, 0, 1, 512, usize::MAX, 512, 4, 4),
+        ] {
+            let (absolute, packed, n, batch, logical, physical, positions, rope) = args;
+            assert!(
+                positioned_prefill_geometry(
+                    absolute, packed, n, batch, logical, physical, positions, rope
+                )
+                .is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_prefill_q8_extent_is_checked_in_physical_bytes() {
+        let required = positioned_prefill_bytes(&[107, 4, 256 / 32, 34]).unwrap();
+        assert_eq!(required, 116416);
+        assert!(positioned_prefill_buffer_extent(required, required, false, false).is_ok());
+        assert!(positioned_prefill_buffer_extent(required - 1, required, false, false).is_err());
+        assert!(positioned_prefill_buffer_extent(0, required, false, false).is_err());
+        assert!(positioned_prefill_buffer_extent(required, required, true, false).is_err());
+        assert!(positioned_prefill_buffer_extent(required, required, false, true).is_err());
+        assert!(positioned_prefill_bytes(&[usize::MAX, 4, 8, 34]).is_err());
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn positioned_prefill_raw_q_extent_covers_padded_scan_workspace() {
+        let k_dim = 16 * 128;
+        for (n, padded_rows) in [(1, 64), (64, 64), (65, 128), (112, 128), (512, 512)] {
+            let required = positioned_prefill_raw_q_bytes(n, k_dim).unwrap();
+            assert_eq!(required, padded_rows * k_dim * 4);
+            assert!(positioned_prefill_buffer_extent(required, required, false, false).is_ok());
+            assert!(
+                positioned_prefill_buffer_extent(required - 1, required, false, false).is_err()
+            );
+            if n != padded_rows {
+                assert!(
+                    positioned_prefill_buffer_extent(n * k_dim * 4, required, false, false)
+                        .is_err()
+                );
+            }
+        }
+        assert!(positioned_prefill_raw_q_bytes(usize::MAX, k_dim).is_err());
+        assert!(positioned_prefill_raw_q_bytes(64, usize::MAX).is_err());
+    }
     /// Head geometry of the generalized chunk scan: 16 key heads, value heads a
     /// multiple of 16 up to 48, 128-wide heads, 4-tap conv.
     #[test]

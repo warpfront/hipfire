@@ -1,0 +1,7 @@
+VRAM guard: sampled device-wide observation, NOT a hard physical limit; only the new command process group can be terminated.
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx1100 (48.3 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/husrcf/.hipfire_kernels/gfx1100
+archived 8192 tokens, pinned 285212672 bytes
+Error: "pinned archive owner leak"
+VRAM guard: completed; peak=793190400 guard=25232932864 bytes; evidence=results/tiered-kv/smoke.vram.json
