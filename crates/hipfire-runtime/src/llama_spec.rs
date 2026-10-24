@@ -112,11 +112,12 @@ pub fn verify_block_logits(
 /// `Vec` — the DSpark accepted-prefix-hidden reuse then stays entirely on-device
 /// (no D2H+H2D per window).
 ///
-/// Returns `(per-position argmax, captured)`. `captured` is `true` iff the
-/// batched path ran (so all `block.len()` positions' hidden were written); the
-/// per-token fallback (`block.len() < 4`, or ineligible dtypes/KV) captures
-/// nothing and returns `false`, matching the host sink's empty-capture signal.
-/// When `false`, `hidden_gpu` is left untouched.
+/// Returns `(per-position argmax, captured)`. `captured` is `true` iff
+/// `extract_layers` is non-empty: the batched path writes every position's
+/// hidden on-device, and the per-token fallback (`block.len() < 4`, or
+/// ineligible dtypes/KV) captures each token on the host and uploads it, so a
+/// short block still hands DSpark its next window's context instead of forcing
+/// a re-bootstrap forward. When `false`, `hidden_gpu` is left untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_argmax_capture_gpu(
     gpu: &mut Gpu,
@@ -130,18 +131,13 @@ pub fn verify_block_argmax_capture_gpu(
     extract_layers: &[usize],
     hidden_gpu: &GpuTensor,
 ) -> HipResult<(Vec<u32>, bool)> {
-    let captured = !extract_layers.is_empty()
-        && batched_verify_eligible(gpu, weights, kv_cache, block.len(), pbs);
+    let captured = !extract_layers.is_empty();
     let mut empty: Vec<f32> = Vec::new();
-    let mut sink = if captured {
-        Some(HiddenCaptureSink {
-            extract_layers,
-            hidden: &mut empty,
-            hidden_gpu: Some(hidden_gpu),
-        })
-    } else {
-        None
-    };
+    let mut sink = captured.then(|| HiddenCaptureSink {
+        extract_layers,
+        hidden: &mut empty,
+        hidden_gpu: Some(hidden_gpu),
+    });
     let argmax = verify_block_logits_or_argmax(
         gpu,
         weights,
@@ -164,7 +160,7 @@ pub fn verify_block_argmax_capture_gpu(
 /// SAME batched forward + GPU-resident hidden capture, but draws each position's
 /// token `t_i ~ p_T(temp, top_p, top_k)` (advancing `rng`) instead of argmax.
 /// Returns `(per-position sampled tokens, captured)` with the same `captured`
-/// semantics (false ⇒ per-token fallback ran, `hidden_gpu` untouched).
+/// semantics (false ⇒ no extract layers, `hidden_gpu` untouched).
 ///
 /// Each position is drawn on-GPU via the fused `sample_top_p_pf` kernel (softmax
 /// + nucleus + top_k + categorical in ONE launch, 4-byte D2H) — no b×vocab
@@ -188,18 +184,13 @@ pub fn verify_block_sampled_capture_gpu(
     top_k: usize,
     rng_state: &mut u64,
 ) -> HipResult<(Vec<u32>, bool)> {
-    let captured = !extract_layers.is_empty()
-        && batched_verify_eligible(gpu, weights, kv_cache, block.len(), pbs);
+    let captured = !extract_layers.is_empty();
     let mut empty: Vec<f32> = Vec::new();
-    let mut sink = if captured {
-        Some(HiddenCaptureSink {
-            extract_layers,
-            hidden: &mut empty,
-            hidden_gpu: Some(hidden_gpu),
-        })
-    } else {
-        None
-    };
+    let mut sink = captured.then(|| HiddenCaptureSink {
+        extract_layers,
+        hidden: &mut empty,
+        hidden_gpu: Some(hidden_gpu),
+    });
     // Sampler scratch, allocated once for the whole block (freed below).
     let result_buf = gpu.alloc_tensor(&[2], DType::F32)?;
     let repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
@@ -381,8 +372,8 @@ fn verify_block_logits_or_argmax(
     // uses, so a 1..3-row block still returns `n × extract × dim` hidden rows.
     // (Previously the fallback captured nothing and the generic DFlash commit
     // sliced an empty buffer: a daemon panic whenever the remaining budget made
-    // the block 1-3 rows.) The GPU-resident sink variant is only ever passed
-    // for eligible blocks; the per-token capture is host-only.
+    // the block 1-3 rows.) That capture is host-side, so a GPU-resident sink
+    // gets each token's rows uploaded to its position-major slot.
     let mut capture = capture;
 
     if eligible {
@@ -486,18 +477,46 @@ fn verify_block_logits_or_argmax(
             let _ = gpu.free_tensor(ab);
         }
     } else {
+        let gpu_sink = capture
+            .as_deref()
+            .and_then(|c| c.hidden_gpu.map(|dst| (dst, c.extract_layers)));
+        let mut row_hidden: Vec<f32> = Vec::new();
         for (i, &tok) in block.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
-            let host_sink = capture.as_deref_mut().filter(|c| c.hidden_gpu.is_none());
-            crate::llama::forward_scratch_compute_capture(
-                gpu,
-                weights,
-                config,
-                start_pos + i,
-                kv_cache,
-                scratch,
-                host_sink,
-            )?;
+            if let Some((dst, extract_layers)) = gpu_sink {
+                row_hidden.clear();
+                crate::llama::forward_scratch_compute_capture(
+                    gpu,
+                    weights,
+                    config,
+                    start_pos + i,
+                    kv_cache,
+                    scratch,
+                    Some(&mut HiddenCaptureSink {
+                        extract_layers,
+                        hidden: &mut row_hidden,
+                        hidden_gpu: None,
+                    }),
+                )?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        row_hidden.as_ptr() as *const u8,
+                        row_hidden.len() * 4,
+                    )
+                };
+                gpu.hip
+                    .memcpy_htod_offset(&dst.buf, i * row_hidden.len() * 4, bytes)?;
+            } else {
+                crate::llama::forward_scratch_compute_capture(
+                    gpu,
+                    weights,
+                    config,
+                    start_pos + i,
+                    kv_cache,
+                    scratch,
+                    capture.as_deref_mut(),
+                )?;
+            }
             if let Some(sc) = sample.as_mut() {
                 let pick = sample_one(gpu, &scratch.logits, vocab, sc)?;
                 out.push(pick);
