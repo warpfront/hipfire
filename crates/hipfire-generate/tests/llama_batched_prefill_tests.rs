@@ -17,7 +17,7 @@ use hipfire_generate::ar::*;
 use hipfire_generate::batch::*;
 use hipfire_generate::common::*;
 
-use hipfire_runtime::llama::ModelArch;
+use hipfire_runtime::llama::{llama_qwen3_batched_prefill_eligible, ModelArch};
 
 #[test]
 fn route_stays_inside_validated_qwen3_q8_envelope() {
