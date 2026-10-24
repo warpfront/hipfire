@@ -11,6 +11,9 @@
 //! concatenated contiguously in fused order (no per-family padding), and only the whole
 //! fused width is padded up to a multiple of [`PANEL_COLS`].
 
+use hipfire_runtime::coproc::{
+    EpilogueContract, FamilyDecl, FamilySet, GroupDecl, LayerKindDecl, StageMap,
+};
 use std::fmt;
 use std::ops::BitOr;
 
@@ -19,27 +22,79 @@ pub const TRUNK_K: usize = 2560;
 /// Output columns of one NPU panel (the G80 wave width).
 pub const PANEL_COLS: usize = 1280;
 
-/// Epilogue contract of the NPU path (see INTERFACES.md §0): the NPU accumulates exactly in integers and emits
-/// BF16 directly; there is no int32 partial, combine or fold on the GPU.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum EpilogueContract {
-    /// Exact integer product of I and grid15-up scales, rounded once to IEEE BF16.
-    #[default]
-    Bf16Direct,
-}
+const FAMILY_DECLS: [FamilyDecl; 8] = {
+    let mut decls = [FamilyDecl {
+        name: "",
+        kind: 0,
+        cols: 0,
+    }; 8];
+    let mut i = 0;
+    while i < 8 {
+        let family = Family::ALL[i];
+        decls[i] = FamilyDecl {
+            name: family.name(),
+            kind: family.shape().index(),
+            cols: family.cols(),
+        };
+        i += 1;
+    }
+    decls
+};
 
-impl EpilogueContract {
-    /// Spelling used in load logs.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Bf16Direct => "bf16_direct",
-        }
+/// Flash-Next's op-level stage map: 36 GDN and 12 QSA layers (K = 2560); the NPU may own the GDN input
+/// projections `qkv` and `z|a|b` and the QSA input projections `q` and `k|v|idx`, each group a contiguous
+/// fused-column range of its shape.
+pub static FLASH_NEXT: StageMap = StageMap {
+    tag: "npu-trunk",
+    kinds: [
+        LayerKindDecl {
+            name: "gdn",
+            layers: 36,
+            in_k: TRUNK_K,
+            out_family: "gdn.out",
+        },
+        LayerKindDecl {
+            name: "qsa",
+            layers: 12,
+            in_k: TRUNK_K,
+            out_family: "qsa.o",
+        },
+    ],
+    families: &FAMILY_DECLS,
+    groups: [
+        GroupDecl {
+            name: "qkv",
+            kind: 0,
+            families: 0x01,
+        },
+        GroupDecl {
+            name: "zab",
+            kind: 0,
+            families: 0x0e,
+        },
+        GroupDecl {
+            name: "q",
+            kind: 1,
+            families: 0x10,
+        },
+        GroupDecl {
+            name: "kvidx",
+            kind: 1,
+            families: 0xe0,
+        },
+    ],
+    contract: EpilogueContract::Bf16Direct,
+};
+
+impl From<FamilyMask> for FamilySet {
+    fn from(mask: FamilyMask) -> Self {
+        FamilySet(u32::from(mask.bits()))
     }
 }
 
-impl fmt::Display for EpilogueContract {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+impl From<FamilySet> for FamilyMask {
+    fn from(set: FamilySet) -> Self {
+        FamilyMask::from_bits(set.0 as u8)
     }
 }
 
@@ -508,9 +563,18 @@ mod tests {
     }
 
     #[test]
-    fn epilogue_contract_spellings() {
-        assert_eq!(EpilogueContract::default(), EpilogueContract::Bf16Direct);
-        assert_eq!(EpilogueContract::Bf16Direct.as_str(), "bf16_direct");
+    fn stage_map_groups_are_contiguous_ranges_of_the_fused_shapes() {
+        FLASH_NEXT.validate().unwrap();
+        let all = FamilyMask::from(FLASH_NEXT.all());
+        assert_eq!(all, FamilyMask::ALL);
+        for (bit, group) in FLASH_NEXT.groups.iter().enumerate() {
+            let mask = FamilyMask::from(FLASH_NEXT.subset(1 << bit));
+            let shape = Shape::ALL[group.kind];
+            assert!(shape.column_map(all).panel_range(mask).is_some());
+            assert!(Family::ALL
+                .iter()
+                .all(|f| !mask.contains(*f) || f.shape() == shape));
+        }
     }
 
     #[test]

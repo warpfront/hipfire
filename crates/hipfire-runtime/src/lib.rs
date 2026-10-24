@@ -27,6 +27,7 @@ pub mod cask;
 pub mod chatml;
 pub mod checkpoint_pool;
 pub mod config;
+pub mod coproc;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
 #[cfg(feature = "deltanet")]

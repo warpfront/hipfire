@@ -32,9 +32,9 @@ use peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512;
 use peacemaker_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
 
 use super::shapes::{
-    ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS,
-    PANEL_COLS, TRUNK_K,
+    ColumnMap, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
 };
+use hipfire_runtime::coproc::EpilogueContract;
 
 /// K covered by one MQ6G256V2 group.
 pub const GROUP_K: usize = 256;

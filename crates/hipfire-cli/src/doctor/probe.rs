@@ -7,7 +7,7 @@
 
 use super::checks::{Access, GpuLock, HostProbe, LocalModelFile, RocmState, FLASH_NEXT_TAG};
 use crate::Paths;
-use hipfire_arch_qwen4::npu_trunk::{self, Calibration};
+use hipfire_arch_qwen4::npu_trunk::{self, load_calibration};
 use hipfire_config::devices::GpuDevice;
 use hipfire_runtime::hfq::HfqFile;
 use std::ffi::CString;
@@ -284,7 +284,7 @@ impl HostProbe for SystemProbe<'_> {
         let path = hipfire_config::npu_trunk_calibration_path();
         let mut records: Vec<(String, &'static str)> = Vec::new();
         for route in ROUTES {
-            let (calibration, source) = Calibration::load_with_builtin(&path, route)?;
+            let (calibration, source) = load_calibration(&path, route)?;
             let record = (
                 calibration
                     .key

@@ -2,7 +2,8 @@
 //! Offline calibration assembly. This command never runs a benchmark or opens a device.
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use hipfire_arch_qwen4::npu_trunk::{
+use hipfire_arch_qwen4::npu_trunk::FLASH_NEXT;
+use hipfire_runtime::coproc::{
     CalKey, Calibration, ContentionCalibration, FamilyCalibration, GlueCalibration, GpuCalibration,
     NpuCalibration, QsaOrder, CALIBRATION_SCHEMA_VERSION,
 };
@@ -56,7 +57,7 @@ impl Measurements {
             margin: self.margin,
             qsa_order: self.qsa_order,
         };
-        cal.validate().map_err(anyhow::Error::msg)?;
+        cal.validate(&FLASH_NEXT).map_err(anyhow::Error::msg)?;
         Ok(cal)
     }
 }
@@ -75,7 +76,8 @@ pub(crate) fn calibrate_command(args: CalibrateArgs) -> Result<()> {
         .context("uname output is not UTF-8")?
         .trim();
     let cal = input.assemble(release)?;
-    cal.store(&args.out).map_err(anyhow::Error::msg)?;
+    cal.store(&args.out, &FLASH_NEXT)
+        .map_err(anyhow::Error::msg)?;
     println!(
         "npu-trunk: calibration={} schema_version={}",
         args.out.display(),
@@ -141,7 +143,7 @@ mod tests {
             let input: Measurements = serde_json::from_value(defaults).unwrap();
             assert_eq!(
                 input.assemble(&release).unwrap().key.build,
-                hipfire_arch_qwen4::npu_trunk::calibration_build_identity()
+                hipfire_runtime::coproc::calibration_build_identity()
             );
             for (parent, field) in [
                 ("key", "trunk_route"),

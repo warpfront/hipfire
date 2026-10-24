@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Python↔Rust cost-model golden vectors, including the original 90 plans.
 use super::*;
+use hipfire_runtime::coproc::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 fn fixture(name: &str) -> PathBuf {
@@ -25,7 +26,7 @@ fn cal(name: &str) -> Calibration {
         v["families"][name]["out_dtype"] = json!(if name == "qkv" { "bf16" } else { "f32" });
     }
     let c: Calibration = serde_json::from_value(v).unwrap();
-    c.validate().unwrap();
+    c.validate(&FLASH_NEXT).unwrap();
     c
 }
 fn mask(names: &str) -> FamilyMask {
@@ -52,10 +53,14 @@ fn golden(names: &str) {
         let c = cal(name);
         let families = mask(names);
         let star = v["n_star"].as_u64().map(|n| n as usize);
-        assert_eq!(crossover(&c, families), star, "{name} {names}");
+        assert_eq!(
+            crossover(&FLASH_NEXT, &c, families.into()),
+            star,
+            "{name} {names}"
+        );
         for p in v["plans"].as_array().unwrap() {
             let rows = p["rows"].as_u64().unwrap() as usize;
-            let actual = plan(&c, families, rows);
+            let actual = plan(&FLASH_NEXT, &c, families.into(), rows);
             let expected: Vec<_> = p["steps"]
                 .as_array()
                 .unwrap()
@@ -95,7 +100,7 @@ fn golden(names: &str) {
                     "families={names} n*={star:?} rows={rows} gpu={:.9} pipe={:.9} {}",
                     actual.t_gpu_ms,
                     actual.t_pipe_ms,
-                    request_log_line(rows, &actual)
+                    request_log_line(&FLASH_NEXT, rows, &actual)
                 );
             }
             count += 1;
@@ -114,26 +119,26 @@ fn npu_trunk_golden_family_b() {
 #[test]
 fn npu_trunk_margin_and_determinism() {
     let mut c = cal("g80bf16-measured.json");
-    let initial = plan(&c, FamilyMask::ALL, 8192);
+    let initial = plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 8192);
     assert!(matches!(initial.steps[0], Step::Pipe { .. }));
     c.margin = 0.10;
     assert!(matches!(
-        plan(&c, FamilyMask::ALL, 8192).steps[0],
+        plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 8192).steps[0],
         Step::Gpu { .. }
     ));
     c.margin = 0.99;
     for n in [0, 2048, 8192, 9319, 16384, 24576, 65536] {
-        let p = plan(&c, FamilyMask::ALL, n);
-        assert_eq!(p, plan(&c, FamilyMask::ALL, n));
+        let p = plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), n);
+        assert_eq!(p, plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), n));
         assert_eq!(p.t_pipe_ms, p.t_gpu_ms);
         assert!(p.steps.iter().all(|s| matches!(s, Step::Gpu { .. })));
     }
-    assert_eq!(crossover(&c, FamilyMask::ALL), None);
+    assert_eq!(crossover(&FLASH_NEXT, &c, FamilyMask::ALL.into()), None);
 }
 #[test]
 fn npu_trunk_key_mismatches_and_logs() {
     let c = cal("g80bf16-measured.json");
-    let p = plan(&c, FamilyMask::ALL, 16384);
+    let p = plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 16384);
     assert_eq!(c.key_matches(&c.key), Ok(()));
     let mutations: [(&str, fn(&mut CalKey)); 8] = [
         ("device.arch", |k| k.device.arch += "x"),
@@ -157,26 +162,33 @@ fn npu_trunk_key_mismatches_and_logs() {
         let log_key = LoadLogKey {
             current: &key,
             mode: "auto",
-            families: FamilyMask::ALL,
+            families: FamilyMask::ALL.into(),
         };
         assert_eq!(
-            load_log_line(&c, &log_key, None, &p, &p),
+            load_log_line(&FLASH_NEXT, &c, &log_key, None, &p, &p),
             format!("npu-trunk: off (calibration key mismatch: {field})")
         );
     }
     let key = LoadLogKey {
         current: &c.key,
         mode: "auto",
-        families: FamilyMask::ALL,
+        families: FamilyMask::ALL.into(),
     };
-    let line = load_log_line(&c, &key, Some(4736), &p, &plan(&c, FamilyMask::ALL, 65536));
+    let line = load_log_line(
+        &FLASH_NEXT,
+        &c,
+        &key,
+        Some(4736),
+        &p,
+        &plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 65536),
+    );
     assert!(
         line.starts_with("npu-trunk: mode=auto contract=bf16 families=qkv,zab,q,kvidx cal_key=")
     );
     assert!(line.contains(" cal_sha256="));
     assert!(line.contains(" n*=4736 T(16384)="));
     assert_eq!(
-        request_log_line(16384, &p),
+        request_log_line(&FLASH_NEXT, 16384, &p),
         "npu-trunk: rows=16384 plan=[pipe 0..8192+8192..16384] predicted=-14.7%"
     );
 }
@@ -185,8 +197,8 @@ fn npu_trunk_record_roundtrip_and_validation() {
     let c = cal("g80bf16-measured.json");
     let path =
         std::env::temp_dir().join(format!("hipfire-npu-trunk-cal-{}.json", std::process::id()));
-    c.store(&path).unwrap();
-    let loaded = Calibration::load(&path).unwrap();
+    c.store(&path, &FLASH_NEXT).unwrap();
+    let loaded = Calibration::load(&path, &FLASH_NEXT).unwrap();
     std::fs::remove_file(path).unwrap();
     assert_eq!(
         serde_json::to_value(&c).unwrap(),
@@ -197,25 +209,30 @@ fn npu_trunk_record_roundtrip_and_validation() {
     assert!(serde_json::from_value::<Calibration>(v).is_err());
     let mut invalid = c.clone();
     invalid.schema_version = 1;
-    assert!(invalid.validate().is_err());
+    assert!(invalid.validate(&FLASH_NEXT).is_err());
     invalid = c.clone();
     invalid.npu.panel_cols = 0;
-    assert!(invalid.validate().is_err());
+    assert!(invalid.validate(&FLASH_NEXT).is_err());
     invalid = c.clone();
     invalid.npu.tops_corun = f64::NAN;
-    assert!(invalid.validate().is_err());
+    assert!(invalid.validate(&FLASH_NEXT).is_err());
 }
 #[test]
 fn npu_trunk_empty_partial_masks_and_padding() {
     let c = cal("g80bf16-measured.json");
-    assert_eq!(npu_ms(&c, 8192, 1), npu_ms(&c, 8192, 1280));
-    assert!(npu_ms(&c, 8192, 1281) > npu_ms(&c, 8192, 1280));
+    assert_eq!(
+        npu_ms(&FLASH_NEXT, &c, 0, 8192, 1),
+        npu_ms(&FLASH_NEXT, &c, 0, 8192, 1280)
+    );
+    assert!(npu_ms(&FLASH_NEXT, &c, 0, 8192, 1281) > npu_ms(&FLASH_NEXT, &c, 0, 8192, 1280));
     for families in [FamilyMask::NONE, FamilyMask::from(Family::GdnZ)] {
-        let p = plan(&c, families, 16384);
+        let p = plan(&FLASH_NEXT, &c, families.into(), 16384);
         assert_eq!(p.t_pipe_ms, p.t_gpu_ms);
         assert!(p.steps.iter().all(|s| matches!(s, Step::Gpu { .. })));
     }
-    assert!(plan(&c, FamilyMask::ALL, 0).steps.is_empty());
+    assert!(plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 0)
+        .steps
+        .is_empty());
 }
 
 fn grouped_mask(names: &Value) -> FamilyMask {
@@ -249,18 +266,26 @@ fn npu_trunk_v2_consume_and_selection_goldens() {
     .unwrap();
     for v in vectors.as_array().unwrap() {
         let cal: Calibration = serde_json::from_value(v["calibration"].clone()).unwrap();
-        cal.validate().unwrap();
-        let (families, report) = select_families(&cal);
-        assert_eq!(families, grouped_mask(&v["selected"]), "{}", v["name"]);
+        cal.validate(&FLASH_NEXT).unwrap();
+        let (families, report) = select_families(&FLASH_NEXT, &cal);
         assert_eq!(
-            report.best_families,
+            FamilyMask::from(families),
+            grouped_mask(&v["selected"]),
+            "{}",
+            v["name"]
+        );
+        assert_eq!(
+            FamilyMask::from(report.best_families),
             grouped_mask(&v["best_families"]),
             "{}",
             v["name"]
         );
         assert_eq!(report.subsets.len(), 15);
         for (actual, expected) in report.subsets.iter().zip(v["subsets"].as_array().unwrap()) {
-            assert_eq!(actual.families, grouped_mask(&expected["families"]));
+            assert_eq!(
+                FamilyMask::from(actual.families),
+                grouped_mask(&expected["families"])
+            );
             assert_eq!(
                 actual.beats_margin_16384,
                 expected["beats_margin_16384"].as_bool().unwrap()
@@ -273,7 +298,13 @@ fn npu_trunk_v2_consume_and_selection_goldens() {
             }
         }
         for expected in v["bank_segments"].as_array().unwrap() {
-            let actual = bank_segments(&cal, grouped_mask(&expected["families"]), 4096, 8192);
+            let actual = bank_segments(
+                &FLASH_NEXT,
+                &cal,
+                grouped_mask(&expected["families"]).into(),
+                4096,
+                8192,
+            );
             for i in 0..2 {
                 close(actual.gpu[i], &expected["gpu"][i]);
                 close(actual.npu[i], &expected["npu"][i]);
@@ -282,7 +313,12 @@ fn npu_trunk_v2_consume_and_selection_goldens() {
         for family_plans in v["plans"].as_array().unwrap() {
             let mask = grouped_mask(&family_plans["families"]);
             for expected in family_plans["plans"].as_array().unwrap() {
-                let actual = plan(&cal, mask, expected["rows"].as_u64().unwrap() as usize);
+                let actual = plan(
+                    &FLASH_NEXT,
+                    &cal,
+                    mask.into(),
+                    expected["rows"].as_u64().unwrap() as usize,
+                );
                 let steps: Vec<_> = expected["steps"]
                     .as_array()
                     .unwrap()
@@ -315,9 +351,9 @@ fn npu_trunk_v2_consume_and_selection_goldens() {
 #[test]
 fn npu_trunk_v2_consume_is_gpu_work_on_live_columns() {
     let mut c = cal("g80bf16-measured.json");
-    let direct = bank_segments(&c, FamilyMask::ALL, 8192, 0);
+    let direct = bank_segments(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 8192, 0);
     c.glue.consume_mode = "retile".into();
-    let retile = bank_segments(&c, FamilyMask::ALL, 8192, 0);
+    let retile = bank_segments(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 8192, 0);
     let expected_gdn = c.glue.consume_ms_per_col_8192["bf16"] * c.families["qkv"].cols as f64
         + c.glue.consume_ms_per_col_8192["f32"] * c.families["zab"].cols as f64;
     let expected_qsa = c.glue.consume_ms_per_col_8192["f32"]
@@ -325,7 +361,7 @@ fn npu_trunk_v2_consume_is_gpu_work_on_live_columns() {
     assert!((retile.gpu[0] - direct.gpu[0] - expected_gdn).abs() < 1e-10);
     assert!((retile.gpu[1] - direct.gpu[1] - expected_qsa).abs() < 1e-10);
     assert_eq!(retile.npu, direct.npu);
-    let half = bank_segments(&c, FamilyMask::ALL, 4096, 0);
+    let half = bank_segments(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 4096, 0);
     assert!((half.gpu[0] * 2.0 - retile.gpu[0]).abs() < 1e-10);
 }
 #[test]
@@ -361,7 +397,7 @@ fn npu_trunk_v2_rejects_missing_invalid_fields() {
         assert!(
             serde_json::from_value::<Calibration>(v)
                 .unwrap()
-                .validate()
+                .validate(&FLASH_NEXT)
                 .is_err(),
             "{pointer}"
         );
@@ -369,20 +405,20 @@ fn npu_trunk_v2_rejects_missing_invalid_fields() {
     for dtype in ["bf16", "f32"] {
         let mut invalid = c.clone();
         invalid.glue.consume_ms_per_col_8192.remove(dtype);
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate(&FLASH_NEXT).is_err());
         let mut invalid = c.clone();
         invalid
             .glue
             .consume_ms_per_col_8192
             .insert(dtype.into(), f64::NAN);
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate(&FLASH_NEXT).is_err());
     }
     let mut invalid = c.clone();
     invalid
         .glue
         .consume_ms_per_col_8192
         .insert("f16".into(), 0.0);
-    assert!(invalid.validate().is_err());
+    assert!(invalid.validate(&FLASH_NEXT).is_err());
     let mut key = c.key.clone();
     key.epilogue = "other".into();
     key.trunk_route = "overlay:gfx1151-zab-v1".into();
@@ -429,29 +465,35 @@ fn npu_trunk_runtime_key_is_cheap_deterministic_metadata() {
 
 #[test]
 fn npu_trunk_auto_admission_matrix() {
-    let c = Calibration::load(fixture("g80bf16-stock-v2.json")).unwrap();
-    assert_eq!(auto_admission(&c, &c.key), Ok(FamilyMask::ALL));
+    let c = Calibration::load(fixture("g80bf16-stock-v2.json"), &FLASH_NEXT).unwrap();
+    assert_eq!(
+        auto_admission(&FLASH_NEXT, &c, &c.key).map(FamilyMask::from),
+        Ok(FamilyMask::ALL)
+    );
     let mut wrong = c.key.clone();
     wrong.device.arch = "gfx1201".into();
     assert_eq!(
-        auto_admission(&c, &wrong),
+        auto_admission(&FLASH_NEXT, &c, &wrong).map(FamilyMask::from),
         Err("calibration key mismatch: device.arch".into())
     );
     let mut subset = c.clone();
     subset.gpu.trunk_in_ms_per_8192.insert("zab".into(), 0.0);
     assert_eq!(
-        select_families(&subset).0,
+        FamilyMask::from(select_families(&FLASH_NEXT, &subset).0),
         FamilyMask::from(Family::GdnQkv) | FamilyMask::QSA
     );
     assert_eq!(
-        auto_admission(&subset, &subset.key),
+        auto_admission(&FLASH_NEXT, &subset, &subset.key).map(FamilyMask::from),
         Ok(FamilyMask::from(Family::GdnQkv) | FamilyMask::QSA)
     );
     let mut none = c.clone();
     none.npu.tops_corun = 0.001;
-    assert_eq!(select_families(&none).0, FamilyMask::NONE);
     assert_eq!(
-        auto_admission(&none, &none.key),
+        FamilyMask::from(select_families(&FLASH_NEXT, &none).0),
+        FamilyMask::NONE
+    );
+    assert_eq!(
+        auto_admission(&FLASH_NEXT, &none, &none.key).map(FamilyMask::from),
         Err("calibration selects no families".into())
     );
 }
@@ -459,8 +501,8 @@ fn npu_trunk_auto_admission_matrix() {
 #[test]
 fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
     for file in ["g80bf16-stock-v2.json", "g80bf16-overlay-v2.json"] {
-        let c = Calibration::load(fixture(file)).unwrap();
-        let star = crossover(&c, FamilyMask::ALL);
+        let c = Calibration::load(fixture(file), &FLASH_NEXT).unwrap();
+        let star = crossover(&FLASH_NEXT, &c, FamilyMask::ALL.into());
         for (rows, expected) in [
             (8000, vec![]),
             (9000, vec![(0, 9000)]),
@@ -480,8 +522,8 @@ fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
                 vec![(0, 16384), (16384, 16384), (32768, 16384), (49152, 16384)],
             ),
         ] {
-            let planned = plan(&c, FamilyMask::ALL, rows);
-            let executable = executable_plan(&c, &planned, rows, star);
+            let planned = plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), rows);
+            let executable = executable_plan(&FLASH_NEXT, &c, &planned, rows, star);
             let pairs: Vec<_> = executable
                 .steps
                 .iter()
@@ -516,17 +558,17 @@ fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
             }
             assert_eq!(at, rows);
         }
-        let p = plan(&c, FamilyMask::ALL, 16384);
+        let p = plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 16384);
         for cutoff in [None, Some(16385)] {
-            assert!(executable_plan(&c, &p, 16384, cutoff)
+            assert!(executable_plan(&FLASH_NEXT, &c, &p, 16384, cutoff)
                 .steps
                 .iter()
                 .all(|s| matches!(s, Step::Gpu { .. })));
         }
         let mut strict = c.clone();
         strict.gpu.min_bank_rows = 8192;
-        let p = plan(&c, FamilyMask::ALL, 16343);
-        assert!(executable_plan(&strict, &p, 16343, Some(0))
+        let p = plan(&FLASH_NEXT, &c, FamilyMask::ALL.into(), 16343);
+        assert!(executable_plan(&FLASH_NEXT, &strict, &p, 16343, Some(0))
             .steps
             .iter()
             .all(|s| matches!(s, Step::Gpu { .. })));
@@ -544,7 +586,7 @@ fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
             t_gpu_ms: 1.0,
             t_pipe_ms: 0.5,
         };
-        assert!(executable_plan(&c, &rebank, 20000, Some(0))
+        assert!(executable_plan(&FLASH_NEXT, &c, &rebank, 20000, Some(0))
             .steps
             .iter()
             .all(|s| matches!(s, Step::Gpu { .. })));
@@ -556,7 +598,7 @@ fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
                 t_gpu_ms: 1.0,
                 t_pipe_ms: 0.5,
             };
-            executable_plan(&c, &p, rows, Some(0))
+            executable_plan(&FLASH_NEXT, &c, &p, rows, Some(0))
                 .steps
                 .iter()
                 .any(|s| matches!(s, Step::Pipe { .. }))
@@ -602,17 +644,20 @@ fn v5_golden() -> (Calibration, Value) {
     .unwrap();
     let v = vectors[0].clone();
     let cal: Calibration = serde_json::from_value(v["calibration"].clone()).unwrap();
-    cal.validate().unwrap();
+    cal.validate(&FLASH_NEXT).unwrap();
     (cal, v)
 }
 #[test]
 fn npu_trunk_v5_goldens_match_python() {
     let (cal, v) = v5_golden();
-    let (selected, report) = select_families(&cal);
-    assert_eq!(selected, grouped_mask(&v["selected"]));
+    let (selected, report) = select_families(&FLASH_NEXT, &cal);
+    assert_eq!(FamilyMask::from(selected), grouped_mask(&v["selected"]));
     assert_eq!(report.subsets.len(), 15);
     for (actual, expected) in report.subsets.iter().zip(v["subsets"].as_array().unwrap()) {
-        assert_eq!(actual.families, grouped_mask(&expected["families"]));
+        assert_eq!(
+            FamilyMask::from(actual.families),
+            grouped_mask(&expected["families"])
+        );
         assert_eq!(actual.selectable, expected["selectable"].as_bool().unwrap());
         assert_eq!(
             actual.beats_margin_16384,
@@ -638,6 +683,7 @@ fn npu_trunk_v5_goldens_match_python() {
     assert!(!cal.families["qsa.o"].selectable && !cal.families["gdn.out"].selectable);
     for expected in v["bank_segments"].as_array().unwrap() {
         let actual = bank_segments_moved(
+            &FLASH_NEXT,
             &cal,
             moved_names(&expected["families"]),
             expected["rows"].as_u64().unwrap() as usize,
@@ -658,6 +704,7 @@ fn npu_trunk_v5_goldens_match_python() {
             .map(|x| x.as_u64().unwrap() as usize)
             .collect();
         let actual = pair_time_moved(
+            &FLASH_NEXT,
             &cal,
             moved_names(&expected["families"]),
             b[0],
@@ -678,7 +725,12 @@ fn npu_trunk_v5_goldens_match_python() {
     for family_plans in v["plans"].as_array().unwrap() {
         let moved = moved_names(&family_plans["families"]);
         for expected in family_plans["plans"].as_array().unwrap() {
-            let actual = plan_moved(&cal, moved, expected["rows"].as_u64().unwrap() as usize);
+            let actual = plan_moved(
+                &FLASH_NEXT,
+                &cal,
+                moved,
+                expected["rows"].as_u64().unwrap() as usize,
+            );
             let range =
                 |r: &Value| r[0].as_u64().unwrap() as usize..r[1].as_u64().unwrap() as usize;
             let steps: Vec<_> = expected["steps"]
@@ -706,21 +758,28 @@ fn npu_trunk_v5_goldens_match_python() {
 #[test]
 fn npu_trunk_v5_model_terms() {
     let (cal, _) = v5_golden();
-    let all = Moved::from(FamilyMask::ALL);
+    let all = Moved::of(&FLASH_NEXT, FamilyMask::ALL.into());
     // Stall = pipeline fill only: no steady-state stall, fill is the first in-proj chain, contention is byte-linear.
-    let pair = pair_time_moved(&cal, all, 8192, 0, 8151, 8192);
+    let pair = pair_time_moved(&FLASH_NEXT, &cal, all, 8192, 0, 8151, 8192);
     assert_eq!(pair.stall, 0.0);
-    assert_eq!(pair.fill, bank_segments_moved(&cal, all, 8192, 0).npu[0]);
+    assert_eq!(
+        pair.fill,
+        bank_segments_moved(&FLASH_NEXT, &cal, all, 8192, 0).npu[0]
+    );
     assert!(
         (pair.extra - 200.0).abs() < 0.5,
         "16K in-pipeline contention {}",
         pair.extra
     );
     // The out families never enter the in-proj mask, so the load-time selection cannot contain them.
-    assert_eq!(Moved::from(FamilyMask::ALL).out, [false, false]);
+    assert_eq!(
+        Moved::of(&FLASH_NEXT, FamilyMask::ALL.into()).out,
+        [false, false]
+    );
     // A QSA out family stalls on the order C_A C_B P_A P_B: out chain only (no in-proj) stalls nothing here, with the
     // in-proj chains the post-GEMM window shrinks and the layer stalls.
     let qsa_out = pair_time_moved(
+        &FLASH_NEXT,
         &cal,
         Moved::new([false; 4], [false, true]),
         8192,
@@ -730,6 +789,7 @@ fn npu_trunk_v5_model_terms() {
     );
     assert_eq!(qsa_out.stall, 0.0);
     let both = pair_time_moved(
+        &FLASH_NEXT,
         &cal,
         Moved::new([true, true, true, true], [false, true]),
         8192,
@@ -739,15 +799,30 @@ fn npu_trunk_v5_model_terms() {
     );
     assert!(both.stall > 0.0);
     // The out chain is NPU time and DRAM bytes, and the GPU o-proj GEMM leaves the GPU segment.
-    let seg = bank_segments_moved(&cal, Moved::new([false; 4], [true, true]), 8192, 0);
-    let base = bank_segments_moved(&cal, Moved::new([false; 4], [false; 2]), 8192, 0);
+    let seg = bank_segments_moved(
+        &FLASH_NEXT,
+        &cal,
+        Moved::new([false; 4], [true, true]),
+        8192,
+        0,
+    );
+    let base = bank_segments_moved(
+        &FLASH_NEXT,
+        &cal,
+        Moved::new([false; 4], [false; 2]),
+        8192,
+        0,
+    );
     assert!(seg.npu_out[0] > 0.0 && seg.npu_out[1] > 0.0 && seg.npu == base.npu);
     assert!(seg.bytes[1] > 0.0 && seg.gpu[1] < base.gpu[1]);
     // Selection stays in-proj: gating an in-proj family out of selection removes its subsets from the contest.
     let mut gated = cal.clone();
     gated.families.get_mut("q").unwrap().selectable = false;
-    let (picked, report) = select_families(&gated);
-    assert!(report.subsets.iter().any(|r| !r.selectable) && !picked.contains(Family::QsaQ));
+    let (picked, report) = select_families(&FLASH_NEXT, &gated);
+    assert!(
+        report.subsets.iter().any(|r| !r.selectable)
+            && !FamilyMask::from(picked).contains(Family::QsaQ)
+    );
 }
 #[test]
 fn npu_trunk_v5_validation() {
@@ -759,39 +834,39 @@ fn npu_trunk_v5_validation() {
         .remove("out");
     assert!(serde_json::from_value::<Calibration>(v)
         .unwrap()
-        .validate()
+        .validate(&FLASH_NEXT)
         .is_err());
     let mut v = serde_json::to_value(&cal).unwrap();
     v.as_object_mut().unwrap().remove("qsa_order");
     assert!(serde_json::from_value::<Calibration>(v)
         .unwrap()
-        .validate()
+        .validate(&FLASH_NEXT)
         .is_err());
     let mut v = serde_json::to_value(&cal).unwrap();
     v["npu"].as_object_mut().unwrap().remove("tops_alone");
     assert!(serde_json::from_value::<Calibration>(v)
         .unwrap()
-        .validate()
+        .validate(&FLASH_NEXT)
         .is_err());
     let mut v = serde_json::to_value(&cal).unwrap();
     v["families"]["qkv"]["out"] = v["families"]["qsa.o"]["out"].clone();
     assert!(serde_json::from_value::<Calibration>(v)
         .unwrap()
-        .validate()
+        .validate(&FLASH_NEXT)
         .is_err());
     let mut v = serde_json::to_value(&cal).unwrap();
     v["families"]["other"] = v["families"]["qkv"].clone();
     assert!(serde_json::from_value::<Calibration>(v)
         .unwrap()
-        .validate()
+        .validate(&FLASH_NEXT)
         .is_err());
     let mut invalid = cal.clone();
     invalid.contention.ms_per_gb = f64::NAN;
-    assert!(invalid.validate().is_err());
+    assert!(invalid.validate(&FLASH_NEXT).is_err());
     // v4 files (no out families, no per-byte contention) still load unchanged.
     let v4: Calibration =
         serde_json::from_str(include_str!("calibrations/halo-xdna2-overlay-v4.json")).unwrap();
-    v4.validate().unwrap();
+    v4.validate(&FLASH_NEXT).unwrap();
     assert!(v4.qsa_order.is_none() && v4.contention.ms_per_gb == 0.0 && v4.families.len() == 4);
     let roundtrip: Value = serde_json::to_value(&v4).unwrap();
     assert!(

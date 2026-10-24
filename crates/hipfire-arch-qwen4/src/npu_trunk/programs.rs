@@ -11,7 +11,8 @@ use peacemaker_npu::kernels::gemm_core::Epilogue;
 use peacemaker_npu::kernels::gemm_g80::{build_panel_program, build_panel_program_rowmajor};
 use peacemaker_npu::kernels::gemm_g80_n512::build_panel_program_out;
 
-use super::shapes::{EpilogueContract, FamilyMask, Shape, OUT_COLS};
+use super::shapes::{FamilyMask, Shape, OUT_COLS};
+use hipfire_runtime::coproc::EpilogueContract;
 
 /// Rows of one G80 M wave: every program is built for a whole number of these.
 const WAVE_ROWS: usize = 256;

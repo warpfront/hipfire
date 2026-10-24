@@ -20,8 +20,9 @@
 
 use hipfire_arch_qwen4::npu_trunk::{
     pack_matrix, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract,
-    EpilogueContract, Family, FamilyMask, LayerTrunkRefs, MatrixRef, Shape, PANEL_COLS, TRUNK_K,
+    Family, FamilyMask, LayerTrunkRefs, MatrixRef, Shape, PANEL_COLS, TRUNK_K,
 };
+use hipfire_runtime::coproc::EpilogueContract;
 
 mod oracle {
     //! Lab CPU oracle, see the file header for the source citation.

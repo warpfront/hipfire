@@ -3,9 +3,10 @@
 //! documented layout, not from the design), row bounds and rounding, sidecar bytes, and masked panel counts.
 //! Nothing here runs the simulator or touches a device.
 use hipfire_arch_qwen4::npu_trunk::{
-    build_out_programs, build_programs, build_programs_for_families, EpilogueContract, Family,
-    FamilyMask, NpuPrograms, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
+    build_out_programs, build_programs, build_programs_for_families, Family, FamilyMask,
+    NpuPrograms, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
 };
+use hipfire_runtime::coproc::EpilogueContract;
 
 const WAVE_M: usize = 256;
 const K_CHUNK: usize = 64;

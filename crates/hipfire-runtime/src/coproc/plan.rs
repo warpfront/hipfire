@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Pure deterministic crossover model. No clock or hardware input.
-use super::calibration::{OutFamily, FAMILY_NAMES, OUT_FAMILY_NAMES};
-use super::{CalKey, Calibration, Family, FamilyCalibration, FamilyMask};
+//! Pure deterministic crossover planner of a co-processor stage. No clock or hardware input.
+//!
+//! Chunk pairs are the micro-batches: a `Step::Pipe` runs two banks of rows layer-major so the co-processor
+//! computes one bank's owned projections while the GPU runs the other bank's layer (`coproc::schedule`); the
+//! first co-processor chain of a pair is the pipeline fill. The model prices the GPU-only chunk, each bank's
+//! per-kind GPU segment and co-processor chains, steady-state stalls, DRAM contention and the fill, all from a
+//! [`Calibration`] of one [`StageMap`].
+use super::calibration::OutFamily;
+use super::stage::{FamilySet, StageMap, GROUPS, KINDS};
+use super::{CalKey, Calibration, FamilyCalibration};
 use sha2::{Digest, Sha256};
 use std::ops::Range;
 
@@ -20,16 +27,17 @@ pub struct Plan {
 #[derive(Clone, Copy, Debug)]
 pub struct GpuChunk {
     pub total: f64,
-    pub gdn_rest: f64,
-    pub qsa_rest: f64,
-    pub trunk: [f64; 4],
+    /// Per layer of each kind: everything but the owned-eligible input projections.
+    pub rest: [f64; KINDS],
+    /// Per group: the GPU cost of its input projections over all layers of its kind.
+    pub trunk: [f64; GROUPS],
 }
 #[derive(Clone, Copy, Debug)]
 pub struct BankSegments {
-    pub gpu: [f64; 2],
-    pub npu: [f64; 2],
-    pub npu_out: [f64; 2],
-    pub bytes: [f64; 2],
+    pub gpu: [f64; KINDS],
+    pub npu: [f64; KINDS],
+    pub npu_out: [f64; KINDS],
+    pub bytes: [f64; KINDS],
     pub chunk: GpuChunk,
 }
 #[derive(Clone, Copy, Debug)]
@@ -41,20 +49,29 @@ pub struct PairTime {
     pub gpu_only: f64,
 }
 
-pub fn gpu_chunk(cal: &Calibration, rows: usize, prefix: usize) -> GpuChunk {
+fn layers(map: &StageMap, kind: usize) -> f64 {
+    map.kinds[kind].layers as f64
+}
+pub fn gpu_chunk(map: &StageMap, cal: &Calibration, rows: usize, prefix: usize) -> GpuChunk {
     let g = &cal.gpu;
     let f = rows as f64 / CHUNK as f64;
     let pre = prefix as f64 / CHUNK as f64;
-    let trunk = FAMILY_NAMES.map(|k| g.trunk_in_ms_per_8192[k] * f);
-    let gdn_rest = (g.uniform_per_layer_ms + g.gdn_core_per_layer_ms) * f;
-    let qsa_rest = (g.uniform_per_layer_ms
-        + g.qsa_per_layer_ms
-        + g.qsa_growth_per_layer_ms_per_8192_prefix * pre)
-        * f;
+    let trunk = map
+        .groups
+        .map(|group| g.trunk_in_ms_per_8192[group.name] * f);
+    let rest = [
+        (g.uniform_per_layer_ms + g.gdn_core_per_layer_ms) * f,
+        (g.uniform_per_layer_ms
+            + g.qsa_per_layer_ms
+            + g.qsa_growth_per_layer_ms_per_8192_prefix * pre)
+            * f,
+    ];
     GpuChunk {
-        total: 36.0 * gdn_rest + 12.0 * qsa_rest + trunk.iter().sum::<f64>() + g.fixed_per_chunk_ms,
-        gdn_rest,
-        qsa_rest,
+        total: layers(map, 0) * rest[0]
+            + layers(map, 1) * rest[1]
+            + trunk.iter().sum::<f64>()
+            + g.fixed_per_chunk_ms,
+        rest,
         trunk,
     }
 }
@@ -62,12 +79,23 @@ fn npu_ms_with(rows: usize, cols: usize, k: usize, panel: usize, tops: f64) -> f
     let padded = cols.div_ceil(panel) * panel;
     2.0 * rows as f64 * padded as f64 * k as f64 / (tops * 1e12) * 1e3
 }
-pub fn npu_ms(cal: &Calibration, rows: usize, cols: usize) -> f64 {
-    npu_ms_with(rows, cols, 2560, cal.npu.panel_cols, cal.npu.tops_corun)
+/// Co-run NPU compute time of `cols` input-projection columns of `kind` over `rows` rows.
+pub fn npu_ms(map: &StageMap, cal: &Calibration, kind: usize, rows: usize, cols: usize) -> f64 {
+    npu_ms_with(
+        rows,
+        cols,
+        map.kinds[kind].in_k,
+        cal.npu.panel_cols,
+        cal.npu.tops_corun,
+    )
 }
-/// Out family of layer kind `k` (0 = `gdn.out`, 1 = `qsa.o`): its calibration and out-projection block.
-fn out_family(cal: &Calibration, k: usize) -> (&FamilyCalibration, &OutFamily) {
-    let family = &cal.families[OUT_FAMILY_NAMES[k]];
+/// Out family of layer kind `k`: its calibration and out-projection block.
+fn out_family<'a>(
+    map: &StageMap,
+    cal: &'a Calibration,
+    k: usize,
+) -> (&'a FamilyCalibration, &'a OutFamily) {
+    let family = &cal.families[map.kinds[k].out_family];
     (
         family,
         family
@@ -77,8 +105,8 @@ fn out_family(cal: &Calibration, k: usize) -> (&FamilyCalibration, &OutFamily) {
     )
 }
 /// Co-run NPU compute time of an out family: its simulator alone rate scaled by the in-proj co-run factor.
-fn out_ms(cal: &Calibration, k: usize, rows: usize) -> f64 {
-    let (family, o) = out_family(cal, k);
+fn out_ms(map: &StageMap, cal: &Calibration, k: usize, rows: usize) -> f64 {
+    let (family, o) = out_family(map, cal, k);
     let tops = o.tops_alone * cal.npu.tops_corun
         / cal
             .npu
@@ -86,80 +114,57 @@ fn out_ms(cal: &Calibration, k: usize, rows: usize) -> f64 {
             .expect("validated: out families need npu.tops_alone");
     npu_ms_with(rows, family.cols, o.k, o.panel_cols, tops)
 }
-fn selected(families: FamilyMask) -> [bool; 4] {
-    [
-        families.contains(Family::GdnQkv),
-        [Family::GdnZ, Family::GdnA, Family::GdnB]
-            .iter()
-            .all(|f| families.contains(*f)),
-        families.contains(Family::QsaQ),
-        [Family::QsaK, Family::QsaV, Family::QsaIdx]
-            .iter()
-            .all(|f| families.contains(*f)),
-    ]
-}
-fn supported(families: FamilyMask) -> bool {
-    for group in [
-        [Family::GdnZ, Family::GdnA, Family::GdnB],
-        [Family::QsaK, Family::QsaV, Family::QsaIdx],
-    ] {
-        let count = group.iter().filter(|f| families.contains(**f)).count();
-        if count != 0 && count != 3 {
-            return false;
-        }
-    }
-    !families.is_empty()
-}
-/// What the planner moves to the NPU: the grouped in-proj families (qkv, zab, q, kvidx) and the out families
-/// (`gdn.out`, `qsa.o`). `supported` is false for an empty or partial-group selection, which stays GPU-only.
+/// What the planner moves to the co-processor: whole in-proj groups (`StageMap::groups`) and the out families
+/// (one per kind). `supported` is false for an empty or partial-group selection, which stays GPU-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Moved {
-    pub inproj: [bool; 4],
-    pub out: [bool; 2],
+    pub inproj: [bool; GROUPS],
+    pub out: [bool; KINDS],
     pub supported: bool,
 }
 impl Moved {
-    pub fn new(inproj: [bool; 4], out: [bool; 2]) -> Self {
+    pub fn new(inproj: [bool; GROUPS], out: [bool; KINDS]) -> Self {
         Self {
             inproj,
             out,
             supported: inproj.iter().chain(&out).any(|moved| *moved),
         }
     }
-}
-impl From<FamilyMask> for Moved {
-    fn from(families: FamilyMask) -> Self {
+    /// The groups of an ownership set; no out family.
+    pub fn of(map: &StageMap, families: FamilySet) -> Self {
         Self {
-            supported: supported(families),
-            ..Self::new(selected(families), [false; 2])
+            supported: map.supports(families),
+            ..Self::new(map.owned_groups(families), [false; KINDS])
         }
     }
 }
 pub fn bank_segments(
+    map: &StageMap,
     cal: &Calibration,
-    families: FamilyMask,
+    families: FamilySet,
     rows: usize,
     prefix: usize,
 ) -> BankSegments {
-    bank_segments_moved(cal, Moved::from(families), rows, prefix)
+    bank_segments_moved(map, cal, Moved::of(map, families), rows, prefix)
 }
 /// Per-layer-kind GPU segment, NPU in-proj / out chains and NPU DRAM bytes of one bank visit. A moved out family
-/// removes its GPU o-proj GEMM from the GPU segment and adds the K=6144 pack.
+/// removes its GPU o-proj GEMM from the GPU segment and adds its K-scaled pack.
 pub fn bank_segments_moved(
+    map: &StageMap,
     cal: &Calibration,
     moved: Moved,
     rows: usize,
     prefix: usize,
 ) -> BankSegments {
-    let chunk = gpu_chunk(cal, rows, prefix);
+    let chunk = gpu_chunk(map, cal, rows, prefix);
     let f = rows as f64 / CHUNK as f64;
-    let mut cols = [0; 2];
-    let mut kept = [0.0; 2];
-    let mut consume = [0.0; 2];
-    for (i, name) in FAMILY_NAMES.iter().enumerate() {
-        let kind = usize::from(cal.families[*name].layer == "qsa");
+    let mut cols = [0; KINDS];
+    let mut kept = [0.0; KINDS];
+    let mut consume = [0.0; KINDS];
+    for (i, group) in map.groups.iter().enumerate() {
+        let kind = group.kind;
         if moved.inproj[i] {
-            let family = &cal.families[*name];
+            let family = &cal.families[group.name];
             cols[kind] += family.cols;
             if cal.glue.consume_mode == "retile" {
                 consume[kind] +=
@@ -170,27 +175,28 @@ pub fn bank_segments_moved(
         }
     }
     let mut gpu = [
-        chunk.gdn_rest + kept[0] / 36.0,
-        chunk.qsa_rest + kept[1] / 12.0,
+        chunk.rest[0] + kept[0] / layers(map, 0),
+        chunk.rest[1] + kept[1] / layers(map, 1),
     ];
-    let mut npu = [0.0; 2];
-    let mut npu_out = [0.0; 2];
-    let mut bytes = [0.0; 2];
-    for k in 0..2 {
+    let mut npu = [0.0; KINDS];
+    let mut npu_out = [0.0; KINDS];
+    let mut bytes = [0.0; KINDS];
+    for k in 0..KINDS {
+        let in_k = map.kinds[k].in_k as f64;
         if cols[k] != 0 {
             gpu[k] += cal.glue.pack_ms_8192 * f;
-            npu[k] = npu_ms(cal, rows, cols[k]) + cal.glue.sync_ms;
+            npu[k] = npu_ms(map, cal, k, rows, cols[k]) + cal.glue.sync_ms;
         }
         gpu[k] += consume[k] * f;
         if cols[k] != 0 || moved.out[k] {
             gpu[k] += cal.glue.visit_ms_8192 * f;
         }
         let padded = cols[k].div_ceil(cal.npu.panel_cols) * cal.npu.panel_cols;
-        bytes[k] = 2.0 * rows as f64 * padded as f64 * 2560.0 / 1e3 * cal.npu.bytes_per_kop;
+        bytes[k] = 2.0 * rows as f64 * padded as f64 * in_k / 1e3 * cal.npu.bytes_per_kop;
         if moved.out[k] {
-            let (family, o) = out_family(cal, k);
-            gpu[k] += (cal.glue.pack_ms_8192 * o.k as f64 / 2560.0 - o.gpu_ms_per_8192) * f;
-            npu_out[k] = out_ms(cal, k, rows) + cal.glue.sync_ms;
+            let (family, o) = out_family(map, cal, k);
+            gpu[k] += (cal.glue.pack_ms_8192 * o.k as f64 / in_k - o.gpu_ms_per_8192) * f;
+            npu_out[k] = out_ms(map, cal, k, rows) + cal.glue.sync_ms;
             bytes[k] += 2.0 * rows as f64 * family.cols as f64 * o.k as f64 / 1e3 * o.bytes_per_kop;
         }
     }
@@ -208,11 +214,13 @@ pub fn contention_extra(cal: &Calibration, gpu_other: f64, npu_this: f64, nbytes
     (cal.contention.alpha_overlap - 1.0) * gpu_other.min(npu_this)
         + cal.contention.ms_per_gb * nbytes / 1e9
 }
-/// Per QSA layer stall of the order `C_A C_B P_A P_B` (a moved `qsa.o`): I(l+1,A) overlaps P_B(l), I(l+1,B)
-/// overlaps C_A(l+1), O_A overlaps C_B, O_B overlaps P_A; each chain stalls by `max(0, chain - window)`. Windows are
-/// the measured 16K-pair Core/post phases scaled by rows (Core is linear in the prefix); the post window loses the
-/// GPU o-proj GEMM and gains the K=6144 pack; the in-proj chain is the calibrated chain scaled by its columns.
+/// Per attention layer stall of the order `C_A C_B P_A P_B` (a moved kind-1 out family): I(l+1,A) overlaps P_B(l),
+/// I(l+1,B) overlaps C_A(l+1), O_A overlaps C_B, O_B overlaps P_A; each chain stalls by `max(0, chain - window)`.
+/// Windows are the measured 16K-pair Core/post phases scaled by rows (Core is linear in the prefix); the post window
+/// loses the GPU o-proj GEMM and gains the K-scaled pack; the in-proj chain is the calibrated chain scaled by its
+/// columns.
 fn qsa_order_stall(
+    map: &StageMap,
     cal: &Calibration,
     moved: Moved,
     (r1, p1): (usize, usize),
@@ -223,25 +231,27 @@ fn qsa_order_stall(
     let q = cal
         .qsa_order
         .as_ref()
-        .expect("validated: qsa.o requires qsa_order");
-    let o = &out_family(cal, 1).1;
+        .expect("validated: the attention out family requires qsa_order");
+    let o = &out_family(map, cal, 1).1;
     let (f1, f2) = (r1 as f64 / CHUNK as f64, r2 as f64 / CHUNK as f64);
     let core = |p: usize| q.core_a_ms + (q.core_b_ms - q.core_a_ms) * p as f64 / CHUNK as f64;
-    let post = q.post_ms - o.gpu_ms_per_8192 + cal.glue.pack_ms_8192 * o.k as f64 / 2560.0;
+    let post = q.post_ms - o.gpu_ms_per_8192
+        + cal.glue.pack_ms_8192 * o.k as f64 / map.kinds[1].in_k as f64;
     let qsa_cols = |all: bool| -> usize {
-        [2usize, 3]
+        map.groups
             .iter()
-            .filter(|i| all || moved.inproj[**i])
-            .map(|i| cal.families[FAMILY_NAMES[*i]].cols)
+            .enumerate()
+            .filter(|(i, g)| g.kind == 1 && (all || moved.inproj[*i]))
+            .map(|(_, g)| cal.families[g.name].cols)
             .sum()
     };
-    let reference = npu_ms(cal, CHUNK, qsa_cols(true));
+    let reference = npu_ms(map, cal, 1, CHUNK, qsa_cols(true));
     let cols = qsa_cols(false);
     let chain = |r: usize| {
         if cols == 0 {
             0.0
         } else {
-            q.inproj_chain_ms * npu_ms(cal, r, cols) / reference
+            q.inproj_chain_ms * npu_ms(map, cal, 1, r, cols) / reference
         }
     };
     let (c_a, c_b) = (core(p1) * f1, core(p2) * f2);
@@ -251,10 +261,12 @@ fn qsa_order_stall(
         + (o1 - c_b).max(0.0)
         + (o2 - p_a).max(0.0)
 }
-/// Steady-state stall per layer. A moved `qsa.o` forces the order `C_A C_B P_A P_B` (`qsa_order_stall`). Everywhere
-/// else the NPU chains of a bank (in-proj, plus the out chain when moved) stall the GPU by what exceeds the other
-/// bank's GPU window: zero at the measured balanced pairs (stall ~1 ms/pair, fill only), real for an unbalanced pair.
+/// Steady-state stall per layer. A moved attention out family forces the order `C_A C_B P_A P_B`
+/// (`qsa_order_stall`). Everywhere else the NPU chains of a bank (in-proj, plus the out chain when moved) stall the
+/// GPU by what exceeds the other bank's GPU window: zero at balanced pairs (fill only), real for an unbalanced pair.
+#[allow(clippy::too_many_arguments)]
 fn layer_stall(
+    map: &StageMap,
     cal: &Calibration,
     moved: Moved,
     k: usize,
@@ -264,22 +276,26 @@ fn layer_stall(
     sb: &BankSegments,
 ) -> f64 {
     if k == 1 && moved.out[1] {
-        return qsa_order_stall(cal, moved, a, b, sa.npu_out[1], sb.npu_out[1]);
+        return qsa_order_stall(map, cal, moved, a, b, sa.npu_out[1], sb.npu_out[1]);
     }
     (sb.npu[k] + sb.npu_out[k] - sa.gpu[k]).max(0.0)
         + (sa.npu[k] + sa.npu_out[k] - sb.gpu[k]).max(0.0)
 }
+#[allow(clippy::too_many_arguments)]
 pub fn pair_time(
+    map: &StageMap,
     cal: &Calibration,
-    families: FamilyMask,
+    families: FamilySet,
     r1: usize,
     p1: usize,
     r2: usize,
     p2: usize,
 ) -> PairTime {
-    pair_time_moved(cal, Moved::from(families), r1, p1, r2, p2)
+    pair_time_moved(map, cal, Moved::of(map, families), r1, p1, r2, p2)
 }
+#[allow(clippy::too_many_arguments)]
 pub fn pair_time_moved(
+    map: &StageMap,
     cal: &Calibration,
     moved: Moved,
     r1: usize,
@@ -287,8 +303,8 @@ pub fn pair_time_moved(
     r2: usize,
     p2: usize,
 ) -> PairTime {
-    let a = bank_segments_moved(cal, moved, r1, p1);
-    let b = bank_segments_moved(cal, moved, r2, p2);
+    let a = bank_segments_moved(map, cal, moved, r1, p1);
+    let b = bank_segments_moved(map, cal, moved, r2, p2);
     let mut pr = PairTime {
         t: 0.0,
         stall: 0.0,
@@ -296,8 +312,9 @@ pub fn pair_time_moved(
         fill: if a.npu[0] != 0.0 { a.npu[0] } else { a.npu[1] },
         gpu_only: a.chunk.total + b.chunk.total,
     };
-    for (k, layers) in [36.0, 12.0].into_iter().enumerate() {
-        let s = layer_stall(cal, moved, k, (r1, p1), (r2, p2), &a, &b);
+    for k in 0..KINDS {
+        let layers = layers(map, k);
+        let s = layer_stall(map, cal, moved, k, (r1, p1), (r2, p2), &a, &b);
         let e = contention_extra(cal, a.gpu[k], b.npu[k] + b.npu_out[k], b.bytes[k])
             + contention_extra(cal, b.gpu[k], a.npu[k] + a.npu_out[k], a.bytes[k]);
         pr.t += layers * (a.gpu[k] + b.gpu[k] + s + e);
@@ -320,23 +337,34 @@ struct Choice {
 }
 
 /// GPU wins exact ties; natural earlier pairs win ties against rebalance/re-bank.
-/// The grouped calibration supports whole zab/kvidx groups; partial masks stay GPU-only.
-pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
-    plan_moved(cal, Moved::from(families), rows)
+/// Only whole groups move; partial-group masks stay GPU-only.
+pub fn plan(map: &StageMap, cal: &Calibration, families: FamilySet, rows: usize) -> Plan {
+    plan_moved(map, cal, Moved::of(map, families), rows)
 }
-pub fn plan_moved(cal: &Calibration, moved: Moved, rows: usize) -> Plan {
-    plan_with(cal, moved, rows, false)
+pub fn plan_moved(map: &StageMap, cal: &Calibration, moved: Moved, rows: usize) -> Plan {
+    plan_with(map, cal, moved, rows, false)
 }
 /// `plan` restricted to what the executor runs: natural 8192 + B pairs and the rebalanced last pair. The single-chunk
 /// split and the re-banked plan are skipped, so a request never gets a plan whose pairs `executable_plan` would
 /// project back to GPU chunks (with live rate scales the re-banked plan can win the model by a fraction of a percent).
-pub fn plan_executable(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
-    plan_with(cal, Moved::from(families), rows, true)
+pub fn plan_executable(
+    map: &StageMap,
+    cal: &Calibration,
+    families: FamilySet,
+    rows: usize,
+) -> Plan {
+    plan_with(map, cal, Moved::of(map, families), rows, true)
 }
-fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool) -> Plan {
+fn plan_with(
+    map: &StageMap,
+    cal: &Calibration,
+    moved: Moved,
+    rows: usize,
+    executable_only: bool,
+) -> Plan {
     let len = rows.div_ceil(CHUNK);
     let g: Vec<_> = (0..len)
-        .map(|i| gpu_chunk(cal, (rows - i * CHUNK).min(CHUNK), i * CHUNK).total)
+        .map(|i| gpu_chunk(map, cal, (rows - i * CHUNK).min(CHUNK), i * CHUNK).total)
         .collect();
     let t_gpu_ms = g.iter().sum();
     if !moved.supported {
@@ -363,7 +391,7 @@ fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool
         if i >= 2 {
             let start = (i - 2) * CHUNK;
             let last = (rows - (i - 1) * CHUNK).min(CHUNK);
-            let pr = pair_time_moved(cal, moved, CHUNK, start, last, start + CHUNK);
+            let pr = pair_time_moved(map, cal, moved, CHUNK, start, last, start + CHUNK);
             if beats(cal, pr.t, pr.gpu_only) && best[i - 2] + pr.t < best[i] {
                 best[i] = best[i - 2] + pr.t;
                 choice[i] = Choice {
@@ -378,7 +406,7 @@ fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool
         let total = rows - start;
         let h1 = half(total);
         let h2 = total - h1;
-        let pr = pair_time_moved(cal, moved, h1, start, h2, start + h1);
+        let pr = pair_time_moved(map, cal, moved, h1, start, h2, start + h1);
         if h1.min(h2) >= cal.gpu.min_bank_rows
             && beats(cal, pr.t, g[len - 2] + g[len - 1])
             && best[len - 2] + pr.t < best[len]
@@ -392,7 +420,7 @@ fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool
     }
     if !executable_only && len == 1 && rows >= 2 * cal.gpu.min_bank_rows {
         let h1 = half(rows);
-        let t = pair_time_moved(cal, moved, h1, 0, rows - h1, h1).t + cal.gpu.boundary_tax_ms;
+        let t = pair_time_moved(map, cal, moved, h1, 0, rows - h1, h1).t + cal.gpu.boundary_tax_ms;
         if beats(cal, t, g[0]) && t < best[1] {
             best[1] = t;
             choice[1] = Choice {
@@ -412,7 +440,7 @@ fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool
             let mut eligible = true;
             for k in (0..nb).step_by(2) {
                 let r2 = if k + 2 == nb { last as usize } else { size };
-                let pr = pair_time_moved(cal, moved, size, k * size, r2, (k + 1) * size);
+                let pr = pair_time_moved(map, cal, moved, size, k * size, r2, (k + 1) * size);
                 t += pr.t;
                 if cal.margin != 0.0 && !beats(cal, pr.t, pr.gpu_only) {
                     eligible = false;
@@ -457,10 +485,10 @@ fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool
     }
 }
 /// First 64-row grid point in 1024..=49152 whose suffix always beats GPU-only.
-pub fn crossover(cal: &Calibration, families: FamilyMask) -> Option<usize> {
+pub fn crossover(map: &StageMap, cal: &Calibration, families: FamilySet) -> Option<usize> {
     let mut first = None;
     for rows in (1024..=6 * CHUNK).step_by(64) {
-        let p = plan(cal, families, rows);
+        let p = plan(map, cal, families, rows);
         if p.t_pipe_ms < p.t_gpu_ms {
             if first.is_none() {
                 first = Some(rows);
@@ -476,7 +504,9 @@ pub const SELECTION_ROWS: [usize; 3] = [16384, 32768, 65536];
 /// One row of the load-time eligibility table, in ascending subset-bit order.
 #[derive(Clone, Debug)]
 pub struct SelectionRow {
-    pub families: FamilyMask,
+    pub families: FamilySet,
+    /// Names of the subset's groups, in map order.
+    pub groups: Vec<&'static str>,
     pub t_pipe_ms: [f64; 3],
     pub t_gpu_ms: [f64; 3],
     pub relative: [f64; 3],
@@ -489,58 +519,44 @@ pub struct SelectionRow {
 pub struct SelectionReport {
     pub subsets: Vec<SelectionRow>,
     /// Minimum-mean candidate before the 16384-row margin gate.
-    pub best_families: FamilyMask,
+    pub best_families: FamilySet,
 }
-impl SelectionRow {
-    pub fn family_names(&self) -> impl Iterator<Item = &'static str> {
-        FAMILY_NAMES
-            .into_iter()
-            .zip(selected(self.families))
-            .filter_map(|(name, yes)| yes.then_some(name))
-    }
-}
-pub(crate) fn subset_mask(bits: u8) -> FamilyMask {
-    let groups = [
-        FamilyMask::from(Family::GdnQkv),
-        FamilyMask::from_bits(0x0e),
-        FamilyMask::from(Family::QsaQ),
-        FamilyMask::from_bits(0xe0),
-    ];
-    groups
-        .into_iter()
-        .enumerate()
-        .fold(FamilyMask::NONE, |mask, (i, group)| {
-            if bits & (1 << i) != 0 {
-                mask | group
-            } else {
-                mask
-            }
-        })
-}
-fn compare_selection(a: &SelectionRow, b: &SelectionRow) -> std::cmp::Ordering {
+/// Mean relative time, then fewer groups, then the sorted group names.
+fn compare_selection(map: &StageMap, a: &SelectionRow, b: &SelectionRow) -> std::cmp::Ordering {
+    let names = map.sorted_group_names();
     a.mean_relative
         .total_cmp(&b.mean_relative)
-        .then_with(|| a.family_names().count().cmp(&b.family_names().count()))
+        .then_with(|| a.groups.len().cmp(&b.groups.len()))
         .then_with(|| {
-            let names = ["kvidx", "q", "qkv", "zab"];
             names
                 .into_iter()
-                .filter(|name| a.family_names().any(|n| n == *name))
-                .cmp(
-                    names
-                        .into_iter()
-                        .filter(|name| b.family_names().any(|n| n == *name)),
-                )
+                .filter(|name| a.groups.contains(name))
+                .cmp(names.into_iter().filter(|name| b.groups.contains(name)))
         })
 }
+/// Names of the groups whose bit is set in `bits`, in map order.
+pub fn group_names(map: &StageMap, bits: u8) -> Vec<&'static str> {
+    map.groups
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bits & (1 << i) != 0)
+        .map(|(_, g)| g.name)
+        .collect()
+}
+/// Whether every group of `bits` is `selectable` in the calibration.
+pub fn selectable(map: &StageMap, cal: &Calibration, bits: u8) -> bool {
+    group_names(map, bits)
+        .into_iter()
+        .all(|name| cal.families[name].selectable)
+}
 /// Select the minimum mean T_pipe/T_gpu across the three fixed prompt sizes among the subsets whose every family is
-/// `selectable` (the out families `gdn.out` / `qsa.o` are not in the in-proj mask and stay at zero selection).
+/// `selectable` (the out families are not in the in-proj mask and stay at zero selection).
 /// Gate that winner (not a runner-up) by the strict 16384-row margin.
-pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
-    let mut subsets = Vec::with_capacity(15);
-    for bits in 1..16 {
-        let families = subset_mask(bits);
-        let plans = SELECTION_ROWS.map(|rows| plan(cal, families, rows));
+pub fn select_families(map: &StageMap, cal: &Calibration) -> (FamilySet, SelectionReport) {
+    let mut subsets = Vec::with_capacity((1 << GROUPS) - 1);
+    for bits in 1..1u8 << GROUPS {
+        let families = map.subset(bits);
+        let plans = SELECTION_ROWS.map(|rows| plan(map, cal, families, rows));
         let t_pipe_ms = std::array::from_fn(|i| plans[i].t_pipe_ms);
         let t_gpu_ms = std::array::from_fn(|i| plans[i].t_gpu_ms);
         // A zero-cost GPU baseline has no possible strict improvement.
@@ -551,37 +567,34 @@ pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
                 t_pipe_ms[i] / t_gpu_ms[i]
             }
         });
-        let selectable = FAMILY_NAMES
-            .iter()
-            .enumerate()
-            .all(|(i, name)| bits & (1 << i) == 0 || cal.families[*name].selectable);
         subsets.push(SelectionRow {
             families,
+            groups: group_names(map, bits),
             t_pipe_ms,
             t_gpu_ms,
             relative,
             mean_relative: relative.iter().sum::<f64>() / 3.0,
             beats_margin_16384: beats(cal, t_pipe_ms[0], t_gpu_ms[0]),
-            selectable,
+            selectable: selectable(map, cal, bits),
         });
     }
     let Some(best) = subsets
         .iter()
         .filter(|row| row.selectable)
-        .min_by(|a, b| compare_selection(a, b))
+        .min_by(|a, b| compare_selection(map, a, b))
     else {
         return (
-            FamilyMask::NONE,
+            FamilySet::NONE,
             SelectionReport {
                 subsets,
-                best_families: FamilyMask::NONE,
+                best_families: FamilySet::NONE,
             },
         );
     };
     let families = if best.beats_margin_16384 {
         best.families
     } else {
-        FamilyMask::NONE
+        FamilySet::NONE
     };
     let best_families = best.families;
     (
@@ -594,9 +607,13 @@ pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
 }
 
 /// Admit any nonempty calibrated family subset.
-pub fn auto_admission(cal: &Calibration, current: &CalKey) -> Result<FamilyMask, String> {
+pub fn auto_admission(
+    map: &StageMap,
+    cal: &Calibration,
+    current: &CalKey,
+) -> Result<FamilySet, String> {
     cal.key_matches(current)?;
-    let (families, _) = select_families(cal);
+    let (families, _) = select_families(map, cal);
     if families.is_empty() {
         return Err("calibration selects no families".into());
     }
@@ -627,17 +644,19 @@ fn executable_pair(a: &Range<usize>, b: &Range<usize>, rows: usize, minimum: usi
 /// and the rebalanced last pair (`pipe-rebalanced`). Split/rebanked steps stay
 /// GPU-only; never substitute force-pairs.
 pub fn executable_plan(
+    map: &StageMap,
     cal: &Calibration,
     planned: &Plan,
     rows: usize,
     n_star: Option<usize>,
 ) -> Plan {
-    executable_plan_for(cal, FamilyMask::ALL, planned, rows, n_star)
+    executable_plan_for(map, cal, map.all(), planned, rows, n_star)
 }
 /// `executable_plan` whose predicted `t_pipe_ms` prices each pair with `families` (the set `planned` was made for).
 pub fn executable_plan_for(
+    map: &StageMap,
     cal: &Calibration,
-    families: FamilyMask,
+    families: FamilySet,
     planned: &Plan,
     rows: usize,
     n_star: Option<usize>,
@@ -661,12 +680,12 @@ pub fn executable_plan_for(
             })
             .flatten();
         if let Some((a, b)) = pair {
-            t_pipe_ms += pair_time(cal, families, a.len(), a.start, b.len(), b.start).t;
+            t_pipe_ms += pair_time(map, cal, families, a.len(), a.start, b.len(), b.start).t;
             at = b.end;
             steps.push(Step::Pipe { a, b });
         } else {
             let end = (at + CHUNK).min(rows);
-            t_pipe_ms += gpu_chunk(cal, end - at, at).total;
+            t_pipe_ms += gpu_chunk(map, cal, end - at, at).total;
             steps.push(Step::Gpu { chunk: at..end });
             at = end;
         }
@@ -689,34 +708,72 @@ pub fn planned_pair(planned: &Plan, offset: usize) -> Option<(usize, usize)> {
 pub fn planned_pair_rows(planned: &Plan, offset: usize) -> Option<usize> {
     planned_pair(planned, offset).map(|(a, b)| a + b)
 }
+/// The max-window budget: a bank below `CHUNK` rows runs the co-processor program of its own padded row count
+/// (`padded_rows`), one hardware context per distinct count, at most `max_contexts` per load. Admits the counts of
+/// `executable`'s pairs into `admitted` in first-use order (the order the co-processor meets them). A pair that would
+/// exceed the budget is dropped and `replan` rebuilds the plan from the remaining pairs, so its rows run GPU-native
+/// rather than through a full `CHUNK`-row chain.
+pub fn admit_wave_budget(
+    executable: Plan,
+    admitted: &mut Vec<usize>,
+    max_contexts: usize,
+    padded_rows: impl Fn(usize) -> usize,
+    replan: impl Fn(&Plan) -> Plan,
+) -> Plan {
+    let mut kept = executable.clone();
+    kept.steps.retain(|step| {
+        let Step::Pipe { a, b } = step else {
+            return true;
+        };
+        let mut next = admitted.clone();
+        for rows in [a.len(), b.len()].map(&padded_rows) {
+            if rows < CHUNK && !next.contains(&rows) {
+                next.push(rows);
+            }
+        }
+        let fits = next.len() <= max_contexts;
+        if fits {
+            *admitted = next;
+        }
+        fits
+    });
+    if kept.steps.len() == executable.steps.len() {
+        executable
+    } else {
+        replan(&kept)
+    }
+}
 /// Load-time log context, all caller-supplied deterministic state.
 pub struct LoadLogKey<'a> {
     pub current: &'a CalKey,
     pub mode: &'a str,
-    pub families: FamilyMask,
+    pub families: FamilySet,
 }
 pub fn load_log_line(
+    map: &StageMap,
     cal: &Calibration,
     key: &LoadLogKey<'_>,
     n_star: Option<usize>,
     t16384: &Plan,
     t65536: &Plan,
 ) -> String {
+    let tag = map.tag;
     if let Err(reason) = cal.key_matches(key.current) {
-        return format!("npu-trunk: off ({reason})");
+        return format!("{tag}: off ({reason})");
     }
     let bytes = serde_json::to_vec(cal).expect("validated calibration JSON");
     let hash = Sha256::digest(&bytes);
-    let names: Vec<_> = FAMILY_NAMES
-        .into_iter()
-        .zip(selected(key.families))
-        .filter_map(|(name, yes)| yes.then_some(name))
+    let names: Vec<_> = map
+        .groups
+        .iter()
+        .zip(map.owned_groups(key.families))
+        .filter_map(|(g, yes)| yes.then_some(g.name))
         .collect();
-    format!("npu-trunk: mode={} contract={} families={} cal_key={} cal_sha256={:x} n*={} T(16384)={:.6}/{:.6} T(65536)={:.6}/{:.6}",
+    format!("{tag}: mode={} contract={} families={} cal_key={} cal_sha256={:x} n*={} T(16384)={:.6}/{:.6} T(65536)={:.6}/{:.6}",
         key.mode, cal.npu.epilogue, names.join(","), serde_json::to_string(&cal.key).expect("key JSON"), hash,
         n_star.map_or_else(|| "none".into(), |n| n.to_string()), t16384.t_pipe_ms, t16384.t_gpu_ms, t65536.t_pipe_ms, t65536.t_gpu_ms)
 }
-pub fn request_log_line(rows: usize, plan: &Plan) -> String {
+pub fn request_log_line(map: &StageMap, rows: usize, plan: &Plan) -> String {
     let steps: Vec<_> = plan
         .steps
         .iter()
@@ -731,7 +788,63 @@ pub fn request_log_line(rows: usize, plan: &Plan) -> String {
         100.0 * (plan.t_pipe_ms - plan.t_gpu_ms) / plan.t_gpu_ms
     };
     format!(
-        "npu-trunk: rows={rows} plan=[{}] predicted={percent:+.1}%",
+        "{}: rows={rows} plan=[{}] predicted={percent:+.1}%",
+        map.tag,
         steps.join(" | ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::stage::{tests::DENSE, LayerKindDecl};
+    use super::*;
+
+    fn calibration() -> Calibration {
+        let group = |cols: usize, layer: &str| serde_json::json!({"layer": layer, "cols": cols, "out_dtype": "bf16"});
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 4,
+            "key": {"device": {"arch": "gfx1151", "pci_bdf": "0000:c5:00.0", "npu_fw_version": "test"},
+                    "kernel": {"uname_release": "test"}, "model_trunk_index_sha256": "0".repeat(64),
+                    "epilogue": "bf16", "trunk_route": "stock"},
+            "gpu": {"trunk_in_ms_per_8192": {"qkv": 550.0, "zab": 365.0, "q": 220.0, "kv": 44.0},
+                    "uniform_per_layer_ms": 40.0, "gdn_core_per_layer_ms": 8.0, "qsa_per_layer_ms": 30.0,
+                    "qsa_growth_per_layer_ms_per_8192_prefix": 2.0, "fixed_per_chunk_ms": 10.0,
+                    "boundary_tax_ms": 300.0, "min_bank_rows": 2048},
+            "families": {"qkv": group(10240, "gdn"), "zab": group(6240, "gdn"), "q": group(12288, "fa"),
+                         "kv": group(2048, "fa")},
+            "glue": {"pack_ms_8192": 1.0, "sync_ms": 4.0, "consume_mode": "direct",
+                     "consume_ms_per_col_8192": {"bf16": 0.0, "f32": 0.0}},
+            "npu": {"tops_corun": 200.0, "bytes_per_kop": 2.4, "epilogue": "bf16", "panel_cols": 512},
+            "contention": {"alpha_overlap": 1.1, "model": "test"},
+            "margin": 0.0
+        }))
+        .unwrap()
+    }
+
+    /// The planner prices a map's own layer counts and reduction depth, not Flash-Next's 36/12 layers and K = 2560.
+    #[test]
+    fn costs_follow_the_map_layer_counts_and_reduction_depth() {
+        let cal = calibration();
+        cal.validate(&DENSE).unwrap();
+        let chunk = gpu_chunk(&DENSE, &cal, CHUNK, 0);
+        assert_eq!(chunk.total, 48.0 * 48.0 + 16.0 * 70.0 + 1179.0 + 10.0);
+        let shallow = StageMap {
+            kinds: DENSE.kinds.map(|k| LayerKindDecl {
+                in_k: k.in_k / 2,
+                ..k
+            }),
+            ..DENSE
+        };
+        assert_eq!(
+            npu_ms(&DENSE, &cal, 0, CHUNK, 10240),
+            2.0 * npu_ms(&shallow, &cal, 0, CHUNK, 10240)
+        );
+        let segments = bank_segments(&DENSE, &cal, DENSE.subset(0b0001), CHUNK, 0);
+        // qkv moved: its whole-stack GPU cost leaves the per-layer GDN segment, the FA segment keeps all of its own.
+        assert_eq!(segments.gpu[0], 48.0 + 365.0 / 48.0 + 1.0);
+        assert_eq!(segments.gpu[1], 70.0 + 264.0 / 16.0);
+        assert!(segments.npu[0] > 0.0 && segments.npu[1] == 0.0);
+        let plan = plan(&DENSE, &cal, DENSE.all(), 16384);
+        assert!(matches!(plan.steps[..], [Step::Pipe { .. }]), "{plan:?}");
+    }
 }

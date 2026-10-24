@@ -18,10 +18,10 @@
 //! Functional ticks are simulator ticks, never silicon cycles. Budget: a fixed number of submits of one wave,
 //! `tick_limit` as in the peacemaker-npu harness (`Config` default, per wait, so a stall is an `Err`, not a hang).
 use hipfire_arch_qwen4::npu_trunk::{
-    build_out_programs, build_programs_for_families, pack_out, pack_shape, EpilogueContract,
-    Family, FamilyMask, MatrixRef, PackedB, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS,
-    TRUNK_K,
+    build_out_programs, build_programs_for_families, pack_out, pack_shape, Family, FamilyMask,
+    MatrixRef, PackedB, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
 };
+use hipfire_runtime::coproc::EpilogueContract;
 use peacemaker_npu::kernels::gemm_array::ArrayDesign;
 use peacemaker_npu::kernels::gemm_core::{Control, Epilogue};
 use peacemaker_npu::kernels::gemm_g80::{design_g80, pack_a_bf16, pack_b_bf16};
