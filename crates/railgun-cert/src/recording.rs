@@ -877,9 +877,9 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gfx1151-mq4v2-verify-xlds",
         predicates: &[IsRecording],
-        condition: "Gpu::gfx1151_xlds_active: `flags.gfx1151_xlds && exact gfx1151 && !is_recording() && 1 <= N <= 16 && k % 256 == 0` (gemm.rs), consulted by gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma and gemm_mq4g256v2_residual_wmma (also the verify lm_head) just before the base launch, by the HFQ4G256/MQ4G256 v1 gemm_{qkvza,qkv}_hfq4g256_wmma, gemm_gate_up_hfq4g256_wmma and gemm_hfq4g256_residual_wmma (also gemm_hfq4g256_batched_lmhead; the last two only without a HIPFIRE_GATE_UP_VARIANT / HIPFIRE_WO_WMMA_VARIANT pin), and by gemm_q8_0_wmma (Q8_0 DFlash draft/verify lm_head; also needs a 16 B aligned weight base); eager and HipGraph capture both take the route (it ignores capture_mode), only Redline recording keeps the base contract. Kill switch HIPFIRE_GFX1151_XLDS=0",
+        condition: "Gpu::gfx1151_xlds_active: `flags.gfx1151_xlds && exact gfx1151 && !is_recording() && 1 <= N <= 16 && k % 256 == 0` (gemm.rs), consulted by gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma and gemm_mq4g256v2_residual_wmma (also the verify lm_head) just before the base launch, by the HFQ4G256/MQ4G256 v1 gemm_{qkvza,qkv}_hfq4g256_wmma, gemm_gate_up_hfq4g256_wmma and gemm_hfq4g256_residual_wmma (also gemm_hfq4g256_batched_lmhead; the last two only without a HIPFIRE_GATE_UP_VARIANT / HIPFIRE_WO_WMMA_VARIANT pin), by gemm_q8_0_wmma (Q8_0 DFlash draft/verify lm_head; also needs a 16 B aligned weight base), by gemm_gate_up_q8_0_wmma (two gemm_q8_0_wmma launches; both weight bases 16 B aligned) and by gemm_mw16_residual_wmma_f16x (DSpark F16 drafter lm_head; W and X 16 B aligned); eager and HipGraph capture both take the route (it ignores capture_mode), only Redline recording keeps the base contract. Kill switch HIPFIRE_GFX1151_XLDS=0",
         effect: KernelSelection,
-        switches: "eager/captured: `gemm_*_{mq4g256v2,hfq4g256}_wmma_gfx1151_xlds` / `gemm_q8_0_wmma_gfx1151_xlds` (128-thread blocks, 4 waves x 16 rows, X slab staged in LDS); recorded: base one-wave `gemm_*_mq4g256v2_wmma` / `gemm_*_hfq4g256_wmma{,_ldscoop_nosync,_k2}` / `gemm_q8_0_wmma`",
+        switches: "eager/captured: `gemm_*_{mq4g256v2,hfq4g256}_wmma_gfx1151_xlds` / `gemm_q8_0_wmma_gfx1151_xlds` / `gemm_f16_wmma_gfx1151_xlds` (128-thread blocks, 4 waves x 16 rows, X slab staged in LDS); recorded: base one-wave `gemm_*_mq4g256v2_wmma` / `gemm_*_hfq4g256_wmma{,_ldscoop_nosync,_k2}` / `gemm_q8_0_wmma` / `gemm_gate_up_q8_0_wmma` / `gemm_mw16_residual_wmma`",
         kernels: &[
             "gemm_*_mq4g256v2_wmma_gfx1151_xlds",
             "gemm_*_mq4g256v2_wmma",
@@ -889,9 +889,12 @@ pub const DECISIONS: &[Decision] = &[
             "gemm_hfq4g256_residual_wmma_k2",
             "gemm_q8_0_wmma_gfx1151_xlds",
             "gemm_q8_0_wmma",
+            "gemm_gate_up_q8_0_wmma",
+            "gemm_f16_wmma_gfx1151_xlds",
+            "gemm_mw16_residual_wmma",
         ],
         verdict: ByteExact,
-        evidence: "by construction: each (weight row, batch row) output is the base kernel's single WMMA chain (same K order from acc = 0, same header selection (MQ4V2 dual-half; v1 group f32 (scale, zero) cast to f16), dequant value fma_f16(scale, nibble, zero) and epilogue); only the X-tile source (an LDS copy of the same fp16 bytes) and the waves per block differ. Oracle: `rdna-compute/examples/test_mq4v2_xlds_gfx1151.rs` compares raw f32 bits of every output element against the base dispatcher for gate_up/qkvza/qkv/residual in both formats at the 27B and 9B shapes and odd shapes, N = 1, 5, 16; `rdna-compute/examples/bench_q8_lmhead_rows.rs` does the same for gemm_q8_0_wmma on a real 248320 x 5120 Q8 head and odd shapes. Reaches no default Redline program (gfx1151 4-bit verify = DFlash)",
+        evidence: "by construction: each (weight row, batch row) output is the base kernel's single WMMA chain (same K order from acc = 0, same header selection (MQ4V2 dual-half; v1 group f32 (scale, zero) cast to f16), dequant value fma_f16(scale, nibble, zero) and epilogue); only the X-tile source (an LDS copy of the same fp16 bytes) and the waves per block differ. Oracle: `rdna-compute/examples/test_mq4v2_xlds_gfx1151.rs` compares raw f32 bits of every output element against the base dispatcher for gate_up/qkvza/qkv/residual in both formats at the 27B and 9B shapes and odd shapes, N = 1, 5, 16; `rdna-compute/examples/bench_q8_lmhead_rows.rs` does the same for gemm_q8_0_wmma on a real 248320 x 5120 Q8 head and odd shapes; `rdna-compute/examples/test_gate_up_f16_xlds_gfx1151.rs` for gemm_gate_up_q8_0_wmma and gemm_mw16_residual_wmma_f16x at odd and DSpark drafter shapes. Reaches no default Redline program (gfx1151 4-bit verify = DFlash)",
         reaches: &[],
     },
     Decision {
