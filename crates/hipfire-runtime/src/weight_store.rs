@@ -1278,6 +1278,14 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     let k_alignment = match dtype {
         DType::MQ4G256V2 => 256usize,
         DType::MQ4G128V2 => 1,
+        // Matrix rows only; other ranks are packed flat. The MQ4 FWHT
+        // rotation spans whole 256-element groups of a row.
+        DType::MQ4G256 if shape.len() >= 2 => 256,
+        // A `[rows, K]` HFQ4G128 matrix pads each row to whole groups. Files
+        // quantized before `b4846285e` packed groups across rows when
+        // `K % 128 != 0`; per-row kernels read past such a buffer. A conv1d
+        // `[C, 1, W]` is packed flat.
+        DType::HFQ4G128 if shape.len() == 2 => 1,
         // qt=55 is expert-blocked, not row-strided: `[E, R, K]` (or `[R, K]`)
         // is E blocks of `b128_block_stride(R, K)` bytes.
         DType::FP8E4M3B128 => {
@@ -1316,8 +1324,12 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         .iter()
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))
         .ok_or_else(|| format!("{dtype:?} payload row count overflows usize"))?;
-    dtype
-        .row_bytes(k)
+    let row_bytes = match dtype {
+        // `DType::row_bytes` has no HFQ4G128 arm; ParoQ4G128 is its layout.
+        DType::HFQ4G128 => DType::ParoQ4G128.row_bytes(k),
+        _ => dtype.row_bytes(k),
+    };
+    row_bytes
         .and_then(|row| rows.checked_mul(row))
         .ok_or_else(|| format!("{dtype:?} payload byte length overflows usize"))
         .map(Some)
@@ -2058,26 +2070,12 @@ where
             };
             return Err(rollback_fulfill_error(store, gpu, error));
         }
-        if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
-            let expected_bytes = entry
-                .logical_shape
-                .iter()
-                .try_fold(1usize, |count, &dim| count.checked_mul(dim))
-                .and_then(|elements| elements.checked_mul(dtype.size()));
-            if expected_bytes != Some(bytes.len()) {
-                let error = FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: 0,
-                    reason: format!(
-                        "source payload has {} bytes, expected {:?} for {dtype:?} {:?}",
-                        bytes.len(),
-                        expected_bytes,
-                        entry.logical_shape
-                    ),
-                };
-                return Err(rollback_fulfill_error(store, gpu, error));
-            }
+        if let Err(reason) = validate_payload_extent(&entry.logical_shape, dtype, bytes.len()) {
+            return Err(rollback_fulfill_error(
+                store,
+                gpu,
+                fulfill_entry_error(entry, reason),
+            ));
         }
         let mut tensor = match upload_pooled_bytes(gpu, &bytes, &entry.logical_shape) {
             Ok(tensor) => tensor,
@@ -4266,6 +4264,24 @@ mod tests {
         assert!(validate_payload_extent(&[2, 129], DType::MQ4G128V2, 2 * 68).is_err());
         assert!(expected_payload_bytes(&[2, 512], DType::MQ4G256V2).is_ok());
         assert!(expected_payload_bytes(&[2, 129], DType::MQ4G256V2).is_err());
+    }
+
+    #[test]
+    fn hfq4g128_extent_refuses_cross_row_packing() {
+        // SmolLM2 q_proj: K=960 is 7.5 groups; each row pads to 8 groups.
+        assert_eq!(
+            expected_payload_bytes(&[960, 960], DType::HFQ4G128).unwrap(),
+            Some(960 * 8 * 72)
+        );
+        // A pre-`b4846285e` file packs groups across rows: 7.5 groups per row.
+        assert!(validate_payload_extent(&[960, 960], DType::HFQ4G128, 960 * 540).is_err());
+        assert!(expected_payload_bytes(&[960, 2560], DType::MQ4G256).is_ok());
+        assert!(expected_payload_bytes(&[2560, 960], DType::MQ4G256).is_err());
+        // A flat-packed conv1d `[C, 1, 4]` has no row-padded extent.
+        assert_eq!(
+            expected_payload_bytes(&[64, 1, 4], DType::HFQ4G128).unwrap(),
+            None
+        );
     }
 
     #[test]
