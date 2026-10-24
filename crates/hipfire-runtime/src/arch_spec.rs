@@ -119,6 +119,11 @@ pub trait DenseArch {
     > {
         Ok(None)
     }
+    /// Called once layer `l` is complete, while `scratch().x` holds its
+    /// post-FFN residual. Default no-op; llama uses it for DFlash hidden capture.
+    fn after_layer(&self, _gpu: &mut Gpu, _l: usize) -> HipResult<()> {
+        Ok(())
+    }
 }
 
 #[inline]
@@ -306,6 +311,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             }],
         )
         .map_err(herr)?;
+        arch.after_layer(gpu, l)?;
     }
 
     Ok(())

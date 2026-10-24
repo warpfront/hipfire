@@ -2075,6 +2075,26 @@ pub fn prefill_forward(
 /// largest physical_cap any consumer sets up.
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// Whether the AR route prefills a prompt with [`forward_prefill_batch`] rather
+/// than the per-token decode forward. Speculators that must reproduce AR's
+/// prompt KV (generic DFlash / n-gram on `LlamaBundle`) use the same gate.
+#[inline]
+pub fn llama_qwen3_batched_prefill_eligible(
+    gpu_arch: &str,
+    model_arch: ModelArch,
+    prefill_batched_enabled: bool,
+    quant_q8: bool,
+    has_eviction: bool,
+    token_count: usize,
+) -> bool {
+    model_arch == ModelArch::Qwen3
+        && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
+        && prefill_batched_enabled
+        && quant_q8
+        && !has_eviction
+        && token_count >= 4
+}
+
 /// Kill-switch for the MQ-V2 (qt44 + neutral qt47-50) gfx11 WMMA prefill path:
 /// gfx12 (`gfx1200`/`gfx1201`) is always admitted, gfx11
 /// (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151`) is admitted unless
@@ -4408,6 +4428,31 @@ fn forward_scratch_layers_lowered(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
+    forward_scratch_compute_lowered(gpu, weights, config, pos, kv_cache, scratch, None)?;
+    gpu.sample_top_p(
+        &scratch.logits,
+        &scratch.sample_buf,
+        &scratch.repeat_buf,
+        config.vocab_size,
+        temperature,
+        top_p,
+        rng_state,
+        repeat_window,
+        repeat_penalty,
+    )
+}
+
+/// Lowered layer loop + final norm + logits (no sampling) with the optional
+/// per-extract-layer hidden capture of [`forward_scratch_compute_capture`].
+fn forward_scratch_compute_lowered(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
     use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 
     let ctx = DispatchCtx::new(gpu);
@@ -4431,10 +4476,18 @@ fn forward_scratch_layers_lowered(
         flash_mode: attention_flash_mode(&gpu.arch),
         knobs,
         pos,
+        extract_layers: capture.as_ref().map_or(&[], |c| c.extract_layers),
+        cap_rows: std::cell::RefCell::new(Vec::new()),
     };
     crate::arch_spec::dense_forward(gpu, &ctx, &arch)?;
+    if let Some(cap) = capture {
+        // `after_layer` collected rows in ascending layer order = extract order.
+        for row in arch.cap_rows.into_inner() {
+            cap.hidden.extend_from_slice(&row);
+        }
+    }
 
-    // ── Final norm + logits + sampling ──
+    // ── Final norm + logits ──
     gpu.rmsnorm_f32(
         &scratch.x,
         &weights.output_norm,
@@ -4451,19 +4504,7 @@ fn forward_scratch_layers_lowered(
             out: &scratch.logits,
         }],
     )
-    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-
-    gpu.sample_top_p(
-        &scratch.logits,
-        &scratch.sample_buf,
-        &scratch.repeat_buf,
-        config.vocab_size,
-        temperature,
-        top_p,
-        rng_state,
-        repeat_window,
-        repeat_penalty,
-    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
 }
 
 /// Per-forward [`crate::arch_spec::DenseArch`] wrapper for llama-family models.
@@ -4478,6 +4519,10 @@ struct LlamaDense<'a> {
     flash_mode: usize,
     knobs: crate::arch_spec::DenseKnobs,
     pos: usize,
+    /// DFlash capture layers (ascending); empty when not capturing.
+    extract_layers: &'a [usize],
+    /// Post-FFN residual rows downloaded by `after_layer` for `extract_layers`.
+    cap_rows: std::cell::RefCell<Vec<Vec<f32>>>,
 }
 
 impl crate::arch_spec::DenseArch for LlamaDense<'_> {
@@ -4543,6 +4588,13 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             c.head_dim,
             c.n_kv_heads * c.head_dim,
         )
+    }
+    fn after_layer(&self, gpu: &mut Gpu, l: usize) -> HipResult<()> {
+        if self.extract_layers.contains(&l) {
+            let row = self.scratch.x.sub_offset(0, self.config.dim);
+            self.cap_rows.borrow_mut().push(gpu.download_f32(&row)?);
+        }
+        Ok(())
     }
     fn attend_plan(&self, l: usize) -> HipResult<Option<(KvTierPlan, AttnParams<'_>)>> {
         let kv = self.kv_cache;
@@ -5191,15 +5243,14 @@ pub fn forward_scratch_compute(
 }
 
 /// `forward_scratch_compute` plus an optional per-extract-layer residual-hidden
-/// capture sink. Processes ONE token (decode kernel — bit-identical to AR's
-/// `forward_scratch`), and for each decoder layer whose index appears in
+/// capture sink. Processes ONE token through the same decode body as AR's
+/// `forward_scratch` (the lowered path unless `HIPFIRE_FORWARD_LOWERED=0`, then
+/// the hand ladder below), and for each decoder layer whose index appears in
 /// `capture.extract_layers` downloads the post-FFN residual (`scratch.x[..dim]`)
 /// and appends, in `extract_layers` ascending order, `num_extract × dim` f32 to
 /// the sink. This is the per-token twin of `forward_prefill_batch_capture`'s
-/// capture; used by the DFlash spec prefill so the speculator conditions on the
-/// EXACT residual stream AR's per-token prefill produces (greedy-equivalence —
-/// the batched prefill kernel is not bitwise-equal to the decode kernel and
-/// flips argmax at near-tie logits).
+/// capture; speculators use it wherever AR runs a per-token forward so the
+/// committed KV and hidden match AR's decode bit for bit.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_scratch_compute_capture(
     gpu: &mut Gpu,
@@ -5210,6 +5261,11 @@ pub fn forward_scratch_compute_capture(
     scratch: &ForwardScratch,
     mut capture: Option<&mut HiddenCaptureSink>,
 ) -> HipResult<()> {
+    if llama_forward_lowered_enabled() {
+        return forward_scratch_compute_lowered(
+            gpu, weights, config, pos, kv_cache, scratch, capture,
+        );
+    }
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;

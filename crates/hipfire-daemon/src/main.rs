@@ -35,14 +35,14 @@ use hipfire_generate::ar::take_fault_after_prefill;
 use hipfire_generate::ar::{
     ckpt_interval, ckpt_max, ckpt_resume_enabled, deepseek4_spec_requested,
     deepseek4_spec_requested_from_policy, emit_qwen_ar_done, generate, llama_prefill_sample_seed,
-    llama_qwen3_batched_prefill_eligible, model_retry_reset_eligible, qwen_ar_apply_cache_action,
-    qwen_ar_cache_action, qwen_ar_done_value, qwen_ar_drain_pending_into_router,
-    qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
-    qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
-    qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
-    select_generation_route, truncate_checkpoints, write_error, GenerationRoute,
-    GenerationRouteInputs, QwenArCacheAction, QwenArForwardFailAction, QwenArRawCommitDisposition,
-    QwenArRouteFinish, QwenArSemanticProducer, QwenArTerminalCause,
+    model_retry_reset_eligible, qwen_ar_apply_cache_action, qwen_ar_cache_action,
+    qwen_ar_done_value, qwen_ar_drain_pending_into_router, qwen_ar_eviction_prefill_chunk_limit,
+    qwen_ar_finish_route, qwen_ar_forward_fail_action, qwen_ar_forward_fail_message,
+    qwen_ar_observe_and_route, qwen_ar_raw_commit_token, qwen_ar_route_filter_text,
+    qwen_ar_route_think_events, reset_core_arch_key, select_generation_route, truncate_checkpoints,
+    write_error, GenerationRoute, GenerationRouteInputs, QwenArCacheAction,
+    QwenArForwardFailAction, QwenArRawCommitDisposition, QwenArRouteFinish, QwenArSemanticProducer,
+    QwenArTerminalCause,
 };
 use hipfire_generate::batch::{
     attach_qwen_ep_batch_receipt_evidence, drive_lfm_continuous_batch,

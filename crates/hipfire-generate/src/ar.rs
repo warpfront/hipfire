@@ -1916,23 +1916,6 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
 }
 
 #[inline]
-pub fn llama_qwen3_batched_prefill_eligible(
-    gpu_arch: &str,
-    model_arch: llama::ModelArch,
-    prefill_batched_enabled: bool,
-    quant_q8: bool,
-    has_eviction: bool,
-    token_count: usize,
-) -> bool {
-    model_arch == llama::ModelArch::Qwen3
-        && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
-        && prefill_batched_enabled
-        && quant_q8
-        && !has_eviction
-        && token_count >= 4
-}
-
-#[inline]
 pub fn llama_prefill_sample_seed(mut seed: u32, token_count: usize, temperature: f32) -> u32 {
     // The legacy sequential prefill sampled after every prompt token. Sampling
     // at temperature=0 does not advance xorshift32; sampled generation advances
@@ -6084,7 +6067,7 @@ pub fn generate(
         let kv = &mut b.kv;
 
         let mut rng_state = request_seed;
-        let batched_prefill = llama_qwen3_batched_prefill_eligible(
+        let batched_prefill = llama::llama_qwen3_batched_prefill_eligible(
             &gpu.arch,
             config.arch,
             hipfire_runtime::config::get().prefill_batched,

@@ -2389,6 +2389,86 @@ mod tests {
         );
     }
 
+    /// HIPF-111: a DSpark bootstrap (`capture_seed_main_hidden`) arms the
+    /// verify's hidden capture at the drafter's layers, for the per-token
+    /// (1..3 rows) and the batched (>= 4 rows) verify alike. The daemon never
+    /// set the bundle's extract layers, so every verify reported
+    /// `captured == false` and DSpark re-ran the bootstrap forward each window.
+    #[test]
+    fn dspark_bootstrap_arms_verify_capture_for_every_block_size() {
+        use hipfire_runtime::spec::{SpecAdvance, SpecTarget};
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(fixture) = pinned_fixture_path() else {
+            return;
+        };
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("dspark-capture: no GPU; skipping");
+            return;
+        };
+        let hfq = HfqFile::open(Path::new(&fixture)).expect("open pinned fixture");
+        let cask = CaskConfig::default();
+        let mut ctx = load_ctx(Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = 64;
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("production load");
+        drop(ctx);
+
+        let prompt: Vec<u32> = (100..120).collect();
+        let SpecAdvance::Ready {
+            last_argmax: seed, ..
+        } = bundle
+            .spec_advance(&mut gpu, &prompt, 0, false, &|| false, None)
+            .expect("prefill")
+        else {
+            panic!("prefill aborted");
+        };
+        let pos = prompt.len();
+        let layers = [1usize, 13, 26];
+        let row = layers.len() * bundle.config.dim;
+        let boot = bundle
+            .capture_seed_main_hidden(&mut gpu, seed, pos, &layers)
+            .expect("bootstrap");
+        assert_eq!(boot.len(), row);
+
+        let hidden = gpu.alloc_tensor(&[5 * row], DType::F32).unwrap();
+        for block in [vec![seed, 7], vec![seed, 7, 8, 9, 10]] {
+            // NaN-fill so an unwritten capture cannot pass for a written one.
+            gpu.hip.memset(&hidden.buf, 0xff, 5 * row * 4).unwrap();
+            let mut scratch = bundle.new_spec_scratch(&mut gpu, block.len()).unwrap();
+            let (_, captured) = bundle
+                .verify_block_capture_gpu(&mut gpu, &block, pos, scratch.as_mut(), &hidden)
+                .expect("verify");
+            scratch.free(&mut gpu);
+            assert!(captured, "{}-row verify captured nothing", block.len());
+            let all = gpu
+                .download_f32(&hidden.sub_offset(0, block.len() * row))
+                .unwrap();
+            assert!(
+                all.iter().all(|v| v.is_finite()),
+                "{}-row capture has unwritten rows",
+                block.len()
+            );
+            // Row 0 is the seed at `pos`, the token the bootstrap captured: the
+            // per-token verify runs the very same forward, the batched one only
+            // differs by GEMM rounding.
+            let peak = boot.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = all[..row]
+                .iter()
+                .zip(&boot)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            if block.len() < 4 {
+                assert_eq!(worst, 0.0, "per-token verify row 0 != bootstrap hidden");
+            } else {
+                assert!(
+                    worst <= 0.02 * peak,
+                    "batched verify row 0 drifts {worst} (peak {peak})"
+                );
+            }
+        }
+        gpu.free_tensor(hidden).unwrap();
+    }
+
     /// Greedy argmax decode over `prompt_tokens` followed by `generated`
     /// self-generated tokens, one token per committed position.
     fn greedy_decode(

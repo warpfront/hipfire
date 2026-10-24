@@ -90,20 +90,31 @@ impl SpecTarget for LlamaBundle {
         // missing → no capture (the `_hidden_out` ignored default of Task 1).
         let extract = self.dflash_extract_layers.clone();
         let want_capture = !extract.is_empty() && hidden_out.is_some();
-        // GREEDY-EQUIVALENCE: prefill the prompt token-by-token through the SAME
-        // decode kernel AR uses (`forward_scratch_compute`), not the batched
-        // prefill kernel. The batched and per-token forwards are not bitwise
-        // equal; on a near-tie logit the batched path's KV flips the verifier's
-        // argmax off AR's greedy pick (bielik/code diverged at token 2: pos 261
-        // logit gap 15.93 vs 15.88). Matching AR's per-token prefill restores
-        // token-identical greedy spec decode. Per-token capture appends one
-        // position's `num_extract × dim` residual per call (extract order).
-        for (i, &tok) in tokens.iter().enumerate() {
+        // GREEDY-EQUIVALENCE: prefill the prompt through the SAME forward AR's
+        // LlamaAr route uses for it (hipfire-generate ar.rs), so the prompt KV and
+        // the captured hidden are AR's bytes. The batched and per-token forwards
+        // are not bitwise equal; on a near-tie logit a mismatched prompt KV flips
+        // the verifier's argmax off AR's greedy pick (bielik/code diverged at
+        // token 2: pos 261 logit gap 15.93 vs 15.88). Qwen3 on gfx11/gfx1201
+        // with Q8 KV: one batched `forward_prefill_batch` call (same chunking as
+        // AR's). Otherwise: per token through the AR decode forward, which appends
+        // one position's `num_extract × dim` residual per call (extract order).
+        // The spec loop never evicts, so `has_eviction` is false.
+        let batched = llama::llama_qwen3_batched_prefill_eligible(
+            &gpu.arch,
+            self.config.arch,
+            hipfire_runtime::config::get().prefill_batched,
+            self.kv.quant_q8,
+            false,
+            tokens.len(),
+        );
+        let step = if batched { tokens.len() } else { 1 };
+        for (i, chunk) in tokens.chunks(step).enumerate() {
             if abort() {
                 self.kv.compact_offset = 0;
                 return Ok(SpecAdvance::Aborted);
             }
-            let pos = start_pos + i;
+            let pos = start_pos + i * step;
             let mut sink = if want_capture {
                 Some(llama::HiddenCaptureSink {
                     extract_layers: &extract,
@@ -113,22 +124,44 @@ impl SpecTarget for LlamaBundle {
             } else {
                 None
             };
-            llama::forward_scratch_embed(gpu, &self.weights, &self.config, tok, pos, &self.scratch)
-                .map_err(|e| format!("{e:?}"))?;
-            llama::forward_scratch_compute_capture(
-                gpu,
-                &self.weights,
-                &self.config,
-                pos,
-                &mut self.kv,
-                &self.scratch,
-                sink.as_mut(),
-            )
-            .map_err(|e| format!("{e:?}"))?;
+            let r = if batched {
+                llama::forward_prefill_batch_capture(
+                    gpu,
+                    &self.weights,
+                    &self.config,
+                    chunk,
+                    pos,
+                    &mut self.kv,
+                    &self.scratch,
+                    None,
+                    sink.as_mut(),
+                )
+            } else {
+                llama::forward_scratch_embed(
+                    gpu,
+                    &self.weights,
+                    &self.config,
+                    chunk[0],
+                    pos,
+                    &self.scratch,
+                )
+                .and_then(|()| {
+                    llama::forward_scratch_compute_capture(
+                        gpu,
+                        &self.weights,
+                        &self.config,
+                        pos,
+                        &mut self.kv,
+                        &self.scratch,
+                        sink.as_mut(),
+                    )
+                })
+            };
+            r.map_err(|e| format!("{e:?}"))?;
         }
-        // The last per-token forward_scratch_compute leaves the final token's
-        // logits in scratch.logits. Hand the host row through so Generic DFlash
-        // prefill can sample at temp>0 without a second D2H.
+        // Both forwards leave the final token's logits in scratch.logits. Hand
+        // the host row through so Generic DFlash prefill can sample at temp>0
+        // without a second D2H.
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| format!("{e:?}"))?;
@@ -388,11 +421,12 @@ impl SpecTarget for LlamaBundle {
     ///
     /// Runs a 1-token capture-armed forward via
     /// `forward_scratch_embed` + `forward_scratch_compute_capture`, reusing the
-    /// same `HiddenCaptureSink` path as `spec_advance`. The `layers` parameter
-    /// comes from the generic drafter's `DsparkConfig::target_layer_ids` and may
-    /// differ from `self.dflash_extract_layers` (e.g. when the bundle was not
-    /// configured as a DFlash target), so we use the argument directly rather
-    /// than `self.dflash_extract_layers`.
+    /// same `HiddenCaptureSink` path as `spec_advance`. `layers` comes from the
+    /// generic drafter's `DsparkConfig::target_layer_ids`; it is also recorded as
+    /// the bundle's extract layers (as qwen35 does), so every later
+    /// `verify_block_capture_gpu` hands DSpark its accepted-prefix hidden. Without
+    /// that the daemon's DSpark verify captured nothing: every window re-ran this
+    /// bootstrap forward and drafted from a single context slot.
     fn capture_seed_main_hidden(
         &mut self,
         gpu: &mut Gpu,
@@ -400,6 +434,7 @@ impl SpecTarget for LlamaBundle {
         position: usize,
         layers: &[usize],
     ) -> Result<Vec<f32>, String> {
+        self.set_dflash_extract_layers(layers.to_vec());
         let mut hidden_out: Vec<f32> = Vec::new();
         let mut sink = llama::HiddenCaptureSink {
             extract_layers: layers,

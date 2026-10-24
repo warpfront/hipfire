@@ -458,10 +458,10 @@ pub trait SpecTarget {
     ///
     /// Returns `(per-position argmax, captured)`. `captured` is `true` iff all
     /// `block.len()` positions' hidden were written to `hidden_gpu`; a target
-    /// whose batched capture path can't run for this block (e.g. llama with
-    /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
-    /// the caller re-bootstraps the next window. `hidden_gpu` must be
-    /// `≥ block.len() × dflash_extract_layers().len() × dim` F32.
+    /// with no extract layers configured returns `false` and leaves
+    /// `hidden_gpu` untouched, and the caller re-bootstraps the next window.
+    /// `hidden_gpu` must be `≥ block.len() × dflash_extract_layers().len() × dim`
+    /// F32.
     ///
     /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
     /// Returns `Err` by default (target has no GPU-resident hidden capture).

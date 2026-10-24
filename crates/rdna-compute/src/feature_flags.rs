@@ -362,9 +362,10 @@ pub struct FeatureFlags {
     pub gate_up_ldsstage: bool,
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 WMMA
     /// GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per block, X slab staged in
-    /// LDS) for gate_up/qkvza/qkv/residual, and the matching Q8_0
-    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head). Default on for exact gfx1151, false
-    /// elsewhere; outputs are byte-identical to the base kernels.
+    /// LDS) for gate_up/qkvza/qkv/residual, the matching Q8_0
+    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head, Q8 gate_up) and the F16
+    /// `gemm_f16_wmma_gfx1151_xlds` (DSpark drafter lm_head). Default on for exact
+    /// gfx1151, false elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
