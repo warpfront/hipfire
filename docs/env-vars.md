@@ -1239,7 +1239,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1710
+**Count:** 1712
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2366,6 +2366,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN35_GRAMMAR` | crates/hipfire-daemon/src/slots.rs, crates/hipfire-generate/src/ar.rs | developer |
 | `HIPFIRE_QWEN35_NGRAM_LEN_MIN` | crates/hipfire-arch-qwen35/src/grammar_config.rs | developer |
 | `HIPFIRE_QWEN35_NGRAM_MIN_REPEATS` | crates/hipfire-arch-qwen35/src/grammar_config.rs | developer |
+| `HIPFIRE_QWEN35_NPU_TRUNK` | crates/hipfire-arch-qwen35/src/npu_trunk.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_QWEN35_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
 | `HIPFIRE_QWEN35_TP_CHUNK` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_QWEN35_TP_MODEL` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, scripts/check-env-docs.py | developer |
@@ -2849,6 +2850,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TEST_MOE_AWQ_SIDECAR_CHILD` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_TEST_REAL_HIPCC` | crates/rdna-compute/src/compiler.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_TEST_REQUIRE_ROCM` | crates/peacemaker-cdna/src/oracle.rs, crates/peacemaker-cdna/tests/enc_sop.rs | developer |
+| `HIPFIRE_TEST_STAGE` | crates/hipfire-runtime/src/coproc/admission.rs, crates/hipfire-runtime/src/coproc/mode.rs | developer |
 | `HIPFIRE_TEST_TARGET` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
 | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs | developer |
