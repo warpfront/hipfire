@@ -2390,12 +2390,12 @@ mod tests {
     }
 
     /// HIPF-111: a DSpark bootstrap (`capture_seed_main_hidden`) arms the
-    /// verify's hidden capture at the drafter's layers, for the per-token
-    /// (1..3 rows) and the batched (>= 4 rows) verify alike. The daemon never
+    /// verify's hidden capture at the drafter's layers, for a 2-row per-token
+    /// and a 5-row batched greedy verify alike. The daemon never
     /// set the bundle's extract layers, so every verify reported
     /// `captured == false` and DSpark re-ran the bootstrap forward each window.
     #[test]
-    fn dspark_bootstrap_arms_verify_capture_for_every_block_size() {
+    fn dspark_bootstrap_arms_verify_capture_for_short_and_batched_blocks() {
         use hipfire_runtime::spec::{SpecAdvance, SpecTarget};
         let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
             .lock()
