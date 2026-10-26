@@ -159,8 +159,11 @@ pub fn verify_block_argmax_capture_gpu(
 /// Sampled (temp>0) counterpart of [`verify_block_argmax_capture_gpu`]: runs the
 /// SAME batched forward + GPU-resident hidden capture, but draws each position's
 /// token `t_i ~ p_T(temp, top_p, top_k)` (advancing `rng`) instead of argmax.
-/// Returns `(per-position sampled tokens, captured)` with the same `captured`
-/// semantics (false ⇒ no extract layers, `hidden_gpu` untouched).
+/// Returns `(per-position sampled tokens, captured)`; `false` ⇒ no extract
+/// layers, `hidden_gpu` untouched. With `true` the batched path writes every
+/// row, but the per-token fallback (`block.len() < 4`) stops after the first
+/// sample that rejects the next draft, so only rows `0..=` that position (seed
+/// plus accepted drafts, all a caller may read) are written.
 ///
 /// Each position is drawn on-GPU via the fused `sample_top_p_pf` kernel (softmax
 /// + nucleus + top_k + categorical in ONE launch, 4-byte D2H) — no b×vocab
