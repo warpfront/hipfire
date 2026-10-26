@@ -115,6 +115,7 @@ pub mod mtp_spec;
 /// core). Deltanet-gated — it touches `ModelSlot` + `MtpSpecState`.
 #[cfg(feature = "deltanet")]
 pub mod mtp_speculator;
+pub mod npu_trunk;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]

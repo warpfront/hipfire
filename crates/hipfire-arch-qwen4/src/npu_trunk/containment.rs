@@ -1,104 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! NPU trunk fault containment: the process-wide route latch and the GPU-only rerun of a faulted request.
+//! NPU trunk fault classification: an NPU runtime fault reruns its request GPU-only, a GPU error fails it.
 
-/// What failed inside a pair: the NPU runtime (chain watchdog, submit, ERT state, relay) or the GPU (a HIP error, whose
-/// context is sticky, so a GPU-only rerun could only fail too).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FaultClass {
-    NpuRuntime,
-    GpuHip,
-}
+use hipfire_runtime::coproc::containment::FaultClass;
 
-impl FaultClass {
-    /// The class of a pair executor error, by variant (never by message text). Every `HipError` is a GPU error, including a
-    /// `rdna_compute::router_fault::RouterFault` (non-finite MoE router row), which `Gpu::take_device_wait_error` returns as
-    /// `HipError` code 0 and which therefore fails the request with its original error and is never rerun.
-    pub(crate) fn of(error: &crate::gpu_forward::Qwen4GpuForwardError) -> Self {
-        if matches!(error, crate::gpu_forward::Qwen4GpuForwardError::Hip(_)) {
-            Self::GpuHip
-        } else {
-            Self::NpuRuntime
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::NpuRuntime => "NPU runtime",
-            Self::GpuHip => "GPU HipError",
-        }
-    }
-}
-
-/// The route's fault latch. The first pair fault of the process stores its reason and turns the route off for good. An
-/// NPU runtime fault also marks the request in flight so its entry point reruns it GPU-only; a GPU HipError never does
-/// (the request fails with its original error).
-#[derive(Default)]
-pub(crate) struct FaultLatch {
-    fault: Option<String>,
-    request: bool,
-}
-
-impl FaultLatch {
-    /// Records a pair fault. Returns true only for the first trip of the process (the caller logs once).
-    pub(crate) fn trip(&mut self, class: FaultClass, reason: &str) -> bool {
-        if class == FaultClass::NpuRuntime {
-            self.request = true;
-        }
-        if self.fault.is_some() {
-            return false;
-        }
-        self.fault = Some(reason.to_string());
-        true
-    }
-    pub(crate) fn tripped(&self) -> bool {
-        self.fault.is_some()
-    }
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn reason(&self) -> Option<&str> {
-        self.fault.as_deref()
-    }
-    /// Whether the request in flight faulted; clears the per-request flag.
-    pub(crate) fn take_request_fault(&mut self) -> bool {
-        std::mem::take(&mut self.request)
-    }
-    /// A new request starts: forget the previous request's fault mark (the process latch stays).
-    pub(crate) fn begin_request(&mut self) {
-        self.request = false;
-    }
-}
-
-/// Runs `attempt(ctx, start)`; when it fails and the failure tripped the fault latch (`take_fault`), runs it once more
-/// from `replan(ctx)`.
-///
-/// The start is re-planned because the faulted attempt consumed and mutated the live state: the session driver's
-/// `begin` took the live continuation, the chunks already forwarded advanced the state, and any uncommitted snapshots
-/// of the attempt are dropped by the next turn's start. The only valid reuse points after the fault are the committed
-/// snapshots (or a cold start), which is what `replan` returns.
-///
-/// The rerun is byte-identical to a GPU-only run of the same request from that start: the latched route plans no pair
-/// (`route_off()` makes the scheduling exactly the `off` one) and the session machinery restores the chosen snapshot or
-/// resets the state before the first row, so nothing the NPU wrote can reach the rerun. A failure that did not trip the
-/// latch (abort, validation, GPU error, `on` mode) is returned unchanged and never rerun.
-pub(crate) fn rerun_after_fault<C: ?Sized, T, E>(
-    ctx: &mut C,
-    rows: usize,
-    start: usize,
-    mut attempt: impl FnMut(&mut C, usize) -> Result<T, E>,
-    take_fault: impl Fn(&mut C) -> bool,
-    replan: impl Fn(&C) -> usize,
-) -> Result<T, E> {
-    match attempt(ctx, start) {
-        Err(error) => {
-            if !take_fault(ctx) {
-                return Err(error);
-            }
-            let restart = replan(ctx);
-            eprintln!(
-                "npu-trunk: the faulted request restarts GPU-only from row {restart} of {rows}"
-            );
-            attempt(ctx, restart)
-        }
-        ok => ok,
+/// The class of a pair executor error, by variant (never by message text). Every `HipError` is a GPU error, including a
+/// `rdna_compute::router_fault::RouterFault` (non-finite MoE router row), which `Gpu::take_device_wait_error` returns as
+/// `HipError` code 0 and which therefore fails the request with its original error and is never rerun.
+pub(crate) fn fault_class_of(error: &crate::gpu_forward::Qwen4GpuForwardError) -> FaultClass {
+    if matches!(error, crate::gpu_forward::Qwen4GpuForwardError::Hip(_)) {
+        FaultClass::GpuHip
+    } else {
+        FaultClass::NpuRuntime
     }
 }
 
@@ -106,6 +18,7 @@ pub(crate) fn rerun_after_fault<C: ?Sized, T, E>(
 mod tests {
     use super::*;
     use crate::gpu_forward::{qwen4_prefill_segment_rows, SessionBoundaries};
+    use hipfire_runtime::coproc::containment::{rerun_after_fault, FaultLatch};
     use std::collections::BTreeMap;
 
     const SCHEDULE_CHUNK: usize = 8192;
@@ -217,6 +130,7 @@ mod tests {
         fn request(&mut self, prompt: &[usize], start: usize) -> Result<u64, String> {
             let rows = prompt.len();
             rerun_after_fault(
+                crate::npu_trunk::SWITCH.tag,
                 self,
                 rows,
                 start,
@@ -506,26 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn non_fault_error_is_not_rerun() {
-        let mut attempts = 0;
-        let mut latch = FaultLatch::default();
-        let result: Result<u32, &str> = rerun_after_fault(
-            &mut latch,
-            10,
-            0,
-            |_, _| {
-                attempts += 1;
-                Err("aborted")
-            },
-            |latch| latch.take_request_fault(),
-            |_| panic!("no replan without a fault"),
-        );
-        assert_eq!(result, Err("aborted"));
-        assert_eq!(attempts, 1);
-        assert!(!latch.tripped());
-    }
-
-    #[test]
     fn gpu_hip_error_fails_the_request_without_a_rerun() {
         let mut faulted = Toy::new(true, Some(0));
         faulted.fault_class = FaultClass::GpuHip;
@@ -552,11 +446,11 @@ mod tests {
         use crate::gpu_forward::Qwen4GpuForwardError;
         use rdna_compute::router_fault::RouterFault;
         // The production path: the fault word's RouterFault -> `to_hip_error` (code 0, as `take_device_wait_error` returns it)
-        // -> `?` into the forward error -> `FaultClass::of` (what `NpuForward::contain_fault` classifies with).
+        // -> `fault_class_of` (what `NpuForward::contain_fault` classifies with).
         let fault = RouterFault::decode(3, RouterFault::encode(17, 1234)).expect("decodes");
         let error = Qwen4GpuForwardError::from(fault.to_hip_error());
         assert!(matches!(&error, Qwen4GpuForwardError::Hip(_)));
-        assert_eq!(FaultClass::of(&error), FaultClass::GpuHip);
+        assert_eq!(fault_class_of(&error), FaultClass::GpuHip);
         // The layer/row message survives the conversion.
         let message = error.to_string();
         assert!(
@@ -567,16 +461,17 @@ mod tests {
         );
         // A non-Hip error (the NPU runtime's relay/validation failures) stays an NPU runtime fault.
         assert_eq!(
-            FaultClass::of(&Qwen4GpuForwardError::Dispatch("npu relay".to_string())),
+            fault_class_of(&Qwen4GpuForwardError::Dispatch("npu relay".to_string())),
             FaultClass::NpuRuntime
         );
         // Latch semantics for that class: the route latches, but the request is never marked for a GPU-only rerun, so
         // `rerun_after_fault` runs it once and returns the router error unchanged.
         let mut latch = FaultLatch::default();
-        assert!(latch.trip(FaultClass::of(&error), &error.to_string()));
+        assert!(latch.trip(fault_class_of(&error), &error.to_string()));
         assert!(latch.tripped() && !latch.take_request_fault());
         let mut attempts = 0;
         let result: Result<(), Qwen4GpuForwardError> = rerun_after_fault(
+            crate::npu_trunk::SWITCH.tag,
             &mut latch,
             10,
             0,
@@ -593,24 +488,5 @@ mod tests {
             message.contains("layer 17") && message.contains("row 1234"),
             "{message}"
         );
-    }
-
-    #[test]
-    fn latch_trips_once_and_request_flag_clears() {
-        let mut latch = FaultLatch::default();
-        assert!(!latch.tripped() && latch.reason().is_none() && !latch.take_request_fault());
-        assert!(latch.trip(FaultClass::NpuRuntime, "first"));
-        assert!(!latch.trip(FaultClass::NpuRuntime, "second"));
-        assert_eq!(latch.reason(), Some("first"));
-        assert!(latch.take_request_fault());
-        assert!(!latch.take_request_fault());
-        latch.trip(FaultClass::NpuRuntime, "third");
-        latch.begin_request();
-        assert!(!latch.take_request_fault());
-        assert!(latch.tripped());
-        // A GPU HipError latches the route but never marks the request for a rerun.
-        let mut gpu = FaultLatch::default();
-        assert!(gpu.trip(FaultClass::GpuHip, "HIP 700"));
-        assert!(gpu.tripped() && !gpu.take_request_fault());
     }
 }

@@ -4,9 +4,10 @@ The Qwen4 `npu_trunk` module owns CPU-only model preparation for hipfire 0.4.2;
 `peacemaker-npu` owns the numerical reference, panel layout and deployment builder.
 Neither preparation path opens hardware or schedules prefill.
 
-`NpuTrunkMode::from_env()` borrows the central process snapshot for
-`HIPFIRE_QWEN4_NPU_TRUNK`: `off`, `auto` (default), `on`, or `emulate`.
+Qwen4 reads `fusions.npu_trunk` (env `HIPFIRE_QWEN4_NPU_TRUNK`) with
+`hipfire_runtime::coproc::Mode::from_config(SWITCH, Mode::Auto)`: `off`, `auto` (default), `on`, or `emulate`. Mode, containment, admission and pair geometry are shared in `hipfire_runtime::coproc`.
 At load, auto resolves silently to off on every arch except gfx1151.
+The qwen3.8-27b switch is `fusions.qwen35_npu_trunk` (env `HIPFIRE_QWEN35_NPU_TRUNK`, default `off`); any other value is refused at load until its prefill driver lands.
 
 ## Serving status (0.4.2)
 
@@ -1244,7 +1245,7 @@ they keep the natural 8192+B pairing.
 
 A pair may carry **one interior session snapshot row**, anywhere in the group
 (C1, 0.4.2). At the A/B split bank A runs whole and its fixed state is staged
-after it, as before. Inside a bank (`CutSite::Bank`), that bank's Core runs as
+after it, as before. Inside a bank (`coproc::pair::CutSite::Bank`), that bank's Core runs as
 two launches `[0,r)` and `[r,rows)` (`execute_*_core_rows`, `CoreWindow`):
 GDN: each launch ends with the ordinary chunk-end Q8 round trip (frame
 `position + lo + rows - 1`) and the conv ring cursor `(start + lo) % 3`; QSA:

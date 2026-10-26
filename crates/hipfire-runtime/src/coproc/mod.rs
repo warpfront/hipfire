@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A co-processor (XDNA2 NPU) as a heterogeneous pipeline stage beside the GPU.
 //!
-//! Four separate concerns, one module each:
+//! One module per concern:
 //! - [`stage`]: the op-level stage map an architecture declares (which projection families the co-processor
 //!   may own, per layer kind) and the ownership table ([`FamilySet`]) over it, plus the stage numerics
 //!   contract ([`EpilogueContract`]);
 //! - [`calibration`]: the stored measurements that price one map on one host;
 //! - [`plan`] / [`rates`]: the deterministic planner that picks the ownership and the chunk-pair micro-batches,
 //!   and the live rate scales that refine its prior under `auto`;
-//! - [`schedule`]: the layer-major order of a chunk pair and the dependency edges it respects.
+//! - [`schedule`]: the layer-major order of a chunk pair and the dependency edges it respects;
+//! - [`mode`]: the per-stage switch (`off`, `auto`, `on`, `emulate`) and its resolution;
+//! - [`admission`]: the checks that run before any weight or device work, and the settlement of a refusal;
+//! - [`containment`]: the fault latch and the GPU-only rerun of a faulted request;
+//! - [`pair`]: the bank-pair geometry (where the session snapshot cuts a group, what each bank launches);
 //!
 //! Architecture crates keep only their shape description (the [`StageMap`] value), weight packing and the hooks
 //! that run one (layer, bank) visit.
 
+pub mod admission;
 pub mod calibration;
+pub mod containment;
+pub mod mode;
+pub mod pair;
 pub mod plan;
 pub mod rates;
 pub mod schedule;
@@ -24,6 +32,7 @@ pub use calibration::{
     DeviceKey, FamilyCalibration, GlueCalibration, GpuCalibration, KernelKey, NpuCalibration,
     OutFamily, QsaOrder, CALIBRATION_SCHEMA_VERSION,
 };
+pub use mode::{Mode, Switch};
 pub use plan::{
     admit_wave_budget, auto_admission, bank_segments, bank_segments_moved, contention_extra,
     crossover, executable_plan, executable_plan_for, gpu_chunk, load_log_line, npu_ms, pair_time,

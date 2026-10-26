@@ -308,11 +308,13 @@ impl SlowlinkMode {
 }
 
 /// Whether the NPU trunk engine is selected for `arch` under `mode`: the same
-/// resolution the forward uses ([`crate::npu_trunk::NpuTrunkMode::resolve`]).
+/// resolution the forward uses ([`hipfire_runtime::coproc::Mode::resolve`]).
 /// S1 declines a selected NPU before any reserve, so a pair route never meets
 /// the layer-major schedule.
-pub fn npu_trunk_selected(arch: &str, mode: crate::npu_trunk::NpuTrunkMode) -> bool {
-    !mode.resolve(arch).is_off()
+pub fn npu_trunk_selected(arch: &str, mode: hipfire_runtime::coproc::Mode) -> bool {
+    !mode
+        .resolve(crate::npu_trunk::arch_admits_auto(arch))
+        .is_off()
 }
 
 /// What the loader knows about a load before it sizes any placement.
@@ -2795,8 +2797,11 @@ impl<'a> LoadShape<'a> {
             stage_opt_out: stage.as_deref() == Some("0"),
             npu_trunk: npu_trunk_selected(
                 arch,
-                crate::npu_trunk::NpuTrunkMode::from_env()
-                    .map_err(|error| format!("qwen4: {error}"))?,
+                hipfire_runtime::coproc::Mode::from_config(
+                    crate::npu_trunk::SWITCH,
+                    hipfire_runtime::coproc::Mode::Auto,
+                )
+                .map_err(|error| format!("qwen4: {error}"))?,
             ),
             chunk_rows_env,
             max_seq,
@@ -3549,7 +3554,7 @@ mod tests {
 
     #[test]
     fn slowlink_admission_selected_npu_truth_table() {
-        use crate::npu_trunk::NpuTrunkMode::{Auto, Emulate, Off, On};
+        use hipfire_runtime::coproc::Mode::{Auto, Emulate, Off, On};
         // `auto` resolves to off outside gfx1151, so the default never selects
         // the NPU on the S1 arch; an explicit `on` or `emulate` does, anywhere.
         for arch in ["gfx1100", "gfx1201", "gfx906", "gfx1030", "gfx942"] {

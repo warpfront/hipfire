@@ -2472,10 +2472,10 @@ pub(crate) fn qwen4_pp_option_refusal(
 pub(crate) fn qwen4_pp_env_refusal(
     pp: usize,
     env: &dyn Fn(&str) -> Option<String>,
-    npu: hipfire_arch_qwen4::npu_trunk::NpuTrunkMode,
+    npu: hipfire_runtime::coproc::Mode,
     session_cache_disk_bytes: u64,
 ) -> Result<(), String> {
-    use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
+    use hipfire_runtime::coproc::Mode;
     if pp <= 1 {
         return Ok(());
     }
@@ -2505,7 +2505,7 @@ pub(crate) fn qwen4_pp_env_refusal(
             "the session cache disk tier (memory.session_cache_disk_bytes; set 0)".to_string(),
         ),
         (
-            matches!(npu, NpuTrunkMode::On | NpuTrunkMode::Emulate),
+            matches!(npu, Mode::On | Mode::Emulate),
             format!("the NPU trunk (fusions.npu_trunk = {})", npu.as_str()),
         ),
     ];
@@ -2923,9 +2923,12 @@ pub fn admit_source_with_options(
             return Err(refusal);
         }
         if pp > 1 {
-            let npu = hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()
-                .map_err(|error| format!("qwen4: {error}"))?
-                .resolve(gpu_arch);
+            let npu = hipfire_runtime::coproc::Mode::from_config(
+                hipfire_arch_qwen4::npu_trunk::SWITCH,
+                hipfire_runtime::coproc::Mode::Auto,
+            )
+            .map_err(|error| format!("qwen4: {error}"))?
+            .resolve(hipfire_arch_qwen4::npu_trunk::arch_admits_auto(gpu_arch));
             qwen4_pp_env_refusal(
                 pp,
                 &|name| hipfire_config::developer_var(name).ok(),
@@ -6823,7 +6826,7 @@ mod non_qwen4_ep_admission_tests {
 #[cfg(test)]
 mod qwen4_pp_admission_tests {
     use super::*;
-    use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
+    use hipfire_runtime::coproc::Mode;
     use hipfire_runtime::mesh_placement::EdgeTransport;
 
     fn rank(ordinal: i32, pci: Option<&str>, arch: &str) -> AdmittedRank {
@@ -7403,8 +7406,8 @@ mod qwen4_pp_admission_tests {
         let ok = |env: &dyn Fn(&str) -> Option<String>, npu, disk| {
             qwen4_pp_env_refusal(2, env, npu, disk)
         };
-        assert_eq!(ok(&none, NpuTrunkMode::Off, 0), Ok(()));
-        assert_eq!(ok(&none, NpuTrunkMode::Auto, 0), Ok(()));
+        assert_eq!(ok(&none, Mode::Off, 0), Ok(()));
+        assert_eq!(ok(&none, Mode::Auto, 0), Ok(()));
         let set = |name: &'static str, value: &'static str| {
             move |query: &str| (query == name).then(|| value.to_string())
         };
@@ -7413,48 +7416,33 @@ mod qwen4_pp_admission_tests {
                 "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
                 ok(
                     &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "auto"),
-                    NpuTrunkMode::Off,
+                    Mode::Off,
                     0,
                 ),
             ),
             (
                 "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
-                ok(
-                    &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "0"),
-                    NpuTrunkMode::Off,
-                    0,
-                ),
+                ok(&set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "0"), Mode::Off, 0),
             ),
             (
                 "HIPFIRE_QWEN4_EXPERT_HOTSET",
-                ok(
-                    &set("HIPFIRE_QWEN4_EXPERT_HOTSET", "/tmp/x"),
-                    NpuTrunkMode::Off,
-                    0,
-                ),
+                ok(&set("HIPFIRE_QWEN4_EXPERT_HOTSET", "/tmp/x"), Mode::Off, 0),
             ),
             (
                 hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
                 ok(
                     &set(hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV, "1"),
-                    NpuTrunkMode::Off,
+                    Mode::Off,
                     0,
                 ),
             ),
             (
                 "HIPFIRE_QWEN4_TURN_SNAPSHOTS",
-                ok(
-                    &set("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "1"),
-                    NpuTrunkMode::Off,
-                    0,
-                ),
+                ok(&set("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "1"), Mode::Off, 0),
             ),
-            ("session_cache_disk_bytes", ok(&none, NpuTrunkMode::Off, 1)),
-            ("fusions.npu_trunk = on", ok(&none, NpuTrunkMode::On, 0)),
-            (
-                "fusions.npu_trunk = emulate",
-                ok(&none, NpuTrunkMode::Emulate, 0),
-            ),
+            ("session_cache_disk_bytes", ok(&none, Mode::Off, 1)),
+            ("fusions.npu_trunk = on", ok(&none, Mode::On, 0)),
+            ("fusions.npu_trunk = emulate", ok(&none, Mode::Emulate, 0)),
         ];
         for (name, result) in refused {
             let error = result.unwrap_err();
@@ -7469,18 +7457,14 @@ mod qwen4_pp_admission_tests {
             (hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV, "0"),
             ("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "0"),
         ] {
-            assert_eq!(
-                ok(&set(name, value), NpuTrunkMode::Off, 0),
-                Ok(()),
-                "{name}"
-            );
+            assert_eq!(ok(&set(name, value), Mode::Off, 0), Ok(()), "{name}");
         }
         // Single is never refused.
         assert_eq!(
             qwen4_pp_env_refusal(
                 1,
                 &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "auto"),
-                NpuTrunkMode::On,
+                Mode::On,
                 9
             ),
             Ok(())

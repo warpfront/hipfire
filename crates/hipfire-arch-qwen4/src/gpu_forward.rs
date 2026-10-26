@@ -22788,64 +22788,6 @@ pub(crate) fn qwen4_prefill_segment_rows(
     rows.min(distance)
 }
 
-/// Where in a pair group the session snapshot row falls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CutSite {
-    /// No interior snapshot row (the group end is published by the driver).
-    None,
-    /// Exactly the A/B boundary: bank A runs whole, state staged after it.
-    Split,
-    /// Inside `bank` at its local `row`: that bank's Core runs as two launches.
-    Bank { bank: usize, row: usize },
-}
-
-/// Bank and sub-launch geometry of one pair group: two banks and the group-local
-/// row of an interior session snapshot. Both the executor and the numerical twin
-/// derive their chunking from this, so they cut at identical rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PairShape {
-    pub rows: [usize; 2],
-    pub cut: Option<usize>,
-}
-
-impl PairShape {
-    /// `cut` is the session boundary `boundary` made group-local at `position`;
-    /// only a boundary strictly inside the group is a cut.
-    pub(crate) fn new(rows: [usize; 2], position: usize, boundary: Option<usize>) -> Self {
-        let total = rows[0] + rows[1];
-        let cut = boundary
-            .filter(|&b| b > position && b < position + total)
-            .map(|b| b - position);
-        Self { rows, cut }
-    }
-
-    pub(crate) fn total(&self) -> usize {
-        self.rows[0] + self.rows[1]
-    }
-
-    pub(crate) fn site(&self) -> CutSite {
-        match self.cut {
-            None => CutSite::None,
-            Some(cut) if cut == self.rows[0] => CutSite::Split,
-            Some(cut) if cut < self.rows[0] => CutSite::Bank { bank: 0, row: cut },
-            Some(cut) => CutSite::Bank {
-                bank: 1,
-                row: cut - self.rows[0],
-            },
-        }
-    }
-
-    /// Group-local row ranges of the sequential chunks the numerical twin runs:
-    /// the banks, further split at the cut (a sub-launch is a chunk boundary).
-    pub(crate) fn pieces(&self) -> Vec<std::ops::Range<usize>> {
-        let mut points = vec![0, self.rows[0], self.total()];
-        points.extend(self.cut);
-        points.sort_unstable();
-        points.dedup();
-        points.windows(2).map(|w| w[0]..w[1]).collect()
-    }
-}
-
 #[cfg(test)]
 mod ep_rank_generic_tests {
     use super::*;
