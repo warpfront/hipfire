@@ -730,14 +730,50 @@ fn check_daemon_build_matches(daemon: &Path) -> Result<()> {
     if CLIENT_BUILD_COMMIT == "unknown" {
         return Ok(());
     }
-    let output = match std::process::Command::new(daemon).arg("--version").output() {
-        Ok(output) if output.status.success() => output,
-        _ => return Ok(()),
+    let mut child = match std::process::Command::new(daemon)
+        .arg("--version")
+        // A daemon fixture that reads stdin must see EOF, not this caller's
+        // pipes; the real daemon answers before touching stdin anyway.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(()),
     };
-    let commit = std::str::from_utf8(&output.stdout)
-        .ok()
-        .and_then(daemon_commit_from_version_line)
-        .unwrap_or("");
+    // The real daemon answers --version before any process init. Anything
+    // still running after the deadline is not a version answer (a fixture
+    // that ignores the flag), not evidence of skew: kill it and pass.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+    };
+    if !status.success() {
+        return Ok(());
+    }
+    // The child has exited, so reading its piped stdout cannot block.
+    let mut stdout = String::new();
+    let read = child
+        .stdout
+        .take()
+        .map_or(false, |mut pipe| {
+            std::io::Read::read_to_string(&mut pipe, &mut stdout).is_ok()
+        });
+    if !read {
+        return Ok(());
+    }
+    let commit = daemon_commit_from_version_line(&stdout).unwrap_or("");
     if commit.is_empty() || commit == "unknown" || commit == CLIENT_BUILD_COMMIT {
         return Ok(());
     }
@@ -3082,6 +3118,8 @@ done
 
     /// An unparseable `--version` answer is not evidence of skew: the probe
     /// passes and the spawn proceeds to fail (or succeed) for its real reason.
+    /// A daemon that ignores `--version` entirely and blocks (a stdin-reading
+    /// fixture) is killed at the probe deadline and also passes.
     #[cfg(unix)]
     #[test]
     fn unparseable_daemon_version_passes_the_build_probe() {
@@ -3100,6 +3138,34 @@ done
             }
             _ => {}
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `--version` that never exits (a fixture that ignores the flag and
+    /// reads stdin forever) is killed at the deadline, not awaited forever.
+    #[cfg(unix)]
+    #[test]
+    fn blocking_daemon_version_probe_times_out_and_passes() {
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_blocking_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\nwhile read line; do :; done\n",
+        );
+        let started = std::time::Instant::now();
+        match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(ClientError::DaemonBuildMismatch { .. }) => {
+                panic!("a blocked version probe must pass, not report skew")
+            }
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "probe must not wait on a daemon that ignores --version"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
